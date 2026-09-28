@@ -336,9 +336,11 @@ pub async fn soft_delete_tls_binding(
     Ok(())
 }
 
-/// Legacy bindings with withdrawn artifacts require matching live measurements.
-/// Artifact acceptance precedes binding updates, so signer equality alone can
-/// reopen the old workload. The binding's image_digest stores a full image_ref.
+/// A withdrawal under the binding's signer identity closes the legacy Rego
+/// path for that binding durably. Coincident image and init-data
+/// measurements on a newer artifact do not prove the binding belongs to
+/// that artifact, so a fresh deployment must authorize through
+/// signed-policy candidates instead of readmitting the old binding.
 pub(crate) async fn load_legacy_tls_bindings(
     db: &PgPool,
 ) -> Result<Vec<KbsTlsBinding>, KbsPolicyError> {
@@ -348,36 +350,16 @@ pub(crate) async fn load_legacy_tls_bindings(
                 signer_identity_subject, signer_identity_issuer
          FROM kbs_tls_bindings AS binding
          WHERE deleted_at IS NULL
-           AND NOT (
-                EXISTS (
-                    SELECT 1
-                      FROM withdrawn_signer_artifacts AS withdrawn
-                      JOIN workload_artifacts AS artifact
-                        ON artifact.descriptor_core_hash = withdrawn.descriptor_core_hash
-                     WHERE artifact.app_id = binding.app_id
-                       AND artifact.descriptor_payload -> 'signer_identity' ->> 'subject'
-                           = binding.signer_identity_subject
-                       AND artifact.descriptor_payload -> 'signer_identity' ->> 'issuer'
-                           = binding.signer_identity_issuer
-                )
-                AND NOT EXISTS (
-                    SELECT 1
-                      FROM workload_artifacts AS artifact
-                     WHERE artifact.app_id = binding.app_id
-                       AND artifact.descriptor_payload -> 'signer_identity' ->> 'subject'
-                           = binding.signer_identity_subject
-                       AND artifact.descriptor_payload -> 'signer_identity' ->> 'issuer'
-                           = binding.signer_identity_issuer
-                       AND artifact.descriptor_payload ->> 'image_ref'
-                           = binding.image_digest
-                       AND artifact.descriptor_payload ->> 'expected_cc_init_data_hash'
-                           = encode(binding.init_data_hash, 'hex')
-                       AND NOT EXISTS (
-                           SELECT 1
-                             FROM withdrawn_signer_artifacts AS withdrawn
-                            WHERE withdrawn.descriptor_core_hash = artifact.descriptor_core_hash
-                       )
-                )
+           AND NOT EXISTS (
+                SELECT 1
+                  FROM withdrawn_signer_artifacts AS withdrawn
+                  JOIN workload_artifacts AS artifact
+                    ON artifact.descriptor_core_hash = withdrawn.descriptor_core_hash
+                 WHERE artifact.app_id = binding.app_id
+                   AND artifact.descriptor_payload -> 'signer_identity' ->> 'subject'
+                       = binding.signer_identity_subject
+                   AND artifact.descriptor_payload -> 'signer_identity' ->> 'issuer'
+                       = binding.signer_identity_issuer
            )
          ORDER BY binding_key",
     )
@@ -476,7 +458,7 @@ pub async fn reconcile_policy(
         return Err(KbsPolicyError::NotConfigured);
     };
 
-    let client = kube::Client::try_default().await?;
+    let client = reconcile_kube_client().await?;
     if signed_policy_mode_active(db).await? {
         tracing::info!(
             namespace = %config.namespace,
@@ -808,14 +790,6 @@ async fn load_signed_policy_candidates(
             JOIN workload_artifacts AS artifact
               ON artifact.app_id = legacy.app_id
              AND artifact.deploy_id = legacy.deployment_id
-            JOIN current_keyring_members AS member
-              -- Case-insensitive membership join: see the comment at the
-              -- job_artifact_candidates join above.
-              ON member.org_id = legacy.org_id
-             AND lower(member.pubkey) = lower(
-                 artifact.signed_policy_artifact
-                     ->'metadata'->>'descriptor_signing_pubkey'
-             )
             WHERE legacy.current_operation_rank = 1
               AND legacy.app_status IN ('creating', 'running')
               AND legacy.deployment_status = 'healthy'
@@ -824,6 +798,17 @@ async fn load_signed_policy_candidates(
                     FROM withdrawn_signer_artifacts AS withdrawn
                    WHERE withdrawn.descriptor_core_hash
                        = artifact.descriptor_core_hash
+              )
+              -- Repeated or case-equivalent member keys must not duplicate an
+              -- artifact and exhaust the serialized policy budget.
+              AND EXISTS (
+                  SELECT 1
+                    FROM current_keyring_members AS member
+                   WHERE member.org_id = legacy.org_id
+                     AND lower(member.pubkey) = lower(
+                         artifact.signed_policy_artifact
+                             ->'metadata'->>'descriptor_signing_pubkey'
+                     )
               )
         ),
         selected AS (
@@ -3046,6 +3031,110 @@ resource_bindings := {
         (user_id, signing_key_id)
     }
 
+    /// A workload artifact pinned to a legacy signer identity with the given
+    /// measurements, mirroring what a signed deployment leaves behind. The
+    /// image_ref and init-data hash derive from the measurement so fixtures
+    /// can give distinct artifacts coincident measurements.
+    async fn insert_signer_identity_artifact(
+        pool: &PgPool,
+        org_id: Uuid,
+        app_id: Uuid,
+        subject: &str,
+        issuer: &str,
+        measurement: &[u8],
+        descriptor_hash: &[u8],
+        signer_hex: &str,
+        created_at: chrono::DateTime<Utc>,
+    ) -> crate::signing_service::SignedPolicyArtifact {
+        let deploy_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO deployments (id, org_id, app_id, status, spec_snapshot, created_at)
+             VALUES ($1, $2, $3, 'healthy'::deploy_status_enum, '{}'::jsonb, $4)",
+        )
+        .bind(deploy_id)
+        .bind(org_id)
+        .bind(app_id)
+        .bind(created_at)
+        .execute(pool)
+        .await
+        .expect("insert signer identity test deployment");
+        let mut artifact = test_signed_policy_artifact("aa", 16);
+        artifact.metadata.app_id = app_id.to_string();
+        artifact.metadata.deploy_id = deploy_id.to_string();
+        artifact.metadata.descriptor_core_hash = hex::encode(descriptor_hash);
+        artifact.metadata.descriptor_signing_pubkey = signer_hex.repeat(32);
+        let measurement_hex = hex::encode(measurement);
+        let descriptor_payload = serde_json::json!({
+            "image_ref": format!("ghcr.io/acme/workload@sha256:{measurement_hex}"),
+            "expected_cc_init_data_hash": measurement_hex,
+            "signer_identity": {"subject": subject, "issuer": issuer},
+        });
+        sqlx::query(
+            "INSERT INTO workload_artifacts (
+                 descriptor_core_hash, app_id, deploy_id, descriptor_payload,
+                 descriptor_signature, descriptor_signing_key_id,
+                 org_keyring_payload, org_keyring_signature, signed_policy_artifact
+             ) VALUES ($1, $2, $3, $4, $5, 'test-key', '{}'::jsonb, $6, $7)",
+        )
+        .bind(descriptor_hash)
+        .bind(app_id)
+        .bind(deploy_id)
+        .bind(&descriptor_payload)
+        .bind(vec![1u8; 64])
+        .bind(vec![2u8; 64])
+        .bind(serde_json::to_value(&artifact).unwrap())
+        .execute(pool)
+        .await
+        .expect("insert signer identity test artifact");
+        artifact
+    }
+
+    /// A legacy kbs_tls_bindings row carrying a signer identity and its
+    /// committed measurements, mirroring what ensure_tls_binding leaves
+    /// behind after a deployment.
+    async fn insert_measured_legacy_tls_binding(
+        pool: &PgPool,
+        app_id: Uuid,
+        subject: &str,
+        issuer: &str,
+        image_ref: &str,
+        init_data_hash: &[u8],
+    ) {
+        let suffix = app_id.simple().to_string();
+        sqlx::query(
+            "INSERT INTO kbs_tls_bindings (
+                 app_id, binding_key, repository, tag, namespace, service_account,
+                 tenant_instance_identity_hash, image_digest, init_data_hash,
+                 signer_identity_subject, signer_identity_issuer
+             ) VALUES ($1, $2, 'default', 'workload-secret-seed', $3, $4, $5, $6, $7, $8, $9)",
+        )
+        .bind(app_id)
+        .bind(format!("tls-{}", &suffix[..12]))
+        .bind(format!("cap-{}", &suffix[..12]))
+        .bind(format!("cap-{}-sa", &suffix[..12]))
+        .bind("22".repeat(32))
+        .bind(image_ref)
+        .bind(init_data_hash)
+        .bind(subject)
+        .bind(issuer)
+        .execute(pool)
+        .await
+        .expect("insert measured legacy tls binding");
+    }
+
+    async fn withdraw_test_artifact(pool: &PgPool, descriptor_hash: &[u8], app_id: Uuid) {
+        sqlx::query(
+            "INSERT INTO withdrawn_signer_artifacts (descriptor_core_hash, app_id)
+             VALUES ($1, $2)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(descriptor_hash)
+        .bind(app_id)
+        .execute(pool)
+        .await
+        .expect("withdraw signer identity test artifact");
+    }
+
     #[tokio::test]
     async fn selector_uses_current_operation_binding_and_legacy_fallback() {
         // Candidate selection reads every org's artifacts, so on the shared
@@ -3836,6 +3925,94 @@ resource_bindings := {
         }));
 
         crate::test_support::drop_isolated_database("cap119_withdrawal_selector", pool).await;
+    }
+
+    /// A legacy binding whose signer's artifacts were withdrawn must
+    /// not be readmitted just because a newer non-withdrawn artifact under
+    /// the same identity shares the binding's image_ref and init-data
+    /// measurements. Equal measurements do not prove the binding belongs to
+    /// that artifact; the fresh deployment authorizes through signed-policy
+    /// candidates instead.
+    #[tokio::test]
+    async fn withdrawn_legacy_binding_is_not_readmitted_by_coincident_measurements() {
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_pr187_legacy_readmission").await;
+        let subject = "https://github.com/acme/workload/.github/workflows/ci.yaml@refs/heads/main";
+        let issuer = "https://token.actions.githubusercontent.com";
+        let measurement: Vec<u8> = (0..32u8).collect();
+        let image_ref = format!("ghcr.io/acme/workload@sha256:{}", hex::encode(&measurement));
+        let (org_id, app_id) = insert_test_app(&pool, "running").await;
+        let now = Utc::now();
+        let withdrawn_hash: Vec<u8> = (0..32u8).collect();
+        let fresh_hash: Vec<u8> = (1..33u8).collect();
+        insert_signer_identity_artifact(
+            &pool,
+            org_id,
+            app_id,
+            subject,
+            issuer,
+            &measurement,
+            &withdrawn_hash,
+            "bb",
+            now,
+        )
+        .await;
+        insert_measured_legacy_tls_binding(&pool, app_id, subject, issuer, &image_ref, &measurement)
+            .await;
+
+        // Baseline: the live artifact admits the binding (no withdrawal).
+        let admitted = load_legacy_tls_bindings(&pool)
+            .await
+            .expect("load admitted legacy tls bindings");
+        assert_eq!(
+            admitted.len(),
+            1,
+            "a never-withdrawn signer must keep its legacy binding admitted"
+        );
+
+        // A -> B -> A: the original artifact is withdrawn durably while the
+        // binding still carries the identity and its original measurements.
+        withdraw_test_artifact(&pool, &withdrawn_hash, app_id).await;
+
+        // A newer accepted artifact under the same identity shares the
+        // binding's exact image_ref and init-data hash but is a different
+        // artifact. The binding must stay denied: coincident measurements
+        // are not binding provenance.
+        let fresh_artifact = insert_signer_identity_artifact(
+            &pool,
+            org_id,
+            app_id,
+            subject,
+            issuer,
+            &measurement,
+            &fresh_hash,
+            "bb",
+            now + chrono::Duration::seconds(1),
+        )
+        .await;
+        let admitted = load_legacy_tls_bindings(&pool)
+            .await
+            .expect("load admitted legacy tls bindings after the rotate-back");
+        assert!(
+            admitted.is_empty(),
+            "a fresh artifact with coincident measurements must not readmit the withdrawn binding, got {admitted:?}"
+        );
+
+        // The fresh signed deployment still authorizes through valid
+        // signed-policy candidates.
+        insert_test_keyring_version(&pool, org_id, 1, &[&"bb".repeat(32)]).await;
+        let candidates = load_signed_policy_candidates(&pool, 1)
+            .await
+            .expect("select candidates for the fresh deployment");
+        assert!(
+            candidates.iter().any(|candidate| {
+                candidate.artifact.metadata.descriptor_core_hash
+                    == fresh_artifact.metadata.descriptor_core_hash
+            }),
+            "the fresh signed artifact must remain selectable"
+        );
+
+        crate::test_support::drop_isolated_database("cap_pr187_legacy_readmission", pool).await;
     }
 
     #[tokio::test]

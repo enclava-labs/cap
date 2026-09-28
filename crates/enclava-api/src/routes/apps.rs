@@ -2035,18 +2035,144 @@ pub async fn issue_signer_rotation_token_route(
     }))
 }
 
+/// The signer identity is already committed when KBS publication fails, so
+/// the failure is committed-but-pending, never a rolled-back success.
+/// Mirrors the keyring pending DTO so operator tooling sees one shape.
+pub(crate) const SIGNER_POLICY_RECONCILIATION_PENDING_CODE: &str =
+    "signer_policy_reconciliation_pending";
+
+fn signer_publication_pending_error() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "error": "signer rotation committed; KBS policy reconciliation pending",
+            "code": SIGNER_POLICY_RECONCILIATION_PENDING_CODE,
+        })),
+    )
+}
+
+/// Confirm the committed signer identity reached the KBS. The identity
+/// mutation is single-use (the email confirmation token is consumed with
+/// it), so every failure here is a committed-but-unpublished outcome:
+/// report the pending DTO instead of a generic 500 so an exact retry can
+/// reconcile publication only.
+///
+/// Configured installs keep the rotation's fence and
+/// [`crate::kbs::reconcile_policy`] (legacy Rego render and signed-mode
+/// convergence alike). Without provider configuration, signed-policy mode
+/// still owes a publication for the rotation's withdrawal and must fail
+/// closed; a genuinely unsigned, unconfigured install has nothing to
+/// publish and stays a success.
+pub(crate) async fn reconcile_signer_publication(
+    state: &AppState,
+    app_id: Uuid,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if state.kbs_policy.is_none() {
+        // The shared confirm helper fails closed exactly when signed-policy
+        // mode is active without configuration, and performs no write on an
+        // unsigned, unconfigured install.
+        if let Err(error) = crate::kbs::confirm_keyring_kbs_publication(state).await {
+            tracing::warn!(
+                app_id = %app_id,
+                %error,
+                error_code = SIGNER_POLICY_RECONCILIATION_PENDING_CODE,
+                "signer rotation committed; KBS policy reconciliation pending"
+            );
+            return Err(signer_publication_pending_error());
+        }
+        return Ok(());
+    }
+    let lease = match crate::mutation_leases::claim_resources(
+        state,
+        "kbs_signer_rotation_policy",
+        Uuid::new_v4(),
+        vec![crate::mutation_leases::ResourceFence::kbs_policy()],
+    )
+    .await
+    {
+        Ok(lease) => lease,
+        Err(error) => {
+            tracing::warn!(
+                app_id = %app_id,
+                error = %error,
+                error_code = "kbs_policy_fence_unavailable",
+                "signer rotation committed but KBS policy reconciliation fence was unavailable"
+            );
+            return Err(signer_publication_pending_error());
+        }
+    };
+    match lease
+        .guard_provider(crate::kbs::reconcile_policy(
+            &state.db,
+            state.kbs_policy.as_ref(),
+        ))
+        .await
+    {
+        Err(error) => {
+            tracing::warn!(
+                app_id = %app_id,
+                error = %error,
+                error_code = "kbs_policy_fence_unavailable",
+                "signer rotation committed but lost the KBS policy fence during reconciliation"
+            );
+            release_finished_lease(lease).await;
+            return Err(signer_publication_pending_error());
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(
+                app_id = %app_id,
+                error = %error,
+                error_code = "kbs_policy_reconciliation_failed",
+                "signer rotation committed but KBS policy reconciliation failed"
+            );
+            release_finished_lease(lease).await;
+            return Err(signer_publication_pending_error());
+        }
+        Ok(Ok(())) => {}
+    }
+    if let Err(error) = lease.finish().await {
+        tracing::warn!(
+            app_id = %app_id,
+            error = %error,
+            error_code = "kbs_policy_lease_finish_failed",
+            "signer rotation reconciled KBS policy but failed to release the fence cleanly"
+        );
+        return Err(signer_publication_pending_error());
+    }
+    Ok(())
+}
+
 /// PATCH /apps/{name}/signer -- rotate the per-app cosign / Fulcio identity.
 /// Owner-only. Requires an email confirmation token tied to the requesting
-/// user's verified email address.
+/// user's verified email address. The identity commits before KBS
+/// publication is confirmed, so a publication failure is reported
+/// explicitly as committed-but-pending, never as a rolled-back success.
 pub async fn rotate_signer(
     auth: AuthContext,
     State(state): State<AppState>,
     Path(app_name): Path<String>,
     Json(body): Json<RotateSignerRequest>,
 ) -> Result<Json<AppResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let app = rotate_signer_commit(auth, &state, &app_name, body).await?;
+    reconcile_signer_publication(&state, app.id).await?;
+    Ok(Json(app))
+}
+
+/// Commit the signer rotation (or initial set) without confirming KBS
+/// publication. Split out of the public route so the internal idempotent
+/// wrapper can persist the committed result as a publication checkpoint:
+/// the email confirmation token is single-use, so a same-key retry of a
+/// committed rotation may only reconcile publication and replay the saved
+/// result, never re-run this mutation.
+pub(crate) async fn rotate_signer_commit(
+    auth: AuthContext,
+    state: &AppState,
+    app_name: &str,
+    body: RotateSignerRequest,
+) -> Result<AppResponse, (StatusCode, Json<serde_json::Value>)> {
     scopes::require_owner(&auth)?;
     scopes::require_scope(&auth, "apps:write")?;
-    ensure_management_write_allowed(&state, &auth).await?;
+    ensure_management_write_allowed(state, &auth).await?;
 
     let subject = body.subject.trim().to_string();
     let issuer = body.issuer.trim().to_string();
@@ -2059,7 +2185,7 @@ pub async fn rotate_signer(
 
     let app_lookup: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
         .bind(auth.org_id)
-        .bind(&app_name)
+        .bind(app_name)
         .fetch_optional(&state.db)
         .await
         .map_err(|_| internal_server_error())?
@@ -2099,7 +2225,7 @@ pub async fn rotate_signer(
     )
     .bind(app_lookup.id)
     .bind(auth.org_id)
-    .bind(&app_name)
+    .bind(app_name)
     .fetch_optional(&mut *tx)
     .await
     .map_err(|_| internal_server_error())?
@@ -2264,69 +2390,7 @@ pub async fn rotate_signer(
         .map_err(|_| internal_server_error())?;
     tx.commit().await.map_err(|_| internal_server_error())?;
 
-    // The committed identity must reach the configured KBS before success.
-    // The periodic reconciler retries failed publication in both policy modes.
-    if state.kbs_policy.is_some() {
-        let lease = match crate::mutation_leases::claim_resources(
-            &state,
-            "kbs_signer_rotation_policy",
-            Uuid::new_v4(),
-            vec![crate::mutation_leases::ResourceFence::kbs_policy()],
-        )
-        .await
-        {
-            Ok(lease) => lease,
-            Err(error) => {
-                tracing::warn!(
-                    app_id = %app.id,
-                    error = %error,
-                    error_code = "kbs_policy_fence_unavailable",
-                    "signer rotation committed but KBS policy reconciliation fence was unavailable"
-                );
-                return Err(internal_server_error());
-            }
-        };
-        match lease
-            .guard_provider(crate::kbs::reconcile_policy(
-                &state.db,
-                state.kbs_policy.as_ref(),
-            ))
-            .await
-        {
-            Err(error) => {
-                tracing::warn!(
-                    app_id = %app.id,
-                    error = %error,
-                    error_code = "kbs_policy_fence_unavailable",
-                    "signer rotation committed but lost the KBS policy fence during reconciliation"
-                );
-                release_finished_lease(lease).await;
-                return Err(internal_server_error());
-            }
-            Ok(Err(error)) => {
-                tracing::warn!(
-                    app_id = %app.id,
-                    error = %error,
-                    error_code = "kbs_policy_reconciliation_failed",
-                    "signer rotation committed but KBS policy reconciliation failed"
-                );
-                release_finished_lease(lease).await;
-                return Err(internal_server_error());
-            }
-            Ok(Ok(())) => {}
-        }
-        if let Err(error) = lease.finish().await {
-            tracing::warn!(
-                app_id = %app.id,
-                error = %error,
-                error_code = "kbs_policy_lease_finish_failed",
-                "signer rotation reconciled KBS policy but failed to release the fence cleanly"
-            );
-            return Err(internal_server_error());
-        }
-    }
-
-    Ok(Json(app.into()))
+    Ok(app.into())
 }
 
 #[cfg(test)]

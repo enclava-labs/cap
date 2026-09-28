@@ -2225,4 +2225,152 @@ pub(crate) mod test_support {
         .expect("drop isolated keyring database");
         admin.close().await;
     }
+
+    /// Stateful Kubernetes API double behind the fenced KBS reconciler: it
+    /// stores the resource-policy ConfigMap and the Trustee deployment the
+    /// way the API server would, so route regressions observe real
+    /// publication (ConfigMap replace plus rollout confirmation) instead of
+    /// a fabricated success.  `healthy = false` makes provider I/O fail.
+    /// The seeded policy body keeps the empty legacy binding maps, so
+    /// legacy Rego reconciliation finds its splice anchors too.
+    pub(crate) struct KbsPolicyProvider {
+        pub(crate) healthy: bool,
+        pub(crate) configmap: serde_json::Value,
+        deployment: serde_json::Value,
+        pub(crate) configmap_replaces: usize,
+    }
+
+    impl KbsPolicyProvider {
+        pub(crate) fn new(healthy: bool) -> Self {
+            Self {
+                healthy,
+                configmap: serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {
+                        "name": "resource-policy",
+                        "namespace": "kbs-test",
+                        "resourceVersion": "1",
+                    },
+                    "data": {
+                        "policy.rego": "package policy\nresource_bindings := {}\nowner_resource_bindings := {}\n",
+                    },
+                }),
+                deployment: serde_json::json!({
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "metadata": {
+                        "name": "trustee",
+                        "namespace": "kbs-test",
+                        "resourceVersion": "1",
+                        "generation": 1,
+                    },
+                    "spec": {
+                        "replicas": 1,
+                        "template": {
+                            "metadata": {},
+                            "spec": {
+                                "containers": [{"name": "trustee", "image": "trustee"}],
+                            },
+                        },
+                    },
+                    "status": {
+                        "observedGeneration": 1_000_000,
+                        "replicas": 1,
+                        "updatedReplicas": 1,
+                        "readyReplicas": 1,
+                        "availableReplicas": 1,
+                    },
+                }),
+                configmap_replaces: 0,
+            }
+        }
+
+        pub(crate) fn published_generation(&self) -> Option<i64> {
+            self.configmap["metadata"]["annotations"]
+                .as_object()?
+                .get("enclava.dev/cap-policy-generation")?
+                .as_str()?
+                .parse()
+                .ok()
+        }
+    }
+
+    pub(crate) fn kbs_policy_kube_client(
+        provider: std::sync::Arc<tokio::sync::Mutex<KbsPolicyProvider>>,
+    ) -> kube::Client {
+        use axum::http::{Request, Response};
+        use http_body_util::BodyExt;
+        use kube::client::Body;
+        use tower::service_fn;
+
+        fn respond(
+            status: u16,
+            value: &serde_json::Value,
+        ) -> Result<Response<Body>, std::io::Error> {
+            Ok(Response::builder()
+                .status(status)
+                .body(Body::from(
+                    serde_json::to_vec(value).expect("serialize kube double response"),
+                ))
+                .expect("build kube double response"))
+        }
+
+        kube::Client::new(
+            service_fn(move |request: Request<Body>| {
+                let provider = provider.clone();
+                async move {
+                    let method = request.method().as_str().to_string();
+                    let path = request.uri().path().to_string();
+                    let body = request
+                        .into_body()
+                        .collect()
+                        .await
+                        .expect("read Kubernetes request body")
+                        .to_bytes();
+                    let mut provider = provider.lock().await;
+                    let mut object: serde_json::Value = if method == "PUT" {
+                        serde_json::from_slice(&body)
+                            .expect("kube double PUT requests carry a JSON body")
+                    } else {
+                        serde_json::json!({})
+                    };
+                    if !provider.healthy
+                        || (method != "GET" && method != "PUT")
+                        || (!path.contains("/configmaps/") && !path.contains("/deployments/"))
+                    {
+                        return respond(
+                            404,
+                            &serde_json::json!({
+                                "apiVersion": "v1", "kind": "Status", "status": "Failure",
+                                "reason": "NotFound", "message": "unavailable", "code": 404,
+                            }),
+                        );
+                    }
+                    if path.contains("/configmaps/") {
+                        if method == "PUT" {
+                            provider.configmap_replaces += 1;
+                            if let Some(metadata) =
+                                object.get_mut("metadata").and_then(|m| m.as_object_mut())
+                            {
+                                metadata.insert(
+                                    "resourceVersion".to_string(),
+                                    serde_json::json!(
+                                        (provider.configmap_replaces + 1).to_string()
+                                    ),
+                                );
+                            }
+                            provider.configmap = object;
+                        }
+                        return respond(200, &provider.configmap);
+                    }
+                    if method == "PUT" {
+                        provider.deployment = object;
+                    }
+                    respond(200, &provider.deployment)
+                }
+            }),
+            "default",
+        )
+    }
 }
