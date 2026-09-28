@@ -1894,7 +1894,7 @@ mod tests {
             "updated_at": updated_at,
         });
         let keyring_signature = replacement_key.sign(&canonical_keyring_bytes(&keyring));
-        let signed_at = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 45).unwrap();
+        let signed_at = Utc::now();
         let reason = "owner key compromised";
         let directive = owner_rotation_directive_bytes(
             org_id,
