@@ -4709,7 +4709,12 @@ pub async fn put_paas_keyring(
         &path,
         &auth,
         &body,
-        IdempotencyRecovery::FailClosed,
+        // RetrySafe, not FailClosed: a committed-pending KBS publication
+        // (503 keyring_publication_pending) defers the receipt, and the SAME
+        // key must re-execute after lease expiry to retry publication. The
+        // route itself is replay-idempotent (identical replays confirm the
+        // stored version without re-inserting), so reclaim is safe.
+        IdempotencyRecovery::RetrySafe,
     )
     .await?
     {
@@ -4793,7 +4798,10 @@ pub async fn rotate_paas_keyring_owner(
         &path,
         &auth,
         &body,
-        IdempotencyRecovery::FailClosed,
+        // RetrySafe for the same committed-pending deferral contract as
+        // put_paas_keyring above; pruned-predecessor replay confirms the
+        // stored rotation without re-driving the signing service.
+        IdempotencyRecovery::RetrySafe,
     )
     .await?
     {
@@ -9033,7 +9041,7 @@ mod tests {
                     management_origin: ManagementOrigin::PaasInternal,
                 },
                 &serde_json::json!({}),
-                IdempotencyRecovery::FailClosed,
+                IdempotencyRecovery::RetrySafe,
             )
             .await
             .unwrap(),
@@ -9072,6 +9080,37 @@ mod tests {
             (true, true, true, false),
             "the receipt must stay incomplete for a same-key publication retry"
         );
+        expire_idempotency_lease(&state.db, &key).await;
+        // Same key, same body: the expired deferred row must be RECLAIMED and
+        // re-executed (RetrySafe), not terminalized as recovery-required --
+        // this is the contract that lets PaaS retry publication alone.
+        let retry = expect_idempotency_execution(
+            begin_actor_idempotent_request(
+                &state,
+                &headers,
+                "PUT",
+                "/internal/paas/orgs/x/keyring",
+                &AuthContext {
+                    user_id,
+                    org_id,
+                    org_name: org_name.clone(),
+                    role: Role::Owner,
+                    api_key: None,
+                    management_origin: ManagementOrigin::PaasInternal,
+                },
+                &serde_json::json!({}),
+                IdempotencyRecovery::RetrySafe,
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(retry.reclaimed(), "the deferred key must be reclaimable");
+        complete_keyring_publication_result(
+            retry,
+            Ok((StatusCode::OK, serde_json::json!({"version": 1}))),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
