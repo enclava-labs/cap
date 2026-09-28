@@ -227,29 +227,6 @@ async fn upload_keyring(
     Ok(())
 }
 
-/// Re-upload the exact fields the server previously accepted. The typed
-/// envelope round-trip can drop unsigned unknown fields or change
-/// pubkey/timestamp encodings, which the PUT existing-version check then
-/// rejects as a conflict even though the keyring is semantically identical.
-async fn replay_accepted_keyring(
-    api: &ApiClient,
-    org_name: &str,
-    accepted: OrgKeyringResponse,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let _ = api
-        .put_org_keyring(
-            org_name,
-            &PutOrgKeyringRequest {
-                version: accepted.version,
-                keyring_payload: accepted.keyring_payload,
-                signature: accepted.signature,
-                signing_pubkey: accepted.signing_pubkey,
-            },
-        )
-        .await?;
-    Ok(())
-}
-
 fn keyring_has_owner(envelope: &OrgKeyringEnvelope, public: &VerifyingKey) -> bool {
     let public = public.to_bytes();
     envelope
@@ -263,6 +240,7 @@ async fn verify_or_initialize_remote_keyring(
     api: &ApiClient,
     me: &CurrentUserResponse,
     seed: &[u8; 32],
+    require_write_confirmation: bool,
 ) -> Result<(Uuid, String, String), Box<dyn std::error::Error>> {
     let user_id = Uuid::parse_str(&me.user_id)?;
     let org_id = Uuid::parse_str(&me.active_org.id)?;
@@ -281,12 +259,16 @@ async fn verify_or_initialize_remote_keyring(
                 )
                 .into());
             }
-            // A committed-but-unpublished keyring (put returned 503
-            // keyring_policy_reconciliation_pending) must not be confirmed
-            // by this retry's GET: replay the same version verbatim so the
-            // server re-drives KBS publication and reports success only
-            // once the generation is live (PR #187 review).
-            upload_keyring(api, &org_name, &envelope, Some(&raw_payload)).await?;
+            // Restoring verified key material must not require keyring
+            // write authority; setup confirms publication before reporting
+            // signing readiness.  A committed-but-unpublished keyring (put
+            // returned 503 keyring_policy_reconciliation_pending) must not
+            // be confirmed by this retry's GET: replay the same version
+            // verbatim so the server re-drives KBS publication and reports
+            // success only once the generation is live (PR #187 review).
+            if require_write_confirmation {
+                upload_keyring(api, &org_name, &envelope, Some(&raw_payload)).await?;
+            }
             store_trusted_owner(&org_id, &envelope.signing_pubkey)?;
             store_keyring_envelope(&org_id, &envelope)?;
             Ok((org_id, org_name, fingerprint(&owner.public)))
@@ -575,7 +557,7 @@ async fn restore(
         &me.active_org.name,
     )?;
     let (_org_id, org_name, owner_fingerprint) =
-        verify_or_initialize_remote_keyring(&api, &me, &seed).await?;
+        verify_or_initialize_remote_keyring(&api, &me, &seed, false).await?;
     ensure_mnemonic_restore_will_not_overwrite(&paths, &org_name, &mnemonics, force)?;
 
     if existing_seed == Some(seed) {
@@ -727,7 +709,7 @@ async fn setup(
         .into());
     }
     let (_, org_name, owner_fingerprint) =
-        verify_or_initialize_remote_keyring(&api, &me, &seed).await?;
+        verify_or_initialize_remote_keyring(&api, &me, &seed, true).await?;
     if existing_seed.is_none() {
         // Install restored/new authority only after the remote keyring accepts it.
         // A stale backup must not poison local state and block a corrected retry.
