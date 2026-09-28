@@ -6,6 +6,12 @@
 -- while at most one API revision is serving; a failed CONCURRENTLY build
 -- leaves an INVALID index that must be dropped before retrying.
 --
+-- IF NOT EXISTS keeps re-runs safe: the index is not part of any earlier
+-- ledger version, so the only ways it can pre-exist are a manually built
+-- copy or a CONCURRENTLY run whose ledger cleanup (below) already ran.
+-- A pre-existing INVALID index is NOT repaired by IF NOT EXISTS — drop it
+-- first per the recovery steps below.
+--
 -- Recovery from failed CONCURRENTLY:
 --   1. Drop the invalid index if it exists:
 --      DROP INDEX IF EXISTS nip98_replay_cache_first_seen_purge;
@@ -13,6 +19,24 @@
 --      the attempt before executing, so a failure leaves it marked failed):
 --      DELETE FROM _sqlx_migrations WHERE version = 57;
 --   3. Retry the migration: cap_migrate will re-execute from a clean slate.
+--
+-- Migration version history note (cap#190 review): this migration pair was
+-- originally numbered 0050/0051, then renumbered to 0056/0057 because
+-- sibling branches in flight (cap#185) landed different migrations as
+-- 0050-0055 and both sets must coexist after merge. sqlx records applied
+-- versions by number, and both run_migrations and verify mode reject a
+-- ledger containing versions the binary does not embed. Any database that
+-- ran the earlier 0050/0051 revision of this branch therefore cannot boot
+-- against this build as-is. No such database exists in this project's
+-- environments (main tops out at 0049, CI databases are ephemeral, and
+-- there is no per-PR preview deployment), but if one is ever found, the
+-- one-time reconciliation is:
+--   DELETE FROM _sqlx_migrations WHERE version IN (50, 51);
+--   ...then run cap_migrate, which applies 0056 (CREATE TABLE IF NOT
+--   EXISTS) and 0057 (CREATE INDEX CONCURRENTLY IF NOT EXISTS) as no-ops
+--   over the objects already present. Verify the resulting index is valid:
+--   SELECT indisvalid FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+--   WHERE c.relname = 'nip98_replay_cache_first_seen_purge';  -- must be t
 --
 -- The NIP-98 replay-cache reaper purges with `WHERE first_seen < now() -
 -- interval`, which cannot use the event_id primary key. Under sustained
@@ -22,5 +46,5 @@
 -- reaper ticks) followed by one large DELETE transaction on each replica.
 --
 -- This first_seen-leading index serves the purge predicate directly.
-CREATE INDEX CONCURRENTLY nip98_replay_cache_first_seen_purge
+CREATE INDEX CONCURRENTLY IF NOT EXISTS nip98_replay_cache_first_seen_purge
     ON nip98_replay_cache (first_seen);
