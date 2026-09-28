@@ -185,36 +185,38 @@ pub fn build_toml_with_options(app: &ConfidentialApp, options: &CcInitDataOption
         "state_root",
         crate::manifest::enclava_init_config::STATE_ROOT,
     );
-    push_toml_string(
+    push_toml_u32_string(
         &mut toml,
         "app_uid",
-        &crate::manifest::enclava_init_config::primary_app_uid(app).to_string(),
+        crate::manifest::enclava_init_config::primary_app_uid(app),
     );
-    push_toml_string(
+    push_toml_u32_string(
         &mut toml,
         "app_gid",
-        &crate::manifest::enclava_init_config::primary_app_gid(app).to_string(),
+        crate::manifest::enclava_init_config::primary_app_gid(app),
     );
-    push_toml_string(
+    push_toml_u32_string(
         &mut toml,
         "caddy_uid",
-        &crate::manifest::enclava_init_config::CADDY_UID.to_string(),
+        crate::manifest::enclava_init_config::CADDY_UID,
     );
-    push_toml_string(
+    push_toml_u32_string(
         &mut toml,
         "caddy_gid",
-        &crate::manifest::enclava_init_config::CADDY_GID.to_string(),
+        crate::manifest::enclava_init_config::CADDY_GID,
     );
     if crate::manifest::enclava_init_config::primary_uses_root_workload_identity(app) {
-        push_toml_string(
+        push_toml_u32_string(
             &mut toml,
             "managed_config_gid",
-            &crate::manifest::enclava_init_config::ROOT_GID.to_string(),
+            crate::manifest::enclava_init_config::ROOT_GID,
         );
-        push_toml_string(
+        // Decimal rendering: the consumer parses base-10, so the 0o700
+        // source constant must serialize as "448", not "700".
+        push_toml_u32_string(
             &mut toml,
             "managed_config_dir_mode",
-            &crate::manifest::enclava_init_config::ROOT_ONLY_MANAGED_CONFIG_DIR_MODE.to_string(),
+            crate::manifest::enclava_init_config::ROOT_ONLY_MANAGED_CONFIG_DIR_MODE,
         );
     }
     push_toml_string(
@@ -467,6 +469,10 @@ fn push_toml_string(toml: &mut String, key: &str, value: &str) {
     toml.push_str(" = ");
     toml.push_str(&toml_string(value));
     toml.push('\n');
+}
+
+fn push_toml_u32_string(toml: &mut String, key: &str, value: u32) {
+    push_toml_string(toml, key, &value.to_string());
 }
 
 fn tls_certificate_hostnames(app: &ConfidentialApp) -> Vec<String> {
