@@ -60,6 +60,17 @@ Rotations whose upstream response was lost before this deployment -- or any
 drift without a matching receipt -- are not waived; the owner must sign and
 present a fresh directive.
 
+Successor-version keyring writes are fenced on the live owner authority:
+after an org has a configured signing service or any recorded rotation
+history, a `PUT` keyring request for a new version requires the service to
+be reachable and to report either no owner (`not_configured`) or exactly the
+current pinned owner. An unreachable, malformed, or owner-mismatched
+authority rejects the write (502/409), and an org with rotation history but
+no service configuration rejects with 503 until the configuration is
+restored. New keyring versions therefore depend on signing-service
+availability once owner rotation is in play; exact same-version replays and
+rotation receipt retries are unaffected.
+
 Cutover notes for `0059`:
 
 - Migrations run at API startup. During rollout, old API pods never mint

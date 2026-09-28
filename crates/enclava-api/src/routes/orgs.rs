@@ -635,42 +635,8 @@ pub async fn put_keyring(
                     "keyring signing owner does not match the current pinned owner",
                 ));
             }
-            // Fence (PR #185 review, Devin "concurrent upload leaves owner
-            // authority drifted"): rotate_org_owner pins the replacement in
-            // the signing service before it writes the successor keyring
-            // version, and the signing-authority lane is released between
-            // those steps. An old-owner upload arriving in that window sees
-            // the previous owner as the pinned owner and could claim the
-            // successor version, after which the rotation's final phase
-            // conflicts and the service and keyring stay pinned to different
-            // owners. While the signing service's owner disagrees with the
-            // current pinned owner, the successor version belongs to the
-            // in-flight (or pending-recovery) rotation: new versions are
-            // refused here. Same-version replays above bypass this fence --
-            // they claim nothing. When the signing service is not configured
-            // or not readable, there is no upstream authority to diverge
-            // from and the check is skipped.
-            if let Some(signing_service) = state.signing_service.as_ref()
-                && let Ok(status) = signing_service.owner_status(org_id).await
-            {
-                let service_owner = status
-                    .owner_pubkey_hex
-                    .as_deref()
-                    .and_then(|raw| hex::decode(raw).ok());
-                let status_matches = status.org_id == org_id && status.state == "ready";
-                if status_matches
-                    && service_owner
-                        .as_deref()
-                        .is_some_and(|owner| owner != latest_signing_pubkey.as_slice())
-                {
-                    return Err((
-                        StatusCode::CONFLICT,
-                        Json(serde_json::json!({
-                            "error": "signing service owner does not match the current pinned owner (owner rotation in progress)"
-                        })),
-                    ));
-                }
-            }
+            fence_successor_keyring_version(&state, &mut tx, org_id, &latest_signing_pubkey)
+                .await?;
             let latest_signing_pubkey: [u8; 32] = latest_signing_pubkey
                 .as_slice()
                 .try_into()
@@ -1101,6 +1067,73 @@ async fn read_live_service_owner(
         ));
     }
     Ok(owner_status)
+}
+
+/// A prior rotation may have changed upstream authority without a CAP commit.
+/// Missing or unreadable authority cannot make its successor version available
+/// to the old pinned owner.
+async fn fence_successor_keyring_version(
+    state: &AppState,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    org_id: Uuid,
+    pinned_owner: &[u8],
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let Some(signing_service) = state.signing_service.as_ref() else {
+        let rotation_history: Option<i32> =
+            sqlx::query_scalar("SELECT 1 FROM org_rotation_intents WHERE org_id = $1 LIMIT 1")
+                .bind(org_id)
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(|_| db_error())?;
+        if rotation_history.is_some() {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "platform signing service is not configured"
+                })),
+            ));
+        }
+        return Ok(());
+    };
+    let owner_status = signing_service
+        .owner_status(org_id)
+        .await
+        .map_err(crate::routes::deployments::signing_error_response)?;
+    let state_consistent = matches!(
+        (
+            owner_status.state.as_str(),
+            owner_status.owner_pubkey_hex.as_ref()
+        ),
+        ("not_configured", None) | ("ready", Some(_))
+    );
+    if owner_status.org_id != org_id || !state_consistent {
+        return Err(crate::routes::deployments::signing_error_response(
+            crate::signing_service::SigningServiceError::AuthorityStatus(
+                "owner status does not match the requested organization".to_string(),
+            ),
+        ));
+    }
+    let service_owner = owner_status
+        .owner_pubkey_hex
+        .as_deref()
+        .map(|raw| decode_hex_len("owner_pubkey_hex", raw, 32))
+        .transpose()
+        .map_err(|_| {
+            crate::routes::deployments::signing_error_response(
+                crate::signing_service::SigningServiceError::AuthorityStatus(
+                    "owner status contains an invalid public key".to_string(),
+                ),
+            )
+        })?;
+    if service_owner.is_some_and(|owner| owner.as_slice() != pinned_owner) {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "signing service owner does not match the current pinned owner (owner rotation in progress)"
+            })),
+        ));
+    }
+    Ok(())
 }
 
 /// Validate a rotate-owner response before it can mint a receipt: it must
@@ -2130,9 +2163,6 @@ mod tests {
         let pool = sqlx::PgPool::connect(&database_url)
             .await
             .expect("connect keyring regression database");
-        // run_migrations serializes concurrent callers process-wide (see
-        // db::pool::run_migrations): parallel tests migrating a fresh
-        // database no longer deadlock on sqlx's migration advisory lock.
         crate::db::pool::run_migrations(&pool)
             .await
             .expect("migrate keyring regression database");
@@ -3739,6 +3769,7 @@ mod tests {
             },
         )
         .await;
+        let unrouted_url = format!("{mock_url}unrouted/");
         let mut state = crate::test_support::lazy_state();
         state.db = isolated_single_connection_pool("cap185_receipt_checkpoint").await;
         state.signing_service = Some(
@@ -3898,13 +3929,88 @@ mod tests {
             "only the receipt checkpoint persists: no v3 keyring, audit, or directive consumption"
         );
 
-        // Exact retry: the receipt proves the upstream rotation already
-        // happened, so CAP completes without calling the remote again.
         sqlx::query("DELETE FROM cap185_receipt_fail_switch WHERE org_id = $1")
             .bind(org_id)
             .execute(&pool)
             .await
             .expect("disarm final-commit failure");
+
+        // The failed rotation already moved the service from B to C, so B
+        // must not claim its successor even when authority becomes unreadable.
+        let stale_put = put_keyring(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(signed_keyring_request(
+                org_id,
+                user_id,
+                &replacement_key,
+                3,
+                3,
+            )),
+        )
+        .await
+        .expect_err("the old pinned owner must not claim the successor version");
+        assert_eq!(stale_put.0, StatusCode::CONFLICT);
+
+        // Missing client: this org has recorded rotation history, so the
+        // absence of configuration cannot stand in for the live authority.
+        let mut no_client_state = state.clone();
+        no_client_state.signing_service = None;
+        let unconfigured = put_keyring(
+            auth.clone(),
+            State(no_client_state),
+            Path(org_name.clone()),
+            Json(signed_keyring_request(
+                org_id,
+                user_id,
+                &replacement_key,
+                3,
+                3,
+            )),
+        )
+        .await
+        .expect_err("rotation history requires restored service configuration");
+        assert_eq!(unconfigured.0, StatusCode::SERVICE_UNAVAILABLE);
+
+        // Unreadable authority: the same mock listener under a prefix it
+        // does not route answers every request with a deterministic 404.
+        let mut unrouted_state = state.clone();
+        unrouted_state.signing_service = Some(
+            crate::signing_service::SigningServiceClient::new(unrouted_url, None)
+                .expect("build unrouted signing service client"),
+        );
+        let unreachable = put_keyring(
+            auth.clone(),
+            State(unrouted_state),
+            Path(org_name.clone()),
+            Json(signed_keyring_request(
+                org_id,
+                user_id,
+                &replacement_key,
+                3,
+                3,
+            )),
+        )
+        .await
+        .expect_err("an unreadable authority must fail closed");
+        assert_eq!(unreachable.0, StatusCode::BAD_GATEWAY);
+        assert_eq!(unreachable.1.0["error"], "signing_service_unavailable");
+
+        let fenced_v3_rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM org_keyrings WHERE org_id = $1 AND version = 3",
+        )
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count v3 keyrings after the fenced puts");
+        assert_eq!(
+            fenced_v3_rows, 0,
+            "every fenced put must reject before inserting a v3 row"
+        );
+
+        // Exact retry: the receipt proves the upstream rotation already
+        // happened, so CAP completes without calling the remote again.
         let replayed = rotate_org_owner(
             auth.clone(),
             State(state.clone()),
