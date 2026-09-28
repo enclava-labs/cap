@@ -353,8 +353,25 @@ fn canonical_keyring_bytes(keyring: &SignedOrgKeyring) -> Vec<u8> {
 fn db_error() -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(serde_json::json!({"error": "database error"})),
+        Json(serde_json::json!({ "error": "database error" })),
     )
+}
+
+// Legacy rows can differ in unsigned fields while carrying identical signed content.
+fn keyring_replay_conflicts(
+    stored_payload: &[u8],
+    stored_signature: &[u8],
+    stored_signing_pubkey: &[u8],
+    canonical_bytes: &[u8],
+    signature: &[u8],
+    signing_pubkey: &[u8],
+) -> bool {
+    let Ok(stored_keyring) = serde_json::from_slice::<SignedOrgKeyring>(stored_payload) else {
+        return true;
+    };
+    canonical_keyring_bytes(&stored_keyring).as_slice() != canonical_bytes
+        || stored_signature != signature
+        || stored_signing_pubkey != signing_pubkey
 }
 
 fn bad_request(message: &str) -> (StatusCode, Json<serde_json::Value>) {
@@ -494,6 +511,16 @@ pub async fn put_keyring(
             Json(serde_json::json!({"error": "serialization error"})),
         )
     })?;
+    // #128 review follow-up (P1): reject keyrings whose CLI envelope would
+    // exceed the deploy-time org_keyring_blob cap, so accepted authority
+    // stays deployable instead of failing every signed deployment at
+    // decode_optional_blobs.
+    crate::signing_service::validate_org_keyring_registration_budget(
+        keyring_payload_bytes.len(),
+        &signature,
+        &signing_pubkey,
+    )
+    .map_err(crate::routes::deployments::signing_error_response)?;
 
     let mut tx = state.db.begin().await.map_err(|_| db_error())?;
     crate::signing_service::lock_org_signing_authority_lane(&mut tx, org_id)
@@ -662,15 +689,15 @@ pub async fn get_keyring(
             Json(serde_json::json!({"error": "org keyring not found"})),
         ));
     };
-    let keyring_payload: serde_json::Value =
-        serde_json::from_slice(&payload_bytes).map_err(|_| db_error())?;
     let keyring: SignedOrgKeyring =
-        serde_json::from_value(keyring_payload.clone()).map_err(|_| db_error())?;
+        serde_json::from_slice(&payload_bytes).map_err(|_| db_error())?;
     let fingerprint = hex::encode(Sha256::digest(canonical_keyring_bytes(&keyring)));
+    // Legacy unsigned extensions must not leak into strict deployment envelopes.
+    let normalized_keyring_payload = serde_json::to_value(&keyring).map_err(|_| db_error())?;
     Ok(Json(OrgKeyringResponse {
         org_id,
         version,
-        keyring_payload,
+        keyring_payload: normalized_keyring_payload,
         signature: hex::encode(signature),
         signing_pubkey: hex::encode(signing_pubkey),
         fingerprint,
@@ -1229,6 +1256,12 @@ pub async fn rotate_org_owner(
     // first recording and existing ledger rows are never rewritten.
     let normalized_payload = serde_json::to_value(&replacement_keyring).map_err(|_| db_error())?;
     let payload_bytes = serde_json::to_vec(&normalized_payload).map_err(|_| db_error())?;
+    crate::signing_service::validate_org_keyring_registration_budget(
+        payload_bytes.len(),
+        &keyring_signature,
+        &replacement_owner,
+    )
+    .map_err(crate::routes::deployments::signing_error_response)?;
     let directive_digest = Sha256::digest(&directive);
     let intent_digest = Sha256::digest(&payload_bytes);
 
@@ -4459,6 +4492,129 @@ mod tests {
         .await
         .expect("count rejected keyring authority rows");
         assert_eq!(authority_rows, (0, 0));
+    }
+
+    #[tokio::test]
+    async fn put_keyring_response_returns_normalized_deployable_keyring() {
+        let pool = database_test_pool().await;
+        let org_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let suffix = org_id.simple().to_string();
+        let org_name = format!("keyring-normalize-{suffix}");
+        crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+            .await
+            .expect("insert keyring normalization org");
+        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Keyring Owner')")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("insert keyring normalization owner");
+        sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+            .bind(user_id)
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("insert keyring normalization membership");
+        let key = SigningKey::generate(&mut OsRng);
+        sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2)")
+            .bind(user_id)
+            .bind(key.verifying_key().to_bytes().to_vec())
+            .execute(&pool)
+            .await
+            .expect("insert keyring normalization signing key");
+
+        let mut request = signed_keyring_request(org_id, user_id, &key, 1, 1);
+        // An otherwise-valid extra field: the typed parse ignores it, but the
+        // 200 response must echo the normalized stored form, not the raw
+        // request JSON, so the response is immediately deployable as an
+        // org_keyring_blob under the strict envelope parser (#128 P2).
+        request.keyring_payload["future_extension"] = serde_json::json!("must-not-echo");
+
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        let auth = AuthContext {
+            user_id,
+            org_id,
+            org_name: org_name.clone(),
+            role: Role::Owner,
+            api_key: None,
+            management_origin: crate::auth::middleware::ManagementOrigin::Public,
+        };
+
+        let (status, put_response) = put_keyring(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(request),
+        )
+        .await
+        .expect("publish keyring carrying an extra field");
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            put_response
+                .keyring_payload
+                .get("future_extension")
+                .is_none(),
+            "PUT response must not echo unknown request fields verbatim"
+        );
+
+        let stored_payload: Vec<u8> = sqlx::query_scalar(
+            "SELECT keyring_payload FROM org_keyrings WHERE org_id = $1 AND version = 1",
+        )
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load stored normalized keyring payload");
+        let stored: serde_json::Value =
+            serde_json::from_slice(&stored_payload).expect("decode stored keyring payload");
+        assert_eq!(
+            put_response.keyring_payload, stored,
+            "PUT response payload must match the stored normalized bytes"
+        );
+
+        let get_response = get_keyring(auth.clone(), State(state.clone()), Path(org_name.clone()))
+            .await
+            .expect("GET keyring after PUT");
+        assert_eq!(
+            put_response.keyring_payload, get_response.keyring_payload,
+            "PUT and GET responses must serve the identical normalized keyring"
+        );
+
+        let mut legacy = signed_keyring_request(org_id, user_id, &key, 2, 2);
+        // Seed the verbatim payload written before normalization.
+        legacy.keyring_payload["future_extension"] = serde_json::json!("legacy-extra");
+        sqlx::query(
+            "INSERT INTO org_keyrings
+                 (org_id, version, keyring_payload, signature, signing_key_id)
+             VALUES ($1, 2, $2, $3,
+                     (SELECT id FROM user_signing_keys WHERE user_id = $4 AND pubkey = $5))",
+        )
+        .bind(org_id)
+        .bind(serde_json::to_vec(&legacy.keyring_payload).expect("encode legacy payload"))
+        .bind(hex::decode(&legacy.signature).expect("decode legacy signature"))
+        .bind(user_id)
+        .bind(key.verifying_key().to_bytes().to_vec())
+        .execute(&pool)
+        .await
+        .expect("persist a keyring with the pre-normalization writer");
+        let (status, _) = put_keyring(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(legacy),
+        )
+        .await
+        .expect("normalization must preserve replay of an existing keyring");
+        assert_eq!(status, StatusCode::OK);
+
+        let legacy_get = get_keyring(auth, State(state), Path(org_name))
+            .await
+            .expect("GET keyring after legacy replay");
+        assert_eq!(legacy_get.version, 2);
+        assert!(
+            legacy_get.keyring_payload.get("future_extension").is_none(),
+            "GET must normalize legacy rows so org_keyring_blob wrapping stays deployable"
+        );
     }
 
     #[tokio::test]

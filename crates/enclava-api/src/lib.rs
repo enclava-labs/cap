@@ -23,7 +23,7 @@ mod workload_tls_timing;
 
 use axum::{
     Json, Router,
-    extract::{Request, State},
+    extract::{DefaultBodyLimit, Request, State},
     http::{HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -160,7 +160,13 @@ where
         router = router.merge(with_tracing(internal_routes, &trace_layer));
     }
 
-    router.layer(build_cors_layer()).with_state(state)
+    router
+        // Explicit global request-body bound (#128): signing blobs get
+        // additional per-field caps in signing_service, but keep the router
+        // limit pinned so a future extractor change cannot silently lift it.
+        .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
+        .layer(build_cors_layer())
+        .with_state(state)
 }
 
 /// Wrap a route group in request tracing. Applied OUTERMOST in every group
