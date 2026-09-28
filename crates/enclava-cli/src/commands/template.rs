@@ -940,6 +940,7 @@ fn release_outcome_is_unknown(error: &ApiError) -> bool {
     match error {
         ApiError::Http(error) => error.is_timeout() || error.is_connect() || error.is_request(),
         ApiError::Api { status, .. } => *status >= 500,
+        ApiError::Decode(_) | ApiError::ResponseTooLarge(_) => true,
         ApiError::NotAuthenticated => false,
     }
 }
