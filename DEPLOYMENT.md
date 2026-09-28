@@ -38,6 +38,37 @@ CAP API is a stateless HTTP service backed by PostgreSQL. At startup it:
 The API can start without every optional integration, but real confidential
 workload deploys require the platform services below.
 
+## Owner Rotation Recovery
+
+Owner-rotation state spans five append-only migrations:
+
+| Migration | Purpose |
+| --- | --- |
+| `0050_org_rotation_directives.sql` | Consume-once ledger of accepted rotation-directive digests. |
+| `0051_org_keyrings_created_at_clock.sql` | `org_keyrings.created_at` defaults to `clock_timestamp()` so freshness bounds measure real insertion time, not transaction start. |
+| `0053_org_rotation_intents.sql` | Presentation record for each authenticated, signature-verified directive; proof of presentation only, never of upstream success. |
+| `0054_org_keyrings_created_at_watermark.sql` | Floors directive version-recency checks for pre-0051 rows with legacy `created_at` semantics. |
+| `0059_org_rotation_upstream_receipts.sql` | Receipts binding a validated signing-service `rotate-owner` response (owner version, `rotated_at`) to the exact directive and normalized keyring digests. |
+
+Recovery semantics: a rotation directive is first-use bounded by its
+`signed_at` max-age. An expired retry of a new-version rotation is accepted
+only when a committed upstream receipt proves that this exact request's
+`rotate-owner` RPC succeeded and the signing service's current owner
+(replacement pubkey, version, `last_changed_at`) still matches the receipt.
+Rotations whose upstream response was lost before this deployment -- or any
+drift without a matching receipt -- are not waived; the owner must sign and
+present a fresh directive.
+
+Cutover notes for `0059`:
+
+- Migrations run at API startup. During rollout, old API pods never mint
+  receipts; drain old pods cleanly (let in-flight requests finish before
+  terminating them) rather than leaving a mixed fleet serving rotations.
+- Never backfill `org_rotation_upstream_receipts`: presentation alone is
+  not proof of upstream success.
+- Keep historical intent/directive/keyring rows and applied migration files
+  unchanged; do not repair recovery by rewriting ledgers or checksums.
+
 ## Required Services
 
 Production deploys need:
