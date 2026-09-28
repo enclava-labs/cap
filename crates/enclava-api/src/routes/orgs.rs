@@ -6296,6 +6296,43 @@ mod tests {
             "the fenced upload must not mutate keyring or audit authority"
         );
 
+        // Fail closed (self-check P1): an unreadable owner status is not
+        // evidence of agreement. With a signing service configured but
+        // unreachable, the successor insert must be refused with 503 and
+        // still write nothing -- this is the exact inter-phase window where
+        // the race re-opened in the fail-open variant of this fence.
+        state.signing_service = Some(
+            crate::signing_service::SigningServiceClient::new(
+                "http://127.0.0.1:1".to_string(),
+                None,
+            )
+            .expect("build unreachable mock signing service client"),
+        );
+        let closed = put_keyring(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(signed_keyring_request(org_id, user_id, &current_key, 2, 2)),
+        )
+        .await
+        .expect_err("an unreadable owner status must not clear the successor insert");
+        assert_eq!(closed.0, StatusCode::SERVICE_UNAVAILABLE);
+        let counts_after_closed: (i64, i64) = sqlx::query_as(
+            "SELECT
+                 (SELECT count(*) FROM org_keyrings WHERE org_id = $1),
+                 (SELECT count(*) FROM audit_log
+                   WHERE org_id = $1 AND action = 'org.keyring.put')",
+        )
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count rows after fail-closed upload");
+        assert_eq!(
+            counts_after_closed,
+            (1, 1),
+            "the fail-closed upload must not mutate keyring or audit authority"
+        );
+
         // Positive control: once the service owner and the pinned owner
         // agree again, the identical successor request is accepted.
         state.signing_service = Some(
