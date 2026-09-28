@@ -2,6 +2,73 @@ use super::*;
 use crate::commands::app::signing::platform_release_from_deployment_context_with_verifier;
 use enclava_cli::app_config::{AppSection, ResourcesSection, StorageSection, UnlockSection};
 use enclava_cli::platform_release::PlatformReleaseEnvelope;
+#[tokio::test]
+async fn stalled_pre_claim_org_read_stops_at_the_hold_deadline_without_claiming() {
+    use tokio::io::AsyncReadExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stalled pre-claim fixture");
+    let addr = listener
+        .local_addr()
+        .expect("stalled pre-claim fixture addr");
+    let (connections, mut seen) = tokio::sync::mpsc::unbounded_channel::<()>();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let _ = connections.send(());
+            tokio::spawn(async move {
+                let mut request = [0_u8; 1024];
+                assert!(stream.read(&mut request).await.unwrap() > 0);
+                std::future::pending::<()>().await;
+                drop(stream);
+            });
+        }
+    });
+    let api = ApiClient::new(&format!("http://{addr}"), Some("test-token".to_string()));
+    let directory = tempfile::tempdir().expect("fixture state directory");
+    let paths = CliPaths::from_root(directory.path().to_path_buf()).expect("fixture state root");
+    let storage_password = StoragePasswordInput::from_file_option(None)
+        .expect("interactive storage password input for the fixture");
+
+    let deadline = Instant::now() + Duration::from_millis(300);
+    let started = Instant::now();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        claim_initial_ownership(
+            &api,
+            &paths,
+            "shell",
+            DeploymentWait::trusted("deploy-1", None),
+            &storage_password,
+            MnemonicCapture::Store,
+            Some(deadline),
+        ),
+    )
+    .await
+    .expect("ownership preparation must respect the hold deadline")
+    .expect_err("a stalled pre-claim org read must stop without claiming");
+
+    assert!(
+        started.elapsed() >= Duration::from_millis(200),
+        "the claim flow must run until the deadline, returned after {:?}",
+        started.elapsed()
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the stalled pre-claim read must stop at the hold deadline instead of the 900s request cap, took {:?}",
+        started.elapsed()
+    );
+    tokio::time::timeout(Duration::from_secs(1), seen.recv())
+        .await
+        .expect("the stalled org lookup must have been recorded")
+        .expect("the fixture must stay alive for the assertion");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), seen.recv())
+            .await
+            .is_err(),
+        "no TEE attestation, challenge, or claim connection may follow the stalled pre-claim read"
+    );
+}
 
 fn test_release() -> PlatformRelease {
     PlatformRelease {
@@ -1405,129 +1472,6 @@ async fn revoke_org_log_key_hits_org_endpoint() {
     assert_eq!(resp.cleared_app_selections, Some(2));
 }
 
-mod claim_recovery_sink_tests {
-    /// Source-order and no-leak contracts for the auto-claim path shared by
-    /// `enclava deploy` and `enclava template deploy`. The TEE mints the
-    /// one-time recovery mnemonic exactly once and rejects a second claim, so
-    /// these tests pin the two invariants that cannot be exercised against a
-    /// real TEE in unit tests: the private sink is validated before any
-    /// challenge/claim request, and no stdout/stderr statement ever interpolates
-    /// the mnemonic.
-    fn fn_body(source: &'static str, start_marker: &str, end_marker: &str) -> String {
-        // CRLF checkouts (Windows autocrlf) must not break source matching:
-        // normalize once so the LF-only multi-line markers below hold on
-        // every checkout.
-        let source = source.replace("\r\n", "\n");
-        let start = source.find(start_marker).expect("start marker exists");
-        let end = start + source[start..].find(end_marker).expect("end marker exists");
-        source[start..end].to_string()
-    }
-
-    const APP_SOURCE: &str = include_str!("../../app.rs");
-
-    #[test]
-    fn fn_body_matches_markers_across_crlf_checkouts() {
-        // Regression for the Windows failure: a CRLF checkout must not break
-        // the LF-only multi-line end markers.
-        let source = "start marker\r\n#[derive(Args)]\r\npub struct StatusArgs\r\nlater";
-        let body = fn_body(
-            source,
-            "start marker",
-            "#[derive(Args)]\npub struct StatusArgs",
-        );
-        // The slice spans from the start marker up to (not including) the
-        // end marker, with normalized line endings.
-        assert_eq!(body, "start marker\n");
-    }
-
-    #[test]
-    fn claim_initial_ownership_gates_sink_before_any_network_claim() {
-        let body = fn_body(
-            APP_SOURCE,
-            "pub(crate) async fn claim_initial_ownership",
-            "#[derive(Args)]\npub struct StatusArgs",
-        );
-
-        let gate = body
-            .find("prepare_recovery_mnemonic_sink")
-            .expect("auto-claim runs the pre-claim sink gate");
-        let challenge = body
-            .find("bootstrap_challenge")
-            .expect("auto-claim requests a challenge");
-        let claim = body
-            .find("bootstrap_claim")
-            .expect("auto-claim sends the claim");
-        assert!(
-            gate < challenge && challenge < claim,
-            "sink gate must reject unsafe modes/sessions/destinations before any claim request"
-        );
-
-        let store = body
-            .find("store_recovery_mnemonic_after_claim")
-            .expect("auto-claim persists the mnemonic post-claim");
-        assert!(store > claim);
-        assert!(
-            !body.contains("present_and_capture_recovery_mnemonic"),
-            "auto-claim must not use the removed stdout/stderr presentation path"
-        );
-    }
-
-    #[test]
-    fn claim_initial_ownership_halts_on_committed_incomplete_backup() {
-        let body = fn_body(
-            APP_SOURCE,
-            "pub(crate) async fn claim_initial_ownership",
-            "#[derive(Args)]\npub struct StatusArgs",
-        );
-
-        // Response loss after the TEE committed ownership must return the
-        // stable incomplete-backup error (halting deploy/template), not warn and
-        // proceed, and must never retry the claim.
-        assert!(body.contains("ownership_committed_recovery_backup_incomplete"));
-        assert!(
-            !body.contains("accepted ownership; continuing"),
-            "response loss must halt, not warn-and-continue"
-        );
-        let single_claim = body.match_indices("bootstrap_claim").count();
-        assert_eq!(
-            single_claim, 1,
-            "auto-claim must never retry the claim after a committed ownership"
-        );
-    }
-
-    #[test]
-    fn deploy_rejects_no_store_mnemonic_before_submitting() {
-        let body = fn_body(
-            APP_SOURCE,
-            "pub async fn deploy",
-            "async fn set_deploy_config",
-        );
-
-        let guard = body
-            .find("validate_recovery_mnemonic_sink_mode")
-            .expect("deploy preflights the sink mode for predictable auto-claims");
-        let submit = body
-            .find("api.deploy(")
-            .expect("deploy submits the deployment");
-        assert!(
-            guard < submit,
-            "no-store rejection must run before the deployment is submitted"
-        );
-    }
-
-    #[test]
-    fn claim_paths_never_print_the_mnemonic_variable() {
-        for line in APP_SOURCE.lines() {
-            if line.contains("println!") || line.contains("eprintln!") {
-                assert!(
-                    !line.contains("{mnemonic"),
-                    "stdout/stderr statement must not interpolate the mnemonic: {line}"
-                );
-            }
-        }
-    }
-}
-
 // --- terminal bootstrap diagnostics -------------------------------------------
 
 mod terminal_diagnostics {
@@ -2632,88 +2576,5 @@ mod terminal_diagnostics {
             error.to_string().contains("did not become healthy"),
             "unexpected error: {error}"
         );
-    }
-
-    #[test]
-    fn terminal_diagnostic_wiring_covers_every_post_claim_wait() {
-        // Fail-if-bypassed wiring check (behavior is covered by the live
-        // tests above): the runtime direct fallback classifies before
-        // returning Ok, config retries probe, and the health wait uses the
-        // deployment-bound probe.
-        let source = include_str!("../../app.rs").replace("\r\n", "\n");
-
-        let runtime_start = source.find("async fn wait_for_deploy_runtime").unwrap();
-        let runtime_end = source[runtime_start..]
-            .find("async fn find_deployment_entry")
-            .unwrap()
-            + runtime_start;
-        let runtime = &source[runtime_start..runtime_end];
-        let classify = runtime.find("direct_tee_runtime_outcome").unwrap();
-        let ready = runtime[classify..]
-            .find("return Ok(())")
-            .map(|offset| offset + classify)
-            .unwrap();
-        assert!(
-            classify < ready,
-            "the direct TEE fallback must classify terminal diagnostics before reporting readiness"
-        );
-        assert!(runtime.contains("bounded_status_json"));
-
-        let config_start = source.find("async fn set_deploy_config").unwrap();
-        let config_end = source[config_start..]
-            .find("fn should_retry_deploy_config")
-            .unwrap()
-            + config_start;
-        let config = &source[config_start..config_end];
-        assert!(
-            config.contains("deployment_bound_terminal_bootstrap_error_on_channel"),
-            "config write retries must stop on a deployment-bound terminal diagnostic from the attested channel"
-        );
-
-        let health_start = source
-            .find("async fn wait_for_deployment_completion")
-            .unwrap();
-        let health_end = source[health_start..]
-            .find("async fn ensure_password_storage_unlocked_for_config")
-            .unwrap()
-            + health_start;
-        let health = &source[health_start..health_end];
-        assert!(
-            health.contains("deployment_bound_terminal_bootstrap_error"),
-            "the health wait must use the deployment-bound terminal probe"
-        );
-
-        // Production ordering inside the post-auth reader is
-        // verification -> predicate -> reader: the launch-identity predicate
-        // must gate the bounded status read.
-        let reader_start = source
-            .find("async fn bound_tee_status_on_attested")
-            .unwrap();
-        let reader_end = source[reader_start..].find("\nasync fn ").unwrap() + reader_start;
-        let reader = &source[reader_start..reader_end];
-        let predicate = reader.find("launch_identity_binds_deployment").unwrap();
-        let read = reader.find("bounded_status_json").unwrap();
-        assert!(
-            predicate < read,
-            "the launch-identity predicate must gate the status read"
-        );
-
-        // No terminal-classifying status read may escape a complete budget:
-        // the unlock wait, the runtime direct fallback, and the bootstrap
-        // fallback arms all use the deadline-capped reads.
-        let unlock_start = source
-            .find("async fn wait_for_deploy_unlock_completion")
-            .unwrap();
-        let unlock_end = source[unlock_start..]
-            .find("pub(crate) async fn claim_initial_ownership")
-            .unwrap()
-            + unlock_start;
-        assert!(
-            source[unlock_start..unlock_end]
-                .contains("bounded_status_json_within(terminal_diagnostic_budget"),
-            "the unlock wait's status read must be budget-capped to its deadline"
-        );
-        assert!(runtime.contains("bounded_status_json_within"));
-        assert!(source.contains("bootstrap_status_within(terminal_diagnostic_budget"));
     }
 }

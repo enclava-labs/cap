@@ -518,11 +518,11 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
             claim_initial_ownership(
                 &api,
                 &paths,
-                &cli_config,
                 &app_name,
                 DeploymentWait::trusted(&resp.deployment_id, Some(&trusted_deployment)),
                 &storage_password,
                 capture,
+                None,
             )
             .await?;
             pb.set_message("Ownership claimed");
@@ -1565,16 +1565,41 @@ async fn wait_for_deploy_unlock_completion(
     }
 }
 
+pub(crate) async fn bounded_request<T>(
+    deadline: Option<Instant>,
+    request: impl Future<Output = T>,
+) -> Option<T> {
+    match deadline {
+        None => Some(request.await),
+        // A zero-duration timeout can still poll a ready request.
+        Some(deadline) if deadline <= Instant::now() => None,
+        Some(deadline) => {
+            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), request)
+                .await
+                .ok()
+        }
+    }
+}
+
 pub(crate) async fn claim_initial_ownership(
     api: &ApiClient,
     paths: &CliPaths,
-    _cli_config: &config::CliConfig,
     app_name: &str,
     deployment: DeploymentWait<'_>,
     storage_password: &StoragePasswordInput,
     capture: MnemonicCapture,
+    deadline: Option<Instant>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let active = resolve_current_user_org(api).await?;
+    let active = match bounded_request(deadline, resolve_current_user_org(api)).await {
+        Some(active) => active?,
+        None => {
+            return Err(
+                "customer-config roll hold deadline reached with the org lookup still in \
+                 flight; no ownership was claimed and the running workload was left unchanged"
+                    .into(),
+            );
+        }
+    };
 
     // Sink gate, before anything touches the TEE: the TEE returns the one-time
     // recovery mnemonic exactly once and rejects a second claim, so an unsafe
@@ -1589,12 +1614,40 @@ pub(crate) async fn claim_initial_ownership(
         storage_password.is_from_file(),
     )?;
 
-    let endpoint = api.get_unlock_endpoint(app_name).await?;
+    let endpoint = match bounded_request(deadline, api.get_unlock_endpoint(app_name)).await {
+        Some(endpoint) => endpoint?,
+        None => {
+            return Err(
+                "customer-config roll hold deadline reached with the ownership endpoint read \
+                 still in flight; no ownership was claimed and the running workload was left \
+                 unchanged"
+                    .into(),
+            );
+        }
+    };
     let tee =
         TeeClient::new_for_ownership_with_resolve_ip(&endpoint.tee_url, endpoint.tee_resolve_ip);
-    let (_attestation, tee) = tee.attest_receipt_key().await?;
+    let (_attestation, tee) = match bounded_request(deadline, tee.attest_receipt_key()).await {
+        Some(attestation) => attestation?,
+        None => {
+            return Err(
+                "customer-config roll hold deadline reached with the TEE attestation still in \
+                 flight; no ownership was claimed and the running workload was left unchanged"
+                    .into(),
+            );
+        }
+    };
 
-    let challenge = tee.bootstrap_challenge().await?;
+    let challenge = match bounded_request(deadline, tee.bootstrap_challenge()).await {
+        Some(challenge) => challenge?,
+        None => {
+            return Err(
+                "customer-config roll hold deadline reached with the bootstrap challenge still \
+                 in flight; no ownership was claimed and the running workload was left unchanged"
+                    .into(),
+            );
+        }
+    };
 
     let private_key_bytes =
         load_or_derive_bootstrap_private_key(paths, &active.org_name, active.org_id, app_name)?
@@ -1609,6 +1662,16 @@ pub(crate) async fn claim_initial_ownership(
 
     let password = storage_password.initial_claim_password()?;
 
+    // Never cancel an in-flight claim: its one-time mnemonic must be received
+    // and persisted even if the hold expires. Check expiry again after saving.
+    if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+        return Err(
+            "customer-config roll hold expired before the ownership claim was sent; no \
+             ownership was claimed and the running workload was left unchanged"
+                .into(),
+        );
+    }
+
     let result = match tee
         .bootstrap_claim(&challenge.nonce, &bootstrap_pubkey, &signature, &password)
         .await
@@ -1621,7 +1684,7 @@ pub(crate) async fn claim_initial_ownership(
             // recognized terminal diagnostic replaces the raw transport
             // error. Never retry the claim and never regenerate identity.
             match tee
-                .bootstrap_status_within(terminal_diagnostic_budget(None))
+                .bootstrap_status_within(terminal_diagnostic_budget(deadline))
                 .await
             {
                 Ok(status) if status.claimed => {
@@ -1641,7 +1704,9 @@ pub(crate) async fn claim_initial_ownership(
                                 app_name,
                                 deployment,
                                 &tee,
-                                Instant::now() + TERMINAL_DIAGNOSTIC_PROBE_BUDGET,
+                                deadline.unwrap_or_else(|| {
+                                    Instant::now() + TERMINAL_DIAGNOSTIC_PROBE_BUDGET
+                                }),
                             )
                             .await
                     {
@@ -1673,6 +1738,14 @@ pub(crate) async fn claim_initial_ownership(
         app_name,
         &mnemonic,
     )?;
+
+    if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+        return Err(
+            "customer-config roll hold expired after the ownership claim committed and the \
+             recovery mnemonic was stored; the customer-config roll was not released"
+                .into(),
+        );
+    }
     Ok(())
 }
 
