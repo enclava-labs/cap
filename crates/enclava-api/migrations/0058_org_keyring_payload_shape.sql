@@ -27,22 +27,31 @@
 --
 -- Blast radius rule (follow-up review finding): keyrings retain every
 -- version and the selector treats the highest surviving version as the
--- current authority, so deleting ONLY the malformed row could promote an
+-- current authority, so deleting ONLY a malformed row could promote an
 -- older generation and re-authorize signers that the malformed (but
 -- otherwise valid, owner-signed) version had revoked -- e.g. v2 removing
 -- Alice while carrying a bad `memo`, whose deletion would make v1
--- (Alice+Bob) current again.  Instead, an org with ANY malformed version
--- loses ALL of its keyring rows: that is the fail-closed outcome the
--- selector already guarantees for a missing keyring (INNER JOIN drop), it
--- can never resurrect a revoked signer, and the org recovers by uploading a
--- fresh owner-signed keyring (the version-1 initial-upload path).  A RAISE
--- NOTICE records the affected orgs and versions for operators, since the
--- row loss is silent otherwise.
+-- (Alice+Bob) current again.  Two cases, then:
+--
+--   * LATEST version malformed: the org's current authority is
+--     untrustworthy and no older version may be promoted over it, so the
+--     org loses ALL keyring rows.  That is the fail-closed outcome the
+--     selector already guarantees for a missing keyring (INNER JOIN drop),
+--     it can never resurrect a revoked signer, and the org recovers by
+--     uploading a fresh owner-signed keyring (the version-1 initial-upload
+--     path).
+--   * Malformed row strictly BELOW a clean current version: deleting just
+--     the malformed rows cannot change authority (the clean max version
+--     stays current, nothing is promoted), so the live keyring and the
+--     audit-retained valid versions are preserved and only the bad rows go.
+--
+-- A RAISE NOTICE records both cases per org for operators, since the row
+-- loss is silent otherwise.
 --
 -- The helper swallows parse errors via an EXCEPTION block because the bare
 -- cast would raise, not return false, and SQL does not guarantee OR
--- short-circuit ordering.  Rows that are valid jsonb but the wrong shape are
--- removed by the same predicate.
+-- short-circuit ordering.  Rows that are valid jsonb but the wrong shape
+-- are removed by the same predicate.
 CREATE FUNCTION org_keyrings_payload_matches_shape(payload bytea)
 RETURNS boolean
 LANGUAGE plpgsql
@@ -58,31 +67,51 @@ EXCEPTION
 END;
 $$;
 
+-- Orgs whose CURRENT (highest) version is malformed: nothing may be
+-- promoted over a corrupt authority, so these lose every row.  Plain TEMP
+-- table with an explicit drop below -- ON COMMIT DROP would vanish
+-- immediately under statement-autocommit runners (psql -f), before the
+-- DO/DELETE blocks that read it.
+CREATE TEMP TABLE org_keyrings_shape_quarantined AS
+SELECT org_id,
+       max(version) AS latest_version
+  FROM org_keyrings
+ GROUP BY org_id
+HAVING NOT org_keyrings_payload_matches_shape(
+    (SELECT keyring_payload FROM org_keyrings k2
+      WHERE k2.org_id = org_keyrings.org_id
+        AND k2.version = max(org_keyrings.version))
+);
+
 DO $$
 DECLARE
     affected record;
 BEGIN
     FOR affected IN
         SELECT org_id,
-               string_agg('v' || version, ', ' ORDER BY version) AS versions
+               string_agg('v' || version, ', ' ORDER BY version) AS versions,
+               bool_or(org_id IN (SELECT org_id FROM org_keyrings_shape_quarantined)) AS quarantined
           FROM org_keyrings
-         WHERE org_id IN (
-               SELECT org_id FROM org_keyrings
-                WHERE NOT org_keyrings_payload_matches_shape(keyring_payload)
-         )
+         WHERE NOT org_keyrings_payload_matches_shape(keyring_payload)
+            OR org_id IN (SELECT org_id FROM org_keyrings_shape_quarantined)
          GROUP BY org_id
     LOOP
-        RAISE NOTICE 'migration 0058: dropping ALL keyring rows for org % (versions %, at least one jsonb-unrepresentable/malformed); the org must upload a fresh owner-signed keyring',
-            affected.org_id, affected.versions;
+        IF affected.quarantined THEN
+            RAISE NOTICE 'migration 0058: malformed CURRENT keyring for org % (versions % present); dropping ALL of this org''s keyring rows -- no older generation may be promoted; the org must upload a fresh owner-signed keyring',
+                affected.org_id, affected.versions;
+        ELSE
+            RAISE NOTICE 'migration 0058: dropping malformed historical keyring rows for org % (versions %); the clean current version is untouched',
+                affected.org_id, affected.versions;
+        END IF;
     END LOOP;
 END;
 $$;
 
 DELETE FROM org_keyrings
- WHERE org_id IN (
-       SELECT org_id FROM org_keyrings
-        WHERE NOT org_keyrings_payload_matches_shape(keyring_payload)
- );
+ WHERE org_id IN (SELECT org_id FROM org_keyrings_shape_quarantined)
+    OR NOT org_keyrings_payload_matches_shape(keyring_payload);
+
+DROP TABLE org_keyrings_shape_quarantined;
 
 DROP FUNCTION org_keyrings_payload_matches_shape(bytea);
 
