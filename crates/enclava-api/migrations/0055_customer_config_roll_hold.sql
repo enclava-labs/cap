@@ -58,3 +58,19 @@ CREATE INDEX idx_deployment_apply_jobs_customer_config_hold
     WHERE customer_config_hold
       AND customer_config_released_at IS NULL
       AND state = 'setup_pending';
+
+-- Older workers only gate claims on next_attempt_at. Park unreleased holds
+-- at infinity; release sets a finite retry time and released_at atomically.
+-- A draining/Recreate rollout is still required for the policy-selector cutover.
+
+ALTER TABLE deployment_apply_jobs
+    ADD CONSTRAINT deployment_apply_jobs_unreleased_hold_wake_check
+    CHECK (
+        NOT customer_config_hold
+        OR customer_config_released_at IS NOT NULL
+        OR state IN ('failed', 'completed')
+        OR (
+            state = 'setup_pending'
+            AND next_attempt_at = 'infinity'::timestamptz
+        )
+    );

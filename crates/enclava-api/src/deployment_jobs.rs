@@ -443,6 +443,8 @@ pub async fn insert_setup_job(
         .transpose()
         .map_err(|_| DeploymentJobError::InvalidPayload)?;
     let customer_config_hold = customer_config_hold_seconds.is_some();
+    // Older workers only gate on next_attempt_at. Keep it infinite until release;
+    // it must stay SQL-only because chrono cannot decode PostgreSQL infinity.
     let customer_config_hold_seconds = customer_config_hold_seconds.unwrap_or(0);
     sqlx::query(
         "INSERT INTO deployment_apply_jobs (
@@ -455,7 +457,11 @@ pub async fn insert_setup_job(
          )
          VALUES (
              $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-             'setup_pending', clock_timestamp() + $13::interval,
+             'setup_pending',
+             CASE
+                 WHEN $14 THEN 'infinity'::timestamptz
+                 ELSE clock_timestamp() + $13::interval
+             END,
              $14,
              CASE
                  WHEN $14 THEN clock_timestamp() + make_interval(secs => $15)
@@ -581,6 +587,14 @@ pub async fn release_customer_config_hold(
     .execute(&mut *tx)
     .await?;
     if updated.rows_affected() != 1 {
+        if fail_unreleased_customer_config_hold_in_tx(&mut tx, deployment_id, app_id, org_id)
+            .await?
+        {
+            tx.commit().await?;
+            return Ok(CustomerConfigHoldRelease::Unavailable(
+                "customer config roll hold expired before release; the running workload was left unchanged",
+            ));
+        }
         return Err(DeploymentJobError::LeaseLost);
     }
     // Publish the released deployment only when signed-policy mode is already
@@ -641,6 +655,7 @@ async fn fail_unreleased_customer_config_hold_in_tx(
             AND state = 'setup_pending'
             AND lock_token IS NULL
             AND customer_config_hold
+            AND customer_config_hold_until <= clock_timestamp()
             AND customer_config_released_at IS NULL",
     )
     .bind(deployment_id)
@@ -2838,7 +2853,7 @@ async fn publish_rollout_outcome_with_mutation(
         return Err(DeploymentJobError::LeaseLost);
     }
     let failed = outcome.deploy_status == "failed";
-    if failed {
+    if failed || outcome.deploy_status == "healthy" {
         crate::kbs::enqueue_signed_policy_revocation_if_active(&mut tx).await?;
     }
     if let Some(mutation) = mutation {
@@ -3195,6 +3210,13 @@ mod tests {
     async fn insert_job_fixture(
         pool: &PgPool,
     ) -> (App, Uuid, SetupJobLease, DeploymentApplyJobPayload) {
+        insert_job_fixture_with_hold(pool, None).await
+    }
+
+    async fn insert_job_fixture_with_hold(
+        pool: &PgPool,
+        customer_config_hold_seconds: Option<i32>,
+    ) -> (App, Uuid, SetupJobLease, DeploymentApplyJobPayload) {
         let org_id = Uuid::new_v4();
         let app_id = Uuid::new_v4();
         let deployment_id = Uuid::new_v4();
@@ -3303,9 +3325,16 @@ mod tests {
         .execute(&mut *tx)
         .await
         .expect("insert deployment job deployment");
-        let lease = insert_setup_job(&mut tx, deployment_id, deployment_id, &payload, false, None)
-            .await
-            .expect("insert setup job");
+        let lease = insert_setup_job(
+            &mut tx,
+            deployment_id,
+            deployment_id,
+            &payload,
+            false,
+            customer_config_hold_seconds,
+        )
+        .await
+        .expect("insert setup job");
         tx.commit().await.expect("commit deployment job fixture");
         (app, deployment_id, lease, payload)
     }
@@ -4533,7 +4562,8 @@ mod tests {
         sqlx::query(
             "UPDATE deployment_apply_jobs
                 SET customer_config_hold = true,
-                    customer_config_hold_until = clock_timestamp() + interval '1 hour'
+                    customer_config_hold_until = clock_timestamp() + interval '1 hour',
+                    next_attempt_at = 'infinity'::timestamptz
               WHERE deployment_id = $1",
         )
         .bind(deployment_id)
@@ -4568,7 +4598,8 @@ mod tests {
         sqlx::query(
             "UPDATE deployment_apply_jobs
                 SET customer_config_hold = true,
-                    customer_config_hold_until = clock_timestamp() - interval '1 second'
+                    customer_config_hold_until = clock_timestamp() - interval '1 second',
+                    next_attempt_at = 'infinity'::timestamptz
               WHERE deployment_id = $1",
         )
         .bind(expired_deployment)
@@ -4610,6 +4641,266 @@ mod tests {
             .execute(&pool)
             .await
             .expect("delete expired hold fixture");
+    }
+
+    /// An old worker's initial-claim predicate, scoped to the fixture deployment.
+    async fn claim_with_pre_hold_worker_query(
+        pool: &PgPool,
+        deployment_id: Uuid,
+    ) -> Result<Option<ClaimedJob>, sqlx::Error> {
+        sqlx::query_as::<_, ClaimedJob>(
+            "WITH candidate AS (
+                 SELECT deployment_id
+                   FROM deployment_apply_jobs
+                  WHERE payload_version BETWEEN $1 AND $2
+                    AND state = $3
+                    AND next_attempt_at <= clock_timestamp()
+                    AND deployment_id = $4
+                  ORDER BY created_at, deployment_id
+                  FOR UPDATE SKIP LOCKED
+                  LIMIT 1
+             )
+             UPDATE deployment_apply_jobs AS job
+                SET state = $5,
+                    lock_token = $6,
+                    locked_until = clock_timestamp() + $7::interval,
+                    attempts = attempts + 1,
+                    updated_at = clock_timestamp()
+               FROM candidate
+              WHERE job.deployment_id = candidate.deployment_id
+             RETURNING job.deployment_id, job.app_id, job.org_id,
+                       job.source_deployment_id, job.payload_version,
+                       job.lock_token, job.payload, job.payload_sha256,
+                       job.cleanup_app_on_setup_failure, job.signed_required,
+                       job.artifact_deployment_id,
+                       job.artifact_descriptor_core_hash, job.log_encryption",
+        )
+        .bind(MIN_SUPPORTED_JOB_PAYLOAD_VERSION)
+        .bind(MAX_SUPPORTED_JOB_PAYLOAD_VERSION)
+        .bind("setup_pending")
+        .bind(deployment_id)
+        .bind("setting_up")
+        .bind(Uuid::new_v4())
+        .bind(LEASE_INTERVAL_SQL)
+        .fetch_optional(pool)
+        .await
+    }
+
+    #[tokio::test]
+    async fn pre_hold_worker_claim_requires_customer_config_release() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _setup, _payload) =
+            insert_job_fixture_with_hold(&pool, Some(3600)).await;
+        let wake = sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET next_attempt_at = clock_timestamp()
+              WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect_err("an older recovery writer must not wake an unreleased hold");
+        assert_eq!(
+            wake.as_database_error()
+                .and_then(|error| error.code())
+                .as_deref(),
+            Some("23514")
+        );
+
+        assert!(
+            claim_with_pre_hold_worker_query(&pool, deployment_id)
+                .await
+                .expect("pre-hold worker claim while held")
+                .is_none(),
+            "an unreleased hold must be invisible to a pre-0055 claim query"
+        );
+
+        let release = release_customer_config_hold(&pool, app.org_id, deployment_id)
+            .await
+            .expect("release hold");
+        assert_eq!(release, CustomerConfigHoldRelease::Released);
+
+        let modern = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("modern claim after release")
+            .expect("release must make the job claimable");
+        modern
+            .decode_payload()
+            .expect("decode a released job through the modern read contract");
+        requeue_setup_job(&pool, &modern, "exercise the pre-hold claim after release")
+            .await
+            .expect("requeue for the pre-hold claim");
+        sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET next_attempt_at = clock_timestamp() - interval '1 second'
+              WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("make the requeued job due for a pre-0055 worker");
+
+        let legacy = claim_with_pre_hold_worker_query(&pool, deployment_id)
+            .await
+            .expect("pre-hold worker claim after release")
+            .expect("release must activate the job for pre-0055 workers too");
+        legacy
+            .decode_payload()
+            .expect("decode a released job through the pre-hold read contract");
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete pre-hold claim fixture");
+    }
+
+    #[tokio::test]
+    async fn late_release_past_an_unswept_deadline_fails_the_hold_without_rolling() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _setup, _payload) =
+            insert_job_fixture_with_hold(&pool, Some(3600)).await;
+        sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET customer_config_hold_until = clock_timestamp() - interval '1 second'
+              WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("arm an expired but unswept customer-config hold");
+        assert!(
+            claim_with_pre_hold_worker_query(&pool, deployment_id)
+                .await
+                .expect("pre-hold claim past the unswept deadline")
+                .is_none()
+        );
+
+        let release = release_customer_config_hold(&pool, app.org_id, deployment_id)
+            .await
+            .expect("release past the deadline");
+        assert!(matches!(release, CustomerConfigHoldRelease::Unavailable(_)));
+
+        let (job_state, error_code, unreleased, deploy_status, setup_state, app_status): (
+            String,
+            Option<String>,
+            bool,
+            String,
+            Option<String>,
+            String,
+        ) = sqlx::query_as(
+            "SELECT job.state,
+                    job.last_error_code,
+                    job.customer_config_released_at IS NULL,
+                    deployment.status::text,
+                    deployment.spec_snapshot->>'setup_state',
+                    app.status::text
+               FROM deployment_apply_jobs job
+               JOIN deployments deployment ON deployment.id = job.deployment_id
+               JOIN apps app ON app.id = job.app_id
+              WHERE job.deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load the failed hold");
+        assert_eq!(job_state, "failed");
+        assert_eq!(error_code.as_deref(), Some(CUSTOMER_CONFIG_HOLD_EXPIRED));
+        assert!(unreleased, "an expired hold must not be released");
+        assert_eq!(deploy_status, "failed");
+        assert_eq!(setup_state.as_deref(), Some(DEPLOYMENT_SETUP_FAILED));
+        assert_eq!(
+            app_status, "creating",
+            "the previous workload projection is unchanged"
+        );
+        assert!(
+            claim_with_pre_hold_worker_query(&pool, deployment_id)
+                .await
+                .expect("pre-hold worker claim after expiry")
+                .is_none(),
+            "an expired hold must not roll, not even for a pre-0055 worker"
+        );
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete unswept deadline fixture");
+    }
+
+    #[tokio::test]
+    async fn release_deadline_race_fails_the_hold_terminal_not_ambiguous() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _setup, _payload) =
+            insert_job_fixture_with_hold(&pool, Some(3600)).await;
+
+        // Expire the locked hold and suppress only the release write, forcing
+        // the zero-row boundary without relying on scheduler timing.
+        let trigger_suffix = deployment_id.simple().to_string();
+        let trigger_name = format!("hold_deadline_crossing_{trigger_suffix}");
+        let function_name = format!("hold_deadline_crossing_fn_{trigger_suffix}");
+        sqlx::query(&format!(
+            "CREATE FUNCTION {function_name}() RETURNS trigger AS $fn$
+             BEGIN
+                 UPDATE deployment_apply_jobs
+                    SET customer_config_hold_until = clock_timestamp() - interval '1 second'
+                  WHERE deployment_id = OLD.deployment_id;
+                 RETURN NULL;
+             END $fn$ LANGUAGE plpgsql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("create deadline-crossing function");
+        sqlx::query(&format!(
+            "CREATE TRIGGER {trigger_name}
+                 BEFORE UPDATE ON deployment_apply_jobs
+                 FOR EACH ROW
+                 WHEN (
+                     NEW.customer_config_released_at IS DISTINCT FROM OLD.customer_config_released_at
+                     AND OLD.deployment_id = '{deployment_id}'
+                 )
+                 EXECUTE FUNCTION {function_name}()"
+        ))
+        .execute(&pool)
+        .await
+        .expect("create deadline-crossing trigger");
+
+        let release = release_customer_config_hold(&pool, app.org_id, deployment_id)
+            .await
+            .expect("release that loses the deadline race");
+        assert!(
+            matches!(release, CustomerConfigHoldRelease::Unavailable(_)),
+            "a deadline crossing under the row lock must answer terminally, not LeaseLost"
+        );
+
+        let (job_state, error_code, unreleased): (String, Option<String>, bool) = sqlx::query_as(
+            "SELECT state, last_error_code, customer_config_released_at IS NULL
+                   FROM deployment_apply_jobs
+                  WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load the raced hold");
+        assert_eq!(job_state, "failed");
+        assert_eq!(error_code.as_deref(), Some(CUSTOMER_CONFIG_HOLD_EXPIRED));
+        assert!(unreleased, "the raced release must not apply");
+
+        sqlx::query(&format!(
+            "DROP TRIGGER {trigger_name} ON deployment_apply_jobs"
+        ))
+        .execute(&pool)
+        .await
+        .expect("drop deadline-crossing trigger");
+        sqlx::query(&format!("DROP FUNCTION {function_name}()"))
+            .execute(&pool)
+            .await
+            .expect("drop deadline-crossing function");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete deadline race fixture");
     }
 
     #[tokio::test]

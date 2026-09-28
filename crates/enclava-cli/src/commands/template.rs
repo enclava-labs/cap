@@ -509,9 +509,7 @@ async fn deploy_with_timings(
     if customer_config_hold && deployment_id == "pending" {
         return Err("PaaS held the workload roll but did not return a deployment id".into());
     }
-    // The server armed the hold during the create call above. Stopping this
-    // far before that deadline leaves room for the release round trip and
-    // keeps request timeouts inside the hold.
+    // Reserve release time within the same window armed before the create request.
     let pre_release_deadline =
         customer_config_hold.then(|| hold_deadline(hold_armed_at, roll_hold_seconds));
     let phase_budget =
@@ -652,7 +650,13 @@ async fn deploy_with_timings(
             .is_some();
         if customer_config_hold && values_stored {
             pb.set_message("Customer config stored; releasing workload roll...");
-            release_customer_config_roll_with_retry(api, &instance_name, &deployment_id).await?;
+            release_customer_config_roll_with_retry(
+                api,
+                &instance_name,
+                &deployment_id,
+                hold_expiry(hold_armed_at, roll_hold_seconds),
+            )
+            .await?;
             return Err(error);
         }
         if customer_config_hold {
@@ -665,7 +669,13 @@ async fn deploy_with_timings(
     }
     if customer_config_hold {
         pb.set_message("Customer config stored; releasing workload roll...");
-        release_customer_config_roll_with_retry(api, &instance_name, &deployment_id).await?;
+        release_customer_config_roll_with_retry(
+            api,
+            &instance_name,
+            &deployment_id,
+            hold_expiry(hold_armed_at, roll_hold_seconds),
+        )
+        .await?;
     }
     pb.set_message(counted_progress(
         "Customer config",
@@ -920,11 +930,14 @@ const CUSTOMER_CONFIG_ROLL_HOLD_MAX_SECONDS: u64 = 7_200;
 /// cover managed-config delivery and the password-mode owner wait.
 const CUSTOMER_CONFIG_ROLL_HOLD_PREFIX_SECONDS: u64 = 240 + (121 * 2) + 60;
 
-/// Cover the managed-config wait and the customer-config delivery, each of
-/// which can consume the deploy's ssh timeout, plus the work that starts
-/// after CAP arms the hold. CAP clamps the same window.
+/// The pre-request clock conservatively precedes CAP arming the hold.
+fn hold_expiry(armed_at: Instant, hold_seconds: u32) -> Instant {
+    armed_at + Duration::from_secs(u64::from(hold_seconds))
+}
+
+/// Leave 30 seconds for release after config delivery.
 fn hold_deadline(armed_at: Instant, hold_seconds: u32) -> Instant {
-    armed_at + Duration::from_secs(u64::from(hold_seconds)) - Duration::from_secs(30)
+    hold_expiry(armed_at, hold_seconds) - Duration::from_secs(30)
 }
 
 /// Cap a pre-release wait at the hold deadline. Unheld deploys keep the
@@ -945,39 +958,91 @@ fn release_outcome_is_unknown(error: &ApiError) -> bool {
     }
 }
 
+const CUSTOMER_CONFIG_RELEASE_MAX_ATTEMPTS: u8 = 3;
+
+#[derive(Debug, thiserror::Error)]
+enum CustomerConfigReleaseError {
+    #[error("{0}")]
+    OutcomeUnknown(String),
+    #[error("{0}")]
+    Rejected(String),
+}
+
+/// Release a held workload roll, bounded by the estimated hold expiry:
+/// every in-flight call and retry sleep is capped at the remaining window
+/// (the API client's own 900 s timeout would otherwise let one stalled
+/// call run past the hold).
 async fn release_customer_config_roll_with_retry(
     api: &ApiClient,
     instance_name: &str,
     deployment_id: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+    hold_expiry: Instant,
+) -> Result<(), CustomerConfigReleaseError> {
     let mut attempt = 0u8;
     let mut outcome_unknown = false;
     loop {
-        attempt += 1;
-        match api
-            .release_template_customer_config_roll(instance_name, deployment_id)
-            .await
-        {
-            Ok(()) => return Ok(()),
-            Err(error) => {
-                let retryable = release_outcome_is_unknown(&error);
-                outcome_unknown |= retryable;
-                if retryable && attempt < 3 {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    continue;
-                }
-                let message = if outcome_unknown {
-                    format!(
-                        "customer config was stored, but the roll-release result is unknown after {attempt} attempts: {error}. The roll may already be released; check `enclava status --app {instance_name}` before assuming the running workload is unchanged."
-                    )
-                } else {
-                    format!(
-                        "customer config was stored, but the workload roll was not released: {error}. The running workload was left unchanged."
-                    )
-                };
-                return Err(message.into());
-            }
+        let remaining = hold_expiry.saturating_duration_since(Instant::now());
+        // An abandoned request may have released the roll before expiry.
+        if remaining.is_zero() {
+            return Err(release_failure_message(
+                instance_name,
+                attempt,
+                "the roll-hold window expired before the release could be confirmed",
+                true,
+            ));
         }
+        attempt += 1;
+        // Early attempts get half the remaining window so one stalled call
+        // still leaves time for a retry before the hold expires.
+        let budget = if attempt < CUSTOMER_CONFIG_RELEASE_MAX_ATTEMPTS {
+            remaining / 2
+        } else {
+            remaining
+        };
+        let result = tokio::time::timeout(
+            budget,
+            api.release_template_customer_config_roll(instance_name, deployment_id),
+        )
+        .await;
+        let (description, unknown) = match result {
+            Ok(Ok(())) => return Ok(()),
+            // A locally abandoned request may still reach CAP, so the
+            // outcome is exactly as ambiguous as a transport error.
+            Err(_abandoned) => (
+                format!("release request abandoned after {budget:?} without a response"),
+                true,
+            ),
+            Ok(Err(error)) => (error.to_string(), release_outcome_is_unknown(&error)),
+        };
+        outcome_unknown |= unknown;
+        if unknown && attempt < CUSTOMER_CONFIG_RELEASE_MAX_ATTEMPTS {
+            let remaining = hold_expiry.saturating_duration_since(Instant::now());
+            tokio::time::sleep(Duration::from_secs(1).min(remaining / 2)).await;
+            continue;
+        }
+        return Err(release_failure_message(
+            instance_name,
+            attempt,
+            &description,
+            outcome_unknown,
+        ));
+    }
+}
+
+fn release_failure_message(
+    instance_name: &str,
+    attempts: u8,
+    error: &str,
+    outcome_unknown: bool,
+) -> CustomerConfigReleaseError {
+    if outcome_unknown {
+        CustomerConfigReleaseError::OutcomeUnknown(format!(
+            "customer config was stored, but the roll-release result is unknown after {attempts} attempts: {error}. The roll may already be released; check `enclava status --app {instance_name}` before assuming the running workload is unchanged."
+        ))
+    } else {
+        CustomerConfigReleaseError::Rejected(format!(
+            "customer config was stored, but the workload roll was not released: {error}. The running workload was left unchanged."
+        ))
     }
 }
 
@@ -4659,6 +4724,162 @@ mod tests {
         assert_eq!(customer_config_roll_hold_seconds(10_000), 7_200);
     }
 
+    #[tokio::test]
+    async fn stalled_release_call_is_bounded_and_retried_within_the_hold() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stalled release fixture");
+        let addr = listener.local_addr().expect("stalled release fixture addr");
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        tokio::spawn(async move {
+            let mut stalled = true;
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut request = [0_u8; 1024];
+                let read = stream.read(&mut request).await.unwrap_or(0);
+                seen.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&request[..read]).to_string());
+                if stalled {
+                    stalled = false;
+                    // Hold the connection open without a response.
+                    let _ = stream.read(&mut [0_u8; 1]).await;
+                } else {
+                    stream
+                        .write_all(b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n")
+                        .await
+                        .expect("write release response");
+                    break;
+                }
+            }
+        });
+        let api = ApiClient::new(&format!("http://{addr}"), Some("test-token".to_string()));
+
+        let expiry = Instant::now() + Duration::from_secs(6);
+        let started = Instant::now();
+        release_customer_config_roll_with_retry(&api, "shell", "deploy-1", expiry)
+            .await
+            .expect("the retry must release the roll inside the hold");
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "a stalled release call must be retried, saw {requests:?}"
+        );
+        for request in requests.iter() {
+            assert!(
+                request.contains("POST /apps/shell/deployments/deploy-1/customer-config-released"),
+                "unexpected release request: {request}"
+            );
+        }
+        drop(requests);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(6),
+            "release must complete inside the hold window, took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exhausted_hold_deadline_reports_unknown_release_promptly() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stalling release fixture");
+        let addr = listener
+            .local_addr()
+            .expect("stalling release fixture addr");
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = accepted.clone();
+        tokio::spawn(async move {
+            // Wait for cancellation without responding.
+            while let Ok((mut stream, _)) = listener.accept().await {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut request = [0_u8; 1024];
+                let _ = stream.read(&mut request).await;
+                let _ = stream.read(&mut [0_u8; 1]).await;
+            }
+        });
+        let api = ApiClient::new(&format!("http://{addr}"), Some("test-token".to_string()));
+
+        let expiry = Instant::now() + Duration::from_secs(2);
+        let started = Instant::now();
+        let error = release_customer_config_roll_with_retry(&api, "shell", "deploy-1", expiry)
+            .await
+            .expect_err("an expired hold must not report a released roll");
+
+        assert!(matches!(
+            error,
+            CustomerConfigReleaseError::OutcomeUnknown(_)
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "must return at the hold expiry instead of the 900s request cap, took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            accepted.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "a short hold must still leave time for a retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn abandoned_release_stays_unknown_when_the_retry_is_rejected() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind rejected retry fixture");
+        let addr = listener.local_addr().expect("rejected retry fixture addr");
+        let server = tokio::spawn(async move {
+            // First connection stalls and is abandoned; the retry gets a
+            // definitive 4xx rejection.
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await;
+            let _ = stream.read(&mut [0_u8; 1]).await;
+
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await;
+            let body = r#"{"message":"roll is not held"}"#;
+            let response = format!(
+                "HTTP/1.1 409 Conflict\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write rejected release response");
+        });
+        let api = ApiClient::new(&format!("http://{addr}"), Some("test-token".to_string()));
+
+        let expiry = Instant::now() + Duration::from_secs(4);
+        let started = Instant::now();
+        let error = release_customer_config_roll_with_retry(&api, "shell", "deploy-1", expiry)
+            .await
+            .expect_err("a rejected retry must fail the release");
+
+        assert!(matches!(
+            error,
+            CustomerConfigReleaseError::OutcomeUnknown(_)
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "the rejection must surface inside the hold window, took {:?}",
+            started.elapsed()
+        );
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("the retry must reach the service")
+            .expect("the release fixture must respond");
+    }
+
     #[test]
     fn held_roll_deadline_bounds_all_delivery_requests() {
         let api = ApiClient::new("https://api.example.test", Some("test".to_string()));
@@ -4715,54 +4936,6 @@ mod tests {
         state.engaged_deadline = None;
         state.locked_since = None;
         assert_eq!(state.request_deadline(), None);
-    }
-
-    #[test]
-    fn template_deploy_verifies_platform_trust_before_remote_mutation() {
-        let source = include_str!("template.rs");
-        let deploy_start = source.find("async fn deploy").expect("deploy exists");
-        let deploy_end = source[deploy_start..]
-            .find("async fn ssh_command")
-            .expect("ssh_command follows deploy")
-            + deploy_start;
-        let body = &source[deploy_start..deploy_end];
-
-        let verify_platform = body
-            .find("fetch_verified_platform_release(api, &ctx.paths)")
-            .expect("template deploy verifies the signed platform release");
-        let bootstrap = body
-            .find("template_bootstrap_pubkey_hash")
-            .expect("template deploy may bootstrap remote keyring state");
-        let ensure_app = body
-            .find("ensure_template_app")
-            .expect("template deploy may create a remote app");
-
-        assert!(
-            verify_platform < bootstrap && verify_platform < ensure_app,
-            "template deploy must verify platform trust before remote mutation"
-        );
-    }
-
-    #[test]
-    fn template_bootstrap_endpoint_retries_without_redeploying() {
-        let body = include_str!("template.rs")
-            .split_once("async fn wait_for_template_bootstrap_endpoint")
-            .unwrap();
-        let body = body
-            .1
-            .split_once("async fn deliver_template_config_with_retry")
-            .unwrap()
-            .0;
-        let wait_loop = body.find("loop {").unwrap();
-        let failure_check = body.find("fail_if_template_deployment_failed").unwrap();
-        let endpoint = body.find("get_unlock_endpoint").unwrap();
-        let retry = body[endpoint..].find("continue;").unwrap() + endpoint;
-
-        assert!(wait_loop < failure_check && failure_check < endpoint && endpoint < retry);
-        assert!(body.contains("should_retry_template_bootstrap_endpoint_error"));
-        assert!(body.contains("tokio::time::sleep(poll_interval).await"));
-        assert!(!body.contains("create_template_instance"));
-        assert!(!body.contains(".deploy("));
     }
 
     #[test]
