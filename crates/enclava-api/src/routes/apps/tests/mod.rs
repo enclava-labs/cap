@@ -588,6 +588,106 @@ fn app_delete_failure_discards_secret_source_diagnostics() {
     assert!(!response.contains(SECRET));
 }
 
+#[test]
+fn app_delete_source_never_reads_or_formats_external_diagnostics() {
+    let source = include_str!("../../apps.rs");
+    let teardown = source
+        .split("async fn request_workload_teardown")
+        .nth(1)
+        .expect("workload teardown helper exists")
+        .split("/// Comprehensive app name validation")
+        .next()
+        .expect("workload teardown helper body");
+    let deletion = source
+        .split("pub async fn delete_app")
+        .nth(1)
+        .expect("app deletion route exists")
+        .split("#[derive(Debug, Deserialize)]\npub struct RotateSignerRequest")
+        .next()
+        .expect("app deletion route body");
+
+    for forbidden in [
+        "response.text()",
+        "app_name = %app.name",
+        "namespace = %app.namespace",
+        "url = %url",
+        "body = %body",
+        "error = %error",
+        "failed to issue teardown token: {e}",
+    ] {
+        assert!(
+            !teardown.contains(forbidden),
+            "teardown diagnostics must not contain `{forbidden}`"
+        );
+    }
+
+    assert!(
+        !deletion.contains("dns_error_response"),
+        "app deletion must not use the raw DNS error response"
+    );
+    assert!(
+        !deletion.contains("format!("),
+        "app deletion must not format dependency errors into responses"
+    );
+    assert!(
+        deletion
+            .find("request_workload_teardown")
+            .expect("app deletion requests workload teardown")
+            < deletion
+                .find("enqueue_signed_policy_revocation_if_active")
+                .expect("app deletion enqueues signed-policy revocation"),
+        "app deletion must preserve KBS authorization until workload teardown completes"
+    );
+    assert!(
+        deletion
+            .contains("WHEN status = 'deleting'::app_status_enum THEN workload_teardown_required"),
+        "app deletion must persist the pre-delete teardown decision across retries"
+    );
+    assert!(
+        deletion.contains("requires_workload_teardown(phase_app.status)"),
+        "app deletion must decide teardown from the status before the deleting transition"
+    );
+    assert!(
+        !deletion.contains("requires_workload_teardown(deleting_app.status)"),
+        "app deletion must not re-derive teardown from the post-transition Deleting status"
+    );
+    assert!(
+        teardown.contains("workload_teardown_completed_at"),
+        "successful teardown must persist a durable completion marker"
+    );
+    assert!(
+        teardown.contains("app_delete_teardown_already_completed"),
+        "retries must skip TEE teardown after the completion marker is set"
+    );
+    assert!(
+        teardown.contains("AppDeleteFailure::TeardownLocked"),
+        "a locked TEE must fail destroy through a stable teardown error code"
+    );
+    assert!(
+        teardown.contains("Duration::from_secs(60)"),
+        "the teardown client timeout must out-wait the proxy's two 20 s KBS deletes"
+    );
+    let migration = include_str!("../../../../migrations/0048_app_workload_teardown_state.sql");
+    assert!(
+        !migration.to_lowercase().contains("update apps"),
+        "0048 must not backfill: the delete route records the requirement at delete time, and any backfill would only be read by a new replica retrying an old-replica delete whose workload may already be gone (mixed-rollout wedge)"
+    );
+    for failure in [
+        "app_delete_dns_failure",
+        "AppDeleteFailure::EdgeBackend",
+        "AppDeleteFailure::EdgeRoute",
+        "AppDeleteFailure::Namespace",
+        "AppDeleteFailure::KbsOwnerBinding",
+        "AppDeleteFailure::KbsTlsBinding",
+        "AppDeleteFailure::KbsPolicy",
+    ] {
+        assert!(
+            deletion.contains(failure),
+            "app deletion must route failures through bounded diagnostic `{failure}`"
+        );
+    }
+}
+
 #[tokio::test]
 async fn create_app_rejects_member_before_database_access() {
     let result = create_app(
