@@ -92,8 +92,10 @@ pub enum PlatformReleaseError {
     },
     #[error("platform release root pubkey is not configured at compile time")]
     MissingRootPubkey,
-    #[error("platform release signature pubkey is not the pinned root")]
-    RootMismatch,
+    #[error(
+        "platform release signature pubkey is not the pinned root: this build pins {pinned} but the release is signed by {signing}; the platform signing root rotated after this binary was built — update this CLI to a build carrying the current pin"
+    )]
+    RootMismatch { pinned: String, signing: String },
     #[error("platform release signature verification failed: {0}")]
     BadSignature(String),
     #[error("policy_template_sha256 does not match policy_template_text")]
@@ -273,7 +275,10 @@ pub fn verify_envelope_with_root(
     let pinned = hex32("ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX", root_hex)?;
     let signing = hex32("signing_pubkey", &envelope.signing_pubkey)?;
     if signing != pinned {
-        return Err(PlatformReleaseError::RootMismatch);
+        return Err(PlatformReleaseError::RootMismatch {
+            pinned: hex::encode(pinned),
+            signing: hex::encode(signing),
+        });
     }
     let verifying_key =
         VerifyingKey::from_bytes(&signing).map_err(|err| PlatformReleaseError::InvalidField {
@@ -866,13 +871,24 @@ mod tests {
         let envelope: PlatformReleaseEnvelope =
             serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
         verify_envelope_with_root(envelope.clone(), TEST_FIXTURE_RELEASE_ROOT_PUBKEY_HEX).unwrap();
+        let mismatch = verify_envelope_with_root(
+            envelope,
+            "0000000000000000000000000000000000000000000000000000000000000001",
+        )
+        .expect_err("a foreign root must fail verification");
         assert!(matches!(
-            verify_envelope_with_root(
-                envelope,
-                "0000000000000000000000000000000000000000000000000000000000000001"
-            ),
-            Err(PlatformReleaseError::RootMismatch)
+            mismatch,
+            PlatformReleaseError::RootMismatch { .. }
         ));
+        let message = mismatch.to_string();
+        assert!(
+            message.contains("0000000000000000000000000000000000000000000000000000000000000001"),
+            "error must name the pinned root: {message}"
+        );
+        assert!(
+            message.contains(TEST_FIXTURE_RELEASE_ROOT_PUBKEY_HEX),
+            "error must name the release signing key: {message}"
+        );
     }
 
     #[test]
