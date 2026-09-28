@@ -490,19 +490,8 @@ async fn enqueue_signed_policy_bootstrap_if_idle(
     Ok(result.rows_affected() == 1)
 }
 
-/// Clear stray deferred policy debts from an unsigned-only row.
-///
-/// Both debt triggers (the keyring-membership counter and the
-/// signer-withdrawal counter) owe generation bumps only where
-/// `desired_generation > 0` (mirroring
-/// [`enqueue_signed_policy_revocation_if_active`]'s active-mode guard), so
-/// the debt invariant is
-/// `selector_bumps_owed > 0 OR withdrawal_bumps_owed > 0 =>
-/// desired_generation > 0`.  If a stray debt ever lands on an
-/// unsigned-only row (manual psql, a future backfill), it is cleared here
-/// without bumping so the install cannot be pushed into signed-policy
-/// mode.  This touches only the debt columns, so it is invisible to old
-/// replicas and safe at any point in a run.
+/// Stray debts must not promote a legacy unsigned install into signed mode,
+/// where an empty artifact set would deny every workload.
 async fn clear_stray_policy_debts(db: &PgPool) -> Result<(), KbsPolicyError> {
     sqlx::query(
         "UPDATE kbs_signed_policy_reconciliation
@@ -518,54 +507,16 @@ async fn clear_stray_policy_debts(db: &PgPool) -> Result<(), KbsPolicyError> {
     Ok(())
 }
 
-/// Commit the deferred policy generation bumps owed by the
-/// keyring-membership and signer-withdrawal migrations -- and ONLY once
-/// the fully filtered policy body is live in the ConfigMap.
+/// Commit both debts only after publishing the fully filtered ConfigMap.
 ///
-/// Only this implementation -- the one filtering signed-policy candidates
-/// by current keyring membership AND refusing withdrawn signer hashes --
-/// may interpret either debt.  `deploy/api/deployment.yaml` runs the API
-/// with `DATABASE_MIGRATION_MODE=verify`, so a migration step can precede
-/// the new binary by minutes while an old replica keeps reconciling every
-/// 30 seconds: a generation bumped directly (migration or route) would be
-/// consumed by that replica's unfiltered candidate query and published as
-/// the old policy body at the new generation, after which this build would
-/// crash-loop on [`KbsPolicyError::PolicyGenerationConflict`] with no bump
-/// left to recover.
+/// Publishing first leaves old reconcilers behind its generation; committing
+/// first would let them publish an unfiltered body at the owed generation.
+/// The content-bound annotation also rejects stale writers after this commit.
 ///
-/// Publishing first and committing second keeps that failure unreachable on
-/// every crash path.  Until this call, `desired_generation` stays
-/// unchanged and an old reconciler keeps finding its unfiltered hash
-/// matching the published body: it stays quiescent.  The filtered replace
-/// annotates the ConfigMap with the owed generation while the durable
-/// desired generation is still behind it, so an old reconciler treats it
-/// as [`GenerationDecision::Superseded`] and cannot overwrite; once the
-/// increments land here, the same content-bound annotation turns any late
-/// unfiltered republication into a same-generation conflict.  A failure
-/// before the replace leaves the debts owed and the increments
-/// uncommitted, so the next run simply republishes.
-///
-/// Both debts are COUNTERS (not boolean markers) re-armed inside their
-/// writers' own transactions by row triggers -- keyring INSERTs and apps
-/// signer-identity changes -- so they survive writes committed by old
-/// replicas during the rollout: those binaries enqueue nothing of their
-/// own, and their writers only take per-org lanes that cannot fence a
-/// global publication.  That is why consumption is a single
-/// compare-and-set on the exact `(desired_generation,
-/// selector_bumps_owed, withdrawal_bumps_owed)` triple this run published
-/// at: a write on either channel landing mid-run moves its counter, the
-/// CAS fails, `None` is returned, and the caller's next loop attempt
-/// republishes the post-write candidate set at the strictly higher
-/// generation instead of recording a stale set as the final state of a
-/// generation.  The two counters are never consumed separately: a partial
-/// commit would advance `desired_generation` while the other debt still
-/// points past it, and a writer landing between two partial commits would
-/// make the second CAS observe a state the first commit already broke --
-/// one atomic commit keeps every interleaving equivalent to a clean
-/// retry.  Debts on an unsigned-only row are never committed (the
-/// `desired_generation > 0` guard); [`clear_stray_policy_debts`] removes
-/// them instead.
-/// Returns the new desired generation when this call performed the commit.
+/// Database triggers increment each counter in its writer's transaction.
+/// Comparing the entire observed triple catches either revocation arriving
+/// mid-publication. On mismatch, return `None` and retry with fresh candidates
+/// at the higher generation; never consume the two counters separately.
 async fn consume_deferred_policy_debts(
     db: &PgPool,
     observed_desired_generation: i64,
@@ -967,12 +918,7 @@ async fn reconcile_pending_signed_policy_artifacts_with_client(
     expected_artifact: Option<&crate::signing_service::SignedPolicyArtifact>,
     client: kube::Client,
 ) -> Result<(), KbsPolicyError> {
-    // Clear any stray deferred policy debts on an unsigned-only row (see
-    // clear_stray_policy_debts).  Debts on a signed-mode row are left in
-    // place here on purpose: the owed generation bumps are published first
-    // and committed only after the filtered ConfigMap replace succeeded
-    // (consume_deferred_policy_debts below), so no failure in this run can
-    // expose a raw bumped generation to an old replica.
+    // Do not let stray debt opt an unsigned installation into signed mode.
     clear_stray_policy_debts(db).await?;
     let cm_api: Api<ConfigMap> = Api::namespaced(client.clone(), &config.namespace);
     for _ in 0..KUBERNETES_CAS_ATTEMPTS {
@@ -1008,16 +954,9 @@ async fn reconcile_pending_signed_policy_artifacts_with_client(
             }
             return Ok(());
         }
-        // Pending deferred policy debts (the signer-withdrawal and
-        // keyring-membership counters) publish the owed generation as
-        // desired_generation + selector_bumps_owed + withdrawal_bumps_owed
-        // without committing the increments yet -- consume_deferred_policy_debts
-        // does that only after the filtered replace below.  Old replicas
-        // reading the same row keep seeing the unchanged
-        // desired_generation and stay quiescent.
-        let generation = state.desired_generation
-            + state.selector_bumps_owed
-            + state.withdrawal_bumps_owed;
+        // Keep the owed generation private until the filtered body is published.
+        let generation =
+            state.desired_generation + state.selector_bumps_owed + state.withdrawal_bumps_owed;
         let reset_bootstrap = state.configmap_generation == 0 && state.applied_generation == 0;
         let previously_applied = state.applied_generation >= generation;
         let candidates = load_signed_policy_candidates(db, config.signed_policy_retention).await?;
@@ -1067,34 +1006,9 @@ async fn reconcile_pending_signed_policy_artifacts_with_client(
             } => (true, resource_version, publication_token),
             ConfigMapConvergence::Superseded => continue,
         };
-        // The filtered body is now live at `generation` with its
-        // content-bound generation annotation, and only now are the owed
-        // increments safe to commit: while `desired_generation` was still
-        // behind, an old replica saw the annotated generation as
-        // Superseded and could not overwrite; after the increments land,
-        // the same annotation turns any late unfiltered republication
-        // into a same-generation conflict.  Committing before this replace
-        // would expose a raw bumped generation that an old replica could
-        // consume with its unfiltered query whenever this run fails before
-        // publishing.
-        //
-        // Both debts are consumed by ONE compare-and-set on the exact
-        // (desired_generation, selector_bumps_owed, withdrawal_bumps_owed)
-        // triple this run published at.  That CAS is what fences OLD
-        // writers of both revocation channels: a keyring write from a
-        // pre-selector-debt replica and a signer rotation from a
-        // pre-withdrawal-debt replica each owe their bump inside their own
-        // transaction through the migration triggers.  If such a write
-        // landed after this run loaded its candidate set, its counter has
-        // moved, the CAS fails, and the loop retries -- republishing the
-        // post-write candidate set at the strictly higher generation
-        // instead of sealing a stale one.  The two counters are never
-        // consumed separately: a partial commit would advance
-        // desired_generation while the other debt still points past it,
-        // and a writer landing between the two commits would make the
-        // second CAS observe a pair the first commit already broke -- a
-        // single atomic commit keeps every interleaving equivalent to a
-        // clean retry.
+        // Commit both debts after publication. A concurrent revocation changes
+        // the observed triple, so retry with fresh candidates instead of sealing
+        // a stale policy generation.
         if (state.selector_bumps_owed > 0 || state.withdrawal_bumps_owed > 0)
             && consume_deferred_policy_debts(
                 db,
@@ -3374,15 +3288,14 @@ owner_resource_bindings := {}
 
     #[tokio::test]
     async fn selector_drops_artifacts_withdrawn_by_signer_rotation() {
-        let pool = database_test_pool().await;
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap119_withdrawal_selector").await;
         let now = Utc::now();
         let (org_id, app_id) = insert_test_app(&pool, "running").await;
+        insert_test_keyring_version(&pool, org_id, 1, &[&"bb".repeat(32)]).await;
         let current = Uuid::new_v4();
         insert_test_deployment(&pool, org_id, app_id, current, "healthy", now).await;
-        // A per-run hash byte avoids PK collisions with leftover fixtures on
-        // the shared regression database.
-        let hash_byte = format!("{:02x}", app_id.as_bytes()[0]);
-        let current_artifact = insert_test_artifact(&pool, app_id, current, &hash_byte).await;
+        let current_artifact = insert_test_artifact(&pool, app_id, current, "31").await;
         insert_test_job(
             &pool,
             org_id,
@@ -3428,11 +3341,7 @@ owner_resource_bindings := {}
                 != current_artifact.metadata.descriptor_core_hash
         }));
 
-        sqlx::query("DELETE FROM organizations WHERE id = $1")
-            .bind(org_id)
-            .execute(&pool)
-            .await
-            .expect("delete signer rotation fixture");
+        crate::test_support::drop_isolated_database("cap119_withdrawal_selector", pool).await;
     }
 
     #[tokio::test]

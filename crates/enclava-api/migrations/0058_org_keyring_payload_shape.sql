@@ -189,20 +189,16 @@ ALTER TABLE org_keyrings
 -- and the writer's own INSERT re-arms it through a row trigger inside the
 -- writer's transaction: the debt is durable across keyring writes from ANY
 -- binary.  The reconciler publishes the filtered candidate set as
--- generation desired_generation + selector_bumps_owed (plus any
--- signer-withdrawal debt owed alongside it, migration 0052) while leaving
+-- generation desired_generation + selector_bumps_owed while leaving
 -- desired_generation itself untouched, and only after that replace
--- succeeded does consume_deferred_policy_debts
--- (crates/enclava-api/src/kbs.rs) commit the increments, guarded by a
--- single compare-and-set on the exact (desired_generation,
--- selector_bumps_owed, withdrawal_bumps_owed) triple the run published
--- at.  Both debt counters are always consumed together -- committing
--- one before the other would advance desired_generation while the
--- other debt still points past it.  A keyring write that lands mid-run
--- moves its counter, fails the CAS, and makes the next attempt republish
--- at the strictly higher generation with a fresh candidate set, so a
--- candidate set that went stale mid-run is never recorded as the final
--- state of a generation.
+-- succeeded does consume_deferred_selector_bumps
+-- (crates/enclava-api/src/kbs.rs) commit the increment, guarded by a
+-- compare-and-set on the exact (desired_generation, selector_bumps_owed)
+-- pair the run published at.  A keyring write that lands mid-run changes
+-- the pair, fails the CAS, and makes the next attempt republish at the
+-- strictly higher generation with a fresh candidate set, so a candidate set
+-- that went stale mid-run is never recorded as the final state of a
+-- generation.
 --
 -- A pre-0050 reconciler therefore never sees the owed generation as a raw
 -- desired generation.  Before the replace it keeps finding an unchanged

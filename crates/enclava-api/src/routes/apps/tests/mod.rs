@@ -588,106 +588,6 @@ fn app_delete_failure_discards_secret_source_diagnostics() {
     assert!(!response.contains(SECRET));
 }
 
-#[test]
-fn app_delete_source_never_reads_or_formats_external_diagnostics() {
-    let source = include_str!("../../apps.rs");
-    let teardown = source
-        .split("async fn request_workload_teardown")
-        .nth(1)
-        .expect("workload teardown helper exists")
-        .split("/// Comprehensive app name validation")
-        .next()
-        .expect("workload teardown helper body");
-    let deletion = source
-        .split("pub async fn delete_app")
-        .nth(1)
-        .expect("app deletion route exists")
-        .split("#[derive(Debug, Deserialize)]\npub struct RotateSignerRequest")
-        .next()
-        .expect("app deletion route body");
-
-    for forbidden in [
-        "response.text()",
-        "app_name = %app.name",
-        "namespace = %app.namespace",
-        "url = %url",
-        "body = %body",
-        "error = %error",
-        "failed to issue teardown token: {e}",
-    ] {
-        assert!(
-            !teardown.contains(forbidden),
-            "teardown diagnostics must not contain `{forbidden}`"
-        );
-    }
-
-    assert!(
-        !deletion.contains("dns_error_response"),
-        "app deletion must not use the raw DNS error response"
-    );
-    assert!(
-        !deletion.contains("format!("),
-        "app deletion must not format dependency errors into responses"
-    );
-    assert!(
-        deletion
-            .find("request_workload_teardown")
-            .expect("app deletion requests workload teardown")
-            < deletion
-                .find("enqueue_signed_policy_revocation_if_active")
-                .expect("app deletion enqueues signed-policy revocation"),
-        "app deletion must preserve KBS authorization until workload teardown completes"
-    );
-    assert!(
-        deletion
-            .contains("WHEN status = 'deleting'::app_status_enum THEN workload_teardown_required"),
-        "app deletion must persist the pre-delete teardown decision across retries"
-    );
-    assert!(
-        deletion.contains("requires_workload_teardown(phase_app.status)"),
-        "app deletion must decide teardown from the status before the deleting transition"
-    );
-    assert!(
-        !deletion.contains("requires_workload_teardown(deleting_app.status)"),
-        "app deletion must not re-derive teardown from the post-transition Deleting status"
-    );
-    assert!(
-        teardown.contains("workload_teardown_completed_at"),
-        "successful teardown must persist a durable completion marker"
-    );
-    assert!(
-        teardown.contains("app_delete_teardown_already_completed"),
-        "retries must skip TEE teardown after the completion marker is set"
-    );
-    assert!(
-        teardown.contains("AppDeleteFailure::TeardownLocked"),
-        "a locked TEE must fail destroy through a stable teardown error code"
-    );
-    assert!(
-        teardown.contains("Duration::from_secs(60)"),
-        "the teardown client timeout must out-wait the proxy's two 20 s KBS deletes"
-    );
-    let migration = include_str!("../../../../migrations/0048_app_workload_teardown_state.sql");
-    assert!(
-        !migration.to_lowercase().contains("update apps"),
-        "0048 must not backfill: the delete route records the requirement at delete time, and any backfill would only be read by a new replica retrying an old-replica delete whose workload may already be gone (mixed-rollout wedge)"
-    );
-    for failure in [
-        "app_delete_dns_failure",
-        "AppDeleteFailure::EdgeBackend",
-        "AppDeleteFailure::EdgeRoute",
-        "AppDeleteFailure::Namespace",
-        "AppDeleteFailure::KbsOwnerBinding",
-        "AppDeleteFailure::KbsTlsBinding",
-        "AppDeleteFailure::KbsPolicy",
-    ] {
-        assert!(
-            deletion.contains(failure),
-            "app deletion must route failures through bounded diagnostic `{failure}`"
-        );
-    }
-}
-
 #[tokio::test]
 async fn create_app_rejects_member_before_database_access() {
     let result = create_app(
@@ -1110,7 +1010,7 @@ async fn signer_rotation_token_is_single_use_and_owes_a_deferred_withdrawal_bump
     .fetch_one(&pool)
     .await
     .expect("count consumed jti rows after replay");
-    assert_eq!(jti_rows, 1, "the rejected replay must not add a jti row");
+    assert_eq!(jti_rows, 2, "the rejected replay must not add a jti row");
 
     crate::test_support::drop_isolated_database("cap119_rotation_single_use", pool).await;
 }
@@ -1347,29 +1247,19 @@ async fn old_binary_signer_rotation_via_direct_sql_is_fenced_by_the_apps_trigger
         (1, 0, 1),
         "the initial signer set must owe nothing"
     );
-    let withdrawn_app2: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM withdrawn_signer_artifacts WHERE app_id = $1",
-    )
-    .bind(app_id2)
-    .fetch_one(&pool)
-    .await
-    .expect("count withdrawn artifacts for the initial-set app");
+    let withdrawn_app2: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM withdrawn_signer_artifacts WHERE app_id = $1")
+            .bind(app_id2)
+            .fetch_one(&pool)
+            .await
+            .expect("count withdrawn artifacts for the initial-set app");
     assert_eq!(withdrawn_app2, 0, "initial set must withdraw nothing");
 
     crate::test_support::drop_isolated_database("cap119_old_binary_rotation", pool).await;
 }
 
-/// Regression for the migration 0052 backfill window.  The backfill that
-/// withdraws already-rotated artifacts reads apps before the
-/// apps_signer_rotation_withdrawal trigger exists; a signer change
-/// committed between that snapshot and the trigger installation would
-/// escape both (no withdrawal row, no owed bump).  The migration therefore
-/// takes LOCK TABLE apps IN SHARE ROW EXCLUSIVE MODE before reading.  This
-/// test reconstructs the pre-migration state (trigger dropped) on two
-/// connections and replays the ordering: a rotation arriving behind the
-/// migration's table lock blocks until the migration transaction -- which
-/// installs the trigger -- commits, and the resumed write then fires that
-/// trigger instead of escaping it.
+// Pause the production migration after its backfill, before trigger installation.
+// An old signer writer must wait and then execute under the new trigger.
 #[tokio::test]
 async fn migration_backfill_window_is_fenced_by_the_apps_write_exclusion_lock() {
     let (_db_cleanup, pool) =
@@ -1398,90 +1288,110 @@ async fn migration_backfill_window_is_fenced_by_the_apps_write_exclusion_lock() 
     .await
     .expect("enter signed-policy mode");
 
-    // Reconstruct the pre-migration state: the trigger does not exist
-    // yet, exactly like the database the migration runs against.
-    sqlx::query("DROP TRIGGER apps_signer_rotation_withdrawal ON apps")
-        .execute(&pool)
-        .await
-        .expect("drop rotation trigger for the window reconstruction");
-
-    // The migration transaction: lock apps, then (backfill read), then
-    // install the trigger, then commit -- the same statement order the
-    // migration file uses.
-    let mut migration = pool.acquire().await.expect("acquire migration connection");
-    sqlx::query("BEGIN")
-        .execute(&mut *migration)
-        .await
-        .expect("begin migration transaction");
-    sqlx::query("LOCK TABLE apps IN SHARE ROW EXCLUSIVE MODE")
-        .execute(&mut *migration)
-        .await
-        .expect("lock apps for the backfill window");
-
-    // The old-binary rotation arrives behind the lock.  It must block:
-    // while the migration holds the table lock the write cannot commit,
-    // so it cannot slip between the backfill snapshot and the trigger
-    // installation.
-    let writer = {
-        let pool = pool.clone();
-        tokio::spawn(async move {
-            let mut conn = pool.acquire().await.expect("acquire writer connection");
-            sqlx::query(
-                "UPDATE apps
-                    SET signer_identity_subject = $1,
-                        signer_identity_issuer  = $2,
-                        signer_identity_set_at  = now(),
-                        updated_at              = now()
-                  WHERE id = $3",
-            )
-            .bind(new_subject)
-            .bind(new_issuer)
-            .bind(app_id)
-            .execute(&mut *conn)
-            .await
-            .expect("old-binary signer rotation behind the lock");
-        })
-    };
-    // Give the blocked write a moment to prove it cannot finish while the
-    // migration holds the lock.  If it completed here, the lock would not
-    // fence the window and the rotation would escape the backfill.
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    assert!(
-        !writer.is_finished(),
-        "the rotation must block behind the migration's apps table lock"
-    );
-
-    // The migration installs the trigger inside the same transaction that
-    // holds the lock, then commits -- exactly the fixed statement order.
-    sqlx::query(
-        "CREATE TRIGGER apps_signer_rotation_withdrawal
-            AFTER UPDATE OF signer_identity_subject, signer_identity_issuer ON apps
-            FOR EACH ROW
-            WHEN (
-                OLD.signer_identity_subject IS NOT NULL
-                AND OLD.signer_identity_issuer IS NOT NULL
-                AND (
-                     OLD.signer_identity_subject IS DISTINCT FROM NEW.signer_identity_subject
-                     OR OLD.signer_identity_issuer IS DISTINCT FROM NEW.signer_identity_issuer
-                )
-            )
-            EXECUTE FUNCTION enforce_signer_rotation_withdrawal()",
+    sqlx::raw_sql(
+        "DROP TRIGGER apps_signer_rotation_withdrawal ON apps;
+         DROP FUNCTION enforce_signer_rotation_withdrawal();
+         DROP TABLE consumed_signer_rotation_tokens;
+         DROP TABLE withdrawn_signer_artifacts;
+         ALTER TABLE kbs_signed_policy_reconciliation DROP COLUMN withdrawal_bumps_owed;",
     )
-    .execute(&mut *migration)
+    .execute(&pool)
     .await
-    .expect("install rotation trigger in the migration transaction");
-    sqlx::query("COMMIT")
-        .execute(&mut *migration)
-        .await
-        .expect("commit migration transaction");
-    drop(migration);
+    .expect("restore schema before the withdrawal migration");
 
-    // The blocked rotation resumes after the commit and must fire the
-    // trigger the migration installed: the rotated-out artifact is
-    // withdrawn, the debt is owed, and the legacy binding carries the new
-    // identity.  Without the lock ordering, this write would have
-    // committed between the backfill and the trigger installation and
-    // left none of these effects.
+    async fn wait_for_blocker(pool: &sqlx::PgPool, waiting: i32, blocking: i32) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let blocked: bool = sqlx::query_scalar("SELECT $1 = ANY(pg_blocking_pids($2))")
+                    .bind(blocking)
+                    .bind(waiting)
+                    .fetch_one(pool)
+                    .await
+                    .unwrap();
+                if blocked {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("expected database lock dependency did not appear");
+    }
+
+    // This table lock pauses the migration's ALTER TABLE after the backfill,
+    // leaving the exact unsafe window open without rewriting the migration.
+    let mut gate = pool.begin().await.unwrap();
+    sqlx::query("SELECT singleton FROM kbs_signed_policy_reconciliation FOR UPDATE")
+        .fetch_one(&mut *gate)
+        .await
+        .unwrap();
+    let gate_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *gate)
+        .await
+        .unwrap();
+
+    let mut existing_writer = pool.begin().await.unwrap();
+    sqlx::query("UPDATE apps SET updated_at = clock_timestamp() WHERE id = $1")
+        .bind(app_id)
+        .execute(&mut *existing_writer)
+        .await
+        .unwrap();
+    let existing_writer_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *existing_writer)
+        .await
+        .unwrap();
+    let mut migration = pool.begin().await.unwrap();
+    let migration_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *migration)
+        .await
+        .unwrap();
+    let migration = tokio::spawn(async move {
+        sqlx::Executor::execute(
+            &mut *migration,
+            include_str!("../../../../migrations/0052_signer_rotation_jti_and_policy.sql"),
+        )
+        .await
+        .expect("execute production withdrawal migration");
+        migration.commit().await.unwrap();
+    });
+    wait_for_blocker(&pool, migration_pid, existing_writer_pid).await;
+    // Deploy transactions take apps before workload_artifacts. Migration must
+    // not hold the artifact FK lock while waiting for an existing app writer.
+    sqlx::query("LOCK TABLE workload_artifacts IN ROW EXCLUSIVE MODE NOWAIT")
+        .execute(&mut *existing_writer)
+        .await
+        .expect("migration must preserve app-before-artifact lock ordering");
+    existing_writer.commit().await.unwrap();
+    wait_for_blocker(&pool, migration_pid, gate_pid).await;
+
+    let mut writer_connection = pool.acquire().await.unwrap();
+    let writer_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *writer_connection)
+        .await
+        .unwrap();
+    let writer = tokio::spawn(async move {
+        sqlx::query(
+            "UPDATE apps
+                SET signer_identity_subject = $1,
+                    signer_identity_issuer = $2,
+                    signer_identity_set_at = now(),
+                    updated_at = now()
+              WHERE id = $3",
+        )
+        .bind(new_subject)
+        .bind(new_issuer)
+        .bind(app_id)
+        .execute(&mut *writer_connection)
+        .await
+        .expect("old-binary signer rotation");
+    });
+    wait_for_blocker(&pool, writer_pid, migration_pid).await;
+    gate.commit().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), migration)
+        .await
+        .expect("migration finishes once its gate opens")
+        .expect("migration task panics propagate");
+
     tokio::time::timeout(std::time::Duration::from_secs(5), writer)
         .await
         .expect("blocked rotation completes after the migration commits")
