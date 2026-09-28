@@ -333,8 +333,32 @@ fn canonical_keyring_bytes(keyring: &SignedOrgKeyring) -> Vec<u8> {
 fn db_error() -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(serde_json::json!({"error": "database error"})),
+        Json(serde_json::json!({ "error": "database error" })),
     )
+}
+
+/// #128 review follow-up: decide whether a same-version retry conflicts with
+/// the stored keyring. Legacy rows persisted the request JSON verbatim, so an
+/// extra unsigned field or alternate timestamp formatting makes raw byte
+/// comparison reject an otherwise-identical idempotent retry with a false
+/// 409. Compare parsed canonical keyring content, signature, and signing
+/// pubkey instead; genuinely different signed content still conflicts.
+fn keyring_replay_conflicts(
+    stored_payload: &[u8],
+    stored_signature: &[u8],
+    stored_signing_pubkey: &[u8],
+    canonical_bytes: &[u8],
+    signature: &[u8],
+    signing_pubkey: &[u8],
+) -> bool {
+    let Ok(stored_keyring) = serde_json::from_slice::<SignedOrgKeyring>(stored_payload) else {
+        // A stored payload that no longer parses cannot match any valid
+        // signed retry; fail closed into the conflict branch.
+        return true;
+    };
+    canonical_keyring_bytes(&stored_keyring).as_slice() != canonical_bytes
+        || stored_signature != signature
+        || stored_signing_pubkey != signing_pubkey
 }
 
 fn bad_request(message: &str) -> (StatusCode, Json<serde_json::Value>) {
@@ -531,9 +555,14 @@ pub async fn put_keyring(
             ));
         }
         if body.version == latest_version
-            && (latest_payload != keyring_payload_bytes
-                || latest_signature != signature
-                || latest_signing_pubkey != signing_pubkey)
+            && keyring_replay_conflicts(
+                &latest_payload,
+                &latest_signature,
+                &latest_signing_pubkey,
+                &canonical_bytes,
+                &signature,
+                &signing_pubkey,
+            )
         {
             return Err((
                 StatusCode::CONFLICT,
@@ -649,12 +678,18 @@ pub async fn get_keyring(
     let keyring_payload: serde_json::Value =
         serde_json::from_slice(&payload_bytes).map_err(|_| db_error())?;
     let keyring: SignedOrgKeyring =
-        serde_json::from_value(keyring_payload.clone()).map_err(|_| db_error())?;
+        serde_json::from_value(keyring_payload).map_err(|_| db_error())?;
     let fingerprint = hex::encode(Sha256::digest(canonical_keyring_bytes(&keyring)));
+    // #128 review follow-up (P2): serve the normalized typed keyring, not the
+    // raw row payload. Legacy rows persisted the request JSON verbatim and may
+    // carry extra unsigned fields or alternate timestamp formatting that the
+    // strict deny_unknown_fields envelope parser rejects; a consumer wrapping
+    // this payload in org_keyring_blob must receive the deployable form.
+    let normalized_keyring_payload = serde_json::to_value(&keyring).map_err(|_| db_error())?;
     Ok(Json(OrgKeyringResponse {
         org_id,
         version,
-        keyring_payload,
+        keyring_payload: normalized_keyring_payload,
         signature: hex::encode(signature),
         signing_pubkey: hex::encode(signing_pubkey),
         fingerprint,
@@ -979,10 +1014,14 @@ pub async fn rotate_org_owner(
     .ok_or_else(|| bad_request("org keyring must be uploaded before owner rotation"))?;
 
     let (base_payload, expected_current_owner, insert_new_version) = if body.version == latest.0 {
-        if latest.1 != payload_bytes
-            || latest.2 != keyring_signature
-            || latest.3 != replacement_owner
-        {
+        if keyring_replay_conflicts(
+            &latest.1,
+            &latest.2,
+            &latest.3,
+            &canonical_bytes,
+            &keyring_signature,
+            &replacement_owner,
+        ) {
             return Err((
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({
@@ -1846,7 +1885,13 @@ mod tests {
             "PUT and GET responses must serve the identical normalized keyring"
         );
 
-        let legacy = signed_keyring_request(org_id, user_id, &key, 2, 2);
+        let mut legacy = signed_keyring_request(org_id, user_id, &key, 2, 2);
+        // Legacy writers persisted the request JSON verbatim: the stored row
+        // carries an extra unsigned field, so its raw bytes differ from the
+        // normalized retry bytes even though the canonical signed content,
+        // signature, and signing pubkey are identical. The replay must still
+        // be idempotent (200), not a false 409 (#128 review follow-up).
+        legacy.keyring_payload["future_extension"] = serde_json::json!("legacy-extra");
         sqlx::query(
             "INSERT INTO org_keyrings
                  (org_id, version, keyring_payload, signature, signing_key_id)
@@ -1861,10 +1906,27 @@ mod tests {
         .execute(&pool)
         .await
         .expect("persist a keyring with the pre-normalization writer");
-        let (status, _) = put_keyring(auth, State(state), Path(org_name), Json(legacy))
-            .await
-            .expect("normalization must preserve replay of an existing keyring");
+        let (status, _) = put_keyring(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(legacy),
+        )
+        .await
+        .expect("normalization must preserve replay of an existing keyring");
         assert_eq!(status, StatusCode::OK);
+
+        // GET must serve the normalized deployable form of the legacy row,
+        // stripping the extra unsigned field the old writer persisted (#128
+        // review follow-up, GET path).
+        let legacy_get = get_keyring(auth, State(state), Path(org_name))
+            .await
+            .expect("GET keyring after legacy replay");
+        assert_eq!(legacy_get.version, 2);
+        assert!(
+            legacy_get.keyring_payload.get("future_extension").is_none(),
+            "GET must normalize legacy rows so org_keyring_blob wrapping stays deployable"
+        );
     }
 
     #[tokio::test]
