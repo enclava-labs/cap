@@ -800,6 +800,29 @@ async fn insert_signed_artifact_for_identity(
     subject: &str,
     issuer: &str,
 ) -> Vec<u8> {
+    let descriptor_core_hash: Vec<u8> = (0..32u8).collect();
+    insert_signed_artifact_for_identity_with_hash(
+        pool,
+        org_id,
+        app_id,
+        subject,
+        issuer,
+        &descriptor_core_hash,
+    )
+    .await;
+    descriptor_core_hash
+}
+
+/// [`insert_signed_artifact_for_identity`] with an explicit descriptor hash,
+/// for tests that need several distinct artifacts under one identity.
+async fn insert_signed_artifact_for_identity_with_hash(
+    pool: &sqlx::PgPool,
+    org_id: uuid::Uuid,
+    app_id: uuid::Uuid,
+    subject: &str,
+    issuer: &str,
+    descriptor_core_hash: &[u8],
+) {
     let deploy_id = uuid::Uuid::new_v4();
     sqlx::query(
         "INSERT INTO deployments (id, org_id, app_id, status, spec_snapshot)
@@ -811,7 +834,6 @@ async fn insert_signed_artifact_for_identity(
     .execute(pool)
     .await
     .expect("insert signer rotation deployment");
-    let descriptor_core_hash: Vec<u8> = (0..32u8).collect();
     let descriptor_payload = serde_json::json!({
         "signer_identity": {
             "subject": subject,
@@ -825,7 +847,7 @@ async fn insert_signed_artifact_for_identity(
              org_keyring_payload, org_keyring_signature, signed_policy_artifact
          ) VALUES ($1, $2, $3, $4, $5, 'test-key', '{}'::jsonb, $6, '{}'::jsonb)",
     )
-    .bind(&descriptor_core_hash)
+    .bind(descriptor_core_hash)
     .bind(app_id)
     .bind(deploy_id)
     .bind(&descriptor_payload)
@@ -834,7 +856,6 @@ async fn insert_signed_artifact_for_identity(
     .execute(pool)
     .await
     .expect("insert rotated-out workload artifact");
-    descriptor_core_hash
 }
 
 /// A legacy kbs_tls_bindings row: the Rego render source on unsigned
@@ -1474,6 +1495,217 @@ async fn migration_backfill_repairs_stale_legacy_tls_bindings() {
     );
 
     crate::test_support::drop_isolated_database("cap119_stale_binding_backfill", pool).await;
+}
+
+/// Issue #119 security follow-up: a rotate-back must not resurrect legacy
+/// KBS admission for the rotated-out signer. The B -> A rotation carries A
+/// back into kbs_tls_bindings (the binding tracks the committed identity),
+/// but the A -> B step withdrew A's deployed artifacts and that withdrawal
+/// is durable: the legacy Rego render must fail closed exactly like the
+/// signed selector until a fresh deployment commits a live artifact under A
+/// again. Legacy Rego previously ignored withdrawn_signer_artifacts, so the
+/// burned workload regained access with no new deployment at all.
+#[tokio::test]
+async fn rotate_back_to_withheld_signer_fails_closed_until_a_fresh_artifact() {
+    let (_db_cleanup, pool) =
+        crate::test_support::isolated_database_test_pool("cap119_rotate_back_legacy").await;
+    let subject_a = "https://github.com/acme/retired/.github/workflows/ci.yaml@refs/heads/main";
+    let issuer_a = "https://token.actions.githubusercontent.com";
+    let subject_b = "https://github.com/acme/active/.github/workflows/ci.yaml@refs/heads/main";
+    let issuer_b = "https://new-issuer.example.test";
+    let (org_id, _user_id, app_id) =
+        insert_signer_rotation_app(&pool, Some(subject_a), Some(issuer_a)).await;
+    insert_signed_artifact_for_identity_with_hash(
+        &pool,
+        org_id,
+        app_id,
+        subject_a,
+        issuer_a,
+        &(0..32u8).collect::<Vec<u8>>(),
+    )
+    .await;
+    insert_legacy_tls_binding(&pool, app_id, subject_a, issuer_a).await;
+
+    // Baseline: the live artifact admits the binding.
+    let admitted = crate::kbs::load_legacy_tls_bindings(&pool)
+        .await
+        .expect("load admitted legacy tls bindings");
+    assert_eq!(admitted.len(), 1, "the live signer must start admitted");
+
+    // A -> B, then the rotate-back B -> A. The direct UPDATEs are the exact
+    // statement an old writer runs; migration 0052's trigger performs the
+    // artifact withdrawal and the binding carry on both changes.
+    for (subject, issuer) in [(subject_b, issuer_b), (subject_a, issuer_a)] {
+        sqlx::query(
+            "UPDATE apps
+                SET signer_identity_subject = $1,
+                    signer_identity_issuer  = $2,
+                    signer_identity_set_at  = now(),
+                    updated_at              = now()
+              WHERE id = $3",
+        )
+        .bind(subject)
+        .bind(issuer)
+        .bind(app_id)
+        .execute(&pool)
+        .await
+        .expect("signer rotation via direct sql");
+    }
+
+    // The binding tracks the committed identity ...
+    let (binding_subject, binding_issuer): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT signer_identity_subject, signer_identity_issuer
+           FROM kbs_tls_bindings WHERE app_id = $1",
+    )
+    .bind(app_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load tls binding after the rotate-back");
+    assert_eq!(binding_subject.as_deref(), Some(subject_a));
+    assert_eq!(binding_issuer.as_deref(), Some(issuer_a));
+
+    // ... A's artifact is withdrawn (durably) ...
+    let withdrawn: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM withdrawn_signer_artifacts WHERE app_id = $1")
+            .bind(app_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count withdrawn artifacts after the rotate-back");
+    assert_eq!(
+        withdrawn, 1,
+        "the A -> B rotation must withdraw A's artifact"
+    );
+
+    // ... and the legacy render fails closed: no live artifact under A
+    // exists, so the burned workload must not regain admission.
+    let admitted = crate::kbs::load_legacy_tls_bindings(&pool)
+        .await
+        .expect("load admitted legacy tls bindings after the rotate-back");
+    assert!(
+        admitted.is_empty(),
+        "a rotated-out signer must not regain legacy admission without a fresh artifact, got {admitted:?}"
+    );
+
+    // A fresh deployment under A re-admits the binding.
+    insert_signed_artifact_for_identity_with_hash(
+        &pool,
+        org_id,
+        app_id,
+        subject_a,
+        issuer_a,
+        &(1..33u8).collect::<Vec<u8>>(),
+    )
+    .await;
+    let admitted = crate::kbs::load_legacy_tls_bindings(&pool)
+        .await
+        .expect("load admitted legacy tls bindings after the fresh deployment");
+    assert_eq!(
+        admitted.len(),
+        1,
+        "a fresh artifact under the re-instated signer must restore admission"
+    );
+    assert_eq!(
+        admitted[0].signer_identity_subject.as_deref(),
+        Some(subject_a)
+    );
+
+    crate::test_support::drop_isolated_database("cap119_rotate_back_legacy", pool).await;
+}
+
+/// The withdrawal filter must not over-reach: identities that were never
+/// rotated out still admit immediately (the initial set carries the identity
+/// into an existing legacy binding without waiting for a deployment), and
+/// unsigned (NULL identity) bindings keep rendering exactly as before.
+#[tokio::test]
+async fn never_withdrawn_signer_identities_still_admit_immediately_in_legacy_mode() {
+    let (_db_cleanup, pool) =
+        crate::test_support::isolated_database_test_pool("cap119_legacy_fresh_identity").await;
+
+    // A genuine unsigned install: NULL-identity bindings render unchanged.
+    let (_org_id1, _user_id1, app_id1) = insert_signer_rotation_app(&pool, None, None).await;
+    let suffix1 = app_id1.simple().to_string();
+    sqlx::query(
+        "INSERT INTO kbs_tls_bindings (
+             app_id, binding_key, repository, tag, namespace, service_account,
+             tenant_instance_identity_hash
+         ) VALUES ($1, $2, 'default', 'workload-secret-seed', $3, $4, $5)",
+    )
+    .bind(app_id1)
+    .bind(format!("tls-{}-unsigned", &suffix1[..12]))
+    .bind(format!("cap-{}", &suffix1[..12]))
+    .bind(format!("cap-{}-sa", &suffix1[..12]))
+    .bind("22".repeat(32))
+    .execute(&pool)
+    .await
+    .expect("insert unsigned legacy tls binding");
+
+    // An unsigned-era app whose owner performs the initial signer set: the
+    // fresh identity admits immediately (no artifact and no withdrawal rows
+    // exist for it, so nothing can have been burned under it).
+    let (_org_id2, _user_id2, app_id2) = insert_signer_rotation_app(&pool, None, None).await;
+    let suffix2 = app_id2.simple().to_string();
+    sqlx::query(
+        "INSERT INTO kbs_tls_bindings (
+             app_id, binding_key, repository, tag, namespace, service_account,
+             tenant_instance_identity_hash
+         ) VALUES ($1, $2, 'default', 'workload-secret-seed', $3, $4, $5)",
+    )
+    .bind(app_id2)
+    .bind(format!("tls-{}-initial", &suffix2[..12]))
+    .bind(format!("cap-{}", &suffix2[..12]))
+    .bind(format!("cap-{}-sa", &suffix2[..12]))
+    .bind("33".repeat(32))
+    .execute(&pool)
+    .await
+    .expect("insert unsigned-era legacy tls binding");
+    let fresh_subject = "https://github.com/acme/fresh/.github/workflows/ci.yaml@refs/heads/main";
+    let fresh_issuer = "https://fresh-issuer.example.test";
+    sqlx::query(
+        "UPDATE apps
+            SET signer_identity_subject = $1,
+                signer_identity_issuer  = $2,
+                signer_identity_set_at  = now(),
+                updated_at              = now()
+          WHERE id = $3",
+    )
+    .bind(fresh_subject)
+    .bind(fresh_issuer)
+    .bind(app_id2)
+    .execute(&pool)
+    .await
+    .expect("initial signer set via direct sql");
+
+    let admitted = crate::kbs::load_legacy_tls_bindings(&pool)
+        .await
+        .expect("load admitted legacy tls bindings");
+    let mut admitted_keys: Vec<String> = admitted
+        .iter()
+        .map(|binding| binding.binding_key.clone())
+        .collect();
+    admitted_keys.sort();
+    let mut expected_keys = vec![
+        format!("tls-{}-unsigned", &suffix1[..12]),
+        format!("tls-{}-initial", &suffix2[..12]),
+    ];
+    expected_keys.sort();
+    assert_eq!(
+        admitted_keys, expected_keys,
+        "unsigned bindings and never-withdrawn identities must both render"
+    );
+    let initial_binding = admitted
+        .iter()
+        .find(|binding| binding.binding_key == format!("tls-{}-initial", &suffix2[..12]))
+        .expect("the initial-set binding must be admitted");
+    assert_eq!(
+        initial_binding.signer_identity_subject.as_deref(),
+        Some(fresh_subject)
+    );
+    assert_eq!(
+        initial_binding.signer_identity_issuer.as_deref(),
+        Some(fresh_issuer)
+    );
+
+    crate::test_support::drop_isolated_database("cap119_legacy_fresh_identity", pool).await;
 }
 
 // Pause the production migration after its backfill, before trigger installation.

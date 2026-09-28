@@ -105,17 +105,17 @@ struct KbsOwnerBinding {
 }
 
 #[derive(Debug, Clone, Deserialize, sqlx::FromRow)]
-struct KbsTlsBinding {
-    binding_key: String,
-    repository: String,
-    tag: String,
-    image_digest: Option<String>,
-    init_data_hash: Option<Vec<u8>>,
-    signer_identity_subject: Option<String>,
-    signer_identity_issuer: Option<String>,
-    namespace: String,
-    service_account: String,
-    tenant_instance_identity_hash: String,
+pub(crate) struct KbsTlsBinding {
+    pub(crate) binding_key: String,
+    pub(crate) repository: String,
+    pub(crate) tag: String,
+    pub(crate) image_digest: Option<String>,
+    pub(crate) init_data_hash: Option<Vec<u8>>,
+    pub(crate) signer_identity_subject: Option<String>,
+    pub(crate) signer_identity_issuer: Option<String>,
+    pub(crate) namespace: String,
+    pub(crate) service_account: String,
+    pub(crate) tenant_instance_identity_hash: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -336,6 +336,65 @@ pub async fn soft_delete_tls_binding(
     Ok(())
 }
 
+/// TLS bindings the legacy Rego render may publish.
+///
+/// Withdrawal is durable: a rotated-out signer's artifacts stay revoked and
+/// rolling back to a withdrawn artifact intentionally fails closed. The
+/// legacy render admits identities straight from `kbs_tls_bindings`, so a
+/// rotate-back (A -> B -> A) would otherwise re-admit the exact workload
+/// whose artifacts were burned at the A -> B step -- without any new
+/// deployment -- while the signed selector keeps that workload revoked.
+/// Suppress such a binding until a fresh deployment commits a live
+/// (non-withdrawn) artifact under that identity again: `ensure_tls_binding`
+/// upserts the row at deployment time and the next render converges.
+/// Identities that were never rotated out (the initial set, a first
+/// rotation) still admit immediately, matching the binding-tracking rule
+/// migration 0052's trigger enforces, and unsigned (NULL identity)
+/// bindings never match the artifact predicates below, so they render
+/// exactly as before.
+pub(crate) async fn load_legacy_tls_bindings(
+    db: &PgPool,
+) -> Result<Vec<KbsTlsBinding>, KbsPolicyError> {
+    let bindings: Vec<KbsTlsBinding> = sqlx::query_as(
+        "SELECT binding_key, repository, tag, namespace, service_account,
+                tenant_instance_identity_hash, image_digest, init_data_hash,
+                signer_identity_subject, signer_identity_issuer
+         FROM kbs_tls_bindings AS binding
+         WHERE deleted_at IS NULL
+           AND NOT (
+                EXISTS (
+                    SELECT 1
+                      FROM withdrawn_signer_artifacts AS withdrawn
+                      JOIN workload_artifacts AS artifact
+                        ON artifact.descriptor_core_hash = withdrawn.descriptor_core_hash
+                     WHERE artifact.app_id = binding.app_id
+                       AND artifact.descriptor_payload -> 'signer_identity' ->> 'subject'
+                           = binding.signer_identity_subject
+                       AND artifact.descriptor_payload -> 'signer_identity' ->> 'issuer'
+                           = binding.signer_identity_issuer
+                )
+                AND NOT EXISTS (
+                    SELECT 1
+                      FROM workload_artifacts AS artifact
+                     WHERE artifact.app_id = binding.app_id
+                       AND artifact.descriptor_payload -> 'signer_identity' ->> 'subject'
+                           = binding.signer_identity_subject
+                       AND artifact.descriptor_payload -> 'signer_identity' ->> 'issuer'
+                           = binding.signer_identity_issuer
+                       AND NOT EXISTS (
+                           SELECT 1
+                             FROM withdrawn_signer_artifacts AS withdrawn
+                            WHERE withdrawn.descriptor_core_hash = artifact.descriptor_core_hash
+                       )
+                )
+           )
+         ORDER BY binding_key",
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(bindings)
+}
+
 /// Recheck signed authority on each CAS retry so a concurrent signed acceptance
 /// fences legacy writers.
 async fn reconcile_legacy_rego_policy_with_client(
@@ -352,16 +411,10 @@ async fn reconcile_legacy_rego_policy_with_client(
     )
     .fetch_all(db)
     .await?;
-    let tls_bindings: Vec<KbsTlsBinding> = sqlx::query_as(
-        "SELECT binding_key, repository, tag, namespace, service_account,
-                tenant_instance_identity_hash, image_digest, init_data_hash,
-                signer_identity_subject, signer_identity_issuer
-         FROM kbs_tls_bindings
-         WHERE deleted_at IS NULL
-         ORDER BY binding_key",
-    )
-    .fetch_all(db)
-    .await?;
+    // Suppressed while a rotated-out signer's artifacts are all withdrawn
+    // and no fresh deployment has committed a live artifact under the
+    // binding's identity (see load_legacy_tls_bindings).
+    let tls_bindings = load_legacy_tls_bindings(db).await?;
 
     let cm_api: Api<ConfigMap> = Api::namespaced(client.clone(), &config.namespace);
     for _ in 0..KUBERNETES_CAS_ATTEMPTS {
