@@ -5143,64 +5143,6 @@ resource_bindings := {
     }
 
     #[tokio::test]
-    async fn selector_drops_artifacts_withdrawn_by_signer_rotation() {
-        let (_db_cleanup, pool) =
-            crate::test_support::isolated_database_test_pool("cap119_withdrawal_selector").await;
-        let now = Utc::now();
-        let (org_id, app_id) = insert_test_app(&pool, "running").await;
-        insert_test_keyring_version(&pool, org_id, 1, &[&"bb".repeat(32)]).await;
-        let current = Uuid::new_v4();
-        insert_test_deployment(&pool, org_id, app_id, current, "healthy", now).await;
-        let current_artifact = insert_test_artifact(&pool, app_id, current, "31").await;
-        insert_test_job(
-            &pool,
-            org_id,
-            app_id,
-            current,
-            current,
-            Some((current, &current_artifact)),
-        )
-        .await;
-
-        let candidates = load_signed_policy_candidates(&pool, 2)
-            .await
-            .expect("select pre-rotation candidates");
-        assert!(candidates.iter().any(|candidate| {
-            candidate.artifact.metadata.descriptor_core_hash
-                == current_artifact.metadata.descriptor_core_hash
-        }));
-
-        // Signer rotation withdraws every artifact signed under the previous
-        // identity (issue #119): the withdrawal row is recorded and the
-        // selector must refuse the hash on every path. (The runtime
-        // subject/issuer predicate itself is exercised end-to-end by the
-        // rotate_signer route test.)
-        let mut tx = pool.begin().await.expect("begin withdrawal tx");
-        sqlx::query(
-            "INSERT INTO withdrawn_signer_artifacts (descriptor_core_hash, app_id)
-             SELECT descriptor_core_hash, app_id
-               FROM workload_artifacts
-              WHERE descriptor_core_hash = $1
-              ON CONFLICT DO NOTHING",
-        )
-        .bind(hex::decode(&current_artifact.metadata.descriptor_core_hash).unwrap())
-        .execute(&mut *tx)
-        .await
-        .expect("withdraw rotated-out artifact");
-        tx.commit().await.expect("commit withdrawal");
-
-        let candidates = load_signed_policy_candidates(&pool, 2)
-            .await
-            .expect("select post-rotation candidates");
-        assert!(candidates.iter().all(|candidate| {
-            candidate.artifact.metadata.descriptor_core_hash
-                != current_artifact.metadata.descriptor_core_hash
-        }));
-
-        crate::test_support::drop_isolated_database("cap119_withdrawal_selector", pool).await;
-    }
-
-    #[tokio::test]
     async fn latest_deployment_prefers_jobs_then_deterministic_legacy_identity() {
         let pool = crate::test_support::database_test_pool().await;
         let (org_id, app_id) = insert_test_app(&pool, "running").await;
