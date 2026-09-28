@@ -869,6 +869,20 @@ pub async fn reconcile_signed_policy_once(
     Ok(())
 }
 
+/// Call after releasing the org transaction: publication claims the global KBS
+/// fence, and missing provider configuration must not hide an active revocation.
+pub async fn confirm_keyring_kbs_publication(
+    state: &crate::state::AppState,
+) -> Result<(), KbsPolicyReconciliationError> {
+    if !signed_policy_mode_active(&state.db).await? {
+        return Ok(());
+    }
+    if state.kbs_policy.is_none() {
+        return Err(KbsPolicyError::NotConfigured.into());
+    }
+    reconcile_signed_policy_once(state).await
+}
+
 /// Converge KBS authority before readiness or deployment dispatch.
 ///
 /// Another starting replica may briefly own the global fence, so startup
@@ -921,9 +935,24 @@ async fn reconcile_pending_signed_policy_artifacts_inner(
     config: &KbsPolicyConfig,
     expected_artifact: Option<&crate::signing_service::SignedPolicyArtifact>,
 ) -> Result<(), KbsPolicyError> {
-    let client = kube::Client::try_default().await?;
+    let client = reconcile_kube_client().await?;
     reconcile_pending_signed_policy_artifacts_with_client(db, config, expected_artifact, client)
         .await
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static TEST_KUBE_CLIENT: kube::Client;
+}
+
+async fn reconcile_kube_client() -> Result<kube::Client, KbsPolicyError> {
+    #[cfg(test)]
+    if let Ok(client) = TEST_KUBE_CLIENT.try_with(Clone::clone) {
+        return Ok(client);
+    }
+    kube::Client::try_default()
+        .await
+        .map_err(KbsPolicyError::Kube)
 }
 
 async fn reconcile_pending_signed_policy_artifacts_with_client(

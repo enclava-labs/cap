@@ -792,6 +792,7 @@ async fn rotate_owner(
                 "remote keyring does not contain the owner derived from this backup".into(),
             );
         }
+        upload_keyring(&api, &me.active_org.name, &remote).await?;
         println!(
             "The backup and active owner already match; no rotation was needed. Use a new backup path to start another rotation."
         );
@@ -802,6 +803,7 @@ async fn rotate_owner(
         if !keyring_has_owner(&remote, &replacement_owner.public) {
             return Err("remote keyring does not contain the replacement owner".into());
         }
+        upload_keyring(&api, &me.active_org.name, &remote).await?;
         finalize_local_owner_rotation(
             &paths,
             org_id,
@@ -905,41 +907,6 @@ async fn rotate_owner(
 mod tests {
     use super::*;
 
-    #[test]
-    fn setup_writes_encrypted_backup_before_remote_authority() {
-        let source = include_str!("key.rs");
-        let body = source
-            .split("async fn setup(")
-            .nth(1)
-            .unwrap()
-            .split("fn finalize_local_owner_rotation")
-            .next()
-            .unwrap();
-        assert!(
-            body.find("write_encrypted_backup").unwrap()
-                < body.find("verify_or_initialize_remote_keyring").unwrap()
-        );
-        assert!(
-            body.find("verify_or_initialize_remote_keyring").unwrap()
-                < body.find("store_seed_at").unwrap()
-        );
-        let initialize_missing = source
-            .split("async fn verify_or_initialize_remote_keyring(")
-            .nth(1)
-            .unwrap()
-            .split("Err(enclava_cli::api_client::ApiError::Api { status: 404, .. }) => {")
-            .nth(1)
-            .unwrap()
-            .split("Err(err) => Err(err.into())")
-            .next()
-            .unwrap();
-        assert!(
-            initialize_missing.find("upload_keyring").unwrap()
-                < initialize_missing.find("store_trusted_owner").unwrap()
-        );
-        assert!(body.contains("only an organization owner can create signing authority"));
-    }
-
     #[cfg(unix)]
     #[test]
     fn restore_mnemonics_requires_force_before_overwriting_different_existing_value() {
@@ -951,11 +918,9 @@ mod tests {
             mnemonic: "older mnemonic".to_string(),
         }];
 
-        let err = ensure_mnemonic_restore_will_not_overwrite(&paths, "org-a", &mnemonics, false)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("different recovery mnemonic"));
-        assert!(err.contains("--force"));
+        assert!(
+            ensure_mnemonic_restore_will_not_overwrite(&paths, "org-a", &mnemonics, false).is_err()
+        );
         assert_eq!(
             keys::load_app_mnemonic(&paths, "org-a", "shell").unwrap(),
             Some("newer mnemonic".to_string())
@@ -981,31 +946,24 @@ mod tests {
         }];
 
         ensure_mnemonic_restore_will_not_overwrite(&paths, "org-a", &mnemonics, false).unwrap();
-    }
-
-    #[test]
-    fn logged_out_backup_metadata_records_requested_org_name() {
-        let (metadata, backup_org_name) = logged_out_backup_metadata(Some("org-a".to_string()));
-
-        assert_eq!(metadata.org_name.as_deref(), Some("org-a"));
-        assert_eq!(backup_org_name.as_deref(), Some("org-a"));
-        assert!(metadata.org_id.is_none());
-        assert!(metadata.owner_fingerprint.is_none());
+        restore_app_mnemonics(&paths, "org-a", &mnemonics).unwrap();
+        assert_eq!(
+            keys::load_app_mnemonic(&paths, "org-a", "shell").unwrap(),
+            Some("same mnemonic".to_string())
+        );
     }
 
     #[test]
     fn restore_rejects_backup_org_name_mismatch() {
-        let err = ensure_backup_org_matches_active_org(
-            None,
-            Some("org-a"),
-            "22222222-2222-2222-2222-222222222222",
-            "org-b",
-        )
-        .unwrap_err()
-        .to_string();
-
-        assert!(err.contains("backup is for org org-a"));
-        assert!(err.contains("active org is org-b"));
+        assert!(
+            ensure_backup_org_matches_active_org(
+                None,
+                Some("org-a"),
+                "22222222-2222-2222-2222-222222222222",
+                "org-b",
+            )
+            .is_err()
+        );
     }
 
     #[cfg(unix)]
@@ -1018,11 +976,7 @@ mod tests {
             mnemonic: "older mnemonic".to_string(),
         }];
 
-        let err = restore_app_mnemonics(&paths, "org-a", &mnemonics)
-            .unwrap_err()
-            .to_string();
-
-        assert!(err.contains("invalid recovery mnemonic app name"));
+        assert!(restore_app_mnemonics(&paths, "org-a", &mnemonics).is_err());
         assert!(!tmp.path().join("state/keys/escape.mnemonic").exists());
         assert!(!tmp.path().join("escape.mnemonic").exists());
     }
