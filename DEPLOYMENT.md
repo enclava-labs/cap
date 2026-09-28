@@ -437,6 +437,10 @@ stored, retries wait for that rollout without creating another generation.
 Both legacy and signed publication wait for old replicas to leave and all
 updated replicas to become available. A changed ConfigMap or signed-authority
 handoff during confirmation must be reconciled before success is returned.
+Apply canonical signed-content keyring replay handling before this CLI
+update: historical payload encodings must not turn an exact signed replay
+into a conflict.
+
 
 ## Smoke Checks
 
