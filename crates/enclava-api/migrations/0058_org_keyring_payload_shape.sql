@@ -25,6 +25,18 @@
 -- escape -- accepted by serde_json, unrepresentable in jsonb -- could be
 -- stored by any binary running before the handler guard added in this PR.
 --
+-- Take ACCESS EXCLUSIVE on org_keyrings BEFORE inspecting/deleting (review
+-- finding): this migration runs in the rollout step while a pre-0058 replica
+-- may still be live, and its unguarded writer can INSERT a NUL payload that
+-- races this transaction -- a row committed between the DELETE below and
+-- ADD CONSTRAINT's scan would abort the migration and stall the rollout.
+-- The lock makes concurrent keyring INSERTs (RowExclusive) wait until this
+-- transaction commits; they then evaluate against the new CHECK and fail
+-- cleanly there, which is the bounded, drain-contract-delimited behavior
+-- for old-binary writers.  Keyring reads (the old reconciler's selector)
+-- block only for the duration of this migration transaction.
+LOCK TABLE org_keyrings IN ACCESS EXCLUSIVE MODE;
+--
 -- Blast radius rule (follow-up review finding): keyrings retain every
 -- version and the selector treats the highest surviving version as the
 -- current authority, so deleting ONLY a malformed row could promote an
@@ -45,8 +57,12 @@
 --     stays current, nothing is promoted), so the live keyring and the
 --     audit-retained valid versions are preserved and only the bad rows go.
 --
--- A RAISE NOTICE records both cases per org for operators, since the row
--- loss is silent otherwise.
+-- A RAISE NOTICE records both cases per org for operators, and every row
+-- the repair removes is copied verbatim into org_keyring_repairs (payload,
+-- signature, signing key, original created_at) before the DELETE: NOTICEs
+-- evaporate with the migration log, while an operator restoring an org
+-- whose only keyring was removed needs the exact affected org/version/
+-- payload recorded durably (review finding).
 --
 -- The helper swallows parse errors via an EXCEPTION block because the bare
 -- cast would raise, not return false, and SQL does not guarantee OR
@@ -97,15 +113,37 @@ BEGIN
          GROUP BY org_id
     LOOP
         IF affected.quarantined THEN
-            RAISE NOTICE 'migration 0058: malformed CURRENT keyring for org % (versions % present); dropping ALL of this org''s keyring rows -- no older generation may be promoted; the org must upload a fresh owner-signed keyring',
+            RAISE NOTICE 'migration 0058: malformed CURRENT keyring for org % (versions % present); dropping ALL of this org''s keyring rows -- no older generation may be promoted; the org must upload a fresh owner-signed keyring (originals archived in org_keyring_repairs)',
                 affected.org_id, affected.versions;
         ELSE
-            RAISE NOTICE 'migration 0058: dropping malformed historical keyring rows for org % (versions %); the clean current version is untouched',
+            RAISE NOTICE 'migration 0058: dropping malformed historical keyring rows for org % (versions %); the clean current version is untouched (dropped originals archived in org_keyring_repairs)',
                 affected.org_id, affected.versions;
         END IF;
     END LOOP;
 END;
 $$;
+
+-- Durable repair record: one row per removed keyring generation, in the
+-- exact set the DELETE below removes (same predicate, same snapshot).
+-- signing_key_id is deliberately not a foreign key -- this is provenance
+-- data for operator restores and must not block user_signing_keys cleanup.
+CREATE TABLE org_keyring_repairs (
+    org_id          uuid NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    version         bigint NOT NULL,
+    keyring_payload bytea NOT NULL,
+    signature       bytea NOT NULL,
+    signing_key_id  uuid,
+    created_at      timestamptz NOT NULL,
+    repaired_at     timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (org_id, version)
+);
+
+INSERT INTO org_keyring_repairs
+    (org_id, version, keyring_payload, signature, signing_key_id, created_at)
+SELECT org_id, version, keyring_payload, signature, signing_key_id, created_at
+  FROM org_keyrings
+ WHERE org_id IN (SELECT org_id FROM org_keyrings_shape_quarantined)
+    OR NOT org_keyrings_payload_matches_shape(keyring_payload);
 
 DELETE FROM org_keyrings
  WHERE org_id IN (SELECT org_id FROM org_keyrings_shape_quarantined)
