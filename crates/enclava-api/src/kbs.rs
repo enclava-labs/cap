@@ -778,17 +778,20 @@ async fn load_signed_policy_candidates(
             JOIN workload_artifacts AS artifact
               ON artifact.app_id = legacy.app_id
              AND artifact.deploy_id = legacy.deployment_id
-            JOIN current_keyring_members AS member
-              -- Case-insensitive membership join: see the comment at the
-              -- job_artifact_candidates join above.
-              ON member.org_id = legacy.org_id
-             AND lower(member.pubkey) = lower(
-                 artifact.signed_policy_artifact
-                     ->'metadata'->>'descriptor_signing_pubkey'
-             )
             WHERE legacy.current_operation_rank = 1
               AND legacy.app_status IN ('creating', 'running')
               AND legacy.deployment_status = 'healthy'
+              -- Repeated or case-equivalent member keys must not duplicate an
+              -- artifact and exhaust the serialized policy budget.
+              AND EXISTS (
+                  SELECT 1
+                    FROM current_keyring_members AS member
+                   WHERE member.org_id = legacy.org_id
+                     AND lower(member.pubkey) = lower(
+                         artifact.signed_policy_artifact
+                             ->'metadata'->>'descriptor_signing_pubkey'
+                     )
+              )
         ),
         selected AS (
             SELECT *
@@ -3650,6 +3653,52 @@ resource_bindings := {
                 .expect("delete keyring rotation fixture user");
         }
         crate::test_support::drop_isolated_database("cap130_selector_rotation", pool).await;
+    }
+
+    #[tokio::test]
+    async fn duplicate_keyring_members_authorize_each_legacy_artifact_once() {
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_pr187_duplicate_members").await;
+        let (org_id, app_id) = insert_test_app(&pool, "running").await;
+        let legacy = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, legacy, "healthy", Utc::now()).await;
+        let artifact = insert_test_artifact(&pool, app_id, legacy, "77").await;
+        let signer = "bb".repeat(32);
+        // The same member key twice: once lowercase, once in the uppercase
+        // spelling validation accepts and stores as-is.
+        insert_test_keyring_version(&pool, org_id, 1, &[&signer, &signer.to_uppercase()]).await;
+
+        let candidates = load_signed_policy_candidates(&pool, 1)
+            .await
+            .expect("select candidates with duplicate member keys");
+        let matching: Vec<_> = candidates
+            .iter()
+            .filter(|candidate| {
+                candidate.artifact.metadata.descriptor_core_hash
+                    == artifact.metadata.descriptor_core_hash
+            })
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "repeated member keys must not duplicate the authorized legacy artifact"
+        );
+        assert!(matching[0].required);
+
+        let single_body_len =
+            signed_policy_artifact_policy_body(std::slice::from_ref(&matching[0].artifact))
+                .unwrap()
+                .len();
+        let selected =
+            select_signed_policy_artifacts_for_policy_body(candidates, single_body_len + 32)
+                .unwrap();
+        assert_eq!(
+            selected.len(),
+            1,
+            "the repeated member key must not spuriously exhaust the serialized policy budget"
+        );
+
+        crate::test_support::drop_isolated_database("cap_pr187_duplicate_members", pool).await;
     }
 
     /// Fail closed for #130: an org with retained artifacts but no keyring row
