@@ -999,7 +999,7 @@ async fn derive_rotation_path(
     canonical_bytes: &[u8],
     keyring_signature: &[u8; 64],
     replacement_owner: &[u8; 32],
-) -> Result<(Vec<u8>, Vec<u8>, bool), (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Option<(Vec<u8>, Vec<u8>, bool)>, (StatusCode, Json<serde_json::Value>)> {
     if body_version == latest.0 {
         if keyring_replay_conflicts(
             &latest.1,
@@ -1016,7 +1016,7 @@ async fn derive_rotation_path(
                 })),
             ));
         }
-        let previous: (Vec<u8>, Vec<u8>) = sqlx::query_as(
+        let previous: Option<(Vec<u8>, Vec<u8>)> = sqlx::query_as(
             "SELECT ok.keyring_payload, usk.pubkey
                FROM org_keyrings ok
                JOIN user_signing_keys usk ON usk.id = ok.signing_key_id
@@ -1026,9 +1026,16 @@ async fn derive_rotation_path(
         .bind(body_version - 1)
         .fetch_optional(&mut **tx)
         .await
-        .map_err(|_| db_error())?
-        .ok_or_else(|| bad_request("previous keyring authority is unavailable"))?;
-        Ok((previous.0, previous.1, false))
+        .map_err(|_| db_error())?;
+        let Some(previous) = previous else {
+            // Predecessor pruned (e.g. by migration 0058's repair pass)
+            // while the committed rotation itself is intact and matches
+            // this request byte-for-byte: confirm the replay without
+            // re-deriving validations that were enforced at commit time
+            // and without re-driving the signing service.
+            return Ok(None);
+        };
+        Ok(Some((previous.0, previous.1, false)))
     } else if body_version == latest.0 + 1 {
         Ok((latest.1, latest.3, true))
     } else if body_version < latest.0 {
@@ -1355,16 +1362,28 @@ pub async fn rotate_org_owner(
         scopes::lock_and_read_active_membership_role_in_tx(&mut tx, org_id, auth.user_id).await?;
     scopes::require_owner_role(current_role)?;
     let (latest, version_created_at_floor) = read_rotation_authority(&mut tx, org_id).await?;
-    let (base_payload, expected_current_owner, insert_new_version) = derive_rotation_path(
-        &mut tx,
-        org_id,
-        body.version,
-        latest,
-        &canonical_bytes,
-        &keyring_signature,
-        &replacement_owner,
-    )
-    .await?;
+    let Some((base_payload, expected_current_owner, insert_new_version)) =
+        derive_rotation_path(
+            &mut tx,
+            org_id,
+            body.version,
+            latest,
+            &canonical_bytes,
+            &keyring_signature,
+            &replacement_owner,
+        )
+        .await?
+    else {
+        // Predecessor-less replay of an intact committed rotation: the
+        // content equality checks inside derive_rotation_path already
+        // proved this request matches the committed row byte-for-byte.
+        return Ok(Json(RotateOrgOwnerResponse {
+            org_id,
+            state: "ready",
+            keyring_version: body.version,
+            owner_fingerprint: hex::encode(Sha256::digest(replacement_owner)),
+        }));
+    };
     if expected_current_owner.as_slice() != current_owner.as_slice() {
         return Err(bad_request(
             "rotation signer does not match the current pinned owner",
@@ -1558,27 +1577,40 @@ pub async fn rotate_org_owner(
         scopes::lock_and_read_active_membership_role_in_tx(&mut tx, org_id, auth.user_id).await?;
     scopes::require_owner_role(current_role)?;
     let (latest, version_created_at_floor) = read_rotation_authority(&mut tx, org_id).await?;
-    let (base_payload, expected_current_owner, insert_new_version) = derive_rotation_path(
-        &mut tx,
-        org_id,
-        body.version,
-        latest,
-        &canonical_bytes,
-        &keyring_signature,
-        &replacement_owner,
-    )
-    .await?;
+    let Some((base_payload, expected_current_owner, insert_new_version)) =
+        derive_rotation_path(
+            &mut tx,
+            org_id,
+            body.version,
+            latest,
+            &canonical_bytes,
+            &keyring_signature,
+            &replacement_owner,
+        )
+        .await?
+    else {
+        // Predecessor-less replay of an intact committed rotation (see
+        // phase 1): the byte-for-byte equality checks already confirmed
+        // this request against the committed row.
+        tx.commit().await.map_err(|_| db_error())?;
+        return Ok(Json(RotateOrgOwnerResponse {
+            org_id,
+            state: "ready",
+            keyring_version: body.version,
+            owner_fingerprint: hex::encode(Sha256::digest(replacement_owner)),
+        }));
+    };
     if expected_current_owner.as_slice() != current_owner.as_slice() {
         return Err(bad_request(
             "rotation signer does not match the current pinned owner",
         ));
-        // Owner rotation can remove the signer of retained signed policy
-        // artifacts still inside the KBS retention window (#130).  As with
-        // put_keyring, the owed generation bump is recorded by migration
-        // 0058's org_keyrings INSERT trigger inside this transaction -- a
-        // direct desired_generation bump here could be consumed by a
-        // pre-0058 replica's unfiltered reconciler during the rollout.
     }
+    // Owner rotation can remove the signer of retained signed policy
+    // artifacts still inside the KBS retention window (#130).  As with
+    // put_keyring, the owed generation bump is recorded by migration
+    // 0058's org_keyrings INSERT trigger inside this transaction -- a
+    // direct desired_generation bump here could be consumed by a
+    // pre-0058 replica's unfiltered reconciler during the rollout.
 
     let owner_status = read_live_service_owner(signing_service, org_id).await?;
     let service_owner = service_owner_pubkey(&owner_status);
@@ -4798,20 +4830,21 @@ mod tests {
             reason,
         );
         let rotation_signature = key.sign(&directive);
+        let rotation_request = RotateOrgOwnerRequest {
+            version: 2,
+            keyring_payload: keyring_payload.clone(),
+            signature: hex::encode(keyring_signature.to_bytes()),
+            replacement_signing_pubkey: hex::encode(replacement_pubkey),
+            current_signing_pubkey: hex::encode(key.verifying_key().to_bytes()),
+            signed_at,
+            reason: reason.to_string(),
+            rotation_signature: hex::encode(rotation_signature.to_bytes()),
+        };
         let rotated = rotate_org_owner(
-            auth,
-            State(state),
+            auth.clone(),
+            State(state.clone()),
             Path(org_name.clone()),
-            Json(RotateOrgOwnerRequest {
-                version: 2,
-                keyring_payload,
-                signature: hex::encode(keyring_signature.to_bytes()),
-                replacement_signing_pubkey: hex::encode(replacement_pubkey),
-                current_signing_pubkey: hex::encode(key.verifying_key().to_bytes()),
-                signed_at,
-                reason: reason.to_string(),
-                rotation_signature: hex::encode(rotation_signature.to_bytes()),
-            }),
+            Json(rotation_request.clone()),
         )
         .await
         .expect("rotate owner enqueues reconciliation");
@@ -4840,6 +4873,38 @@ mod tests {
                 .expect("read latest keyring version");
         assert_eq!(latest_version, 2);
         assert_eq!(rotated.0.state, "ready");
+
+        // Review follow-up (Devin BUG on the repair pass): the v1
+        // predecessor row can be pruned by migration 0058's repair pass
+        // (e.g. a malformed historical payload) while the committed v2
+        // rotation stays intact.  Replaying the identical request after
+        // that prune must still confirm the rotation, not fail with
+        // "previous keyring authority is unavailable".
+        sqlx::query("DELETE FROM org_keyrings WHERE org_id = $1 AND version = 1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("prune predecessor keyring row");
+        let replayed = rotate_org_owner(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(rotation_request),
+        )
+        .await
+        .expect("replay after predecessor prune must confirm the rotation");
+        assert_eq!(replayed.0.state, "ready");
+        assert_eq!(replayed.0.keyring_version, 2);
+        let versions_after_replay: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM org_keyrings WHERE org_id = $1")
+                .bind(org_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count keyring rows after replay");
+        assert_eq!(
+            versions_after_replay, 1,
+            "replay must not insert a duplicate row"
+        );
 
         mock.abort();
         sqlx::query("DELETE FROM audit_log WHERE org_id = $1")
