@@ -1027,7 +1027,35 @@ pub async fn rotate_org_owner(
             // while the committed rotation itself is intact and matches
             // this request byte-for-byte: confirm the replay without
             // re-deriving validations that were enforced at commit time
-            // and without re-driving the signing service.
+            // and without re-driving the rotation itself.  The signing
+            // service side of the commit is still confirmed: a replay
+            // must not report `ready` while the service owner has
+            // drifted away from the committed rotation or is unreachable
+            // (same contract as the non-pruned replay path below).
+            let signing_service = state.signing_service.as_ref().ok_or((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "platform signing service is not configured"
+                })),
+            ))?;
+            let owner_status = signing_service
+                .owner_status(org_id)
+                .await
+                .map_err(crate::routes::deployments::signing_error_response)?;
+            let service_owner = owner_status
+                .owner_pubkey_hex
+                .as_deref()
+                .and_then(|raw| hex::decode(raw).ok());
+            if owner_status.org_id != org_id
+                || owner_status.state != "ready"
+                || service_owner.as_deref() != Some(replacement_owner.as_slice())
+            {
+                return Err(crate::routes::deployments::signing_error_response(
+                    crate::signing_service::SigningServiceError::AuthorityStatus(
+                        "signing service owner does not match the committed rotation".to_string(),
+                    ),
+                ));
+            }
             return Ok(Json(RotateOrgOwnerResponse {
                 org_id,
                 state: "ready",
@@ -1426,6 +1454,7 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use ed25519_dalek::{Signer, SigningKey};
     use rand::rngs::OsRng;
+    use std::sync::{Arc, Mutex};
 
     #[tokio::test]
     async fn create_org_rejects_non_dns_safe_names_before_database_access() {
@@ -1955,21 +1984,32 @@ mod tests {
         let address = listener.local_addr().expect("mock signing service address");
         let replacement_hex = hex::encode(replacement_key.verifying_key().to_bytes());
         let org_id_for_mock = org_id;
-        let mock = tokio::spawn(async move {
-            use axum::{Json, routing::get};
-            let app = axum::Router::new().route(
+        // Test knob for the pruned-predecessor replay checks below: when
+        // Some, the mock reports that (drifted) key instead of the
+        // committed replacement owner.
+        let drift_pubkey_hex: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let mock = tokio::spawn({
+            let drift_pubkey_hex = drift_pubkey_hex.clone();
+            async move {
+                use axum::{Json, routing::get};
+                let app = axum::Router::new().route(
                 "/orgs/{org_id}/owner",
                 get(move || async move {
+                    let owner_hex = drift_pubkey_hex
+                        .lock()
+                        .expect("drift knob lock")
+                        .clone();
                     Json(serde_json::json!({
                         "org_id": org_id_for_mock,
                         "state": "ready",
                         "version": 2,
-                        "owner_pubkey_hex": replacement_hex,
+                        "owner_pubkey_hex": owner_hex.unwrap_or_else(|| replacement_hex.clone()),
                         "last_changed_at": null,
                     }))
                 }),
             );
-            axum::serve(listener, app).await.expect("serve mock");
+                axum::serve(listener, app).await.expect("serve mock");
+            }
         });
         state.signing_service = Some(
             crate::signing_service::SigningServiceClient::new(format!("http://{address}"), None)
@@ -2071,7 +2111,7 @@ mod tests {
             auth.clone(),
             State(state.clone()),
             Path(org_name.clone()),
-            Json(rotation_request),
+            Json(rotation_request.clone()),
         )
         .await
         .expect("replay after predecessor prune must confirm the rotation");
@@ -2087,6 +2127,65 @@ mod tests {
             versions_after_replay, 1,
             "replay must not insert a duplicate row"
         );
+
+        // Review follow-up (Devin BUG on the pruned replay branch): the
+        // pruned-predecessor replay must still confirm the signing
+        // service side of the committed rotation.  A service owner that
+        // has drifted back to the old key must fail the replay instead
+        // of reporting `ready`.
+        *drift_pubkey_hex.lock().expect("drift knob lock") =
+            Some(hex::encode(key.verifying_key().to_bytes()));
+        let drifted = rotate_org_owner(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(rotation_request.clone()),
+        )
+        .await
+        .expect_err("pruned replay must reject a drifted service owner");
+        assert_eq!(drifted.0, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            drifted.1.0.get("error").and_then(serde_json::Value::as_str),
+            Some("signing_authority_status_invalid")
+        );
+        *drift_pubkey_hex.lock().expect("drift knob lock") = None;
+
+        // An unreachable signing service must also fail the replay (the
+        // handler may not claim readiness it cannot verify)...
+        let mut outage_state = crate::test_support::lazy_state();
+        outage_state.db = pool.clone();
+        outage_state.signing_service = Some(
+            crate::signing_service::SigningServiceClient::new(
+                "http://127.0.0.1:9".to_string(),
+                None,
+            )
+            .expect("dead signing service client"),
+        );
+        let outage = rotate_org_owner(
+            auth.clone(),
+            State(outage_state),
+            Path(org_name.clone()),
+            Json(rotation_request.clone()),
+        )
+        .await
+        .expect_err("pruned replay must reject an unreachable signing service");
+        assert_eq!(outage.0, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            outage.1.0.get("error").and_then(serde_json::Value::as_str),
+            Some("signing_service_unavailable")
+        );
+
+        // ...while a restored service confirms it again end-to-end.
+        let restored = rotate_org_owner(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(rotation_request),
+        )
+        .await
+        .expect("pruned replay must confirm once the service owner matches");
+        assert_eq!(restored.0.state, "ready");
+        assert_eq!(restored.0.keyring_version, 2);
 
         mock.abort();
         sqlx::query("DELETE FROM audit_log WHERE org_id = $1")
