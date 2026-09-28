@@ -2195,11 +2195,17 @@ pub async fn rotate_signer(
             app_id = %app.id,
             "confirming a committed signer rotation: re-driving KBS reconciliation"
         );
-        let app: App = sqlx::query_as("SELECT * FROM apps WHERE id = $1")
-            .bind(app.id)
-            .fetch_one(&state.db)
+        // Release the transaction (authority lanes + app row lock) before
+        // the fenced Kubernetes reconciliation: the commit path below does
+        // the same, and holding the lanes through up to 8 CAS attempts and
+        // a Trustee rollout would stall concurrent keyring/entitlement
+        // revocations and starve the pool. The locked row is already in
+        // hand -- no second connection re-read (a failure there would map
+        // to a bare 500 and terminalize FailClosed as outcome-unknown,
+        // closing the retry path this branch exists to keep open).
+        tx.rollback()
             .await
-            .map_err(|_| internal_server_error())?;
+            .map_err(|_| signer_rotation_publication_pending_error("rotate_signer"))?;
         if state.kbs_policy.is_some() {
             reconcile_committed_rotation_kbs_policy(&state, &app).await?;
         }
