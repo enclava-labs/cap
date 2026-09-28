@@ -264,6 +264,7 @@ async fn verify_or_initialize_remote_keyring(
                 )
                 .into());
             }
+            replay_accepted_keyring(api, &org_name, response).await?;
             store_trusted_owner(&org_id, &envelope.signing_pubkey)?;
             store_keyring_envelope(&org_id, &envelope)?;
             Ok((org_id, org_name, fingerprint(&owner.public)))
