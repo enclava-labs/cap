@@ -24,14 +24,25 @@
 -- client-supplied payload verbatim, so an extra field carrying a `\u0000`
 -- escape -- accepted by serde_json, unrepresentable in jsonb -- could be
 -- stored by any binary running before the handler guard added in this PR.
--- Deleting such rows is the fail-closed outcome the selector already
--- guarantees for a missing keyring (INNER JOIN drop): the org loses KBS
--- signed-policy candidacy until a clean keyring is re-uploaded, and no
--- malformed payload can hold the migration (or every org's candidate
--- loading) hostage.  Rows that are valid jsonb but the wrong shape are
--- removed by the same predicate.  The helper swallows parse errors via an
--- EXCEPTION block because the bare cast would raise, not return false, and
--- SQL does not guarantee OR short-circuit ordering.
+--
+-- Blast radius rule (follow-up review finding): keyrings retain every
+-- version and the selector treats the highest surviving version as the
+-- current authority, so deleting ONLY the malformed row could promote an
+-- older generation and re-authorize signers that the malformed (but
+-- otherwise valid, owner-signed) version had revoked -- e.g. v2 removing
+-- Alice while carrying a bad `memo`, whose deletion would make v1
+-- (Alice+Bob) current again.  Instead, an org with ANY malformed version
+-- loses ALL of its keyring rows: that is the fail-closed outcome the
+-- selector already guarantees for a missing keyring (INNER JOIN drop), it
+-- can never resurrect a revoked signer, and the org recovers by uploading a
+-- fresh owner-signed keyring (the version-1 initial-upload path).  A RAISE
+-- NOTICE records the affected orgs and versions for operators, since the
+-- row loss is silent otherwise.
+--
+-- The helper swallows parse errors via an EXCEPTION block because the bare
+-- cast would raise, not return false, and SQL does not guarantee OR
+-- short-circuit ordering.  Rows that are valid jsonb but the wrong shape are
+-- removed by the same predicate.
 CREATE FUNCTION org_keyrings_payload_matches_shape(payload bytea)
 RETURNS boolean
 LANGUAGE plpgsql
@@ -47,8 +58,31 @@ EXCEPTION
 END;
 $$;
 
+DO $$
+DECLARE
+    affected record;
+BEGIN
+    FOR affected IN
+        SELECT org_id,
+               string_agg('v' || version, ', ' ORDER BY version) AS versions
+          FROM org_keyrings
+         WHERE org_id IN (
+               SELECT org_id FROM org_keyrings
+                WHERE NOT org_keyrings_payload_matches_shape(keyring_payload)
+         )
+         GROUP BY org_id
+    LOOP
+        RAISE NOTICE 'migration 0058: dropping ALL keyring rows for org % (versions %, at least one jsonb-unrepresentable/malformed); the org must upload a fresh owner-signed keyring',
+            affected.org_id, affected.versions;
+    END LOOP;
+END;
+$$;
+
 DELETE FROM org_keyrings
- WHERE NOT org_keyrings_payload_matches_shape(keyring_payload);
+ WHERE org_id IN (
+       SELECT org_id FROM org_keyrings
+        WHERE NOT org_keyrings_payload_matches_shape(keyring_payload)
+ );
 
 DROP FUNCTION org_keyrings_payload_matches_shape(bytea);
 
