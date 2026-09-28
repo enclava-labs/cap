@@ -40,9 +40,19 @@ pub async fn create_pool(database_url: &str) -> Result<PgPool, sqlx::Error> {
 /// harnesses — reports the same verdict. A migration Job that exits 0 over
 /// a broken purge index only surfaces the problem later, at API startup,
 /// with nothing linking it back to the schema step that "succeeded".
+///
+/// Migration runs are serialized process-wide: concurrent run_migrations
+/// calls (parallel tests each migrating a fresh database, or racing
+/// startup paths) deadlock on sqlx's per-migration advisory lock. The
+/// held lock is only this process's call ordering, not the migration
+/// itself -- sqlx still coordinates across processes via its advisory
+/// lock, so this is safe for multi-replica startup too.
 pub async fn run_migrations(pool: &PgPool) -> Result<()> {
+    static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _serial = SERIAL.lock().await;
     MIGRATOR.run(pool).await?;
     verify_nip98_purge_index(pool).await
+
 }
 
 /// Apply migrations for standalone installs, or only verify the schema when a
