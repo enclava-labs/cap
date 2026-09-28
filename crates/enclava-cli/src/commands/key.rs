@@ -227,6 +227,29 @@ async fn upload_keyring(
     Ok(())
 }
 
+/// Re-upload the exact fields the server previously accepted. The typed
+/// envelope round-trip can drop unsigned unknown fields or change
+/// pubkey/timestamp encodings, which the PUT existing-version check then
+/// rejects as a conflict even though the keyring is semantically identical.
+async fn replay_accepted_keyring(
+    api: &ApiClient,
+    org_name: &str,
+    accepted: OrgKeyringResponse,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = api
+        .put_org_keyring(
+            org_name,
+            &PutOrgKeyringRequest {
+                version: accepted.version,
+                keyring_payload: accepted.keyring_payload,
+                signature: accepted.signature,
+                signing_pubkey: accepted.signing_pubkey,
+            },
+        )
+        .await?;
+    Ok(())
+}
+
 fn keyring_has_owner(envelope: &OrgKeyringEnvelope, public: &VerifyingKey) -> bool {
     let public = public.to_bytes();
     envelope
