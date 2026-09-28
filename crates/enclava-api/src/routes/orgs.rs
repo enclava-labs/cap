@@ -588,24 +588,25 @@ pub async fn put_keyring(
             // they claim nothing. When the signing service is not configured
             // or not readable, there is no upstream authority to diverge
             // from and the check is skipped.
-            if let Some(signing_service) = state.signing_service.as_ref() {
-                if let Ok(status) = signing_service.owner_status(org_id).await {
-                    let service_owner = status
-                        .owner_pubkey_hex
+            if let Some(signing_service) = state.signing_service.as_ref()
+                && let Ok(status) = signing_service.owner_status(org_id).await
+            {
+                let service_owner = status
+                    .owner_pubkey_hex
+                    .as_deref()
+                    .and_then(|raw| hex::decode(raw).ok());
+                let status_matches = status.org_id == org_id && status.state == "ready";
+                if status_matches
+                    && service_owner
                         .as_deref()
-                        .and_then(|raw| hex::decode(raw).ok());
-                    let status_matches =
-                        status.org_id == org_id && status.state.as_str() == "ready";
-                    if status_matches
-                        && service_owner.as_deref() != Some(latest_signing_pubkey.as_slice())
-                    {
-                        return Err((
-                            StatusCode::CONFLICT,
-                            Json(serde_json::json!({
-                                "error": "signing service owner does not match the current pinned owner (owner rotation in progress)"
-                            })),
-                        ));
-                    }
+                        .is_some_and(|owner| owner != latest_signing_pubkey.as_slice())
+                {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({
+                            "error": "signing service owner does not match the current pinned owner (owner rotation in progress)"
+                        })),
+                    ));
                 }
             }
             let latest_signing_pubkey: [u8; 32] = latest_signing_pubkey
