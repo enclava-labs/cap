@@ -565,19 +565,36 @@ pub async fn put_keyring(
                 Json(serde_json::json!({"error": "keyring version is stale"})),
             ));
         }
-        if body.version == latest_version
-            && (latest_payload != keyring_payload_bytes
-                || latest_signature != signature
-                || latest_signing_pubkey != signing_pubkey)
-        {
-            return Err((
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": "keyring version already exists with different content"
-                })),
-            ));
-        }
         if body.version == latest_version {
+            // Semantic replay check (PR #187 review): the stored payload may
+            // carry unsigned extra JSON fields (e.g. a client's "memo") that
+            // a typed rebuild drops before resubmitting.  The signature is
+            // over the canonical keyring bytes, so comparing those (plus the
+            // signature and signing key) instead of raw payload bytes keeps
+            // an exact-version replay idempotent for semantically identical
+            // payloads while still rejecting any genuinely different
+            // content.  A stored payload that no longer parses fails closed
+            // as a conflict.
+            let latest_keyring: SignedOrgKeyring = serde_json::from_slice(&latest_payload)
+                .map_err(|_| {
+                    (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({
+                            "error": "keyring version already exists with different content"
+                        })),
+                    )
+                })?;
+            if latest_signature != signature
+                || latest_signing_pubkey != signing_pubkey
+                || canonical_keyring_bytes(&latest_keyring) != canonical_bytes
+            {
+                return Err((
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": "keyring version already exists with different content"
+                    })),
+                ));
+            }
             insert_new_version = false;
         }
         let next_version = latest_version
@@ -2593,6 +2610,108 @@ mod tests {
             .await
             .expect("delete rotate enqueue user");
         drop_isolated_database("cap130_keyring_enqueue_rotate", pool).await;
+    }
+
+    #[tokio::test]
+    async fn put_keyring_replay_ignores_unsigned_extra_payload_fields() {
+        // PR #187 review: a client (e.g. the CLI's owner-recovery retry)
+        // fetches a committed keyring, rebuilds it through the typed
+        // envelope -- dropping unsigned extra JSON fields like "memo" --
+        // and PUTs the same version back. The replay must be idempotent:
+        // the signature is over the canonical keyring bytes, so comparing
+        // those instead of raw payload bytes accepts the semantically
+        // identical payload while still rejecting genuinely different
+        // content. Unsigned-only mode keeps KBS publication out of scope.
+        let (_db_cleanup, pool) = isolated_database_test_pool("cap187_keyring_replay_extra").await;
+        let org_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let suffix = org_id.simple().to_string();
+        let org_name = format!("keyring-replay-{suffix}");
+        crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+            .await
+            .expect("insert keyring replay org");
+        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Keyring Replayer')")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("insert keyring replay user");
+        sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+            .bind(user_id)
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("insert keyring replay membership");
+        let key = SigningKey::generate(&mut OsRng);
+        sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2)")
+            .bind(user_id)
+            .bind(key.verifying_key().to_bytes().to_vec())
+            .execute(&pool)
+            .await
+            .expect("insert keyring replay signing key");
+
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        let auth = AuthContext {
+            user_id,
+            org_id,
+            org_name: org_name.clone(),
+            role: Role::Owner,
+            api_key: None,
+            management_origin: crate::auth::middleware::ManagementOrigin::Public,
+        };
+
+        // Initial put carries an unsigned extra field the typed keyring
+        // does not know about.
+        let mut request = signed_keyring_request(org_id, user_id, &key, 1, 1);
+        request
+            .keyring_payload
+            .as_object_mut()
+            .expect("keyring payload is an object")
+            .insert("memo".to_string(), serde_json::json!("rotation"));
+        let created = put_keyring(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(request),
+        )
+        .await
+        .expect("initial put with an extra field must succeed");
+        assert_eq!(created.1.version, 1);
+
+        // The CLI-style replay drops the extra field before resubmitting
+        // the same version: semantically identical, so idempotent.
+        let stripped = signed_keyring_request(org_id, user_id, &key, 1, 1);
+        let replayed = put_keyring(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(stripped),
+        )
+        .await
+        .expect("typed rebuild replay of the same version must be idempotent");
+        assert_eq!(replayed.1.version, 1);
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM org_keyrings WHERE org_id = $1")
+            .bind(org_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count keyring rows after replay");
+        assert_eq!(rows, 1, "the replay must not insert a duplicate row");
+
+        // Genuinely different content at the same version still conflicts:
+        // a different updated_at changes the canonical bytes, and this
+        // payload carries its own valid signature over those bytes.
+        let conflicting = signed_keyring_request(org_id, user_id, &key, 1, 2);
+        let rejected = put_keyring(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(conflicting),
+        )
+        .await
+        .expect_err("same-version replay with different canonical content must conflict");
+        assert_eq!(rejected.0, StatusCode::CONFLICT);
+
+        drop_isolated_database("cap187_keyring_replay_extra", pool).await;
     }
 
     #[tokio::test]
