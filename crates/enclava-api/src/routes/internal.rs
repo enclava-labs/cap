@@ -1284,7 +1284,10 @@ async fn begin_idempotent_request_with_recovery_and_binding(
             .as_ref()
             .and_then(|body| body.get("code"))
             .and_then(serde_json::Value::as_str)
-            == Some(KEYRING_POLICY_RECONCILIATION_PENDING_CODE);
+            .is_some_and(|code| {
+                code == KEYRING_POLICY_RECONCILIATION_PENDING_CODE
+                    || code == SIGNER_ROTATION_PUBLICATION_PENDING_CODE
+            });
     if !row.known_not_applied
         && (policy_changed
             || deterministic_legacy_is_unsafe
@@ -1720,6 +1723,9 @@ async fn complete_app_delete_result(
 
 const KEYRING_POLICY_RECONCILIATION_PENDING_CODE: &str = "keyring_policy_reconciliation_pending";
 
+const SIGNER_ROTATION_PUBLICATION_PENDING_CODE: &str =
+    crate::routes::apps::SIGNER_ROTATION_PUBLICATION_PENDING_CODE;
+
 /// Only a known committed keyring may retain a nonterminal publication
 /// checkpoint; unrelated failures keep the generic fail-closed disposition.
 async fn complete_keyring_result(
@@ -1739,6 +1745,32 @@ async fn complete_keyring_result(
             defer_idempotent_request(lease, Some(&checkpoint)).await;
         if deferred_status == StatusCode::CONFLICT {
             deferred_body["cause"] = serde_json::json!(KEYRING_POLICY_RECONCILIATION_PENDING_CODE);
+        }
+        return Err((deferred_status, Json(deferred_body)));
+    }
+    complete_idempotent_result(lease, result).await
+}
+
+/// Only a known committed signer rotation may retain a nonterminal publication
+/// checkpoint; unrelated failures keep the generic fail-closed disposition.
+/// This mirrors [`complete_keyring_result`] for signer rotation publication failures.
+async fn complete_signer_rotation_result(
+    lease: IdempotencyLease,
+    result: Result<IdempotencyResponse, InternalRouteError>,
+) -> Result<IdempotencyResponse, InternalRouteError> {
+    if let Err((status, body)) = &result
+        && *status == StatusCode::SERVICE_UNAVAILABLE
+        && body.get("code").and_then(serde_json::Value::as_str)
+            == Some(SIGNER_ROTATION_PUBLICATION_PENDING_CODE)
+    {
+        let checkpoint = (
+            *status,
+            serde_json::json!({"code": SIGNER_ROTATION_PUBLICATION_PENDING_CODE}),
+        );
+        let (deferred_status, Json(mut deferred_body)) =
+            defer_idempotent_request(lease, Some(&checkpoint)).await;
+        if deferred_status == StatusCode::CONFLICT {
+            deferred_body["cause"] = serde_json::json!(SIGNER_ROTATION_PUBLICATION_PENDING_CODE);
         }
         return Err((deferred_status, Json(deferred_body)));
     }
@@ -4926,7 +4958,7 @@ pub async fn rotate_paas_signer(
         Ok((StatusCode::OK, response))
     }
     .await;
-    let (status, response) = complete_idempotent_result(idempotency, result).await?;
+    let (status, response) = complete_signer_rotation_result(idempotency, result).await?;
     Ok((status, Json(response)))
 }
 
