@@ -1989,6 +1989,13 @@ mod runtime_gate_tests {
 
 #[cfg(test)]
 pub(crate) mod test_support {
+    /// Serializes tests that mutate or assert on the global
+    /// `kbs_signed_policy_reconciliation` singleton row: cargo runs lib
+    /// tests in parallel against one shared database, so unsynchronized
+    /// generation bumps from one test would corrupt another's assertions.
+    pub(crate) static SIGNED_POLICY_SINGLETON_LOCK: tokio::sync::Mutex<()> =
+        tokio::sync::Mutex::const_new(());
+
     use crate::auth::api_key::ValidatedApiKey;
     use crate::auth::middleware::{AuthContext, ManagementOrigin};
     use crate::clients::{AllowList, ClientConfig, RegistryClient};
@@ -2083,11 +2090,10 @@ pub(crate) mod test_support {
     }
 
     /// Route-level and reconciliation tests assert exact values on the global
-    /// `kbs_signed_policy_reconciliation` singleton row.  The shared test
+    /// `kbs_signed_policy_reconciliation` singleton.  The shared test
     /// database is mutated concurrently by hundreds of other tests (and by
-    /// sibling pipeline worktrees), any of which can bump the generation or
-    /// the deferred-withdrawal debt mid-assertion.  A dedicated database makes
-    /// such tests deterministic.
+    /// sibling pipeline worktrees), any of which can bump the generation
+    /// mid-assertion.  A dedicated database makes these tests deterministic.
     ///
     /// The database name is suffixed with the current process id: sibling CI
     /// worktrees share one PostgreSQL server, and a fixed name would let two
@@ -2120,7 +2126,7 @@ pub(crate) mod test_support {
             .max_connections(1)
             .connect(&base_url)
             .await
-            .expect("connect isolated test database admin");
+            .expect("connect isolated keyring database admin");
         // A leftover database from a crashed run would carry a stale
         // singleton generation; drop it so every run starts from scratch.
         sqlx::query(&format!(
@@ -2128,11 +2134,11 @@ pub(crate) mod test_support {
         ))
         .execute(&admin)
         .await
-        .expect("drop stale isolated test database");
+        .expect("drop stale isolated keyring database");
         sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
             .execute(&admin)
             .await
-            .expect("create isolated test database");
+            .expect("create isolated keyring database");
         admin.close().await;
         // Same connection settings with only the database replaced: parse
         // the URL instead of slicing it so query parameters (sslmode, a
@@ -2141,16 +2147,16 @@ pub(crate) mod test_support {
         // socket-host URL can even place a '/' inside the query.
         let options = base_url
             .parse::<sqlx::postgres::PgConnectOptions>()
-            .expect("parse DATABASE_URL for isolated test database")
+            .expect("parse DATABASE_URL for isolated keyring database")
             .database(&db_name);
         let pool = PgPoolOptions::new()
             .max_connections(4)
             .connect_with(options)
             .await
-            .expect("connect isolated test database");
+            .expect("connect isolated keyring database");
         crate::db::pool::run_migrations(&pool)
             .await
-            .expect("migrate isolated test database");
+            .expect("migrate isolated keyring database");
         (cleanup, pool)
     }
 
@@ -2199,13 +2205,13 @@ pub(crate) mod test_support {
         // URL's query string (sslmode, options, a socket host, ...) and only
         // swap the database name; string slicing on the last '/' would drop
         // the whole query (and a socket-host URL can even place a '/' inside
-        // it).
+        // it).  Regression guard for the Codex review finding on #178.
         let base = "postgresql://test:test@localhost:5432/test?sslmode=require"
             .parse::<sqlx::postgres::PgConnectOptions>()
             .expect("parse DATABASE_URL");
         assert_eq!(base.get_database(), Some("test"));
-        let swapped = base.clone().database("cap119_swap");
-        assert_eq!(swapped.get_database(), Some("cap119_swap"));
+        let swapped = base.clone().database("cap130_swap");
+        assert_eq!(swapped.get_database(), Some("cap130_swap"));
         assert_eq!(swapped.get_host(), base.get_host());
         assert_eq!(swapped.get_port(), base.get_port());
         assert_eq!(swapped.get_username(), base.get_username());
@@ -2235,13 +2241,13 @@ pub(crate) mod test_support {
             .max_connections(1)
             .connect(&base_url)
             .await
-            .expect("connect isolated test database admin for drop");
+            .expect("connect isolated keyring database admin for drop");
         sqlx::query(&format!(
             "DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"
         ))
         .execute(&admin)
         .await
-        .expect("drop isolated test database");
+        .expect("drop isolated keyring database");
         admin.close().await;
     }
 }

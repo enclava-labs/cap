@@ -900,9 +900,9 @@ async fn insert_legacy_tls_binding(
     .expect("insert legacy tls binding");
 }
 
-async fn read_withdrawal_reconciliation_state(pool: &sqlx::PgPool) -> (i64, i64) {
+async fn read_withdrawal_reconciliation_state(pool: &sqlx::PgPool) -> (i64, i64, i64) {
     sqlx::query_as(
-        "SELECT desired_generation, withdrawal_bumps_owed
+        "SELECT desired_generation, selector_bumps_owed, withdrawal_bumps_owed
            FROM kbs_signed_policy_reconciliation WHERE singleton",
     )
     .fetch_one(pool)
@@ -1018,7 +1018,7 @@ async fn signer_rotation_token_is_single_use_and_owes_a_deferred_withdrawal_bump
     // ConfigMap replace succeeded (migration 0052).
     assert_eq!(
         read_withdrawal_reconciliation_state(&pool).await,
-        (1, 1),
+        (1, 0, 1),
         "rotation must owe the withdrawal bump, not perform it"
     );
     // The consumed jti ledger row is committed with the rotation.
@@ -1066,7 +1066,7 @@ async fn signer_rotation_token_is_single_use_and_owes_a_deferred_withdrawal_bump
     // publishes.
     assert_eq!(
         read_withdrawal_reconciliation_state(&pool).await,
-        (1, 2),
+        (1, 0, 2),
         "rotating an already-withdrawn artifact must still owe a bump"
     );
 
@@ -1100,7 +1100,7 @@ async fn signer_rotation_token_is_single_use_and_owes_a_deferred_withdrawal_bump
     );
     assert_eq!(
         read_withdrawal_reconciliation_state(&pool).await,
-        (1, 2),
+        (1, 0, 2),
         "rejected replay must roll back the owed withdrawal bump"
     );
     let jti_rows: i64 = sqlx::query_scalar(
@@ -1135,7 +1135,7 @@ async fn signer_rotation_never_flips_an_unsigned_install_into_signed_mode() {
     // unsigned-only state (migration 0041 seeds desired_generation = 0).
     assert_eq!(
         read_withdrawal_reconciliation_state(&pool).await,
-        (0, 0),
+        (0, 0, 0),
         "the isolated database must start unsigned"
     );
 
@@ -1216,7 +1216,7 @@ async fn signer_rotation_never_flips_an_unsigned_install_into_signed_mode() {
     // mode nor owes any debt there.
     assert_eq!(
         read_withdrawal_reconciliation_state(&pool).await,
-        (0, 0),
+        (0, 0, 0),
         "rotation on an unsigned-only install must not enter signed mode"
     );
 
@@ -1291,7 +1291,7 @@ async fn old_binary_signer_rotation_via_direct_sql_is_fenced_by_the_apps_trigger
     );
     assert_eq!(
         read_withdrawal_reconciliation_state(&pool).await,
-        (1, 1),
+        (1, 0, 1),
         "the trigger must owe the deferred bump without moving desired_generation"
     );
     let (binding_subject, binding_issuer): (Option<String>, Option<String>) = sqlx::query_as(
@@ -1321,7 +1321,7 @@ async fn old_binary_signer_rotation_via_direct_sql_is_fenced_by_the_apps_trigger
         .expect("non-identity apps update");
     assert_eq!(
         read_withdrawal_reconciliation_state(&pool).await,
-        (1, 1),
+        (1, 0, 1),
         "non-identity updates must not owe anything"
     );
 
@@ -1344,7 +1344,7 @@ async fn old_binary_signer_rotation_via_direct_sql_is_fenced_by_the_apps_trigger
     .expect("initial signer set");
     assert_eq!(
         read_withdrawal_reconciliation_state(&pool).await,
-        (1, 1),
+        (1, 0, 1),
         "the initial signer set must owe nothing"
     );
     let withdrawn_app2: i64 = sqlx::query_scalar(
@@ -1512,7 +1512,7 @@ async fn migration_backfill_window_is_fenced_by_the_apps_write_exclusion_lock() 
     );
     assert_eq!(
         read_withdrawal_reconciliation_state(&pool).await,
-        (1, 1),
+        (1, 0, 1),
         "the resumed rotation must owe the deferred withdrawal bump"
     );
 

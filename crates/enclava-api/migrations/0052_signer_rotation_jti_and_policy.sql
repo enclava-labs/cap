@@ -76,22 +76,23 @@ ON CONFLICT DO NOTHING;
 -- with no bump left to recover.
 --
 -- The bump is therefore OWED, not performed: this counter is a
--- signer-withdrawal-specific debt that only the post-0052 reconciler -- the
--- one refusing withdrawn_signer_artifacts hashes in
--- load_signed_policy_candidates -- may interpret.  It is deliberately NOT
--- the selector_bumps_owed counter from the open keyring-membership change
--- (#130): a 178-era reconciler filtering by keyring membership but not by
--- signer withdrawal would consume a shared marker with a
--- withdrawal-unaware selector and hit the same conflict.  The reconciler
--- publishes the filtered candidate set as generation
--- desired_generation + withdrawal_bumps_owed while leaving
+-- signer-withdrawal-specific debt that only a withdrawal-aware reconciler
+-- may interpret.  It is a SEPARATE column from selector_bumps_owed (the
+-- keyring-membership debt, migration 0058) on purpose: a binary aware of
+-- only one debt must never consume the other's marker -- it would publish
+-- through a selector that does not apply the other filter and hit the
+-- same conflict.  A reconciler aware of both debts publishes the fully
+-- filtered candidate set as generation desired_generation
+-- + selector_bumps_owed + withdrawal_bumps_owed while leaving
 -- desired_generation untouched, and only after that ConfigMap replace
--- succeeded does consume_deferred_withdrawal_bumps
--- (crates/enclava-api/src/kbs.rs) commit the increment, guarded by a
+-- succeeded does consume_deferred_policy_debts
+-- (crates/enclava-api/src/kbs.rs) commit BOTH increments in a single
 -- compare-and-set on the exact (desired_generation,
--- withdrawal_bumps_owed) pair the run published at.  A rotation landing
--- mid-run changes the pair, fails the CAS, and makes the next attempt
--- republish at the strictly higher generation with a fresh candidate set.
+-- selector_bumps_owed, withdrawal_bumps_owed) triple the run published
+-- at -- the counters are never committed one before the other.  A
+-- rotation landing mid-run moves its counter, fails the CAS, and makes
+-- the next attempt republish at the strictly higher generation with a
+-- fresh candidate set.
 --
 -- A pre-0052 reconciler therefore never sees the owed generation as a raw
 -- desired generation.  Before the replace it keeps finding an unchanged
