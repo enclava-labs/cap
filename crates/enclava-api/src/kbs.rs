@@ -1286,14 +1286,6 @@ async fn load_signed_policy_candidates(
             JOIN workload_artifacts AS artifact
               ON artifact.app_id = legacy.app_id
              AND artifact.deploy_id = legacy.deployment_id
-            JOIN current_keyring_members AS member
-              -- Case-insensitive membership join: see the comment at the
-              -- job_artifact_candidates join above.
-              ON member.org_id = legacy.org_id
-             AND lower(member.pubkey) = lower(
-                 artifact.signed_policy_artifact
-                     ->'metadata'->>'descriptor_signing_pubkey'
-             )
             WHERE legacy.current_operation_rank = 1
               -- App failure alone does not retire the last healthy workload.
               AND (
