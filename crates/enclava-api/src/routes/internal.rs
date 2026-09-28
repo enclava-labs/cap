@@ -1767,6 +1767,9 @@ async fn complete_app_delete_result(
 
 const KEYRING_POLICY_RECONCILIATION_PENDING_CODE: &str = "keyring_policy_reconciliation_pending";
 
+const SIGNER_ROTATION_PUBLICATION_PENDING_CODE: &str =
+    crate::routes::apps::SIGNER_ROTATION_PUBLICATION_PENDING_CODE;
+
 /// Only a known committed keyring may retain a nonterminal publication
 /// checkpoint; unrelated failures keep the generic fail-closed disposition.
 async fn complete_keyring_result(

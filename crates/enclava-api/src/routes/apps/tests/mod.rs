@@ -906,6 +906,155 @@ async fn read_withdrawal_reconciliation_state(pool: &sqlx::PgPool) -> (i64, i64,
     .expect("read signed policy reconciliation singleton")
 }
 
+/// Stateful Kubernetes API double behind the fenced KBS reconciler (same
+/// contract as the orgs.rs one): stores the resource-policy ConfigMap and
+/// the Trustee deployment so route tests observe real publication instead
+/// of fabricated success. `healthy = false` makes provider I/O fail.
+struct KbsPolicyProvider {
+    healthy: bool,
+    configmap: serde_json::Value,
+    deployment: serde_json::Value,
+    configmap_replaces: usize,
+}
+
+impl KbsPolicyProvider {
+    fn new(healthy: bool) -> Self {
+        Self {
+            healthy,
+            configmap: serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {
+                    "name": "resource-policy",
+                    "namespace": "kbs-test",
+                    "resourceVersion": "1",
+                },
+                "data": {
+                    "policy.rego": "package policy\n\n# legacy unsigned policy\n",
+                },
+            }),
+            deployment: serde_json::json!({
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "metadata": {
+                    "name": "trustee",
+                    "namespace": "kbs-test",
+                    "resourceVersion": "1",
+                    "generation": 1,
+                },
+                "spec": {
+                    "replicas": 1,
+                    "template": {
+                        "metadata": {},
+                        "spec": {
+                            "containers": [{"name": "trustee", "image": "trustee"}],
+                        },
+                    },
+                },
+                "status": {
+                    "observedGeneration": 1_000_000,
+                    "replicas": 1,
+                    "updatedReplicas": 1,
+                    "readyReplicas": 1,
+                    "availableReplicas": 1,
+                },
+            }),
+            configmap_replaces: 0,
+        }
+    }
+
+    fn published_generation(&self) -> Option<i64> {
+        self.configmap["metadata"]["annotations"]
+            .as_object()?
+            .get("enclava.dev/cap-policy-generation")?
+            .as_str()?
+            .parse()
+            .ok()
+    }
+}
+
+fn kbs_policy_kube_client(provider: Arc<tokio::sync::Mutex<KbsPolicyProvider>>) -> kube::Client {
+    fn respond(status: StatusCode, value: &serde_json::Value) -> Result<Response<Body>, io::Error> {
+        Ok(Response::builder()
+            .status(status)
+            .body(Body::from(
+                serde_json::to_vec(value).expect("serialize kube double response"),
+            ))
+            .expect("build kube double response"))
+    }
+
+    kube::Client::new(
+        service_fn(move |request: Request<Body>| {
+            let provider = provider.clone();
+            async move {
+                let method = request.method().as_str().to_string();
+                let path = request.uri().path().to_string();
+                let body = request
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("read Kubernetes request body")
+                    .to_bytes();
+                let mut provider = provider.lock().await;
+                let mut object: serde_json::Value = if method == "PUT" {
+                    serde_json::from_slice(&body)
+                        .expect("kube double PUT requests carry a JSON body")
+                } else {
+                    serde_json::json!({})
+                };
+                if !provider.healthy
+                    || (method != "GET" && method != "PUT")
+                    || (!path.contains("/configmaps/") && !path.contains("/deployments/"))
+                {
+                    return respond(
+                        StatusCode::NOT_FOUND,
+                        &serde_json::json!({
+                            "apiVersion": "v1", "kind": "Status", "status": "Failure",
+                            "reason": "NotFound", "message": "unavailable", "code": 404,
+                        }),
+                    );
+                }
+                if path.contains("/configmaps/") {
+                    if method == "PUT" {
+                        provider.configmap_replaces += 1;
+                        if let Some(metadata) =
+                            object.get_mut("metadata").and_then(|m| m.as_object_mut())
+                        {
+                            metadata.insert(
+                                "resourceVersion".to_string(),
+                                serde_json::json!((provider.configmap_replaces + 1).to_string()),
+                            );
+                        }
+                        provider.configmap = object;
+                    }
+                    return respond(StatusCode::OK, &provider.configmap);
+                }
+                if method == "PUT" {
+                    provider.deployment = object;
+                }
+                respond(StatusCode::OK, &provider.deployment)
+            }
+        }),
+        "default",
+    )
+}
+
+fn test_kbs_policy_config() -> crate::kbs::KbsPolicyConfig {
+    crate::kbs::KbsPolicyConfig {
+        namespace: "kbs-test".to_string(),
+        configmap_name: "resource-policy".to_string(),
+        policy_key: "policy.rego".to_string(),
+        deployment_name: "trustee".to_string(),
+        required: true,
+        signed_policy_retention: 6,
+        signed_policy_max_bytes: 900 * 1024,
+    }
+}
+
+use http_body_util::BodyExt;
+
+/// Issue #119 regression: a rotation token is single-use (its jti is
+
 /// Issue #119 regression: a rotation token is single-use (its jti is
 /// consumed in the rotation transaction; a replay is refused and the whole
 /// rotation, including the database trigger's withdrawal and owed bump, is
@@ -2038,4 +2187,193 @@ fn clone_auth(auth: &AuthContext) -> AuthContext {
         api_key: auth.api_key.clone(),
         management_origin: auth.management_origin,
     }
+}
+
+/// Codex P1 / #187 regression: a signer rotation whose post-commit KBS
+/// reconciliation fails transiently must report the explicit
+/// committed-pending 503 (`signer_rotation_publication_pending`), not a
+/// bare 500 -- and a retry of the same request (no valid unconsumed token
+/// exists anymore: the jti is consumed) must CONFIRM the committed
+/// rotation, re-drive the KBS publication, and succeed without writing a
+/// second rotation, audit row, or withdrawal bump.
+#[tokio::test]
+async fn signer_rotation_publication_failure_reports_pending_and_retry_confirms() {
+    let (_db_cleanup, pool) =
+        crate::test_support::isolated_database_test_pool("cap119_rotation_pending_retry").await;
+    let previous_subject = "https://github.com/acme/old/.github/workflows/ci.yaml@refs/heads/main";
+    let previous_issuer = "https://token.actions.githubusercontent.com";
+    let new_subject = "https://github.com/acme/new/.github/workflows/ci.yaml@refs/heads/main";
+    let new_issuer = "https://new-issuer.example.test";
+    let (org_id, user_id, app_id) =
+        insert_signer_rotation_app(&pool, Some(previous_subject), Some(previous_issuer)).await;
+    insert_signed_artifact_for_identity(
+        &pool,
+        org_id,
+        app_id,
+        previous_subject,
+        previous_issuer,
+    )
+    .await;
+    sqlx::query("UPDATE kbs_signed_policy_reconciliation SET desired_generation = 1 WHERE singleton")
+        .execute(&pool)
+        .await
+        .expect("enter signed-policy mode");
+
+    let mut state = crate::test_support::lazy_state();
+    state.db = pool.clone();
+    let hmac_key = [7u8; 32];
+    let auth = AuthContext {
+        user_id,
+        org_id,
+        org_name: "rotation-pending-test".to_string(),
+        role: Role::Owner,
+        api_key: None,
+        management_origin: crate::auth::middleware::ManagementOrigin::Public,
+    };
+    state.kbs_policy = Some(test_kbs_policy_config());
+    let provider = std::sync::Arc::new(tokio::sync::Mutex::new(KbsPolicyProvider::new(false)));
+
+    let token = crate::auth::jwt::issue_signer_rotation_token(
+        &hmac_key,
+        &SignerRotationTokenInput {
+            user_id,
+            org_id,
+            app_id,
+            previous_subject: previous_subject.to_string(),
+            previous_issuer: previous_issuer.to_string(),
+            new_subject: new_subject.to_string(),
+            new_issuer: new_issuer.to_string(),
+        },
+        chrono::Duration::seconds(600),
+    )
+    .expect("issue signer rotation token");
+
+    let app_name = sqlx::query_scalar::<_, String>("SELECT name FROM apps WHERE id = $1")
+        .bind(app_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load app name");
+
+    crate::kbs::TEST_KUBE_CLIENT.scope(kbs_policy_kube_client(provider.clone()), async {
+        // First attempt: the rotation commits, but the provider is down, so
+        // the fenced publication cannot be confirmed.
+        let pending = rotate_signer(
+            clone_auth(&auth),
+            State(state.clone()),
+            Path(app_name.clone()),
+            Json(RotateSignerRequest {
+                subject: new_subject.to_string(),
+                issuer: new_issuer.to_string(),
+                email_confirmation_token: Some(token.clone()),
+            }),
+        )
+        .await
+        .expect_err("failed publication must not report success");
+        assert_eq!(pending.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            pending.1.0["code"],
+            crate::routes::apps::SIGNER_ROTATION_PUBLICATION_PENDING_CODE,
+            "the failure must be the explicit committed-pending error, not a bare 500"
+        );
+        assert_eq!(pending.1.0["committed"], true);
+
+        // The rotation itself is durable exactly once: identity, jti,
+        // withdrawal, and the owed bump.
+        let committed_subject: Option<String> =
+            sqlx::query_scalar("SELECT signer_identity_subject FROM apps WHERE id = $1")
+                .bind(app_id)
+                .fetch_one(&pool)
+                .await
+                .expect("load committed subject");
+        assert_eq!(committed_subject.as_deref(), Some(new_subject));
+        let jti_rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM consumed_signer_rotation_tokens WHERE app_id = $1")
+                .bind(app_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count consumed jti rows");
+        assert_eq!(jti_rows, 1, "the rotation token was consumed exactly once");
+        let audit_rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM audit_log WHERE org_id = $1 AND action = 'app.signer.rotate'",
+        )
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count rotation audit rows");
+        assert_eq!(audit_rows, 1, "exactly one rotation was committed");
+        assert_eq!(
+            read_withdrawal_reconciliation_state(&pool).await,
+            (1, 0, 1),
+            "the withdrawal debt stays owed until publication succeeds"
+        );
+
+        // Same-request retry (the consumed token cannot be replayed): the
+        // committed identity equals the target, so the route CONFIRMS the
+        // rotation -- no token path, no second mutation -- and re-drives the
+        // KBS publication under the fence.
+        {
+            let mut provider = provider.lock().await;
+            provider.healthy = true;
+        }
+        // Failed provider calls retain their fence until its reclaim deadline.
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET locked_until = clock_timestamp() - interval '2 seconds',
+                    reclaim_after = clock_timestamp() - interval '1 second'
+              WHERE resource_scope = 'kbs_policy' AND resource_key = 'global'",
+        )
+        .execute(&pool)
+        .await
+        .expect("expire failed publication fence");
+        let Json(confirmed) = rotate_signer(
+            clone_auth(&auth),
+            State(state.clone()),
+            Path(app_name.clone()),
+            Json(RotateSignerRequest {
+                subject: new_subject.to_string(),
+                issuer: new_issuer.to_string(),
+                email_confirmation_token: Some(token.clone()),
+            }),
+        )
+        .await
+        .expect("confirmation retry must succeed once publication is confirmed");
+        assert_eq!(
+            confirmed.signer_identity_subject.as_deref(),
+            Some(new_subject)
+        );
+
+        // The confirmation added NO second mutation: same single audit row,
+        // same single jti, and the debt is now published and consumed.
+        let audit_rows_after: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM audit_log WHERE org_id = $1 AND action = 'app.signer.rotate'",
+        )
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count rotation audit rows after confirmation");
+        assert_eq!(audit_rows_after, 1, "the confirmation must not rotate again");
+        let jti_rows_after: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM consumed_signer_rotation_tokens WHERE app_id = $1")
+                .bind(app_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count consumed jti rows after confirmation");
+        assert_eq!(jti_rows_after, 1);
+        assert_eq!(
+            read_withdrawal_reconciliation_state(&pool).await,
+            (2, 0, 0),
+            "the confirmation retry must publish and consume the owed bump"
+        );
+        {
+            let provider = provider.lock().await;
+            assert_eq!(
+                provider.published_generation(),
+                Some(2),
+                "the owed generation must be live before success is reported"
+            );
+        }
+    })
+    .await;
+
+    crate::test_support::drop_isolated_database("cap119_rotation_pending_retry", pool).await;
 }
