@@ -332,25 +332,17 @@ pub async fn soft_delete_tls_binding(
     Ok(())
 }
 
-pub async fn reconcile_policy(
+/// Re-render the legacy Rego ConfigMap from the current `kbs_tls_bindings`
+/// and `kbs_owner_bindings` (the unsigned/legacy policy authority).
+///
+/// Signed-policy checks re-run inside the CAS loop so a signed acceptance
+/// that commits mid-render fences this legacy writer before it can retry a
+/// resourceVersion conflict with stale Rego.
+async fn reconcile_legacy_rego_policy_with_client(
     db: &PgPool,
-    config: Option<&KbsPolicyConfig>,
+    config: &KbsPolicyConfig,
+    client: kube::Client,
 ) -> Result<(), KbsPolicyError> {
-    let Some(config) = config else {
-        return Err(KbsPolicyError::NotConfigured);
-    };
-
-    let client = kube::Client::try_default().await?;
-    if signed_policy_mode_active(db).await? {
-        tracing::info!(
-            namespace = %config.namespace,
-            configmap = %config.configmap_name,
-            "durable signed KBS authority supersedes legacy marker reconciliation"
-        );
-        return reconcile_pending_signed_policy_artifacts_with_client(db, config, None, client)
-            .await;
-    }
-
     let bindings: Vec<KbsOwnerBinding> = sqlx::query_as(
         "SELECT binding_key, repository, allowed_tags, namespace, service_account,
                 tenant_instance_identity_hash
@@ -433,6 +425,27 @@ pub async fn reconcile_policy(
         }
     }
     Err(KbsPolicyError::PolicyCasExhausted)
+}
+
+pub async fn reconcile_policy(
+    db: &PgPool,
+    config: Option<&KbsPolicyConfig>,
+) -> Result<(), KbsPolicyError> {
+    let Some(config) = config else {
+        return Err(KbsPolicyError::NotConfigured);
+    };
+
+    let client = kube::Client::try_default().await?;
+    if signed_policy_mode_active(db).await? {
+        tracing::info!(
+            namespace = %config.namespace,
+            configmap = %config.configmap_name,
+            "durable signed KBS authority supersedes legacy marker reconciliation"
+        );
+        return reconcile_pending_signed_policy_artifacts_with_client(db, config, None, client)
+            .await;
+    }
+    reconcile_legacy_rego_policy_with_client(db, config, client).await
 }
 
 /// Enqueue a signed-policy generation in the caller's authority transaction.
@@ -952,7 +965,17 @@ async fn reconcile_pending_signed_policy_artifacts_with_client(
             if signed_policy_mode_active(db).await? {
                 continue;
             }
-            return Ok(());
+            // Genuine legacy (unsigned) installation: converge the legacy
+            // Rego ConfigMap from the current bindings here too, so a signer
+            // rotation committed by a pre-0052 binary during the migration
+            // window (which only updated kbs_tls_bindings via the DB trigger
+            // and never re-rendered Rego) is repaired by this startup pass
+            // and every periodic tick, instead of waiting for an unrelated
+            // deploy or delete to call reconcile_policy. No-ops (rendered
+            // body matches) return without restarting Trustee. Box::pin the
+            // tail call: this function and the legacy renderer are mutually
+            // recursive, so one edge needs indirection.
+            return Box::pin(reconcile_legacy_rego_policy_with_client(db, config, client)).await;
         }
         // Keep the owed generation private until the filtered body is published.
         let generation =
