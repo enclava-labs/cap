@@ -1933,6 +1933,21 @@ mod tests {
             message.contains(&"a".repeat(32)),
             "conflict Display names the desired hash: {message}"
         );
+        let absent = KbsPolicyReconciliationError::from(KbsPolicyError::PolicyGenerationConflict {
+            existing_generation: None,
+            existing_hash: None,
+            desired_generation: 4,
+            desired_hash: "cc".repeat(32),
+        });
+        let message = absent.to_string();
+        assert!(
+            message.contains("existing generation None"),
+            "absent annotations must render as None: {message}"
+        );
+        assert!(
+            message.contains(&"c".repeat(32)),
+            "conflict Display still names the desired hash: {message}"
+        );
 
         let mutation =
             KbsPolicyReconciliationError::from(crate::mutation_leases::MutationLeaseError::Lost);
