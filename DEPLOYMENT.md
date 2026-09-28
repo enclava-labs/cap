@@ -250,8 +250,6 @@ The CLI confirms the accepted keyring's policy before finalizing local recovery
 state. Preserve both the replacement backup and the previous backup until a
 fresh login and deployment succeed. Use the updated API and CLI together; drain
 old API replicas before relying on these completion semantics.
-Apply canonical signed-content keyring replay handling before this CLI update:
-historical payload encodings must not turn an exact signed replay into a conflict.
 
 ## Smoke Checks
 
