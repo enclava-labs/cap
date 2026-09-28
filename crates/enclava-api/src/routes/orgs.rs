@@ -337,6 +337,127 @@ fn bad_request(message: &str) -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
+/// The org authority transaction has committed, but fenced KBS convergence
+/// could not be confirmed before responding (Codex P1, #187 / shared #178
+/// source): a keyring generation that removes the signer of retained signed
+/// policy artifacts must revoke that authority from the live Trustee policy
+/// before the caller is told the revocation succeeded.
+///
+/// This is a *committed-pending* outcome, not a failed write: the keyring row,
+/// audit entry, and the trigger-owed selector bump are durable, and the
+/// background signed-policy reconciler keeps retrying the publication.  A
+/// plain 500 here would be dishonest twice over -- it invites an unsafe
+/// client retry of a committed mutation, and the internal PaaS idempotency
+/// ledger would terminalize the intent as outcome-unknown.  The explicit 503
+/// body names the state so wrappers can defer the receipt and the same
+/// idempotency key can retry publication only.
+pub(crate) fn keyring_publication_pending_error(
+    context: &str,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "error": "keyring_publication_pending",
+            "message": "the org keyring change committed but its KBS policy publication \
+                 is still pending; retry with the same parameters to complete publication",
+            "context": context,
+            "committed": true,
+            "retryable": true,
+        })),
+    )
+}
+
+/// Converge the live KBS policy under the global mutation fence after an org
+/// authority transaction commits (put_keyring / rotate_org_owner).  Mirrors
+/// rotate_signer's post-commit reconciliation: claim the kbs_policy resource
+/// fence, run the (signed or legacy) reconciliation to convergence, and
+/// release the fence cleanly.  On any failure the durable debts remain and
+/// the background reconciler retries; the caller reports the explicit
+/// committed-pending 503 above rather than a bare 500.
+///
+/// Returns Ok(()) when KBS policy management is not configured.
+pub(crate) async fn reconcile_kbs_policy_after_keyring_commit(
+    state: &AppState,
+    org_id: Uuid,
+    context: &str,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if state.kbs_policy.is_none() {
+        return Ok(());
+    }
+    let lease = match crate::mutation_leases::claim_resources(
+        state,
+        "kbs_keyring_policy_publication",
+        Uuid::new_v4(),
+        vec![crate::mutation_leases::ResourceFence::kbs_policy()],
+    )
+    .await
+    {
+        Ok(lease) => lease,
+        Err(error) => {
+            tracing::warn!(
+                org_id = %org_id,
+                error = %error,
+                error_code = "kbs_policy_fence_unavailable",
+                context,
+                "org keyring change committed but KBS policy reconciliation fence was unavailable"
+            );
+            return Err(keyring_publication_pending_error(context));
+        }
+    };
+    match lease
+        .guard_provider(crate::kbs::reconcile_policy(
+            &state.db,
+            state.kbs_policy.as_ref(),
+        ))
+        .await
+    {
+        Err(error) => {
+            tracing::warn!(
+                org_id = %org_id,
+                error = %error,
+                error_code = "kbs_policy_fence_unavailable",
+                context,
+                "org keyring change committed but lost the KBS policy fence during reconciliation"
+            );
+            release_finished_lease(lease).await;
+            return Err(keyring_publication_pending_error(context));
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(
+                org_id = %org_id,
+                error = %error,
+                error_code = "kbs_policy_reconciliation_failed",
+                context,
+                "org keyring change committed but KBS policy reconciliation failed"
+            );
+            release_finished_lease(lease).await;
+            return Err(keyring_publication_pending_error(context));
+        }
+        Ok(Ok(())) => {}
+    }
+    if let Err(error) = lease.finish().await {
+        tracing::warn!(
+            org_id = %org_id,
+            error = %error,
+            error_code = "kbs_policy_lease_finish_failed",
+            context,
+            "org keyring change reconciled KBS policy but failed to release the fence cleanly"
+        );
+        return Err(keyring_publication_pending_error(context));
+    }
+    Ok(())
+}
+
+async fn release_finished_lease(lease: crate::mutation_leases::ResourceMutationLease) {
+    if let Err(error) = lease.finish().await {
+        tracing::warn!(
+            error = %error,
+            error_code = "kbs_policy_lease_finish_failed",
+            "failed to release the KBS policy fence after a failed publish"
+        );
+    }
+}
+
 /// keyring payloads are persisted as UTF-8 JSON that PostgreSQL must be able
 /// to re-parse as jsonb (migration 0058's shape CHECK, and the candidate
 /// selector's cast).  serde_json is stricter than jsonb in exactly one
@@ -627,6 +748,16 @@ pub async fn put_keyring(
     }
 
     tx.commit().await.map_err(|_| db_error())?;
+
+    // #130/#187: a committed keyring generation that removes the signer of
+    // retained artifacts must revoke that authority from the live Trustee
+    // policy before success is reported -- the 30-second background
+    // reconciler is the backstop, not the revocation path. Converge under
+    // the same kbs_policy mutation fence rotate_signer uses; a publication
+    // failure returns the explicit committed-pending 503 so the internal
+    // PaaS wrappers can defer the receipt and the same idempotency key
+    // retries publication without repeating keyring/audit writes.
+    reconcile_kbs_policy_after_keyring_commit(&state, org_id, "put_keyring").await?;
 
     let fingerprint = hex::encode(Sha256::digest(&canonical_bytes));
     Ok((
@@ -1182,6 +1313,11 @@ pub async fn rotate_org_owner(
         // pre-0058 replica's unfiltered reconciler during the rollout.
     }
     tx.commit().await.map_err(|_| db_error())?;
+
+    // #130/#187: same fenced post-commit convergence as put_keyring -- the
+    // owner rotation can remove the signer of retained artifacts, and that
+    // revocation must be live in Trustee before "ready" is reported.
+    reconcile_kbs_policy_after_keyring_commit(&state, org_id, "rotate_org_owner").await?;
 
     Ok(Json(RotateOrgOwnerResponse {
         org_id,
@@ -1838,6 +1974,153 @@ mod tests {
             .await
             .expect("delete keyring enqueue user");
         drop_isolated_database("cap130_keyring_enqueue_put", pool).await;
+    }
+
+    /// Codex P1 follow-up (#187, shared #178 source): a committed keyring
+    /// generation that removes the signer of retained artifacts must
+    /// reconcile the live KBS policy before success is reported.  When the
+    /// fenced publication cannot run (here: the global kbs_policy fence is
+    /// already held), the route must return the explicit committed-pending
+    /// 503 `keyring_publication_pending` -- never a bare 500 -- while the
+    /// keyring row, audit entry, and trigger-owed selector bump remain
+    /// durable for the background reconciler / same-key retry.
+    #[tokio::test]
+    async fn put_keyring_reports_committed_pending_503_when_kbs_publication_is_fenced_out() {
+        let _singleton = keyring_enqueue_guard().await;
+        let (_db_cleanup, pool) =
+            isolated_database_test_pool("cap187_keyring_publication_pending").await;
+        let org_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let suffix = org_id.simple().to_string();
+        let org_name = format!("keyring-pending-{suffix}");
+        crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+            .await
+            .expect("insert keyring pending org");
+        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Keyring Pending')")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("insert keyring pending user");
+        sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+            .bind(user_id)
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("insert keyring pending membership");
+        let key = SigningKey::generate(&mut OsRng);
+        sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2)")
+            .bind(user_id)
+            .bind(key.verifying_key().to_bytes().to_vec())
+            .execute(&pool)
+            .await
+            .expect("insert keyring pending signing key");
+
+        // Signed-policy mode is active so the keyring insert owes a selector
+        // bump (migration 0058's trigger) that only the reconciler consumes.
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 5
+              WHERE singleton",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed signed-policy generation");
+
+        // Seize the global kbs_policy fence the way a concurrent fenced
+        // publisher would, so the post-commit reconciliation returns Busy.
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET owner_token = $1,
+                    locked_until = clock_timestamp() + interval '30 seconds',
+                    reclaim_after = clock_timestamp() + interval '60 seconds',
+                    updated_at = clock_timestamp()
+              WHERE resource_scope = 'kbs_policy' AND resource_key = 'global'",
+        )
+        .bind(Uuid::new_v4())
+        .execute(&pool)
+        .await
+        .expect("seize kbs policy fence");
+
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.side_effect_admission = crate::state::side_effect_admission_for_pool(&pool);
+        state.kbs_policy = Some(crate::kbs::KbsPolicyConfig {
+            namespace: "kbs-test".to_string(),
+            configmap_name: "resource-policy".to_string(),
+            policy_key: "policy.rego".to_string(),
+            deployment_name: "kbs".to_string(),
+            required: true,
+            signed_policy_retention: 2,
+            signed_policy_max_bytes: 65536,
+        });
+        let auth = AuthContext {
+            user_id,
+            org_id,
+            org_name: org_name.clone(),
+            role: Role::Owner,
+            api_key: None,
+            management_origin: crate::auth::middleware::ManagementOrigin::Public,
+        };
+        let pending = put_keyring(
+            auth,
+            State(state),
+            Path(org_name.clone()),
+            Json(signed_keyring_request(org_id, user_id, &key, 1, 1)),
+        )
+        .await
+        .expect_err("fenced-out publication must surface the committed-pending 503");
+        assert_eq!(pending.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(pending.1.0["error"], "keyring_publication_pending");
+        assert_eq!(pending.1.0["committed"], true);
+        assert_eq!(pending.1.0["retryable"], true);
+
+        // The org authority transaction itself is durable: the keyring row,
+        // its audit entry, and the trigger-owed selector bump all landed.
+        let keyring_rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM org_keyrings WHERE org_id = $1 AND version = 1",
+        )
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count committed keyring rows");
+        assert_eq!(keyring_rows, 1, "the keyring row must be committed");
+        let audit_rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM audit_log WHERE org_id = $1 AND action = 'org.keyring.put'",
+        )
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count committed audit rows");
+        assert_eq!(audit_rows, 1, "the audit entry must be committed");
+        let (desired, owed): (i64, i64) = sqlx::query_as(
+            "SELECT desired_generation, selector_bumps_owed
+               FROM kbs_signed_policy_reconciliation WHERE singleton",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read reconciliation state after fenced-out publication");
+        assert_eq!(desired, 5, "the handler must not bump desired_generation");
+        assert_eq!(
+            owed, 1,
+            "the trigger-owed selector bump must remain durable for the reconciler"
+        );
+
+        sqlx::query("DELETE FROM audit_log WHERE org_id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete keyring pending audit rows");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete keyring pending org");
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("delete keyring pending user");
+        drop_isolated_database("cap187_keyring_publication_pending", pool).await;
     }
 
     /// Review follow-up: a `\u0000` escape in an unknown field passes

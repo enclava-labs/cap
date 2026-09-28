@@ -4664,6 +4664,34 @@ pub async fn get_paas_signing_readiness(
     Ok(Json(to_value(response)?))
 }
 
+/// Complete an org keyring/owner-rotation idempotent request.  A
+/// committed-pending publication outcome (503 `keyring_publication_pending`,
+/// see [`crate::routes::orgs::reconcile_kbs_policy_after_keyring_commit`])
+/// defers exactly like app-delete's recoverable failures: the org authority
+/// transaction is durable and the background reconciler keeps retrying the
+/// publication, so the receipt must stay incomplete for the SAME
+/// idempotency key to retry publication without repeating keyring/audit/
+/// owner changes.  The deferred body names the cause for PaaS callers.
+/// Every other error keeps the generic dispositions.
+async fn complete_keyring_publication_result(
+    lease: IdempotencyLease,
+    result: Result<IdempotencyResponse, InternalRouteError>,
+) -> Result<IdempotencyResponse, InternalRouteError> {
+    if let Err((status, body)) = &result {
+        let publication_pending = *status == StatusCode::SERVICE_UNAVAILABLE
+            && body.get("error").and_then(serde_json::Value::as_str)
+                == Some("keyring_publication_pending");
+        if publication_pending {
+            let (deferred_status, Json(mut deferred_body)) = defer_idempotent_request(lease).await;
+            if deferred_status == StatusCode::CONFLICT {
+                deferred_body["cause"] = serde_json::json!("keyring_publication_pending");
+            }
+            return Err((deferred_status, Json(deferred_body)));
+        }
+    }
+    complete_idempotent_result(lease, result).await
+}
+
 pub async fn put_paas_keyring(
     _auth: InternalAuth,
     State(state): State<AppState>,
@@ -4702,7 +4730,7 @@ pub async fn put_paas_keyring(
         Ok((status, response))
     }
     .await;
-    let (status, response) = complete_idempotent_result(idempotency, result).await?;
+    let (status, response) = complete_keyring_publication_result(idempotency, result).await?;
     Ok((status, Json(response)))
 }
 
@@ -4785,7 +4813,7 @@ pub async fn rotate_paas_keyring_owner(
         Ok((StatusCode::OK, to_value(response)?))
     }
     .await;
-    let (status, response) = complete_idempotent_result(idempotency, result).await?;
+    let (status, response) = complete_keyring_publication_result(idempotency, result).await?;
     Ok((status, Json(response)))
 }
 
@@ -8958,6 +8986,92 @@ mod tests {
         complete_app_delete_result(winners.pop().unwrap(), Ok((StatusCode::NO_CONTENT, body)))
             .await
             .unwrap();
+    }
+
+    /// Codex P1 / #187 idempotency slice: the explicit committed-pending 503
+    /// (`keyring_publication_pending`) from put_keyring/rotate_org_owner must
+    /// DEFER the internal receipt -- the row stays incomplete and names its
+    /// cause -- so the SAME idempotency key retries publication without
+    /// repeating keyring/audit/owner changes, instead of being terminalized
+    /// as outcome-unknown (which a plain 5xx would do).
+    #[tokio::test]
+    async fn keyring_publication_pending_defers_and_same_key_reexecutes() {
+        let pool = database_test_pool().await;
+        let org_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let paas_org_id = org_id.simple().to_string();
+        let paas_user_id = user_id.simple().to_string();
+        let org_name = format!("keyring-pending-{}", &paas_org_id[..8]);
+        insert_config_token_test_actor(
+            &pool,
+            org_id,
+            &org_name,
+            &paas_org_id,
+            user_id,
+            &paas_user_id,
+        )
+        .await;
+        let state = {
+            let mut state = idempotency_test_state(pool.clone());
+            state.management_mode = crate::state::CapManagementMode::PaasManaged;
+            state
+        };
+        let key = format!("keyring-pending-{}", Uuid::new_v4());
+        let headers = idempotency_headers(&key);
+        let lease = expect_idempotency_execution(
+            begin_actor_idempotent_request(
+                &state,
+                &headers,
+                "PUT",
+                "/internal/paas/orgs/x/keyring",
+                &AuthContext {
+                    user_id,
+                    org_id,
+                    org_name: org_name.clone(),
+                    role: Role::Owner,
+                    api_key: None,
+                    management_origin: ManagementOrigin::PaasInternal,
+                },
+                &serde_json::json!({}),
+                IdempotencyRecovery::FailClosed,
+            )
+            .await
+            .unwrap(),
+        );
+        // The route's real error constructor so the shape cannot drift.
+        let failure = complete_keyring_publication_result(
+            lease,
+            Err(crate::routes::orgs::keyring_publication_pending_error(
+                "put_keyring",
+            )),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(failure.0, StatusCode::CONFLICT);
+        assert_eq!(
+            failure.1.0.get("error"),
+            idempotency_in_progress_error().1.0.get("error"),
+            "committed-pending publication must defer like a recoverable failure"
+        );
+        assert_eq!(
+            failure.1.0.get("cause"),
+            Some(&serde_json::json!("keyring_publication_pending")),
+            "the deferred body must name its cause"
+        );
+        let receipt: (bool, bool, bool, bool) = sqlx::query_as(
+            "SELECT completed_at IS NULL, response_status IS NULL,
+                    response_body IS NULL, known_not_applied
+               FROM cap_internal_idempotency WHERE idempotency_key = $1",
+        )
+        .bind(&key)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(
+            receipt,
+            (true, true, true, false),
+            "the receipt must stay incomplete for a same-key publication retry"
+        );
     }
 
     #[tokio::test]
