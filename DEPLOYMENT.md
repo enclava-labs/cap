@@ -246,10 +246,16 @@ enclava key rotate-owner --backup-out ./owner-replacement.json \
   --passphrase-file ./backup.pass --yes
 ```
 
-The CLI confirms the accepted keyring's policy before finalizing local recovery
-state. Preserve both the replacement backup and the previous backup until a
+Preserve both the replacement backup and the previous backup until a
 fresh login and deployment succeed. Use the updated API and CLI together; drain
 old API replicas before relying on these completion semantics.
+
+`enclava key setup` and owner rotation confirm the accepted keyring's
+publication before finalizing local state, so they require the acting owner's
+keyring write authority and a reachable policy publication path. `enclava key
+restore` is read-and-verify: it validates the signed remote keyring and works
+for any active member whose derived key is still Owner in that keyring,
+without requiring keyring write permission or KBS availability.
 
 ## Smoke Checks
 
