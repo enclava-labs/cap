@@ -614,7 +614,7 @@ async fn enqueue_signed_policy_bootstrap_if_idle(
 
 /// Clear a stray deferred-selector debt from an unsigned-only row.
 ///
-/// Migration 0050's trigger owes selector generation bumps only where
+/// Migration 0058's trigger owes selector generation bumps only where
 /// `desired_generation > 0` (mirroring
 /// [`enqueue_signed_policy_revocation_if_active`]'s active-mode guard), so
 /// the debt
@@ -622,7 +622,7 @@ async fn enqueue_signed_policy_bootstrap_if_idle(
 /// stray debt ever lands on an unsigned-only row (manual psql, a future
 /// backfill), it is cleared here without bumping so the install cannot be
 /// pushed into signed-policy mode.  This touches only the debt column, so
-/// it is invisible to pre-0050 replicas and safe at any point in a run.
+/// it is invisible to pre-0058 replicas and safe at any point in a run.
 async fn clear_stray_selector_debt(db: &PgPool) -> Result<(), KbsPolicyError> {
     sqlx::query(
         "UPDATE kbs_signed_policy_reconciliation
@@ -638,13 +638,13 @@ async fn clear_stray_selector_debt(db: &PgPool) -> Result<(), KbsPolicyError> {
 }
 
 /// Commit the deferred candidate-selector generation bumps owed by migration
-/// 0050 -- and ONLY once the filtered policy body is live in the ConfigMap.
+/// 0058 -- and ONLY once the filtered policy body is live in the ConfigMap.
 ///
-/// Only the post-0050 implementation -- the one filtering signed-policy
+/// Only the post-0058 implementation -- the one filtering signed-policy
 /// candidates by current keyring membership -- may interpret the debt.
 /// `deploy/api/deployment.yaml` runs the API with
 /// `DATABASE_MIGRATION_MODE=verify`, so the migration step can precede the
-/// new binary by minutes while a pre-0050 replica keeps reconciling every 30
+/// new binary by minutes while a pre-0058 replica keeps reconciling every 30
 /// seconds: a generation bumped at migration time would be consumed by that
 /// replica's unfiltered candidate query and published as the old policy body
 /// at the new generation, after which this build would crash-loop on
@@ -653,10 +653,10 @@ async fn clear_stray_selector_debt(db: &PgPool) -> Result<(), KbsPolicyError> {
 ///
 /// Publishing first and committing second keeps that failure unreachable on
 /// every crash path.  Until this call, `desired_generation` stays unchanged
-/// and a pre-0050 reconciler keeps finding its unfiltered hash matching the
+/// and a pre-0058 reconciler keeps finding its unfiltered hash matching the
 /// published body: it stays quiescent.  The filtered replace annotates the
 /// ConfigMap with the owed generation while the durable desired generation
-/// is still behind it, so a pre-0050 reconciler treats it as
+/// is still behind it, so a pre-0058 reconciler treats it as
 /// [`GenerationDecision::Superseded`] and cannot overwrite; once the
 /// increment lands here, the same content-bound annotation turns any late
 /// unfiltered republication into a same-generation conflict.  A failure
@@ -664,8 +664,8 @@ async fn clear_stray_selector_debt(db: &PgPool) -> Result<(), KbsPolicyError> {
 /// so the next run simply republishes.
 ///
 /// The debt is a COUNTER (not a boolean marker) re-armed by migration
-/// 0050's `org_keyrings` INSERT trigger, so it survives keyring writes
-/// committed by a pre-0050 replica during the rollout: `put_keyring` and
+/// 0058's `org_keyrings` INSERT trigger, so it survives keyring writes
+/// committed by a pre-0058 replica during the rollout: `put_keyring` and
 /// `rotate_org_owner` only take the per-org signing-authority lane and the
 /// old binary enqueues nothing, so such a write can land after this run
 /// loaded its candidate set and before the ConfigMap replace.  That is why
@@ -942,7 +942,7 @@ async fn load_signed_policy_candidates(
         ),
         -- The cast is safe at two levels: org_keyrings rows are written only
         -- by the put/rotate handlers, which serialize validated JSON, and the
-        -- org_keyrings_payload_wellformed CHECK constraint (migration 0050)
+        -- org_keyrings_payload_wellformed CHECK constraint (migration 0058)
         -- rejects any non-JSON or non-object payload or a non-array members
         -- entry at INSERT time, so a malformed row from a backfill script or
         -- manual psql fix can never take down candidate loading for every
@@ -1452,10 +1452,10 @@ async fn reconcile_pending_signed_policy_artifacts_with_client(
 ) -> Result<(), KbsPolicyError> {
     // Clear any stray deferred-selector debt on an unsigned-only row (see
     // clear_stray_selector_debt).  A debt on a signed-mode row is left in
-    // place here on purpose: the owed generation bump (migration 0050) is
+    // place here on purpose: the owed generation bump (migration 0058) is
     // published first and committed only after the filtered ConfigMap replace
     // succeeded (consume_deferred_selector_bumps below), so no failure in
-    // this run can expose a raw bumped generation to a pre-0050 reconciler.
+    // this run can expose a raw bumped generation to a pre-0058 reconciler.
     clear_stray_selector_debt(db).await?;
     let cm_api: Api<ConfigMap> = Api::namespaced(client.clone(), &config.namespace);
     // Clear any stray deferred-withdrawal debt on an unsigned-only row (see
@@ -1504,10 +1504,10 @@ async fn reconcile_pending_signed_policy_artifacts_with_client(
         // does that only after the filtered replace below.  Pre-0052
         // replicas reading the same row keep seeing the unchanged
         // desired_generation and stay quiescent.
-        // Pending deferred selector bumps (migration 0050) likewise publish
+        // Pending deferred selector bumps (migration 0058) likewise publish
         // the owed generation as desired_generation + selector_bumps_owed
         // without committing the increment yet -- consume_deferred_selector_bumps
-        // does that only after the filtered replace below.  Pre-0050
+        // does that only after the filtered replace below.  Pre-0058
         // replicas reading the same row keep seeing the unchanged
         // desired_generation and stay quiescent.
         let generation = state.desired_generation
@@ -1592,6 +1592,7 @@ async fn reconcile_pending_signed_policy_artifacts_with_client(
             } => (true, resource_version, publication_token),
             ConfigMapConvergence::Superseded => continue,
         };
+<<<<<<< HEAD
         // The withdrawal-filtered body is now live at `generation` with its
         // content-bound generation annotation, and only now is the owed
         // increment (migration 0052) safe to commit: while
@@ -1621,10 +1622,10 @@ async fn reconcile_pending_signed_policy_artifacts_with_client(
             continue;
         }
         // The selector-filtered body is likewise live at `generation`, and
-        // only now is the selector increment (migration 0050) safe to commit.
+        // only now is the selector increment (migration 0058) safe to commit.
         // The CAS on the observed (desired, owed) pair is what fences OLD
-        // keyring writers: put_keyring / rotate_org_owner from a pre-0050
-        // replica commit no enqueue of their own, but migration 0050's
+        // keyring writers: put_keyring / rotate_org_owner from a pre-0058
+        // replica commit no enqueue of their own, but migration 0058's
         // org_keyrings trigger has already owed them a bump inside their own
         // transaction.  If such a write landed after this run loaded its
         // candidate set, owed has moved, the CAS fails, and the loop retries
@@ -3954,9 +3955,9 @@ resource_bindings := {
     }
 
     /// Regression coverage for the #130 keyring-rotation generation bump.
-    /// Migration 0050's `org_keyrings` INSERT trigger owes one selector bump
+    /// Migration 0058's `org_keyrings` INSERT trigger owes one selector bump
     /// per keyring write while signed-policy mode is active -- including
-    /// writes committed by a PRE-0050 replica during a rolling upgrade,
+    /// writes committed by a PRE-0058 replica during a rolling upgrade,
     /// which is the whole point of the trigger (the old binary enqueues
     /// nothing itself).  Runs against its own uniquely named per-process
     /// database (see [`crate::test_support::isolated_database_test_pool`]):
@@ -4004,7 +4005,7 @@ resource_bindings := {
         // the reconciler withdraws rotated-out artifacts (#130): the changed
         // candidate set at an unchanged generation would otherwise be
         // rejected as a content conflict.  desired_generation itself must
-        // stay put -- a pre-0050 replica must never see a raw bump.
+        // stay put -- a pre-0058 replica must never see a raw bump.
         sqlx::query(
             "UPDATE kbs_signed_policy_reconciliation
                 SET desired_generation = 1
@@ -4029,14 +4030,14 @@ resource_bindings := {
         crate::test_support::drop_isolated_database("cap130_rotation_enqueue", pool).await;
     }
 
-    /// Migration 0050 owes selector generation bumps in a counter instead of
-    /// performing them, so a pre-0050 replica still reconciling during the
+    /// Migration 0058 owes selector generation bumps in a counter instead of
+    /// performing them, so a pre-0058 replica still reconciling during the
     /// rollout cannot consume the bump with its unfiltered candidate query.
-    /// Only the post-0050 reconciler interprets the debt -- exactly once per
+    /// Only the post-0058 reconciler interprets the debt -- exactly once per
     /// observed (desired, owed) pair, and only after the filtered policy body
     /// is published (consume_deferred_selector_bumps).  A keyring write
     /// landing between the reconciler's state read and its consumption
-    /// (exactly the interleaving raised in review: a pre-0050 replica's
+    /// (exactly the interleaving raised in review: a pre-0058 replica's
     /// put_keyring committing after candidates were loaded) increments the
     /// counter, fails the CAS, and forces republication at a strictly higher
     /// generation -- never a same-generation conflict on a stale candidate
@@ -4065,7 +4066,7 @@ resource_bindings := {
             None
         );
 
-        // Migration 0050 marks signed-mode installs with one owed bump; the
+        // Migration 0058 marks signed-mode installs with one owed bump; the
         // post-publication commit lands exactly the observed pair.
         sqlx::query(
             "UPDATE kbs_signed_policy_reconciliation
@@ -4095,8 +4096,8 @@ resource_bindings := {
         );
 
         // The review interleaving: the reconciler observed (3, 1) and
-        // published at 4, but a pre-0050 replica's put_keyring committed in
-        // between -- migration 0050's trigger owed that write a bump too.
+        // published at 4, but a pre-0058 replica's put_keyring committed in
+        // between -- migration 0058's trigger owed that write a bump too.
         // The stale CAS must fail and leave the debt for the retry, which
         // republishes at a strictly higher generation.
         sqlx::query(
