@@ -2183,17 +2183,9 @@ pub(crate) async fn rotate_signer_commit(
         ));
     }
 
-    // Fail closed BEFORE the rotation transaction: in signed-policy mode a
-    // committed rotation withdraws the rotated-out signer's artifacts and
-    // owes a deferred generation bump, but neither the post-commit
-    // reconciliation below nor the periodic reconciler can publish without
-    // provider configuration -- the withdrawal would strand the old policy
-    // live with no convergence path until configuration returns (PR #187
-    // review). The keyring routes enforce the same gap via
-    // confirm_keyring_kbs_publication; here the check is pre-commit so the
-    // caller gets a clean retryable error and the rotation token JTI stays
-    // unconsumed for a retry once configuration is restored.
-    if let Err(error) = crate::kbs::ensure_kbs_publication_configured(&state).await {
+    // Without a configured publisher, signed-policy withdrawals cannot converge.
+    // Refuse before consuming the rotation token so the request remains retryable.
+    if let Err(error) = crate::kbs::ensure_kbs_publication_configured(state).await {
         tracing::warn!(
             app = %app_name,
             org_id = %auth.org_id,

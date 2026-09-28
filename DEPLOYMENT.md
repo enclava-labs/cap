@@ -262,8 +262,24 @@ The CLI confirms the accepted keyring's policy before finalizing local recovery
 state. Preserve both the replacement backup and the previous backup until a
 fresh login and deployment succeed. Use the updated API and CLI together; drain
 old API replicas before relying on these completion semantics.
-Apply canonical signed-content keyring replay handling before this CLI update:
-historical payload encodings must not turn an exact signed replay into a conflict.
+
+## Signer Rotation Completion
+
+In signed-policy mode, missing KBS publication configuration rejects a signer
+rotation before changing the app or consuming its single-use token. Restore the
+configuration and retry the same request.
+
+After a rotation commits, a publication failure returns
+`signer_policy_reconciliation_pending`. Internal PaaS callers receive a `deferred`
+disposition and must retry with the same idempotency key and request body. CAP
+retains the committed response and retries publication only; it does not consume
+the rotation token or apply the mutation again. Unrelated, uncertain failures
+remain fail-closed and require recovery rather than automatic mutation replay.
+
+A withdrawn legacy TLS binding stays withdrawn even if a newer artifact has the
+same image and init-data measurements. Those measurements do not bind the old
+entry to the new workload instance. Fresh deployments must authorize through
+signed-policy candidates instead of readmitting the old legacy binding.
 
 ## Smoke Checks
 

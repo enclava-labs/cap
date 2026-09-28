@@ -3858,6 +3858,52 @@ resource_bindings := {
         crate::test_support::drop_isolated_database("cap130_selector_rotation", pool).await;
     }
 
+    #[tokio::test]
+    async fn duplicate_keyring_members_authorize_each_legacy_artifact_once() {
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_pr187_duplicate_members").await;
+        let (org_id, app_id) = insert_test_app(&pool, "running").await;
+        let legacy = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, legacy, "healthy", Utc::now()).await;
+        let artifact = insert_test_artifact(&pool, app_id, legacy, "77").await;
+        let signer = "bb".repeat(32);
+        // The same member key twice: once lowercase, once in the uppercase
+        // spelling validation accepts and stores as-is.
+        insert_test_keyring_version(&pool, org_id, 1, &[&signer, &signer.to_uppercase()]).await;
+
+        let candidates = load_signed_policy_candidates(&pool, 1)
+            .await
+            .expect("select candidates with duplicate member keys");
+        let matching: Vec<_> = candidates
+            .iter()
+            .filter(|candidate| {
+                candidate.artifact.metadata.descriptor_core_hash
+                    == artifact.metadata.descriptor_core_hash
+            })
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "repeated member keys must not duplicate the authorized legacy artifact"
+        );
+        assert!(matching[0].required);
+
+        let single_body_len =
+            signed_policy_artifact_policy_body(std::slice::from_ref(&matching[0].artifact))
+                .unwrap()
+                .len();
+        let selected =
+            select_signed_policy_artifacts_for_policy_body(candidates, single_body_len + 32)
+                .unwrap();
+        assert_eq!(
+            selected.len(),
+            1,
+            "the repeated member key must not spuriously exhaust the serialized policy budget"
+        );
+
+        crate::test_support::drop_isolated_database("cap_pr187_duplicate_members", pool).await;
+    }
+
     /// Fail closed for #130: an org with retained artifacts but no keyring row
     /// at all must contribute no authorization -- the INNER JOIN drops it, and
     /// the deferred selector bump publishes exactly that withdrawal on upgrade.
@@ -3890,81 +3936,6 @@ resource_bindings := {
             "artifacts of an org without any keyring row must contribute no authority"
         );
         crate::test_support::drop_isolated_database("cap130_selector_fail_closed", pool).await;
-    }
-
-    /// PR #187 review: an owner-signed keyring may carry two distinct members
-    /// with the same public key. `current_keyring_members` yields one row per
-    /// member, and the legacy branch joined artifacts per member row -- the
-    /// same artifact twice, inflating the policy body. The dedupe on
-    /// (org_id, lower(pubkey)) must emit every matching artifact exactly
-    /// once on both the job-backed and the legacy paths.
-    #[tokio::test]
-    async fn selector_emits_each_artifact_once_for_duplicated_member_keys() {
-        let (_db_cleanup, pool) =
-            crate::test_support::isolated_database_test_pool("cap187_dedup_member_keys").await;
-        let now = Utc::now();
-        let signer = "bb".repeat(32);
-
-        // Job-backed path: current operation binds an artifact signed by a
-        // key that two keyring members carry.
-        let (org_id, app_id) = insert_test_app(&pool, "running").await;
-        insert_test_keyring_version(&pool, org_id, 1, &[&signer, &signer]).await;
-        let deployment = Uuid::new_v4();
-        insert_test_deployment(&pool, org_id, app_id, deployment, "healthy", now).await;
-        let artifact = insert_test_artifact(&pool, app_id, deployment, "51").await;
-        insert_test_job(
-            &pool,
-            org_id,
-            app_id,
-            deployment,
-            deployment,
-            Some((deployment, &artifact)),
-        )
-        .await;
-
-        let candidates = load_signed_policy_candidates(&pool, 2)
-            .await
-            .expect("select job-backed candidates with duplicated member keys");
-        let matches = || {
-            candidates
-                .iter()
-                .filter(|candidate| {
-                    candidate.artifact.metadata.descriptor_core_hash
-                        == artifact.metadata.descriptor_core_hash
-                })
-                .count()
-        };
-        // The helper's owner member carries the same key as the deployer.
-        assert_eq!(
-            matches(),
-            1,
-            "the job-backed path must emit the artifact exactly once for duplicated member keys"
-        );
-
-        // Legacy path (pre-0038 deployment without jobs): same duplicated
-        // membership, same single-emission requirement.
-        let (legacy_org, legacy_app) = insert_test_app(&pool, "running").await;
-        insert_test_keyring_version(&pool, legacy_org, 1, &[&signer, &signer]).await;
-        let legacy = Uuid::new_v4();
-        insert_test_deployment(&pool, legacy_org, legacy_app, legacy, "healthy", now).await;
-        let legacy_artifact = insert_test_artifact(&pool, legacy_app, legacy, "52").await;
-
-        let candidates = load_signed_policy_candidates(&pool, 1)
-            .await
-            .expect("select legacy candidates with duplicated member keys");
-        let legacy_matches = candidates
-            .iter()
-            .filter(|candidate| {
-                candidate.artifact.metadata.descriptor_core_hash
-                    == legacy_artifact.metadata.descriptor_core_hash
-            })
-            .count();
-        assert_eq!(
-            legacy_matches, 1,
-            "the legacy path must emit the artifact exactly once for duplicated member keys"
-        );
-
-        crate::test_support::drop_isolated_database("cap187_dedup_member_keys", pool).await;
     }
 
     #[tokio::test]
