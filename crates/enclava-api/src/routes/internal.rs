@@ -1288,7 +1288,7 @@ async fn begin_idempotent_request_with_recovery_and_binding(
                 .and_then(|body| body.get("code"))
                 .and_then(serde_json::Value::as_str),
             Some(KEYRING_POLICY_RECONCILIATION_PENDING_CODE)
-                | Some(crate::routes::apps::SIGNER_POLICY_RECONCILIATION_PENDING_CODE)
+                | Some(crate::routes::apps::SIGNER_ROTATION_PUBLICATION_PENDING_CODE)
         );
     if !row.known_not_applied
         && (policy_changed
@@ -1771,13 +1771,13 @@ async fn complete_signer_result(
         Err((status, Json(body)))
             if status == StatusCode::SERVICE_UNAVAILABLE
                 && body.get("code").and_then(serde_json::Value::as_str)
-                    == Some(crate::routes::apps::SIGNER_POLICY_RECONCILIATION_PENDING_CODE) =>
+                    == Some(crate::routes::apps::SIGNER_ROTATION_PUBLICATION_PENDING_CODE) =>
         {
             let checkpoint = (status, body);
             let (status, Json(mut body)) = defer_idempotent_request(lease, Some(&checkpoint)).await;
             if status == StatusCode::CONFLICT {
                 body["cause"] = serde_json::json!(
-                    crate::routes::apps::SIGNER_POLICY_RECONCILIATION_PENDING_CODE
+                    crate::routes::apps::SIGNER_ROTATION_PUBLICATION_PENDING_CODE
                 );
             }
             Err((status, Json(body)))
@@ -1788,7 +1788,7 @@ async fn complete_signer_result(
 
 fn signer_publication_checkpoint_error(committed: serde_json::Value) -> InternalRouteError {
     let mut body = serde_json::json!({
-        "code": crate::routes::apps::SIGNER_POLICY_RECONCILIATION_PENDING_CODE,
+        "code": crate::routes::apps::SIGNER_ROTATION_PUBLICATION_PENDING_CODE,
     });
     body[SIGNER_PUBLICATION_CHECKPOINT_RESPONSE_FIELD] = committed;
     (StatusCode::SERVICE_UNAVAILABLE, Json(body))
@@ -1828,7 +1828,7 @@ async fn signer_publication_checkpoint(
         return Err(db_error());
     };
     if body.get("code").and_then(serde_json::Value::as_str)
-        != Some(crate::routes::apps::SIGNER_POLICY_RECONCILIATION_PENDING_CODE)
+        != Some(crate::routes::apps::SIGNER_ROTATION_PUBLICATION_PENDING_CODE)
     {
         return Err(db_error());
     }
@@ -11867,7 +11867,7 @@ mod tests {
         assert_eq!(deferred.1.0["retryable"], true);
         assert_eq!(
             deferred.1.0["cause"],
-            crate::routes::apps::SIGNER_POLICY_RECONCILIATION_PENDING_CODE
+            crate::routes::apps::SIGNER_ROTATION_PUBLICATION_PENDING_CODE
         );
 
         // The deferred receipt is an incomplete checkpoint carrying the
@@ -11889,7 +11889,7 @@ mod tests {
         );
         assert_eq!(
             body.as_ref().unwrap()["code"],
-            crate::routes::apps::SIGNER_POLICY_RECONCILIATION_PENDING_CODE
+            crate::routes::apps::SIGNER_ROTATION_PUBLICATION_PENDING_CODE
         );
         assert_eq!(
             body.as_ref().unwrap()["committed_response"]["signer_identity_subject"],
@@ -11960,7 +11960,7 @@ mod tests {
         assert_eq!(retried.1.0["idempotency_disposition"], "deferred");
         assert_eq!(
             retried.1.0["cause"],
-            crate::routes::apps::SIGNER_POLICY_RECONCILIATION_PENDING_CODE
+            crate::routes::apps::SIGNER_ROTATION_PUBLICATION_PENDING_CODE
         );
         let rotation_receipts_after: (i64, i64) = sqlx::query_as(
             "SELECT (SELECT count(*) FROM consumed_signer_rotation_tokens WHERE app_id = $1),
@@ -12130,7 +12130,7 @@ mod tests {
                 assert_eq!(deferred.1.0["retryable"], true);
                 assert_eq!(
                     deferred.1.0["cause"],
-                    crate::routes::apps::SIGNER_POLICY_RECONCILIATION_PENDING_CODE
+                    crate::routes::apps::SIGNER_ROTATION_PUBLICATION_PENDING_CODE
                 );
                 let subject: Option<String> =
                     sqlx::query_scalar("SELECT signer_identity_subject FROM apps WHERE id = $1")

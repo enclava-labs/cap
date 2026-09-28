@@ -270,7 +270,7 @@ rotation before changing the app or consuming its single-use token. Restore the
 configuration and retry the same request.
 
 After a rotation commits, a publication failure returns
-`signer_policy_reconciliation_pending`. Internal PaaS callers receive a `deferred`
+`signer_rotation_publication_pending`. Internal PaaS callers receive a `deferred`
 disposition and must retry with the same idempotency key and request body. CAP
 retains the committed response and retries publication only; it does not consume
 the rotation token or apply the mutation again. Unrelated, uncertain failures

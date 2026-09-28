@@ -31,6 +31,11 @@ fn internal_server_error() -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
+/// Publication failures must not disguise an already-committed rotation as an
+/// uncertain mutation failure.
+pub(crate) const SIGNER_ROTATION_PUBLICATION_PENDING_CODE: &str =
+    "signer_rotation_publication_pending";
+
 /// Bounded diagnostics for app deletion failures.
 ///
 /// Deletion dependencies can embed tenant-controlled hostnames, namespaces,
@@ -2035,18 +2040,16 @@ pub async fn issue_signer_rotation_token_route(
     }))
 }
 
-/// The signer identity is already committed when KBS publication fails, so
-/// the failure is committed-but-pending, never a rolled-back success.
-/// Mirrors the keyring pending DTO so operator tooling sees one shape.
-pub(crate) const SIGNER_POLICY_RECONCILIATION_PENDING_CODE: &str =
-    "signer_policy_reconciliation_pending";
-
 fn signer_publication_pending_error() -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::SERVICE_UNAVAILABLE,
         Json(serde_json::json!({
-            "error": "signer rotation committed; KBS policy reconciliation pending",
-            "code": SIGNER_POLICY_RECONCILIATION_PENDING_CODE,
+            "error": "signer_rotation_publication_pending",
+            "code": SIGNER_ROTATION_PUBLICATION_PENDING_CODE,
+            "message": "the signer rotation committed but its KBS policy publication is still pending; retry with the same parameters to complete publication",
+            "context": "rotate_signer",
+            "committed": true,
+            "retryable": true,
         })),
     )
 }
@@ -2075,7 +2078,7 @@ pub(crate) async fn reconcile_signer_publication(
             tracing::warn!(
                 app_id = %app_id,
                 %error,
-                error_code = SIGNER_POLICY_RECONCILIATION_PENDING_CODE,
+                error_code = SIGNER_ROTATION_PUBLICATION_PENDING_CODE,
                 "signer rotation committed; KBS policy reconciliation pending"
             );
             return Err(signer_publication_pending_error());
@@ -2257,6 +2260,16 @@ pub(crate) async fn rotate_signer_commit(
     let previous_issuer = app.signer_identity_issuer.clone();
 
     let is_initial_set = previous_subject.is_none() && previous_issuer.is_none();
+
+    // A current-identity confirmation cannot mutate authority or consume a token.
+    // Release the lanes before the caller takes the global publication fence.
+    if previous_subject.as_deref() == Some(subject.as_str())
+        && previous_issuer.as_deref() == Some(issuer.as_str())
+    {
+        tx.rollback().await.map_err(|_| internal_server_error())?;
+        return Ok(app.into());
+    }
+
     let confirmation_token = body
         .email_confirmation_token
         .as_deref()
