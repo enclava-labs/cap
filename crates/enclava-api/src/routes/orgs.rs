@@ -1985,9 +1985,19 @@ mod tests {
         let pool = sqlx::PgPool::connect(&database_url)
             .await
             .expect("connect keyring regression database");
-        crate::db::pool::run_migrations(&pool)
-            .await
-            .expect("migrate keyring regression database");
+        // Migrate at most once per test process (PR #185 review follow-up):
+        // on a fresh database, concurrent run_migrations calls from
+        // parallel tests deadlock on sqlx's migration advisory lock. CI
+        // serializes with --test-threads=1, but this guard makes a plain
+        // parallel cargo test safe on a fresh database too.
+        static MIGRATED: tokio::sync::Mutex<bool> = tokio::sync::Mutex::const_new(false);
+        let mut migrated = MIGRATED.lock().await;
+        if !*migrated {
+            crate::db::pool::run_migrations(&pool)
+                .await
+                .expect("migrate keyring regression database");
+            *migrated = true;
+        }
         pool
     }
 
