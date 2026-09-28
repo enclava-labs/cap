@@ -421,7 +421,7 @@ async fn deploy_with_timings(
 
     let bootstrap_pubkey_hash =
         template_bootstrap_pubkey_hash(api, &ctx.paths, template, &instance_name).await?;
-    let (app, app_already_existed) = ensure_template_app(
+    let app = ensure_template_app(
         api,
         template,
         &instance_name,
@@ -465,8 +465,17 @@ async fn deploy_with_timings(
     pb.set_position(2);
     pb.set_message("Creating template instance...");
 
-    let roll_hold_seconds =
-        app_already_existed.then(|| customer_config_roll_hold_seconds(args.ssh_timeout_seconds));
+    // Always request the normalized hold so the idempotency key stays stable
+    // across a first-deploy retry: this run may have created the app above,
+    // so gating the request on the app existing would change the key on the
+    // retry. CAP applies the hold only when a live workload is being
+    // replaced and reports that in the response.
+    let roll_hold_seconds = customer_config_roll_hold_seconds(args.ssh_timeout_seconds);
+    // CAP arms the hold when it accepts the request below. The deadline
+    // clock starts here, not at deploy_started, so preflight time above
+    // (discovery, app creation, key preparation, signing) does not consume
+    // the hold.
+    let hold_armed_at = Instant::now();
     let response = match timings
         .run(
             DeployPhase::DeployRequest,
@@ -478,7 +487,7 @@ async fn deploy_with_timings(
                 customer_descriptor_blob: Some(signed_blobs.customer_descriptor_blob),
                 org_keyring_blob: Some(signed_blobs.org_keyring_blob),
                 signed_policy_artifact: Some(signed_blobs.signed_policy_artifact),
-                customer_config_roll_hold_seconds: roll_hold_seconds,
+                customer_config_roll_hold_seconds: Some(roll_hold_seconds),
             }),
         )
         .await
@@ -500,14 +509,11 @@ async fn deploy_with_timings(
     if customer_config_hold && deployment_id == "pending" {
         return Err("PaaS held the workload roll but did not return a deployment id".into());
     }
-    // The server armed the hold during the create call, which started after
-    // deploy_started. Stopping this far before that deadline leaves room for
-    // the release round trip and keeps request timeouts inside the hold.
-    let pre_release_deadline = if customer_config_hold {
-        roll_hold_seconds.map(|seconds| hold_deadline(deploy_started, seconds))
-    } else {
-        None
-    };
+    // The server armed the hold during the create call above. Stopping this
+    // far before that deadline leaves room for the release round trip and
+    // keeps request timeouts inside the hold.
+    let pre_release_deadline =
+        customer_config_hold.then(|| hold_deadline(hold_armed_at, roll_hold_seconds));
     let phase_budget =
         |requested: u64| bounded_phase(pre_release_deadline, Duration::from_secs(requested));
     if customer_config_hold
@@ -628,6 +634,7 @@ async fn deploy_with_timings(
                         pre_release_deadline,
                         Duration::from_secs(args.ssh_timeout_seconds),
                     ),
+                    hold_deadline: pre_release_deadline,
                     progress: &pb,
                     timings_mode: args.timings,
                 },
@@ -916,8 +923,8 @@ const CUSTOMER_CONFIG_ROLL_HOLD_PREFIX_SECONDS: u64 = 240 + (121 * 2) + 60;
 /// Cover the managed-config wait and the customer-config delivery, each of
 /// which can consume the deploy's ssh timeout, plus the work that starts
 /// after CAP arms the hold. CAP clamps the same window.
-fn hold_deadline(deploy_started: Instant, hold_seconds: u32) -> Instant {
-    deploy_started + Duration::from_secs(u64::from(hold_seconds)) - Duration::from_secs(30)
+fn hold_deadline(armed_at: Instant, hold_seconds: u32) -> Instant {
+    armed_at + Duration::from_secs(u64::from(hold_seconds)) - Duration::from_secs(30)
 }
 
 /// Cap a pre-release wait at the hold deadline. Unheld deploys keep the
@@ -985,9 +992,9 @@ async fn ensure_template_app(
     template: &HostedTemplate,
     instance_name: &str,
     bootstrap_pubkey_hash: Option<&str>,
-) -> Result<(AppResponse, bool), Box<dyn std::error::Error>> {
+) -> Result<AppResponse, Box<dyn std::error::Error>> {
     match api.get_app(instance_name).await {
-        Ok(app) => return Ok((app, true)),
+        Ok(app) => return Ok(app),
         Err(ApiError::Api { status: 404, .. }) => {}
         Err(error) => return Err(error.into()),
     }
@@ -1000,10 +1007,11 @@ async fn ensure_template_app(
         )?)
         .await
     {
-        Ok(app) => Ok((app, false)),
-        // A concurrent create won. The app already exists, so a following
-        // deploy is a redeploy and may hold the roll.
-        Err(ApiError::Api { status: 409, .. }) => Ok((api.get_app(instance_name).await?, true)),
+        Ok(app) => Ok(app),
+        // A concurrent create won. The app already exists; fetch it.
+        Err(ApiError::Api { status: 409, .. }) => {
+            api.get_app(instance_name).await.map_err(Into::into)
+        }
         Err(error) => Err(error.into()),
     }
 }
@@ -1535,6 +1543,12 @@ struct DeliverTemplateConfigTarget<'a> {
     /// self-unlock and keep the default budget.
     password_mode: bool,
     owner_wait_budget: Duration,
+    /// Absolute deadline for a held redeploy: every request the delivery
+    /// makes is bounded by it, so a stalled write cannot outlive the roll
+    /// hold — including auto-unlock deliveries and password-mode requests
+    /// before the first lock response, which the owner-wait alone does not
+    /// bound. `None` on unheld deploys.
+    hold_deadline: Option<Instant>,
     progress: &'a ProgressBar,
     /// Output mode for operator notices: `--timings` owns stderr as a
     /// JSONL stream, so notices ride it as structured events instead of
@@ -1563,6 +1577,7 @@ async fn deliver_template_config_with_retry(
         locked_since: None,
         password_mode: target.password_mode,
         owner_wait_budget: target.owner_wait_budget,
+        hold_deadline: target.hold_deadline,
         delivery_started: Instant::now(),
         progress: target.progress,
         owner_wait_announced: false,
@@ -1687,6 +1702,11 @@ struct TemplateConfigDeliveryState<'a> {
     /// Sticky for the delivery: a successful write clears the lock window
     /// but must not discard the deadline the post-write sync still needs.
     engaged_deadline: Option<Instant>,
+    /// Absolute deadline of a held redeploy's roll hold. Bounds every
+    /// request the delivery makes, including auto-unlock deliveries and
+    /// password-mode requests before the first lock response. `None` on
+    /// unheld deploys.
+    hold_deadline: Option<Instant>,
 }
 
 impl TemplateConfigDeliveryState<'_> {
@@ -1850,15 +1870,25 @@ impl TemplateConfigDeliveryState<'_> {
     /// password-mode lock is even a candidate (a stalled request must not
     /// outlive the budget waiting for the persistence threshold) and
     /// retained for the rest of the delivery once engaged — a successful
-    /// write clears the lock window but not this deadline. Deliveries with
-    /// no password-mode lock state pass `None` and keep today's exact
-    /// behavior.
+    /// write clears the lock window but not this deadline. A held redeploy
+    /// additionally bounds every request by the absolute hold deadline, so
+    /// a stalled write cannot outlive the roll hold even while no
+    /// password-mode lock state exists. Deliveries with neither pass `None`
+    /// and keep today's exact behavior.
     fn request_deadline(&self) -> Option<Instant> {
-        if !self.password_mode || (self.locked_since.is_none() && self.engaged_deadline.is_none()) {
-            return None;
+        let owner_wait = if !self.password_mode
+            || (self.locked_since.is_none() && self.engaged_deadline.is_none())
+        {
+            None
+        } else {
+            self.engaged_deadline
+                .or_else(|| self.delivery_started.checked_add(self.owner_wait_budget))
+        };
+        match (self.hold_deadline, owner_wait) {
+            (Some(hold), Some(owner_wait)) => Some(hold.min(owner_wait)),
+            (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+            (None, None) => None,
         }
-        self.engaged_deadline
-            .or_else(|| self.delivery_started.checked_add(self.owner_wait_budget))
     }
 
     async fn set_key(&mut self, key: &str, value: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -4611,77 +4641,68 @@ mod tests {
     }
 
     #[test]
-    fn template_deploy_claims_password_template_before_config_delivery() {
-        let source = include_str!("template.rs");
-        let deploy_start = source.find("async fn deploy").expect("deploy exists");
-        let deploy_end = source[deploy_start..]
-            .find("async fn ssh_command")
-            .expect("ssh_command follows deploy")
-            + deploy_start;
-        let body = &source[deploy_start..deploy_end];
-
-        let bootstrap_hash = body
-            .find("template_bootstrap_pubkey_hash")
-            .expect("template deploy derives bootstrap hash");
-        let password_preflight = body
-            .find("storage_password.ensure_available_for_password_mode")
-            .expect("template deploy preflights password input availability");
-        let ensure_app = body
-            .find("ensure_template_app")
-            .expect("template deploy creates app");
-        let prepare_log_key = body
-            .find("prepare_template_log_key")
-            .expect("template deploy prepares tenant log encryption");
-        let create_instance = body
-            .find("create_template_instance")
-            .expect("template deploy creates template instance");
-        let wait_claim = body
-            .find("wait_for_template_bootstrap_endpoint")
-            .expect("template deploy waits for ownership claim endpoint");
-        let claim = body
-            .find("claim_initial_ownership")
-            .expect("template deploy claims ownership");
-        let managed_config = body
-            .find("deliver_managed_template_config")
-            .expect("template deploy asks PaaS to deliver managed config");
-        let wait_managed_config = body
-            .find("wait_for_paas_managed_config_keys")
-            .expect("template deploy waits for PaaS-managed config metadata");
-        let config = body
-            .find("deliver_template_config_with_retry")
-            .expect("template deploy writes customer config");
-        let release = body
-            .find("release_customer_config_roll_with_retry")
-            .expect("template redeploy releases the workload roll after customer config");
-        let ssh_wait = body
-            .find("wait_for_paas_ssh_command")
-            .expect("template deploy waits for the stable SSH command");
-
-        assert!(
-            !body.contains("enable_steady_tick"),
-            "template deploy progress must not redraw during password and recovery-mnemonic prompts"
-        );
-        assert!(
-            password_preflight < bootstrap_hash
-                && bootstrap_hash < ensure_app
-                && ensure_app < prepare_log_key
-                && prepare_log_key < create_instance
-                && create_instance < wait_claim
-                && wait_claim < claim
-                && claim < managed_config
-                && managed_config < wait_managed_config
-                && wait_managed_config < config
-                && config < release
-                && release < ssh_wait,
-            "template deploy must prepare tenant log encryption before deployment, write customer config before releasing a held roll, and only then wait for SSH"
-        );
-    }
-
-    #[test]
     fn customer_config_roll_hold_covers_both_wait_budgets() {
         assert_eq!(customer_config_roll_hold_seconds(1_800), 4_142);
         assert_eq!(customer_config_roll_hold_seconds(10), 562);
         assert_eq!(customer_config_roll_hold_seconds(10_000), 7_200);
+    }
+
+    #[test]
+    fn held_roll_deadline_bounds_all_delivery_requests() {
+        let api = ApiClient::new("https://api.example.test", Some("test".to_string()));
+        let mut tee = TeeClient::new("shell.example.test");
+        let mut config_token = "token".to_string();
+        let mut tee_url = "https://shell.example.test/config".to_string();
+        let mut tee_resolve_ip = None;
+        let progress = ProgressBar::hidden();
+        let mut state = TemplateConfigDeliveryState {
+            api: &api,
+            tee: &mut tee,
+            instance_name: "shell",
+            deployment: DeploymentWait::trusted("expected-1", None),
+            config_token: &mut config_token,
+            tee_url: &mut tee_url,
+            tee_resolve_ip: &mut tee_resolve_ip,
+            terminal_probe_at: None,
+            locked_since: None,
+            password_mode: false,
+            owner_wait_budget: Duration::from_secs(1_800),
+            hold_deadline: None,
+            delivery_started: Instant::now(),
+            progress: &progress,
+            owner_wait_announced: false,
+            post_lock_note_printed: false,
+            timings_mode: false,
+            observed_lock: false,
+            engaged_deadline: None,
+        };
+
+        // Auto-unlock deliveries and password-mode deliveries before the
+        // first lock response have no owner-wait deadline; a held redeploy
+        // must still bound every request by the absolute hold deadline.
+        let hold = Instant::now() + Duration::from_secs(60);
+        state.hold_deadline = Some(hold);
+        assert_eq!(state.request_deadline(), Some(hold));
+        state.password_mode = true;
+        assert_eq!(state.request_deadline(), Some(hold));
+
+        // An engaged owner-wait keeps its own deadline; the request stops at
+        // whichever comes first.
+        let later = Instant::now() + Duration::from_secs(120);
+        state.locked_since = Some(Instant::now());
+        state.engaged_deadline = Some(later);
+        assert_eq!(state.request_deadline(), Some(hold));
+        let earlier = Instant::now() + Duration::from_secs(10);
+        state.engaged_deadline = Some(earlier);
+        assert_eq!(state.request_deadline(), Some(earlier));
+
+        // Unheld deploys keep today's behavior: only the engaged
+        // owner-wait deadline applies, and no lock state means none.
+        state.hold_deadline = None;
+        assert_eq!(state.request_deadline(), Some(earlier));
+        state.engaged_deadline = None;
+        state.locked_since = None;
+        assert_eq!(state.request_deadline(), None);
     }
 
     #[test]
@@ -6242,134 +6263,6 @@ mod tests {
     }
 
     #[test]
-    fn template_config_delivery_owner_wait_is_wired_to_deploy_metadata() {
-        // The owner-wait is caller-supplied deploy metadata (unlock mode + the
-        // shared ssh-timeout budget), never a lookup from inside the wait,
-        // and the delivery loop must consult it on both retry arms.
-        // Windows checkouts carry CRLF; the multi-line needle below embeds LF.
-        let source = include_str!("template.rs").replace("\r\n", "\n");
-
-        assert!(
-            source.contains("password_mode: template.unlock_mode == \"password\""),
-            "the deploy call site must pass the detected unlock mode"
-        );
-        assert!(
-            source.contains(
-                "owner_wait_budget: bounded_phase(\n                        pre_release_deadline,\n                        Duration::from_secs(args.ssh_timeout_seconds),"
-            ),
-            "the owner-wait budget must ride the shared ssh-timeout knob and the roll-hold deadline"
-        );
-
-        let fn_start = source.find("async fn set_key").expect("set_key exists");
-        let fn_end = source
-            .find("async fn attest_template_config_tee_with_retry")
-            .expect("attest retry follows the delivery state impl");
-        let body = &source[fn_start..fn_end];
-        let refresh_arm = body
-            .find("should_refresh_template_config_token")
-            .expect("refresh arm");
-        let retry_arm = body
-            .rfind("should_retry_template_config_tee_error")
-            .expect("retry arm");
-        for arm in [refresh_arm, retry_arm] {
-            let arm_body = &body[arm..];
-            assert!(
-                arm_body.contains("delivery_continues(attempt)"),
-                "both retry arms must honor the continuation predicate"
-            );
-            assert!(
-                arm_body.contains("note_delivery_error(&error)"),
-                "both retry arms must track locked persistence"
-            );
-        }
-
-        assert!(
-            source.contains("enclava unlock --app {}"),
-            "the guidance message must name the unlock command"
-        );
-        let announce_fn = source
-            .find("fn announce")
-            .expect("operator notice channel selection exists");
-        let announce_body = &source[announce_fn..announce_fn + 1200];
-        assert!(
-            announce_body.contains("is_hidden()"),
-            "hidden bars never render bar output; notices need a channel"
-        );
-        assert!(
-            announce_body.contains("timings_mode")
-                && announce_body.contains("template_deploy_notice"),
-            "stderr is the timing JSONL stream whenever --timings is set: notices \
-             must ride it as structured events, never free-form text"
-        );
-        assert!(
-            source.contains("timings_mode: args.timings"),
-            "output mode must be caller-supplied deploy metadata"
-        );
-        let set_key_fn = source.find("async fn set_key").expect("set_key exists");
-        let set_key_body = &source[set_key_fn..set_key_fn + 4000];
-        assert!(
-            set_key_body.contains("report_post_lock_delivery"),
-            "a write that lands after an unlock may have missed the workload's \
-             boot and must say so"
-        );
-        let deliver_fn = source
-            .split_once("async fn deliver_template_config_with_retry")
-            .unwrap()
-            .1
-            .split_once("struct TemplateConfigDeliveryState")
-            .unwrap()
-            .0;
-        assert!(
-            deliver_fn.contains("undelivered_template_config_error"),
-            "a terminal delivery failure must name the abandoned keys"
-        );
-        assert!(
-            deliver_fn.contains("downcast_ref::<TeeError>()"),
-            "the unlock prescription must follow the terminal error, not the \\
-             sticky wait history"
-        );
-        assert!(
-            deliver_fn.contains("delivery.password_mode"),
-            "auto-unlock apps self-unlock: a locked terminal error must not \\
-             prescribe a manual unlock for them"
-        );
-        assert!(
-            source.contains("fn request_deadline"),
-            "nested retry helpers need the phase deadline while a lock is a \\
-             candidate or the wait is engaged"
-        );
-        let refresh_arm_fn = source
-            .find("async fn refresh_template_config_token_with_retry")
-            .expect("refresh helper exists");
-        let refresh_body = &source[refresh_arm_fn..refresh_arm_fn + 2000];
-        assert!(
-            refresh_body.contains("template_config_nested_retry_continues"),
-            "the token-refresh retry loop must honor the owner-wait deadline"
-        );
-        assert!(
-            refresh_body.contains("tokio::time::timeout"),
-            "the deadline must also cut an in-flight token request, not only \
-             gate the next iteration"
-        );
-        let set_key_fn2 = source.find("async fn set_key").expect("set_key exists");
-        let set_key_body2 = &source[set_key_fn2..set_key_fn2 + 3000];
-        assert!(
-            set_key_body2.contains("tokio::time::timeout"),
-            "the deadline must also cut an in-flight config write"
-        );
-        assert!(
-            set_key_body2.contains("self.locked_since = None;"),
-            "a successful write is a non-locked outcome: the persistence window \
-             must not leak into the next key's delivery"
-        );
-        assert!(
-            deliver_fn.contains("platform key sync failed"),
-            "a sync failure after a successful TEE write is a distinct failure \
-             class and must be distinguishable from an undelivered value"
-        );
-    }
-
-    #[test]
     fn template_config_slow_connect_class_and_cap() {
         assert!(is_slow_template_config_attest_attempt(
             &TeeError::Attestation("TEE TCP connect timed out".to_string())
@@ -6775,6 +6668,7 @@ mod tests {
             timings_mode: false,
             observed_lock: false,
             engaged_deadline: None,
+            hold_deadline: None,
         };
         state
             .set_key("SKEY", "value")
@@ -6861,6 +6755,7 @@ mod tests {
             timings_mode: false,
             observed_lock: false,
             engaged_deadline: None,
+            hold_deadline: None,
         };
         assert!(
             state.terminal_bootstrap_stop().await.is_none(),

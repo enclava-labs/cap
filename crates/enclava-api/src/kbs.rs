@@ -626,11 +626,30 @@ async fn load_signed_policy_candidates(
                 ) AS current_operation_rank
             FROM deployments AS deployment
             JOIN apps AS app ON app.id = deployment.app_id
+            -- This must agree with the ranked_job_operations filter above:
+            -- an app whose healthy deployment predates durable apply jobs
+            -- (migration 0038 created no job rows) falls back to this branch,
+            -- so jobs excluded there (unreleased holds) must not disable the
+            -- fallback here either. A held redeploy's own deployment row is
+            -- also excluded from the ranking, or it would outrank the
+            -- previous healthy deployment and drop the running legacy TEE's
+            -- KBS authority while the roll is held or expired failed.
             WHERE NOT EXISTS (
                 SELECT 1
                   FROM deployment_apply_jobs AS any_job
                  WHERE any_job.app_id = deployment.app_id
+                   AND NOT (
+                       any_job.customer_config_hold
+                       AND any_job.customer_config_released_at IS NULL
+                   )
             )
+              AND NOT EXISTS (
+                  SELECT 1
+                    FROM deployment_apply_jobs AS held_job
+                   WHERE held_job.deployment_id = deployment.id
+                     AND held_job.customer_config_hold
+                     AND held_job.customer_config_released_at IS NULL
+              )
         ),
         legacy_artifacts AS (
             SELECT
@@ -2568,6 +2587,86 @@ owner_resource_bindings := {}
                 .await
                 .expect("delete KBS selector fixture");
         }
+    }
+
+    #[tokio::test]
+    async fn legacy_authority_survives_while_the_only_durable_job_is_an_unreleased_hold() {
+        let pool = database_test_pool().await;
+        let now = Utc::now();
+        let (org_id, app_id) = insert_test_app(&pool, "running").await;
+        let legacy = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, legacy, "healthy", now).await;
+        let legacy_artifact = insert_test_artifact(&pool, app_id, legacy, "9a").await;
+
+        // The app's first durable job is a held redeploy that has not been
+        // released. The previous healthy deployment must stay authoritative,
+        // including after the hold expires failed.
+        let held = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            org_id,
+            app_id,
+            held,
+            "healthy",
+            now + chrono::Duration::seconds(1),
+        )
+        .await;
+        insert_test_job(&pool, org_id, app_id, held, held, None).await;
+        sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET state = 'setup_pending',
+                    customer_config_hold = true,
+                    customer_config_hold_until = clock_timestamp() + interval '1 hour'
+              WHERE deployment_id = $1",
+        )
+        .bind(held)
+        .execute(&pool)
+        .await
+        .expect("hold the redeploy job");
+        sqlx::query("UPDATE deployments SET status = 'pending' WHERE id = $1")
+            .bind(held)
+            .execute(&pool)
+            .await
+            .expect("mark the held deployment pending after its durable job exists");
+
+        let held_candidates = load_signed_policy_candidates(&pool, 1)
+            .await
+            .expect("select authority while the roll is held");
+        assert!(
+            held_candidates.iter().any(|candidate| {
+                candidate.artifact.metadata.descriptor_core_hash
+                    == legacy_artifact.metadata.descriptor_core_hash
+            }),
+            "the legacy artifact stays eligible while the only durable job is an unreleased hold"
+        );
+
+        // Releasing the hold lets the durable job take over the ranking, so
+        // the legacy fallback no longer applies to this app.
+        sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET customer_config_released_at = clock_timestamp()
+              WHERE deployment_id = $1",
+        )
+        .bind(held)
+        .execute(&pool)
+        .await
+        .expect("release the held job");
+        let released_candidates = load_signed_policy_candidates(&pool, 1)
+            .await
+            .expect("select authority after the hold is released");
+        assert!(
+            !released_candidates.iter().any(|candidate| {
+                candidate.artifact.metadata.descriptor_core_hash
+                    == legacy_artifact.metadata.descriptor_core_hash
+            }),
+            "the legacy artifact stops being selected once a durable job is released"
+        );
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete KBS hold fixture");
     }
 
     #[tokio::test]

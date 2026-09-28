@@ -11,9 +11,9 @@ pub struct GenericDeploymentRequest {
     pub signing: GenericDeploymentSigning,
     #[serde(default)]
     pub security: GenericDeploymentSecurity,
-    /// Forwarded by PaaS when the CLI is delivering customer config before
-    /// the workload roll. CAP honors it only for a redeploy that already has
-    /// a TEE domain.
+    /// Holds the workload roll until customer config is released. Only the
+    /// internal PaaS route may send it; the public route rejects it, and CAP
+    /// applies it only for a redeploy of an app with a live TEE.
     #[serde(default)]
     pub customer_config_roll_hold_seconds: Option<u32>,
 }
@@ -240,10 +240,33 @@ pub async fn generate_agent_policy(
 }
 
 /// POST /deployments -- generic provider-aware deployment entrypoint.
+///
+/// Public callers have no route to release a customer-config hold (only the
+/// internal PaaS path proxies one), so a request that asks for a hold is
+/// rejected here instead of arming a roll nothing outside PaaS can release.
 pub async fn create_generic_deployment(
     auth: AuthContext,
     State(state): State<AppState>,
     Json(body): Json<GenericDeploymentRequest>,
+) -> Result<(StatusCode, Json<GenericDeploymentResponse>), (StatusCode, Json<serde_json::Value>)> {
+    scopes::require_app_write(&auth)?;
+    if body.customer_config_roll_hold_seconds.is_some() {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "customer_config_roll_hold_seconds is only accepted on the internal PaaS deployment route",
+        ));
+    }
+    create_generic_deployment_inner(auth, state, body, false).await
+}
+
+/// Shared body of the generic deployment entrypoint. The internal PaaS
+/// route is the only caller that may honor a customer-config hold, because
+/// it is the only path paired with a release route.
+pub(crate) async fn create_generic_deployment_inner(
+    auth: AuthContext,
+    state: AppState,
+    body: GenericDeploymentRequest,
+    honor_customer_config_roll_hold: bool,
 ) -> Result<(StatusCode, Json<GenericDeploymentResponse>), (StatusCode, Json<serde_json::Value>)> {
     scopes::require_app_write(&auth)?;
     crate::routes::apps::ensure_management_write_allowed(&state, &auth).await?;
@@ -339,9 +362,15 @@ pub async fn create_generic_deployment(
         customer_config_roll_hold_seconds: body.customer_config_roll_hold_seconds,
     };
     let org_id = auth.org_id;
-    let (status, Json(deployed)) =
-        super::deploy_app_candidate(auth, state.clone(), app, deploy_request, app_mutation, true)
-            .await?;
+    let (status, Json(deployed)) = super::deploy_app_candidate(
+        auth,
+        state.clone(),
+        app,
+        deploy_request,
+        app_mutation,
+        honor_customer_config_roll_hold,
+    )
+    .await?;
     let (deployment, app) = fetch_deployment_with_app(&state, org_id, deployed.deployment_id)
         .await?
         .ok_or_else(|| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;

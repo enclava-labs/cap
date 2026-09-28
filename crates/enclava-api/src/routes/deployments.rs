@@ -519,6 +519,7 @@ impl DeploymentResponse {
 }
 
 mod generic;
+pub(crate) use generic::create_generic_deployment_inner;
 pub(crate) use generic::generic_config_token_for_issuance;
 use generic::json_error;
 pub use generic::{

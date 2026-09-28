@@ -380,7 +380,10 @@ pub struct CreateTemplateInstanceRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signed_policy_artifact: Option<String>,
     /// Ask PaaS to hold the workload roll until customer config has been
-    /// written to the current TEE. Sent only for a redeploy of an existing app.
+    /// written to the current TEE. Always sent with the deploy's normalized
+    /// budget so a retried request keeps one idempotency key; PaaS and CAP
+    /// apply the hold only when a live workload is being replaced, so first
+    /// deploys stay unheld.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub customer_config_roll_hold_seconds: Option<u32>,
 }

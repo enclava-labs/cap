@@ -5236,10 +5236,11 @@ pub async fn create_paas_generic_deployment(
                 idempotency.operation_id(),
             ));
         }
-        let (status, Json(response)) = crate::routes::deployments::create_generic_deployment(
+        let (status, Json(response)) = crate::routes::deployments::create_generic_deployment_inner(
             auth,
-            State(state.clone()),
-            Json(parsed),
+            state.clone(),
+            parsed,
+            true,
         )
         .await?;
         Ok((status, to_value(response)?))

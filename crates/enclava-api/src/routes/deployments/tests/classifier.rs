@@ -821,3 +821,70 @@ async fn generic_config_token_rejects_unscoped_api_key_before_database_access() 
 
     assert_eq!(err.0, StatusCode::FORBIDDEN);
 }
+
+fn generic_roll_hold_boundary_request() -> GenericDeploymentRequest {
+    GenericDeploymentRequest {
+        external_id: None,
+        app: GenericDeploymentApp {
+            name: format!("hold-boundary-{}", Uuid::new_v4().simple()),
+            create_if_missing: false,
+            unlock_mode: "password".to_string(),
+            bootstrap_pubkey_hash: None,
+            egress_allowlist: Vec::new(),
+            egress_mode: "restricted".to_string(),
+        },
+        source: GenericDeploymentSource {
+            provider: SourceProvider::GitHub,
+            repository: "acme/confidential-app".to_string(),
+        },
+        workload: GenericDeploymentWorkload {
+            image: "ghcr.io/acme/confidential-app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_string(),
+            container_name: None,
+            resources: None,
+        },
+        signing: GenericDeploymentSigning {
+            subject: "https://github.com/acme/confidential-app/.github/workflows/build.yml@refs/heads/main"
+                .to_string(),
+            issuer: "https://token.actions.githubusercontent.com".to_string(),
+        },
+        security: GenericDeploymentSecurity::default(),
+        customer_config_roll_hold_seconds: None,
+    }
+}
+
+#[tokio::test]
+async fn public_generic_deployment_route_rejects_roll_hold_requests() {
+    let mut held = generic_roll_hold_boundary_request();
+    held.customer_config_roll_hold_seconds = Some(600);
+    let rejection = create_generic_deployment(
+        crate::test_support::auth_context(Role::Owner, &[]),
+        State(crate::test_support::lazy_state()),
+        Json(held),
+    )
+    .await
+    .expect_err("a public deployment request must not arm a customer-config hold");
+    assert_eq!(rejection.0, StatusCode::BAD_REQUEST);
+    assert!(
+        rejection.1.0["error"]
+            .as_str()
+            .expect("hold rejection names its field")
+            .contains("customer_config_roll_hold_seconds")
+    );
+}
+
+#[tokio::test]
+async fn internal_generic_deployment_rejects_member_before_database_access() {
+    let mut request = generic_roll_hold_boundary_request();
+    request.customer_config_roll_hold_seconds = Some(600);
+    let rejection = create_generic_deployment_inner(
+        crate::test_support::auth_context(Role::Member, &[]),
+        crate::test_support::lazy_state(),
+        request,
+        true,
+    )
+    .await
+    .expect_err("a roll hold must not bypass deployment authorization");
+
+    assert_eq!(rejection.0, StatusCode::FORBIDDEN);
+}
