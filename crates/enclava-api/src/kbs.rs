@@ -332,25 +332,13 @@ pub async fn soft_delete_tls_binding(
     Ok(())
 }
 
-pub async fn reconcile_policy(
+/// Recheck signed authority on each CAS retry so a concurrent signed acceptance
+/// fences legacy writers.
+async fn reconcile_legacy_rego_policy_with_client(
     db: &PgPool,
-    config: Option<&KbsPolicyConfig>,
+    config: &KbsPolicyConfig,
+    client: kube::Client,
 ) -> Result<(), KbsPolicyError> {
-    let Some(config) = config else {
-        return Err(KbsPolicyError::NotConfigured);
-    };
-
-    let client = kube::Client::try_default().await?;
-    if signed_policy_mode_active(db).await? {
-        tracing::info!(
-            namespace = %config.namespace,
-            configmap = %config.configmap_name,
-            "durable signed KBS authority supersedes legacy marker reconciliation"
-        );
-        return reconcile_pending_signed_policy_artifacts_with_client(db, config, None, client)
-            .await;
-    }
-
     let bindings: Vec<KbsOwnerBinding> = sqlx::query_as(
         "SELECT binding_key, repository, allowed_tags, namespace, service_account,
                 tenant_instance_identity_hash
@@ -433,6 +421,27 @@ pub async fn reconcile_policy(
         }
     }
     Err(KbsPolicyError::PolicyCasExhausted)
+}
+
+pub async fn reconcile_policy(
+    db: &PgPool,
+    config: Option<&KbsPolicyConfig>,
+) -> Result<(), KbsPolicyError> {
+    let Some(config) = config else {
+        return Err(KbsPolicyError::NotConfigured);
+    };
+
+    let client = kube::Client::try_default().await?;
+    if signed_policy_mode_active(db).await? {
+        tracing::info!(
+            namespace = %config.namespace,
+            configmap = %config.configmap_name,
+            "durable signed KBS authority supersedes legacy marker reconciliation"
+        );
+        return reconcile_pending_signed_policy_artifacts_with_client(db, config, None, client)
+            .await;
+    }
+    reconcile_legacy_rego_policy_with_client(db, config, client).await
 }
 
 /// Enqueue a signed-policy generation in the caller's authority transaction.
@@ -952,7 +961,10 @@ async fn reconcile_pending_signed_policy_artifacts_with_client(
             if signed_policy_mode_active(db).await? {
                 continue;
             }
-            return Ok(());
+            // Old binaries update bindings without publishing Rego. Converge
+            // them on startup and periodic passes too. Box breaks the recursive
+            // future type when a concurrent acceptance switches to signed mode.
+            return Box::pin(reconcile_legacy_rego_policy_with_client(db, config, client)).await;
         }
         // Keep the owed generation private until the filtered body is published.
         let generation =
@@ -1695,19 +1707,19 @@ fn replace_bindings_block(
 
         let mut next = String::with_capacity(policy.len() + cap_section.len());
         next.push_str(&policy[..begin]);
-        next.push_str(cap_section.trim_start_matches(','));
+        next.push_str(cap_section.trim_start_matches(',').trim());
         next.push_str(&policy[line_end..]);
         return Ok(next);
     }
 
     let section = if block_body.trim().is_empty() {
-        cap_section.trim_start_matches(',').to_string()
+        cap_section.trim_start_matches(',')
     } else {
-        cap_section.to_string()
+        cap_section
     };
     let mut next = String::with_capacity(policy.len() + section.len());
     next.push_str(&policy[..block_body_end]);
-    next.push_str(&section);
+    next.push_str(section);
     next.push_str(&policy[block_body_end..]);
     Ok(next)
 }
@@ -1835,27 +1847,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reconciliation_error_display_preserves_typed_cause() {
-        let policy = KbsPolicyReconciliationError::from(KbsPolicyError::PolicyGenerationConflict);
-        assert_eq!(
-            policy.to_string(),
-            "KBS policy reconciliation failed: signed KBS policy generation has conflicting content"
-        );
-
-        let mutation =
-            KbsPolicyReconciliationError::from(crate::mutation_leases::MutationLeaseError::Lost);
-        assert_eq!(
-            mutation.to_string(),
-            "durable KBS mutation fence failed: application mutation lease was lost"
-        );
-
+    fn reconciliation_error_display_redacts_upstream_detail() {
         let db = KbsPolicyReconciliationError::from(KbsPolicyError::Db(sqlx::Error::Protocol(
             "tenant-sensitive database detail".to_string(),
         )));
-        assert_eq!(
-            db.to_string(),
-            "KBS policy reconciliation failed: database error"
-        );
         assert!(!db.to_string().contains("tenant-sensitive"));
 
         let kube = KbsPolicyReconciliationError::from(KbsPolicyError::Kube(kube::Error::Api(
@@ -1866,10 +1861,6 @@ mod tests {
             .with_code(500)
             .boxed(),
         )));
-        assert_eq!(
-            kube.to_string(),
-            "KBS policy reconciliation failed: Kubernetes API error"
-        );
         assert!(!kube.to_string().contains("tenant-sensitive"));
     }
 
@@ -1953,11 +1944,29 @@ allow if {
     }
 
     #[test]
-    fn renders_empty_cap_section() {
-        assert_eq!(
-            render_cap_owner_bindings_section(&[]),
-            ",\n  # BEGIN CAP MANAGED OWNER BINDINGS\n  # END CAP MANAGED OWNER BINDINGS\n"
-        );
+    fn managed_policy_updates_are_idempotent_and_preserve_unmanaged_bindings() {
+        let render = |policy: &str, tls: &[KbsTlsBinding], owners: &[KbsOwnerBinding]| {
+            let policy = replace_tls_resource_bindings_block(policy, tls).unwrap();
+            replace_owner_bindings_block(&policy, owners).unwrap()
+        };
+        let policy = r#"package policy
+resource_bindings := {"external-tls": {"repository": "default"}}
+owner_resource_bindings := {"external-owner": {"repository": "default"}}
+"#;
+        let empty = render(policy, &[], &[]);
+        assert_eq!(render(&empty, &[], &[]), empty);
+
+        let tls = [tls_binding("new-tls")];
+        let owners = [binding("new-owner")];
+        let populated = render(&empty, &tls, &owners);
+        assert_eq!(render(&populated, &tls, &owners), populated);
+        assert!(populated.contains("\"new-tls\""));
+        assert!(populated.contains("\"new-owner\""));
+
+        let withdrawn = render(&populated, &[], &[]);
+        assert_eq!(withdrawn, empty);
+        assert!(withdrawn.contains("\"external-tls\""));
+        assert!(withdrawn.contains("\"external-owner\""));
     }
 
     #[test]

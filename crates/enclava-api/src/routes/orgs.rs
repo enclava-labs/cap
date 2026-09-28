@@ -2199,6 +2199,24 @@ mod tests {
         assert_eq!(unavailable.0, StatusCode::BAD_GATEWAY);
         assert_eq!(unavailable.1.0["error"], "signing_service_unavailable");
 
+        owner_status_response
+            .lock()
+            .expect("owner status mock lock")["state"] = serde_json::json!("ready");
+        state.signing_service = Some(
+            crate::signing_service::SigningServiceClient::new(format!("http://{address}"), None)
+                .expect("restored signing service client"),
+        );
+        let restored = rotate_org_owner(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(rotation_request),
+        )
+        .await
+        .expect("pruned replay must confirm once the service owner matches");
+        assert_eq!(restored.0.state, "ready");
+        assert_eq!(restored.0.keyring_version, 2);
+
         assert_eq!(
             rotate_calls.load(std::sync::atomic::Ordering::SeqCst),
             0,
