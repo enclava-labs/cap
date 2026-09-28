@@ -573,6 +573,41 @@ pub async fn put_keyring(
                     "keyring signing owner does not match the current pinned owner",
                 ));
             }
+            // Fence (PR #185 review, Devin "concurrent upload leaves owner
+            // authority drifted"): rotate_org_owner pins the replacement in
+            // the signing service before it writes the successor keyring
+            // version, and the signing-authority lane is released between
+            // those steps. An old-owner upload arriving in that window sees
+            // the previous owner as the pinned owner and could claim the
+            // successor version, after which the rotation's final phase
+            // conflicts and the service and keyring stay pinned to different
+            // owners. While the signing service's owner disagrees with the
+            // current pinned owner, the successor version belongs to the
+            // in-flight (or pending-recovery) rotation: new versions are
+            // refused here. Same-version replays above bypass this fence --
+            // they claim nothing. When the signing service is not configured
+            // or not readable, there is no upstream authority to diverge
+            // from and the check is skipped.
+            if let Some(signing_service) = state.signing_service.as_ref() {
+                if let Ok(status) = signing_service.owner_status(org_id).await {
+                    let service_owner = status
+                        .owner_pubkey_hex
+                        .as_deref()
+                        .and_then(|raw| hex::decode(raw).ok());
+                    let status_matches =
+                        status.org_id == org_id && status.state.as_str() == "ready";
+                    if status_matches
+                        && service_owner.as_deref() != Some(latest_signing_pubkey.as_slice())
+                    {
+                        return Err((
+                            StatusCode::CONFLICT,
+                            Json(serde_json::json!({
+                                "error": "signing service owner does not match the current pinned owner (owner rotation in progress)"
+                            })),
+                        ));
+                    }
+                }
+            }
             let latest_signing_pubkey: [u8; 32] = latest_signing_pubkey
                 .as_slice()
                 .try_into()
@@ -1985,19 +2020,12 @@ mod tests {
         let pool = sqlx::PgPool::connect(&database_url)
             .await
             .expect("connect keyring regression database");
-        // Migrate at most once per test process (PR #185 review follow-up):
-        // on a fresh database, concurrent run_migrations calls from
-        // parallel tests deadlock on sqlx's migration advisory lock. CI
-        // serializes with --test-threads=1, but this guard makes a plain
-        // parallel cargo test safe on a fresh database too.
-        static MIGRATED: tokio::sync::Mutex<bool> = tokio::sync::Mutex::const_new(false);
-        let mut migrated = MIGRATED.lock().await;
-        if !*migrated {
-            crate::db::pool::run_migrations(&pool)
-                .await
-                .expect("migrate keyring regression database");
-            *migrated = true;
-        }
+        // run_migrations serializes concurrent callers process-wide (see
+        // db::pool::run_migrations): parallel tests migrating a fresh
+        // database no longer deadlock on sqlx's migration advisory lock.
+        crate::db::pool::run_migrations(&pool)
+            .await
+            .expect("migrate keyring regression database");
         pool
     }
 
