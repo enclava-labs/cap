@@ -92,7 +92,7 @@ pub enum PlatformReleaseError {
     #[error("platform release root pubkey is not configured at compile time")]
     MissingRootPubkey,
     #[error(
-        "platform release signature pubkey is not the pinned root: this build pins {pinned} but the release is signed by {signing}; the platform signing root rotated after this binary was built — update this enclava-api deployment to a build carrying the current pin"
+        "platform release signature pubkey is not the pinned root: this build pins {pinned}, the release declares {signing}; verify the target platform and, if this is an expected root rotation, update this enclava-api deployment using a trusted build with the expected pin"
     )]
     RootMismatch { pinned: String, signing: String },
     #[error("platform release signature verification failed: {0}")]
@@ -474,20 +474,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn root_mismatch_error_names_both_keys() {
-        let error = PlatformReleaseError::RootMismatch {
-            pinned: "0000000000000000000000000000000000000000000000000000000000000001".into(),
-            signing: TEST_FIXTURE_RELEASE_ROOT_PUBKEY_HEX.into(),
-        };
+    fn verifier_reports_mismatched_declared_root() {
+        let pinned = option_env!("ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX")
+            .unwrap_or(TEST_FIXTURE_RELEASE_ROOT_PUBKEY_HEX);
+        let mut foreign_root = hex32("test root", pinned).unwrap();
+        foreign_root[0] ^= 1;
+        let declared = hex::encode(foreign_root);
+        let mut envelope: PlatformReleaseEnvelope =
+            serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
+        envelope.signing_pubkey = declared.clone();
+
+        let error = verify_envelope(envelope).expect_err("a foreign root must fail verification");
+        assert!(matches!(error, PlatformReleaseError::RootMismatch { .. }));
         let message = error.to_string();
-        assert!(
-            message.contains("0000000000000000000000000000000000000000000000000000000000000001"),
-            "error must name the pinned root: {message}"
-        );
-        assert!(
-            message.contains(TEST_FIXTURE_RELEASE_ROOT_PUBKEY_HEX),
-            "error must name the release signing key: {message}"
-        );
+        assert!(message.contains(&pinned.to_ascii_lowercase()));
+        assert!(message.contains(&declared));
     }
 
     #[test]

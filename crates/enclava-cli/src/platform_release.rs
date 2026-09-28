@@ -93,7 +93,7 @@ pub enum PlatformReleaseError {
     #[error("platform release root pubkey is not configured at compile time")]
     MissingRootPubkey,
     #[error(
-        "platform release signature pubkey is not the pinned root: this build pins {pinned} but the release is signed by {signing}; the platform signing root rotated after this binary was built — update this CLI to a build carrying the current pin"
+        "platform release signature pubkey is not the pinned root: this build pins {pinned}, the release declares {signing}; verify the target platform and, if this is an expected root rotation, update this CLI from a trusted source"
     )]
     RootMismatch { pinned: String, signing: String },
     #[error("platform release signature verification failed: {0}")]
