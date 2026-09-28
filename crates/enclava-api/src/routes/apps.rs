@@ -2264,25 +2264,8 @@ pub async fn rotate_signer(
         .map_err(|_| internal_server_error())?;
     tx.commit().await.map_err(|_| internal_server_error())?;
 
-    // The rotation is committed; converge the live KBS policy before
-    // reporting success, under the same fence app deletion uses. This runs
-    // for the initial set as well: reconcile_legacy_rego_policy_with_client
-    // renders from kbs_tls_bindings, and the 0052 trigger carries the newly
-    // committed identity into that row -- without this reconciliation an
-    // existing legacy binding would keep admitting the previous (or empty)
-    // signer set until some later deployment re-rendered the policy. In
-    // signed mode reconcile_policy publishes the withdrawal-filtered candidate set
-    // at the owed generation (desired_generation + withdrawal_bumps_owed)
-    // and commits the increment only after the ConfigMap replace succeeds
-    // (revoking the previous signer's artifacts; the background reconciler
-    // keeps retrying that durable debt if this publish fails). In legacy
-    // mode it re-renders Rego from the updated kbs_tls_bindings so the new
-    // identity is the one admitted; nothing retries a failed legacy render
-    // automatically — the next unsigned deploy re-renders it — so a failure
-    // here surfaces as 500 with a stable error code and the fence is
-    // released (not held for the quarantine window) to unblock that
-    // follow-up writer. Success is only reported when reconcile returned Ok
-    // on both layers. Runs for the initial set too (see above).
+    // The committed identity must reach the configured KBS before success.
+    // The periodic reconciler retries failed publication in both policy modes.
     if state.kbs_policy.is_some() {
         let lease = match crate::mutation_leases::claim_resources(
             &state,

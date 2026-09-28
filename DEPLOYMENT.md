@@ -242,6 +242,29 @@ Before using it outside local experimentation:
   registry metadata, DNS, and tenant TEE callbacks;
 - decide whether CAP-managed DNS and KBS policy management are required.
 
+## Keyring Revocation Completion
+
+In signed-policy mode, keyring uploads and owner rotations confirm success only
+after the filtered KBS policy has converged. A `503` response with code
+`keyring_policy_reconciliation_pending` means the keyring change committed, but
+policy publication is still unconfirmed. It does not mean the keyring rolled back.
+
+Retry the same request after restoring KBS availability. Internal PaaS callers
+must retain the same idempotency key when the response is stamped `deferred`.
+For CLI owner-rotation recovery, reuse the encrypted replacement backup:
+
+```bash
+enclava key rotate-owner --backup-out ./owner-replacement.json \
+  --passphrase-file ./backup.pass --yes
+```
+
+The CLI confirms the accepted keyring's policy before finalizing local recovery
+state. Preserve both the replacement backup and the previous backup until a
+fresh login and deployment succeed. Use the updated API and CLI together; drain
+old API replicas before relying on these completion semantics.
+Apply canonical signed-content keyring replay handling before this CLI update:
+historical payload encodings must not turn an exact signed replay into a conflict.
+
 ## Smoke Checks
 
 After rollout:
