@@ -1403,9 +1403,9 @@ async fn insert_legacy_tls_binding(
     .expect("insert legacy tls binding");
 }
 
-async fn read_withdrawal_reconciliation_state(pool: &sqlx::PgPool) -> (i64, i64) {
+async fn read_withdrawal_reconciliation_state(pool: &sqlx::PgPool) -> (i64, i64, i64) {
     sqlx::query_as(
-        "SELECT desired_generation, withdrawal_bumps_owed
+        "SELECT desired_generation, selector_bumps_owed, withdrawal_bumps_owed
            FROM kbs_signed_policy_reconciliation WHERE singleton",
     )
     .fetch_one(pool)
@@ -1521,7 +1521,7 @@ async fn signer_rotation_token_is_single_use_and_owes_a_deferred_withdrawal_bump
     // ConfigMap replace succeeded (migration 0052).
     assert_eq!(
         read_withdrawal_reconciliation_state(&pool).await,
-        (1, 1),
+        (1, 0, 1),
         "rotation must owe the withdrawal bump, not perform it"
     );
     // The consumed jti ledger row is committed with the rotation.
@@ -1569,7 +1569,7 @@ async fn signer_rotation_token_is_single_use_and_owes_a_deferred_withdrawal_bump
     // publishes.
     assert_eq!(
         read_withdrawal_reconciliation_state(&pool).await,
-        (1, 2),
+        (1, 0, 2),
         "rotating an already-withdrawn artifact must still owe a bump"
     );
 
@@ -1603,7 +1603,7 @@ async fn signer_rotation_token_is_single_use_and_owes_a_deferred_withdrawal_bump
     );
     assert_eq!(
         read_withdrawal_reconciliation_state(&pool).await,
-        (1, 2),
+        (1, 0, 2),
         "rejected replay must roll back the owed withdrawal bump"
     );
     let jti_rows: i64 = sqlx::query_scalar(
@@ -1638,7 +1638,7 @@ async fn signer_rotation_never_flips_an_unsigned_install_into_signed_mode() {
     // unsigned-only state (migration 0041 seeds desired_generation = 0).
     assert_eq!(
         read_withdrawal_reconciliation_state(&pool).await,
-        (0, 0),
+        (0, 0, 0),
         "the isolated database must start unsigned"
     );
 
@@ -1719,7 +1719,7 @@ async fn signer_rotation_never_flips_an_unsigned_install_into_signed_mode() {
     // mode nor owes any debt there.
     assert_eq!(
         read_withdrawal_reconciliation_state(&pool).await,
-        (0, 0),
+        (0, 0, 0),
         "rotation on an unsigned-only install must not enter signed mode"
     );
 
@@ -1794,7 +1794,7 @@ async fn old_binary_signer_rotation_via_direct_sql_is_fenced_by_the_apps_trigger
     );
     assert_eq!(
         read_withdrawal_reconciliation_state(&pool).await,
-        (1, 1),
+        (1, 0, 1),
         "the trigger must owe the deferred bump without moving desired_generation"
     );
     let (binding_subject, binding_issuer): (Option<String>, Option<String>) = sqlx::query_as(
@@ -1824,14 +1824,32 @@ async fn old_binary_signer_rotation_via_direct_sql_is_fenced_by_the_apps_trigger
         .expect("non-identity apps update");
     assert_eq!(
         read_withdrawal_reconciliation_state(&pool).await,
-        (1, 1),
+        (1, 0, 1),
         "non-identity updates must not owe anything"
     );
 
     // The initial set (NULL -> identity) owes nothing: no artifact can be
     // signed under a missing identity, and the app's first binding insert
-    // carries the identity anyway.
+    // carries the identity anyway. The trigger still fires so a binding
+    // that already exists (created by an earlier unsigned deployment)
+    // carries the newly committed identity immediately.
     let (_org_id2, _user_id2, app_id2) = insert_signer_rotation_app(&pool, None, None).await;
+    let binding2_suffix = app_id2.simple().to_string();
+    sqlx::query(
+        "INSERT INTO kbs_tls_bindings (
+             app_id, binding_key, repository, tag, namespace, service_account,
+             tenant_instance_identity_hash
+         ) VALUES ($1, $2, 'default', 'workload-secret-seed', $3, $4, $5)
+         ON CONFLICT (app_id) DO NOTHING",
+    )
+    .bind(app_id2)
+    .bind(format!("tls-{}", &binding2_suffix[..12]))
+    .bind(format!("cap-{}", &binding2_suffix[..12]))
+    .bind(format!("cap-{}-sa", &binding2_suffix[..12]))
+    .bind("33".repeat(32))
+    .execute(&pool)
+    .await
+    .expect("insert unsigned-era tls binding");
     sqlx::query(
         "UPDATE apps
             SET signer_identity_subject = $1,
@@ -1847,7 +1865,7 @@ async fn old_binary_signer_rotation_via_direct_sql_is_fenced_by_the_apps_trigger
     .expect("initial signer set");
     assert_eq!(
         read_withdrawal_reconciliation_state(&pool).await,
-        (1, 1),
+        (1, 0, 1),
         "the initial signer set must owe nothing"
     );
     let withdrawn_app2: i64 =
@@ -1857,8 +1875,142 @@ async fn old_binary_signer_rotation_via_direct_sql_is_fenced_by_the_apps_trigger
             .await
             .expect("count withdrawn artifacts for the initial-set app");
     assert_eq!(withdrawn_app2, 0, "initial set must withdraw nothing");
+    let (binding2_subject, binding2_issuer): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT signer_identity_subject, signer_identity_issuer
+           FROM kbs_tls_bindings WHERE app_id = $1",
+    )
+    .bind(app_id2)
+    .fetch_one(&pool)
+    .await
+    .expect("load unsigned-era binding after the initial set");
+    assert_eq!(
+        binding2_subject.as_deref(),
+        Some(new_subject),
+        "the initial set must carry the new identity into an existing legacy binding"
+    );
+    assert_eq!(
+        binding2_issuer.as_deref(),
+        Some(new_issuer),
+        "the initial set must carry the new issuer into an existing legacy binding"
+    );
 
     crate::test_support::drop_isolated_database("cap119_old_binary_rotation", pool).await;
+}
+
+/// Pre-migration rotations left kbs_tls_bindings holding the rotated-out
+/// signer, and the legacy Rego render keeps authorizing that stale identity.
+/// Migration 0052's backfill must align every live binding with the app's
+/// committed identity, not just withdraw the old signer's artifacts.
+#[tokio::test]
+async fn migration_backfill_repairs_stale_legacy_tls_bindings() {
+    let (_db_cleanup, pool) =
+        crate::test_support::isolated_database_test_pool("cap119_stale_binding_backfill").await;
+    let previous_subject = "https://github.com/acme/old/.github/workflows/ci.yaml@refs/heads/main";
+    let previous_issuer = "https://token.actions.githubusercontent.com";
+    let new_subject = "https://github.com/acme/new/.github/workflows/ci.yaml@refs/heads/main";
+    let new_issuer = "https://new-issuer.example.test";
+    let (org_id, _user_id, app_id) =
+        insert_signer_rotation_app(&pool, Some(previous_subject), Some(previous_issuer)).await;
+    let descriptor_core_hash = insert_signed_artifact_for_identity(
+        &pool,
+        org_id,
+        app_id,
+        previous_subject,
+        previous_issuer,
+    )
+    .await;
+    insert_legacy_tls_binding(&pool, app_id, previous_subject, previous_issuer).await;
+    sqlx::query(
+        "UPDATE kbs_signed_policy_reconciliation
+            SET desired_generation = 1
+          WHERE singleton",
+    )
+    .execute(&pool)
+    .await
+    .expect("enter signed-policy mode");
+
+    // Recreate the pre-0052 world, then rotate with old-binary semantics:
+    // the apps row changes, the binding does not.
+    sqlx::raw_sql(
+        "DROP TRIGGER apps_signer_rotation_withdrawal ON apps;
+         DROP FUNCTION enforce_signer_rotation_withdrawal();
+         DROP TABLE consumed_signer_rotation_tokens;
+         DROP TABLE withdrawn_signer_artifacts;
+         ALTER TABLE kbs_signed_policy_reconciliation DROP COLUMN withdrawal_bumps_owed;",
+    )
+    .execute(&pool)
+    .await
+    .expect("restore schema before the withdrawal migration");
+    sqlx::query(
+        "UPDATE apps
+            SET signer_identity_subject = $1,
+                signer_identity_issuer  = $2,
+                signer_identity_set_at  = now(),
+                updated_at              = now()
+          WHERE id = $3",
+    )
+    .bind(new_subject)
+    .bind(new_issuer)
+    .bind(app_id)
+    .execute(&pool)
+    .await
+    .expect("pre-0052 signer rotation");
+    let (stale_subject, stale_issuer): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT signer_identity_subject, signer_identity_issuer
+           FROM kbs_tls_bindings WHERE app_id = $1",
+    )
+    .bind(app_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load binding before the migration");
+    assert_eq!(stale_subject.as_deref(), Some(previous_subject));
+    assert_eq!(stale_issuer.as_deref(), Some(previous_issuer));
+
+    sqlx::raw_sql(include_str!(
+        "../../../../migrations/0052_signer_rotation_jti_and_policy.sql"
+    ))
+    .execute(&pool)
+    .await
+    .expect("execute production withdrawal migration");
+
+    let (repaired_subject, repaired_issuer): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT signer_identity_subject, signer_identity_issuer
+           FROM kbs_tls_bindings WHERE app_id = $1",
+    )
+    .bind(app_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load binding after the migration");
+    assert_eq!(
+        repaired_subject.as_deref(),
+        Some(new_subject),
+        "the backfill must repair the stale legacy binding to the app's identity"
+    );
+    assert_eq!(
+        repaired_issuer.as_deref(),
+        Some(new_issuer),
+        "the backfill must repair the stale legacy binding to the app's issuer"
+    );
+    let withdrawn: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM withdrawn_signer_artifacts
+          WHERE descriptor_core_hash = $1 AND app_id = $2",
+    )
+    .bind(&descriptor_core_hash)
+    .bind(app_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count withdrawn artifacts after the migration");
+    assert_eq!(
+        withdrawn, 1,
+        "the backfill must still withdraw the rotated-out signer's artifacts"
+    );
+    assert_eq!(
+        read_withdrawal_reconciliation_state(&pool).await,
+        (1, 0, 1),
+        "the backfill must owe the deferred withdrawal bump"
+    );
+
+    crate::test_support::drop_isolated_database("cap119_stale_binding_backfill", pool).await;
 }
 
 // Pause the production migration after its backfill, before trigger installation.
@@ -2025,7 +2177,7 @@ async fn migration_backfill_window_is_fenced_by_the_apps_write_exclusion_lock() 
     );
     assert_eq!(
         read_withdrawal_reconciliation_state(&pool).await,
-        (1, 1),
+        (1, 0, 1),
         "the resumed rotation must owe the deferred withdrawal bump"
     );
 
