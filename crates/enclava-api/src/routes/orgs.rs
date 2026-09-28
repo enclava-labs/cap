@@ -237,7 +237,7 @@ pub struct AuthorizedSignerResponse {
 
 type KeyringRow = (i64, Vec<u8>, Vec<u8>, Vec<u8>);
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct SignedOrgKeyring {
     org_id: Uuid,
     version: u64,
@@ -245,16 +245,23 @@ struct SignedOrgKeyring {
     updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct SignedOrgKeyringMember {
     user_id: Uuid,
-    #[serde(deserialize_with = "deserialize_pubkey")]
+    #[serde(
+        deserialize_with = "deserialize_pubkey",
+        serialize_with = "serialize_pubkey"
+    )]
     pubkey: [u8; 32],
     role: SignedOrgKeyringRole,
     added_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+fn serialize_pubkey<S: serde::Serializer>(b: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&hex::encode(b))
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum SignedOrgKeyringRole {
     Owner,
@@ -308,6 +315,26 @@ fn canonical_members_hash(members: &[SignedOrgKeyringMember]) -> [u8; 32] {
         .map(|(label, hash)| (label.as_str(), hash.as_slice()))
         .collect();
     ce_v1_hash(&records)
+}
+
+// Legacy rows can differ in unsigned fields while carrying identical signed
+// content (registration stored raw request bytes before #182 normalized the
+// encoding). Replay equality therefore compares the canonical signed bytes,
+// not the stored encoding.
+fn keyring_replay_conflicts(
+    stored_payload: &[u8],
+    stored_signature: &[u8],
+    stored_signing_pubkey: &[u8],
+    canonical_bytes: &[u8],
+    signature: &[u8],
+    signing_pubkey: &[u8],
+) -> bool {
+    let Ok(stored_keyring) = serde_json::from_slice::<SignedOrgKeyring>(stored_payload) else {
+        return true;
+    };
+    canonical_keyring_bytes(&stored_keyring).as_slice() != canonical_bytes
+        || stored_signature != signature
+        || stored_signing_pubkey != signing_pubkey
 }
 
 fn canonical_keyring_bytes(keyring: &SignedOrgKeyring) -> Vec<u8> {
@@ -976,7 +1003,16 @@ pub async fn rotate_org_owner(
         .verify(&directive, &Signature::from_bytes(&rotation_signature))
         .map_err(|_| bad_request("owner rotation signature verification failed"))?;
 
-    let payload_bytes = serde_json::to_vec(&body.keyring_payload).map_err(|_| db_error())?;
+    // Cross-PR integration contract (#185 review): the durable
+    // `org_rotation_intents.keyring_sha256` digest, the keyring-version
+    // insert, and the stored replay-equality bytes must all use the same
+    // normalized JSON-value encoding registration (put_keyring after #182)
+    // uses -- the typed struct re-serialized as a JSON value, dropping
+    // unsigned extra fields -- never the raw request bytes. The encoding is
+    // fixed at first recording and is never switched afterwards; existing
+    // intent/consumption ledger rows are never rewritten.
+    let normalized_payload = serde_json::to_value(&replacement_keyring).map_err(|_| db_error())?;
+    let payload_bytes = serde_json::to_vec(&normalized_payload).map_err(|_| db_error())?;
     let directive_digest = Sha256::digest(&directive);
 
     // Snapshot the signing-service owner authority and durably record this
@@ -1081,10 +1117,14 @@ pub async fn rotate_org_owner(
     let version_created_at_floor = created_at_watermark.unwrap_or(latest.4).max(latest.4);
 
     let (base_payload, expected_current_owner, insert_new_version) = if body.version == latest.0 {
-        if latest.1 != payload_bytes
-            || latest.2 != keyring_signature
-            || latest.3 != replacement_owner
-        {
+        if keyring_replay_conflicts(
+            &latest.1,
+            &latest.2,
+            &latest.3,
+            &canonical_bytes,
+            &keyring_signature,
+            &replacement_owner,
+        ) {
             return Err((
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({
@@ -2218,6 +2258,171 @@ mod tests {
             .execute(&pool)
             .await
             .expect("delete directive replay user");
+    }
+
+    // Cross-PR integration regression (#185 review / #182): the durable
+    // rotation-intent digest and the stored keyring bytes must use the same
+    // normalized JSON-value encoding registration uses after #182 -- the
+    // typed struct re-serialized, dropping unsigned extra fields -- and a
+    // legacy row stored under the pre-#182 raw encoding must still replay
+    // idempotently.
+    #[tokio::test]
+    async fn owner_rotation_intent_digest_uses_registration_normalized_encoding() {
+        let pool = database_test_pool().await;
+        let org_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let suffix = org_id.simple().to_string();
+        let org_name = format!("keyring-intent-encoding-{suffix}");
+        crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+            .await
+            .expect("insert intent encoding org");
+        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Intent Encoding Owner')")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("insert intent encoding user");
+        sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+            .bind(user_id)
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("insert intent encoding membership");
+        let current_key = SigningKey::generate(&mut OsRng);
+        let replacement_key = SigningKey::generate(&mut OsRng);
+        sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2), ($1, $3)")
+            .bind(user_id)
+            .bind(current_key.verifying_key().to_bytes().to_vec())
+            .bind(replacement_key.verifying_key().to_bytes().to_vec())
+            .execute(&pool)
+            .await
+            .expect("insert intent encoding signing keys");
+
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.signing_service = Some(
+            crate::signing_service::SigningServiceClient::new(
+                mock_signing_service_owner_api(org_id, current_key.verifying_key().to_bytes())
+                    .await,
+                None,
+            )
+            .expect("build mock signing service client"),
+        );
+        let auth = AuthContext {
+            user_id,
+            org_id,
+            org_name: org_name.clone(),
+            role: Role::Owner,
+            api_key: None,
+            management_origin: crate::auth::middleware::ManagementOrigin::Public,
+        };
+        let _ = put_keyring(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(signed_keyring_request(org_id, user_id, &current_key, 1, 1)),
+        )
+        .await
+        .expect("publish v1 keyring");
+
+        // Rotation request whose raw JSON carries an unsigned extra field:
+        // the typed parse ignores it, but the durable intent digest and the
+        // stored keyring bytes must be computed over the normalized typed
+        // serialization, exactly like registration after #182.
+        let mut request = rotation_request(
+            org_id,
+            user_id,
+            &current_key,
+            &replacement_key,
+            2,
+            2,
+            Utc::now(),
+            "intent-encoding",
+        );
+        request.keyring_payload["future_extension"] = serde_json::json!("unsigned-extra");
+        let normalized_bytes = serde_json::to_vec(
+            &serde_json::to_value(&SignedOrgKeyring {
+                org_id,
+                version: 2,
+                members: vec![SignedOrgKeyringMember {
+                    user_id,
+                    pubkey: replacement_key.verifying_key().to_bytes(),
+                    role: SignedOrgKeyringRole::Owner,
+                    added_at: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+                }],
+                updated_at: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 2).unwrap(),
+            })
+            .expect("serialize normalized keyring"),
+        )
+        .expect("serialize normalized keyring bytes");
+        let _response = rotate_org_owner(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(request),
+        )
+        .await
+        .expect("normalized rotation succeeds");
+
+        // The stored keyring version is the normalized encoding, not the
+        // raw request bytes carrying the extra field.
+        let stored: Vec<u8> = sqlx::query_scalar(
+            "SELECT keyring_payload FROM org_keyrings WHERE org_id = $1 AND version = 2",
+        )
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load stored rotated keyring");
+        assert_eq!(stored, normalized_bytes, "stored bytes must be normalized");
+
+        // The intent row's keyring digest is sha256 of the same normalized
+        // bytes registration would store, not sha256 of the raw request.
+        let expected_digest: Vec<u8> = Sha256::digest(&normalized_bytes).to_vec();
+        let intent_digest: Vec<u8> =
+            sqlx::query_scalar("SELECT keyring_sha256 FROM org_rotation_intents WHERE org_id = $1")
+                .bind(org_id)
+                .fetch_one(&pool)
+                .await
+                .expect("load recorded intent digest");
+        assert_eq!(
+            intent_digest, expected_digest,
+            "intent digest must match the registration encoding"
+        );
+
+        // Legacy replay compatibility: rewrite the stored v2 row to the raw
+        // pre-#182 encoding (extra field re-added) and retry the exact
+        // rotation -- it must still be recognized as an already-applied
+        // rotation and succeed idempotently at any directive age.
+        let mut legacy_value: serde_json::Value =
+            serde_json::from_slice(&normalized_bytes).expect("parse normalized bytes");
+        legacy_value["future_extension"] = serde_json::json!("unsigned-extra");
+        let legacy_raw = serde_json::to_vec(&legacy_value).expect("serialize legacy raw bytes");
+        sqlx::query(
+            "UPDATE org_keyrings SET keyring_payload = $1 WHERE org_id = $2 AND version = 2",
+        )
+        .bind(&legacy_raw)
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("rewrite stored row to legacy encoding");
+        let mut retry = rotation_request(
+            org_id,
+            user_id,
+            &current_key,
+            &replacement_key,
+            2,
+            2,
+            Utc::now() - chrono::Duration::hours(1),
+            "intent-encoding",
+        );
+        retry.keyring_payload["future_extension"] = serde_json::json!("unsigned-extra");
+        let _response = rotate_org_owner(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(retry),
+        )
+        .await
+        .expect("legacy-encoded replay must stay idempotent");
     }
 
     #[tokio::test]
