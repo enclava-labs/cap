@@ -583,13 +583,13 @@ pub async fn put_keyring(
         .map_err(|_| db_error())?;
         // A new keyring generation can remove the signer of retained signed
         // policy artifacts still inside the KBS retention window (#130).
-        // The generation bump is NOT enqueued here: migration 0050's
+        // The generation bump is NOT enqueued here: migration 0058's
         // org_keyrings INSERT trigger (owe_selector_bump) owes the bump
         // inside this same transaction instead.  A direct desired_generation
-        // bump here would be a raw bump that a pre-0050 replica still
+        // bump here would be a raw bump that a pre-0058 replica still
         // reconciling during the rollout could consume with its unfiltered
         // candidate query; the deferred debt is consumed only by the
-        // post-0050 reconciler, after it has published the filtered
+        // post-0058 reconciler, after it has published the filtered
         // candidate set (consume_deferred_selector_bumps in kbs.rs).
     }
 
@@ -1104,9 +1104,9 @@ pub async fn rotate_org_owner(
         // Owner rotation can remove the signer of retained signed policy
         // artifacts still inside the KBS retention window (#130).  As with
         // put_keyring, the owed generation bump is recorded by migration
-        // 0050's org_keyrings INSERT trigger inside this transaction -- a
+        // 0058's org_keyrings INSERT trigger inside this transaction -- a
         // direct desired_generation bump here could be consumed by a
-        // pre-0050 replica's unfiltered reconciler during the rollout.
+        // pre-0058 replica's unfiltered reconciler during the rollout.
     }
     tx.commit().await.map_err(|_| db_error())?;
 
@@ -1661,12 +1661,12 @@ mod tests {
             .expect("insert keyring enqueue signing key");
 
         // Route-level regression for #130: the keyring insert must owe a
-        // selector generation bump through migration 0050's trigger, inside
+        // selector generation bump through migration 0058's trigger, inside
         // the put_keyring transaction itself (visible as soon as the row
         // lands, before the handler returns).  A regression that drops the
         // trigger would silently reintroduce #130 while the kbs helper test
         // stays green.  desired_generation must stay untouched -- only the
-        // post-0050 reconciler may consume the debt, never a pre-0050
+        // post-0058 reconciler may consume the debt, never a pre-0058
         // replica still running during the rollout.
         sqlx::query(
             "UPDATE kbs_signed_policy_reconciliation
