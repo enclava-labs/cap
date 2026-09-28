@@ -354,7 +354,9 @@ fn reject_jsonb_unrepresentable_payload(
         match value {
             serde_json::Value::String(s) => s.contains('\u{0000}'),
             serde_json::Value::Array(items) => items.iter().any(contains_nul),
-            serde_json::Value::Object(map) => map.values().any(contains_nul),
+            serde_json::Value::Object(map) => {
+                map.keys().any(|key| key.contains('\u{0000}')) || map.values().any(contains_nul)
+            }
             _ => false,
         }
     }
@@ -1834,6 +1836,15 @@ mod tests {
             );
         }
         assert!(reject_jsonb_unrepresentable_payload(&nested).is_err());
+        // A NUL inside an object KEY must be caught too (self-review C1):
+        // serde_json parses it, serde_json::to_vec round-trips it verbatim,
+        // and jsonb rejects it just like a NUL in a value.
+        let mut nul_key = serde_json::Map::new();
+        nul_key.insert(
+            "a\u{0}b".to_string(),
+            serde_json::Value::String("value is fine".to_string()),
+        );
+        assert!(reject_jsonb_unrepresentable_payload(&serde_json::Value::Object(nul_key)).is_err());
         assert!(
             reject_jsonb_unrepresentable_payload(&serde_json::json!({
                 "org_id": Uuid::new_v4(),
