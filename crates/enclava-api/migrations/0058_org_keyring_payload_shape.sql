@@ -15,6 +15,43 @@
 -- as passing, so a JSON object that omits "members" entirely would otherwise
 -- satisfy the constraint (NULL = 'array' evaluates to NULL, which passes a
 -- CHECK). IS TRUE makes a missing "members" key an explicit violation.
+--
+-- Repair pass first (review finding on this PR): the CHECK below evaluates
+-- every EXISTING row, and a row whose payload PostgreSQL cannot even parse
+-- as jsonb aborts the whole migration.  Such rows are producible by the
+-- pre-0058 writers: put_keyring / rotate_org_owner deserialize into
+-- SignedOrgKeyring (which ignores unknown fields) but persist the
+-- client-supplied payload verbatim, so an extra field carrying a `\u0000`
+-- escape -- accepted by serde_json, unrepresentable in jsonb -- could be
+-- stored by any binary running before the handler guard added in this PR.
+-- Deleting such rows is the fail-closed outcome the selector already
+-- guarantees for a missing keyring (INNER JOIN drop): the org loses KBS
+-- signed-policy candidacy until a clean keyring is re-uploaded, and no
+-- malformed payload can hold the migration (or every org's candidate
+-- loading) hostage.  Rows that are valid jsonb but the wrong shape are
+-- removed by the same predicate.  The helper swallows parse errors via an
+-- EXCEPTION block because the bare cast would raise, not return false, and
+-- SQL does not guarantee OR short-circuit ordering.
+CREATE FUNCTION org_keyrings_payload_matches_shape(payload bytea)
+RETURNS boolean
+LANGUAGE plpgsql
+IMMUTABLE
+AS $$
+BEGIN
+    RETURN (jsonb_typeof(convert_from(payload, 'UTF8')::jsonb) = 'object') IS TRUE
+       AND (jsonb_typeof(
+            convert_from(payload, 'UTF8')::jsonb -> 'members'
+        ) = 'array') IS TRUE;
+EXCEPTION
+    WHEN OTHERS THEN RETURN false;
+END;
+$$;
+
+DELETE FROM org_keyrings
+ WHERE NOT org_keyrings_payload_matches_shape(keyring_payload);
+
+DROP FUNCTION org_keyrings_payload_matches_shape(bytea);
+
 ALTER TABLE org_keyrings
     ADD CONSTRAINT org_keyrings_payload_wellformed CHECK (
         (jsonb_typeof(convert_from(keyring_payload, 'UTF8')::jsonb) = 'object') IS TRUE

@@ -337,6 +337,36 @@ fn bad_request(message: &str) -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
+/// keyring payloads are persisted as UTF-8 JSON that PostgreSQL must be able
+/// to re-parse as jsonb (migration 0058's shape CHECK, and the candidate
+/// selector's cast).  serde_json is stricter than jsonb in exactly one
+/// practical way: it accepts `\u0000` escapes that jsonb cannot represent.
+/// The writers persist the client-supplied payload verbatim while
+/// `SignedOrgKeyring` ignores unknown fields, so an extra field carrying a
+/// NUL would pass signature verification and then fail the INSERT with a
+/// database error (500).  Reject it as a 400 up front.  (A NUL cannot appear
+/// in a signature-verified known field: pubkeys are hex, ids/roles/timestamps
+/// are typed, so this scan only ever fires on client-supplied extras.)
+fn reject_jsonb_unrepresentable_payload(
+    payload: &serde_json::Value,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    fn contains_nul(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::String(s) => s.contains('\u{0000}'),
+            serde_json::Value::Array(items) => items.iter().any(contains_nul),
+            serde_json::Value::Object(map) => map.values().any(contains_nul),
+            _ => false,
+        }
+    }
+    if contains_nul(payload) {
+        return Err(bad_request(
+            "keyring_payload contains a \\u0000 escape, which PostgreSQL jsonb \
+             cannot represent",
+        ));
+    }
+    Ok(())
+}
+
 fn decode_hex_len(
     name: &'static str,
     value: &str,
@@ -406,6 +436,7 @@ pub async fn put_keyring(
     if body.version < 1 {
         return Err(bad_request("version must be positive"));
     }
+    reject_jsonb_unrepresentable_payload(&body.keyring_payload)?;
     let signature = decode_hex_len("signature", &body.signature, 64)?;
     let signing_pubkey = decode_hex_len("signing_pubkey", &body.signing_pubkey, 32)?;
     let keyring_org_id = body
@@ -874,6 +905,7 @@ pub async fn rotate_org_owner(
     if body.version < 2 {
         return Err(bad_request("rotated keyring version must be at least two"));
     }
+    reject_jsonb_unrepresentable_payload(&body.keyring_payload)?;
 
     let current_owner: [u8; 32] =
         decode_hex_len("current_signing_pubkey", &body.current_signing_pubkey, 32)?
@@ -1765,6 +1797,51 @@ mod tests {
             .await
             .expect("delete keyring enqueue user");
         drop_isolated_database("cap130_keyring_enqueue_put", pool).await;
+    }
+
+    /// Review follow-up: a `\u0000` escape in an unknown field passes
+    /// SignedOrgKeyring deserialization (unknown fields ignored) and would be
+    /// persisted verbatim, but jsonb cannot represent it -- the INSERT would
+    /// surface as a database error (500) once migration 0058's CHECK exists.
+    /// The handler must reject it as a 400 before any signature work, and
+    /// must never leave a row behind.
+    #[tokio::test]
+    async fn put_keyring_rejects_jsonb_unrepresentable_payload() {
+        let mut request = signed_keyring_request(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            &SigningKey::from_bytes(&[7u8; 32]),
+            1,
+            0,
+        );
+        if let serde_json::Value::Object(map) = &mut request.keyring_payload {
+            map.insert(
+                "memo".to_string(),
+                serde_json::Value::String("bad \u{0} nul".to_string()),
+            );
+        } else {
+            panic!("signed_keyring_request payload must be an object");
+        }
+        let err = reject_jsonb_unrepresentable_payload(&request.keyring_payload)
+            .expect_err("NUL escape in an extra field must be rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        // Nested positions must be caught too, and clean payloads pass.
+        let mut nested = serde_json::json!({"outer": ["fine", "x\u{0}y"]});
+        if let serde_json::Value::Object(map) = &mut nested {
+            map.insert(
+                "org_id".into(),
+                serde_json::Value::String(Uuid::new_v4().to_string()),
+            );
+        }
+        assert!(reject_jsonb_unrepresentable_payload(&nested).is_err());
+        assert!(
+            reject_jsonb_unrepresentable_payload(&serde_json::json!({
+                "org_id": Uuid::new_v4(),
+                "members": [],
+                "memo": "no nul here"
+            }))
+            .is_ok()
+        );
     }
 
     #[tokio::test]
