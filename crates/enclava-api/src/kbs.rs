@@ -525,7 +525,9 @@ async fn signed_policy_mode_active(db: &PgPool) -> Result<bool, KbsPolicyError> 
 /// historical deployment that owns an artifact.  A rollback therefore makes
 /// its exact source artifact required.  The active operation is authoritative
 /// even while the app row still projects the preceding failed/stopped state.
-/// Failed, unsigned, or deleting latest operations contribute no authorization.
+/// Failed, unsigned, or deleting latest operations contribute no authorization,
+/// except that a deleting app with confidential teardown still pending keeps its
+/// current authorization until the teardown completes.
 async fn load_signed_policy_candidates(
     db: &PgPool,
     retention: i64,
@@ -542,6 +544,8 @@ async fn load_signed_policy_candidates(
                 job.state AS job_state,
                 deployment.status::text AS deployment_status,
                 app.status::text AS app_status,
+                app.workload_teardown_required,
+                app.workload_teardown_completed_at,
                 ROW_NUMBER() OVER (
                     PARTITION BY job.app_id
                     ORDER BY job.generation DESC
@@ -557,7 +561,15 @@ async fn load_signed_policy_candidates(
             SELECT *
               FROM ranked_job_operations
              WHERE current_operation_rank = 1
-               AND app_status <> 'deleting'
+               -- A deleting app with confidential teardown still pending keeps
+               -- its authorization: the teardown's KBS resource deletes are
+               -- policy-governed, so stripping it here can permanently wedge
+               -- the delete it is waiting on.
+               AND (
+                    app_status <> 'deleting'
+                    OR (workload_teardown_required
+                        AND workload_teardown_completed_at IS NULL)
+               )
                AND deployment_status IN ('pending', 'applying', 'watching', 'healthy')
                AND job_state IN ('setup_pending', 'setting_up', 'pending', 'running', 'completed')
                AND artifact_deployment_id IS NOT NULL
@@ -623,6 +635,8 @@ async fn load_signed_policy_candidates(
                 deployment.app_id,
                 deployment.status::text AS deployment_status,
                 app.status::text AS app_status,
+                app.workload_teardown_required,
+                app.workload_teardown_completed_at,
                 deployment.created_at,
                 ROW_NUMBER() OVER (
                     PARTITION BY deployment.app_id
@@ -649,7 +663,11 @@ async fn load_signed_policy_candidates(
               ON artifact.app_id = legacy.app_id
              AND artifact.deploy_id = legacy.deployment_id
             WHERE legacy.current_operation_rank = 1
-              AND legacy.app_status IN ('creating', 'running')
+              AND (
+                  legacy.app_status IN ('creating', 'running')
+                  OR (legacy.workload_teardown_required
+                      AND legacy.workload_teardown_completed_at IS NULL)
+              )
               AND legacy.deployment_status = 'healthy'
         ),
         selected AS (
@@ -3178,6 +3196,97 @@ resource_bindings := {
                 .execute(&pool)
                 .await
                 .expect("delete receipt fixture organization");
+        }
+    }
+
+    #[tokio::test]
+    async fn deleting_app_keeps_authorization_only_while_teardown_pending() {
+        let pool = database_test_pool().await;
+        let now = Utc::now();
+
+        let (pending_org, pending_app) = insert_test_app(&pool, "deleting").await;
+        sqlx::query("UPDATE apps SET workload_teardown_required = true WHERE id = $1")
+            .bind(pending_app)
+            .execute(&pool)
+            .await
+            .expect("mark workload teardown pending");
+        let pending_deployment = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            pending_org,
+            pending_app,
+            pending_deployment,
+            "healthy",
+            now,
+        )
+        .await;
+        let pending_artifact =
+            insert_test_artifact(&pool, pending_app, pending_deployment, "de").await;
+        insert_test_job(
+            &pool,
+            pending_org,
+            pending_app,
+            pending_deployment,
+            pending_deployment,
+            Some((pending_deployment, &pending_artifact)),
+        )
+        .await;
+
+        let (completed_org, completed_app) = insert_test_app(&pool, "deleting").await;
+        sqlx::query(
+            "UPDATE apps
+                SET workload_teardown_required = true,
+                    workload_teardown_completed_at = clock_timestamp()
+              WHERE id = $1",
+        )
+        .bind(completed_app)
+        .execute(&pool)
+        .await
+        .expect("mark workload teardown completed");
+        let completed_deployment = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            completed_org,
+            completed_app,
+            completed_deployment,
+            "healthy",
+            now,
+        )
+        .await;
+        let completed_artifact =
+            insert_test_artifact(&pool, completed_app, completed_deployment, "ef").await;
+        insert_test_job(
+            &pool,
+            completed_org,
+            completed_app,
+            completed_deployment,
+            completed_deployment,
+            Some((completed_deployment, &completed_artifact)),
+        )
+        .await;
+
+        let candidates = load_signed_policy_candidates(&pool, 1)
+            .await
+            .expect("select teardown-pending KBS authority");
+        let hashes: HashSet<_> = candidates
+            .iter()
+            .map(|candidate| candidate.artifact.metadata.descriptor_core_hash.as_str())
+            .collect();
+        assert!(
+            hashes.contains(pending_artifact.metadata.descriptor_core_hash.as_str()),
+            "a deleting app with teardown still pending must keep its authorization"
+        );
+        assert!(
+            !hashes.contains(completed_artifact.metadata.descriptor_core_hash.as_str()),
+            "a deleting app whose teardown completed must drop out"
+        );
+
+        for cleanup_org in [pending_org, completed_org] {
+            sqlx::query("DELETE FROM organizations WHERE id = $1")
+                .bind(cleanup_org)
+                .execute(&pool)
+                .await
+                .expect("delete teardown-pending fixture organization");
         }
     }
 }
