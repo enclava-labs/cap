@@ -528,20 +528,9 @@ pub async fn put_keyring(
         scopes::lock_and_read_active_membership_role_in_tx(&mut tx, org_id, auth.user_id).await?;
     scopes::require_owner_role(current_role)?;
 
-    // Re-read key registration and latest keyring only after acquiring the
-    // shared signing-authority lane. Rotation and signed acceptance therefore
+    // Re-read the latest keyring only after acquiring the shared
+    // signing-authority lane. Rotation and signed acceptance therefore
     // linearize on one exact owner authority generation.
-    let signing_key_id: Uuid = sqlx::query_scalar(
-        "SELECT id FROM user_signing_keys
-         WHERE user_id = $1 AND pubkey = $2 AND revoked_at IS NULL",
-    )
-    .bind(auth.user_id)
-    .bind(&signing_pubkey)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(|_| db_error())?
-    .ok_or_else(|| bad_request("signing_pubkey is not registered for this user"))?;
-
     type LatestKeyringAuthority = (i64, Vec<u8>, Vec<u8>, Vec<u8>);
     let latest: Option<LatestKeyringAuthority> = sqlx::query_as(
         "SELECT ok.version, ok.keyring_payload, ok.signature, usk.pubkey
@@ -626,6 +615,17 @@ pub async fn put_keyring(
     }
 
     if insert_new_version {
+        let signing_key_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM user_signing_keys
+             WHERE user_id = $1 AND pubkey = $2 AND revoked_at IS NULL",
+        )
+        .bind(auth.user_id)
+        .bind(&signing_pubkey)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| db_error())?
+        .ok_or_else(|| bad_request("signing_pubkey is not registered for this user"))?;
+
         sqlx::query(
             "INSERT INTO org_keyrings
                  (org_id, version, keyring_payload, signature, signing_key_id)
@@ -1966,6 +1966,206 @@ mod tests {
             .await
             .expect("delete keyring enqueue user");
         drop_isolated_database("cap130_keyring_enqueue_put", pool).await;
+    }
+
+    async fn keyring_put_authority(pool: &sqlx::PgPool, org_id: Uuid) -> (i64, i64, i64, i64) {
+        sqlx::query_as(
+            "SELECT
+                 (SELECT count(*) FROM org_keyrings WHERE org_id = $1),
+                 (SELECT count(*) FROM audit_log
+                   WHERE org_id = $1 AND action = 'org.keyring.put'),
+                 (SELECT desired_generation FROM kbs_signed_policy_reconciliation
+                   WHERE singleton),
+                 (SELECT selector_bumps_owed FROM kbs_signed_policy_reconciliation
+                   WHERE singleton)",
+        )
+        .bind(org_id)
+        .fetch_one(pool)
+        .await
+        .expect("read keyring put authority counters")
+    }
+
+    #[tokio::test]
+    async fn put_keyring_second_owner_replays_current_envelope_without_owning_signer_registration()
+    {
+        let _singleton = keyring_enqueue_guard().await;
+        let (_db_cleanup, pool) = isolated_database_test_pool("cap178_second_owner_replay").await;
+        let org_id = Uuid::new_v4();
+        let alice_id = Uuid::new_v4();
+        let bob_id = Uuid::new_v4();
+        let suffix = org_id.simple().to_string();
+        let org_name = format!("keyring-second-owner-{suffix}");
+        crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+            .await
+            .expect("insert second-owner replay org");
+        for (user_id, display_name) in [(alice_id, "Alice"), (bob_id, "Bob")] {
+            sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, $2)")
+                .bind(user_id)
+                .bind(display_name)
+                .execute(&pool)
+                .await
+                .expect("insert second-owner replay user");
+            sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+                .bind(user_id)
+                .bind(org_id)
+                .execute(&pool)
+                .await
+                .expect("insert second-owner replay membership");
+        }
+        let alice_key = SigningKey::generate(&mut OsRng);
+        sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2)")
+            .bind(alice_id)
+            .bind(alice_key.verifying_key().to_bytes().to_vec())
+            .execute(&pool)
+            .await
+            .expect("insert Alice's signing key registration");
+
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 5,
+                    selector_bumps_owed = 0,
+                    configmap_generation = 0,
+                    applied_generation = 0,
+                    configmap_policy_sha256 = NULL,
+                    applied_policy_sha256 = NULL,
+                    configmap_resource_version = NULL
+              WHERE singleton",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed signed-policy generation");
+
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.kbs_policy = Some(test_kbs_policy_config());
+        let auth_for = |user_id| AuthContext {
+            user_id,
+            org_id,
+            org_name: org_name.clone(),
+            role: Role::Owner,
+            api_key: None,
+            management_origin: crate::auth::middleware::ManagementOrigin::Public,
+        };
+        let alice_auth = auth_for(alice_id);
+        let bob_auth = auth_for(bob_id);
+
+        let provider = std::sync::Arc::new(tokio::sync::Mutex::new(KbsPolicyProvider::new(false)));
+        crate::kbs::TEST_KUBE_CLIENT
+            .scope(kbs_policy_kube_client(provider.clone()), async {
+                let alice_envelope = || signed_keyring_request(org_id, alice_id, &alice_key, 1, 1);
+
+                let pending = put_keyring(
+                    alice_auth.clone(),
+                    State(state.clone()),
+                    Path(org_name.clone()),
+                    Json(alice_envelope()),
+                )
+                .await
+                .expect_err("unavailable KBS must leave Alice's write pending");
+                assert_eq!(pending.0, StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(pending.1.0["code"], "keyring_policy_reconciliation_pending");
+                assert_eq!(
+                    keyring_put_authority(&pool, org_id).await,
+                    (1, 1, 5, 1),
+                    "Alice's write must commit the keyring, audit row, and owed selector bump once"
+                );
+
+                sqlx::query(
+                    "UPDATE external_resource_mutation_leases
+                SET locked_until = clock_timestamp() - interval '2 seconds',
+                    reclaim_after = clock_timestamp() - interval '1 second'
+              WHERE resource_scope = 'kbs_policy' AND resource_key = 'global'",
+                )
+                .execute(&pool)
+                .await
+                .expect("expire failed publication fence");
+                let bob_pending = put_keyring(
+                    bob_auth.clone(),
+                    State(state.clone()),
+                    Path(org_name.clone()),
+                    Json(alice_envelope()),
+                )
+                .await
+                .expect_err("second-owner replay must stay pending while KBS is unavailable");
+                assert_eq!(bob_pending.0, StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(
+                    bob_pending.1.0["code"],
+                    "keyring_policy_reconciliation_pending"
+                );
+                assert_eq!(
+                    keyring_put_authority(&pool, org_id).await,
+                    (1, 1, 5, 1),
+                    "the second-owner replay must not write another keyring or audit row"
+                );
+
+                {
+                    let mut provider = provider.lock().await;
+                    provider.healthy = true;
+                }
+                sqlx::query(
+                    "UPDATE external_resource_mutation_leases
+                SET locked_until = clock_timestamp() - interval '2 seconds',
+                    reclaim_after = clock_timestamp() - interval '1 second'
+              WHERE resource_scope = 'kbs_policy' AND resource_key = 'global'",
+                )
+                .execute(&pool)
+                .await
+                .expect("expire failed publication fence");
+                let published = put_keyring(
+                    bob_auth.clone(),
+                    State(state.clone()),
+                    Path(org_name.clone()),
+                    Json(alice_envelope()),
+                )
+                .await
+                .expect("second-owner replay must confirm publication");
+                assert_eq!(published.1.0.version, 1);
+                {
+                    let provider = provider.lock().await;
+                    assert_eq!(
+                        provider.published_generation(),
+                        Some(6),
+                        "the owed generation must be live before success is reported"
+                    );
+                }
+                assert_eq!(
+                    keyring_put_authority(&pool, org_id).await,
+                    (1, 1, 6, 0),
+                    "the healthy second-owner replay must consume the debt without a new write"
+                );
+
+                let denied = put_keyring(
+                    bob_auth.clone(),
+                    State(state.clone()),
+                    Path(org_name.clone()),
+                    Json(signed_keyring_request(org_id, alice_id, &alice_key, 2, 2)),
+                )
+                .await
+                .expect_err("fresh successor must require a caller-owned registration");
+                assert_eq!(denied.0, StatusCode::BAD_REQUEST);
+                assert_eq!(
+                    keyring_put_authority(&pool, org_id).await,
+                    (1, 1, 6, 0),
+                    "the denied successor must not write anything"
+                );
+            })
+            .await;
+        sqlx::query("DELETE FROM audit_log WHERE org_id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete second-owner replay audit rows");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete second-owner replay org");
+        sqlx::query("DELETE FROM users WHERE id = ANY($1)")
+            .bind(vec![alice_id, bob_id])
+            .execute(&pool)
+            .await
+            .expect("delete second-owner replay users");
+        drop_isolated_database("cap178_second_owner_replay", pool).await;
     }
 
     /// Review follow-up: a `\u0000` escape in an unknown field passes
