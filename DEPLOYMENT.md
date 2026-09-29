@@ -51,6 +51,16 @@ Owner rotation and policy publication use these append-only migrations:
 | `0058_org_keyring_payload_shape.sql` | Archives and repairs malformed keyrings, constrains future payloads, and queues publication of changed keyring authority. |
 | `0059_org_rotation_upstream_receipts.sql` | Receipts binding a validated signing-service `rotate-owner` response (owner version, `rotated_at`) to the exact directive and normalized keyring digests. |
 
+Note on `0053`'s in-file comment: the SQL comment inside
+`0053_org_rotation_intents.sql` is historical and byte-frozen (sqlx
+checksums applied migration bytes, and this file's checksum is already
+recorded in databases), and it describes the earlier intent-row waiver that
+`0059` superseded. Do not read it as current semantics. An intent row is
+proof of presentation only: it never mints, grants, or blocks recovery. The
+expired-retry waiver is granted exclusively by a matching
+`org_rotation_upstream_receipts` row (see `expired_rotation_waived_by_receipt`
+in `routes/orgs.rs`); a captured or unactioned presentation is inert.
+
 Recovery semantics: a rotation directive is first-use bounded by its
 `signed_at` max-age. An expired retry of a new-version rotation is accepted
 only when a committed upstream receipt proves that this exact request's
@@ -85,6 +95,34 @@ Cutover notes for `0059`:
   not proof of upstream success.
 - Keep historical intent/directive/keyring rows and applied migration files
   unchanged; do not repair recovery by rewriting ledgers or checksums.
+
+## Internal Keyring API Deferred Responses
+
+The internal keyring endpoints (`PUT /internal/paas/orgs/{org}/keyring`,
+`POST /internal/paas/orgs/{org}/keyring/rotate-owner`) now defer a
+publication-pending failure instead of failing the request outright. When
+the keyring mutation is committed but KBS policy reconciliation cannot be
+confirmed (503 `keyring_policy_reconciliation_pending`), the request's
+idempotency record is checkpointed and the caller receives
+409 `idempotency_request_in_progress` with `retryable: true`,
+`disposition: retry_same_key`, `idempotency_disposition: "deferred"` and
+`cause: keyring_policy_reconciliation_pending`. A retry with the same
+idempotency key resumes the deferred request -- the checkpoint keeps it out
+of the fail-closed disposition -- and re-confirms publication instead of
+repeating the mutation. The checkpointed lease is the short (~5 s) retry
+interval, not a terminal outcome.
+
+Cross-project rollout gate (AGENTS.md): the CAP internal API response shape
+changed, so update and test enclava-paas against this response **before**
+deploying CAP API. Retries must keep the original idempotency key:
+enclava-paas forwards a caller-supplied `Idempotency-Key` deterministically
+(namespaced `paas:{org}:sha256(key)`), but when the caller sends none it
+derives a per-attempt random key (`cli_cap_idempotency_key`), so a plain
+retry would open a new CAP idempotency record instead of resuming the
+deferred one. Hosted keyring flows must therefore carry a stable
+`Idempotency-Key` (caller-supplied, or a PaaS-derived deterministic key as
+the template config-token retry already does) before CAP API with this
+change is deployed.
 
 ## Required Services
 

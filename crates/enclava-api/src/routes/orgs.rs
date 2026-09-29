@@ -1209,6 +1209,12 @@ async fn rotate_service_owner(
 /// The version and timestamp equality run in SQL on PostgreSQL's
 /// microsecond timestamptz representation; Rust-side nanosecond equality
 /// would mismatch after the service's JSON roundtrip.
+///
+/// Presentation rows (`org_rotation_intents`) never satisfy this query: an
+/// intent is proof of presentation only, never of execution. (The historical
+/// SQL comment in migration `0053` describes the superseded intent-row
+/// waiver; that file is byte-frozen because sqlx checksums applied migration
+/// bytes — see `DEPLOYMENT.md` for the current semantics.)
 async fn upstream_receipt_matches_live_service(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     org_id: Uuid,
