@@ -1277,10 +1277,18 @@ async fn begin_idempotent_request_with_recovery_and_binding(
             legacy_identity_bound: false
         }
     ) && legacy_unbound;
+    let keyring_publication_pending = !legacy_unbound
+        && row.response_status == Some(i32::from(StatusCode::SERVICE_UNAVAILABLE.as_u16()))
+        && row
+            .response_body
+            .as_ref()
+            .and_then(|body| body.get("code"))
+            .and_then(serde_json::Value::as_str)
+            == Some(KEYRING_POLICY_RECONCILIATION_PENDING_CODE);
     if !row.known_not_applied
         && (policy_changed
             || deterministic_legacy_is_unsafe
-            || recovery == IdempotencyRecovery::FailClosed)
+            || (recovery == IdempotencyRecovery::FailClosed && !keyring_publication_pending))
     {
         return complete_unrecoverable_idempotency_request(
             &state.db,
@@ -1398,6 +1406,7 @@ async fn begin_idempotent_request_with_recovery_and_binding(
 }
 
 fn completed_idempotency_response(row: &IdempotencyRow) -> Option<IdempotencyResponse> {
+    row.completed_at?;
     let status = row
         .response_status
         .and_then(|code| StatusCode::from_u16(code as u16).ok())?;
@@ -1578,16 +1587,20 @@ fn stamp_idempotency_completion(body: &mut serde_json::Value) {
     }
 }
 
-/// Defer an idempotent request: stop the heartbeat and push the lease expiry
-/// out by the retry interval, leaving the row incomplete so a same-key retry
-/// re-executes. Returns the stamped body the caller must return to the client.
-async fn defer_idempotent_request(mut lease: IdempotencyLease) -> InternalRouteError {
+/// Keep the request bound until retry. A checkpoint preserves a known committed
+/// outcome across process loss without mislabeling it as not applied.
+async fn defer_idempotent_request(
+    mut lease: IdempotencyLease,
+    checkpoint: Option<&IdempotencyResponse>,
+) -> InternalRouteError {
     lease.stop_heartbeat();
-    let updated = sqlx::query(
+    let update = sqlx::query(
         "UPDATE cap_internal_idempotency
             SET lease_expires_at = clock_timestamp()
                 + ($3::bigint * interval '1 second'),
-                updated_at = clock_timestamp()
+                updated_at = clock_timestamp(),
+                response_status = $4,
+                response_body = $5
           WHERE idempotency_key = $1
             AND reservation_token = $2
             AND completed_at IS NULL",
@@ -1595,8 +1608,24 @@ async fn defer_idempotent_request(mut lease: IdempotencyLease) -> InternalRouteE
     .bind(&lease.key)
     .bind(lease.token)
     .bind(IDEMPOTENCY_RETRY_DEFER_SECONDS)
-    .execute(&lease.pool)
-    .await;
+    .bind(checkpoint.map(|(status, _)| i32::from(status.as_u16())))
+    .bind(checkpoint.map(|(_, body)| body));
+    let updated = if checkpoint.is_some() {
+        let mut tx = match lease.pool.begin().await {
+            Ok(tx) => tx,
+            Err(_) => return db_error(),
+        };
+        if let Err(error) = set_idempotency_completion_owner(&mut tx, lease.token).await {
+            return error;
+        }
+        let updated = update.execute(&mut *tx).await;
+        if updated.is_ok() && tx.commit().await.is_err() {
+            return db_error();
+        }
+        updated
+    } else {
+        update.execute(&lease.pool).await
+    };
     // Both Ok arms return the same deferred body now that the central
     // in-progress helper carries the `deferred` stamp: a 1-row update means the
     // defer landed; a 0-row update means the lease was already completed or
@@ -1678,12 +1707,40 @@ async fn complete_app_delete_result(
             && body.get("error").and_then(serde_json::Value::as_str)
                 == Some("app_delete_teardown_locked");
         if status.is_server_error() || teardown_locked {
-            let (deferred_status, Json(mut deferred_body)) = defer_idempotent_request(lease).await;
+            let (deferred_status, Json(mut deferred_body)) =
+                defer_idempotent_request(lease, None).await;
             if teardown_locked && deferred_status == StatusCode::CONFLICT {
                 deferred_body["cause"] = serde_json::json!("app_delete_teardown_locked");
             }
             return Err((deferred_status, Json(deferred_body)));
         }
+    }
+    complete_idempotent_result(lease, result).await
+}
+
+const KEYRING_POLICY_RECONCILIATION_PENDING_CODE: &str = "keyring_policy_reconciliation_pending";
+
+/// Only a known committed keyring may retain a nonterminal publication
+/// checkpoint; unrelated failures keep the generic fail-closed disposition.
+async fn complete_keyring_result(
+    lease: IdempotencyLease,
+    result: Result<IdempotencyResponse, InternalRouteError>,
+) -> Result<IdempotencyResponse, InternalRouteError> {
+    if let Err((status, body)) = &result
+        && *status == StatusCode::SERVICE_UNAVAILABLE
+        && body.get("code").and_then(serde_json::Value::as_str)
+            == Some(KEYRING_POLICY_RECONCILIATION_PENDING_CODE)
+    {
+        let checkpoint = (
+            *status,
+            serde_json::json!({"code": KEYRING_POLICY_RECONCILIATION_PENDING_CODE}),
+        );
+        let (deferred_status, Json(mut deferred_body)) =
+            defer_idempotent_request(lease, Some(&checkpoint)).await;
+        if deferred_status == StatusCode::CONFLICT {
+            deferred_body["cause"] = serde_json::json!(KEYRING_POLICY_RECONCILIATION_PENDING_CODE);
+        }
+        return Err((deferred_status, Json(deferred_body)));
     }
     complete_idempotent_result(lease, result).await
 }
@@ -4534,7 +4591,7 @@ pub async fn deploy_paas_app(
         {
             Ok(InternalDeploymentAdoption::Missing) => {}
             Ok(InternalDeploymentAdoption::SetupIncomplete) => {
-                return Err(defer_idempotent_request(idempotency).await);
+                return Err(defer_idempotent_request(idempotency, None).await);
             }
             Ok(InternalDeploymentAdoption::Response(response)) => {
                 let (status, response) =
@@ -4702,7 +4759,7 @@ pub async fn put_paas_keyring(
         Ok((status, response))
     }
     .await;
-    let (status, response) = complete_idempotent_result(idempotency, result).await?;
+    let (status, response) = complete_keyring_result(idempotency, result).await?;
     Ok((status, Json(response)))
 }
 
@@ -4785,7 +4842,7 @@ pub async fn rotate_paas_keyring_owner(
         Ok((StatusCode::OK, to_value(response)?))
     }
     .await;
-    let (status, response) = complete_idempotent_result(idempotency, result).await?;
+    let (status, response) = complete_keyring_result(idempotency, result).await?;
     Ok((status, Json(response)))
 }
 
@@ -5252,7 +5309,7 @@ pub async fn create_paas_generic_deployment(
                     == Some("external_id belongs to a deployment whose setup did not complete")
         )
     {
-        return Err(defer_idempotent_request(idempotency).await);
+        return Err(defer_idempotent_request(idempotency, None).await);
     }
     let (status, response) = complete_idempotent_result(idempotency, result).await?;
     Ok((status, Json(response)))
@@ -8361,7 +8418,7 @@ mod tests {
                 .await
                 .expect("reserve deferred handler"),
         );
-        let deferred = defer_idempotent_request(lease).await;
+        let deferred = defer_idempotent_request(lease, None).await;
         assert_eq!(deferred.0, StatusCode::CONFLICT);
         assert_eq!(deferred.1["idempotency_disposition"], "deferred");
         assert_eq!(deferred.1["retryable"], true);
@@ -11034,6 +11091,600 @@ mod tests {
         .await
         .expect("load shared membership authority");
         assert_eq!(authority, (2, 1, 2));
+    }
+
+    /// Canonical keyring bytes for the single-owner keyrings these tests sign.
+    /// Mirrors routes::orgs's private canonicalization (CE-v1 records) so a
+    /// signature made here verifies inside put_keyring / rotate_org_owner.
+    fn test_canonical_keyring_bytes(
+        org_id: Uuid,
+        version: u64,
+        member: &(Uuid, [u8; 32], chrono::DateTime<chrono::Utc>),
+        updated_at: &chrono::DateTime<chrono::Utc>,
+    ) -> Vec<u8> {
+        let (user_id, pubkey, added_at) = member;
+        let role = b"owner".to_vec();
+        let added_at_bytes = added_at.to_rfc3339().into_bytes();
+        let member_hash = enclava_common::canonical::ce_v1_hash(&[
+            ("user_id", user_id.as_bytes().as_slice()),
+            ("pubkey", pubkey.as_slice()),
+            ("role", &role),
+            ("added_at", &added_at_bytes),
+        ]);
+        let member_label = user_id.to_string();
+        let members_hash = enclava_common::canonical::ce_v1_hash(&[(
+            member_label.as_str(),
+            member_hash.as_slice(),
+        )]);
+        let version_be = version.to_be_bytes();
+        let updated_at_bytes = updated_at.to_rfc3339().into_bytes();
+        enclava_common::canonical::ce_v1_bytes(&[
+            ("purpose", b"enclava-org-keyring-v1"),
+            ("org_id", org_id.as_bytes().as_slice()),
+            ("version", &version_be),
+            ("members", &members_hash),
+            ("updated_at", &updated_at_bytes),
+        ])
+    }
+
+    fn signed_keyring_body(
+        org_id: Uuid,
+        user_id: Uuid,
+        key: &ed25519_dalek::SigningKey,
+        version: i64,
+        updated_second: u32,
+    ) -> serde_json::Value {
+        use chrono::TimeZone;
+        use ed25519_dalek::Signer;
+        let added_at = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let updated_at = chrono::Utc
+            .with_ymd_and_hms(2026, 1, 1, 0, 0, updated_second)
+            .unwrap();
+        let pubkey = key.verifying_key().to_bytes();
+        let canonical = test_canonical_keyring_bytes(
+            org_id,
+            version as u64,
+            &(user_id, pubkey, added_at),
+            &updated_at,
+        );
+        let signature = key.sign(&canonical);
+        serde_json::json!({
+            "version": version,
+            "keyring_payload": {
+                "org_id": org_id,
+                "version": version,
+                "members": [{
+                    "user_id": user_id,
+                    "pubkey": hex::encode(pubkey),
+                    "role": "owner",
+                    "added_at": added_at,
+                }],
+                "updated_at": updated_at,
+            },
+            "signature": hex::encode(signature.to_bytes()),
+            "signing_pubkey": hex::encode(pubkey),
+        })
+    }
+
+    fn signed_rotation_body(
+        org_id: Uuid,
+        user_id: Uuid,
+        current_key: &ed25519_dalek::SigningKey,
+        replacement_key: &ed25519_dalek::SigningKey,
+    ) -> serde_json::Value {
+        use chrono::TimeZone;
+        use ed25519_dalek::Signer;
+        let added_at = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let updated_at = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 1, 0).unwrap();
+        let current_pubkey = current_key.verifying_key().to_bytes();
+        let replacement_pubkey = replacement_key.verifying_key().to_bytes();
+        let canonical = test_canonical_keyring_bytes(
+            org_id,
+            2,
+            &(user_id, replacement_pubkey, added_at),
+            &updated_at,
+        );
+        let keyring_signature = replacement_key.sign(&canonical);
+        let signed_at = chrono::Utc::now();
+        let reason = "owner key compromised";
+        let directive = enclava_common::crypto::owner_rotation_directive_bytes(
+            org_id,
+            &current_pubkey,
+            &replacement_pubkey,
+            signed_at,
+            reason,
+        );
+        let rotation_signature = current_key.sign(&directive);
+        serde_json::json!({
+            "version": 2,
+            "keyring_payload": {
+                "org_id": org_id,
+                "version": 2,
+                "members": [{
+                    "user_id": user_id,
+                    "pubkey": hex::encode(replacement_pubkey),
+                    "role": "owner",
+                    "added_at": added_at,
+                }],
+                "updated_at": updated_at,
+            },
+            "signature": hex::encode(keyring_signature.to_bytes()),
+            "replacement_signing_pubkey": hex::encode(replacement_pubkey),
+            "current_signing_pubkey": hex::encode(current_pubkey),
+            "signed_at": signed_at,
+            "reason": reason,
+            "rotation_signature": hex::encode(rotation_signature.to_bytes()),
+        })
+    }
+
+    async fn seed_keyring_pending_org(
+        pool: &sqlx::PgPool,
+        signing_keys: &[ed25519_dalek::SigningKey],
+    ) -> (Uuid, Uuid, String, String) {
+        let org_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let suffix = org_id.simple().to_string();
+        let org_name = format!("keyring-pending-{}", &suffix[..16]);
+        let paas_org_id = format!("paas-keyring-org-{suffix}");
+        let paas_user_id = format!("paas-keyring-user-{suffix}");
+        insert_config_token_test_actor(
+            pool,
+            org_id,
+            &org_name,
+            &paas_org_id,
+            user_id,
+            &paas_user_id,
+        )
+        .await;
+        for key in signing_keys {
+            sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2)")
+                .bind(user_id)
+                .bind(key.verifying_key().to_bytes().to_vec())
+                .execute(pool)
+                .await
+                .expect("register keyring pending signing key");
+        }
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 5,
+                    selector_bumps_owed = 0,
+                    configmap_generation = 0,
+                    applied_generation = 0,
+                    configmap_policy_sha256 = NULL,
+                    applied_policy_sha256 = NULL,
+                    configmap_resource_version = NULL
+              WHERE singleton",
+        )
+        .execute(pool)
+        .await
+        .expect("activate signed-policy mode without a converged generation");
+        (org_id, user_id, paas_org_id, paas_user_id)
+    }
+
+    /// Insert keyring v1 signed by `key` directly, bypassing the HTTP route
+    /// (routing the seed through put_paas_keyring would defer under pending
+    /// KBS state or terminalize under an unrelated failure).
+    async fn seed_owner_keyring_v1(
+        pool: &sqlx::PgPool,
+        org_id: Uuid,
+        user_id: Uuid,
+        key: &ed25519_dalek::SigningKey,
+    ) {
+        let body = signed_keyring_body(org_id, user_id, key, 1, 0);
+        let signing_key_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM user_signing_keys WHERE user_id = $1 AND pubkey = $2",
+        )
+        .bind(user_id)
+        .bind(key.verifying_key().to_bytes().to_vec())
+        .fetch_one(pool)
+        .await
+        .expect("resolve v1 signing key id");
+        sqlx::query(
+            "INSERT INTO org_keyrings
+                 (org_id, version, keyring_payload, signature, signing_key_id)
+             VALUES ($1, 1, $2, $3, $4)",
+        )
+        .bind(org_id)
+        .bind(serde_json::to_vec(&body["keyring_payload"]).expect("serialize v1 keyring payload"))
+        .bind(
+            hex::decode(body["signature"].as_str().expect("v1 signature"))
+                .expect("decode v1 keyring signature"),
+        )
+        .bind(signing_key_id)
+        .execute(pool)
+        .await
+        .expect("seed keyring v1");
+    }
+
+    #[tokio::test]
+    async fn put_keyring_committed_pending_defers_and_same_key_reexecutes() {
+        let _singleton = crate::test_support::SIGNED_POLICY_SINGLETON_LOCK
+            .lock()
+            .await;
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_keyring_pending_put").await;
+        let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let (org_id, user_id, paas_org_id, paas_user_id) =
+            seed_keyring_pending_org(&pool, std::slice::from_ref(&key)).await;
+        let mut state = idempotency_test_state(pool.clone());
+        state.management_mode = crate::state::CapManagementMode::PaasManaged;
+        let idempotency_key = format!("keyring-pending-put-{}", Uuid::new_v4());
+        let headers = config_token_actor_headers(&idempotency_key, &paas_user_id);
+        let request = signed_keyring_body(org_id, user_id, &key, 1, 0);
+
+        // Active signed mode with no KBS config: the keyring transaction
+        // commits, publication cannot be confirmed, and the wrapper must
+        // defer rather than cache success or a terminal outcome.
+        let deferred = put_paas_keyring(
+            internal_test_auth(),
+            State(state.clone()),
+            Path(paas_org_id.clone()),
+            headers.clone(),
+            Json(request.clone()),
+        )
+        .await
+        .expect_err("committed-but-unconfirmed keyring must defer, not succeed");
+        assert_eq!(deferred.0, StatusCode::CONFLICT);
+        assert_eq!(deferred.1.0["error"], "idempotency_request_in_progress");
+        assert_eq!(deferred.1.0["idempotency_disposition"], "deferred");
+        assert_eq!(deferred.1.0["retryable"], true);
+        assert_eq!(
+            deferred.1.0["cause"],
+            KEYRING_POLICY_RECONCILIATION_PENDING_CODE
+        );
+
+        // The keyring version, its audit row and the request binding are
+        // durable; the idempotency row stays incomplete and not-applied-free.
+        let receipt: (bool, bool) = sqlx::query_as(
+            "SELECT completed_at IS NULL, known_not_applied
+               FROM cap_internal_idempotency WHERE idempotency_key = $1",
+        )
+        .bind(&idempotency_key)
+        .fetch_one(&pool)
+        .await
+        .expect("inspect deferred keyring receipt");
+        assert_eq!(receipt, (true, false));
+        let versions: Vec<i64> = sqlx::query_scalar(
+            "SELECT version FROM org_keyrings WHERE org_id = $1 ORDER BY version",
+        )
+        .bind(org_id)
+        .fetch_all(&pool)
+        .await
+        .expect("read committed keyring versions");
+        assert_eq!(versions, vec![1]);
+        let put_audits: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM audit_log
+              WHERE org_id = $1 AND action = 'org.keyring.put'",
+        )
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count keyring put audits");
+        assert_eq!(put_audits, 1);
+
+        // A same-key retry under the live deferred lease stays deferred, and
+        // a different payload cannot hijack the bound key.
+        let busy = put_paas_keyring(
+            internal_test_auth(),
+            State(state.clone()),
+            Path(paas_org_id.clone()),
+            headers.clone(),
+            Json(request.clone()),
+        )
+        .await
+        .expect_err("a live deferred lease must keep deferring same-key retries");
+        assert_eq!(
+            (busy.0, busy.1.0),
+            (StatusCode::CONFLICT, idempotency_in_progress_error().1.0)
+        );
+        let mut hijack = request.clone();
+        hijack["version"] = serde_json::json!(2);
+        let rejected = put_paas_keyring(
+            internal_test_auth(),
+            State(state.clone()),
+            Path(paas_org_id.clone()),
+            headers.clone(),
+            Json(hijack),
+        )
+        .await
+        .expect_err("a different payload must not reuse the bound key");
+        assert_eq!(rejected.0, StatusCode::CONFLICT);
+        assert_eq!(rejected.1.0["error"], "idempotency_key_reused");
+
+        // A concurrent newer keyring makes the reclaimed same-key retry
+        // re-execute the handler (stale-version conflict, terminal receipt)
+        // instead of replaying the deferred committed-pending response.
+        let signing_key_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM user_signing_keys WHERE user_id = $1 AND pubkey = $2",
+        )
+        .bind(user_id)
+        .bind(key.verifying_key().to_bytes().to_vec())
+        .fetch_one(&pool)
+        .await
+        .expect("resolve signing key id");
+        let concurrent = signed_keyring_body(org_id, user_id, &key, 2, 30);
+        sqlx::query(
+            "INSERT INTO org_keyrings
+                 (org_id, version, keyring_payload, signature, signing_key_id)
+             VALUES ($1, 2, $2, $3, $4)",
+        )
+        .bind(org_id)
+        .bind(
+            serde_json::to_vec(&concurrent["keyring_payload"])
+                .expect("serialize concurrent keyring payload"),
+        )
+        .bind(
+            hex::decode(
+                concurrent["signature"]
+                    .as_str()
+                    .expect("concurrent signature"),
+            )
+            .expect("decode concurrent keyring signature"),
+        )
+        .bind(signing_key_id)
+        .execute(&pool)
+        .await
+        .expect("insert concurrent newer keyring");
+        expire_idempotency_lease(&pool, &idempotency_key).await;
+        let retried = put_paas_keyring(
+            internal_test_auth(),
+            State(state.clone()),
+            Path(paas_org_id.clone()),
+            headers.clone(),
+            Json(request.clone()),
+        )
+        .await
+        .expect_err("the stale-version retry is a conflict, not a success");
+        assert_eq!(retried.0, StatusCode::CONFLICT);
+        assert_eq!(retried.1.0["idempotency_disposition"], "completed");
+        assert_eq!(retried.1.0["retryable"], false);
+        assert_ne!(retried.1.0["error"], "idempotency_request_in_progress");
+        assert_ne!(retried.1.0["error"], "idempotency_recovery_required");
+        assert!(
+            retried.1.0.get("cause").is_none(),
+            "the retry must re-execute against the newer keyring, not replay the defer"
+        );
+        let versions_after: Vec<i64> = sqlx::query_scalar(
+            "SELECT version FROM org_keyrings WHERE org_id = $1 ORDER BY version",
+        )
+        .bind(org_id)
+        .fetch_all(&pool)
+        .await
+        .expect("read keyring versions after retry");
+        assert_eq!(versions_after, vec![1, 2]);
+        let put_audits_after: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM audit_log
+              WHERE org_id = $1 AND action = 'org.keyring.put'",
+        )
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count keyring put audits after retry");
+        assert_eq!(
+            put_audits_after, 1,
+            "the re-executed stale retry must not write another version or audit"
+        );
+
+        // The terminal receipt is now cached and replays exactly.
+        let replayed = put_paas_keyring(
+            internal_test_auth(),
+            State(state.clone()),
+            Path(paas_org_id.clone()),
+            headers.clone(),
+            Json(request.clone()),
+        )
+        .await
+        .expect("the completed stale conflict replays");
+        assert_eq!(replayed.0, retried.0);
+        assert_eq!(replayed.1.0, retried.1.0);
+
+        crate::test_support::drop_isolated_database("cap_keyring_pending_put", pool).await;
+    }
+
+    #[tokio::test]
+    async fn rotate_owner_committed_pending_defers_and_exact_replay_retries_publication() {
+        let _singleton = crate::test_support::SIGNED_POLICY_SINGLETON_LOCK
+            .lock()
+            .await;
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_keyring_pending_rotate").await;
+        let current_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let replacement_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let (org_id, user_id, paas_org_id, paas_user_id) =
+            seed_keyring_pending_org(&pool, &[current_key.clone(), replacement_key.clone()]).await;
+
+        // Publish v1 as the current owner directly: routing the seed through
+        // put_paas_keyring would itself defer under the pending KBS state.
+        seed_owner_keyring_v1(&pool, org_id, user_id, &current_key).await;
+
+        let mut state = idempotency_test_state(pool.clone());
+        state.management_mode = crate::state::CapManagementMode::PaasManaged;
+        // The signing service already reports the replacement owner, so the
+        // rotation commits locally without a remote owner change.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind signing service mock");
+        let address = listener.local_addr().expect("mock signing service address");
+        let replacement_hex = hex::encode(replacement_key.verifying_key().to_bytes());
+        let status_org_id = org_id;
+        let mock = tokio::spawn(async move {
+            use axum::{Json, routing::get};
+            let app = axum::Router::new().route(
+                "/orgs/{org_id}/owner",
+                get(move || {
+                    let org_id = status_org_id;
+                    let owner_hex = replacement_hex.clone();
+                    async move {
+                        Json(serde_json::json!({
+                            "org_id": org_id,
+                            "state": "ready",
+                            "version": 2,
+                            "owner_pubkey_hex": owner_hex,
+                            "last_changed_at": null,
+                        }))
+                    }
+                }),
+            );
+            axum::serve(listener, app).await.expect("serve mock");
+        });
+        state.signing_service = Some(
+            crate::signing_service::SigningServiceClient::new(format!("http://{address}"), None)
+                .expect("mock signing service client"),
+        );
+
+        let idempotency_key = format!("keyring-pending-rotate-{}", Uuid::new_v4());
+        let headers = config_token_actor_headers(&idempotency_key, &paas_user_id);
+        let rotation = signed_rotation_body(org_id, user_id, &current_key, &replacement_key);
+
+        let deferred = rotate_paas_keyring_owner(
+            internal_test_auth(),
+            State(state.clone()),
+            Path(paas_org_id.clone()),
+            headers.clone(),
+            Json(rotation.clone()),
+        )
+        .await
+        .expect_err("committed-but-unconfirmed rotation must defer, not succeed");
+        assert_eq!(deferred.0, StatusCode::CONFLICT);
+        assert_eq!(deferred.1.0["idempotency_disposition"], "deferred");
+        assert_eq!(
+            deferred.1.0["cause"],
+            KEYRING_POLICY_RECONCILIATION_PENDING_CODE
+        );
+
+        // The rotation committed exactly once: version 2 exists with exactly
+        // one rotation audit row, and the idempotency row stays incomplete.
+        let versions: Vec<i64> = sqlx::query_scalar(
+            "SELECT version FROM org_keyrings WHERE org_id = $1 ORDER BY version",
+        )
+        .bind(org_id)
+        .fetch_all(&pool)
+        .await
+        .expect("read rotation keyring versions");
+        assert_eq!(versions, vec![1, 2]);
+        let rotate_audits: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM audit_log
+              WHERE org_id = $1 AND action = 'org.keyring.owner.rotate'",
+        )
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count rotation audits");
+        assert_eq!(rotate_audits, 1);
+        let receipt: (bool, bool) = sqlx::query_as(
+            "SELECT completed_at IS NULL, known_not_applied
+               FROM cap_internal_idempotency WHERE idempotency_key = $1",
+        )
+        .bind(&idempotency_key)
+        .fetch_one(&pool)
+        .await
+        .expect("inspect deferred rotation receipt");
+        assert_eq!(receipt, (true, false));
+
+        // Exact replay after the lease frees re-executes and defers again --
+        // retrying publication -- without repeating the owner rotation.
+        expire_idempotency_lease(&pool, &idempotency_key).await;
+        let retried = rotate_paas_keyring_owner(
+            internal_test_auth(),
+            State(state.clone()),
+            Path(paas_org_id.clone()),
+            headers.clone(),
+            Json(rotation.clone()),
+        )
+        .await
+        .expect_err("exact replay retries publication and defers again");
+        assert_eq!(retried.0, StatusCode::CONFLICT);
+        assert_eq!(retried.1.0["idempotency_disposition"], "deferred");
+        assert_eq!(
+            retried.1.0["cause"],
+            KEYRING_POLICY_RECONCILIATION_PENDING_CODE
+        );
+        let versions_after: Vec<i64> = sqlx::query_scalar(
+            "SELECT version FROM org_keyrings WHERE org_id = $1 ORDER BY version",
+        )
+        .bind(org_id)
+        .fetch_all(&pool)
+        .await
+        .expect("read keyring versions after replay");
+        assert_eq!(versions_after, vec![1, 2]);
+        let rotate_audits_after: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM audit_log
+              WHERE org_id = $1 AND action = 'org.keyring.owner.rotate'",
+        )
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count rotation audits after replay");
+        assert_eq!(
+            rotate_audits_after, 1,
+            "exact replay must never repeat the owner rotation"
+        );
+
+        mock.abort();
+        crate::test_support::drop_isolated_database("cap_keyring_pending_rotate", pool).await;
+    }
+
+    #[tokio::test]
+    async fn keyring_unrelated_five_xx_stays_fail_closed() {
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_keyring_pending_unrelated").await;
+        let current_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let replacement_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let (org_id, user_id, paas_org_id, paas_user_id) =
+            seed_keyring_pending_org(&pool, &[current_key.clone(), replacement_key.clone()]).await;
+        seed_owner_keyring_v1(&pool, org_id, user_id, &current_key).await;
+        let mut state = idempotency_test_state(pool.clone());
+        state.management_mode = crate::state::CapManagementMode::PaasManaged;
+        let idempotency_key = format!("keyring-pending-unrelated-{}", Uuid::new_v4());
+        let headers = config_token_actor_headers(&idempotency_key, &paas_user_id);
+        let rotation = signed_rotation_body(org_id, user_id, &current_key, &replacement_key);
+        let call = |state: AppState, headers: HeaderMap| {
+            rotate_paas_keyring_owner(
+                internal_test_auth(),
+                State(state),
+                Path(paas_org_id.clone()),
+                headers,
+                Json(rotation.clone()),
+            )
+        };
+
+        // No signing service is configured: the handler fails with an
+        // unrelated 503 before anything commits, and the wrapper must keep
+        // the generic fail-closed disposition instead of deferring.
+        let terminal = call(state.clone(), headers.clone())
+            .await
+            .expect_err("an unrelated 503 must fail closed, not defer");
+        assert_eq!(terminal.0, StatusCode::CONFLICT);
+        assert_eq!(terminal.1.0["error"], "idempotency_recovery_required");
+        assert_eq!(terminal.1.0["idempotency_disposition"], "completed");
+        assert_eq!(terminal.1.0["retryable"], false);
+
+        // The fail-closed receipt is terminal and replays without
+        // re-executing the handler.
+        let (replayed_status, Json(replayed)) = call(state.clone(), headers.clone())
+            .await
+            .expect("the fail-closed receipt is terminal and replays");
+        assert_eq!((replayed_status, replayed), (terminal.0, terminal.1.0));
+
+        let versions: Vec<i64> = sqlx::query_scalar(
+            "SELECT version FROM org_keyrings WHERE org_id = $1 ORDER BY version",
+        )
+        .bind(org_id)
+        .fetch_all(&pool)
+        .await
+        .expect("read keyring versions after unrelated failure");
+        assert_eq!(versions, vec![1]);
+        let rotate_audits: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM audit_log
+              WHERE org_id = $1 AND action = 'org.keyring.owner.rotate'",
+        )
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count rotation audits after unrelated failure");
+        assert_eq!(rotate_audits, 0);
+
+        crate::test_support::drop_isolated_database("cap_keyring_pending_unrelated", pool).await;
     }
 }
 
