@@ -1682,6 +1682,15 @@ async fn complete_app_delete_result(
             if teardown_locked && deferred_status == StatusCode::CONFLICT {
                 deferred_body["cause"] = serde_json::json!("app_delete_teardown_locked");
             }
+            // Surface the teardown disposition (restored vs kept deleting)
+            // on the deferral too: hosted callers retry through the deferral
+            // and would otherwise never see why the attempt failed — the
+            // original 5xx body is dropped by the deferral shape.
+            if *status == StatusCode::BAD_GATEWAY
+                && let Some(reason) = body.get("reason")
+            {
+                deferred_body["reason"] = reason.clone();
+            }
             return Err((deferred_status, Json(deferred_body)));
         }
     }
@@ -8695,6 +8704,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn app_delete_deferral_carries_teardown_disposition() {
+        let (state, auth, app_name, _) = app_delete_fixture().await;
+        let key = format!("disposition-delete-{}", Uuid::new_v4());
+        let headers = idempotency_headers(&key);
+        let path = format!("/internal/paas/orgs/{}/apps/{app_name}", auth.org_id);
+        let body = serde_json::json!({});
+        let lease = expect_idempotency_execution(
+            begin_app_delete_request(&state, &headers, &path, &auth, &body, &app_name)
+                .await
+                .unwrap(),
+        );
+        let mut failure = json_error(StatusCode::BAD_GATEWAY, "app_delete_teardown_unavailable");
+        failure.1.0["reason"] = serde_json::json!("app_kept_deleting");
+        let deferred = complete_app_delete_result(lease, Err(failure))
+            .await
+            .unwrap_err();
+        assert_eq!(deferred.0, StatusCode::CONFLICT);
+        assert_eq!(
+            deferred.1.0["error"], "idempotency_request_in_progress",
+            "the deferral shape stays intact"
+        );
+        assert_eq!(
+            deferred.1.0["reason"], "app_kept_deleting",
+            "the teardown disposition must ride the deferral for hosted callers"
+        );
+    }
+
+    #[tokio::test]
     async fn app_delete_terminal_failure_recovery_preserves_success_and_incarnation() {
         let (state, auth, app_name, app_id) = app_delete_fixture().await;
         let path = format!("/internal/paas/orgs/{}/apps/{app_name}", auth.org_id);
@@ -9203,9 +9240,16 @@ mod tests {
         )
         .await
         .unwrap_err();
+        assert_eq!(failed.0, StatusCode::CONFLICT);
         assert_eq!(
-            (failed.0, failed.1.0),
-            (StatusCode::CONFLICT, idempotency_in_progress_error().1.0)
+            failed.1.0["error"], "idempotency_request_in_progress",
+            "the deferral shape stays intact: {:?}",
+            failed.1.0
+        );
+        assert!(
+            failed.1.0.get("reason").is_none(),
+            "non-teardown 502 deferrals carry no disposition: {:?}",
+            failed.1.0
         );
         let state_after_failure: (String, bool, bool, i64) = sqlx::query_as(
             "SELECT status::text,
@@ -9469,9 +9513,15 @@ mod tests {
         )
         .await
         .unwrap_err();
+        assert_eq!(failed.0, StatusCode::CONFLICT);
         assert_eq!(
-            (failed.0, failed.1.0),
-            (StatusCode::CONFLICT, idempotency_in_progress_error().1.0)
+            failed.1.0["error"], "idempotency_request_in_progress",
+            "the deferral shape stays intact: {:?}",
+            failed.1.0
+        );
+        assert_eq!(
+            failed.1.0["reason"], "app_restored",
+            "this attempt restored the app; the deferral must say so"
         );
         let after_first: (String, bool, bool, bool) = sqlx::query_as(
             "SELECT status::text, workload_teardown_required,
