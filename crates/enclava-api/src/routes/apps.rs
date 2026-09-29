@@ -346,20 +346,24 @@ pub(crate) async fn post_workload_teardown(
 
     if response.status().is_success() {
         // The wrap is erased on the TEE at this point. The marker is what lets
-        // a later-step retry skip the proxy's non-idempotent teardown re-POST,
-        // so ride out transient pool/database blips with a few bounded
-        // attempts. If it still fails, failing the delete here would guarantee
-        // that wedge on the retry, so log and proceed: the wrap is erased and
-        // the marker only matters if a later step fails and a retry runs.
+        // a later-step retry skip re-POSTing teardown, so ride out transient
+        // pool/database blips with a few bounded attempts. If it still fails,
+        // proceeding is the lesser evil: the wrap is erased, the marker only
+        // matters if a later step fails and a retry runs, and that retry's
+        // re-POST converges once the in-guest teardown treats an
+        // already-erased resource as success (attestation-proxy #11). Until
+        // that ships, a lost marker plus a later-step failure can still wedge
+        // the retry at the non-idempotent endpoint; the bounded-recovery
+        // delete (cap #194 recovery half) is the backstop for that corner.
         let mut marker_persisted = false;
-        for attempt in 0..3u32 {
+        for attempt in 0..5u32 {
             match persist_workload_teardown_completed(&state.db, app.id).await {
                 Ok(()) => {
                     marker_persisted = true;
                     break;
                 }
-                Err(_) if attempt < 2 => {
-                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                Err(_) if attempt < 4 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 }
                 Err(_) => break,
             }

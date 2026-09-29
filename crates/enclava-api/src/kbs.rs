@@ -526,8 +526,9 @@ async fn signed_policy_mode_active(db: &PgPool) -> Result<bool, KbsPolicyError> 
 /// its exact source artifact required.  The active operation is authoritative
 /// even while the app row still projects the preceding failed/stopped state.
 /// Failed, unsigned, or deleting latest operations contribute no authorization,
-/// except that a deleting app with confidential teardown still pending keeps its
-/// current authorization until the teardown completes.
+/// except that a deleting app with confidential teardown still pending keeps the
+/// authorization of every operation it may still be running until the teardown
+/// completes.
 async fn load_signed_policy_candidates(
     db: &PgPool,
     retention: i64,
@@ -560,18 +561,27 @@ async fn load_signed_policy_candidates(
         eligible_current_job_operations AS (
             SELECT *
               FROM ranked_job_operations
-             WHERE current_operation_rank = 1
-               -- A deleting app with confidential teardown still pending keeps
-               -- its authorization: the teardown's KBS resource deletes are
-               -- policy-governed, so stripping it here can permanently wedge
-               -- the delete it is waiting on.
-               AND (
-                    app_status <> 'deleting'
-                    OR (workload_teardown_required
-                        AND workload_teardown_completed_at IS NULL)
+             WHERE (
+                    (
+                        current_operation_rank = 1
+                        AND app_status <> 'deleting'
+                        AND deployment_status IN ('pending', 'applying', 'watching', 'healthy')
+                        AND job_state IN ('setup_pending', 'setting_up', 'pending', 'running', 'completed')
+                    )
+                    OR (
+                        -- Deleting with confidential teardown still pending:
+                        -- every operation the workload may still be running
+                        -- under stays authorized until the teardown completes.
+                        -- The delete supersedes unfinished operations
+                        -- (marking them failed), so a rank-1-only selection
+                        -- would drop the running workload's artifact and
+                        -- permanently fail the teardown's policy-governed KBS
+                        -- deletes.
+                        app_status = 'deleting'
+                        AND workload_teardown_required
+                        AND workload_teardown_completed_at IS NULL
+                    )
                )
-               AND deployment_status IN ('pending', 'applying', 'watching', 'healthy')
-               AND job_state IN ('setup_pending', 'setting_up', 'pending', 'running', 'completed')
                AND artifact_deployment_id IS NOT NULL
                AND artifact_descriptor_core_hash IS NOT NULL
                AND EXISTS (
@@ -601,8 +611,15 @@ async fn load_signed_policy_candidates(
             JOIN deployments AS historical_deployment
               ON historical_deployment.id = historical.deployment_id
              AND historical_deployment.app_id = historical.app_id
-             AND historical_deployment.status::text
-                 IN ('pending', 'applying', 'watching', 'healthy')
+             AND (
+                  historical_deployment.status::text
+                      IN ('pending', 'applying', 'watching', 'healthy')
+                  OR (
+                      current.app_status = 'deleting'
+                      AND current.workload_teardown_required
+                      AND current.workload_teardown_completed_at IS NULL
+                  )
+             )
             JOIN workload_artifacts AS artifact
               ON artifact.app_id = historical.app_id
              AND artifact.deploy_id = historical.artifact_deployment_id
@@ -3288,5 +3305,122 @@ resource_bindings := {
                 .await
                 .expect("delete teardown-pending fixture organization");
         }
+    }
+
+    #[tokio::test]
+    async fn teardown_pending_authorization_survives_deployment_supersession() {
+        let pool = database_test_pool().await;
+        let now = Utc::now();
+        let (org_id, app_id) = insert_test_app(&pool, "deleting").await;
+        sqlx::query("UPDATE apps SET workload_teardown_required = true WHERE id = $1")
+            .bind(app_id)
+            .execute(&pool)
+            .await
+            .expect("mark workload teardown pending");
+
+        // The still-running workload's signed deployment.
+        let healthy = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, healthy, "healthy", now).await;
+        let healthy_artifact = insert_test_artifact(&pool, app_id, healthy, "ab").await;
+        insert_test_job(
+            &pool,
+            org_id,
+            app_id,
+            healthy,
+            healthy,
+            Some((healthy, &healthy_artifact)),
+        )
+        .await;
+
+        // A newer upgrade that never finished applying. The three rows share
+        // one transaction: a nonterminal deployment requires its apply job at
+        // INSERT time (schema trigger), while the job's artifact binding and
+        // the artifact's deployment reference are deferred FKs.
+        let pending = Uuid::new_v4();
+        let mut pending_artifact = test_signed_policy_artifact("cd", 16);
+        pending_artifact.metadata.app_id = app_id.to_string();
+        pending_artifact.metadata.deploy_id = pending.to_string();
+        let pending_hash = hex::decode(&pending_artifact.metadata.descriptor_core_hash).unwrap();
+        let mut fx = pool.begin().await.unwrap();
+        sqlx::query(
+            "INSERT INTO deployment_apply_jobs (
+                 deployment_id, app_id, org_id, source_deployment_id,
+                 payload_version, payload, payload_sha256,
+                 cleanup_app_on_setup_failure, signed_required,
+                 artifact_deployment_id, artifact_descriptor_core_hash,
+                 log_encryption, state
+             ) VALUES ($1, $2, $3, $4, 1,
+                       '{\"version\":1,\"log_encryption\":null}'::jsonb,
+                       $5, true, true, $4, $6, NULL, 'pending')",
+        )
+        .bind(pending)
+        .bind(app_id)
+        .bind(org_id)
+        .bind(pending)
+        .bind(vec![4u8; 32])
+        .bind(&pending_hash)
+        .execute(&mut *fx)
+        .await
+        .expect("insert pending apply job");
+        sqlx::query(
+            "INSERT INTO workload_artifacts (
+                 descriptor_core_hash, app_id, deploy_id, descriptor_payload,
+                 descriptor_signature, descriptor_signing_key_id,
+                 org_keyring_payload, org_keyring_signature,
+                 signed_policy_artifact
+             ) VALUES ($1, $2, $3, '{}'::jsonb, $4, 'test-key',
+                       '{}'::jsonb, $5, $6)",
+        )
+        .bind(&pending_hash)
+        .bind(app_id)
+        .bind(pending)
+        .bind(vec![1u8; 64])
+        .bind(vec![2u8; 64])
+        .bind(serde_json::to_value(&pending_artifact).unwrap())
+        .execute(&mut *fx)
+        .await
+        .expect("insert pending apply artifact");
+        sqlx::query(
+            "INSERT INTO deployments (id, org_id, app_id, status, spec_snapshot, created_at)
+             VALUES ($1, $2, $3, 'pending'::deploy_status_enum, '{}'::jsonb, $4)",
+        )
+        .bind(pending)
+        .bind(org_id)
+        .bind(app_id)
+        .bind(now + chrono::Duration::seconds(1))
+        .execute(&mut *fx)
+        .await
+        .expect("insert pending deployment");
+        fx.commit().await.unwrap();
+
+        // The delete supersedes the unfinished operation before teardown runs:
+        // its job and deployment rows are marked failed.
+        let mut tx = pool.begin().await.unwrap();
+        crate::deploy::supersede_incomplete_deployments(&mut tx, app_id)
+            .await
+            .expect("supersede incomplete deployments");
+        tx.commit().await.unwrap();
+
+        let candidates = load_signed_policy_candidates(&pool, 2)
+            .await
+            .expect("select teardown-pending authority after supersession");
+        let hashes: HashSet<_> = candidates
+            .iter()
+            .map(|candidate| candidate.artifact.metadata.descriptor_core_hash.as_str())
+            .collect();
+        assert!(
+            hashes.contains(healthy_artifact.metadata.descriptor_core_hash.as_str()),
+            "the still-running workload's artifact must stay authorized through teardown"
+        );
+        assert!(
+            hashes.contains(pending_artifact.metadata.descriptor_core_hash.as_str()),
+            "a superseded-but-maybe-applied operation's artifact must stay authorized through teardown"
+        );
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete supersession fixture organization");
     }
 }
