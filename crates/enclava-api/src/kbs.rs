@@ -526,8 +526,9 @@ async fn signed_policy_mode_active(db: &PgPool) -> Result<bool, KbsPolicyError> 
 /// its exact source artifact required.  The active operation is authoritative
 /// even while the app row still projects the preceding failed/stopped state.
 /// Failed, unsigned, or deleting latest operations contribute no authorization,
-/// except that a deleting app with confidential teardown still pending keeps the
-/// authorization of every operation it may still be running until the teardown
+/// except that a deleting app with confidential teardown still pending keeps
+/// the authorization of the operations its workload may still be running
+/// under — bounded to the two most recent generations — until the teardown
 /// completes.
 async fn load_signed_policy_candidates(
     db: &PgPool,
@@ -570,16 +571,25 @@ async fn load_signed_policy_candidates(
                     )
                     OR (
                         -- Deleting with confidential teardown still pending:
-                        -- every operation the workload may still be running
-                        -- under stays authorized until the teardown completes.
+                        -- the operations the workload may still be running
+                        -- under stay authorized until the teardown completes.
                         -- The delete supersedes unfinished operations
                         -- (marking them failed), so a rank-1-only selection
                         -- would drop the running workload's artifact and
                         -- permanently fail the teardown's policy-governed KBS
-                        -- deletes.
+                        -- deletes. The mutation lease serializes deployments,
+                        -- so at most one operation can be in flight besides the
+                        -- still-watching live one: the two most recent
+                        -- generations cover every operation the workload may
+                        -- still be running under. The bound also keeps the
+                        -- shared signed-policy byte budget safe — every
+                        -- admitted operation contributes a required artifact,
+                        -- and admitting the whole history could exceed the
+                        -- budget and fail publication for every tenant.
                         app_status = 'deleting'
                         AND workload_teardown_required
                         AND workload_teardown_completed_at IS NULL
+                        AND current_operation_rank <= 2
                     )
                )
                AND artifact_deployment_id IS NOT NULL
@@ -608,6 +618,22 @@ async fn load_signed_policy_candidates(
             FROM eligible_current_job_operations AS current
             JOIN deployment_apply_jobs AS historical
               ON historical.app_id = current.app_id
+             AND (
+                  -- A deleting app contributes no optional (rollback/
+                  -- retention) artifacts — there is no rollback from a
+                  -- delete. Restricting the historical side to the current
+                  -- row's own artifact keeps its candidate set bounded to
+                  -- the admitted operations instead of cross-joining every
+                  -- historical artifact, and keeps `required` deterministic
+                  -- per artifact (every admitted row is its own current row).
+                  current.app_status <> 'deleting'
+                  OR (
+                      historical.artifact_deployment_id
+                          = current.artifact_deployment_id
+                      AND historical.artifact_descriptor_core_hash
+                          = current.artifact_descriptor_core_hash
+                  )
+             )
             JOIN deployments AS historical_deployment
               ON historical_deployment.id = historical.deployment_id
              AND historical_deployment.app_id = historical.app_id
@@ -628,6 +654,11 @@ async fn load_signed_policy_candidates(
             ORDER BY
                 current.app_id,
                 artifact.descriptor_core_hash,
+                -- Prefer a required row when an artifact reaches this point
+                -- with both required and optional bindings: DISTINCT ON must
+                -- not let an optional row displace the running workload's
+                -- authorization.
+                required DESC,
                 historical.generation DESC
         ),
         ranked_job_artifacts AS (
@@ -3318,6 +3349,24 @@ resource_bindings := {
             .await
             .expect("mark workload teardown pending");
 
+        // A long-dead historical operation (failed two generations back).
+        // Its artifact must NOT re-enter the policy: nothing can still be
+        // running under it, and re-admitting it would balloon the shared
+        // signed-policy budget. Inserted first so its apply job gets the
+        // lowest generation.
+        let dead = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, dead, "failed", now).await;
+        let dead_artifact = insert_test_artifact(&pool, app_id, dead, "ef").await;
+        insert_test_job(
+            &pool,
+            org_id,
+            app_id,
+            dead,
+            dead,
+            Some((dead, &dead_artifact)),
+        )
+        .await;
+
         // The still-running workload's signed deployment.
         let healthy = Uuid::new_v4();
         insert_test_deployment(&pool, org_id, app_id, healthy, "healthy", now).await;
@@ -3415,6 +3464,10 @@ resource_bindings := {
         assert!(
             hashes.contains(pending_artifact.metadata.descriptor_core_hash.as_str()),
             "a superseded-but-maybe-applied operation's artifact must stay authorized through teardown"
+        );
+        assert!(
+            !hashes.contains(dead_artifact.metadata.descriptor_core_hash.as_str()),
+            "a long-dead historical operation's artifact must not re-enter the policy"
         );
 
         sqlx::query("DELETE FROM organizations WHERE id = $1")
