@@ -9341,6 +9341,22 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(final_rows, (0, 1));
+        // Legacy-install guard (fresh schema: no signed acceptance ever ran,
+        // so signed-policy mode was never active). The post-delete
+        // reconciliation must not activate signed mode here — publishing an
+        // empty artifact set would strip every other app's Rego-authorized
+        // KBS access on an unsigned installation.
+        let signed_generation: Option<i64> = sqlx::query_scalar(
+            "SELECT desired_generation FROM kbs_signed_policy_reconciliation WHERE singleton",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(
+            signed_generation,
+            Some(0),
+            "a delete must never activate signed-policy mode on a legacy install"
+        );
     }
 
     /// Route-level pin of the durable teardown decision and completion marker

@@ -1994,24 +1994,32 @@ pub(crate) async fn delete_app_before(
     // nothing would re-run publication and the stale Trustee policy would
     // keep authorizing the deleted workload until some unrelated
     // reconciliation. Enqueue and best-effort run one now — the app is gone,
-    // so the next candidate selection drops it. A failure only delays the
-    // revocation (the enqueue is durable and the global reconciler
-    // converges); the deletion itself is complete.
+    // so the next candidate selection drops it — but only when CAP has
+    // already entered signed-policy mode: a delete must never *activate*
+    // signed mode on a legacy Rego installation (generation 0, no signed
+    // artifacts), where publication would replace the Rego policy still
+    // authorizing other apps with an empty artifact set. A failure of the
+    // immediate run only delays the revocation (the enqueue is durable and
+    // the global reconciler converges); the deletion itself is complete.
     let mut post_delete_tx = state
         .db
         .begin()
         .await
         .map_err(|_| internal_server_error())?;
-    crate::kbs::enqueue_signed_policy_reconciliation(&mut post_delete_tx)
-        .await
-        .map_err(|_| internal_server_error())?;
+    let post_delete_reconcile =
+        crate::kbs::enqueue_signed_policy_revocation_if_active(&mut post_delete_tx)
+            .await
+            .map_err(|_| internal_server_error())?;
     post_delete_tx
         .commit()
         .await
         .map_err(|_| internal_server_error())?;
-    if let Err(_error) =
-        crate::kbs::reconcile_pending_signed_policy_artifacts(&state.db, state.kbs_policy.as_ref())
-            .await
+    if post_delete_reconcile.is_some()
+        && let Err(_error) = crate::kbs::reconcile_pending_signed_policy_artifacts(
+            &state.db,
+            state.kbs_policy.as_ref(),
+        )
+        .await
     {
         tracing::warn!(
             app_id = %deleting_app.id,
