@@ -761,21 +761,9 @@ async fn signer_rotation_token_rejects_api_key_before_database_access() {
     assert_eq!(err.0, StatusCode::FORBIDDEN);
 }
 
-async fn database_test_pool() -> sqlx::PgPool {
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
-    let pool = sqlx::PgPool::connect(&database_url)
-        .await
-        .expect("connect app-delete test database");
-    crate::db::pool::run_migrations(&pool)
-        .await
-        .expect("migrate app-delete test database");
-    pool
-}
-
 #[tokio::test]
 async fn abandon_teardown_proceeds_past_unreachable_workload() {
-    let pool = database_test_pool().await;
+    let pool = crate::test_support::database_test_pool().await;
     let auth = crate::test_support::auth_context(Role::Admin, &["apps:write"]);
     // Pre-flight: a previously failed run may have leaked this test-owned
     // organization and its (fixed-domain) fences into finite reclaim
@@ -1010,14 +998,7 @@ async fn abandon_teardown_proceeds_past_unreachable_workload() {
 
 #[tokio::test]
 async fn teardown_failure_after_supersede_keeps_deleting() {
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
-    let pool = sqlx::PgPool::connect(&database_url)
-        .await
-        .expect("connect delete-atomicity test database");
-    crate::db::pool::run_migrations(&pool)
-        .await
-        .expect("migrate delete-atomicity test database");
+    let pool = crate::test_support::database_test_pool().await;
     let auth = crate::test_support::auth_context(Role::Admin, &["apps:write"]);
     let org_id = auth.org_id;
     let suffix = uuid::Uuid::new_v4().simple().to_string();

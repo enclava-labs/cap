@@ -837,6 +837,12 @@ pub(crate) async fn prepare_app_candidate(
                 Json(serde_json::json!({"error": error})),
             )
         })?;
+    // Every create path derives the KBS owner binding key from the tenant
+    // namespace and app name, so it is identical across incarnations of the
+    // same name: refuse the create here (the shared chokepoint) when the
+    // previous incarnation was destroyed without completing its confidential
+    // teardown.
+    refuse_stale_owner_seed(state, &namespace, &body.name).await?;
     let app_host =
         enclava_common::hostnames::app_hostname(&body.name, &org.cust_slug, &state.platform_domain)
             .map_err(|error| {
@@ -900,6 +906,30 @@ pub(crate) async fn prepare_app_candidate(
 }
 
 /// POST /apps -- create a new app.
+/// Refuse a create whose binding key carries a recorded teardown waiver: the
+/// previous incarnation of this name was destroyed while its owner seed may
+/// still exist in KBS, and a fresh workload would boot already-claimed.
+/// Shared by every create path (public, generic-deployment, hosted).
+pub(crate) async fn refuse_stale_owner_seed(
+    state: &AppState,
+    namespace: &str,
+    name: &str,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let stale_owner_seed = crate::kbs::stale_owner_seed_for_binding(&state.db, namespace, name)
+        .await
+        .map_err(|_| internal_server_error())?;
+    if stale_owner_seed {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "stale_owner_seed",
+                "message": "the previous incarnation of this app name was destroyed without completing its confidential teardown; its owner seed may still exist in KBS and a new workload would boot already-claimed. Have the operator erase the stale seed (KBS repository removal per the destroy runbook) or choose a different name.",
+            })),
+        ));
+    }
+    Ok(())
+}
+
 pub async fn create_app(
     auth: AuthContext,
     State(state): State<AppState>,
@@ -909,22 +939,6 @@ pub async fn create_app(
     ensure_management_write_allowed(&state, &auth).await?;
 
     let app_candidate = prepare_app_candidate(&state, &auth, &body).await?;
-    let stale_owner_seed = crate::kbs::stale_owner_seed_for_binding(
-        &state.db,
-        &app_candidate.namespace,
-        &app_candidate.name,
-    )
-    .await
-    .map_err(|_| internal_server_error())?;
-    if stale_owner_seed {
-        return Err((
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": "stale_owner_seed",
-                "message": "the previous incarnation of this app name was destroyed without completing its confidential teardown; its owner seed may still exist in KBS. Erase it or choose a different name.",
-            })),
-        ));
-    }
     let app_id = app_candidate.id;
     let resources = crate::models::AppResources {
         app_id,
