@@ -914,26 +914,6 @@ pub async fn confirm_keyring_kbs_publication(
     reconcile_signed_policy_once(state).await
 }
 
-/// Call BEFORE the mutation transaction: active signed-policy mode without
-/// provider configuration would let a committed rotation withdraw signers
-/// from the desired policy that nothing can publish -- the periodic
-/// reconciler also refuses to start without configuration -- so the
-/// rotation must fail closed before anything commits (PR #187 review).
-/// Mirrors [`confirm_keyring_kbs_publication`]'s fail-closed gap check,
-/// but pre-commit, so the caller reports a clean retryable error instead
-/// of a committed-but-unpublishable mutation.
-pub async fn ensure_kbs_publication_configured(
-    state: &crate::state::AppState,
-) -> Result<(), KbsPolicyReconciliationError> {
-    if !signed_policy_mode_active(&state.db).await? {
-        return Ok(());
-    }
-    if state.kbs_policy.is_none() {
-        return Err(KbsPolicyError::NotConfigured.into());
-    }
-    Ok(())
-}
-
 /// Converge KBS authority before readiness or deployment dispatch.
 ///
 /// Another starting replica may briefly own the global fence, so startup

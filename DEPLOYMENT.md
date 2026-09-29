@@ -272,15 +272,21 @@ without requiring keyring write permission or KBS availability.
 ## Signer Rotation Completion
 
 In signed-policy mode, missing KBS publication configuration rejects a signer
-rotation before changing the app or consuming its single-use token. Restore the
-configuration and retry the same request.
+rotation before changing the app or consuming its single-use token. This check
+runs under the app authority locks and serializes with signed-mode activation.
+Restore the configuration and retry the same request.
 
-After a rotation commits, a publication failure returns
-`signer_rotation_publication_pending`. Internal PaaS callers receive a `deferred`
+After a rotation commits, a public API publication failure returns HTTP `503`
+with `signer_rotation_publication_pending`. Internal PaaS callers receive a `deferred`
 disposition and must retry with the same idempotency key and request body. CAP
 retains the committed response and retries publication only; it does not consume
 the rotation token or apply the mutation again. Unrelated, uncertain failures
 remain fail-closed and require recovery rather than automatic mutation replay.
+
+A currently authorized org owner may confirm an already committed signer
+identity without a new rotation token. This only retries publication; it cannot
+change the signer or consume another token. A real identity transition still
+requires a fresh, bound, single-use token.
 
 A withdrawn legacy TLS binding stays withdrawn even if a newer artifact has the
 same image and init-data measurements. Those measurements do not bind the old

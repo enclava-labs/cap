@@ -914,7 +914,11 @@ fn test_kbs_policy_config() -> crate::kbs::KbsPolicyConfig {
 }
 
 /// Rotating back to the previous identity must not make its consumed token
-/// replayable or let a rejected replay change the published generation.
+/// replayable or let a rejected replay change the published generation. The
+/// token stays unusable for transitions (A -> B -> A -> B reuses no token),
+/// but presenting the consumed A -> B token while B is current is an
+/// owner-authorized read-only confirmation of the committed identity: it
+/// must not mutate authority, consume a jti, audit, withdraw, or republish.
 #[tokio::test]
 async fn signer_rotation_token_is_single_use_and_owes_a_deferred_withdrawal_bump() {
     let (_db_cleanup, pool) =
@@ -1145,11 +1149,11 @@ async fn signer_rotation_token_is_single_use_and_owes_a_deferred_withdrawal_bump
             let replay = rotate_signer(
                 clone_auth(&auth),
                 State(state.clone()),
-                Path(app_name),
+                Path(app_name.clone()),
                 Json(RotateSignerRequest {
                     subject: new_subject.to_string(),
                     issuer: new_issuer.to_string(),
-                    email_confirmation_token: Some(token),
+                    email_confirmation_token: Some(token.clone()),
                 }),
             )
             .await;
@@ -1183,6 +1187,163 @@ async fn signer_rotation_token_is_single_use_and_owes_a_deferred_withdrawal_bump
             .await
             .expect("count consumed jti rows after replay");
             assert_eq!(jti_rows, 2, "the rejected replay must not add a jti row");
+
+            // A consumed token cannot rotate A again, but it can confirm B
+            // after a different, fresh token has legitimately committed B.
+            let state_before_second_rotation =
+                read_withdrawal_reconciliation_state(&pool).await;
+            let jti_rows_before_second_rotation: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM consumed_signer_rotation_tokens WHERE app_id = $1",
+            )
+            .bind(app_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count consumed jti rows before the second genuine rotation");
+            let second_rotation_token = crate::auth::jwt::issue_signer_rotation_token(
+                &hmac_key,
+                &SignerRotationTokenInput {
+                    user_id,
+                    org_id,
+                    app_id,
+                    previous_subject: previous_subject.to_string(),
+                    previous_issuer: previous_issuer.to_string(),
+                    new_subject: new_subject.to_string(),
+                    new_issuer: new_issuer.to_string(),
+                },
+                chrono::Duration::seconds(600),
+            )
+            .expect("issue second genuine rotation token");
+            let Json(rotated_again) = rotate_signer(
+                clone_auth(&auth),
+                State(state.clone()),
+                Path(app_name.clone()),
+                Json(RotateSignerRequest {
+                    subject: new_subject.to_string(),
+                    issuer: new_issuer.to_string(),
+                    email_confirmation_token: Some(second_rotation_token),
+                }),
+            )
+            .await
+            .expect("genuine second A->B rotation must commit with a fresh bound token");
+            assert_eq!(
+                rotated_again.signer_identity_subject.as_deref(),
+                Some(new_subject)
+            );
+            let state_after_second_rotation =
+                read_withdrawal_reconciliation_state(&pool).await;
+            assert!(
+                state_after_second_rotation.0 > state_before_second_rotation.0,
+                "the genuine second rotation must advance the published generation"
+            );
+            assert_eq!(
+                (state_after_second_rotation.1, state_after_second_rotation.2),
+                (0, 0),
+                "the genuine second rotation must settle its withdrawal debt before success"
+            );
+            let jti_rows_after_second_rotation: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM consumed_signer_rotation_tokens WHERE app_id = $1",
+            )
+            .bind(app_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count consumed jti rows after the second genuine rotation");
+            assert_eq!(
+                jti_rows_after_second_rotation, jti_rows_before_second_rotation + 1,
+                "the genuine second rotation must consume its own fresh jti"
+            );
+
+            let state_before_confirmation =
+                read_withdrawal_reconciliation_state(&pool).await;
+            type ConfirmationSnapshot = (
+                Option<String>,
+                Option<String>,
+                Option<chrono::DateTime<chrono::Utc>>,
+                i64,
+                i64,
+                i64,
+            );
+            let confirmation_snapshot_sql =
+                "SELECT signer_identity_subject, signer_identity_issuer, signer_identity_set_at,
+                    (SELECT count(*) FROM consumed_signer_rotation_tokens WHERE app_id = $1),
+                    (SELECT count(*) FROM audit_log
+                      WHERE org_id = $2 AND action = 'app.signer.rotate'),
+                    (SELECT count(*) FROM withdrawn_signer_artifacts
+                      WHERE app_id = $1 AND descriptor_core_hash = $3)
+                 FROM apps WHERE id = $1";
+            let before_confirmation: ConfirmationSnapshot =
+                sqlx::query_as(confirmation_snapshot_sql)
+                    .bind(app_id)
+                    .bind(org_id)
+                    .bind(&descriptor_core_hash)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("read authority before confirmation");
+            {
+                let provider = provider.lock().await;
+                assert_eq!(
+                    provider.published_generation(),
+                    Some(state_after_second_rotation.0),
+                    "the genuine second rotation must leave its generation live before the confirmation"
+                );
+            }
+            let Json(confirmed) = rotate_signer(
+                clone_auth(&auth),
+                State(state.clone()),
+                Path(app_name.clone()),
+                Json(RotateSignerRequest {
+                    subject: new_subject.to_string(),
+                    issuer: new_issuer.to_string(),
+                    email_confirmation_token: Some(token),
+                }),
+            )
+            .await
+            .expect("consumed A->B token is an accepted read-only confirmation while B is current");
+            assert_eq!(
+                confirmed.signer_identity_subject.as_deref(),
+                Some(new_subject),
+                "the confirmation reports the committed identity"
+            );
+            let Json(confirmed_without_token) = rotate_signer(
+                clone_auth(&auth),
+                State(state.clone()),
+                Path(app_name.clone()),
+                Json(RotateSignerRequest {
+                    subject: new_subject.to_string(),
+                    issuer: new_issuer.to_string(),
+                    email_confirmation_token: None,
+                }),
+            )
+            .await
+            .expect("the current owner may confirm the committed identity without a token");
+            assert_eq!(
+                confirmed_without_token.signer_identity_subject.as_deref(),
+                Some(new_subject)
+            );
+            let after_confirmation: ConfirmationSnapshot =
+                sqlx::query_as(confirmation_snapshot_sql)
+                    .bind(app_id)
+                    .bind(org_id)
+                    .bind(&descriptor_core_hash)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("read authority after confirmation");
+            assert_eq!(
+                after_confirmation, before_confirmation,
+                "confirmation must preserve identity, commit time, tokens, audit, and withdrawals"
+            );
+            assert_eq!(
+                read_withdrawal_reconciliation_state(&pool).await,
+                state_before_confirmation,
+                "the confirmation must not bump or owe any generation"
+            );
+            {
+                let provider = provider.lock().await;
+                assert_eq!(
+                    provider.published_generation(),
+                    Some(state_before_confirmation.0),
+                    "the confirmation must leave the published generation untouched"
+                );
+            }
 
             crate::test_support::drop_isolated_database("cap119_rotation_single_use", pool).await;
         })
@@ -2267,4 +2428,174 @@ async fn signer_rotation_publication_failure_reports_pending_and_retry_confirms(
         .await;
 
     crate::test_support::drop_isolated_database("cap119_rotation_pending_retry", pool).await;
+}
+
+#[tokio::test]
+async fn signer_rotation_refuses_when_signed_mode_activates_while_it_waits_for_the_app_lane() {
+    let (_db_cleanup, pool) =
+        crate::test_support::isolated_database_test_pool("cap187_rotation_activation_race").await;
+    let previous_subject = "https://github.com/acme/old/.github/workflows/ci.yaml@refs/heads/main";
+    let previous_issuer = "https://token.actions.githubusercontent.com";
+    let new_subject = "https://github.com/acme/new/.github/workflows/ci.yaml@refs/heads/main";
+    let new_issuer = "https://new-issuer.example.test";
+    let (org_id, user_id, app_id) =
+        insert_signer_rotation_app(&pool, Some(previous_subject), Some(previous_issuer)).await;
+    let descriptor_core_hash = insert_signed_artifact_for_identity(
+        &pool,
+        org_id,
+        app_id,
+        previous_subject,
+        previous_issuer,
+    )
+    .await;
+    // Activation happens only after the rotation is blocked on the app lane.
+
+    let mut state = crate::test_support::lazy_state();
+    state.db = pool.clone();
+    let auth = AuthContext {
+        user_id,
+        org_id,
+        org_name: "rotation-activation-race".to_string(),
+        role: Role::Owner,
+        api_key: None,
+        management_origin: crate::auth::middleware::ManagementOrigin::Public,
+    };
+    let token = crate::auth::jwt::issue_signer_rotation_token(
+        &[7u8; 32],
+        &SignerRotationTokenInput {
+            user_id,
+            org_id,
+            app_id,
+            previous_subject: previous_subject.to_string(),
+            previous_issuer: previous_issuer.to_string(),
+            new_subject: new_subject.to_string(),
+            new_issuer: new_issuer.to_string(),
+        },
+        chrono::Duration::seconds(600),
+    )
+    .expect("issue rotation token for the activation race");
+    let app_name = sqlx::query_scalar::<_, String>("SELECT name FROM apps WHERE id = $1")
+        .bind(app_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load app name");
+
+    let mut lane = pool.begin().await.expect("begin app lane hold");
+    crate::deploy::lock_app_deployment_lane(&mut lane, app_id)
+        .await
+        .expect("hold app deployment lane");
+    let lane_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *lane)
+        .await
+        .expect("read lane holder pid");
+
+    let rotation = tokio::spawn(async move {
+        rotate_signer(
+            clone_auth(&auth),
+            State(state),
+            Path(app_name),
+            Json(RotateSignerRequest {
+                subject: new_subject.to_string(),
+                issuer: new_issuer.to_string(),
+                email_confirmation_token: Some(token),
+            }),
+        )
+        .await
+    });
+
+    // Observe the lock wait rather than assuming the rotation reached the lane.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let waiting: Option<i32> = sqlx::query_scalar(
+                "SELECT pid FROM pg_stat_activity
+                  WHERE wait_event_type = 'Lock'
+                    AND wait_event = 'advisory'
+                    AND $1 = ANY(pg_blocking_pids(pid))",
+            )
+            .bind(lane_pid)
+            .fetch_optional(&pool)
+            .await
+            .expect("poll for the rotation blocked on the app lane");
+            if waiting.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the rotation must block on the held app deployment lane");
+
+    let mut activation = pool.begin().await.expect("begin signed-mode activation");
+    sqlx::query(
+        "UPDATE kbs_signed_policy_reconciliation
+            SET desired_generation = 1
+          WHERE singleton",
+    )
+    .execute(&mut *activation)
+    .await
+    .expect("activate signed-policy mode");
+    activation.commit().await.expect("commit activation");
+    lane.commit().await.expect("release app deployment lane");
+
+    let refused = tokio::time::timeout(Duration::from_secs(5), rotation)
+        .await
+        .expect("the rotation settles once the lane opens")
+        .expect("rotation task panics propagate");
+    let err = match refused {
+        Ok(_) => {
+            panic!("an unconfigured rotation must refuse once signed mode activated mid-flight")
+        }
+        Err(err) => err,
+    };
+    assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        err.1.0["code"], "kbs_publication_not_configured",
+        "the refusal must be the retryable pre-commit gate, not a committed-but-pending report"
+    );
+
+    let (signer_subject, signer_issuer): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT signer_identity_subject, signer_identity_issuer FROM apps WHERE id = $1",
+    )
+    .bind(app_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load signer identity after the refusal");
+    assert_eq!(signer_subject.as_deref(), Some(previous_subject));
+    assert_eq!(signer_issuer.as_deref(), Some(previous_issuer));
+    let jti_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM consumed_signer_rotation_tokens WHERE app_id = $1",
+    )
+    .bind(app_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count consumed jti rows after the refusal");
+    assert_eq!(jti_rows, 0, "the refusal must leave the token unconsumed");
+    let audit_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_log WHERE org_id = $1 AND action = 'app.signer.rotate'",
+    )
+    .bind(org_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count rotation audit rows after the refusal");
+    assert_eq!(
+        audit_rows, 0,
+        "the refusal must not write a rotation audit row"
+    );
+    let withdrawn: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM withdrawn_signer_artifacts
+          WHERE descriptor_core_hash = $1 AND app_id = $2",
+    )
+    .bind(&descriptor_core_hash)
+    .bind(app_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count withdrawn artifacts after the refusal");
+    assert_eq!(withdrawn, 0, "the refusal must not withdraw the old signer");
+    assert_eq!(
+        read_withdrawal_reconciliation_state(&pool).await,
+        (1, 0, 0),
+        "only the activation may have touched the reconciliation singleton: no withdrawal debt"
+    );
+
+    crate::test_support::drop_isolated_database("cap187_rotation_activation_race", pool).await;
 }
