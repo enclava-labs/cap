@@ -2582,22 +2582,22 @@ pub async fn destroy(args: DestroyArgs) -> Result<(), Box<dyn std::error::Error>
     spinner.enable_steady_tick(Duration::from_millis(100));
 
     let result = api.delete_app(&app_name).await;
-    // Teardown failures leave the app in 'deleting' and are retryable once the
-    // workload is reachable again; without this hint the raw API code is the
-    // only signal an operator gets. A hosted delete surfaces the locked
-    // teardown only as the deferral cause on a generic in-progress error, so
-    // the message carries it too.
+    // Teardown failures restore the app to its pre-delete state (the delete is
+    // atomic) and are retryable once the workload is reachable again; without
+    // this hint the raw API code is the only signal an operator gets. A hosted
+    // delete surfaces the locked teardown only as the deferral cause on a
+    // generic in-progress error, so the message carries it too.
     if let Err(ApiError::Api { code, message, .. }) = &result {
         let teardown_cause = code.as_deref() == Some("app_delete_teardown_locked")
             || message.contains("app_delete_teardown_locked");
         let hint = if teardown_cause {
             Some(format!(
-                "the confidential workload is locked; unlock it with its storage password (`enclava unlock --app {app_name}`), then retry destroy"
+                "the confidential workload is locked and the app remains intact; unlock it with its storage password (`enclava unlock --app {app_name}`), then retry destroy"
             ))
         } else {
             match code.as_deref() {
                 Some("app_delete_teardown_unavailable") => Some(
-                    "the confidential workload teardown did not complete; the app stays in 'deleting' -- wait for the workload to become reachable and retry destroy, or contact the operator if it keeps failing".to_string(),
+                    "the confidential workload teardown did not complete and the app was restored to its previous state -- retry destroy when the workload becomes reachable, or contact the operator if it keeps failing".to_string(),
                 ),
                 _ => None,
             }

@@ -9269,8 +9269,9 @@ mod tests {
 
     /// Route-level pin of the durable teardown decision and completion marker
     /// (the #109 retry contract): a running app requires teardown, an
-    /// unreachable TEE blocks the first attempt before any other cleanup, and
-    /// once the completion marker exists the retry finishes with the TEE gone.
+    /// unreachable TEE fails the first attempt atomically (the app is restored
+    /// before any other cleanup), and once the completion marker exists the
+    /// retry finishes with the TEE gone.
     #[tokio::test]
     async fn app_delete_retry_finishes_after_teardown_completion_marker() {
         const CHILD: &str = "CAP_APP_DELETE_TEST_TEARDOWN_CHILD";
@@ -9484,8 +9485,8 @@ mod tests {
         .unwrap();
         assert_eq!(
             after_first,
-            ("deleting".into(), true, false, true),
-            "unreachable teardown must block the delete before KBS revocation"
+            ("running".into(), true, false, true),
+            "unreachable teardown must fail atomically: restored and untouched before KBS revocation"
         );
         // The failed teardown must release the shared fences immediately: an
         // abandoned lease would hold cluster-wide edge_config and kbs_policy
