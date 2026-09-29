@@ -1013,19 +1013,26 @@ async fn derive_rotation_path(
                 })),
             ));
         }
-        let previous: Option<(Vec<u8>, Vec<u8>)> = sqlx::query_as(
-            "SELECT ok.keyring_payload, usk.pubkey
+        // checked_sub/checked_add (PR #185 review, Devin "maximum keyring
+        // version overflows rotation"): the version space has an i64
+        // ceiling, and unclipped arithmetic here panicked on overflow
+        // instead of returning a version error.
+        let previous: Option<(Vec<u8>, Vec<u8>)> = match body_version.checked_sub(1) {
+            Some(previous_version) => sqlx::query_as(
+                "SELECT ok.keyring_payload, usk.pubkey
                FROM org_keyrings ok
                JOIN user_signing_keys usk ON usk.id = ok.signing_key_id
               WHERE ok.org_id = $1 AND ok.version = $2",
-        )
-        .bind(org_id)
-        .bind(body_version - 1)
-        .fetch_optional(&mut **tx)
-        .await
-        .map_err(|_| db_error())?;
+            )
+            .bind(org_id)
+            .bind(previous_version)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|_| db_error())?,
+            None => None,
+        };
         Ok(previous.map(|(payload, owner)| (payload, owner, false)))
-    } else if body_version == latest.0 + 1 {
+    } else if Some(body_version) == latest.0.checked_add(1) {
         Ok(Some((latest.1, latest.3, true)))
     } else if body_version < latest.0 {
         Err((
@@ -1231,16 +1238,24 @@ async fn expired_rotation_waived_by_receipt(
 }
 
 /// Validate the rotation successor against the base version's keyring and
-/// confirm the replacement key is still registered. Registration is
-/// re-checked in the final phase because revocation can happen between
-/// phases.
+/// locate the registered signing key row for the replacement owner;
+/// registration is re-checked in the final phase because revocation can
+/// happen between phases. `registration_user` is `Some(caller)` for first
+/// presentations -- the replacement key must be registered to the
+/// requesting user (anti-spoofing: a caller cannot pin the org to a key
+/// they do not own) -- and `None` when the signing service already holds
+/// the replacement owner (recovery of an already-executed rotation), where
+/// the key needs only be registered to some user: upstream ownership is
+/// the stronger fact, and binding to the retry's caller is what left
+/// drifted orgs unrecoverable by a remaining owner (PR #185 review, Codex
+/// "keep caller authorization stable").
 async fn validate_rotation_successor(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     base_payload: &[u8],
     replacement_keyring: &SignedOrgKeyring,
     current_owner: &[u8; 32],
     replacement_owner: &[u8; 32],
-    user_id: Uuid,
+    registration_user: Option<Uuid>,
 ) -> Result<Uuid, (StatusCode, Json<serde_json::Value>)> {
     let current_keyring: SignedOrgKeyring =
         serde_json::from_slice(base_payload).map_err(|_| db_error())?;
@@ -1260,16 +1275,26 @@ async fn validate_rotation_successor(
         replacement_owner,
     )
     .map_err(bad_request)?;
-    sqlx::query_scalar(
-        "SELECT id FROM user_signing_keys
-          WHERE user_id = $1 AND pubkey = $2 AND revoked_at IS NULL",
-    )
-    .bind(user_id)
-    .bind(replacement_owner.as_slice())
-    .fetch_optional(&mut **tx)
-    .await
-    .map_err(|_| db_error())?
-    .ok_or_else(|| bad_request("replacement owner key is not registered for this user"))
+    let key_id: Option<Uuid> = match registration_user {
+        Some(user_id) => sqlx::query_scalar(
+            "SELECT id FROM user_signing_keys
+                  WHERE user_id = $1 AND pubkey = $2 AND revoked_at IS NULL",
+        )
+        .bind(user_id)
+        .bind(replacement_owner.as_slice())
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|_| db_error())?,
+        None => sqlx::query_scalar(
+            "SELECT id FROM user_signing_keys
+                  WHERE pubkey = $1 AND revoked_at IS NULL",
+        )
+        .bind(replacement_owner.as_slice())
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|_| db_error())?,
+    };
+    key_id.ok_or_else(|| bad_request("replacement owner key is not registered for this user"))
 }
 
 // Release the org lane before calling: publication takes the global KBS fence.
@@ -1522,7 +1547,10 @@ pub async fn rotate_org_owner(
         &replacement_keyring,
         &current_owner,
         &replacement_owner,
-        auth.user_id,
+        // Strict caller-key binding for first presentations; relaxed once
+        // the signing service already holds the replacement owner
+        // (recovery of an already-executed rotation -- see the fn doc).
+        (service_owner.as_deref() != Some(replacement_owner.as_slice())).then_some(auth.user_id),
     )
     .await?;
 
@@ -1640,19 +1668,26 @@ pub async fn rotate_org_owner(
 
     // Phase 2: final lane transaction. The lane was released after the
     // receipt-only commit, so competing keyring changes may have landed;
-    // membership, keyring, service owner, and freshness are re-read and
-    // re-derived here. This phase never issues an upstream RPC (at most
-    // one per request, spent or deliberately skipped in phase 1): the
-    // service must already hold the replacement owner before any CAP
-    // write, so the stored keyring authority and the service stay pinned
-    // to the same owner.
+    // authorization was consumed in phase 1; keyring, service owner,
+    // and freshness are re-read and re-derived here. This phase never
+    // issues an upstream RPC (at most one per request, spent or deliberately
+    // skipped in phase 1): the service must already hold the replacement
+    // owner before any CAP write, so the stored keyring authority and the
+    // service stay pinned to the same owner.
+    //
+    // The caller's membership role is deliberately NOT re-checked here
+    // (PR #185 review, Codex "keep caller authorization stable"): phase 1
+    // checked it under the membership row lock, and a role change or
+    // membership removal landing between the phases must not abort the
+    // final CAP write after the upstream owner already switched -- that
+    // abort is exactly the half-executed, drifted state the two-phase
+    // design exists to avoid, and the retry it forces would fail the
+    // caller-key binding below. First presentations still require an
+    // active owner at request start (see rotate_org_owner).
     let mut tx = state.db.begin().await.map_err(|_| db_error())?;
     let lane_now = crate::signing_service::lock_org_signing_authority_lane_now(&mut tx, org_id)
         .await
         .map_err(|_| db_error())?;
-    let current_role =
-        scopes::lock_and_read_active_membership_role_in_tx(&mut tx, org_id, auth.user_id).await?;
-    scopes::require_owner_role(current_role)?;
     let (latest, version_created_at_floor) = read_rotation_authority(&mut tx, org_id).await?;
     let rotation_path = derive_rotation_path(
         &mut tx,
@@ -1745,13 +1780,16 @@ pub async fn rotate_org_owner(
             })),
         ));
     }
+    // Phase 2 already required the signing service to hold the replacement
+    // owner, which is exactly the recovery condition for the relaxed
+    // registration binding (see the fn doc).
     let replacement_signing_key_id = validate_rotation_successor(
         &mut tx,
         &base_payload,
         &replacement_keyring,
         &current_owner,
         &replacement_owner,
-        auth.user_id,
+        None,
     )
     .await?;
 
@@ -5945,6 +5983,420 @@ mod tests {
             api_key: None,
             management_origin: crate::auth::middleware::ManagementOrigin::Public,
         }
+    }
+
+    /// Regression (PR #185 review, Devin "maximum keyring version overflows
+    /// rotation"): with the latest keyring version at the i64 ceiling,
+    /// derive_rotation_path's successor arithmetic must not overflow; a
+    /// request below the ceiling returns the stale-version conflict
+    /// instead of panicking (the stale comparison evaluates the successor
+    /// check, which is where the overflow hit).
+    #[tokio::test]
+    async fn owner_rotation_rejects_stale_version_at_i64_ceiling_without_overflow() {
+        let pool = database_test_pool().await;
+        let org_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let suffix = org_id.simple().to_string();
+        let org_name = format!("rotate-ceiling-{suffix}");
+        crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+            .await
+            .expect("insert ceiling org");
+        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Ceiling Owner')")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("insert ceiling user");
+        sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+            .bind(user_id)
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("insert ceiling membership");
+        let current_key = SigningKey::generate(&mut OsRng);
+        let replacement_key = SigningKey::generate(&mut OsRng);
+        let signing_key_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(current_key.verifying_key().to_bytes().to_vec())
+        .fetch_one(&pool)
+        .await
+        .expect("insert ceiling signing key");
+        // A keyring version already at the i64 ceiling.
+        sqlx::query(
+            "INSERT INTO org_keyrings (org_id, version, keyring_payload, signature, signing_key_id)
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(org_id)
+        .bind(i64::MAX)
+        .bind(br#"{"org_id":"00000000-0000-0000-0000-000000000000","version":9223372036854775807,"members":[],"updated_at":"2026-01-01T00:00:00Z"}"#.to_vec())
+        .bind(vec![0u8; 64])
+        .bind(signing_key_id)
+        .execute(&pool)
+        .await
+        .expect("insert ceiling keyring version");
+
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        let (base_url, _service) = spawn_mock_signing_service_owner(
+            org_id,
+            MockSigningServiceOwner {
+                owner: current_key.verifying_key().to_bytes(),
+                changed_at: Utc::now(),
+                version: 1,
+                rotate_calls: 0,
+            },
+        )
+        .await;
+        state.signing_service = Some(
+            crate::signing_service::SigningServiceClient::new(base_url, None)
+                .expect("build ceiling mock client"),
+        );
+        let auth = AuthContext {
+            user_id,
+            org_id,
+            org_name: org_name.clone(),
+            role: Role::Owner,
+            api_key: None,
+            management_origin: crate::auth::middleware::ManagementOrigin::Public,
+        };
+        let request = rotation_request(
+            org_id,
+            user_id,
+            &current_key,
+            &replacement_key,
+            2,
+            2,
+            Utc::now(),
+            "version ceiling",
+        );
+        let error = rotate_org_owner(auth, State(state), Path(org_name.clone()), Json(request))
+            .await
+            .expect_err("a request below the ceiling version must be rejected, not panic");
+        let body = serde_json::to_string(&error.1.0).expect("serialize error body");
+        assert!(
+            body.contains("stale"),
+            "expected the stale-version conflict, got: {body}"
+        );
+    }
+
+    /// Regression (PR #185 review, Codex "keep caller authorization stable
+    /// through rotation finalization", part 1): phase 2 must finalize the
+    /// rotation even when the caller's membership disappears between the
+    /// phases -- the upstream owner change already happened under the
+    /// caller's phase-1 authorization, and aborting is what left authority
+    /// drifted with no recoverable request. The mock deletes the caller's
+    /// membership during phase 2's owner read (its second GET), i.e. after
+    /// phase 1 has committed its receipt-only transaction.
+    #[tokio::test]
+    async fn owner_rotation_finalizes_after_caller_membership_removal_mid_request() {
+        let pool = database_test_pool().await;
+        let org_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let suffix = org_id.simple().to_string();
+        let org_name = format!("rotate-midremoval-{suffix}");
+        crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+            .await
+            .expect("insert midremoval org");
+        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Midremoval Owner')")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("insert midremoval user");
+        sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+            .bind(user_id)
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("insert midremoval membership");
+        let current_key = SigningKey::generate(&mut OsRng);
+        let replacement_key = SigningKey::generate(&mut OsRng);
+        sqlx::query(
+            "INSERT INTO user_signing_keys (user_id, pubkey)
+             VALUES ($1, $2), ($1, $3)",
+        )
+        .bind(user_id)
+        .bind(current_key.verifying_key().to_bytes().to_vec())
+        .bind(replacement_key.verifying_key().to_bytes().to_vec())
+        .execute(&pool)
+        .await
+        .expect("insert midremoval signing keys");
+
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+
+        // Mock signing service whose second GET /orgs/{id}/owner call
+        // (phase 2's live-owner read) synchronously deletes the caller's
+        // membership before answering -- the exact mid-request removal.
+        let owner = Arc::new(std::sync::Mutex::new(MockSigningServiceOwner {
+            owner: current_key.verifying_key().to_bytes(),
+            changed_at: Utc::now(),
+            version: 1,
+            rotate_calls: 0,
+        }));
+        let status_owner = owner.clone();
+        let rotate_owner = owner.clone();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let status_calls = calls.clone();
+        let hook_pool = pool.clone();
+        let app = axum::Router::new()
+            .route(
+                &format!("/orgs/{org_id}/owner"),
+                axum::routing::get(move || async move {
+                    if status_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 1 {
+                        sqlx::query("DELETE FROM memberships WHERE org_id = $1 AND user_id = $2")
+                            .bind(org_id)
+                            .bind(user_id)
+                            .execute(&hook_pool)
+                            .await
+                            .expect("remove caller membership mid-request");
+                    }
+                    let state = status_owner.lock().expect("mock owner lock");
+                    axum::Json(serde_json::json!({
+                        "org_id": org_id,
+                        "state": "ready",
+                        "version": state.version,
+                        "owner_pubkey_hex": hex::encode(state.owner),
+                        "last_changed_at": state.changed_at,
+                    }))
+                }),
+            )
+            .route(
+                "/rotate-owner",
+                axum::routing::post(
+                    move |axum::Json(req): axum::Json<serde_json::Value>| async move {
+                        let mut state = rotate_owner.lock().expect("mock owner lock");
+                        let signer = req["signing_pubkey_b64"]
+                            .as_str()
+                            .and_then(|raw| B64.decode(raw).ok())
+                            .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok());
+                        if signer != Some(state.owner) {
+                            return (
+                                StatusCode::CONFLICT,
+                                axum::Json(serde_json::json!({
+                                    "error": "rotation signer does not match the current owner"
+                                })),
+                            );
+                        }
+                        let replacement: [u8; 32] = B64
+                            .decode(req["replacement_owner_pubkey_b64"].as_str().unwrap_or(""))
+                            .expect("mock replacement owner decodes")
+                            .try_into()
+                            .expect("mock replacement owner is 32 bytes");
+                        state.owner = replacement;
+                        state.changed_at = Utc::now();
+                        state.version += 1;
+                        state.rotate_calls += 1;
+                        (
+                            StatusCode::OK,
+                            axum::Json(serde_json::json!({
+                                "org_id": req["org_id"].clone(),
+                                "version": state.version,
+                                "owner_pubkey_fingerprint": hex::encode(replacement),
+                                "rotated_at": state.changed_at,
+                            })),
+                        )
+                    },
+                ),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind midremoval mock");
+        let address = listener.local_addr().expect("midremoval mock address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve midremoval mock");
+        });
+        state.signing_service = Some(
+            crate::signing_service::SigningServiceClient::new(format!("http://{address}/"), None)
+                .expect("build midremoval mock client"),
+        );
+
+        let auth = AuthContext {
+            user_id,
+            org_id,
+            org_name: org_name.clone(),
+            role: Role::Owner,
+            api_key: None,
+            management_origin: crate::auth::middleware::ManagementOrigin::Public,
+        };
+        let _ = put_keyring(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(signed_keyring_request(org_id, user_id, &current_key, 1, 1)),
+        )
+        .await
+        .expect("insert v1 keyring");
+
+        let request = rotation_request(
+            org_id,
+            user_id,
+            &current_key,
+            &replacement_key,
+            2,
+            2,
+            Utc::now(),
+            "mid-request membership removal",
+        );
+        let response = rotate_org_owner(
+            auth,
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(request),
+        )
+        .await
+        .expect("rotation must finalize even when the caller is removed between the phases");
+        assert_eq!(response.0.keyring_version, 2);
+        let membership_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM memberships WHERE org_id = $1 AND user_id = $2",
+        )
+        .bind(org_id)
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count caller membership");
+        assert_eq!(
+            membership_count, 0,
+            "the mid-request removal hook must have fired"
+        );
+        let stored: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM org_keyrings WHERE org_id = $1 AND version = 2",
+        )
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count v2 keyring");
+        assert_eq!(stored, 1, "the successor keyring must be finalized");
+    }
+
+    /// Regression (PR #185 review, Codex "keep caller authorization stable",
+    /// part 2): once the signing service already holds the replacement
+    /// owner, a remaining owner must be able to submit the recovery for an
+    /// already-executed rotation even though the replacement key is
+    /// registered to a different user -- the upstream fact outranks the
+    /// first-presentation caller-key binding.
+    #[tokio::test]
+    async fn owner_rotation_recovery_allows_remaining_owner_with_foreign_replacement_key() {
+        let pool = database_test_pool().await;
+        let org_id = Uuid::new_v4();
+        let removed_user_id = Uuid::new_v4();
+        let remaining_user_id = Uuid::new_v4();
+        let suffix = org_id.simple().to_string();
+        let org_name = format!("rotate-recovery-{suffix}");
+        crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+            .await
+            .expect("insert recovery org");
+        sqlx::query(
+            "INSERT INTO users (id, display_name)
+             VALUES ($1, 'Removed Owner'), ($2, 'Remaining Owner')",
+        )
+        .bind(removed_user_id)
+        .bind(remaining_user_id)
+        .execute(&pool)
+        .await
+        .expect("insert recovery users");
+        sqlx::query(
+            "INSERT INTO memberships (user_id, org_id, role)
+             VALUES ($1, $3, 'owner'), ($2, $3, 'owner')",
+        )
+        .bind(removed_user_id)
+        .bind(remaining_user_id)
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("insert recovery memberships");
+        let current_key = SigningKey::generate(&mut OsRng);
+        let replacement_key = SigningKey::generate(&mut OsRng);
+        // Both keys belong to the (later removed) original user; the
+        // remaining owner owns neither.
+        sqlx::query(
+            "INSERT INTO user_signing_keys (user_id, pubkey)
+             VALUES ($1, $2), ($1, $3)",
+        )
+        .bind(removed_user_id)
+        .bind(current_key.verifying_key().to_bytes().to_vec())
+        .bind(replacement_key.verifying_key().to_bytes().to_vec())
+        .execute(&pool)
+        .await
+        .expect("insert recovery signing keys");
+
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        // Drifted state left by a request that died between the phases: the
+        // service already holds the replacement (rotate_calls stays 1 from
+        // that lost request) while CAP still pins v1 under the current key.
+        let (base_url, service) = spawn_mock_signing_service_owner(
+            org_id,
+            MockSigningServiceOwner {
+                owner: replacement_key.verifying_key().to_bytes(),
+                changed_at: Utc::now(),
+                version: 2,
+                rotate_calls: 1,
+            },
+        )
+        .await;
+        state.signing_service = Some(
+            crate::signing_service::SigningServiceClient::new(base_url, None)
+                .expect("build recovery mock client"),
+        );
+
+        let removed_auth = AuthContext {
+            user_id: removed_user_id,
+            org_id,
+            org_name: org_name.clone(),
+            role: Role::Owner,
+            api_key: None,
+            management_origin: crate::auth::middleware::ManagementOrigin::Public,
+        };
+        let _ = put_keyring(
+            removed_auth,
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(signed_keyring_request(
+                org_id,
+                removed_user_id,
+                &current_key,
+                1,
+                1,
+            )),
+        )
+        .await
+        .expect("insert v1 keyring");
+
+        let request = rotation_request(
+            org_id,
+            removed_user_id,
+            &current_key,
+            &replacement_key,
+            2,
+            2,
+            Utc::now(),
+            "receipt-bound recovery by remaining owner",
+        );
+        let remaining_auth = AuthContext {
+            user_id: remaining_user_id,
+            org_id,
+            org_name: org_name.clone(),
+            role: Role::Owner,
+            api_key: None,
+            management_origin: crate::auth::middleware::ManagementOrigin::Public,
+        };
+        let response = rotate_org_owner(
+            remaining_auth,
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(request),
+        )
+        .await
+        .expect("a remaining owner must be able to finalize the already-executed rotation");
+        assert_eq!(response.0.keyring_version, 2);
+        let rotate_calls = service.lock().expect("mock owner lock").rotate_calls;
+        assert_eq!(
+            rotate_calls, 1,
+            "recovery must not issue a second upstream rotation"
+        );
     }
 
     /// Regression (PR #185 review, Devin "concurrent upload leaves owner
