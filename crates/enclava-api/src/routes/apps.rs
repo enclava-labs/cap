@@ -2060,7 +2060,7 @@ fn signer_publication_pending_error() -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
-fn signer_rotation_superseded_error() -> (StatusCode, Json<serde_json::Value>) {
+pub(crate) fn signer_rotation_superseded_error() -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::CONFLICT,
         Json(serde_json::json!({
