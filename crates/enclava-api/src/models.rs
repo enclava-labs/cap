@@ -123,6 +123,11 @@ pub struct App {
     pub signer_identity_subject: Option<String>,
     pub signer_identity_issuer: Option<String>,
     pub signer_identity_set_at: Option<DateTime<Utc>>,
+    /// Monotonic per-app generation bumped by the database on every signer
+    /// identity change (migration 0060). Identity equality cannot detect a
+    /// rotate-back (A -> B -> C -> B) superseding a pending rotation; the
+    /// generation can.
+    pub signer_rotation_generation: i64,
     pub source_provider: Option<String>,
     pub source_repository: Option<String>,
     pub egress_allowlist: Json<Vec<EgressRule>>,
