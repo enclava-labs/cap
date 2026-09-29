@@ -1807,8 +1807,10 @@ fn signer_publication_checkpoint_error(
 /// response; a retry compares it against the live generation so a rotate-back
 /// (A -> B -> C -> B) through a later authority event still counts as
 /// superseded. A malformed checkpoint — including one missing the generation
-/// (written before this field existed) — fails closed instead of
-/// re-executing the single-use mutation.
+/// (written before this field existed) — fails closed here instead of
+/// re-executing the single-use mutation, and the caller terminalizes that
+/// failure through the completed channel with the bounded new-key
+/// disposition.
 async fn signer_publication_checkpoint(
     pool: &sqlx::PgPool,
     lease: &IdempotencyLease,
@@ -5030,20 +5032,27 @@ pub async fn rotate_paas_signer(
         IdempotencyBegin::Execute(lease) => lease,
         IdempotencyBegin::Replay((status, body)) => return Ok((status, Json(body))),
     };
-    let checkpoint = signer_publication_checkpoint(&state.db, &idempotency).await?;
+    // The checkpoint lookup runs inside the result scope on purpose: any
+    // failure there — including a malformed or unverifiable checkpoint such
+    // as one written before the generation field existed — must flow through
+    // complete_signer_result, which terminalizes outcome-unknown failures to
+    // the bounded new-key disposition on the completed channel. Surfacing it
+    // with `?` outside would leave the row incomplete and re-run on every
+    // lease expiry forever.
     let result: Result<IdempotencyResponse, InternalRouteError> = async {
-        let (app_id, rotation_generation, committed) = match checkpoint {
-            Some((app_id, rotation_generation, committed)) => {
-                (app_id, rotation_generation, committed)
-            }
-            None => {
-                let parsed = parse_internal_body(body)?;
-                let (committed, rotation_generation) =
-                    crate::routes::apps::rotate_signer_commit(auth, &state, &app_name, parsed)
-                        .await?;
-                (committed.id, rotation_generation, to_value(&committed)?)
-            }
-        };
+        let (app_id, rotation_generation, committed) =
+            match signer_publication_checkpoint(&state.db, &idempotency).await? {
+                Some((app_id, rotation_generation, committed)) => {
+                    (app_id, rotation_generation, committed)
+                }
+                None => {
+                    let parsed = parse_internal_body(body)?;
+                    let (committed, rotation_generation) =
+                        crate::routes::apps::rotate_signer_commit(auth, &state, &app_name, parsed)
+                            .await?;
+                    (committed.id, rotation_generation, to_value(&committed)?)
+                }
+            };
         let (Some(expected_subject), Some(expected_issuer)) = (
             committed
                 .get("signer_identity_subject")
@@ -12722,6 +12731,182 @@ mod tests {
             .await;
 
         crate::test_support::drop_isolated_database("cap_signer_rotate_back", pool).await;
+    }
+
+    /// A checkpoint written before the generation field existed (or otherwise
+    /// unverifiable) must terminalize to the bounded new-key disposition on
+    /// the completed channel — not 500 forever: the publication-checkpoint
+    /// reclaim carve-out would otherwise re-run the handler after every lease
+    /// expiry and never complete the row.
+    #[tokio::test]
+    async fn signer_checkpoint_without_generation_terminalizes_to_new_key_disposition() {
+        let _singleton = crate::test_support::SIGNED_POLICY_SINGLETON_LOCK
+            .lock()
+            .await;
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_signer_stale_checkpoint").await;
+        let (org_id, user_id, app_id, app_name, paas_org_id, paas_user_id) =
+            seed_signer_rotation_fixture(&pool).await;
+        sqlx::query(
+            "INSERT INTO kbs_tls_bindings (app_id, binding_key, namespace, service_account, tenant_instance_identity_hash)
+             SELECT id, id::text, namespace, service_account, tenant_instance_identity_hash FROM apps WHERE id = $1",
+        )
+        .bind(app_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 5,
+                    selector_bumps_owed = 0,
+                    configmap_generation = 0,
+                    applied_generation = 0,
+                    configmap_policy_sha256 = NULL,
+                    applied_policy_sha256 = NULL,
+                    configmap_resource_version = NULL
+              WHERE singleton",
+        )
+        .execute(&pool)
+        .await
+        .expect("activate signed-policy mode without a converged generation");
+
+        let mut state = idempotency_test_state(pool.clone());
+        state.management_mode = crate::state::CapManagementMode::PaasManaged;
+        state.kbs_policy = Some(crate::kbs::KbsPolicyConfig {
+            namespace: "kbs-test".into(),
+            configmap_name: "resource-policy".into(),
+            policy_key: "policy.rego".into(),
+            deployment_name: "trustee".into(),
+            required: true,
+            signed_policy_retention: 1,
+            signed_policy_max_bytes: 1_048_576,
+        });
+        let previous_subject =
+            "https://github.com/enclava/test/.github/workflows/build.yml@refs/heads/main";
+        let previous_issuer = "https://token.actions.githubusercontent.com";
+        let new_subject =
+            "https://github.com/enclava/stale/.github/workflows/build.yml@refs/heads/main";
+        let new_issuer = "https://stale-issuer.example.test";
+        let token = crate::auth::jwt::issue_signer_rotation_token(
+            state.hmac_key.as_ref(),
+            &crate::auth::jwt::SignerRotationTokenInput {
+                user_id,
+                org_id,
+                app_id,
+                previous_subject: previous_subject.to_string(),
+                previous_issuer: previous_issuer.to_string(),
+                new_subject: new_subject.to_string(),
+                new_issuer: new_issuer.to_string(),
+            },
+            chrono::Duration::seconds(600),
+        )
+        .expect("issue rotation token");
+        let idempotency_key = format!("signer-stale-checkpoint-{}", Uuid::new_v4());
+        let headers = config_token_actor_headers(&idempotency_key, &paas_user_id);
+        let request = serde_json::json!({
+            "subject": new_subject,
+            "issuer": new_issuer,
+            "email_confirmation_token": token,
+        });
+
+        let provider = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::test_support::KbsPolicyProvider::new(false),
+        ));
+        crate::kbs::TEST_KUBE_CLIENT
+            .scope(crate::test_support::kbs_policy_kube_client(provider.clone()), async {
+                let deferred = rotate_paas_signer(
+                    internal_test_auth(),
+                    State(state.clone()),
+                    Path((paas_org_id.clone(), app_name.clone())),
+                    headers.clone(),
+                    Json(request.clone()),
+                )
+                .await
+                .expect_err("committed-but-unconfirmed rotation must defer, not succeed");
+                assert_eq!(deferred.0, StatusCode::CONFLICT);
+
+                // Simulate a pre-generation checkpoint (e.g. written by an
+                // intermediate build) by dropping the generation sibling.
+                // The ledger's owner guard requires the connection to prove
+                // the reservation token for a response-body rewrite.
+                let mut tx = pool.begin().await.expect("begin checkpoint rewrite");
+                sqlx::query(
+                    "SELECT set_config(
+                        'enclava.idempotency_reservation_token',
+                        (SELECT reservation_token::text
+                           FROM cap_internal_idempotency WHERE idempotency_key = $1),
+                        true)",
+                )
+                .bind(&idempotency_key)
+                .execute(&mut *tx)
+                .await
+                .expect("prove reservation ownership");
+                sqlx::query(
+                    "UPDATE cap_internal_idempotency
+                        SET response_body = response_body::jsonb - 'signer_rotation_generation'
+                      WHERE idempotency_key = $1",
+                )
+                .bind(&idempotency_key)
+                .execute(&mut *tx)
+                .await
+                .expect("strip the generation field from the checkpoint body");
+                tx.commit().await.expect("commit checkpoint rewrite");
+                expire_idempotency_lease(&pool, &idempotency_key).await;
+
+                let terminal = rotate_paas_signer(
+                    internal_test_auth(),
+                    State(state.clone()),
+                    Path((paas_org_id.clone(), app_name.clone())),
+                    headers.clone(),
+                    Json(request.clone()),
+                )
+                .await
+                .expect_err("an unverifiable checkpoint must not report success");
+                assert_eq!(terminal.0, StatusCode::CONFLICT);
+                assert_eq!(terminal.1.0["error"], "idempotency_recovery_required");
+                assert_eq!(terminal.1.0["retryable"], false);
+                assert_eq!(terminal.1.0["disposition"], "reconcile_then_retry_with_new_key");
+                assert_eq!(terminal.1.0["idempotency_disposition"], "completed");
+
+                // The terminal disposition is persisted on the completed
+                // channel, so the row is finished and replays stably instead
+                // of re-running after every lease expiry.
+                let completed: Option<bool> = sqlx::query_scalar(
+                    "SELECT completed_at IS NOT NULL
+                       FROM cap_internal_idempotency WHERE idempotency_key = $1",
+                )
+                .bind(&idempotency_key)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                assert_eq!(completed, Some(true));
+
+                let replayed = rotate_paas_signer(
+                    internal_test_auth(),
+                    State(state.clone()),
+                    Path((paas_org_id.clone(), app_name.clone())),
+                    headers.clone(),
+                    Json(request.clone()),
+                )
+                .await
+                .expect("the terminal receipt must replay as the same conflict");
+                assert_eq!(replayed.0, StatusCode::CONFLICT);
+                assert_eq!(replayed.1.0, terminal.1.0);
+
+                let receipts: (i64, i64) = sqlx::query_as(
+                    "SELECT (SELECT count(*) FROM consumed_signer_rotation_tokens WHERE app_id = $1),
+                            (SELECT count(*) FROM audit_log WHERE org_id = $2 AND action = 'app.signer.rotate')",
+                )
+                .bind(app_id)
+                .bind(org_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                assert_eq!(receipts, (1, 1));
+            })
+            .await;
+
+        crate::test_support::drop_isolated_database("cap_signer_stale_checkpoint", pool).await;
     }
 
     #[tokio::test]

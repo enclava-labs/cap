@@ -961,8 +961,9 @@ pub async fn create_app(
         service_account, bootstrap_owner_pubkey_hash, tenant_instance_identity_hash,
          unlock_mode, domain, tee_domain,
          signer_identity_subject, signer_identity_issuer, signer_identity_set_at,
+         signer_rotation_generation,
         source_provider, source_repository, egress_allowlist, egress_mode)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::unlock_enum, $11, $12, $13, $14, $15, $16, $17, $18, $19)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::unlock_enum, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)",
     )
     .bind(app_id)
     .bind(app_candidate.org_id)
@@ -979,6 +980,7 @@ pub async fn create_app(
     .bind(app_candidate.signer_identity_subject.as_deref())
     .bind(app_candidate.signer_identity_issuer.as_deref())
     .bind(app_candidate.signer_identity_set_at)
+    .bind(app_candidate.signer_rotation_generation)
     .bind(app_candidate.source_provider.as_deref())
     .bind(app_candidate.source_repository.as_deref())
     .bind(&app_candidate.egress_allowlist)
