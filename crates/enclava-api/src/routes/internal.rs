@@ -3354,7 +3354,11 @@ pub async fn create_paas_app(
             signer_identity_subject, signer_identity_issuer, signer_identity_set_at,
             egress_allowlist, egress_mode
          )
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::unlock_enum, $11, $12, $13, $14, $15, $16, $17)",
+         SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10::unlock_enum, $11, $12, $13, $14, $15, $16, $17
+         WHERE NOT EXISTS (
+             SELECT 1 FROM kbs_owner_seed_waivers
+              WHERE binding_key = $18
+         )",
     )
     .bind(app_id)
     .bind(cap_org_id)
@@ -3373,6 +3377,7 @@ pub async fn create_paas_app(
     .bind(signer_set_at)
     .bind(sqlx::types::Json(egress_allowlist.clone()))
     .bind(egress_mode.as_str())
+    .bind(crate::kbs::owner_binding_key_for(&namespace, &body.name))
     .execute(&mut *tx)
     .await
     .map_err(|error| {
@@ -3382,6 +3387,17 @@ pub async fn create_paas_app(
             db_error()
         }
     })?;
+    // The waiver guard above runs before this transaction; the NOT EXISTS in
+    // the insert re-checks atomically so an abandoned destroy committing in
+    // between cannot slip a recreate past the tombstone.
+    let inserted = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM apps WHERE id = $1")
+        .bind(app_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| db_error())?;
+    if inserted == 0 {
+        return Err(json_error(StatusCode::CONFLICT, "stale_owner_seed"));
+    }
     sqlx::query(
         "INSERT INTO app_resources (
              app_id, cpu_limit, memory_limit, app_data_size, tls_data_size

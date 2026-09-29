@@ -6,8 +6,23 @@ use super::{
     request_workload_teardown, requires_workload_teardown, validate_egress_allowlist,
     validate_egress_mode, workload_teardown_http_failure, workload_teardown_instance_id,
 };
-use crate::auth::middleware::AuthContext;
+use crate::auth::middleware::{AuthContext, ManagementOrigin};
 use crate::models::{App, AppStatus, Role, UnlockMode};
+
+/// A per-test admin identity: unlike the fixed `test_support::auth_context`
+/// organization, concurrent tests (the default workspace test run is
+/// parallel) cannot collide on — or cascade away — each other's fixtures.
+fn unique_admin_auth() -> AuthContext {
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    AuthContext {
+        user_id: uuid::Uuid::new_v4(),
+        org_id: uuid::Uuid::new_v4(),
+        org_name: format!("del-{suffix}"),
+        role: Role::Admin,
+        api_key: None,
+        management_origin: ManagementOrigin::Public,
+    }
+}
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::{Request, Response, StatusCode};
@@ -764,7 +779,7 @@ async fn signer_rotation_token_rejects_api_key_before_database_access() {
 #[tokio::test]
 async fn abandon_teardown_proceeds_past_unreachable_workload() {
     let pool = crate::test_support::database_test_pool().await;
-    let auth = crate::test_support::auth_context(Role::Admin, &["apps:write"]);
+    let auth = unique_admin_auth();
     // Pre-flight: a previously failed run may have leaked this test-owned
     // organization and its (fixed-domain) fences into finite reclaim
     // quarantine, which would fail every later attempt as Busy. Wipe and
@@ -784,12 +799,18 @@ async fn abandon_teardown_proceeds_past_unreachable_workload() {
     .execute(&pool)
     .await
     .expect("clear abandon test fences");
+    // Unique slug (not the historic fixed one): the app domain — and with it
+    // the dns/edge mutation fences — derives from it, so concurrent tests
+    // cannot fence each other out.
+    let slug = uuid::Uuid::new_v4().simple().to_string();
     sqlx::query(
         "INSERT INTO organizations (id, name, cust_slug)
-         VALUES ($1, 'abandon-test-org', 'ab012345')
+         VALUES ($1, $2, $3)
          ON CONFLICT (id) DO NOTHING",
     )
     .bind(auth.org_id)
+    .bind(format!("abandon-test-org-{}", &slug[..8]))
+    .bind(&slug[..8])
     .execute(&pool)
     .await
     .expect("insert abandon test organization");
@@ -894,7 +915,7 @@ async fn abandon_teardown_proceeds_past_unreachable_workload() {
     // Without the override, an unreachable teardown fails atomically and
     // restores the app.
     let (status, body) = crate::routes::apps::delete_app_before(
-        crate::test_support::auth_context(Role::Admin, &["apps:write"]),
+        auth.clone(),
         State(state.clone()),
         Path(app_name.clone()),
         None,
@@ -946,7 +967,7 @@ async fn abandon_teardown_proceeds_past_unreachable_workload() {
     // then fails at the provider step, since no Kubernetes cluster is
     // reachable from tests) and no longer restores the app.
     let (status, body) = crate::routes::apps::delete_app_before(
-        crate::test_support::auth_context(Role::Admin, &["apps:write"]),
+        auth.clone(),
         State(state.clone()),
         Path(app_name.clone()),
         None,
@@ -999,7 +1020,7 @@ async fn abandon_teardown_proceeds_past_unreachable_workload() {
 #[tokio::test]
 async fn teardown_failure_after_supersede_keeps_deleting() {
     let pool = crate::test_support::database_test_pool().await;
-    let auth = crate::test_support::auth_context(Role::Admin, &["apps:write"]);
+    let auth = unique_admin_auth();
     let org_id = auth.org_id;
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     sqlx::query(
@@ -1102,7 +1123,7 @@ async fn teardown_failure_after_supersede_keeps_deleting() {
     state.db = pool.clone();
 
     let (status, body) = crate::routes::apps::delete_app_before(
-        crate::test_support::auth_context(Role::Admin, &["apps:write"]),
+        auth.clone(),
         State(state),
         Path(app_name),
         None,

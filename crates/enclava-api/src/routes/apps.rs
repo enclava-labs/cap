@@ -403,8 +403,13 @@ async fn persist_workload_teardown_completed(
     pool: &sqlx::PgPool,
     app_id: Uuid,
 ) -> Result<(), sqlx::Error> {
-    // Single statement: atomic on its own, and committed independently of the
-    // delete lane so a later step failure cannot roll back the marker.
+    // Single transaction: the marker and the waiver clear commit together, so
+    // a teardown that erased the seed can never leave a stale tombstone
+    // behind — an abandoned attempt's waiver would otherwise outlive a
+    // successful retry and refuse every same-name recreate despite the
+    // erasure. Still committed independently of the delete lane so a later
+    // step failure cannot roll back the marker.
+    let mut tx = pool.begin().await?;
     sqlx::query(
         "UPDATE apps
             SET workload_teardown_completed_at = COALESCE(workload_teardown_completed_at, clock_timestamp()),
@@ -412,8 +417,13 @@ async fn persist_workload_teardown_completed(
           WHERE id = $1",
     )
     .bind(app_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    sqlx::query("DELETE FROM kbs_owner_seed_waivers WHERE app_id = $1")
+        .bind(app_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -910,6 +920,16 @@ pub(crate) async fn prepare_app_candidate(
 /// previous incarnation of this name was destroyed while its owner seed may
 /// still exist in KBS, and a fresh workload would boot already-claimed.
 /// Shared by every create path (public, generic-deployment, hosted).
+pub(crate) fn stale_owner_seed_response() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "error": "stale_owner_seed",
+            "message": "the previous incarnation of this app name was destroyed without completing its confidential teardown; its owner seed may still exist in KBS and a new workload would boot already-claimed. Have the operator erase the stale seed (KBS repository removal per the destroy runbook) or choose a different name.",
+        })),
+    )
+}
+
 pub(crate) async fn refuse_stale_owner_seed(
     state: &AppState,
     namespace: &str,
@@ -919,13 +939,7 @@ pub(crate) async fn refuse_stale_owner_seed(
         .await
         .map_err(|_| internal_server_error())?;
     if stale_owner_seed {
-        return Err((
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": "stale_owner_seed",
-                "message": "the previous incarnation of this app name was destroyed without completing its confidential teardown; its owner seed may still exist in KBS and a new workload would boot already-claimed. Have the operator erase the stale seed (KBS repository removal per the destroy runbook) or choose a different name.",
-            })),
-        ));
+        return Err(stale_owner_seed_response());
     }
     Ok(())
 }
@@ -980,7 +994,11 @@ pub async fn create_app(
          unlock_mode, domain, tee_domain,
          signer_identity_subject, signer_identity_issuer, signer_identity_set_at,
         source_provider, source_repository, egress_allowlist, egress_mode)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::unlock_enum, $11, $12, $13, $14, $15, $16, $17, $18, $19)",
+         SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10::unlock_enum, $11, $12, $13, $14, $15, $16, $17, $18, $19
+         WHERE NOT EXISTS (
+             SELECT 1 FROM kbs_owner_seed_waivers
+              WHERE binding_key = $20
+         )",
     )
     .bind(app_id)
     .bind(app_candidate.org_id)
@@ -1001,17 +1019,33 @@ pub async fn create_app(
     .bind(app_candidate.source_repository.as_deref())
     .bind(&app_candidate.egress_allowlist)
     .bind(&app_candidate.egress_mode)
+    .bind(crate::kbs::owner_binding_key_for(
+        &app_candidate.namespace,
+        &app_candidate.name,
+    ))
     .execute(&mut *tx)
     .await;
 
-    if let Err(e) = result {
-        if e.to_string().contains("duplicate key") || e.to_string().contains("unique") {
-            return Err((
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({"error": "app name already taken in this org"})),
-            ));
+    let insert_result = match result {
+        Ok(executed) => executed,
+        Err(e) => {
+            if e.to_string().contains("duplicate key") || e.to_string().contains("unique") {
+                return Err((
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({"error": "app name already taken in this org"})),
+                ));
+            }
+            return Err(internal_server_error());
         }
-        return Err(internal_server_error());
+    };
+    // The waiver check in `prepare_app_candidate` runs before this
+    // transaction, so an abandoned destroy committing between the check and
+    // this insert could slip a recreate past the tombstone (the insert waits
+    // out the old row's unique constraint and resumes only after the destroy
+    // commits). The NOT EXISTS above re-checks atomically with the insert:
+    // zero rows inserted means the waiver landed in between - refuse.
+    if insert_result.rows_affected() == 0 {
+        return Err(stale_owner_seed_response());
     }
 
     sqlx::query(
@@ -1887,11 +1921,16 @@ pub(crate) async fn delete_app_before(
         .commit()
         .await
         .map_err(|_| internal_server_error())?;
-    crate::kbs::soft_delete_owner_binding(&state.db, deleting_app.id, teardown_required)
-        .await
-        .map_err(|error| {
-            app_delete_failure(deleting_app.id, AppDeleteFailure::KbsOwnerBinding, error)
-        })?;
+    crate::kbs::soft_delete_owner_binding(
+        &state.db,
+        deleting_app.id,
+        &deleting_app.namespace,
+        &deleting_app.name,
+    )
+    .await
+    .map_err(|error| {
+        app_delete_failure(deleting_app.id, AppDeleteFailure::KbsOwnerBinding, error)
+    })?;
     crate::kbs::soft_delete_tls_binding(&state.db, state.kbs_policy.as_ref(), deleting_app.id)
         .await
         .map_err(|error| {
