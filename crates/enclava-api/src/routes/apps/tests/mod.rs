@@ -883,6 +883,10 @@ async fn teardown_failure_after_supersede_keeps_deleting() {
     .expect_err("unreachable teardown must fail the delete");
     assert_eq!(status, StatusCode::BAD_GATEWAY, "{:?}", body.0);
     assert_eq!(body.0["error"], "app_delete_teardown_unavailable");
+    assert_eq!(
+        body.0["reason"], "app_kept_deleting",
+        "a superseding attempt must tell the client the app was not restored"
+    );
     let post_failure: String = sqlx::query_scalar("SELECT status::text FROM apps WHERE id = $1")
         .bind(app_id)
         .fetch_one(&pool)

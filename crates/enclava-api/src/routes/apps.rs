@@ -1546,8 +1546,11 @@ pub(crate) async fn delete_app_before(
         // 'deleting': its wrap is erased, and the retry (skipping teardown
         // via the monotonic completion marker) must finish the cleanup.
         // (unless it was already 'deleting' from an earlier attempt, whose
-        // pre-attempt status is unknown)
-        if phase_app.status != AppStatus::Deleting && superseded_by_this_attempt == 0 {
+        // pre-attempt status is unknown) The disposition rides the error
+        // body's `reason` so clients can tell an intact, restored app from
+        // one that must finish (or abandon) its deletion.
+        let restored = phase_app.status != AppStatus::Deleting && superseded_by_this_attempt == 0;
+        if restored {
             sqlx::query(
                 "UPDATE apps
                     SET status = $2::app_status_enum,
@@ -1575,7 +1578,18 @@ pub(crate) async fn delete_app_before(
             .commit()
             .await
             .map_err(|_| internal_server_error())?;
-        return Err(failure);
+        let (status, mut body) = failure;
+        if let Some(object) = body.0.as_object_mut() {
+            object.insert(
+                "reason".to_string(),
+                serde_json::json!(if restored {
+                    "app_restored"
+                } else {
+                    "app_kept_deleting"
+                }),
+            );
+        }
+        return Err((status, body));
     }
 
     // The running workload needs its current KBS authorization to erase the
