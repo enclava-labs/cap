@@ -5026,8 +5026,31 @@ pub async fn rotate_paas_signer(
                 (committed.id, to_value(&committed)?)
             }
         };
-        match crate::routes::apps::reconcile_signer_publication(&state, app_id).await {
+        let (Some(expected_subject), Some(expected_issuer)) = (
+            committed
+                .get("signer_identity_subject")
+                .and_then(serde_json::Value::as_str),
+            committed
+                .get("signer_identity_issuer")
+                .and_then(serde_json::Value::as_str),
+        ) else {
+            return Err(db_error());
+        };
+        match crate::routes::apps::reconcile_signer_publication(
+            &state,
+            app_id,
+            expected_subject,
+            expected_issuer,
+        )
+        .await
+        {
             Ok(()) => Ok((StatusCode::OK, committed)),
+            Err((StatusCode::CONFLICT, Json(body)))
+                if body.get("code").and_then(serde_json::Value::as_str)
+                    == Some(crate::routes::apps::SIGNER_ROTATION_SUPERSEDED_CODE) =>
+            {
+                Err((StatusCode::CONFLICT, Json(body)))
+            }
             Err(_) => Err(signer_publication_checkpoint_error(committed)),
         }
     }
@@ -12229,6 +12252,392 @@ mod tests {
             .await;
 
         crate::test_support::drop_isolated_database("cap_signer_rot_recovery", pool).await;
+    }
+
+    #[tokio::test]
+    async fn rotate_signer_retry_after_superseding_rotation_is_terminal_conflict() {
+        let _singleton = crate::test_support::SIGNED_POLICY_SINGLETON_LOCK
+            .lock()
+            .await;
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_signer_superseded").await;
+        let (org_id, user_id, app_id, app_name, paas_org_id, paas_user_id) =
+            seed_signer_rotation_fixture(&pool).await;
+        sqlx::query(
+            "INSERT INTO kbs_tls_bindings (app_id, binding_key, namespace, service_account, tenant_instance_identity_hash)
+             SELECT id, id::text, namespace, service_account, tenant_instance_identity_hash FROM apps WHERE id = $1",
+        )
+        .bind(app_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 5,
+                    selector_bumps_owed = 0,
+                    configmap_generation = 0,
+                    applied_generation = 0,
+                    configmap_policy_sha256 = NULL,
+                    applied_policy_sha256 = NULL,
+                    configmap_resource_version = NULL
+              WHERE singleton",
+        )
+        .execute(&pool)
+        .await
+        .expect("activate signed-policy mode without a converged generation");
+
+        let mut state = idempotency_test_state(pool.clone());
+        state.management_mode = crate::state::CapManagementMode::PaasManaged;
+        state.kbs_policy = Some(crate::kbs::KbsPolicyConfig {
+            namespace: "kbs-test".into(),
+            configmap_name: "resource-policy".into(),
+            policy_key: "policy.rego".into(),
+            deployment_name: "trustee".into(),
+            required: true,
+            signed_policy_retention: 1,
+            signed_policy_max_bytes: 1_048_576,
+        });
+        let previous_subject =
+            "https://github.com/enclava/test/.github/workflows/build.yml@refs/heads/main";
+        let previous_issuer = "https://token.actions.githubusercontent.com";
+        let superseded_subject =
+            "https://github.com/enclava/rotated/.github/workflows/build.yml@refs/heads/main";
+        let superseded_issuer = "https://rotated-issuer.example.test";
+        let authority_subject =
+            "https://github.com/enclava/authority/.github/workflows/build.yml@refs/heads/main";
+        let authority_issuer = "https://authority-issuer.example.test";
+
+        let old_token = crate::auth::jwt::issue_signer_rotation_token(
+            state.hmac_key.as_ref(),
+            &crate::auth::jwt::SignerRotationTokenInput {
+                user_id,
+                org_id,
+                app_id,
+                previous_subject: previous_subject.to_string(),
+                previous_issuer: previous_issuer.to_string(),
+                new_subject: superseded_subject.to_string(),
+                new_issuer: superseded_issuer.to_string(),
+            },
+            chrono::Duration::seconds(600),
+        )
+        .expect("issue superseded rotation token");
+        let old_idempotency_key = format!("signer-superseded-old-{}", Uuid::new_v4());
+        let old_headers = config_token_actor_headers(&old_idempotency_key, &paas_user_id);
+        let old_request = serde_json::json!({
+            "subject": superseded_subject,
+            "issuer": superseded_issuer,
+            "email_confirmation_token": old_token,
+        });
+        let authority_token = crate::auth::jwt::issue_signer_rotation_token(
+            state.hmac_key.as_ref(),
+            &crate::auth::jwt::SignerRotationTokenInput {
+                user_id,
+                org_id,
+                app_id,
+                previous_subject: superseded_subject.to_string(),
+                previous_issuer: superseded_issuer.to_string(),
+                new_subject: authority_subject.to_string(),
+                new_issuer: authority_issuer.to_string(),
+            },
+            chrono::Duration::seconds(600),
+        )
+        .expect("issue authority rotation token");
+
+        let provider = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::test_support::KbsPolicyProvider::new(false),
+        ));
+        crate::kbs::TEST_KUBE_CLIENT
+            .scope(crate::test_support::kbs_policy_kube_client(provider.clone()), async {
+                let deferred = rotate_paas_signer(
+                    internal_test_auth(),
+                    State(state.clone()),
+                    Path((paas_org_id.clone(), app_name.clone())),
+                    old_headers.clone(),
+                    Json(old_request.clone()),
+                )
+                .await
+                .expect_err("committed-but-unconfirmed rotation must defer, not succeed");
+                assert_eq!(deferred.0, StatusCode::CONFLICT);
+                assert_eq!(
+                    deferred.1.0["cause"],
+                    crate::routes::apps::SIGNER_ROTATION_PUBLICATION_PENDING_CODE
+                );
+                let committed_subject: Option<String> =
+                    sqlx::query_scalar("SELECT signer_identity_subject FROM apps WHERE id = $1")
+                        .bind(app_id)
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                assert_eq!(committed_subject.as_deref(), Some(superseded_subject));
+
+                expire_idempotency_lease(&pool, &old_idempotency_key).await;
+                {
+                    let mut provider = provider.lock().await;
+                    provider.healthy = true;
+                }
+                let authority_key = format!("signer-superseded-new-{}", Uuid::new_v4());
+                let authority_headers = config_token_actor_headers(&authority_key, &paas_user_id);
+                let (authority_status, Json(published)) = rotate_paas_signer(
+                    internal_test_auth(),
+                    State(state.clone()),
+                    Path((paas_org_id.clone(), app_name.clone())),
+                    authority_headers,
+                    Json(serde_json::json!({
+                        "subject": authority_subject,
+                        "issuer": authority_issuer,
+                        "email_confirmation_token": authority_token,
+                    })),
+                )
+                .await
+                .expect("the legitimate later rotation must publish");
+                assert_eq!(authority_status, StatusCode::OK);
+                assert_eq!(published["signer_identity_subject"], authority_subject);
+
+                // Supersession must terminate even while KBS is unavailable.
+                {
+                    let mut provider = provider.lock().await;
+                    provider.healthy = false;
+                }
+                let superseded = rotate_paas_signer(
+                    internal_test_auth(),
+                    State(state.clone()),
+                    Path((paas_org_id.clone(), app_name.clone())),
+                    old_headers.clone(),
+                    Json(old_request.clone()),
+                )
+                .await
+                .expect_err("the superseded retry must report a terminal conflict");
+                assert_eq!(superseded.0, StatusCode::CONFLICT);
+                assert_eq!(
+                    superseded.1.0["code"],
+                    crate::routes::apps::SIGNER_ROTATION_SUPERSEDED_CODE
+                );
+                assert_eq!(superseded.1.0["idempotency_disposition"], "completed");
+                assert_eq!(superseded.1.0["retryable"], false);
+                assert!(superseded.1.0.get("committed_response").is_none());
+
+                let receipts: (i64, i64, i64) = sqlx::query_as(
+                    "SELECT (SELECT count(*) FROM consumed_signer_rotation_tokens WHERE app_id = $1),
+                            (SELECT count(*) FROM audit_log WHERE org_id = $2 AND action = 'app.signer.rotate'),
+                            (SELECT count(*) FROM withdrawn_signer_artifacts WHERE app_id = $1)",
+                )
+                .bind(app_id)
+                .bind(org_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                assert_eq!(receipts, (2, 2, 0));
+
+                let replayed = rotate_paas_signer(
+                    internal_test_auth(),
+                    State(state.clone()),
+                    Path((paas_org_id.clone(), app_name.clone())),
+                    old_headers.clone(),
+                    Json(old_request.clone()),
+                )
+                .await
+                .expect("the terminal receipt must replay as the same conflict");
+                assert_eq!(replayed.0, StatusCode::CONFLICT);
+                assert_eq!(replayed.1.0, superseded.1.0);
+
+                let receipts_after: (i64, i64, i64) = sqlx::query_as(
+                    "SELECT (SELECT count(*) FROM consumed_signer_rotation_tokens WHERE app_id = $1),
+                            (SELECT count(*) FROM audit_log WHERE org_id = $2 AND action = 'app.signer.rotate'),
+                            (SELECT count(*) FROM withdrawn_signer_artifacts WHERE app_id = $1)",
+                )
+                .bind(app_id)
+                .bind(org_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                assert_eq!(receipts_after, (2, 2, 0));
+                let subject_after: Option<String> =
+                    sqlx::query_scalar("SELECT signer_identity_subject FROM apps WHERE id = $1")
+                        .bind(app_id)
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                assert_eq!(subject_after.as_deref(), Some(authority_subject));
+            })
+            .await;
+
+        crate::test_support::drop_isolated_database("cap_signer_superseded", pool).await;
+    }
+
+    #[tokio::test]
+    async fn rotate_signer_retry_after_app_removal_is_terminal_conflict() {
+        let _singleton = crate::test_support::SIGNED_POLICY_SINGLETON_LOCK
+            .lock()
+            .await;
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_signer_superseded_removal").await;
+        let (org_id, user_id, app_id, app_name, paas_org_id, paas_user_id) =
+            seed_signer_rotation_fixture(&pool).await;
+        let (org_id_2, user_id_2, app_id_2, app_name_2, paas_org_id_2, paas_user_id_2) =
+            seed_signer_rotation_fixture(&pool).await;
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 5,
+                    selector_bumps_owed = 0,
+                    configmap_generation = 0,
+                    applied_generation = 0,
+                    configmap_policy_sha256 = NULL,
+                    applied_policy_sha256 = NULL,
+                    configmap_resource_version = NULL
+              WHERE singleton",
+        )
+        .execute(&pool)
+        .await
+        .expect("activate signed-policy mode without a converged generation");
+
+        let mut state = idempotency_test_state(pool.clone());
+        state.management_mode = crate::state::CapManagementMode::PaasManaged;
+        state.kbs_policy = Some(crate::kbs::KbsPolicyConfig {
+            namespace: "kbs-test".into(),
+            configmap_name: "resource-policy".into(),
+            policy_key: "policy.rego".into(),
+            deployment_name: "trustee".into(),
+            required: true,
+            signed_policy_retention: 1,
+            signed_policy_max_bytes: 1_048_576,
+        });
+        let previous_subject =
+            "https://github.com/enclava/test/.github/workflows/build.yml@refs/heads/main";
+        let previous_issuer = "https://token.actions.githubusercontent.com";
+        let superseded_subject =
+            "https://github.com/enclava/gone/.github/workflows/build.yml@refs/heads/main";
+        let superseded_issuer = "https://gone-issuer.example.test";
+
+        let issue_request = |org_id: Uuid,
+                             user_id: Uuid,
+                             app_id: Uuid,
+                             paas_user_id: &str|
+         -> (String, HeaderMap, serde_json::Value) {
+            let token = crate::auth::jwt::issue_signer_rotation_token(
+                state.hmac_key.as_ref(),
+                &crate::auth::jwt::SignerRotationTokenInput {
+                    user_id,
+                    org_id,
+                    app_id,
+                    previous_subject: previous_subject.to_string(),
+                    previous_issuer: previous_issuer.to_string(),
+                    new_subject: superseded_subject.to_string(),
+                    new_issuer: superseded_issuer.to_string(),
+                },
+                chrono::Duration::seconds(600),
+            )
+            .expect("issue signer rotation token");
+            let key = format!("signer-removal-{}", Uuid::new_v4());
+            let headers = config_token_actor_headers(&key, paas_user_id);
+            (
+                key,
+                headers,
+                serde_json::json!({
+                    "subject": superseded_subject,
+                    "issuer": superseded_issuer,
+                    "email_confirmation_token": token,
+                }),
+            )
+        };
+
+        let provider = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::test_support::KbsPolicyProvider::new(false),
+        ));
+        crate::kbs::TEST_KUBE_CLIENT
+            .scope(
+                crate::test_support::kbs_policy_kube_client(provider.clone()),
+                async {
+                    let (deleting_key, deleting_headers, deleting_request) =
+                        issue_request(org_id, user_id, app_id, &paas_user_id);
+                    let (missing_key, missing_headers, missing_request) =
+                        issue_request(org_id_2, user_id_2, app_id_2, &paas_user_id_2);
+                    for (app_name, paas_org_id, headers, request) in [
+                        (
+                            &app_name,
+                            &paas_org_id,
+                            &deleting_headers,
+                            &deleting_request,
+                        ),
+                        (
+                            &app_name_2,
+                            &paas_org_id_2,
+                            &missing_headers,
+                            &missing_request,
+                        ),
+                    ] {
+                        let deferred = rotate_paas_signer(
+                            internal_test_auth(),
+                            State(state.clone()),
+                            Path((paas_org_id.clone(), app_name.clone())),
+                            headers.clone(),
+                            Json(request.clone()),
+                        )
+                        .await
+                        .expect_err("committed-but-unconfirmed rotation must defer");
+                        assert_eq!(deferred.0, StatusCode::CONFLICT);
+                        assert_eq!(
+                            deferred.1.0["cause"],
+                            crate::routes::apps::SIGNER_ROTATION_PUBLICATION_PENDING_CODE
+                        );
+                    }
+                    expire_idempotency_lease(&pool, &deleting_key).await;
+                    expire_idempotency_lease(&pool, &missing_key).await;
+
+                    sqlx::query(
+                        "UPDATE apps SET status = 'deleting'::app_status_enum WHERE id = $1",
+                    )
+                    .bind(app_id)
+                    .execute(&pool)
+                    .await
+                    .expect("mark the first app deleting");
+                    let deleting = rotate_paas_signer(
+                        internal_test_auth(),
+                        State(state.clone()),
+                        Path((paas_org_id.clone(), app_name.clone())),
+                        deleting_headers.clone(),
+                        Json(deleting_request.clone()),
+                    )
+                    .await
+                    .expect_err("a deleting app must not keep deferring publication");
+                    assert_eq!(deleting.0, StatusCode::CONFLICT);
+                    assert_eq!(
+                        deleting.1.0["code"],
+                        crate::routes::apps::SIGNER_ROTATION_SUPERSEDED_CODE
+                    );
+                    assert_eq!(deleting.1.0["idempotency_disposition"], "completed");
+
+                    for table in [
+                        "DELETE FROM consumed_signer_rotation_tokens WHERE app_id = $1",
+                        "DELETE FROM audit_log WHERE app_id = $1",
+                        "DELETE FROM kbs_tls_bindings WHERE app_id = $1",
+                        "DELETE FROM apps WHERE id = $1",
+                    ] {
+                        sqlx::query(table)
+                            .bind(app_id_2)
+                            .execute(&pool)
+                            .await
+                            .expect("remove the second app and its dependents");
+                    }
+                    let missing = rotate_paas_signer(
+                        internal_test_auth(),
+                        State(state.clone()),
+                        Path((paas_org_id_2.clone(), app_name_2.clone())),
+                        missing_headers.clone(),
+                        Json(missing_request.clone()),
+                    )
+                    .await
+                    .expect_err("a deleted app must not keep deferring publication");
+                    assert_eq!(missing.0, StatusCode::CONFLICT);
+                    assert_eq!(
+                        missing.1.0["code"],
+                        crate::routes::apps::SIGNER_ROTATION_SUPERSEDED_CODE
+                    );
+                    assert_eq!(missing.1.0["idempotency_disposition"], "completed");
+                },
+            )
+            .await;
+
+        crate::test_support::drop_isolated_database("cap_signer_superseded_removal", pool).await;
     }
 
     #[tokio::test]

@@ -546,6 +546,7 @@ pub async fn put_keyring(
     .map_err(|_| db_error())?;
 
     let mut insert_new_version = true;
+    let mut replayed_envelope: Option<(serde_json::Value, String, String)> = None;
     if let Some((latest_version, latest_payload, latest_signature, latest_signing_pubkey)) = latest
     {
         if body.version < latest_version {
@@ -555,24 +556,22 @@ pub async fn put_keyring(
             ));
         }
         if body.version == latest_version {
-            // Semantic replay check (PR #187 review): the stored payload may
-            // carry unsigned extra JSON fields (e.g. a client's "memo") that
-            // a typed rebuild drops before resubmitting.  The signature is
-            // over the canonical keyring bytes, so comparing those (plus the
-            // signature and signing key) instead of raw payload bytes keeps
-            // an exact-version replay idempotent for semantically identical
-            // payloads while still rejecting any genuinely different
-            // content.  A stored payload that no longer parses fails closed
-            // as a conflict.
-            let latest_keyring: SignedOrgKeyring = serde_json::from_slice(&latest_payload)
-                .map_err(|_| {
-                    (
-                        StatusCode::CONFLICT,
-                        Json(serde_json::json!({
-                            "error": "keyring version already exists with different content"
-                        })),
-                    )
-                })?;
+            // Legacy payloads can differ in unsigned fields while signing
+            // identical canonical content.
+            let (latest_payload, latest_keyring) =
+                serde_json::from_slice::<serde_json::Value>(&latest_payload)
+                    .and_then(|payload| {
+                        let keyring = SignedOrgKeyring::deserialize(&payload)?;
+                        Ok((payload, keyring))
+                    })
+                    .map_err(|_| {
+                        (
+                            StatusCode::CONFLICT,
+                            Json(serde_json::json!({
+                                "error": "keyring version already exists with different content"
+                            })),
+                        )
+                    })?;
             if latest_signature != signature
                 || latest_signing_pubkey != signing_pubkey
                 || canonical_keyring_bytes(&latest_keyring) != canonical_bytes
@@ -585,6 +584,11 @@ pub async fn put_keyring(
                 ));
             }
             insert_new_version = false;
+            replayed_envelope = Some((
+                latest_payload,
+                hex::encode(&latest_signature),
+                hex::encode(&latest_signing_pubkey),
+            ));
         }
         let next_version = latest_version
             .checked_add(1)
@@ -664,14 +668,18 @@ pub async fn put_keyring(
     confirm_keyring_kbs_publication(&state).await?;
 
     let fingerprint = hex::encode(Sha256::digest(&canonical_bytes));
+    let (keyring_payload, signature, signing_pubkey) = match replayed_envelope {
+        Some(envelope) => envelope,
+        None => (body.keyring_payload, body.signature, body.signing_pubkey),
+    };
     Ok((
         StatusCode::OK,
         Json(OrgKeyringResponse {
             org_id,
             version: body.version,
-            keyring_payload: body.keyring_payload,
-            signature: body.signature,
-            signing_pubkey: body.signing_pubkey,
+            keyring_payload,
+            signature,
+            signing_pubkey,
             fingerprint,
         }),
     ))
@@ -2166,6 +2174,166 @@ mod tests {
             .await
             .expect("delete second-owner replay users");
         drop_isolated_database("cap178_second_owner_replay", pool).await;
+    }
+
+    #[tokio::test]
+    async fn put_keyring_replay_answers_with_stored_envelope_not_submitted_echo() {
+        let _singleton = keyring_enqueue_guard().await;
+        let (_db_cleanup, pool) = isolated_database_test_pool("cap187_replay_envelope").await;
+        let org_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let suffix = org_id.simple().to_string();
+        let org_name = format!("keyring-replay-envelope-{suffix}");
+        crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+            .await
+            .expect("insert replay envelope org");
+        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Replay Owner')")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("insert replay envelope user");
+        sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+            .bind(user_id)
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("insert replay envelope membership");
+        let key = SigningKey::generate(&mut OsRng);
+        sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2)")
+            .bind(user_id)
+            .bind(key.verifying_key().to_bytes().to_vec())
+            .execute(&pool)
+            .await
+            .expect("insert replay envelope signing key");
+
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 5,
+                    selector_bumps_owed = 0,
+                    configmap_generation = 0,
+                    applied_generation = 0,
+                    configmap_policy_sha256 = NULL,
+                    applied_policy_sha256 = NULL,
+                    configmap_resource_version = NULL
+              WHERE singleton",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed signed-policy generation");
+
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.kbs_policy = Some(test_kbs_policy_config());
+        let auth = AuthContext {
+            user_id,
+            org_id,
+            org_name: org_name.clone(),
+            role: Role::Owner,
+            api_key: None,
+            management_origin: crate::auth::middleware::ManagementOrigin::Public,
+        };
+
+        fn with_memo(mut request: PutOrgKeyringRequest, memo: &str) -> PutOrgKeyringRequest {
+            let serde_json::Value::Object(map) = &mut request.keyring_payload else {
+                panic!("signed keyring payload must be an object");
+            };
+            map.insert(
+                "memo".to_string(),
+                serde_json::Value::String(memo.to_string()),
+            );
+            request
+        }
+
+        let provider = std::sync::Arc::new(tokio::sync::Mutex::new(KbsPolicyProvider::new(true)));
+        crate::kbs::TEST_KUBE_CLIENT
+            .scope(kbs_policy_kube_client(provider), async {
+                let stored = put_keyring(
+                    auth.clone(),
+                    State(state.clone()),
+                    Path(org_name.clone()),
+                    Json(with_memo(
+                        signed_keyring_request(org_id, user_id, &key, 1, 1),
+                        "old",
+                    )),
+                )
+                .await
+                .expect("initial keyring put must succeed");
+                assert_eq!(stored.0, StatusCode::OK);
+                assert_eq!(
+                    keyring_put_authority(&pool, org_id).await,
+                    (1, 1, 6, 0),
+                    "the initial put must commit one keyring and audit row and consume the owed selector bump"
+                );
+
+                let mut replay = with_memo(
+                    signed_keyring_request(org_id, user_id, &key, 1, 1),
+                    "new",
+                );
+                replay.signature = replay.signature.to_uppercase();
+                replay.signing_pubkey = replay.signing_pubkey.to_uppercase();
+                let Some(member_pubkey) = replay
+                    .keyring_payload
+                    .get_mut("members")
+                    .and_then(serde_json::Value::as_array_mut)
+                    .and_then(|members| members.first_mut())
+                    .and_then(|member| member.get_mut("pubkey"))
+                else {
+                    panic!("signed keyring payload must carry a member pubkey");
+                };
+                *member_pubkey = serde_json::Value::String(
+                    member_pubkey
+                        .as_str()
+                        .expect("member pubkey is a string")
+                        .to_uppercase(),
+                );
+                let replayed = put_keyring(
+                    auth.clone(),
+                    State(state.clone()),
+                    Path(org_name.clone()),
+                    Json(replay),
+                )
+                .await
+                .expect("semantic replay must succeed");
+                assert_eq!(replayed.0, StatusCode::OK);
+                assert_eq!(
+                    keyring_put_authority(&pool, org_id).await,
+                    (1, 1, 6, 0),
+                    "the accepted replay must not write another keyring, audit row, or selector bump"
+                );
+
+                let fetched = get_keyring(auth.clone(), State(state.clone()), Path(org_name.clone()))
+                    .await
+                    .expect("get keyring after replay");
+                assert_eq!(
+                    fetched.0.keyring_payload["memo"], "old",
+                    "the stored payload is the first submission's"
+                );
+                assert_eq!(
+                    serde_json::to_value(&replayed.1.0).unwrap(),
+                    serde_json::to_value(&fetched.0).unwrap(),
+                    "the replay response must equal GET's stored envelope"
+                );
+
+                let conflict = put_keyring(
+                    auth.clone(),
+                    State(state.clone()),
+                    Path(org_name.clone()),
+                    Json(with_memo(
+                        signed_keyring_request(org_id, user_id, &key, 1, 2),
+                        "new",
+                    )),
+                )
+                .await
+                .expect_err("different signed content at the same version must conflict");
+                assert_eq!(conflict.0, StatusCode::CONFLICT);
+                assert_eq!(
+                    keyring_put_authority(&pool, org_id).await,
+                    (1, 1, 6, 0),
+                    "the conflicting replay must not write anything"
+                );
+            })
+            .await;
+        drop_isolated_database("cap187_replay_envelope", pool).await;
     }
 
     /// Review follow-up: a `\u0000` escape in an unknown field passes

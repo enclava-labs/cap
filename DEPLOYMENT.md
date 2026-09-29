@@ -283,6 +283,12 @@ retains the committed response and retries publication only; it does not consume
 the rotation token or apply the mutation again. Unrelated, uncertain failures
 remain fail-closed and require recovery rather than automatic mutation replay.
 
+CAP checks the committed signer under authority lanes before and after
+publication. A later rotation, app deletion, or deletion in progress ends the
+old operation with HTTP `409` and `signer_rotation_superseded`; internal callers
+receive a terminal `completed` disposition. Repeating that key returns the same
+terminal result, not a stale signer response or another token consumption.
+
 A currently authorized org owner may confirm an already committed signer
 identity without a new rotation token. This only retries publication; it cannot
 change the signer or consume another token. A real identity transition still

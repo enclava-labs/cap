@@ -36,6 +36,12 @@ fn internal_server_error() -> (StatusCode, Json<serde_json::Value>) {
 pub(crate) const SIGNER_ROTATION_PUBLICATION_PENDING_CODE: &str =
     "signer_rotation_publication_pending";
 
+/// Terminal disposition for a committed rotation whose identity a later
+/// authority replaced before publication was confirmed: the app's live
+/// signer identity is authoritative, so callers must not receive the
+/// superseded rotation's saved response.
+pub(crate) const SIGNER_ROTATION_SUPERSEDED_CODE: &str = "signer_rotation_superseded";
+
 /// Bounded diagnostics for app deletion failures.
 ///
 /// Deletion dependencies can embed tenant-controlled hostnames, namespaces,
@@ -2054,22 +2060,77 @@ fn signer_publication_pending_error() -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
-/// Confirm the committed signer identity reached the KBS. The identity
-/// mutation is single-use (the email confirmation token is consumed with
-/// it), so every failure here is a committed-but-unpublished outcome:
-/// report the pending DTO instead of a generic 500 so an exact retry can
-/// reconcile publication only.
-///
-/// Configured installs keep the rotation's fence and
-/// [`crate::kbs::reconcile_policy`] (legacy Rego render and signed-mode
-/// convergence alike). Without provider configuration, signed-policy mode
-/// still owes a publication for the rotation's withdrawal and must fail
-/// closed; a genuinely unsigned, unconfigured install has nothing to
-/// publish and stays a success.
+fn signer_rotation_superseded_error() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "error": SIGNER_ROTATION_SUPERSEDED_CODE,
+            "code": SIGNER_ROTATION_SUPERSEDED_CODE,
+            "message": "the committed signer rotation was superseded by a later authority before its publication was confirmed; the app's live signer identity is authoritative",
+            "context": "rotate_signer",
+            "committed": true,
+            "retryable": false,
+        })),
+    )
+}
+
+// Release authority lanes before external KBS work; reacquire to detect supersession.
+async fn confirm_committed_signer_identity(
+    state: &AppState,
+    app_id: Uuid,
+    expected_subject: &str,
+    expected_issuer: &str,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|_| signer_publication_pending_error())?;
+    let org_id: Uuid = sqlx::query_scalar("SELECT org_id FROM apps WHERE id = $1")
+        .bind(app_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| signer_publication_pending_error())?
+        .ok_or_else(signer_rotation_superseded_error)?;
+    crate::signing_service::lock_org_signing_authority_lane(&mut tx, org_id)
+        .await
+        .map_err(|_| signer_publication_pending_error())?;
+    crate::deploy::lock_app_deployment_lane(&mut tx, app_id)
+        .await
+        .map_err(|_| signer_publication_pending_error())?;
+    let live: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT signer_identity_subject, signer_identity_issuer
+           FROM apps
+          WHERE id = $1
+            AND status <> 'deleting'::app_status_enum",
+    )
+    .bind(app_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|_| signer_publication_pending_error())?;
+    tx.rollback()
+        .await
+        .map_err(|_| signer_publication_pending_error())?;
+    match live {
+        Some((subject, issuer))
+            if subject.as_deref() == Some(expected_subject)
+                && issuer.as_deref() == Some(expected_issuer) =>
+        {
+            Ok(())
+        }
+        _ => Err(signer_rotation_superseded_error()),
+    }
+}
+
+/// Confirm publication only while the committed signer remains current.
+/// Authority checks release their database lanes before external KBS work.
 pub(crate) async fn reconcile_signer_publication(
     state: &AppState,
     app_id: Uuid,
+    expected_subject: &str,
+    expected_issuer: &str,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    confirm_committed_signer_identity(state, app_id, expected_subject, expected_issuer).await?;
     if state.kbs_policy.is_none() {
         // The shared confirm helper fails closed exactly when signed-policy
         // mode is active without configuration, and performs no write on an
@@ -2083,7 +2144,8 @@ pub(crate) async fn reconcile_signer_publication(
             );
             return Err(signer_publication_pending_error());
         }
-        return Ok(());
+        return confirm_committed_signer_identity(state, app_id, expected_subject, expected_issuer)
+            .await;
     }
     let lease = match crate::mutation_leases::claim_resources(
         state,
@@ -2142,6 +2204,8 @@ pub(crate) async fn reconcile_signer_publication(
         );
         return Err(signer_publication_pending_error());
     }
+    // Authority may change during external publication.
+    confirm_committed_signer_identity(state, app_id, expected_subject, expected_issuer).await?;
     Ok(())
 }
 
@@ -2157,7 +2221,15 @@ pub async fn rotate_signer(
     Json(body): Json<RotateSignerRequest>,
 ) -> Result<Json<AppResponse>, (StatusCode, Json<serde_json::Value>)> {
     let app = rotate_signer_commit(auth, &state, &app_name, body).await?;
-    reconcile_signer_publication(&state, app.id).await?;
+    let expected_subject = app
+        .signer_identity_subject
+        .as_deref()
+        .ok_or_else(internal_server_error)?;
+    let expected_issuer = app
+        .signer_identity_issuer
+        .as_deref()
+        .ok_or_else(internal_server_error)?;
+    reconcile_signer_publication(&state, app.id, expected_subject, expected_issuer).await?;
     Ok(Json(app))
 }
 
