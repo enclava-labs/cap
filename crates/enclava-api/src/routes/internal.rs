@@ -1786,23 +1786,28 @@ async fn complete_signer_result(
     }
 }
 
-fn signer_publication_checkpoint_error(committed: serde_json::Value) -> InternalRouteError {
+fn signer_publication_checkpoint_error(
+    committed: serde_json::Value,
+    rotation_count: Option<i64>,
+) -> InternalRouteError {
     let mut body = serde_json::json!({
         "code": crate::routes::apps::SIGNER_ROTATION_PUBLICATION_PENDING_CODE,
     });
     body[SIGNER_PUBLICATION_CHECKPOINT_RESPONSE_FIELD] = committed;
+    if let Some(count) = rotation_count {
+        // Deferred checkpoint metadata must never enter the HTTP app response.
+        body["rotation_count"] = serde_json::json!(count);
+    }
     (StatusCode::SERVICE_UNAVAILABLE, Json(body))
 }
 
-/// A deferred signer publication checkpoint owned by this request's lease,
-/// as `(app_id, committed response)`. The reservation-token CAS preserves
-/// completion ownership: only the lease holder may turn the checkpoint into
-/// a publication-only retry. A malformed checkpoint fails closed instead of
-/// re-executing the single-use mutation.
+/// Only the reservation-token owner may resume publication. Malformed checkpoints
+/// fail closed instead of re-executing the mutation; older checkpoints without a
+/// count retain identity-only confirmation.
 async fn signer_publication_checkpoint(
     pool: &sqlx::PgPool,
     lease: &IdempotencyLease,
-) -> Result<Option<(Uuid, serde_json::Value)>, InternalRouteError> {
+) -> Result<Option<(Uuid, serde_json::Value, Option<i64>)>, InternalRouteError> {
     let row: Option<(Option<i32>, Option<serde_json::Value>)> = sqlx::query_as(
         "SELECT response_status, response_body
            FROM cap_internal_idempotency
@@ -1832,18 +1837,37 @@ async fn signer_publication_checkpoint(
     {
         return Err(db_error());
     }
-    let Some(committed) = body
+    let Some(mut committed) = body
         .get_mut(SIGNER_PUBLICATION_CHECKPOINT_RESPONSE_FIELD)
         .map(serde_json::Value::take)
     else {
         return Err(db_error());
     };
+    // Older checkpoints embedded fencing metadata in the committed response.
+    let embedded_count = committed
+        .as_object_mut()
+        .and_then(|response| response.remove("rotation_count"));
+    if let (Some(stored), Some(embedded)) = (body.get("rotation_count"), embedded_count.as_ref())
+        && stored != embedded
+    {
+        return Err(db_error());
+    }
+    let rotation_count = body
+        .get("rotation_count")
+        .or(embedded_count.as_ref())
+        .map(|value| {
+            value
+                .as_i64()
+                .filter(|count| *count >= 0)
+                .ok_or_else(db_error)
+        })
+        .transpose()?;
     let app_id = committed
         .get("id")
         .and_then(serde_json::Value::as_str)
         .and_then(|value| Uuid::parse_str(value).ok())
         .ok_or_else(db_error)?;
-    Ok(Some((app_id, committed)))
+    Ok(Some((app_id, committed, rotation_count)))
 }
 
 /// Return an expiring capability exactly once without persisting it in CAP's
@@ -5012,55 +5036,30 @@ pub async fn rotate_paas_signer(
     .await?
     {
         IdempotencyBegin::Execute(lease) => lease,
-        IdempotencyBegin::Replay((status, body)) => return Ok((status, Json(body))),
+        IdempotencyBegin::Replay((status, mut body)) => {
+            // Older completed receipts may contain private fencing metadata.
+            if let Some(map) = body.as_object_mut() {
+                map.remove("rotation_count");
+            }
+            return Ok((status, Json(body)));
+        }
     };
     let checkpoint = signer_publication_checkpoint(&state.db, &idempotency).await?;
     let result: Result<IdempotencyResponse, InternalRouteError> = async {
-        let (app_id, committed, checkpoint_rotation_count) = match checkpoint {
-            Some((app_id, committed)) => {
-                // On retry, extract rotation count from stored checkpoint body.
-                let stored_count = committed
-                    .get("rotation_count")
-                    .and_then(serde_json::Value::as_i64);
-                (app_id, committed, stored_count)
-            }
+        let (app_id, committed, expected_rotation_count) = match checkpoint {
+            Some((app_id, committed, rotation_count)) => (app_id, committed, rotation_count),
             None => {
                 let parsed = parse_internal_body(body)?;
                 let committed =
                     crate::routes::apps::rotate_signer_commit(auth, &state, &app_name, parsed)
                         .await?;
-                // Capture rotation count at commit time to detect rotate-back supersession.
-                // A rotate-back (A→B→C→B) makes the original pending rotation's
-                // subject/issuer match again, so we must track count to distinguish
-                // a legitimate retry from a superseded one.
-                let rotation_count: i64 = sqlx::query_scalar(
-                    "SELECT count(*) FROM consumed_signer_rotation_tokens WHERE app_id = $1",
+                (
+                    committed.app.id,
+                    to_value(&committed.app)?,
+                    Some(committed.rotation_count),
                 )
-                .bind(committed.id)
-                .fetch_one(&state.db)
-                .await
-                .map_err(|_| db_error())?;
-                // Store count in the checkpoint for later comparison on retry.
-                let mut committed_value = to_value(&committed)?;
-                committed_value["rotation_count"] = serde_json::json!(rotation_count);
-                (committed.id, committed_value, Some(rotation_count))
             }
         };
-        // Verify rotation hasn't been superseded (including rotate-back) by comparing counts.
-        // If current count differs from checkpoint count, a different rotation committed
-        // in the interim, even if the signer identity coincidentally matches.
-        if let Some(stored_count) = checkpoint_rotation_count {
-            let current_count: i64 = sqlx::query_scalar(
-                "SELECT count(*) FROM consumed_signer_rotation_tokens WHERE app_id = $1",
-            )
-            .bind(app_id)
-            .fetch_one(&state.db)
-            .await
-            .map_err(|_| db_error())?;
-            if current_count != stored_count {
-                return Err(crate::routes::apps::signer_rotation_superseded_error());
-            }
-        }
         let (Some(expected_subject), Some(expected_issuer)) = (
             committed
                 .get("signer_identity_subject")
@@ -5076,6 +5075,7 @@ pub async fn rotate_paas_signer(
             app_id,
             expected_subject,
             expected_issuer,
+            expected_rotation_count,
         )
         .await
         {
@@ -5086,7 +5086,10 @@ pub async fn rotate_paas_signer(
             {
                 Err((StatusCode::CONFLICT, Json(body)))
             }
-            Err(_) => Err(signer_publication_checkpoint_error(committed)),
+            Err(_) => Err(signer_publication_checkpoint_error(
+                committed,
+                expected_rotation_count,
+            )),
         }
     }
     .await;
@@ -11953,6 +11956,12 @@ mod tests {
             body.as_ref().unwrap()["committed_response"]["signer_identity_subject"],
             new_subject
         );
+        assert_eq!(body.as_ref().unwrap()["rotation_count"], serde_json::json!(1));
+        assert!(
+            body.as_ref().unwrap()["committed_response"]
+                .get("rotation_count")
+                .is_none()
+        );
         let committed_subject: Option<String> =
             sqlx::query_scalar("SELECT signer_identity_subject FROM apps WHERE id = $1")
                 .bind(app_id)
@@ -12227,6 +12236,10 @@ mod tests {
                 assert_eq!(status, StatusCode::OK);
                 assert_eq!(published["signer_identity_subject"], new_subject);
                 assert_eq!(published["id"], app_id.to_string());
+                assert!(
+                    published.get("rotation_count").is_none(),
+                    "the confirmed success must expose only the AppResponse contract"
+                );
                 let rotation_receipts_after: (i64, i64) = sqlx::query_as(
                     "SELECT (SELECT count(*) FROM consumed_signer_rotation_tokens WHERE app_id = $1),
                             (SELECT count(*) FROM audit_log WHERE org_id = $2 AND action = 'app.signer.rotate')",
@@ -12427,6 +12440,10 @@ mod tests {
                 .expect("the legitimate later rotation must publish");
                 assert_eq!(authority_status, StatusCode::OK);
                 assert_eq!(published["signer_identity_subject"], authority_subject);
+                assert!(
+                    published.get("rotation_count").is_none(),
+                    "a fresh success must expose only the AppResponse contract"
+                );
 
                 // Supersession must terminate even while KBS is unavailable.
                 {
@@ -12673,6 +12690,799 @@ mod tests {
             .await;
 
         crate::test_support::drop_isolated_database("cap_signer_superseded_removal", pool).await;
+    }
+
+    fn issue_test_signer_rotation_token(
+        state: &AppState,
+        user_id: Uuid,
+        org_id: Uuid,
+        app_id: Uuid,
+        previous_subject: &str,
+        previous_issuer: &str,
+        new_subject: &str,
+        new_issuer: &str,
+    ) -> String {
+        crate::auth::jwt::issue_signer_rotation_token(
+            state.hmac_key.as_ref(),
+            &crate::auth::jwt::SignerRotationTokenInput {
+                user_id,
+                org_id,
+                app_id,
+                previous_subject: previous_subject.to_string(),
+                previous_issuer: previous_issuer.to_string(),
+                new_subject: new_subject.to_string(),
+                new_issuer: new_issuer.to_string(),
+            },
+            chrono::Duration::seconds(600),
+        )
+        .expect("issue signer rotation token")
+    }
+
+    async fn rewrite_idempotency_fixture(pool: &sqlx::PgPool, key: &str, statement: &str) {
+        let mut tx = pool.begin().await.expect("begin fixture receipt rewrite");
+        let token: Uuid = sqlx::query_scalar(
+            "SELECT reservation_token FROM cap_internal_idempotency
+              WHERE idempotency_key = $1 FOR UPDATE",
+        )
+        .bind(key)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("load the fixture receipt owner");
+        set_idempotency_completion_owner(&mut tx, token)
+            .await
+            .expect("retain the fixture receipt owner guard");
+        sqlx::query(statement)
+            .bind(key)
+            .execute(&mut *tx)
+            .await
+            .expect("rewrite the fixture receipt");
+        tx.commit().await.expect("commit the fixture receipt");
+    }
+
+    async fn commit_rotation_directly(
+        state: &AppState,
+        user_id: Uuid,
+        org_id: Uuid,
+        app_name: &str,
+        new_subject: &str,
+        new_issuer: &str,
+        token: String,
+    ) -> crate::routes::apps::CommittedSignerRotation {
+        let org_name: String = sqlx::query_scalar("SELECT name FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .fetch_one(&state.db)
+            .await
+            .expect("load org name for the direct rotation");
+        crate::routes::apps::rotate_signer_commit(
+            AuthContext {
+                user_id,
+                org_id,
+                org_name,
+                role: Role::Owner,
+                api_key: None,
+                management_origin: ManagementOrigin::PaasInternal,
+            },
+            state,
+            app_name,
+            crate::routes::apps::RotateSignerRequest {
+                subject: new_subject.to_string(),
+                issuer: new_issuer.to_string(),
+                email_confirmation_token: Some(token),
+            },
+        )
+        .await
+        .expect("commit the rotation without publication")
+    }
+
+    async fn signer_rotation_publication_state(
+        pool: &sqlx::PgPool,
+        app_id: Uuid,
+    ) -> (
+        AppState,
+        std::sync::Arc<tokio::sync::Mutex<crate::test_support::KbsPolicyProvider>>,
+    ) {
+        sqlx::query(
+            "INSERT INTO kbs_tls_bindings (app_id, binding_key, namespace, service_account, tenant_instance_identity_hash)
+             SELECT id, id::text, namespace, service_account, tenant_instance_identity_hash FROM apps WHERE id = $1",
+        )
+        .bind(app_id)
+        .execute(pool)
+        .await
+        .expect("seed legacy binding for the rotation");
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 5,
+                    selector_bumps_owed = 0,
+                    configmap_generation = 0,
+                    applied_generation = 0,
+                    configmap_policy_sha256 = NULL,
+                    applied_policy_sha256 = NULL,
+                    configmap_resource_version = NULL
+              WHERE singleton",
+        )
+        .execute(pool)
+        .await
+        .expect("activate signed-policy mode without a converged generation");
+        let mut state = idempotency_test_state(pool.clone());
+        state.management_mode = crate::state::CapManagementMode::PaasManaged;
+        state.kbs_policy = Some(crate::kbs::KbsPolicyConfig {
+            namespace: "kbs-test".into(),
+            configmap_name: "resource-policy".into(),
+            policy_key: "policy.rego".into(),
+            deployment_name: "trustee".into(),
+            required: true,
+            signed_policy_retention: 1,
+            signed_policy_max_bytes: 1_048_576,
+        });
+        let provider = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::test_support::KbsPolicyProvider::new(false),
+        ));
+        (state, provider)
+    }
+
+    async fn signer_rotation_receipts(
+        pool: &sqlx::PgPool,
+        app_id: Uuid,
+        org_id: Uuid,
+    ) -> (i64, i64) {
+        sqlx::query_as(
+            "SELECT (SELECT count(*) FROM consumed_signer_rotation_tokens WHERE app_id = $1),
+                    (SELECT count(*) FROM audit_log WHERE org_id = $2 AND action = 'app.signer.rotate')",
+        )
+        .bind(app_id)
+        .bind(org_id)
+        .fetch_one(pool)
+        .await
+        .expect("count signer rotation receipts")
+    }
+
+    #[tokio::test]
+    async fn rotate_signer_retry_after_rotate_back_is_terminal_conflict() {
+        let _singleton = crate::test_support::SIGNED_POLICY_SINGLETON_LOCK
+            .lock()
+            .await;
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_signer_rotate_back").await;
+        let (org_id, user_id, app_id, app_name, paas_org_id, paas_user_id) =
+            seed_signer_rotation_fixture(&pool).await;
+        let (state, provider) = signer_rotation_publication_state(&pool, app_id).await;
+        let previous_subject =
+            "https://github.com/enclava/test/.github/workflows/build.yml@refs/heads/main";
+        let previous_issuer = "https://token.actions.githubusercontent.com";
+        let pending_subject =
+            "https://github.com/enclava/rotated/.github/workflows/build.yml@refs/heads/main";
+        let pending_issuer = "https://rotated-issuer.example.test";
+        let intervening_subject =
+            "https://github.com/enclava/intervening/.github/workflows/build.yml@refs/heads/main";
+        let intervening_issuer = "https://intervening-issuer.example.test";
+
+        let old_token = issue_test_signer_rotation_token(
+            &state,
+            user_id,
+            org_id,
+            app_id,
+            previous_subject,
+            previous_issuer,
+            pending_subject,
+            pending_issuer,
+        );
+        let old_idempotency_key = format!("signer-rotate-back-old-{}", Uuid::new_v4());
+        let old_headers = config_token_actor_headers(&old_idempotency_key, &paas_user_id);
+        let old_request = serde_json::json!({
+            "subject": pending_subject,
+            "issuer": pending_issuer,
+            "email_confirmation_token": old_token,
+        });
+
+        crate::kbs::TEST_KUBE_CLIENT
+            .scope(
+                crate::test_support::kbs_policy_kube_client(provider.clone()),
+                async {
+                    let deferred = rotate_paas_signer(
+                        internal_test_auth(),
+                        State(state.clone()),
+                        Path((paas_org_id.clone(), app_name.clone())),
+                        old_headers.clone(),
+                        Json(old_request.clone()),
+                    )
+                    .await
+                    .expect_err("committed-but-unconfirmed rotation must defer, not succeed");
+                    assert_eq!(deferred.0, StatusCode::CONFLICT);
+                    assert_eq!(
+                        deferred.1.0["cause"],
+                        crate::routes::apps::SIGNER_ROTATION_PUBLICATION_PENDING_CODE
+                    );
+
+                    // A real B -> C -> B: the pending identity matches again, but
+                    // the count proves a later authority intervened.
+                    expire_idempotency_lease(&pool, &old_idempotency_key).await;
+                    provider.lock().await.healthy = true;
+                    let intervening_key = format!("signer-rotate-back-new-{}", Uuid::new_v4());
+                    let intervening_headers =
+                        config_token_actor_headers(&intervening_key, &paas_user_id);
+                    let intervening_token = issue_test_signer_rotation_token(
+                        &state,
+                        user_id,
+                        org_id,
+                        app_id,
+                        pending_subject,
+                        pending_issuer,
+                        intervening_subject,
+                        intervening_issuer,
+                    );
+                    let (intervening_status, Json(intervening_published)) = rotate_paas_signer(
+                        internal_test_auth(),
+                        State(state.clone()),
+                        Path((paas_org_id.clone(), app_name.clone())),
+                        intervening_headers,
+                        Json(serde_json::json!({
+                            "subject": intervening_subject,
+                            "issuer": intervening_issuer,
+                            "email_confirmation_token": intervening_token,
+                        })),
+                    )
+                    .await
+                    .expect("the intervening rotation must publish");
+                    assert_eq!(intervening_status, StatusCode::OK);
+                    assert!(intervening_published.get("rotation_count").is_none());
+                    let rotate_back_key = format!("signer-rotate-back-return-{}", Uuid::new_v4());
+                    let rotate_back_headers =
+                        config_token_actor_headers(&rotate_back_key, &paas_user_id);
+                    let rotate_back_token = issue_test_signer_rotation_token(
+                        &state,
+                        user_id,
+                        org_id,
+                        app_id,
+                        intervening_subject,
+                        intervening_issuer,
+                        pending_subject,
+                        pending_issuer,
+                    );
+                    let (rotate_back_status, Json(rotate_back_published)) = rotate_paas_signer(
+                        internal_test_auth(),
+                        State(state.clone()),
+                        Path((paas_org_id.clone(), app_name.clone())),
+                        rotate_back_headers,
+                        Json(serde_json::json!({
+                            "subject": pending_subject,
+                            "issuer": pending_issuer,
+                            "email_confirmation_token": rotate_back_token,
+                        })),
+                    )
+                    .await
+                    .expect("the rotate-back rotation must publish");
+                    assert_eq!(rotate_back_status, StatusCode::OK);
+                    assert!(rotate_back_published.get("rotation_count").is_none());
+                    let live_subject: Option<String> = sqlx::query_scalar(
+                        "SELECT signer_identity_subject FROM apps WHERE id = $1",
+                    )
+                    .bind(app_id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("load app subject after the rotate-back");
+                    assert_eq!(live_subject.as_deref(), Some(pending_subject));
+                    assert_eq!(
+                        signer_rotation_receipts(&pool, app_id, org_id).await,
+                        (3, 3)
+                    );
+
+                    let superseded = rotate_paas_signer(
+                        internal_test_auth(),
+                        State(state.clone()),
+                        Path((paas_org_id.clone(), app_name.clone())),
+                        old_headers.clone(),
+                        Json(old_request.clone()),
+                    )
+                    .await
+                    .expect_err("the rotate-back superseded retry must report a terminal conflict");
+                    assert_eq!(superseded.0, StatusCode::CONFLICT);
+                    assert_eq!(
+                        superseded.1.0["code"],
+                        crate::routes::apps::SIGNER_ROTATION_SUPERSEDED_CODE
+                    );
+                    assert_eq!(superseded.1.0["idempotency_disposition"], "completed");
+                    assert_eq!(superseded.1.0["retryable"], false);
+                    assert!(superseded.1.0.get("committed_response").is_none());
+
+                    // The terminal receipt replays stably without new commits.
+                    let replayed = rotate_paas_signer(
+                        internal_test_auth(),
+                        State(state.clone()),
+                        Path((paas_org_id.clone(), app_name.clone())),
+                        old_headers.clone(),
+                        Json(old_request.clone()),
+                    )
+                    .await
+                    .expect("the terminal receipt must replay as the same conflict");
+                    assert_eq!((replayed.0, replayed.1.0), (superseded.0, superseded.1.0));
+                    assert_eq!(
+                        signer_rotation_receipts(&pool, app_id, org_id).await,
+                        (3, 3)
+                    );
+                },
+            )
+            .await;
+
+        crate::test_support::drop_isolated_database("cap_signer_rotate_back", pool).await;
+    }
+
+    #[tokio::test]
+    async fn rotate_signer_retry_rejects_rotation_committed_during_publication() {
+        let _singleton = crate::test_support::SIGNED_POLICY_SINGLETON_LOCK
+            .lock()
+            .await;
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_signer_during_publication").await;
+        let (org_id, user_id, app_id, app_name, paas_org_id, paas_user_id) =
+            seed_signer_rotation_fixture(&pool).await;
+        let (state, provider) = signer_rotation_publication_state(&pool, app_id).await;
+        let previous_subject =
+            "https://github.com/enclava/test/.github/workflows/build.yml@refs/heads/main";
+        let previous_issuer = "https://token.actions.githubusercontent.com";
+        let pending_subject =
+            "https://github.com/enclava/rotated/.github/workflows/build.yml@refs/heads/main";
+        let pending_issuer = "https://rotated-issuer.example.test";
+        let intervening_subject =
+            "https://github.com/enclava/intervening/.github/workflows/build.yml@refs/heads/main";
+        let intervening_issuer = "https://intervening-issuer.example.test";
+
+        let old_token = issue_test_signer_rotation_token(
+            &state,
+            user_id,
+            org_id,
+            app_id,
+            previous_subject,
+            previous_issuer,
+            pending_subject,
+            pending_issuer,
+        );
+        let old_idempotency_key = format!("signer-during-publication-{}", Uuid::new_v4());
+        let old_headers = config_token_actor_headers(&old_idempotency_key, &paas_user_id);
+        let old_request = serde_json::json!({
+            "subject": pending_subject,
+            "issuer": pending_issuer,
+            "email_confirmation_token": old_token,
+        });
+
+        crate::kbs::TEST_KUBE_CLIENT
+            .scope(
+                crate::test_support::kbs_policy_kube_client(provider.clone()),
+                async {
+                    let deferred = rotate_paas_signer(
+                        internal_test_auth(),
+                        State(state.clone()),
+                        Path((paas_org_id.clone(), app_name.clone())),
+                        old_headers.clone(),
+                        Json(old_request.clone()),
+                    )
+                    .await
+                    .expect_err("committed-but-unconfirmed rotation must defer, not succeed");
+                    assert_eq!(deferred.0, StatusCode::CONFLICT);
+                    assert_eq!(
+                        deferred.1.0["cause"],
+                        crate::routes::apps::SIGNER_ROTATION_PUBLICATION_PENDING_CODE
+                    );
+
+                    expire_idempotency_lease(&pool, &old_idempotency_key).await;
+                    let (reached_tx, reached_rx) = tokio::sync::oneshot::channel::<()>();
+                    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+                    {
+                        let mut gated = provider.lock().await;
+                        gated.healthy = true;
+                        gated.configmap_put_hold = Some((reached_tx, release_rx));
+                    }
+
+                    // Both futures run on this task: the test kube client is
+                    // task-local, and the retry must park inside its publication
+                    // while the later authority commits underneath it.
+                    let retry_state = state.clone();
+                    let retry_paas_org_id = paas_org_id.clone();
+                    let retry_app_name = app_name.clone();
+                    let retry_headers = old_headers.clone();
+                    let retry_request = old_request.clone();
+                    let interleave_state = state.clone();
+                    let (retry_result, ()) = tokio::join!(
+                        async move {
+                            rotate_paas_signer(
+                                internal_test_auth(),
+                                State(retry_state),
+                                Path((retry_paas_org_id, retry_app_name)),
+                                retry_headers,
+                                Json(retry_request),
+                            )
+                            .await
+                        },
+                        async move {
+                            reached_rx
+                                .await
+                                .expect("publication parks at the configmap write");
+                            commit_rotation_directly(
+                                &interleave_state,
+                                user_id,
+                                org_id,
+                                &app_name,
+                                intervening_subject,
+                                intervening_issuer,
+                                issue_test_signer_rotation_token(
+                                    &interleave_state,
+                                    user_id,
+                                    org_id,
+                                    app_id,
+                                    pending_subject,
+                                    pending_issuer,
+                                    intervening_subject,
+                                    intervening_issuer,
+                                ),
+                            )
+                            .await;
+                            commit_rotation_directly(
+                                &interleave_state,
+                                user_id,
+                                org_id,
+                                &app_name,
+                                pending_subject,
+                                pending_issuer,
+                                issue_test_signer_rotation_token(
+                                    &interleave_state,
+                                    user_id,
+                                    org_id,
+                                    app_id,
+                                    intervening_subject,
+                                    intervening_issuer,
+                                    pending_subject,
+                                    pending_issuer,
+                                ),
+                            )
+                            .await;
+                            release_tx.send(()).expect("release the parked publication");
+                        }
+                    );
+                    let superseded = retry_result
+                        .expect_err("a rotation committed during publication must not pass");
+                    assert_eq!(superseded.0, StatusCode::CONFLICT);
+                    assert_eq!(
+                        superseded.1.0["code"],
+                        crate::routes::apps::SIGNER_ROTATION_SUPERSEDED_CODE
+                    );
+                    assert_eq!(superseded.1.0["idempotency_disposition"], "completed");
+                    assert_eq!(superseded.1.0["retryable"], false);
+                    assert!(superseded.1.0.get("committed_response").is_none());
+
+                    assert_eq!(
+                        signer_rotation_receipts(&pool, app_id, org_id).await,
+                        (3, 3)
+                    );
+                },
+            )
+            .await;
+
+        crate::test_support::drop_isolated_database("cap_signer_during_publication", pool).await;
+    }
+
+    #[tokio::test]
+    async fn rotate_signer_legacy_checkpoints_keep_their_original_fencing_semantics() {
+        let _singleton = crate::test_support::SIGNED_POLICY_SINGLETON_LOCK
+            .lock()
+            .await;
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_signer_legacy_checkpoint").await;
+        let (org_id, user_id, app_id, app_name, paas_org_id, paas_user_id) =
+            seed_signer_rotation_fixture(&pool).await;
+        let (state, provider) = signer_rotation_publication_state(&pool, app_id).await;
+        let initial_subject =
+            "https://github.com/enclava/test/.github/workflows/build.yml@refs/heads/main";
+        let initial_issuer = "https://token.actions.githubusercontent.com";
+        let first_subject =
+            "https://github.com/enclava/first/.github/workflows/build.yml@refs/heads/main";
+        let first_issuer = "https://first-issuer.example.test";
+        let second_subject =
+            "https://github.com/enclava/second/.github/workflows/build.yml@refs/heads/main";
+        let second_issuer = "https://second-issuer.example.test";
+        let third_subject =
+            "https://github.com/enclava/third/.github/workflows/build.yml@refs/heads/main";
+        let third_issuer = "https://third-issuer.example.test";
+        let fourth_subject =
+            "https://github.com/enclava/fourth/.github/workflows/build.yml@refs/heads/main";
+        let fourth_issuer = "https://fourth-issuer.example.test";
+
+        crate::kbs::TEST_KUBE_CLIENT
+            .scope(
+                crate::test_support::kbs_policy_kube_client(provider.clone()),
+                async {
+                    // Embedded metadata must still fence without entering the app response.
+                    let embedded_key = format!("signer-legacy-embedded-{}", Uuid::new_v4());
+                    let embedded_headers = config_token_actor_headers(&embedded_key, &paas_user_id);
+                    let embedded_request = serde_json::json!({
+                        "subject": first_subject,
+                        "issuer": first_issuer,
+                        "email_confirmation_token": issue_test_signer_rotation_token(
+                            &state, user_id, org_id, app_id,
+                            initial_subject, initial_issuer, first_subject, first_issuer,
+                        ),
+                    });
+                    let deferred = rotate_paas_signer(
+                        internal_test_auth(),
+                        State(state.clone()),
+                        Path((paas_org_id.clone(), app_name.clone())),
+                        embedded_headers.clone(),
+                        Json(embedded_request.clone()),
+                    )
+                    .await
+                    .expect_err("the first rotation must defer while publication is down");
+                    assert_eq!(deferred.0, StatusCode::CONFLICT);
+                    rewrite_idempotency_fixture(
+                        &pool,
+                        &embedded_key,
+                        "UPDATE cap_internal_idempotency
+                        SET response_body = jsonb_set(
+                                response_body - 'rotation_count',
+                                '{committed_response,rotation_count}',
+                                response_body->'rotation_count'
+                            )
+                      WHERE idempotency_key = $1",
+                    )
+                    .await;
+                    rewrite_idempotency_fixture(
+                        &pool,
+                        &embedded_key,
+                        "UPDATE cap_internal_idempotency
+                            SET response_body = jsonb_set(
+                                response_body,
+                                '{committed_response,rotation_count}',
+                                to_jsonb('invalid'::text)
+                            )
+                          WHERE idempotency_key = $1",
+                    )
+                    .await;
+                    expire_idempotency_lease(&pool, &embedded_key).await;
+                    let invalid_checkpoint = rotate_paas_signer(
+                        internal_test_auth(),
+                        State(state.clone()),
+                        Path((paas_org_id.clone(), app_name.clone())),
+                        embedded_headers.clone(),
+                        Json(embedded_request.clone()),
+                    )
+                    .await
+                    .expect_err("malformed fencing metadata must not become an unfenced retry");
+                    assert_eq!(invalid_checkpoint.0, StatusCode::INTERNAL_SERVER_ERROR);
+                    rewrite_idempotency_fixture(
+                        &pool,
+                        &embedded_key,
+                        "UPDATE cap_internal_idempotency
+                            SET response_body = jsonb_set(
+                                response_body,
+                                '{committed_response,rotation_count}',
+                                '1'
+                            )
+                          WHERE idempotency_key = $1",
+                    )
+                    .await;
+                    expire_idempotency_lease(&pool, &embedded_key).await;
+                    provider.lock().await.healthy = true;
+                    let (embedded_status, Json(embedded_published)) = rotate_paas_signer(
+                        internal_test_auth(),
+                        State(state.clone()),
+                        Path((paas_org_id.clone(), app_name.clone())),
+                        embedded_headers.clone(),
+                        Json(embedded_request.clone()),
+                    )
+                    .await
+                    .expect("the embedded-count checkpoint must still publish");
+                    assert_eq!(embedded_status, StatusCode::OK);
+                    assert_eq!(embedded_published["signer_identity_subject"], first_subject);
+                    assert!(embedded_published.get("rotation_count").is_none());
+
+                    // Count-less receipts cannot distinguish a rotation away and back.
+                    provider.lock().await.healthy = false;
+                    let countless_key = format!("signer-legacy-countless-{}", Uuid::new_v4());
+                    let countless_headers =
+                        config_token_actor_headers(&countless_key, &paas_user_id);
+                    let countless_request = serde_json::json!({
+                        "subject": second_subject,
+                        "issuer": second_issuer,
+                        "email_confirmation_token": issue_test_signer_rotation_token(
+                            &state, user_id, org_id, app_id,
+                            first_subject, first_issuer, second_subject, second_issuer,
+                        ),
+                    });
+                    let deferred = rotate_paas_signer(
+                        internal_test_auth(),
+                        State(state.clone()),
+                        Path((paas_org_id.clone(), app_name.clone())),
+                        countless_headers.clone(),
+                        Json(countless_request.clone()),
+                    )
+                    .await
+                    .expect_err("the second rotation must defer while publication is down");
+                    assert_eq!(deferred.0, StatusCode::CONFLICT);
+                    rewrite_idempotency_fixture(
+                        &pool,
+                        &countless_key,
+                        "UPDATE cap_internal_idempotency
+                        SET response_body = response_body - 'rotation_count'
+                      WHERE idempotency_key = $1",
+                    )
+                    .await;
+                    commit_rotation_directly(
+                        &state,
+                        user_id,
+                        org_id,
+                        &app_name,
+                        third_subject,
+                        third_issuer,
+                        issue_test_signer_rotation_token(
+                            &state,
+                            user_id,
+                            org_id,
+                            app_id,
+                            second_subject,
+                            second_issuer,
+                            third_subject,
+                            third_issuer,
+                        ),
+                    )
+                    .await;
+                    commit_rotation_directly(
+                        &state,
+                        user_id,
+                        org_id,
+                        &app_name,
+                        second_subject,
+                        second_issuer,
+                        issue_test_signer_rotation_token(
+                            &state,
+                            user_id,
+                            org_id,
+                            app_id,
+                            third_subject,
+                            third_issuer,
+                            second_subject,
+                            second_issuer,
+                        ),
+                    )
+                    .await;
+                    expire_idempotency_lease(&pool, &countless_key).await;
+                    provider.lock().await.healthy = true;
+                    let (countless_status, Json(countless_published)) = rotate_paas_signer(
+                        internal_test_auth(),
+                        State(state.clone()),
+                        Path((paas_org_id.clone(), app_name.clone())),
+                        countless_headers.clone(),
+                        Json(countless_request.clone()),
+                    )
+                    .await
+                    .expect("the count-less legacy checkpoint must keep identity-only semantics");
+                    assert_eq!(countless_status, StatusCode::OK);
+                    assert_eq!(
+                        countless_published["signer_identity_subject"],
+                        second_subject
+                    );
+                    assert!(countless_published.get("rotation_count").is_none());
+
+                    // The embedded shape must also fence: a rotate-back under it
+                    // is a terminal supersession, not a false success.
+                    provider.lock().await.healthy = false;
+                    let embedded_fenced_key = format!("signer-legacy-fenced-{}", Uuid::new_v4());
+                    let embedded_fenced_headers =
+                        config_token_actor_headers(&embedded_fenced_key, &paas_user_id);
+                    let embedded_fenced_request = serde_json::json!({
+                        "subject": third_subject,
+                        "issuer": third_issuer,
+                        "email_confirmation_token": issue_test_signer_rotation_token(
+                            &state, user_id, org_id, app_id,
+                            second_subject, second_issuer, third_subject, third_issuer,
+                        ),
+                    });
+                    let deferred = rotate_paas_signer(
+                        internal_test_auth(),
+                        State(state.clone()),
+                        Path((paas_org_id.clone(), app_name.clone())),
+                        embedded_fenced_headers.clone(),
+                        Json(embedded_fenced_request.clone()),
+                    )
+                    .await
+                    .expect_err("the third rotation must defer while publication is down");
+                    assert_eq!(deferred.0, StatusCode::CONFLICT);
+                    rewrite_idempotency_fixture(
+                        &pool,
+                        &embedded_fenced_key,
+                        "UPDATE cap_internal_idempotency
+                        SET response_body = jsonb_set(
+                                response_body - 'rotation_count',
+                                '{committed_response,rotation_count}',
+                                response_body->'rotation_count'
+                            )
+                      WHERE idempotency_key = $1",
+                    )
+                    .await;
+                    commit_rotation_directly(
+                        &state,
+                        user_id,
+                        org_id,
+                        &app_name,
+                        fourth_subject,
+                        fourth_issuer,
+                        issue_test_signer_rotation_token(
+                            &state,
+                            user_id,
+                            org_id,
+                            app_id,
+                            third_subject,
+                            third_issuer,
+                            fourth_subject,
+                            fourth_issuer,
+                        ),
+                    )
+                    .await;
+                    commit_rotation_directly(
+                        &state,
+                        user_id,
+                        org_id,
+                        &app_name,
+                        third_subject,
+                        third_issuer,
+                        issue_test_signer_rotation_token(
+                            &state,
+                            user_id,
+                            org_id,
+                            app_id,
+                            fourth_subject,
+                            fourth_issuer,
+                            third_subject,
+                            third_issuer,
+                        ),
+                    )
+                    .await;
+                    expire_idempotency_lease(&pool, &embedded_fenced_key).await;
+                    let superseded = rotate_paas_signer(
+                        internal_test_auth(),
+                        State(state.clone()),
+                        Path((paas_org_id.clone(), app_name.clone())),
+                        embedded_fenced_headers.clone(),
+                        Json(embedded_fenced_request.clone()),
+                    )
+                    .await
+                    .expect_err("the embedded count must fence the rotate-back");
+                    assert_eq!(superseded.0, StatusCode::CONFLICT);
+                    assert_eq!(
+                        superseded.1.0["code"],
+                        crate::routes::apps::SIGNER_ROTATION_SUPERSEDED_CODE
+                    );
+                    assert_eq!(superseded.1.0["idempotency_disposition"], "completed");
+                    assert!(superseded.1.0.get("committed_response").is_none());
+                    assert_eq!(
+                        signer_rotation_receipts(&pool, app_id, org_id).await,
+                        (7, 7)
+                    );
+
+                    // Older completed responses may also contain the private count.
+                    rewrite_idempotency_fixture(
+                        &pool,
+                        &embedded_key,
+                        "UPDATE cap_internal_idempotency
+                        SET response_body = jsonb_set(
+                                response_body, '{rotation_count}', '7'
+                            )
+                      WHERE idempotency_key = $1",
+                    )
+                    .await;
+                    let (replay_status, Json(replayed)) = rotate_paas_signer(
+                        internal_test_auth(),
+                        State(state.clone()),
+                        Path((paas_org_id.clone(), app_name.clone())),
+                        embedded_headers.clone(),
+                        Json(embedded_request.clone()),
+                    )
+                    .await
+                    .expect("the completed receipt must replay");
+                    assert_eq!(replay_status, StatusCode::OK);
+                    assert_eq!(replayed["signer_identity_subject"], first_subject);
+                    assert!(replayed.get("rotation_count").is_none());
+                },
+            )
+            .await;
+
+        crate::test_support::drop_isolated_database("cap_signer_legacy_checkpoint", pool).await;
     }
 
     #[tokio::test]

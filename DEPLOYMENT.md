@@ -269,6 +269,12 @@ restore` is read-and-verify: it validates the signed remote keyring and works
 for any active member whose derived key is still Owner in that keyring,
 without requiring keyring write permission or KBS availability.
 
+Setup also attempts signing-service bootstrap after confirming an existing
+keyring, using the accepted envelope's signing owner even when the caller owns
+a different authorized key. Bootstrap failures stop setup before local authority
+is stored, except for the existing optional-service HTTP `503` compatibility
+case. Successful key setup therefore does not certify signing-service readiness.
+
 ## Signer Rotation Completion
 
 In signed-policy mode, missing KBS publication configuration rejects a signer
@@ -283,11 +289,21 @@ retains the committed response and retries publication only; it does not consume
 the rotation token or apply the mutation again. Unrelated, uncertain failures
 remain fail-closed and require recovery rather than automatic mutation replay.
 
-CAP checks the committed signer under authority lanes before and after
-publication. A later rotation, app deletion, or deletion in progress ends the
-old operation with HTTP `409` and `signer_rotation_superseded`; internal callers
-receive a terminal `completed` disposition. Repeating that key returns the same
-terminal result, not a stale signer response or another token consumption.
+CAP checks the committed signer and its consumed-token count under authority
+lanes before and after publication. The count is captured inside the authority
+transaction and stored only as private checkpoint metadata, never in the
+successful app response. A later rotation, including a rotation away and back
+to the same identity, app deletion, or deletion in progress ends the old operation
+with HTTP `409` and `signer_rotation_superseded`; internal callers receive a
+terminal `completed` disposition. Repeating that key returns the same terminal
+result, not a stale signer response or another token consumption.
+
+Older checkpoints with no count retain identity-only confirmation; they cannot
+detect a rotation away and back. Embedded-count checkpoints retain count fencing
+without returning that metadata to callers. Preserve the consumed-token ledger:
+its app-scoped count is meaningful only while committed token records remain.
+Drain old API replicas before relying on these semantics; mixed-version writers
+and rollback to an older checkpoint reader are not supported.
 
 A currently authorized org owner may confirm an already committed signer
 identity without a new rotation token. This only retries publication; it cannot
