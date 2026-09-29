@@ -460,8 +460,14 @@ async fn reconcile_legacy_rego_policy_with_client(
             return reconcile_pending_signed_policy_artifacts_with_client(db, config, None, client)
                 .await;
         }
-        if converge_legacy_trustee_publication(db, client.clone(), config, &publication_token)
-            .await?
+        if converge_legacy_trustee_publication(
+            db,
+            client.clone(),
+            config,
+            &publication_token,
+            &policy_sha256_hex,
+        )
+        .await?
             == GenerationDecision::Superseded
         {
             continue;
@@ -1684,6 +1690,7 @@ async fn converge_legacy_trustee_publication(
     client: kube::Client,
     config: &KbsPolicyConfig,
     publication_token: &str,
+    policy_sha256_hex: &str,
 ) -> Result<GenerationDecision, KbsPolicyError> {
     let deploy_api: Api<Deployment> = Api::namespaced(client, &config.namespace);
     for _ in 0..KUBERNETES_CAS_ATTEMPTS {
@@ -1696,11 +1703,17 @@ async fn converge_legacy_trustee_publication(
             .as_ref()
             .and_then(|spec| spec.template.metadata.as_ref())
             .and_then(|metadata| metadata.annotations.as_ref());
-        if annotated_policy_generation(template_annotations)?.is_some() {
+        if let Some((generation, policy_hash)) = annotated_policy_generation(template_annotations)?
+        {
             if signed_policy_mode_active(db).await? {
                 return Ok(GenerationDecision::Superseded);
             }
-            return Err(KbsPolicyError::PolicyGenerationConflict);
+            return Err(KbsPolicyError::PolicyGenerationConflict {
+                existing_generation: Some(generation),
+                existing_hash: Some(policy_hash.to_string()),
+                desired_generation: 0,
+                desired_hash: policy_sha256_hex.to_string(),
+            });
         }
         let existing_token = template_annotations
             .and_then(|annotations| annotations.get(POLICY_PUBLICATION_TOKEN_ANNOTATION))
