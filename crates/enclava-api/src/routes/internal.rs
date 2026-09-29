@@ -12540,6 +12540,7 @@ mod tests {
         crate::test_support::drop_isolated_database("cap_signer_superseded", pool).await;
     }
 
+
     #[tokio::test]
     async fn rotate_signer_retry_after_app_removal_is_terminal_conflict() {
         let _singleton = crate::test_support::SIGNED_POLICY_SINGLETON_LOCK

@@ -961,7 +961,7 @@ pub async fn create_app(
         service_account, bootstrap_owner_pubkey_hash, tenant_instance_identity_hash,
          unlock_mode, domain, tee_domain,
          signer_identity_subject, signer_identity_issuer, signer_identity_set_at,
-        signer_rotation_generation,
+         signer_rotation_generation,
         source_provider, source_repository, egress_allowlist, egress_mode)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::unlock_enum, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)",
     )
