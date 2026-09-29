@@ -1685,10 +1685,11 @@ async fn complete_app_delete_result(
             // Surface the teardown disposition (restored vs kept deleting)
             // on the deferral too: hosted callers retry through the deferral
             // and would otherwise never see why the attempt failed — the
-            // original 5xx body is dropped by the deferral shape.
-            if *status == StatusCode::BAD_GATEWAY
-                && let Some(reason) = body.get("reason")
-            {
+            // original failure body is dropped by the deferral shape. The
+            // teardown branch attaches `reason` for every deferral-worthy
+            // status (token 500, transport 502, locked 423); other delete
+            // step failures carry none, so copy whatever is present.
+            if let Some(reason) = body.get("reason") {
                 deferred_body["reason"] = reason.clone();
             }
             return Err((deferred_status, Json(deferred_body)));
@@ -8759,6 +8760,32 @@ mod tests {
         assert_eq!(
             deferred.1.0["reason"], "app_kept_deleting",
             "the teardown disposition must ride the deferral for hosted callers"
+        );
+
+        // A locked teardown (423) carries the same disposition — the handler
+        // attaches `reason` for every deferral-worthy teardown status — and
+        // must keep its `cause` too.
+        let (state, auth, app_name, _) = app_delete_fixture().await;
+        let key = format!("disposition-locked-{}", Uuid::new_v4());
+        let headers = idempotency_headers(&key);
+        let path = format!("/internal/paas/orgs/{}/apps/{app_name}", auth.org_id);
+        let body = serde_json::json!({});
+        let lease = expect_idempotency_execution(
+            begin_app_delete_request(&state, &headers, &path, &auth, &body, &app_name)
+                .await
+                .unwrap(),
+        );
+        let mut locked =
+            crate::routes::apps::workload_teardown_http_failure(Uuid::new_v4(), StatusCode::LOCKED);
+        locked.1.0["reason"] = serde_json::json!("app_restored");
+        let deferred = complete_app_delete_result(lease, Err(locked))
+            .await
+            .unwrap_err();
+        assert_eq!(deferred.0, StatusCode::CONFLICT);
+        assert_eq!(deferred.1.0["cause"], "app_delete_teardown_locked");
+        assert_eq!(
+            deferred.1.0["reason"], "app_restored",
+            "locked teardowns keep the app disposition on the deferral"
         );
     }
 
