@@ -894,6 +894,11 @@ pub(crate) async fn prepare_app_candidate(
         signer_identity_set_at: (body.signer_identity_subject.is_some()
             || body.signer_identity_issuer.is_some())
         .then_some(now),
+        // An initial identity set counts as the first rotation event (the
+        // generation trigger only bumps on UPDATE, so seed it here).
+        signer_rotation_generation: i64::from(
+            body.signer_identity_subject.is_some() || body.signer_identity_issuer.is_some(),
+        ),
         source_provider: body
             .source_provider
             .map(SourceProvider::as_str)
@@ -956,8 +961,9 @@ pub async fn create_app(
         service_account, bootstrap_owner_pubkey_hash, tenant_instance_identity_hash,
          unlock_mode, domain, tee_domain,
          signer_identity_subject, signer_identity_issuer, signer_identity_set_at,
+        signer_rotation_generation,
         source_provider, source_repository, egress_allowlist, egress_mode)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::unlock_enum, $11, $12, $13, $14, $15, $16, $17, $18, $19)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::unlock_enum, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)",
     )
     .bind(app_id)
     .bind(app_candidate.org_id)
@@ -974,6 +980,7 @@ pub async fn create_app(
     .bind(app_candidate.signer_identity_subject.as_deref())
     .bind(app_candidate.signer_identity_issuer.as_deref())
     .bind(app_candidate.signer_identity_set_at)
+    .bind(app_candidate.signer_rotation_generation)
     .bind(app_candidate.source_provider.as_deref())
     .bind(app_candidate.source_repository.as_deref())
     .bind(&app_candidate.egress_allowlist)
@@ -2074,27 +2081,18 @@ fn signer_rotation_superseded_error() -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
-// Reads are serialized by the org/app authority lanes; the ledger is append-only.
-async fn count_consumed_signer_rotation_tokens(
-    connection: &mut sqlx::PgConnection,
-    app_id: Uuid,
-) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar("SELECT count(*) FROM consumed_signer_rotation_tokens WHERE app_id = $1")
-        .bind(app_id)
-        .fetch_one(connection)
-        .await
-}
-
 // Release authority lanes before external KBS work; reacquire to detect
-// supersession. `expected_rotation_count` fences rotate-back supersession
-// (A→B→C→B) that the subject/issuer check alone cannot see. A checkpoint
-// without a count predates count fencing and keeps identity-only semantics.
+// supersession. The generation comparison catches a rotate-back (A -> B ->
+// C -> B): the same identity pair returns through a NEW authority event, and
+// only the generation captured with the commit distinguishes the two
+// occurrences. A DB failure keeps the committed rotation pending, never
+// reported as supersession.
 async fn confirm_committed_signer_identity(
     state: &AppState,
     app_id: Uuid,
     expected_subject: &str,
     expected_issuer: &str,
-    expected_rotation_count: Option<i64>,
+    expected_generation: i64,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     let mut tx = state
         .db
@@ -2113,8 +2111,8 @@ async fn confirm_committed_signer_identity(
     crate::deploy::lock_app_deployment_lane(&mut tx, app_id)
         .await
         .map_err(|_| signer_publication_pending_error())?;
-    let live: Option<(Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT signer_identity_subject, signer_identity_issuer
+    let live: Option<(Option<String>, Option<String>, i64)> = sqlx::query_as(
+        "SELECT signer_identity_subject, signer_identity_issuer, signer_rotation_generation
            FROM apps
           WHERE id = $1
             AND status <> 'deleting'::app_status_enum",
@@ -2123,30 +2121,16 @@ async fn confirm_committed_signer_identity(
     .fetch_optional(&mut *tx)
     .await
     .map_err(|_| signer_publication_pending_error())?;
-    // A count read failure keeps the committed rotation pending; it must
-    // never be reported as supersession.
-    let live_rotation_count = match expected_rotation_count {
-        Some(_) => Some(
-            count_consumed_signer_rotation_tokens(&mut tx, app_id)
-                .await
-                .map_err(|_| signer_publication_pending_error())?,
-        ),
-        None => None,
-    };
     tx.rollback()
         .await
         .map_err(|_| signer_publication_pending_error())?;
     match live {
-        Some((subject, issuer))
+        Some((subject, issuer, generation))
             if subject.as_deref() == Some(expected_subject)
-                && issuer.as_deref() == Some(expected_issuer) =>
+                && issuer.as_deref() == Some(expected_issuer)
+                && generation == expected_generation =>
         {
-            match (expected_rotation_count, live_rotation_count) {
-                (Some(expected), Some(live)) if live != expected => {
-                    Err(signer_rotation_superseded_error())
-                }
-                _ => Ok(()),
-            }
+            Ok(())
         }
         _ => Err(signer_rotation_superseded_error()),
     }
@@ -2159,14 +2143,14 @@ pub(crate) async fn reconcile_signer_publication(
     app_id: Uuid,
     expected_subject: &str,
     expected_issuer: &str,
-    expected_rotation_count: Option<i64>,
+    expected_generation: i64,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     confirm_committed_signer_identity(
         state,
         app_id,
         expected_subject,
         expected_issuer,
-        expected_rotation_count,
+        expected_generation,
     )
     .await?;
     if state.kbs_policy.is_none() {
@@ -2187,7 +2171,7 @@ pub(crate) async fn reconcile_signer_publication(
             app_id,
             expected_subject,
             expected_issuer,
-            expected_rotation_count,
+            expected_generation,
         )
         .await;
     }
@@ -2254,7 +2238,7 @@ pub(crate) async fn reconcile_signer_publication(
         app_id,
         expected_subject,
         expected_issuer,
-        expected_rotation_count,
+        expected_generation,
     )
     .await?;
     Ok(())
@@ -2271,8 +2255,8 @@ pub async fn rotate_signer(
     Path(app_name): Path<String>,
     Json(body): Json<RotateSignerRequest>,
 ) -> Result<Json<AppResponse>, (StatusCode, Json<serde_json::Value>)> {
-    let committed = rotate_signer_commit(auth, &state, &app_name, body).await?;
-    let app = committed.app;
+    let (app, signer_rotation_generation) =
+        rotate_signer_commit(auth, &state, &app_name, body).await?;
     let expected_subject = app
         .signer_identity_subject
         .as_deref()
@@ -2286,16 +2270,10 @@ pub async fn rotate_signer(
         app.id,
         expected_subject,
         expected_issuer,
-        Some(committed.rotation_count),
+        signer_rotation_generation,
     )
     .await?;
     Ok(Json(app))
-}
-
-// Keep the commit-time fence outside the HTTP AppResponse contract.
-pub(crate) struct CommittedSignerRotation {
-    pub(crate) app: AppResponse,
-    pub(crate) rotation_count: i64,
 }
 
 /// Commit the signer rotation (or initial set) without confirming KBS
@@ -2303,13 +2281,17 @@ pub(crate) struct CommittedSignerRotation {
 /// wrapper can persist the committed result as a publication checkpoint:
 /// the email confirmation token is single-use, so a same-key retry of a
 /// committed rotation may only reconcile publication and replay the saved
-/// result, never re-run this mutation.
+/// result, never re-run this mutation. Returns the committed app response
+/// together with the signer rotation generation established by this
+/// transaction (or the current one for the read-only same-identity
+/// confirmation): a deferred retry compares it against the live generation
+/// so a rotate-back through a later authority event counts as superseded.
 pub(crate) async fn rotate_signer_commit(
     auth: AuthContext,
     state: &AppState,
     app_name: &str,
     body: RotateSignerRequest,
-) -> Result<CommittedSignerRotation, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<(AppResponse, i64), (StatusCode, Json<serde_json::Value>)> {
     scopes::require_owner(&auth)?;
     scopes::require_scope(&auth, "apps:write")?;
     ensure_management_write_allowed(state, &auth).await?;
@@ -2413,19 +2395,14 @@ pub(crate) async fn rotate_signer_commit(
 
     // A current-identity confirmation cannot mutate authority or consume a
     // token. Release the lanes before the caller takes the global publication
-    // fence. The count is still sampled under the lanes so the confirmation
-    // fences rotations that commit after it.
+    // fence; the generation still comes from the row read under the lanes so
+    // the confirmation fences rotations that commit after it.
     if previous_subject.as_deref() == Some(subject.as_str())
         && previous_issuer.as_deref() == Some(issuer.as_str())
     {
-        let rotation_count = count_consumed_signer_rotation_tokens(&mut tx, app.id)
-            .await
-            .map_err(|_| internal_server_error())?;
+        let signer_rotation_generation = app.signer_rotation_generation;
         tx.rollback().await.map_err(|_| internal_server_error())?;
-        return Ok(CommittedSignerRotation {
-            app: app.into(),
-            rotation_count,
-        });
+        return Ok((app.into(), signer_rotation_generation));
     }
 
     let confirmation_token = body
@@ -2573,11 +2550,6 @@ pub(crate) async fn rotate_signer_commit(
     .await
     .map_err(|_| internal_server_error())?;
 
-    // A post-commit read could capture a later rotation after the lanes are released.
-    let rotation_count = count_consumed_signer_rotation_tokens(&mut tx, app.id)
-        .await
-        .map_err(|_| internal_server_error())?;
-
     let app: App = sqlx::query_as("SELECT * FROM apps WHERE id = $1")
         .bind(app.id)
         .fetch_one(&mut *tx)
@@ -2585,10 +2557,8 @@ pub(crate) async fn rotate_signer_commit(
         .map_err(|_| internal_server_error())?;
     tx.commit().await.map_err(|_| internal_server_error())?;
 
-    Ok(CommittedSignerRotation {
-        app: app.into(),
-        rotation_count,
-    })
+    let signer_rotation_generation = app.signer_rotation_generation;
+    Ok((app.into(), signer_rotation_generation))
 }
 
 #[cfg(test)]

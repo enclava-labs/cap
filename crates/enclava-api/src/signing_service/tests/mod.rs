@@ -163,6 +163,7 @@ fn api_app_for_descriptor(
         signer_identity_subject: Some(descriptor.signer_identity.subject.clone()),
         signer_identity_issuer: Some(descriptor.signer_identity.issuer.clone()),
         signer_identity_set_at: Some("2026-04-01T00:00:00Z".parse().unwrap()),
+        signer_rotation_generation: 1,
         source_provider: None,
         source_repository: None,
         egress_allowlist: sqlx::types::Json(Vec::new()),

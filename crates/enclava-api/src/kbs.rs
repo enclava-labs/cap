@@ -424,18 +424,11 @@ async fn reconcile_legacy_rego_policy_with_client(
         let next_policy = replace_owner_bindings_block(&next_policy, &bindings)?;
         let policy_sha256_hex = hex::encode(Sha256::digest(next_policy.as_bytes()));
 
-        // Keep the same target across a successful CM write and later unchanged reads.
-        let resource_version = if next_policy == *current_policy {
-            configmap
-                .metadata
-                .resource_version
-                .take()
-                .ok_or(KbsPolicyError::InvalidPolicyGeneration)?
-        } else {
+        if next_policy != *current_policy {
             configmap
                 .data
                 .get_or_insert_with(BTreeMap::new)
-                .insert(config.policy_key.clone(), next_policy.clone());
+                .insert(config.policy_key.clone(), next_policy);
             match bounded_kube_write(cm_api.replace(
                 &config.configmap_name,
                 &PostParams::default(),
@@ -443,16 +436,16 @@ async fn reconcile_legacy_rego_policy_with_client(
             ))
             .await
             {
-                Ok(updated) => updated
-                    .metadata
-                    .resource_version
-                    .ok_or(KbsPolicyError::InvalidPolicyGeneration)?,
+                Ok(_) => {}
                 Err(KbsPolicyError::Kube(error)) if is_kubernetes_conflict(&error) => continue,
                 Err(error) => return Err(error),
             }
-        };
-        let publication_token =
-            legacy_publication_token(config, &resource_version, &policy_sha256_hex);
+        }
+        // The token binds the stable target identity to the policy content,
+        // so it survives a successful ConfigMap write and later unchanged
+        // reads; metadata-only ConfigMap churn never mints a new rollout
+        // target.
+        let publication_token = legacy_publication_token(config, &policy_sha256_hex);
 
         // If signed authority committed after the ConfigMap CAS, let it
         // repair the brief legacy write before this call returns.
@@ -477,19 +470,22 @@ async fn reconcile_legacy_rego_policy_with_client(
                 .await;
         }
 
-        // Re-read after the rollout. A ConfigMap that changed underneath it
-        // (external writer or a signed acceptance) must not be reported as a
-        // converged legacy publication; re-render and converge again.
+        // Re-read after the rollout. A ConfigMap whose policy content changed
+        // underneath it (external writer or a signed acceptance) must not be
+        // reported as a converged legacy publication; re-render and converge
+        // again. Metadata-only churn is not a policy change.
         let configmap_after = cm_api.get(&config.configmap_name).await?;
         let policy_after = configmap_after
             .data
             .as_ref()
             .and_then(|data| data.get(&config.policy_key))
             .ok_or_else(|| KbsPolicyError::MissingPolicyKey(config.policy_key.clone()))?;
-        if policy_after != &next_policy {
-            continue;
-        }
-        if configmap_after.metadata.resource_version.as_deref() != Some(resource_version.as_str()) {
+        let expected_policy = configmap
+            .data
+            .as_ref()
+            .and_then(|data| data.get(&config.policy_key))
+            .ok_or_else(|| KbsPolicyError::MissingPolicyKey(config.policy_key.clone()))?;
+        if policy_after != expected_policy {
             continue;
         }
         return Ok(());
@@ -1673,13 +1669,9 @@ fn is_signed_policy_artifact_body(policy: &str) -> bool {
 }
 
 // Legacy tokens must not populate the signed generation/hash annotations.
-fn legacy_publication_token(
-    config: &KbsPolicyConfig,
-    resource_version: &str,
-    policy_sha256_hex: &str,
-) -> String {
+fn legacy_publication_token(config: &KbsPolicyConfig, policy_sha256_hex: &str) -> String {
     format!(
-        "legacy:{}/{}/{}:{resource_version}:{policy_sha256_hex}",
+        "legacy:{}/{}/{}:{policy_sha256_hex}",
         config.namespace, config.configmap_name, config.policy_key
     )
 }
@@ -4559,6 +4551,17 @@ resource_bindings := {
             .scope(client, async {
                 reconcile_policy(&pool, Some(&config)).await.unwrap();
                 reconcile_policy(&pool, Some(&config)).await.unwrap();
+
+                // External metadata-only churn: resourceVersion, labels, and
+                // an unrelated data key advance without a policy change, so
+                // the converged publication must not rewrite anything.
+                let mut guard = provider.lock().await;
+                guard.configmap["metadata"]["resourceVersion"] = serde_json::json!("2");
+                guard.configmap["metadata"]["labels"] =
+                    serde_json::json!({"team": "platform"});
+                guard.configmap["data"]["unrelated.txt"] = serde_json::json!("noise");
+                drop(guard);
+
                 reconcile_policy(&pool, Some(&config)).await.unwrap();
             })
             .await;

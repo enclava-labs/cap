@@ -2867,6 +2867,7 @@ mod tests {
             signer_identity_subject: None,
             signer_identity_issuer: None,
             signer_identity_set_at: None,
+            signer_rotation_generation: 0,
             source_provider: None,
             source_repository: None,
             egress_allowlist: Json(Vec::new()),
@@ -3577,6 +3578,7 @@ mod tests {
             signer_identity_subject: None,
             signer_identity_issuer: None,
             signer_identity_set_at: None,
+            signer_rotation_generation: 0,
             source_provider: None,
             source_repository: None,
             egress_allowlist: Json(Vec::new()),
@@ -3650,6 +3652,38 @@ mod tests {
             claimed.decode_payload(),
             Err(DeploymentJobError::InvalidPayload)
         ));
+    }
+
+    #[test]
+    fn legacy_app_snapshot_preserves_its_durable_payload_hash() {
+        let app = test_app(Uuid::new_v4(), Uuid::new_v4());
+        let mut value = serde_json::to_value(test_payload(&app)).unwrap();
+        value["app"]
+            .as_object_mut()
+            .unwrap()
+            .remove("signer_rotation_generation");
+        let accepted_hash = canonical_payload_hash(&value).unwrap();
+        let claimed = ClaimedJob {
+            deployment_id: Uuid::new_v4(),
+            app_id: app.id,
+            org_id: app.org_id,
+            source_deployment_id: Uuid::new_v4(),
+            payload_version: JOB_PAYLOAD_VERSION,
+            lock_token: Uuid::new_v4(),
+            payload: value,
+            payload_sha256: accepted_hash.to_vec(),
+            cleanup_app_on_setup_failure: false,
+            signed_required: false,
+            artifact_deployment_id: None,
+            artifact_descriptor_core_hash: None,
+            log_encryption: None,
+        };
+        let restored = claimed.decode_payload().expect("resume the legacy job");
+        assert_eq!(
+            restored.canonical_value_and_hash().unwrap().1,
+            accepted_hash,
+            "resuming a pre-generation snapshot must retain its accepted payload hash"
+        );
     }
 
     #[test]
