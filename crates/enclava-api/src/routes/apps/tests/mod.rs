@@ -760,3 +760,167 @@ async fn signer_rotation_token_rejects_api_key_before_database_access() {
 
     assert_eq!(err.0, StatusCode::FORBIDDEN);
 }
+
+#[tokio::test]
+async fn teardown_failure_after_supersede_keeps_deleting() {
+    let database_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
+    let pool = sqlx::PgPool::connect(&database_url)
+        .await
+        .expect("connect delete-atomicity test database");
+    crate::db::pool::run_migrations(&pool)
+        .await
+        .expect("migrate delete-atomicity test database");
+    let auth = crate::test_support::auth_context(Role::Admin, &["apps:write"]);
+    let org_id = auth.org_id;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    sqlx::query(
+        "INSERT INTO users (id, display_name)
+         VALUES ($1, 'Supersede Restore Test') ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(auth.user_id)
+    .execute(&pool)
+    .await
+    .expect("insert user");
+    sqlx::query("INSERT INTO organizations (id, name, cust_slug) VALUES ($1, $2, $3)")
+        .bind(org_id)
+        .bind(format!("supersede-{}", &suffix[..8]))
+        .bind(&suffix[..8])
+        .execute(&pool)
+        .await
+        .expect("insert organization");
+    sqlx::query(
+        "INSERT INTO memberships (user_id, org_id, role, removed_at)
+         VALUES ($1, $2, 'admin'::role_enum, NULL)",
+    )
+    .bind(auth.user_id)
+    .bind(org_id)
+    .execute(&pool)
+    .await
+    .expect("insert membership");
+
+    let app_id = uuid::Uuid::new_v4();
+    let app_name = format!("supersede-{}", &suffix[..8]);
+    let namespace = format!("cap-{}", &suffix[..8]);
+    let domain = format!("{}-sp.example.test", &suffix[..8]);
+    let tee_domain = format!("{}-sp.tee.example.test", &suffix[..8]);
+    sqlx::query(
+        "INSERT INTO apps (
+             id, org_id, name, namespace, instance_id, tenant_id,
+             service_account, bootstrap_owner_pubkey_hash,
+             tenant_instance_identity_hash, domain, tee_domain, status
+         ) VALUES ($1, $2, $5, $6, $7, $7, 'cap-supersede-sa',
+                   $3, $4, $8, $9, 'running'::app_status_enum)",
+    )
+    .bind(app_id)
+    .bind(org_id)
+    .bind("00".repeat(32))
+    .bind("11".repeat(32))
+    .bind(&app_name)
+    .bind(&namespace)
+    .bind(&suffix)
+    .bind(&domain)
+    .bind(&tee_domain)
+    .execute(&pool)
+    .await
+    .expect("insert app");
+
+    // A live (watching) deployment with its queued apply job: the delete's
+    // flip transaction will supersede it. A nonterminal deployment requires
+    // its apply job row at INSERT time (schema trigger), while the job's
+    // deployment reference is deferred.
+    let live_deployment = uuid::Uuid::new_v4();
+    let mut fx = pool.begin().await.expect("begin deployment fixture");
+    sqlx::query(
+        "INSERT INTO deployment_apply_jobs (
+             deployment_id, app_id, org_id, source_deployment_id,
+             payload_version, payload, payload_sha256,
+             cleanup_app_on_setup_failure, signed_required,
+             artifact_deployment_id, artifact_descriptor_core_hash,
+             log_encryption, state
+         ) VALUES ($1, $2, $3, $1, 1,
+                   '{\"version\":1,\"log_encryption\":null}'::jsonb,
+                   $4, true, false, NULL, NULL, NULL, 'pending')",
+    )
+    .bind(live_deployment)
+    .bind(app_id)
+    .bind(org_id)
+    .bind(vec![5u8; 32])
+    .execute(&mut *fx)
+    .await
+    .expect("insert apply job");
+    sqlx::query(
+        "INSERT INTO deployments (id, org_id, app_id, status, spec_snapshot)
+         VALUES ($1, $2, $3, 'watching'::deploy_status_enum, '{}'::jsonb)",
+    )
+    .bind(live_deployment)
+    .bind(org_id)
+    .bind(app_id)
+    .execute(&mut *fx)
+    .await
+    .expect("insert watching deployment");
+    fx.commit().await.expect("commit deployment fixture");
+
+    sqlx::query(
+        "UPDATE kbs_signed_policy_reconciliation
+            SET desired_generation = 0, configmap_generation = 0,
+                applied_generation = 0",
+    )
+    .execute(&pool)
+    .await
+    .expect("reset signed policy reconciliation");
+
+    let mut state = unreachable_tee_state();
+    state.db = pool.clone();
+
+    let (status, body) = crate::routes::apps::delete_app_before(
+        crate::test_support::auth_context(Role::Admin, &["apps:write"]),
+        State(state),
+        Path(app_name),
+        None,
+    )
+    .await
+    .expect_err("unreachable teardown must fail the delete");
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{:?}", body.0);
+    assert_eq!(body.0["error"], "app_delete_teardown_unavailable");
+    let post_failure: String = sqlx::query_scalar("SELECT status::text FROM apps WHERE id = $1")
+        .bind(app_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read post-failure status");
+    assert_eq!(
+        post_failure, "deleting",
+        "a teardown failure after this attempt superseded the watching deployment must not \
+         restore the status: the app is no longer unchanged"
+    );
+    let superseded_live: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM deployments WHERE id = $1 AND status = 'failed'")
+            .bind(live_deployment)
+            .fetch_one(&pool)
+            .await
+            .expect("read superseded deployment status");
+    assert_eq!(
+        superseded_live, 1,
+        "the watching deployment was superseded by the delete flip"
+    );
+
+    // Expire this attempt's finite lease quarantine so the teardown cascades.
+    for statement in [
+        "DELETE FROM app_mutation_leases WHERE app_id = $1",
+        "UPDATE external_resource_mutation_leases
+            SET locked_until = clock_timestamp() - interval '2 seconds',
+                reclaim_after = clock_timestamp() - interval '1 second'
+          WHERE operation_id = $1 AND reclaim_after <> 'infinity'::timestamptz",
+    ] {
+        sqlx::query(statement)
+            .bind(app_id)
+            .execute(&pool)
+            .await
+            .expect("expire attempt lease quarantine");
+    }
+    sqlx::query("DELETE FROM organizations WHERE id = $1")
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("delete fixture organization");
+}

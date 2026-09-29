@@ -1432,34 +1432,35 @@ pub(crate) async fn delete_app_before(
     .execute(&mut *phase_tx)
     .await
     .map_err(|_| internal_server_error())?;
-    match crate::deploy::supersede_incomplete_deployments(&mut phase_tx, phase_app.id).await {
-        Ok(_) => {}
-        Err(crate::deploy::SupersedeDeploymentError::Busy) => {
-            // A deployment mutation is still in progress, so this delete is
-            // known-not-applied: only the in-transaction `status = 'deleting'`
-            // transition ran, and it is discarded by the rollback below. The
-            // delete mutation lease must be released too — leaving it abandoned
-            // (Drop only stops the heartbeat; the lock rows persist until
-            // quarantine expiry) would block a same-key retry from re-claiming
-            // until then, turning the cancel disposition into a self-inflicted
-            // busy loop on this app's own abandoned lease.
-            phase_tx
-                .rollback()
-                .await
-                .map_err(|_| internal_server_error())?;
-            delete_mutation
-                .finish()
-                .await
-                .map_err(|_| internal_server_error())?;
-            return Err((
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({"error": "deployment mutation is still in progress"})),
-            ));
-        }
-        Err(crate::deploy::SupersedeDeploymentError::Database(_)) => {
-            return Err(internal_server_error());
-        }
-    }
+    let superseded_by_this_attempt: u64 =
+        match crate::deploy::supersede_incomplete_deployments(&mut phase_tx, phase_app.id).await {
+            Ok(superseded) => superseded,
+            Err(crate::deploy::SupersedeDeploymentError::Busy) => {
+                // A deployment mutation is still in progress, so this delete is
+                // known-not-applied: only the in-transaction `status = 'deleting'`
+                // transition ran, and it is discarded by the rollback below. The
+                // delete mutation lease must be released too — leaving it abandoned
+                // (Drop only stops the heartbeat; the lock rows persist until
+                // quarantine expiry) would block a same-key retry from re-claiming
+                // until then, turning the cancel disposition into a self-inflicted
+                // busy loop on this app's own abandoned lease.
+                phase_tx
+                    .rollback()
+                    .await
+                    .map_err(|_| internal_server_error())?;
+                delete_mutation
+                    .finish()
+                    .await
+                    .map_err(|_| internal_server_error())?;
+                return Err((
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({"error": "deployment mutation is still in progress"})),
+                ));
+            }
+            Err(crate::deploy::SupersedeDeploymentError::Database(_)) => {
+                return Err(internal_server_error());
+            }
+        };
     phase_tx
         .commit()
         .await
@@ -1534,13 +1535,19 @@ pub(crate) async fn delete_app_before(
         .map_err(|_| internal_server_error())?;
     if let Err(failure) = teardown {
         // A failed teardown exits before any fenced resource is touched: the
-        // workload is intact, so the delete is atomic — restore the pre-delete
-        // status instead of stranding the app in 'deleting' (unless it was
-        // already 'deleting' from an earlier attempt, whose pre-attempt status
-        // is unknown). A failure AFTER teardown keeps 'deleting': its wrap is
-        // erased, and the retry (skipping teardown via the monotonic
-        // completion marker) must finish the cleanup.
-        if phase_app.status != AppStatus::Deleting {
+        // delete is atomic — restore the pre-delete status instead of
+        // stranding the app in 'deleting' — but only when this attempt
+        // really left the app unchanged. If the flip transaction
+        // superseded a nonterminal deployment, that deployment is now
+        // failed and a status flip alone would present an app whose
+        // serving state cannot be reconstructed (its live operation is
+        // terminal): keep 'deleting' (wired and retryable under the
+        // teardown-pending rules) instead. A failure AFTER teardown keeps
+        // 'deleting': its wrap is erased, and the retry (skipping teardown
+        // via the monotonic completion marker) must finish the cleanup.
+        // (unless it was already 'deleting' from an earlier attempt, whose
+        // pre-attempt status is unknown)
+        if phase_app.status != AppStatus::Deleting && superseded_by_this_attempt == 0 {
             sqlx::query(
                 "UPDATE apps
                     SET status = $2::app_status_enum,
