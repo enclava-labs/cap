@@ -9281,7 +9281,7 @@ mod tests {
                         assert!(path.contains("/daemonsets/") || path.contains("/deployments/"), "unexpected provider request {path}");
                         serde_json::json!({"apiVersion":"apps/v1", "kind": if path.contains("/daemonsets/") {"DaemonSet"} else {"Deployment"},
                             "metadata":metadata, "spec":{"replicas":1, "selector":{}, "template":{"metadata":{}, "spec":{"containers":[]}}},
-                            "status":{"readyReplicas":1, "availableReplicas":1, "updatedReplicas":1, "observedGeneration":1}})
+                            "status":{"replicas":1, "readyReplicas":1, "availableReplicas":1, "updatedReplicas":1, "observedGeneration":1}})
                     };
                     (StatusCode::OK, Json(resource))
                 }
@@ -9522,7 +9522,7 @@ mod tests {
                             assert!(path.contains("/daemonsets/") || path.contains("/deployments/"), "unexpected provider request {path}");
                             serde_json::json!({"apiVersion":"apps/v1", "kind": if path.contains("/daemonsets/") {"DaemonSet"} else {"Deployment"},
                                 "metadata":metadata, "spec":{"replicas":1, "selector":{}, "template":{"metadata":{}, "spec":{"containers":[]}}},
-                                "status":{"readyReplicas":1, "availableReplicas":1, "updatedReplicas":1, "observedGeneration":1}})
+                                "status":{"replicas":1, "readyReplicas":1, "availableReplicas":1, "updatedReplicas":1, "observedGeneration":1}})
                         };
                         (StatusCode::OK, Json(resource))
                     }

@@ -299,6 +299,16 @@ same image and init-data measurements. Those measurements do not bind the old
 entry to the new workload instance. Fresh deployments must authorize through
 signed-policy candidates instead of readmitting the old legacy binding.
 
+Legacy Rego publication is confirmed only when the Trustee pod template carries
+the token for the exact ConfigMap identity, resourceVersion, and policy hash,
+and that rollout is ready. An unmarked legacy install needs one adoption
+rollout; converged retries write neither the ConfigMap nor the Deployment.
+A failed Deployment update is retried. If the template token was already
+stored, retries wait for that rollout without creating another generation.
+Both legacy and signed publication wait for old replicas to leave and all
+updated replicas to become available. A changed ConfigMap or signed-authority
+handoff during confirmation must be reconciled before success is returned.
+
 ## Smoke Checks
 
 After rollout:

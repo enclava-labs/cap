@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, HashSet};
 
-use chrono::Utc;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::ConfigMap;
 use kube::api::{Api, PostParams};
@@ -368,24 +367,12 @@ pub(crate) async fn load_legacy_tls_bindings(
     Ok(bindings)
 }
 
-/// Recheck signed authority on each CAS retry so a concurrent signed acceptance
-/// fences legacy writers.
+/// An unchanged ConfigMap may still have an unfinished Trustee rollout.
 async fn reconcile_legacy_rego_policy_with_client(
     db: &PgPool,
     config: &KbsPolicyConfig,
     client: kube::Client,
 ) -> Result<(), KbsPolicyError> {
-    let bindings: Vec<KbsOwnerBinding> = sqlx::query_as(
-        "SELECT binding_key, repository, allowed_tags, namespace, service_account,
-                tenant_instance_identity_hash
-         FROM kbs_owner_bindings
-         WHERE deleted_at IS NULL
-         ORDER BY binding_key",
-    )
-    .fetch_all(db)
-    .await?;
-    let tls_bindings = load_legacy_tls_bindings(db).await?;
-
     let cm_api: Api<ConfigMap> = Api::namespaced(client.clone(), &config.namespace);
     for _ in 0..KUBERNETES_CAS_ATTEMPTS {
         // Recheck on every retry. A signed acceptance that commits after the
@@ -414,38 +401,85 @@ async fn reconcile_legacy_rego_policy_with_client(
             return reconcile_pending_signed_policy_artifacts_with_client(db, config, None, client)
                 .await;
         }
+        // Read authority after the ConfigMap version, so a competing publication
+        // forces a CAS retry and a fresh authority snapshot.
+        let bindings: Vec<KbsOwnerBinding> = sqlx::query_as(
+            "SELECT binding_key, repository, allowed_tags, namespace, service_account,
+                tenant_instance_identity_hash
+         FROM kbs_owner_bindings
+         WHERE deleted_at IS NULL
+         ORDER BY binding_key",
+        )
+        .fetch_all(db)
+        .await?;
+        let tls_bindings = load_legacy_tls_bindings(db).await?;
         let next_policy = replace_tls_resource_bindings_block(current_policy, &tls_bindings)?;
         let next_policy = replace_owner_bindings_block(&next_policy, &bindings)?;
-        if next_policy == *current_policy {
-            return Ok(());
+        let policy_sha256_hex = hex::encode(Sha256::digest(next_policy.as_bytes()));
+
+        // Keep the same target across a successful CM write and later unchanged reads.
+        let resource_version = if next_policy == *current_policy {
+            configmap
+                .metadata
+                .resource_version
+                .take()
+                .ok_or(KbsPolicyError::InvalidPolicyGeneration)?
+        } else {
+            configmap
+                .data
+                .get_or_insert_with(BTreeMap::new)
+                .insert(config.policy_key.clone(), next_policy.clone());
+            match bounded_kube_write(cm_api.replace(
+                &config.configmap_name,
+                &PostParams::default(),
+                &configmap,
+            ))
+            .await
+            {
+                Ok(updated) => updated
+                    .metadata
+                    .resource_version
+                    .ok_or(KbsPolicyError::InvalidPolicyGeneration)?,
+                Err(KbsPolicyError::Kube(error)) if is_kubernetes_conflict(&error) => continue,
+                Err(error) => return Err(error),
+            }
+        };
+        let publication_token =
+            legacy_publication_token(config, &resource_version, &policy_sha256_hex);
+
+        // If signed authority committed after the ConfigMap CAS, let it
+        // repair the brief legacy write before this call returns.
+        if signed_policy_mode_active(db).await? {
+            return reconcile_pending_signed_policy_artifacts_with_client(db, config, None, client)
+                .await;
+        }
+        if converge_legacy_trustee_publication(db, client.clone(), config, &publication_token)
+            .await?
+            == GenerationDecision::Superseded
+        {
+            continue;
+        }
+        if signed_policy_mode_active(db).await? {
+            return reconcile_pending_signed_policy_artifacts_with_client(db, config, None, client)
+                .await;
         }
 
-        configmap
+        // Re-read after the rollout. A ConfigMap that changed underneath it
+        // (external writer or a signed acceptance) must not be reported as a
+        // converged legacy publication; re-render and converge again.
+        let configmap_after = cm_api.get(&config.configmap_name).await?;
+        let policy_after = configmap_after
             .data
-            .get_or_insert_with(BTreeMap::new)
-            .insert(config.policy_key.clone(), next_policy);
-        match bounded_kube_write(cm_api.replace(
-            &config.configmap_name,
-            &PostParams::default(),
-            &configmap,
-        ))
-        .await
-        {
-            Ok(_) => {
-                // If signed authority committed after the ConfigMap CAS, let
-                // it repair the brief legacy write before this call returns.
-                if signed_policy_mode_active(db).await? {
-                    return reconcile_pending_signed_policy_artifacts_with_client(
-                        db, config, None, client,
-                    )
-                    .await;
-                }
-                restart_trustee_deployment(client, config).await?;
-                return Ok(());
-            }
-            Err(KbsPolicyError::Kube(error)) if is_kubernetes_conflict(&error) => continue,
-            Err(error) => return Err(error),
+            .as_ref()
+            .and_then(|data| data.get(&config.policy_key))
+            .ok_or_else(|| KbsPolicyError::MissingPolicyKey(config.policy_key.clone()))?;
+        if policy_after != &next_policy {
+            continue;
         }
+        if configmap_after.metadata.resource_version.as_deref() != Some(resource_version.as_str()) {
+            continue;
+        }
+        return Ok(());
     }
     Err(KbsPolicyError::PolicyCasExhausted)
 }
@@ -1484,6 +1518,28 @@ async fn converge_trustee_policy_generation(
     Err(KbsPolicyError::PolicyCasExhausted)
 }
 
+fn deployment_rollout_is_ready(deployment: &Deployment) -> bool {
+    let desired = deployment
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.replicas)
+        .unwrap_or(1);
+    let status = deployment.status.as_ref();
+    let observed = status
+        .and_then(|status| status.observed_generation)
+        .unwrap_or(0);
+    let generation = deployment.metadata.generation.unwrap_or(0);
+    let replicas = status.and_then(|status| status.replicas).unwrap_or(0);
+    let updated = status
+        .and_then(|status| status.updated_replicas)
+        .unwrap_or(0);
+    let available = status
+        .and_then(|status| status.available_replicas)
+        .unwrap_or(0);
+    // Available replicas can still belong to the old policy's ReplicaSet.
+    observed >= generation && updated >= desired && replicas == updated && available >= updated
+}
+
 async fn wait_for_deployment_policy_generation(
     deploy_api: &Api<Deployment>,
     name: &str,
@@ -1525,26 +1581,7 @@ async fn wait_for_deployment_policy_generation(
             return Err(KbsPolicyError::PolicyGenerationConflict);
         }
 
-        let spec_replicas = deployment
-            .spec
-            .as_ref()
-            .and_then(|spec| spec.replicas)
-            .unwrap_or(1);
-        let status = deployment.status.as_ref();
-        let observed = status
-            .and_then(|status| status.observed_generation)
-            .unwrap_or(0);
-        let kubernetes_generation = deployment.metadata.generation.unwrap_or(0);
-        let updated = status
-            .and_then(|status| status.updated_replicas)
-            .unwrap_or(0);
-        let available = status
-            .and_then(|status| status.available_replicas)
-            .unwrap_or(0);
-        if observed >= kubernetes_generation
-            && updated >= spec_replicas
-            && available >= spec_replicas
-        {
+        if deployment_rollout_is_ready(&deployment) {
             return Ok(GenerationDecision::Current);
         }
         if start.elapsed() >= timeout {
@@ -1612,27 +1649,67 @@ fn is_signed_policy_artifact_body(policy: &str) -> bool {
     is_single || is_set
 }
 
-async fn restart_trustee_deployment(
+// Legacy tokens must not populate the signed generation/hash annotations.
+fn legacy_publication_token(
+    config: &KbsPolicyConfig,
+    resource_version: &str,
+    policy_sha256_hex: &str,
+) -> String {
+    format!(
+        "legacy:{}/{}/{}:{resource_version}:{policy_sha256_hex}",
+        config.namespace, config.configmap_name, config.policy_key
+    )
+}
+
+// Missing durable signed authority is a conflict, not permission to downgrade its template.
+async fn converge_legacy_trustee_publication(
+    db: &PgPool,
     client: kube::Client,
     config: &KbsPolicyConfig,
-) -> Result<(), KbsPolicyError> {
+    publication_token: &str,
+) -> Result<GenerationDecision, KbsPolicyError> {
     let deploy_api: Api<Deployment> = Api::namespaced(client, &config.namespace);
-    let restarted_at = Utc::now().to_rfc3339();
     for _ in 0..KUBERNETES_CAS_ATTEMPTS {
+        if signed_policy_mode_active(db).await? {
+            return Ok(GenerationDecision::Superseded);
+        }
         let mut deployment = deploy_api.get(&config.deployment_name).await?;
-        deployment
+        let template_annotations = deployment
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.template.metadata.as_ref())
+            .and_then(|metadata| metadata.annotations.as_ref());
+        if annotated_policy_generation(template_annotations)?.is_some() {
+            if signed_policy_mode_active(db).await? {
+                return Ok(GenerationDecision::Superseded);
+            }
+            return Err(KbsPolicyError::PolicyGenerationConflict);
+        }
+        let existing_token = template_annotations
+            .and_then(|annotations| annotations.get(POLICY_PUBLICATION_TOKEN_ANNOTATION))
+            .map(String::as_str);
+        if existing_token == Some(publication_token) {
+            return wait_for_legacy_publication(
+                &deploy_api,
+                &config.deployment_name,
+                publication_token,
+            )
+            .await;
+        }
+        let template = &mut deployment
             .spec
             .as_mut()
             .ok_or(KbsPolicyError::InvalidPolicyGeneration)?
-            .template
+            .template;
+        let annotations = template
             .metadata
             .get_or_insert_with(Default::default)
             .annotations
-            .get_or_insert_with(BTreeMap::new)
-            .insert(
-                "enclava.dev/cap-policy-restarted-at".to_string(),
-                restarted_at.clone(),
-            );
+            .get_or_insert_with(BTreeMap::new);
+        annotations.insert(
+            POLICY_PUBLICATION_TOKEN_ANNOTATION.to_string(),
+            publication_token.to_string(),
+        );
         match bounded_kube_write(deploy_api.replace(
             &config.deployment_name,
             &PostParams::default(),
@@ -1641,8 +1718,12 @@ async fn restart_trustee_deployment(
         .await
         {
             Ok(_) => {
-                wait_for_deployment_ready(&deploy_api, &config.deployment_name).await?;
-                return Ok(());
+                return wait_for_legacy_publication(
+                    &deploy_api,
+                    &config.deployment_name,
+                    publication_token,
+                )
+                .await;
             }
             Err(KbsPolicyError::Kube(error)) if is_kubernetes_conflict(&error) => continue,
             Err(error) => return Err(error),
@@ -1651,28 +1732,31 @@ async fn restart_trustee_deployment(
     Err(KbsPolicyError::PolicyCasExhausted)
 }
 
-async fn wait_for_deployment_ready(
+async fn wait_for_legacy_publication(
     deploy_api: &Api<Deployment>,
     name: &str,
-) -> Result<(), KbsPolicyError> {
+    publication_token: &str,
+) -> Result<GenerationDecision, KbsPolicyError> {
     let start = Instant::now();
     let timeout = Duration::from_secs(180);
 
     loop {
         let deployment = deploy_api.get(name).await?;
-        let spec_replicas = deployment
+        let annotations = deployment
             .spec
             .as_ref()
-            .and_then(|spec| spec.replicas)
-            .unwrap_or(1);
-        let status = deployment.status.as_ref();
-        let observed = status.and_then(|s| s.observed_generation).unwrap_or(0);
-        let generation = deployment.metadata.generation.unwrap_or(0);
-        let updated = status.and_then(|s| s.updated_replicas).unwrap_or(0);
-        let available = status.and_then(|s| s.available_replicas).unwrap_or(0);
-
-        if observed >= generation && updated >= spec_replicas && available >= spec_replicas {
-            return Ok(());
+            .and_then(|spec| spec.template.metadata.as_ref())
+            .and_then(|metadata| metadata.annotations.as_ref());
+        if annotated_policy_generation(annotations)?.is_some()
+            || annotations
+                .and_then(|annotations| annotations.get(POLICY_PUBLICATION_TOKEN_ANNOTATION))
+                .map(String::as_str)
+                != Some(publication_token)
+        {
+            return Ok(GenerationDecision::Superseded);
+        }
+        if deployment_rollout_is_ready(&deployment) {
+            return Ok(GenerationDecision::Current);
         }
 
         if start.elapsed() >= timeout {
@@ -2111,6 +2195,8 @@ pub fn config_from_env() -> Option<KbsPolicyConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::KbsPolicyProvider;
+    use chrono::Utc;
 
     #[test]
     fn reconciliation_error_display_redacts_upstream_detail() {
@@ -4199,5 +4285,270 @@ resource_bindings := {
                 .await
                 .expect("delete receipt fixture organization");
         }
+    }
+
+    fn legacy_kbs_test_config() -> KbsPolicyConfig {
+        KbsPolicyConfig {
+            namespace: "kbs-test".to_string(),
+            configmap_name: "resource-policy".to_string(),
+            policy_key: "policy.rego".to_string(),
+            deployment_name: "trustee".to_string(),
+            required: true,
+            signed_policy_retention: 6,
+            signed_policy_max_bytes: 900 * 1024,
+        }
+    }
+
+    async fn insert_legacy_owner_binding(pool: &PgPool, app_id: Uuid, binding_key: &str) {
+        sqlx::query(
+            "INSERT INTO kbs_owner_bindings (
+                 app_id, binding_key, repository, namespace, service_account,
+                 tenant_instance_identity_hash
+             ) VALUES ($1, $2, 'default', 'cap-legacy', 'cap-legacy-sa', $3)",
+        )
+        .bind(app_id)
+        .bind(binding_key)
+        .bind("ab".repeat(32))
+        .execute(pool)
+        .await
+        .expect("insert legacy owner binding");
+    }
+
+    #[tokio::test]
+    async fn rollout_waits_for_old_replicas_to_leave() {
+        for signed in [false, true] {
+            let mut fixture = KbsPolicyProvider::new(true);
+            let token = if signed {
+                "signed-publication"
+            } else {
+                "legacy-publication"
+            };
+            let hash = "ab".repeat(32);
+            let mut annotations = serde_json::json!({
+                POLICY_PUBLICATION_TOKEN_ANNOTATION: token,
+            });
+            if signed {
+                annotations[POLICY_GENERATION_ANNOTATION] = serde_json::json!("1");
+                annotations[POLICY_SHA256_ANNOTATION] = serde_json::json!(hash);
+            }
+            fixture.deployment["spec"]["template"]["metadata"]["annotations"] = annotations;
+            fixture.deployment["status"]["replicas"] = serde_json::json!(2);
+            fixture.deployment_gets_before_failure = Some(1);
+            let provider = std::sync::Arc::new(tokio::sync::Mutex::new(fixture));
+            let client = crate::test_support::kbs_policy_kube_client(provider.clone());
+            let api = Api::<Deployment>::namespaced(client, "kbs-test");
+            let pending = if signed {
+                wait_for_deployment_policy_generation(&api, "trustee", 1, &hash, token, false).await
+            } else {
+                wait_for_legacy_publication(&api, "trustee", token).await
+            };
+            assert!(
+                matches!(pending, Err(KbsPolicyError::Kube(_))),
+                "the old ReplicaSet cannot satisfy publication readiness"
+            );
+            provider.lock().await.deployment["status"]["replicas"] = serde_json::json!(1);
+            let ready = if signed {
+                wait_for_deployment_policy_generation(&api, "trustee", 1, &hash, token, false).await
+            } else {
+                wait_for_legacy_publication(&api, "trustee", token).await
+            };
+            assert_eq!(ready.unwrap(), GenerationDecision::Current);
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_wait_rejects_another_publication() {
+        let mut fixture = KbsPolicyProvider::new(true);
+        fixture.deployment["spec"]["template"]["metadata"]["annotations"] = serde_json::json!({
+            POLICY_PUBLICATION_TOKEN_ANNOTATION: "another-publication",
+        });
+        let provider = std::sync::Arc::new(tokio::sync::Mutex::new(fixture));
+        let client = crate::test_support::kbs_policy_kube_client(provider);
+        let api = Api::<Deployment>::namespaced(client, "kbs-test");
+        assert_eq!(
+            wait_for_legacy_publication(&api, "trustee", "expected-publication")
+                .await
+                .unwrap(),
+            GenerationDecision::Superseded,
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_rollout_fails_closed_until_deployment_converges() {
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap187_legacy_fail_closed").await;
+        let (_org_id, app_id) = insert_test_app(&pool, "running").await;
+        insert_legacy_owner_binding(&pool, app_id, "legacy-owner").await;
+        let config = legacy_kbs_test_config();
+        let provider = std::sync::Arc::new(tokio::sync::Mutex::new(KbsPolicyProvider::new(true)));
+        provider.lock().await.deployment_put_failures = usize::MAX;
+        let client = crate::test_support::kbs_policy_kube_client(provider.clone());
+        crate::kbs::TEST_KUBE_CLIENT
+            .scope(client, async {
+                assert!(reconcile_policy(&pool, Some(&config)).await.is_err());
+                assert!(
+                    provider.lock().await.configmap["data"]["policy.rego"]
+                        .as_str()
+                        .unwrap()
+                        .contains("legacy-owner")
+                );
+                assert!(
+                    reconcile_policy(&pool, Some(&config)).await.is_err(),
+                    "an unchanged ConfigMap with an unconverged deployment marker must fail closed"
+                );
+                provider.lock().await.deployment_put_failures = 0;
+                reconcile_policy(&pool, Some(&config)).await.unwrap();
+                reconcile_policy(&pool, Some(&config)).await.unwrap();
+                reconcile_policy(&pool, Some(&config)).await.unwrap();
+            })
+            .await;
+        let guard = provider.lock().await;
+        assert_eq!(
+            guard.configmap_replaces, 1,
+            "recovery must reuse the persisted ConfigMap, not rewrite it"
+        );
+        assert_eq!(
+            guard.deployment_replaces, 1,
+            "converged passes must not rewrite the Trustee template"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_marker_match_still_requires_readiness_without_new_rollout() {
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap187_legacy_readiness").await;
+        let (_org_id, app_id) = insert_test_app(&pool, "running").await;
+        insert_legacy_owner_binding(&pool, app_id, "legacy-owner").await;
+        let config = legacy_kbs_test_config();
+        let provider = std::sync::Arc::new(tokio::sync::Mutex::new(KbsPolicyProvider::new(true)));
+        provider.lock().await.deployment_gets_before_failure = Some(1);
+        let client = crate::test_support::kbs_policy_kube_client(provider.clone());
+        crate::kbs::TEST_KUBE_CLIENT
+            .scope(client, async {
+                assert!(reconcile_policy(&pool, Some(&config)).await.is_err());
+                assert_eq!(provider.lock().await.deployment_replaces, 1);
+                provider.lock().await.deployment_gets_before_failure = Some(1);
+                assert!(reconcile_policy(&pool, Some(&config)).await.is_err());
+                assert_eq!(provider.lock().await.deployment_replaces, 1);
+                reconcile_policy(&pool, Some(&config)).await.unwrap();
+            })
+            .await;
+        let guard = provider.lock().await;
+        assert_eq!(
+            guard.deployment_replaces, 1,
+            "a readiness-only retry must not rewrite the Trustee template"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_converged_passes_perform_no_recurring_writes() {
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap187_legacy_no_churn").await;
+        let config = legacy_kbs_test_config();
+        let mut fixture = KbsPolicyProvider::new(true);
+        let policy = fixture.configmap["data"]["policy.rego"].as_str().unwrap();
+        let policy = replace_tls_resource_bindings_block(policy, &[]).unwrap();
+        let policy = replace_owner_bindings_block(&policy, &[]).unwrap();
+        fixture.configmap["data"]["policy.rego"] = serde_json::json!(policy);
+        let provider = std::sync::Arc::new(tokio::sync::Mutex::new(fixture));
+        let client = crate::test_support::kbs_policy_kube_client(provider.clone());
+        crate::kbs::TEST_KUBE_CLIENT
+            .scope(client, async {
+                reconcile_policy(&pool, Some(&config)).await.unwrap();
+                reconcile_policy(&pool, Some(&config)).await.unwrap();
+                reconcile_policy(&pool, Some(&config)).await.unwrap();
+            })
+            .await;
+        let guard = provider.lock().await;
+        assert_eq!(
+            guard.configmap_replaces, 0,
+            "an unchanged ConfigMap must not be rewritten for template adoption"
+        );
+        assert_eq!(
+            guard.deployment_replaces, 1,
+            "one adoption rollout, then zero recurring Trustee rewrites"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_rollout_reconverges_when_configmap_changes_mid_rollout() {
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap187_legacy_reconverge").await;
+        let (_org_id, app_id) = insert_test_app(&pool, "running").await;
+        insert_legacy_owner_binding(&pool, app_id, "legacy-owner").await;
+        let config = legacy_kbs_test_config();
+        let mut fixture = KbsPolicyProvider::new(true);
+        let mut replacement = fixture.configmap.clone();
+        replacement["metadata"]["resourceVersion"] = serde_json::json!("external-rewrite");
+        fixture.replace_configmap_on_next_deployment_get = Some(replacement);
+        let provider = std::sync::Arc::new(tokio::sync::Mutex::new(fixture));
+        let client = crate::test_support::kbs_policy_kube_client(provider.clone());
+        crate::kbs::TEST_KUBE_CLIENT
+            .scope(client, async {
+                reconcile_policy(&pool, Some(&config)).await.unwrap();
+            })
+            .await;
+        let guard = provider.lock().await;
+        assert_eq!(
+            guard.configmap_replaces, 2,
+            "the externally replaced ConfigMap must be republished"
+        );
+        assert_eq!(
+            guard.deployment_replaces, 2,
+            "the new publication must trigger a fresh rollout"
+        );
+        assert!(
+            guard.configmap["data"]["policy.rego"]
+                .as_str()
+                .unwrap()
+                .contains("legacy-owner")
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_rollout_hands_off_to_signed_authority() {
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap187_legacy_signed_handoff").await;
+        let (org_id, app_id) = insert_test_app(&pool, "running").await;
+        insert_legacy_owner_binding(&pool, app_id, "legacy-owner").await;
+        let config = legacy_kbs_test_config();
+        let provider = std::sync::Arc::new(tokio::sync::Mutex::new(KbsPolicyProvider::new(true)));
+        provider.lock().await.deployment_gets_before_failure = Some(1);
+        let client = crate::test_support::kbs_policy_kube_client(provider.clone());
+        crate::kbs::TEST_KUBE_CLIENT
+            .scope(client, async {
+                assert!(reconcile_policy(&pool, Some(&config)).await.is_err());
+
+                let signer = "bb".repeat(32);
+                insert_test_keyring_version(&pool, org_id, 1, &[&signer]).await;
+                let deployment = Uuid::new_v4();
+                insert_test_deployment(&pool, org_id, app_id, deployment, "healthy", Utc::now())
+                    .await;
+                let artifact = insert_test_artifact(&pool, app_id, deployment, "aa").await;
+                sqlx::query(
+                    "UPDATE kbs_signed_policy_reconciliation
+                    SET desired_generation = 1
+                  WHERE singleton",
+                )
+                .execute(&pool)
+                .await
+                .expect("activate signed policy mode");
+
+                reconcile_policy(&pool, Some(&config)).await.unwrap();
+                let guard = provider.lock().await;
+                let body = guard.configmap["data"]["policy.rego"].as_str().unwrap();
+                assert!(
+                    body.contains(&artifact.metadata.descriptor_core_hash),
+                    "the signed artifact set must replace the legacy Rego body"
+                );
+                let annotations = &guard.deployment["spec"]["template"]["metadata"]["annotations"];
+                assert_eq!(
+                    annotations["enclava.dev/cap-policy-generation"]
+                        .as_str()
+                        .unwrap(),
+                    "1"
+                );
+            })
+            .await;
     }
 }

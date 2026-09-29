@@ -2236,8 +2236,12 @@ pub(crate) mod test_support {
     pub(crate) struct KbsPolicyProvider {
         pub(crate) healthy: bool,
         pub(crate) configmap: serde_json::Value,
-        deployment: serde_json::Value,
+        pub(crate) deployment: serde_json::Value,
         pub(crate) configmap_replaces: usize,
+        pub(crate) deployment_replaces: usize,
+        pub(crate) deployment_put_failures: usize,
+        pub(crate) deployment_gets_before_failure: Option<usize>,
+        pub(crate) replace_configmap_on_next_deployment_get: Option<serde_json::Value>,
     }
 
     impl KbsPolicyProvider {
@@ -2283,6 +2287,10 @@ pub(crate) mod test_support {
                     },
                 }),
                 configmap_replaces: 0,
+                deployment_replaces: 0,
+                deployment_put_failures: 0,
+                deployment_gets_before_failure: None,
+                replace_configmap_on_next_deployment_get: None,
             }
         }
 
@@ -2365,7 +2373,41 @@ pub(crate) mod test_support {
                         return respond(200, &provider.configmap);
                     }
                     if method == "PUT" {
+                        if provider.deployment_put_failures > 0 {
+                            provider.deployment_put_failures -= 1;
+                            return respond(
+                                500,
+                                &serde_json::json!({
+                                    "apiVersion": "v1", "kind": "Status", "status": "Failure",
+                                    "reason": "InternalError",
+                                    "message": "injected deployment write failure",
+                                    "code": 500,
+                                }),
+                            );
+                        }
+                        provider.deployment_replaces += 1;
                         provider.deployment = object;
+                    } else {
+                        if let Some(configmap) =
+                            provider.replace_configmap_on_next_deployment_get.take()
+                        {
+                            provider.configmap = configmap;
+                        }
+                        if let Some(remaining) = provider.deployment_gets_before_failure {
+                            if remaining == 0 {
+                                provider.deployment_gets_before_failure = None;
+                                return respond(
+                                    500,
+                                    &serde_json::json!({
+                                        "apiVersion": "v1", "kind": "Status", "status": "Failure",
+                                        "reason": "InternalError",
+                                        "message": "injected deployment readiness failure",
+                                        "code": 500,
+                                    }),
+                                );
+                            }
+                            provider.deployment_gets_before_failure = Some(remaining - 1);
+                        }
                     }
                     respond(200, &provider.deployment)
                 }
