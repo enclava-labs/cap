@@ -1180,11 +1180,12 @@ pub async fn create_app(
         service_account, bootstrap_owner_pubkey_hash, tenant_instance_identity_hash,
          unlock_mode, domain, tee_domain,
          signer_identity_subject, signer_identity_issuer, signer_identity_set_at,
+         signer_rotation_generation,
         source_provider, source_repository, egress_allowlist, egress_mode)
-         SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10::unlock_enum, $11, $12, $13, $14, $15, $16, $17, $18, $19
+         SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10::unlock_enum, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20
          WHERE NOT EXISTS (
              SELECT 1 FROM kbs_owner_seed_waivers
-              WHERE binding_key = $20
+              WHERE binding_key = $21
          )",
     )
     .bind(app_id)
@@ -1202,6 +1203,7 @@ pub async fn create_app(
     .bind(app_candidate.signer_identity_subject.as_deref())
     .bind(app_candidate.signer_identity_issuer.as_deref())
     .bind(app_candidate.signer_identity_set_at)
+    .bind(app_candidate.signer_rotation_generation)
     .bind(app_candidate.source_provider.as_deref())
     .bind(app_candidate.source_repository.as_deref())
     .bind(&app_candidate.egress_allowlist)
