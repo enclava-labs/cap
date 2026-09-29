@@ -2453,7 +2453,7 @@ fn signer_publication_pending_error() -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
-pub(crate) fn signer_rotation_superseded_error() -> (StatusCode, Json<serde_json::Value>) {
+fn signer_rotation_superseded_error() -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::CONFLICT,
         Json(serde_json::json!({
@@ -2467,12 +2467,27 @@ pub(crate) fn signer_rotation_superseded_error() -> (StatusCode, Json<serde_json
     )
 }
 
-// Release authority lanes before external KBS work; reacquire to detect supersession.
+// Reads are serialized by the org/app authority lanes; the ledger is append-only.
+async fn count_consumed_signer_rotation_tokens(
+    connection: &mut sqlx::PgConnection,
+    app_id: Uuid,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar("SELECT count(*) FROM consumed_signer_rotation_tokens WHERE app_id = $1")
+        .bind(app_id)
+        .fetch_one(connection)
+        .await
+}
+
+// Release authority lanes before external KBS work; reacquire to detect
+// supersession. `expected_rotation_count` fences rotate-back supersession
+// (A→B→C→B) that the subject/issuer check alone cannot see. A checkpoint
+// without a count predates count fencing and keeps identity-only semantics.
 async fn confirm_committed_signer_identity(
     state: &AppState,
     app_id: Uuid,
     expected_subject: &str,
     expected_issuer: &str,
+    expected_rotation_count: Option<i64>,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     let mut tx = state
         .db
@@ -2501,6 +2516,16 @@ async fn confirm_committed_signer_identity(
     .fetch_optional(&mut *tx)
     .await
     .map_err(|_| signer_publication_pending_error())?;
+    // A count read failure keeps the committed rotation pending; it must
+    // never be reported as supersession.
+    let live_rotation_count = match expected_rotation_count {
+        Some(_) => Some(
+            count_consumed_signer_rotation_tokens(&mut tx, app_id)
+                .await
+                .map_err(|_| signer_publication_pending_error())?,
+        ),
+        None => None,
+    };
     tx.rollback()
         .await
         .map_err(|_| signer_publication_pending_error())?;
@@ -2509,21 +2534,34 @@ async fn confirm_committed_signer_identity(
             if subject.as_deref() == Some(expected_subject)
                 && issuer.as_deref() == Some(expected_issuer) =>
         {
-            Ok(())
+            match (expected_rotation_count, live_rotation_count) {
+                (Some(expected), Some(live)) if live != expected => {
+                    Err(signer_rotation_superseded_error())
+                }
+                _ => Ok(()),
+            }
         }
         _ => Err(signer_rotation_superseded_error()),
     }
 }
 
-/// Confirm publication only while the committed signer remains current.
-/// Authority checks release their database lanes before external KBS work.
+/// Recheck committed authority around publication without holding its lanes
+/// across external KBS I/O.
 pub(crate) async fn reconcile_signer_publication(
     state: &AppState,
     app_id: Uuid,
     expected_subject: &str,
     expected_issuer: &str,
+    expected_rotation_count: Option<i64>,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    confirm_committed_signer_identity(state, app_id, expected_subject, expected_issuer).await?;
+    confirm_committed_signer_identity(
+        state,
+        app_id,
+        expected_subject,
+        expected_issuer,
+        expected_rotation_count,
+    )
+    .await?;
     if state.kbs_policy.is_none() {
         // The shared confirm helper fails closed exactly when signed-policy
         // mode is active without configuration, and performs no write on an
@@ -2537,8 +2575,14 @@ pub(crate) async fn reconcile_signer_publication(
             );
             return Err(signer_publication_pending_error());
         }
-        return confirm_committed_signer_identity(state, app_id, expected_subject, expected_issuer)
-            .await;
+        return confirm_committed_signer_identity(
+            state,
+            app_id,
+            expected_subject,
+            expected_issuer,
+            expected_rotation_count,
+        )
+        .await;
     }
     let lease = match crate::mutation_leases::claim_resources(
         state,
@@ -2598,7 +2642,14 @@ pub(crate) async fn reconcile_signer_publication(
         return Err(signer_publication_pending_error());
     }
     // Authority may change during external publication.
-    confirm_committed_signer_identity(state, app_id, expected_subject, expected_issuer).await?;
+    confirm_committed_signer_identity(
+        state,
+        app_id,
+        expected_subject,
+        expected_issuer,
+        expected_rotation_count,
+    )
+    .await?;
     Ok(())
 }
 
@@ -2613,7 +2664,8 @@ pub async fn rotate_signer(
     Path(app_name): Path<String>,
     Json(body): Json<RotateSignerRequest>,
 ) -> Result<Json<AppResponse>, (StatusCode, Json<serde_json::Value>)> {
-    let app = rotate_signer_commit(auth, &state, &app_name, body).await?;
+    let committed = rotate_signer_commit(auth, &state, &app_name, body).await?;
+    let app = committed.app;
     let expected_subject = app
         .signer_identity_subject
         .as_deref()
@@ -2622,8 +2674,21 @@ pub async fn rotate_signer(
         .signer_identity_issuer
         .as_deref()
         .ok_or_else(internal_server_error)?;
-    reconcile_signer_publication(&state, app.id, expected_subject, expected_issuer).await?;
+    reconcile_signer_publication(
+        &state,
+        app.id,
+        expected_subject,
+        expected_issuer,
+        Some(committed.rotation_count),
+    )
+    .await?;
     Ok(Json(app))
+}
+
+// Keep the commit-time fence outside the HTTP AppResponse contract.
+pub(crate) struct CommittedSignerRotation {
+    pub(crate) app: AppResponse,
+    pub(crate) rotation_count: i64,
 }
 
 /// Commit the signer rotation (or initial set) without confirming KBS
@@ -2637,7 +2702,7 @@ pub(crate) async fn rotate_signer_commit(
     state: &AppState,
     app_name: &str,
     body: RotateSignerRequest,
-) -> Result<AppResponse, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<CommittedSignerRotation, (StatusCode, Json<serde_json::Value>)> {
     scopes::require_owner(&auth)?;
     scopes::require_scope(&auth, "apps:write")?;
     ensure_management_write_allowed(state, &auth).await?;
@@ -2739,41 +2804,21 @@ pub(crate) async fn rotate_signer_commit(
 
     let is_initial_set = previous_subject.is_none() && previous_issuer.is_none();
 
-    // Committed-rotation confirmation (Codex P1, #187 review): a rotation
-    // whose post-commit KBS reconciliation failed reports an explicit 503
-    // `signer_rotation_publication_pending` instead of a bare 500, and the
-    // internal wrapper defers its idempotency receipt so the SAME key can
-    // retry.  On that retry the identity is already committed and the jti
-    // consumed, so the token path is unreachable -- recognize the request
-    // as a confirmation instead: skip the transaction entirely and fall
-    // through to the fenced KBS reconciliation below, which either
-    // publishes (200) or reports pending again.  Scope it to the exact
-    // non-initial case (previous identity existed, target differs from it,
-    // and the committed identity already equals the target); a fresh
-    // rotation with a DIFFERENT target still requires a valid token.
-    let is_pending_confirmation = !is_initial_set
-        && previous_subject.as_deref() == Some(subject.as_str())
-        && previous_issuer.as_deref() == Some(issuer.as_str());
-    if is_pending_confirmation {
-        tracing::info!(
-            app_id = %app.id,
-            "confirming a committed signer rotation: re-driving KBS reconciliation"
-        );
-        // Release the transaction (authority lanes + app row lock) before
-        // the fenced Kubernetes reconciliation: the commit path below does
-        // the same, and holding the lanes through up to 8 CAS attempts and
-        // a Trustee rollout would stall concurrent keyring/entitlement
-        // revocations and starve the pool. The locked row is already in
-        // hand -- no second connection re-read (a failure there would map
-        // to a bare 500 and terminalize FailClosed as outcome-unknown,
-        // closing the retry path this branch exists to keep open).
-        tx.rollback()
+    // A current-identity confirmation cannot mutate authority or consume a
+    // token. Release the lanes before the caller takes the global publication
+    // fence. The count is still sampled under the lanes so the confirmation
+    // fences rotations that commit after it.
+    if previous_subject.as_deref() == Some(subject.as_str())
+        && previous_issuer.as_deref() == Some(issuer.as_str())
+    {
+        let rotation_count = count_consumed_signer_rotation_tokens(&mut tx, app.id)
             .await
-            .map_err(|_| signer_rotation_publication_pending_error("rotate_signer"))?;
-        if state.kbs_policy.is_some() {
-            reconcile_committed_rotation_kbs_policy(&state, &app).await?;
-        }
-        return Ok(app.into());
+            .map_err(|_| internal_server_error())?;
+        tx.rollback().await.map_err(|_| internal_server_error())?;
+        return Ok(CommittedSignerRotation {
+            app: app.into(),
+            rotation_count,
+        });
     }
 
     let confirmation_token = body
@@ -2921,6 +2966,11 @@ pub(crate) async fn rotate_signer_commit(
     .await
     .map_err(|_| internal_server_error())?;
 
+    // A post-commit read could capture a later rotation after the lanes are released.
+    let rotation_count = count_consumed_signer_rotation_tokens(&mut tx, app.id)
+        .await
+        .map_err(|_| internal_server_error())?;
+
     let app: App = sqlx::query_as("SELECT * FROM apps WHERE id = $1")
         .bind(app.id)
         .fetch_one(&mut *tx)
@@ -2928,7 +2978,10 @@ pub(crate) async fn rotate_signer_commit(
         .map_err(|_| internal_server_error())?;
     tx.commit().await.map_err(|_| internal_server_error())?;
 
-    Ok(app.into())
+    Ok(CommittedSignerRotation {
+        app: app.into(),
+        rotation_count,
+    })
 }
 
 /// Converge the live KBS policy under the global mutation fence after a

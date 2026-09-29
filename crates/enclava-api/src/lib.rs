@@ -2258,6 +2258,10 @@ pub(crate) mod test_support {
         pub(crate) deployment_put_failures: usize,
         pub(crate) deployment_gets_before_failure: Option<usize>,
         pub(crate) replace_configmap_on_next_deployment_get: Option<serde_json::Value>,
+        pub(crate) configmap_put_hold: Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
     }
 
     impl KbsPolicyProvider {
@@ -2307,6 +2311,7 @@ pub(crate) mod test_support {
                 deployment_put_failures: 0,
                 deployment_gets_before_failure: None,
                 replace_configmap_on_next_deployment_get: None,
+                configmap_put_hold: None,
             }
         }
 
@@ -2373,6 +2378,14 @@ pub(crate) mod test_support {
                     }
                     if path.contains("/configmaps/") {
                         if method == "PUT" {
+                            if let Some((reached, release)) = provider.configmap_put_hold.take() {
+                                // Deterministic handshake: park this PUT,
+                                // and the provider mutex it holds, until the
+                                // test releases it, so a rotation can commit
+                                // while a publication is mid-flight.
+                                let _ = reached.send(());
+                                let _ = release.await;
+                            }
                             provider.configmap_replaces += 1;
                             if let Some(metadata) =
                                 object.get_mut("metadata").and_then(|m| m.as_object_mut())
