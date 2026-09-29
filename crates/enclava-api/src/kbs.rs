@@ -423,12 +423,23 @@ async fn reconcile_legacy_rego_policy_with_client(
         let next_policy = replace_tls_resource_bindings_block(current_policy, &tls_bindings)?;
         let next_policy = replace_owner_bindings_block(&next_policy, &bindings)?;
         let policy_sha256_hex = hex::encode(Sha256::digest(next_policy.as_bytes()));
+        let policy_token = legacy_publication_token(config, &policy_sha256_hex);
 
         if next_policy != *current_policy {
             configmap
                 .data
                 .get_or_insert_with(BTreeMap::new)
                 .insert(config.policy_key.clone(), next_policy);
+            // Persist a new publication event with the content CAS. Restoring
+            // identical bytes after an intervening write still needs a rollout.
+            configmap
+                .metadata
+                .annotations
+                .get_or_insert_with(BTreeMap::new)
+                .insert(
+                    POLICY_PUBLICATION_TOKEN_ANNOTATION.to_string(),
+                    format!("{policy_token}:{}", Uuid::new_v4()),
+                );
             match bounded_kube_write(cm_api.replace(
                 &config.configmap_name,
                 &PostParams::default(),
@@ -441,11 +452,18 @@ async fn reconcile_legacy_rego_policy_with_client(
                 Err(error) => return Err(error),
             }
         }
-        // The token binds the stable target identity to the policy content,
-        // so it survives a successful ConfigMap write and later unchanged
-        // reads; metadata-only ConfigMap churn never mints a new rollout
-        // target.
-        let publication_token = legacy_publication_token(config, &policy_sha256_hex);
+        let publication_token = configmap
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get(POLICY_PUBLICATION_TOKEN_ANNOTATION))
+            .filter(|token| {
+                token
+                    .strip_prefix(&policy_token)
+                    .and_then(|suffix| suffix.strip_prefix(':'))
+                    .is_some_and(|nonce| Uuid::parse_str(nonce).is_ok())
+            })
+            .unwrap_or(&policy_token);
 
         // If signed authority committed after the ConfigMap CAS, let it
         // repair the brief legacy write before this call returns.
@@ -457,7 +475,7 @@ async fn reconcile_legacy_rego_policy_with_client(
             db,
             client.clone(),
             config,
-            &publication_token,
+            publication_token,
             &policy_sha256_hex,
         )
         .await?
@@ -485,7 +503,18 @@ async fn reconcile_legacy_rego_policy_with_client(
             .as_ref()
             .and_then(|data| data.get(&config.policy_key))
             .ok_or_else(|| KbsPolicyError::MissingPolicyKey(config.policy_key.clone()))?;
-        if policy_after != expected_policy {
+        if policy_after != expected_policy
+            || configmap_after
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.get(POLICY_PUBLICATION_TOKEN_ANNOTATION))
+                != configmap
+                    .metadata
+                    .annotations
+                    .as_ref()
+                    .and_then(|annotations| annotations.get(POLICY_PUBLICATION_TOKEN_ANNOTATION))
+        {
             continue;
         }
         return Ok(());
@@ -4557,8 +4586,7 @@ resource_bindings := {
                 // the converged publication must not rewrite anything.
                 let mut guard = provider.lock().await;
                 guard.configmap["metadata"]["resourceVersion"] = serde_json::json!("2");
-                guard.configmap["metadata"]["labels"] =
-                    serde_json::json!({"team": "platform"});
+                guard.configmap["metadata"]["labels"] = serde_json::json!({"team": "platform"});
                 guard.configmap["data"]["unrelated.txt"] = serde_json::json!("noise");
                 drop(guard);
 

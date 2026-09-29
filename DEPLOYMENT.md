@@ -311,9 +311,11 @@ readers do not understand the new generation, so mixed-version operation and
 reader rollback are unsupported.
 
 A currently authorized org owner may confirm an already committed signer
-identity without a new rotation token. This only retries publication; it cannot
-change the signer or consume another token. A real identity transition still
-requires a fresh, bound, single-use token.
+identity without a new rotation token. The stateless public endpoint confirms
+the current identity, not the historical event behind an earlier request;
+event-attributed retries require the internal idempotency checkpoint. A
+confirmation cannot change the signer or consume another token. A real identity
+transition still requires a fresh, bound, single-use token.
 
 A withdrawn legacy TLS binding stays withdrawn even if a newer artifact has the
 same image and init-data measurements. Those measurements do not bind the old
@@ -321,11 +323,14 @@ entry to the new workload instance. Fresh deployments must authorize through
 signed-policy candidates instead of readmitting the old legacy binding.
 
 Legacy Rego publication is confirmed only when the Trustee pod template carries
-the token for the configured ConfigMap namespace, name, policy key, and policy
-content hash, and that rollout is ready. An unmarked legacy install needs one
+the token for the configured ConfigMap namespace, name, policy key, content hash,
+and publication event, and that rollout is ready. A content update atomically
+persists a new event token in the ConfigMap's publication-token annotation.
+Retries reuse it after a crash, including when an intervening policy write must
+be repaired back to identical bytes. An unmarked legacy install needs one
 adoption rollout; converged retries write neither the ConfigMap nor the Deployment.
 Changes to labels, unrelated data keys, or resourceVersion alone do not restart
-Trustee when the policy content is unchanged.
+Trustee when the policy content and publication event are unchanged.
 A failed Deployment update is retried. If the template token was already
 stored, retries wait for that rollout without creating another generation.
 Both legacy and signed publication wait for old replicas to leave and all
