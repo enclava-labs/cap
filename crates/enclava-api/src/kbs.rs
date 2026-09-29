@@ -21,6 +21,7 @@ const SIGNED_POLICY_SET_SCHEMA_VERSION: &str = "enclava-signed-policy-set-v2";
 const POLICY_GENERATION_ANNOTATION: &str = "enclava.dev/cap-policy-generation";
 const POLICY_SHA256_ANNOTATION: &str = "enclava.dev/cap-policy-sha256";
 const POLICY_PUBLICATION_TOKEN_ANNOTATION: &str = "enclava.dev/cap-policy-publication-token";
+const TRUSTEE_APPLIED_CONFIGMAP_ANNOTATION: &str = "enclava.dev/cap-policy-applied-configmap";
 const KUBERNETES_CAS_ATTEMPTS: usize = 8;
 
 #[derive(Debug, Clone)]
@@ -74,6 +75,8 @@ pub enum KbsPolicyError {
     MalformedManagedMarkers(String),
     #[error("Trustee deployment rollout timed out")]
     RolloutTimedOut,
+    #[error("resource-policy ConfigMap has no resourceVersion to verify Trustee rollout")]
+    MissingConfigmapResourceVersion,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -417,6 +420,12 @@ async fn reconcile_legacy_rego_policy_with_client(
         let next_policy = replace_tls_resource_bindings_block(current_policy, &tls_bindings)?;
         let next_policy = replace_owner_bindings_block(&next_policy, &bindings)?;
         if next_policy == *current_policy {
+            // The ConfigMap text is already durable, but a previous attempt may
+            // have written it and then failed the Trustee rollout. Comparing
+            // only policy text would report publication complete while the
+            // pods still run the previous revision, so verify the deployment
+            // actually rolled this ConfigMap revision out before returning.
+            ensure_trustee_rolled_out_configmap(client.clone(), config, &configmap).await?;
             return Ok(());
         }
 
@@ -431,7 +440,7 @@ async fn reconcile_legacy_rego_policy_with_client(
         ))
         .await
         {
-            Ok(_) => {
+            Ok(replaced) => {
                 // If signed authority committed after the ConfigMap CAS, let
                 // it repair the brief legacy write before this call returns.
                 if signed_policy_mode_active(db).await? {
@@ -440,7 +449,12 @@ async fn reconcile_legacy_rego_policy_with_client(
                     )
                     .await;
                 }
-                restart_trustee_deployment(client, config).await?;
+                let applied_resource_version = replaced
+                    .metadata
+                    .resource_version
+                    .clone()
+                    .unwrap_or_default();
+                restart_trustee_deployment(client, config, &applied_resource_version).await?;
                 return Ok(());
             }
             Err(KbsPolicyError::Kube(error)) if is_kubernetes_conflict(&error) => continue,
@@ -1615,12 +1629,13 @@ fn is_signed_policy_artifact_body(policy: &str) -> bool {
 async fn restart_trustee_deployment(
     client: kube::Client,
     config: &KbsPolicyConfig,
+    applied_configmap_resource_version: &str,
 ) -> Result<(), KbsPolicyError> {
     let deploy_api: Api<Deployment> = Api::namespaced(client, &config.namespace);
     let restarted_at = Utc::now().to_rfc3339();
     for _ in 0..KUBERNETES_CAS_ATTEMPTS {
         let mut deployment = deploy_api.get(&config.deployment_name).await?;
-        deployment
+        let template_annotations = deployment
             .spec
             .as_mut()
             .ok_or(KbsPolicyError::InvalidPolicyGeneration)?
@@ -1628,11 +1643,18 @@ async fn restart_trustee_deployment(
             .metadata
             .get_or_insert_with(Default::default)
             .annotations
-            .get_or_insert_with(BTreeMap::new)
-            .insert(
-                "enclava.dev/cap-policy-restarted-at".to_string(),
-                restarted_at.clone(),
-            );
+            .get_or_insert_with(BTreeMap::new);
+        template_annotations.insert(
+            "enclava.dev/cap-policy-restarted-at".to_string(),
+            restarted_at.clone(),
+        );
+        // Record which ConfigMap revision this rollout applies so a later
+        // unchanged-policy reconciliation can tell a completed publication
+        // from a ConfigMap write whose deployment update never landed.
+        template_annotations.insert(
+            TRUSTEE_APPLIED_CONFIGMAP_ANNOTATION.to_string(),
+            applied_configmap_resource_version.to_string(),
+        );
         match bounded_kube_write(deploy_api.replace(
             &config.deployment_name,
             &PostParams::default(),
@@ -1649,6 +1671,50 @@ async fn restart_trustee_deployment(
         }
     }
     Err(KbsPolicyError::PolicyCasExhausted)
+}
+
+/// Verify the Trustee deployment actually rolled out the ConfigMap revision
+/// currently stored, and restart it when a prior attempt wrote the ConfigMap
+/// but never completed the deployment update. Fails closed (error, not a
+/// success) so callers keep reporting publication as pending.
+async fn ensure_trustee_rolled_out_configmap(
+    client: kube::Client,
+    config: &KbsPolicyConfig,
+    configmap: &ConfigMap,
+) -> Result<(), KbsPolicyError> {
+    let Some(applied_resource_version) = configmap
+        .metadata
+        .resource_version
+        .as_deref()
+        .filter(|version| !version.is_empty())
+    else {
+        // Kubernetes always assigns a resourceVersion to a live ConfigMap; a
+        // missing one means we cannot prove rollout, so fail closed.
+        return Err(KbsPolicyError::MissingConfigmapResourceVersion);
+    };
+    let deploy_api: Api<Deployment> = Api::namespaced(client.clone(), &config.namespace);
+    let deployment = deploy_api.get(&config.deployment_name).await?;
+    let rolled_out_resource_version = deployment
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.template.metadata.as_ref())
+        .and_then(|metadata| metadata.annotations.as_ref())
+        .and_then(|annotations| annotations.get(TRUSTEE_APPLIED_CONFIGMAP_ANNOTATION));
+    match rolled_out_resource_version {
+        Some(rolled_out) if rolled_out == applied_resource_version => {
+            // The template requests a restart for this ConfigMap revision, but
+            // the pods may not have reached it yet (e.g. a prior restart
+            // replaced the template and then timed out waiting for rollout).
+            // Confirm the current generation actually rolled out before
+            // reporting publication complete, mirroring the signed path's
+            // wait_for_deployment_policy_generation check.
+            wait_for_deployment_ready(&deploy_api, &config.deployment_name).await
+        }
+        // Either no rollout was ever recorded (pre-annotation deployment or a
+        // ConfigMap whose restart failed) or it applied an older revision.
+        // Restart against the current revision to make Trustee converge.
+        _ => restart_trustee_deployment(client, config, applied_resource_version).await,
+    }
 }
 
 async fn wait_for_deployment_ready(
