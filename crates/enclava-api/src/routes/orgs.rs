@@ -1025,7 +1025,11 @@ async fn derive_rotation_path(
         .await
         .map_err(|_| db_error())?;
         Ok(previous.map(|(payload, owner)| (payload, owner, false)))
-    } else if body_version == latest.0 + 1 {
+    } else if latest
+        .0
+        .checked_add(1)
+        .is_some_and(|successor| body_version == successor)
+    {
         Ok(Some((latest.1, latest.3, true)))
     } else if body_version < latest.0 {
         Err((
@@ -1194,15 +1198,18 @@ async fn rotate_service_owner(
         .map_err(crate::routes::deployments::signing_error_response)
 }
 
-/// Expired-retry waiver: the only acceptable proof that this directive
-/// caused the upstream drift is a receipt minted from this request's own
-/// successful, response-validated rotate-owner RPC that still matches the
-/// service's current owner (replacement pubkey, version, last_changed_at),
-/// so no later upstream rotation can have superseded it. The version and
-/// timestamp equality run in SQL on PostgreSQL's microsecond timestamptz
-/// representation; Rust-side nanosecond equality would mismatch after the
-/// service's JSON roundtrip.
-async fn expired_rotation_waived_by_receipt(
+/// The only acceptable proof that this directive caused the upstream state
+/// is a receipt minted from this request's own successful,
+/// response-validated rotate-owner RPC that still matches the service's
+/// current owner (replacement pubkey, version, last_changed_at), so no
+/// later upstream rotation can have superseded it. The expired-retry
+/// freshness waiver relies on this, and so does receipt-bound recovery:
+/// it is the sole condition under which an owner other than the
+/// initiating caller may complete this exact, already-executed transition.
+/// The version and timestamp equality run in SQL on PostgreSQL's
+/// microsecond timestamptz representation; Rust-side nanosecond equality
+/// would mismatch after the service's JSON roundtrip.
+async fn upstream_receipt_matches_live_service(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     org_id: Uuid,
     directive_digest: &[u8],
@@ -1230,10 +1237,9 @@ async fn expired_rotation_waived_by_receipt(
         && service_owner_pubkey(owner_status).as_deref() == Some(replacement_owner.as_slice()))
 }
 
-/// Validate the rotation successor against the base version's keyring and
-/// confirm the replacement key is still registered. Registration is
-/// re-checked in the final phase because revocation can happen between
-/// phases.
+/// Fresh rotations require the caller's active replacement-key registration.
+/// Exact receipt-bound recovery may reuse another active registration of that
+/// same key, so removing the initiator does not strand the completed RPC.
 async fn validate_rotation_successor(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     base_payload: &[u8],
@@ -1241,6 +1247,7 @@ async fn validate_rotation_successor(
     current_owner: &[u8; 32],
     replacement_owner: &[u8; 32],
     user_id: Uuid,
+    receipt_bound_recovery: bool,
 ) -> Result<Uuid, (StatusCode, Json<serde_json::Value>)> {
     let current_keyring: SignedOrgKeyring =
         serde_json::from_slice(base_payload).map_err(|_| db_error())?;
@@ -1260,7 +1267,7 @@ async fn validate_rotation_successor(
         replacement_owner,
     )
     .map_err(bad_request)?;
-    sqlx::query_scalar(
+    let mut registration: Option<Uuid> = sqlx::query_scalar(
         "SELECT id FROM user_signing_keys
           WHERE user_id = $1 AND pubkey = $2 AND revoked_at IS NULL",
     )
@@ -1268,8 +1275,22 @@ async fn validate_rotation_successor(
     .bind(replacement_owner.as_slice())
     .fetch_optional(&mut **tx)
     .await
-    .map_err(|_| db_error())?
-    .ok_or_else(|| bad_request("replacement owner key is not registered for this user"))
+    .map_err(|_| db_error())?;
+    if registration.is_none() && receipt_bound_recovery {
+        // Execution provenance comes from the receipt, not registration ownership.
+        // Select a deterministic active registration of the already-executed key.
+        registration = sqlx::query_scalar(
+            "SELECT id FROM user_signing_keys
+              WHERE pubkey = $1 AND revoked_at IS NULL
+              ORDER BY id
+              LIMIT 1",
+        )
+        .bind(replacement_owner.as_slice())
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|_| db_error())?;
+    }
+    registration.ok_or_else(|| bad_request("replacement owner key is not registered for this user"))
 }
 
 // Release the org lane before calling: publication takes the global KBS fence.
@@ -1479,7 +1500,7 @@ pub async fn rotate_org_owner(
             ));
         }
         if body.signed_at < lane_now - chrono::Duration::seconds(MAX_DIRECTIVE_AGE_SECONDS)
-            && !expired_rotation_waived_by_receipt(
+            && !upstream_receipt_matches_live_service(
                 &mut tx,
                 org_id,
                 directive_digest.as_slice(),
@@ -1516,6 +1537,18 @@ pub async fn rotate_org_owner(
             ));
         }
     }
+    // Another owner may finish only an exact, already-executed transition.
+    let receipt_bound_recovery = service_owner.as_deref() == Some(replacement_owner.as_slice())
+        && upstream_receipt_matches_live_service(
+            &mut tx,
+            org_id,
+            directive_digest.as_slice(),
+            intent_digest.as_slice(),
+            &owner_status,
+            &replacement_owner,
+        )
+        .await?;
+
     validate_rotation_successor(
         &mut tx,
         &base_payload,
@@ -1523,6 +1556,7 @@ pub async fn rotate_org_owner(
         &current_owner,
         &replacement_owner,
         auth.user_id,
+        receipt_bound_recovery,
     )
     .await?;
 
@@ -1709,7 +1743,7 @@ pub async fn rotate_org_owner(
         ));
     }
     if body.signed_at < lane_now - chrono::Duration::seconds(MAX_DIRECTIVE_AGE_SECONDS)
-        && !expired_rotation_waived_by_receipt(
+        && !upstream_receipt_matches_live_service(
             &mut tx,
             org_id,
             directive_digest.as_slice(),
@@ -1745,6 +1779,19 @@ pub async fn rotate_org_owner(
             })),
         ));
     }
+    // Revalidate recovery provenance after the lane gap. Fresh requests keep
+    // caller-bound registration checks even if their RPC just minted a receipt.
+    let receipt_bound_recovery = receipt_bound_recovery
+        && upstream_receipt_matches_live_service(
+            &mut tx,
+            org_id,
+            directive_digest.as_slice(),
+            intent_digest.as_slice(),
+            &owner_status,
+            &replacement_owner,
+        )
+        .await?;
+
     let replacement_signing_key_id = validate_rotation_successor(
         &mut tx,
         &base_payload,
@@ -1752,6 +1799,7 @@ pub async fn rotate_org_owner(
         &current_owner,
         &replacement_owner,
         auth.user_id,
+        receipt_bound_recovery,
     )
     .await?;
 
@@ -4061,6 +4109,472 @@ mod tests {
         );
 
         crate::test_support::drop_isolated_database("cap185_receipt_checkpoint", pool).await;
+    }
+
+    #[tokio::test]
+    async fn owner_rotation_receipt_bound_recovery_by_remaining_owner() {
+        // Phase 1 committed the receipt and moved the service to the
+        // replacement owner, then the final CAP commit failed and the
+        // initiating owner was demoted. A demoted actor must never
+        // finalize; a remaining owner must recover the exact
+        // receipt-bound request without another upstream RPC; unrelated
+        // or mutated requests must stay denied.
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap185_receipt_handoff").await;
+        let org_id = Uuid::new_v4();
+        let initiator_id = Uuid::new_v4();
+        let remaining_owner_id = Uuid::new_v4();
+        let suffix = org_id.simple().to_string();
+        let org_name = format!("keyring-receipt-handoff-{suffix}");
+        crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+            .await
+            .expect("insert receipt handoff org");
+        for (member_id, display_name) in [
+            (initiator_id, "Receipt Handoff Initiator"),
+            (remaining_owner_id, "Receipt Handoff Remaining Owner"),
+        ] {
+            sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, $2)")
+                .bind(member_id)
+                .bind(display_name)
+                .execute(&pool)
+                .await
+                .expect("insert receipt handoff user");
+            sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+                .bind(member_id)
+                .bind(org_id)
+                .execute(&pool)
+                .await
+                .expect("insert receipt handoff membership");
+        }
+        let current_key = SigningKey::generate(&mut OsRng);
+        let replacement_key = SigningKey::generate(&mut OsRng);
+        let third_key = SigningKey::generate(&mut OsRng);
+        // Only the initiator holds key registrations: the remaining owner
+        // authorizes purely through role and the receipt, never through
+        // key ownership.
+        sqlx::query(
+            "INSERT INTO user_signing_keys (user_id, pubkey)
+             VALUES ($1, $2), ($1, $3), ($1, $4)",
+        )
+        .bind(initiator_id)
+        .bind(current_key.verifying_key().to_bytes().to_vec())
+        .bind(replacement_key.verifying_key().to_bytes().to_vec())
+        .bind(third_key.verifying_key().to_bytes().to_vec())
+        .execute(&pool)
+        .await
+        .expect("insert receipt handoff signing keys");
+
+        // Scoped failure injection: while the switch row exists, inserts
+        // into org_keyrings for this org raise, aborting only the final
+        // CAP transaction; the receipt table is untouched.
+        sqlx::query("CREATE TABLE cap185_handoff_fail_switch (org_id uuid PRIMARY KEY)")
+            .execute(&pool)
+            .await
+            .expect("create handoff failure switch");
+        sqlx::query(
+            "CREATE OR REPLACE FUNCTION cap185_handoff_fail_insert() RETURNS trigger
+             LANGUAGE plpgsql AS $$
+             BEGIN
+                 IF EXISTS (SELECT 1 FROM cap185_handoff_fail_switch WHERE org_id = NEW.org_id) THEN
+                     RAISE EXCEPTION 'induced final keyring insert failure';
+                 END IF;
+                 RETURN NEW;
+             END $$",
+        )
+        .execute(&pool)
+        .await
+        .expect("create handoff failure function");
+        sqlx::query(
+            "CREATE TRIGGER cap185_handoff_fail_insert_trigger
+             BEFORE INSERT ON org_keyrings
+             FOR EACH ROW EXECUTE FUNCTION cap185_handoff_fail_insert()",
+        )
+        .execute(&pool)
+        .await
+        .expect("create handoff failure trigger");
+
+        let (mock_url, mock) = spawn_mock_signing_service_owner(
+            org_id,
+            MockSigningServiceOwner {
+                owner: current_key.verifying_key().to_bytes(),
+                changed_at: Utc::now(),
+                version: 1,
+                rotate_calls: 0,
+            },
+        )
+        .await;
+        let mut state = crate::test_support::lazy_state();
+        state.db = isolated_single_connection_pool("cap185_receipt_handoff").await;
+        state.signing_service = Some(
+            crate::signing_service::SigningServiceClient::new(mock_url, None)
+                .expect("build mock signing service client"),
+        );
+        let initiator_auth = AuthContext {
+            user_id: initiator_id,
+            org_id,
+            org_name: org_name.clone(),
+            role: Role::Owner,
+            api_key: None,
+            management_origin: crate::auth::middleware::ManagementOrigin::Public,
+        };
+        let remaining_auth = AuthContext {
+            user_id: remaining_owner_id,
+            org_id,
+            org_name: org_name.clone(),
+            role: Role::Owner,
+            api_key: None,
+            management_origin: crate::auth::middleware::ManagementOrigin::Public,
+        };
+        let _ = put_keyring(
+            initiator_auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(signed_keyring_request(
+                org_id,
+                initiator_id,
+                &current_key,
+                1,
+                1,
+            )),
+        )
+        .await
+        .expect("publish v1 keyring");
+
+        // The initiating owner's rotation executes the upstream RPC and
+        // commits the receipt, then the final CAP commit is forced to
+        // fail.
+        sqlx::query("INSERT INTO cap185_handoff_fail_switch (org_id) VALUES ($1)")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("arm final-commit failure");
+        let v2_signed_at = Utc::now();
+        let v2_request = rotation_request(
+            org_id,
+            initiator_id,
+            &current_key,
+            &replacement_key,
+            2,
+            2,
+            v2_signed_at,
+            "handoff",
+        );
+        let failed = rotate_org_owner(
+            initiator_auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(v2_request.clone()),
+        )
+        .await;
+        assert!(
+            failed.is_err(),
+            "forced final persistence failure must surface as an error"
+        );
+        assert_eq!(
+            mock.lock().expect("mock owner lock").rotate_calls,
+            1,
+            "the upstream rotation happened exactly once before the failed commit"
+        );
+        let checkpoint: (i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM org_keyrings WHERE org_id = $1),
+                    (SELECT count(*) FROM org_rotation_directives WHERE org_id = $1),
+                    (SELECT count(*) FROM audit_log
+                      WHERE org_id = $1 AND action = 'org.keyring.owner.rotate')",
+        )
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count CAP-side rows after the failed final commit");
+        assert_eq!(
+            checkpoint,
+            (1, 0, 0),
+            "only the receipt survived the failed final commit"
+        );
+
+        sqlx::query("UPDATE memberships SET role = 'admin' WHERE user_id = $1 AND org_id = $2")
+            .bind(initiator_id)
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("demote the initiating owner");
+
+        let demoted_error = rotate_org_owner(
+            initiator_auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(v2_request.clone()),
+        )
+        .await
+        .expect_err("a demoted actor must never finalize a rotation");
+        assert_eq!(demoted_error.0, StatusCode::FORBIDDEN);
+
+        // Mutated keyring content under the same directive: the receipt
+        // binds the exact keyring digest, so the mutation forfeits the
+        // recovery.
+        let mutated = rotation_request(
+            org_id,
+            initiator_id,
+            &current_key,
+            &replacement_key,
+            2,
+            3,
+            v2_signed_at,
+            "handoff",
+        );
+        let mutated_error = rotate_org_owner(
+            remaining_auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(mutated),
+        )
+        .await
+        .expect_err("a mutated request must not inherit the receipt");
+        assert_eq!(mutated_error.0, StatusCode::BAD_REQUEST);
+
+        // Unrelated directive with the initiator's key: no receipt exists
+        // for it, so the remaining owner cannot borrow the registration.
+        let unrelated = rotation_request(
+            org_id,
+            initiator_id,
+            &current_key,
+            &replacement_key,
+            2,
+            2,
+            v2_signed_at,
+            "handoff-unrelated",
+        );
+        let unrelated_error = rotate_org_owner(
+            remaining_auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(unrelated),
+        )
+        .await
+        .expect_err("an unrelated directive must not inherit the receipt");
+        assert_eq!(unrelated_error.0, StatusCode::BAD_REQUEST);
+
+        sqlx::query("DELETE FROM cap185_handoff_fail_switch WHERE org_id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("disarm the final-commit failure");
+
+        let recovered = rotate_org_owner(
+            remaining_auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(v2_request),
+        )
+        .await
+        .expect("a remaining owner recovers the exact receipt-bound request");
+        assert_eq!(recovered.keyring_version, 2);
+        assert_eq!(
+            recovered.owner_fingerprint,
+            hex::encode(Sha256::digest(replacement_key.verifying_key().to_bytes()))
+        );
+        assert_eq!(
+            mock.lock().expect("mock owner lock").rotate_calls,
+            1,
+            "the recovery must not repeat the upstream rotation"
+        );
+        let recovered_state: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM org_keyrings WHERE org_id = $1),
+                    (SELECT count(*) FROM org_rotation_directives WHERE org_id = $1)",
+        )
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count CAP-side rows after the receipt recovery");
+        assert_eq!(
+            recovered_state,
+            (2, 1),
+            "exactly one v2 keyring and one directive consumption"
+        );
+        let finalized_by: Uuid = sqlx::query_scalar(
+            "SELECT user_id FROM audit_log
+              WHERE org_id = $1 AND action = 'org.keyring.owner.rotate'",
+        )
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load the rotation audit row");
+        assert_eq!(
+            finalized_by, remaining_owner_id,
+            "the remaining owner, not the demoted initiator, finalized the rotation"
+        );
+
+        // A fresh rotation by the remaining owner with a key registered
+        // only to the initiator keeps the caller-bound registration
+        // requirement: no receipt can authorize it.
+        let fresh = rotation_request(
+            org_id,
+            initiator_id,
+            &replacement_key,
+            &third_key,
+            3,
+            3,
+            Utc::now(),
+            "handoff-fresh",
+        );
+        let fresh_error = rotate_org_owner(
+            remaining_auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(fresh),
+        )
+        .await
+        .expect_err("fresh rotations keep the caller-bound registration requirement");
+        assert_eq!(fresh_error.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            mock.lock().expect("mock owner lock").rotate_calls,
+            1,
+            "the denied fresh rotation must not reach the upstream service"
+        );
+
+        crate::test_support::drop_isolated_database("cap185_receipt_handoff", pool).await;
+    }
+
+    #[tokio::test]
+    async fn owner_rotation_version_ceiling_rejects_successor_and_preserves_replay() {
+        // derive_rotation_path must not compute latest+1 unchecked: at
+        // the bigint ceiling no successor version exists. A proposal
+        // below the ceiling must get the normal stale-version conflict
+        // (the unchecked add would panic in debug and wrap in release),
+        // and the exact existing-version replay at the ceiling must keep
+        // working.
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap185_version_ceiling").await;
+        let org_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let suffix = org_id.simple().to_string();
+        let org_name = format!("keyring-version-ceiling-{suffix}");
+        crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+            .await
+            .expect("insert version ceiling org");
+        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Version Ceiling Owner')")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("insert version ceiling user");
+        sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+            .bind(user_id)
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("insert version ceiling membership");
+        let current_key = SigningKey::generate(&mut OsRng);
+        let replacement_key = SigningKey::generate(&mut OsRng);
+        sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2), ($1, $3)")
+            .bind(user_id)
+            .bind(current_key.verifying_key().to_bytes().to_vec())
+            .bind(replacement_key.verifying_key().to_bytes().to_vec())
+            .execute(&pool)
+            .await
+            .expect("insert version ceiling signing keys");
+
+        // Seed the latest keyring at the bigint ceiling exactly as the
+        // committed writers store it: normalized payload bytes signed by
+        // the replacement key.
+        let replay = rotation_request(
+            org_id,
+            user_id,
+            &current_key,
+            &replacement_key,
+            i64::MAX,
+            9,
+            Utc::now(),
+            "ceiling-replay",
+        );
+        let replacement_key_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM user_signing_keys
+              WHERE user_id = $1 AND pubkey = $2 AND revoked_at IS NULL",
+        )
+        .bind(user_id)
+        .bind(replacement_key.verifying_key().to_bytes().to_vec())
+        .fetch_one(&pool)
+        .await
+        .expect("load replacement key registration");
+        sqlx::query(
+            "INSERT INTO org_keyrings
+                 (org_id, version, keyring_payload, signature, signing_key_id)
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(org_id)
+        .bind(i64::MAX)
+        .bind(normalized_keyring_bytes(
+            org_id,
+            user_id,
+            replacement_key.verifying_key().to_bytes(),
+            i64::MAX,
+            9,
+        ))
+        .bind(hex::decode(&replay.signature).expect("decode replay signature"))
+        .bind(replacement_key_id)
+        .execute(&pool)
+        .await
+        .expect("insert keyring at the bigint version ceiling");
+
+        let (mock_url, mock) = spawn_mock_signing_service_owner(
+            org_id,
+            MockSigningServiceOwner {
+                owner: replacement_key.verifying_key().to_bytes(),
+                changed_at: Utc::now(),
+                version: 1,
+                rotate_calls: 0,
+            },
+        )
+        .await;
+        let mut state = crate::test_support::lazy_state();
+        state.db = isolated_single_connection_pool("cap185_version_ceiling").await;
+        state.signing_service = Some(
+            crate::signing_service::SigningServiceClient::new(mock_url, None)
+                .expect("build mock signing service client"),
+        );
+        let auth = AuthContext {
+            user_id,
+            org_id,
+            org_name: org_name.clone(),
+            role: Role::Owner,
+            api_key: None,
+            management_origin: crate::auth::middleware::ManagementOrigin::Public,
+        };
+
+        let below_ceiling = rotation_request(
+            org_id,
+            user_id,
+            &current_key,
+            &replacement_key,
+            i64::MAX - 1,
+            8,
+            Utc::now(),
+            "ceiling-stale",
+        );
+        let stale_error = rotate_org_owner(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(below_ceiling),
+        )
+        .await
+        .expect_err("a version below the committed ceiling is stale");
+        assert_eq!(stale_error.0, StatusCode::CONFLICT);
+
+        let recovered = rotate_org_owner(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(replay),
+        )
+        .await
+        .expect("exact existing-version replay at the ceiling succeeds");
+        assert_eq!(recovered.keyring_version, i64::MAX);
+        assert_eq!(
+            mock.lock().expect("mock owner lock").rotate_calls,
+            0,
+            "neither the stale proposal nor the ceiling replay rotates upstream"
+        );
+
+        crate::test_support::drop_isolated_database("cap185_version_ceiling", pool).await;
     }
 
     #[tokio::test]

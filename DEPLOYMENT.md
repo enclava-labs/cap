@@ -59,6 +59,11 @@ only when a committed upstream receipt proves that this exact request's
 Rotations whose upstream response was lost before this deployment -- or any
 drift without a matching receipt -- are not waived; the owner must sign and
 present a fresh directive.
+If the initiator loses owner access after the upstream RPC, another current
+org owner can finish the exact receipt-bound request while the replacement
+key still has an active registration. The removed owner remains denied;
+fresh rotations still require the caller's own active signing-key
+registration.
 
 Successor-version keyring writes are fenced on the live owner authority:
 after an org has a configured signing service or any recorded rotation
