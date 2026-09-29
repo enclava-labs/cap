@@ -2579,33 +2579,6 @@ pub(crate) async fn rotate_signer_commit(
         ));
     }
 
-    // Fail closed BEFORE the rotation transaction: in signed-policy mode a
-    // committed rotation withdraws the rotated-out signer's artifacts and
-    // owes a deferred generation bump, but neither the post-commit
-    // reconciliation below nor the periodic reconciler can publish without
-    // provider configuration -- the withdrawal would strand the old policy
-    // live with no convergence path until configuration returns (PR #187
-    // review). The keyring routes enforce the same gap via
-    // confirm_keyring_kbs_publication; here the check is pre-commit so the
-    // caller gets a clean retryable error and the rotation token JTI stays
-    // unconsumed for a retry once configuration is restored.
-    if let Err(error) = crate::kbs::ensure_kbs_publication_configured(&state).await {
-        tracing::warn!(
-            app = %app_name,
-            org_id = %auth.org_id,
-            %error,
-            error_code = "kbs_publication_not_configured",
-            "refusing signer rotation: signed-policy mode is active without KBS configuration"
-        );
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "error": "signed-policy mode is active but KBS publication is not configured; refusing to commit a signer rotation that could not be published",
-                "code": "kbs_publication_not_configured",
-            })),
-        ));
-    }
-
     let app_lookup: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
         .bind(auth.org_id)
         .bind(app_name)
@@ -2656,6 +2629,38 @@ pub(crate) async fn rotate_signer_commit(
         StatusCode::CONFLICT,
         Json(serde_json::json!({"error": "app signer authority is unavailable"})),
     ))?;
+
+    if state.kbs_policy.is_none() {
+        // Signed-mode activation must serialize with this decision, including
+        // activations committed while the rotation waited for its app lane.
+        let signed_policy_mode_active: bool = sqlx::query_scalar(
+            "SELECT desired_generation > 0
+               FROM kbs_signed_policy_reconciliation
+              WHERE singleton
+              FOR UPDATE",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| internal_server_error())?;
+        if signed_policy_mode_active {
+            let error = crate::kbs::KbsPolicyError::NotConfigured;
+            tracing::warn!(
+                app = %app_name,
+                org_id = %auth.org_id,
+                %error,
+                error_code = "kbs_publication_not_configured",
+                "refusing signer rotation: signed-policy mode is active without KBS configuration"
+            );
+            tx.rollback().await.map_err(|_| internal_server_error())?;
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "signed-policy mode is active but KBS publication is not configured; refusing to commit a signer rotation that could not be published",
+                    "code": "kbs_publication_not_configured",
+                })),
+            ));
+        }
+    }
 
     let previous_subject = app.signer_identity_subject.clone();
     let previous_issuer = app.signer_identity_issuer.clone();
