@@ -20,6 +20,7 @@ const SIGNED_POLICY_SET_SCHEMA_VERSION: &str = "enclava-signed-policy-set-v2";
 const POLICY_GENERATION_ANNOTATION: &str = "enclava.dev/cap-policy-generation";
 const POLICY_SHA256_ANNOTATION: &str = "enclava.dev/cap-policy-sha256";
 const POLICY_PUBLICATION_TOKEN_ANNOTATION: &str = "enclava.dev/cap-policy-publication-token";
+const TRUSTEE_APPLIED_CONFIGMAP_ANNOTATION: &str = "enclava.dev/cap-policy-applied-configmap";
 const KUBERNETES_CAS_ATTEMPTS: usize = 8;
 
 #[derive(Debug, Clone)]
@@ -80,6 +81,8 @@ pub enum KbsPolicyError {
     MalformedManagedMarkers(String),
     #[error("Trustee deployment rollout timed out")]
     RolloutTimedOut,
+    #[error("resource-policy ConfigMap has no resourceVersion to verify Trustee rollout")]
+    MissingConfigmapResourceVersion,
 }
 
 #[derive(Debug, thiserror::Error)]
