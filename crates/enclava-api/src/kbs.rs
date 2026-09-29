@@ -527,9 +527,11 @@ async fn signed_policy_mode_active(db: &PgPool) -> Result<bool, KbsPolicyError> 
 /// even while the app row still projects the preceding failed/stopped state.
 /// Failed, unsigned, or deleting latest operations contribute no authorization,
 /// except that a deleting app with confidential teardown still pending keeps
-/// the authorization of the operations its workload may still be running
-/// under — bounded to the two most recent generations — until the teardown
-/// completes.
+/// the authorization of every workload generation it may still be running
+/// under — the newest completed generation (the last workload known applied;
+/// supersession never rewrites completed jobs) plus any later generation that
+/// reached the apply phase (apply failures are never reverted, and the delete
+/// flip itself supersedes leased work) — until the teardown completes.
 async fn load_signed_policy_candidates(
     db: &PgPool,
     retention: i64,
@@ -548,6 +550,7 @@ async fn load_signed_policy_candidates(
                 app.status::text AS app_status,
                 app.workload_teardown_required,
                 app.workload_teardown_completed_at,
+                job.last_error_code,
                 ROW_NUMBER() OVER (
                     PARTITION BY job.app_id
                     ORDER BY job.generation DESC
@@ -571,25 +574,68 @@ async fn load_signed_policy_candidates(
                     )
                     OR (
                         -- Deleting with confidential teardown still pending:
-                        -- the operations the workload may still be running
-                        -- under stay authorized until the teardown completes.
-                        -- The delete supersedes unfinished operations
-                        -- (marking them failed), so a rank-1-only selection
-                        -- would drop the running workload's artifact and
-                        -- permanently fail the teardown's policy-governed KBS
-                        -- deletes. The mutation lease serializes deployments,
-                        -- so at most one operation can be in flight besides the
-                        -- still-watching live one: the two most recent
-                        -- generations cover every operation the workload may
-                        -- still be running under. The bound also keeps the
-                        -- shared signed-policy byte budget safe — every
-                        -- admitted operation contributes a required artifact,
-                        -- and admitting the whole history could exceed the
-                        -- budget and fail publication for every tenant.
+                        -- every workload generation the app may still be
+                        -- running under stays authorized until the teardown
+                        -- completes, so the teardown's policy-governed KBS
+                        -- deletes cannot be stranded by a reconciliation.
+                        --
+                        -- Soundness does not come from a generation count:
+                        -- single-flight leases serialize concurrent
+                        -- deployments, but sequentially failed generations
+                        -- stack, so the live workload can sit at any rank.
+                        -- It comes from workload state instead:
+                        --   * the newest completed job is the last workload
+                        --     known applied (a watching generation's job
+                        --     completes, and supersession only rewrites
+                        --     queued/leased jobs, so it stays completed) —
+                        --     admitted however many later generations
+                        --     failed;
+                        --   * any later generation that reached the apply
+                        --     phase may have written (or still be rolling
+                        --     out) a workload spec — apply failures are
+                        --     never reverted and the delete flip itself
+                        --     supersedes leased work with
+                        --     'deployment_superseded'. Only provable setup
+                        --     failures are excluded: setup completes before
+                        --     any workload spec is written.
+                        -- The set is therefore bounded by one artifact for
+                        -- the last applied workload plus one per apply-phase
+                        -- generation since it, which keeps the shared
+                        -- signed-policy byte budget safe while never dropping
+                        -- a generation the teardown could still hit.
                         app_status = 'deleting'
                         AND workload_teardown_required
                         AND workload_teardown_completed_at IS NULL
-                        AND current_operation_rank <= 2
+                        AND (
+                            (
+                                job_state = 'completed'
+                                AND NOT EXISTS (
+                                    SELECT 1
+                                      FROM deployment_apply_jobs AS newer
+                                     WHERE newer.app_id = ranked_job_operations.app_id
+                                       AND newer.state = 'completed'
+                                       AND newer.generation
+                                           > ranked_job_operations.generation
+                                )
+                            )
+                            OR (
+                                job_state <> 'completed'
+                                AND COALESCE(
+                                       ranked_job_operations.last_error_code,
+                                       ''
+                                   ) <> 'deployment_setup_failed'
+                                AND ranked_job_operations.generation > COALESCE(
+                                       (
+                                           SELECT MAX(applied.generation)
+                                             FROM deployment_apply_jobs AS applied
+                                            WHERE applied.app_id
+                                                = ranked_job_operations.app_id
+                                              AND applied.state = 'completed'
+                                       ),
+                                       0
+                                   )
+                            )
+                        )
                     )
                )
                AND artifact_deployment_id IS NOT NULL
@@ -3475,5 +3521,122 @@ resource_bindings := {
             .execute(&pool)
             .await
             .expect("delete supersession fixture organization");
+    }
+
+    #[tokio::test]
+    async fn teardown_pending_authorization_survives_stacked_failed_generations() {
+        let pool = database_test_pool().await;
+        let now = Utc::now();
+        let (org_id, app_id) = insert_test_app(&pool, "deleting").await;
+        sqlx::query("UPDATE apps SET workload_teardown_required = true WHERE id = $1")
+            .bind(app_id)
+            .execute(&pool)
+            .await
+            .expect("mark workload teardown pending");
+
+        // The still-running workload: a watching generation's job completed,
+        // and two later generations failed on top of it. Generation-count
+        // bounds would rank the live workload third and drop exactly the
+        // artifact the teardown needs.
+        let live = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, live, "healthy", now).await;
+        let live_artifact = insert_test_artifact(&pool, app_id, live, "ab").await;
+        insert_test_job(
+            &pool,
+            org_id,
+            app_id,
+            live,
+            live,
+            Some((live, &live_artifact)),
+        )
+        .await;
+
+        // A failed generation that never reached the apply phase: setup
+        // completes before any workload spec is written, so nothing can be
+        // running under it and it contributes no authorization.
+        let setup_failed = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, setup_failed, "failed", now).await;
+        let setup_failed_artifact = insert_test_artifact(&pool, app_id, setup_failed, "cd").await;
+        sqlx::query(
+            "INSERT INTO deployment_apply_jobs (
+                 deployment_id, app_id, org_id, source_deployment_id,
+                 payload_version, payload, payload_sha256,
+                 cleanup_app_on_setup_failure, signed_required,
+                 artifact_deployment_id, artifact_descriptor_core_hash,
+                 log_encryption, state, last_error_code
+             ) VALUES ($1, $2, $3, $1, 1,
+                       '{\"version\":1,\"log_encryption\":null}'::jsonb,
+                       $4, false, true, $1, $5, NULL, 'failed',
+                       'deployment_setup_failed')",
+        )
+        .bind(setup_failed)
+        .bind(app_id)
+        .bind(org_id)
+        .bind(vec![5u8; 32])
+        .bind(hex::decode(&setup_failed_artifact.metadata.descriptor_core_hash).unwrap())
+        .execute(&pool)
+        .await
+        .expect("insert setup-failed apply job");
+
+        // A failed generation that reached the apply phase: apply failures
+        // are never reverted, so its workload spec may be the one the
+        // teardown hits.
+        let apply_failed = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            org_id,
+            app_id,
+            apply_failed,
+            "failed",
+            now + chrono::Duration::seconds(1),
+        )
+        .await;
+        let apply_failed_artifact = insert_test_artifact(&pool, app_id, apply_failed, "de").await;
+        sqlx::query(
+            "INSERT INTO deployment_apply_jobs (
+                 deployment_id, app_id, org_id, source_deployment_id,
+                 payload_version, payload, payload_sha256,
+                 cleanup_app_on_setup_failure, signed_required,
+                 artifact_deployment_id, artifact_descriptor_core_hash,
+                 log_encryption, state, last_error_code
+             ) VALUES ($1, $2, $3, $1, 1,
+                       '{\"version\":1,\"log_encryption\":null}'::jsonb,
+                       $4, false, true, $1, $5, NULL, 'failed',
+                       'deployment_apply_failed')",
+        )
+        .bind(apply_failed)
+        .bind(app_id)
+        .bind(org_id)
+        .bind(vec![6u8; 32])
+        .bind(hex::decode(&apply_failed_artifact.metadata.descriptor_core_hash).unwrap())
+        .execute(&pool)
+        .await
+        .expect("insert apply-failed apply job");
+
+        let candidates = load_signed_policy_candidates(&pool, 2)
+            .await
+            .expect("select teardown-pending authority with stacked failures");
+        let hashes: HashSet<_> = candidates
+            .iter()
+            .map(|candidate| candidate.artifact.metadata.descriptor_core_hash.as_str())
+            .collect();
+        assert!(
+            hashes.contains(live_artifact.metadata.descriptor_core_hash.as_str()),
+            "the live workload under two stacked failures must stay authorized"
+        );
+        assert!(
+            hashes.contains(apply_failed_artifact.metadata.descriptor_core_hash.as_str()),
+            "an apply-phase failure newer than the last applied workload must stay authorized"
+        );
+        assert!(
+            !hashes.contains(setup_failed_artifact.metadata.descriptor_core_hash.as_str()),
+            "a provable setup failure never wrote a workload spec and must stay excluded"
+        );
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete stacked-failures fixture organization");
     }
 }
