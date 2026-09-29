@@ -3607,11 +3607,22 @@ pub async fn delete_paas_app(
         .fetch_one(&state.db)
         .await
         .map_err(|_| db_error())?;
+        let abandon_teardown = match body.get("abandon_teardown") {
+            None | Some(serde_json::Value::Bool(false)) => false,
+            Some(serde_json::Value::Bool(true)) => true,
+            Some(_) => {
+                return Err(json_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_abandon_teardown",
+                ));
+            }
+        };
         let status = match crate::routes::apps::delete_app_before(
             auth,
             State(state.clone()),
             Path(app_name),
             Some(created_before),
+            abandon_teardown,
         )
         .await
         {
@@ -8933,6 +8944,7 @@ mod tests {
             State(state.clone()),
             Path(app_name),
             Some(created_before),
+            false,
         )
         .await
         .unwrap_err();

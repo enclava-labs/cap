@@ -311,17 +311,70 @@ pub async fn ensure_tls_binding(
     Ok(())
 }
 
-pub async fn soft_delete_owner_binding(db: &PgPool, app_id: Uuid) -> Result<(), KbsPolicyError> {
+pub async fn soft_delete_owner_binding(
+    db: &PgPool,
+    app_id: Uuid,
+    workload_teardown_required: bool,
+) -> Result<(), KbsPolicyError> {
+    // Record the teardown outcome on the surviving binding row: completed (or
+    // never required) means no owner seed is known to survive; required and
+    // unmarked means the wrap may still exist in KBS (operator-abandoned
+    // destroy, or a lost completion marker) and a later recreate of the same
+    // name must be refused until it is erased.
     sqlx::query(
-        "UPDATE kbs_owner_bindings
-         SET deleted_at = COALESCE(deleted_at, now()), updated_at = now()
-         WHERE app_id = $1",
+        "UPDATE kbs_owner_bindings AS binding
+            SET deleted_at = COALESCE(binding.deleted_at, now()),
+                workload_teardown_completed_at = CASE
+                    WHEN NOT $2 OR app.workload_teardown_completed_at IS NOT NULL
+                        THEN now()
+                    ELSE binding.workload_teardown_completed_at
+                END,
+                workload_teardown_waived_at = CASE
+                    WHEN $2 AND app.workload_teardown_completed_at IS NULL
+                        THEN now()
+                    ELSE binding.workload_teardown_waived_at
+                END,
+                updated_at = now()
+           FROM apps AS app
+          WHERE binding.app_id = $1
+            AND app.id = $1",
     )
     .bind(app_id)
+    .bind(workload_teardown_required)
     .execute(db)
     .await?;
 
     Ok(())
+}
+
+/// Mirrors `enclava_engine::types::ConfidentialApp::owner_resource_type`: the
+/// KBS owner binding key is derived from the tenant namespace and app name, so
+/// it is identical across incarnations of the same name.
+fn owner_binding_key(namespace: &str, name: &str) -> String {
+    format!("{namespace}-{name}-owner")
+}
+
+/// Whether a soft-deleted owner binding with this key was destroyed without a
+/// completed confidential teardown — its owner seed may still exist in KBS,
+/// and a fresh create under the same name would boot already-claimed.
+pub async fn stale_owner_seed_for_binding(
+    db: &PgPool,
+    namespace: &str,
+    name: &str,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1
+               FROM kbs_owner_bindings
+              WHERE binding_key = $1
+                AND deleted_at IS NOT NULL
+                AND workload_teardown_waived_at IS NOT NULL
+                AND workload_teardown_completed_at IS NULL
+         )",
+    )
+    .bind(owner_binding_key(namespace, name))
+    .fetch_one(db)
+    .await
 }
 
 pub async fn soft_delete_tls_binding(
@@ -3475,5 +3528,110 @@ resource_bindings := {
             .execute(&pool)
             .await
             .expect("delete supersession fixture organization");
+    }
+
+    async fn seed_owner_binding_for_app(pool: &PgPool, app_id: Uuid) {
+        sqlx::query(
+            "INSERT INTO kbs_owner_bindings (
+                 app_id, binding_key, repository, allowed_tags, namespace,
+                 service_account, tenant_instance_identity_hash, deleted_at
+             )
+             SELECT id,
+                    namespace || '-' || name || '-owner',
+                    'default', ARRAY['seed-encrypted', 'seed-sealed'],
+                    namespace, service_account, tenant_instance_identity_hash, NULL
+               FROM apps WHERE id = $1",
+        )
+        .bind(app_id)
+        .execute(pool)
+        .await
+        .expect("insert owner binding fixture");
+    }
+
+    async fn owner_binding_outcome(
+        pool: &PgPool,
+        app_id: Uuid,
+    ) -> (Option<chrono::DateTime<Utc>>, Option<chrono::DateTime<Utc>>) {
+        sqlx::query_as(
+            "SELECT workload_teardown_completed_at, workload_teardown_waived_at
+               FROM kbs_owner_bindings WHERE app_id = $1",
+        )
+        .bind(app_id)
+        .fetch_one(pool)
+        .await
+        .expect("read owner binding outcome")
+    }
+
+    #[tokio::test]
+    async fn soft_delete_owner_binding_records_teardown_outcome() {
+        let pool = database_test_pool().await;
+
+        // Required teardown, never completed: the wrap may survive — waived.
+        let (waived_org, waived_app) = insert_test_app(&pool, "running").await;
+        seed_owner_binding_for_app(&pool, waived_app).await;
+        soft_delete_owner_binding(&pool, waived_app, true)
+            .await
+            .expect("soft delete waived binding");
+        let (completed, waived) = owner_binding_outcome(&pool, waived_app).await;
+        assert!(completed.is_none());
+        assert!(waived.is_some());
+        let stale: (String, String) =
+            sqlx::query_as("SELECT namespace, name FROM apps WHERE id = $1")
+                .bind(waived_app)
+                .fetch_one(&pool)
+                .await
+                .expect("read waived app identity");
+        assert!(
+            stale_owner_seed_for_binding(&pool, &stale.0, &stale.1)
+                .await
+                .expect("guard lookup"),
+            "a waived binding must refuse recreation of the same name"
+        );
+
+        // Required teardown, completed: nothing survives — recreate freely.
+        let (done_org, done_app) = insert_test_app(&pool, "running").await;
+        seed_owner_binding_for_app(&pool, done_app).await;
+        sqlx::query(
+            "UPDATE apps SET workload_teardown_completed_at = clock_timestamp()
+              WHERE id = $1",
+        )
+        .bind(done_app)
+        .execute(&pool)
+        .await
+        .expect("mark teardown completed");
+        soft_delete_owner_binding(&pool, done_app, true)
+            .await
+            .expect("soft delete completed binding");
+        let (completed, waived) = owner_binding_outcome(&pool, done_app).await;
+        assert!(completed.is_some());
+        assert!(waived.is_none());
+
+        // Teardown never required: no wrap ever existed — recreate freely.
+        let (fresh_org, fresh_app) = insert_test_app(&pool, "creating").await;
+        seed_owner_binding_for_app(&pool, fresh_app).await;
+        soft_delete_owner_binding(&pool, fresh_app, false)
+            .await
+            .expect("soft delete not-required binding");
+        let (completed, waived) = owner_binding_outcome(&pool, fresh_app).await;
+        assert!(completed.is_some());
+        assert!(waived.is_none());
+        let fresh_identity: (String, String) =
+            sqlx::query_as("SELECT namespace, name FROM apps WHERE id = $1")
+                .bind(fresh_app)
+                .fetch_one(&pool)
+                .await
+                .expect("read fresh app identity");
+        let fresh_stale = stale_owner_seed_for_binding(&pool, &fresh_identity.0, &fresh_identity.1)
+            .await
+            .expect("guard lookup");
+        assert!(!fresh_stale);
+
+        for cleanup_org in [waived_org, done_org, fresh_org] {
+            sqlx::query("DELETE FROM organizations WHERE id = $1")
+                .bind(cleanup_org)
+                .execute(&pool)
+                .await
+                .expect("delete teardown-outcome fixture organization");
+        }
     }
 }
