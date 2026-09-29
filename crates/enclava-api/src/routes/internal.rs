@@ -5016,16 +5016,51 @@ pub async fn rotate_paas_signer(
     };
     let checkpoint = signer_publication_checkpoint(&state.db, &idempotency).await?;
     let result: Result<IdempotencyResponse, InternalRouteError> = async {
-        let (app_id, committed) = match checkpoint {
-            Some(checkpoint) => checkpoint,
+        let (app_id, committed, checkpoint_rotation_count) = match checkpoint {
+            Some((app_id, committed)) => {
+                // On retry, extract rotation count from stored checkpoint body.
+                let stored_count = committed
+                    .get("rotation_count")
+                    .and_then(serde_json::Value::as_i64);
+                (app_id, committed, stored_count)
+            }
             None => {
                 let parsed = parse_internal_body(body)?;
                 let committed =
                     crate::routes::apps::rotate_signer_commit(auth, &state, &app_name, parsed)
                         .await?;
-                (committed.id, to_value(&committed)?)
+                // Capture rotation count at commit time to detect rotate-back supersession.
+                // A rotate-back (A→B→C→B) makes the original pending rotation's
+                // subject/issuer match again, so we must track count to distinguish
+                // a legitimate retry from a superseded one.
+                let rotation_count: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM consumed_signer_rotation_tokens WHERE app_id = $1",
+                )
+                .bind(committed.id)
+                .fetch_one(&state.db)
+                .await
+                .map_err(|_| db_error())?;
+                // Store count in the checkpoint for later comparison on retry.
+                let mut committed_value = to_value(&committed)?;
+                committed_value["rotation_count"] = serde_json::json!(rotation_count);
+                (committed.id, committed_value, Some(rotation_count))
             }
         };
+        // Verify rotation hasn't been superseded (including rotate-back) by comparing counts.
+        // If current count differs from checkpoint count, a different rotation committed
+        // in the interim, even if the signer identity coincidentally matches.
+        if let Some(stored_count) = checkpoint_rotation_count {
+            let current_count: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM consumed_signer_rotation_tokens WHERE app_id = $1",
+            )
+            .bind(app_id)
+            .fetch_one(&state.db)
+            .await
+            .map_err(|_| db_error())?;
+            if current_count != stored_count {
+                return Err(crate::routes::apps::signer_rotation_superseded_error());
+            }
+        }
         let (Some(expected_subject), Some(expected_issuer)) = (
             committed
                 .get("signer_identity_subject")
