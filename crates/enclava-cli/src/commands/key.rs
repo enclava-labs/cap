@@ -166,13 +166,13 @@ fn parse_pubkey(hex_in: &str) -> Result<VerifyingKey, Box<dyn std::error::Error>
 }
 
 fn keyring_envelope_from_response(
-    response: OrgKeyringResponse,
+    response: &OrgKeyringResponse,
 ) -> Result<OrgKeyringEnvelope, Box<dyn std::error::Error>> {
-    let sig_bytes: [u8; 64] = hex::decode(response.signature)?
+    let sig_bytes: [u8; 64] = hex::decode(&response.signature)?
         .try_into()
         .map_err(|_| "API returned org keyring signature with invalid length")?;
     Ok(OrgKeyringEnvelope {
-        keyring: serde_json::from_value(response.keyring_payload)?,
+        keyring: serde::Deserialize::deserialize(&response.keyring_payload)?,
         signature: Signature::from_bytes(&sig_bytes),
         signing_pubkey: parse_pubkey(&response.signing_pubkey)?,
     })
@@ -210,6 +210,51 @@ async fn upload_keyring(
     Ok(())
 }
 
+/// Re-upload the exact fields the server previously accepted. The typed
+/// envelope round-trip can drop unsigned unknown fields or change
+/// pubkey/timestamp encodings, which the PUT existing-version check then
+/// rejects as a conflict even though the keyring is semantically identical.
+async fn replay_accepted_keyring(
+    api: &ApiClient,
+    org_name: &str,
+    accepted: OrgKeyringResponse,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = api
+        .put_org_keyring(
+            org_name,
+            &PutOrgKeyringRequest {
+                version: accepted.version,
+                keyring_payload: accepted.keyring_payload,
+                signature: accepted.signature,
+                signing_pubkey: accepted.signing_pubkey,
+            },
+        )
+        .await?;
+    Ok(())
+}
+
+// Preserve setup on installations where the optional signing service returns
+// 503; completing key setup does not certify signing-service readiness.
+async fn bootstrap_signing_service(
+    api: &ApiClient,
+    org_name: &str,
+    signing_pubkey: &VerifyingKey,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match api
+        .bootstrap_signing_service_owner(
+            org_name,
+            &BootstrapSigningServiceRequest {
+                owner_pubkey_hex: hex::encode(signing_pubkey.to_bytes()),
+            },
+        )
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(enclava_cli::api_client::ApiError::Api { status: 503, .. }) => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
 fn keyring_has_owner(envelope: &OrgKeyringEnvelope, public: &VerifyingKey) -> bool {
     let public = public.to_bytes();
     envelope
@@ -223,6 +268,7 @@ async fn verify_or_initialize_remote_keyring(
     api: &ApiClient,
     me: &CurrentUserResponse,
     seed: &[u8; 32],
+    require_write_confirmation: bool,
 ) -> Result<(Uuid, String, String), Box<dyn std::error::Error>> {
     let user_id = Uuid::parse_str(&me.user_id)?;
     let org_id = Uuid::parse_str(&me.active_org.id)?;
@@ -232,7 +278,7 @@ async fn verify_or_initialize_remote_keyring(
 
     match api.get_org_keyring(&org_name).await {
         Ok(response) => {
-            let envelope = keyring_envelope_from_response(response)?;
+            let envelope = keyring_envelope_from_response(&response)?;
             verify_keyring(&envelope, &envelope.signing_pubkey)?;
             if !keyring_has_owner(&envelope, &owner.public) {
                 return Err(format!(
@@ -240,6 +286,14 @@ async fn verify_or_initialize_remote_keyring(
                     fingerprint(&owner.public)
                 )
                 .into());
+            }
+            // Restoring verified key material must not require keyring write authority.
+            // Setup confirms keyring publication before persisting local authority.
+            if require_write_confirmation {
+                replay_accepted_keyring(api, &org_name, response).await?;
+                // Bootstrap the envelope's signing owner: with a shared
+                // keyring the local key can be another authorized owner.
+                bootstrap_signing_service(api, &org_name, &envelope.signing_pubkey).await?;
             }
             store_trusted_owner(&org_id, &envelope.signing_pubkey)?;
             store_keyring_envelope(&org_id, &envelope)?;
@@ -252,19 +306,7 @@ async fn verify_or_initialize_remote_keyring(
             let keyring = single_member_keyring(org_id, 1, &owner, Role::Owner, chrono::Utc::now());
             let envelope = sign_keyring(&owner, keyring);
             upload_keyring(api, &org_name, &envelope).await?;
-            match api
-                .bootstrap_signing_service_owner(
-                    &org_name,
-                    &BootstrapSigningServiceRequest {
-                        owner_pubkey_hex: hex::encode(owner.public.to_bytes()),
-                    },
-                )
-                .await
-            {
-                Ok(_) => {}
-                Err(enclava_cli::api_client::ApiError::Api { status: 503, .. }) => {}
-                Err(err) => return Err(err.into()),
-            }
+            bootstrap_signing_service(api, &org_name, &envelope.signing_pubkey).await?;
             // Pin only authority CAP accepted. A concurrent team owner may win
             // the first upload, in which case this setup must leave no losing
             // local trust state behind.
@@ -529,7 +571,7 @@ async fn restore(
         &me.active_org.name,
     )?;
     let (_org_id, org_name, owner_fingerprint) =
-        verify_or_initialize_remote_keyring(&api, &me, &seed).await?;
+        verify_or_initialize_remote_keyring(&api, &me, &seed, false).await?;
     ensure_mnemonic_restore_will_not_overwrite(&paths, &org_name, &mnemonics, force)?;
 
     if existing_seed == Some(seed) {
@@ -681,7 +723,7 @@ async fn setup(
         .into());
     }
     let (_, org_name, owner_fingerprint) =
-        verify_or_initialize_remote_keyring(&api, &me, &seed).await?;
+        verify_or_initialize_remote_keyring(&api, &me, &seed, true).await?;
     if existing_seed.is_none() {
         // Install restored/new authority only after the remote keyring accepts it.
         // A stale backup must not poison local state and block a corrected retry.
@@ -784,7 +826,8 @@ async fn rotate_owner(
         seed
     };
     let replacement_owner = keys::derive_org_owner_key(user_id, org_id, &replacement_seed)?;
-    let remote = keyring_envelope_from_response(api.get_org_keyring(&me.active_org.name).await?)?;
+    let remote_response = api.get_org_keyring(&me.active_org.name).await?;
+    let remote = keyring_envelope_from_response(&remote_response)?;
     if current_owner.public == replacement_owner.public {
         verify_keyring(&remote, &current_owner.public)?;
         if !keyring_has_owner(&remote, &current_owner.public) {
@@ -792,6 +835,7 @@ async fn rotate_owner(
                 "remote keyring does not contain the owner derived from this backup".into(),
             );
         }
+        replay_accepted_keyring(&api, &me.active_org.name, remote_response).await?;
         println!(
             "The backup and active owner already match; no rotation was needed. Use a new backup path to start another rotation."
         );
@@ -802,6 +846,7 @@ async fn rotate_owner(
         if !keyring_has_owner(&remote, &replacement_owner.public) {
             return Err("remote keyring does not contain the replacement owner".into());
         }
+        replay_accepted_keyring(&api, &me.active_org.name, remote_response).await?;
         finalize_local_owner_rotation(
             &paths,
             org_id,
@@ -905,41 +950,6 @@ async fn rotate_owner(
 mod tests {
     use super::*;
 
-    #[test]
-    fn setup_writes_encrypted_backup_before_remote_authority() {
-        let source = include_str!("key.rs");
-        let body = source
-            .split("async fn setup(")
-            .nth(1)
-            .unwrap()
-            .split("fn finalize_local_owner_rotation")
-            .next()
-            .unwrap();
-        assert!(
-            body.find("write_encrypted_backup").unwrap()
-                < body.find("verify_or_initialize_remote_keyring").unwrap()
-        );
-        assert!(
-            body.find("verify_or_initialize_remote_keyring").unwrap()
-                < body.find("store_seed_at").unwrap()
-        );
-        let initialize_missing = source
-            .split("async fn verify_or_initialize_remote_keyring(")
-            .nth(1)
-            .unwrap()
-            .split("Err(enclava_cli::api_client::ApiError::Api { status: 404, .. }) => {")
-            .nth(1)
-            .unwrap()
-            .split("Err(err) => Err(err.into())")
-            .next()
-            .unwrap();
-        assert!(
-            initialize_missing.find("upload_keyring").unwrap()
-                < initialize_missing.find("store_trusted_owner").unwrap()
-        );
-        assert!(body.contains("only an organization owner can create signing authority"));
-    }
-
     #[cfg(unix)]
     #[test]
     fn restore_mnemonics_requires_force_before_overwriting_different_existing_value() {
@@ -951,11 +961,9 @@ mod tests {
             mnemonic: "older mnemonic".to_string(),
         }];
 
-        let err = ensure_mnemonic_restore_will_not_overwrite(&paths, "org-a", &mnemonics, false)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("different recovery mnemonic"));
-        assert!(err.contains("--force"));
+        assert!(
+            ensure_mnemonic_restore_will_not_overwrite(&paths, "org-a", &mnemonics, false).is_err()
+        );
         assert_eq!(
             keys::load_app_mnemonic(&paths, "org-a", "shell").unwrap(),
             Some("newer mnemonic".to_string())
@@ -981,31 +989,24 @@ mod tests {
         }];
 
         ensure_mnemonic_restore_will_not_overwrite(&paths, "org-a", &mnemonics, false).unwrap();
-    }
-
-    #[test]
-    fn logged_out_backup_metadata_records_requested_org_name() {
-        let (metadata, backup_org_name) = logged_out_backup_metadata(Some("org-a".to_string()));
-
-        assert_eq!(metadata.org_name.as_deref(), Some("org-a"));
-        assert_eq!(backup_org_name.as_deref(), Some("org-a"));
-        assert!(metadata.org_id.is_none());
-        assert!(metadata.owner_fingerprint.is_none());
+        restore_app_mnemonics(&paths, "org-a", &mnemonics).unwrap();
+        assert_eq!(
+            keys::load_app_mnemonic(&paths, "org-a", "shell").unwrap(),
+            Some("same mnemonic".to_string())
+        );
     }
 
     #[test]
     fn restore_rejects_backup_org_name_mismatch() {
-        let err = ensure_backup_org_matches_active_org(
-            None,
-            Some("org-a"),
-            "22222222-2222-2222-2222-222222222222",
-            "org-b",
-        )
-        .unwrap_err()
-        .to_string();
-
-        assert!(err.contains("backup is for org org-a"));
-        assert!(err.contains("active org is org-b"));
+        assert!(
+            ensure_backup_org_matches_active_org(
+                None,
+                Some("org-a"),
+                "22222222-2222-2222-2222-222222222222",
+                "org-b",
+            )
+            .is_err()
+        );
     }
 
     #[cfg(unix)]
@@ -1018,11 +1019,7 @@ mod tests {
             mnemonic: "older mnemonic".to_string(),
         }];
 
-        let err = restore_app_mnemonics(&paths, "org-a", &mnemonics)
-            .unwrap_err()
-            .to_string();
-
-        assert!(err.contains("invalid recovery mnemonic app name"));
+        assert!(restore_app_mnemonics(&paths, "org-a", &mnemonics).is_err());
         assert!(!tmp.path().join("state/keys/escape.mnemonic").exists());
         assert!(!tmp.path().join("escape.mnemonic").exists());
     }

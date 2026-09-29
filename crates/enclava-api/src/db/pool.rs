@@ -34,6 +34,11 @@ pub async fn create_pool(database_url: &str) -> Result<PgPool, sqlx::Error> {
 
 /// Run all pending migrations.
 pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateError> {
+    // Serialize migration runs process-wide: concurrent run_migrations calls
+    // deadlock on sqlx's per-migration advisory lock. This only orders this
+    // process's calls; cross-process coordination stays with sqlx.
+    static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _serial = SERIAL.lock().await;
     MIGRATOR.run(pool).await
 }
 

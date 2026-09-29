@@ -23,7 +23,7 @@ mod workload_tls_timing;
 
 use axum::{
     Json, Router,
-    extract::{Request, State},
+    extract::{DefaultBodyLimit, Request, State},
     http::{HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -160,7 +160,13 @@ where
         router = router.merge(with_tracing(internal_routes, &trace_layer));
     }
 
-    router.layer(build_cors_layer()).with_state(state)
+    router
+        // Explicit global request-body bound (#128): signing blobs get
+        // additional per-field caps in signing_service, but keep the router
+        // limit pinned so a future extractor change cannot silently lift it.
+        .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
+        .layer(build_cors_layer())
+        .with_state(state)
 }
 
 /// Wrap a route group in request tracing. Applied OUTERMOST in every group
@@ -1989,6 +1995,13 @@ mod runtime_gate_tests {
 
 #[cfg(test)]
 pub(crate) mod test_support {
+    /// Serializes tests that mutate or assert on the global
+    /// `kbs_signed_policy_reconciliation` singleton row: cargo runs lib
+    /// tests in parallel against one shared database, so unsynchronized
+    /// generation bumps from one test would corrupt another's assertions.
+    pub(crate) static SIGNED_POLICY_SINGLETON_LOCK: tokio::sync::Mutex<()> =
+        tokio::sync::Mutex::const_new(());
+
     use crate::auth::api_key::ValidatedApiKey;
     use crate::auth::middleware::{AuthContext, ManagementOrigin};
     use crate::clients::{AllowList, ClientConfig, RegistryClient};
@@ -2080,5 +2093,142 @@ pub(crate) mod test_support {
             side_effect_admission,
             internal_auth: None,
         }
+    }
+
+    /// Route-level and reconciliation tests assert exact values on the global
+    /// `kbs_signed_policy_reconciliation` singleton.  The shared test
+    /// database is mutated concurrently by hundreds of other tests (and by
+    /// sibling pipeline worktrees), any of which can bump the generation
+    /// mid-assertion.  A dedicated database makes these tests deterministic.
+    ///
+    /// The database name is suffixed with the current process id: sibling CI
+    /// worktrees share one PostgreSQL server, and a fixed name would let two
+    /// processes mutate the same singleton row concurrently.  The database is
+    /// created fresh (a stale leftover from a crashed run is dropped first).
+    ///
+    /// The pool must be returned to [`drop_isolated_database`] when the test
+    /// body finishes; that closes the pool and drops the database so repeated
+    /// CI runs do not accumulate fully migrated databases on the shared
+    /// PostgreSQL server (the pid suffix means a later run's initial
+    /// DROP IF EXISTS never matches an earlier run's leftover).
+    ///
+    /// The returned [`IsolatedDatabaseCleanup`] guard is the panic-path
+    /// backstop: the explicit drop runs only on the happy path, but a failing
+    /// assertion (or any panic) would otherwise leak the fully migrated
+    /// per-process database forever.  The guard drops the database during
+    /// unwind as well; its final `DROP IF EXISTS` is idempotent with the
+    /// explicit drop.
+    pub(crate) async fn isolated_database_test_pool(
+        name: &str,
+    ) -> (IsolatedDatabaseCleanup, sqlx::PgPool) {
+        let base_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
+        let db_name = format!("{name}_{}", std::process::id());
+        let cleanup = IsolatedDatabaseCleanup {
+            db_name: db_name.clone(),
+            base_url: base_url.clone(),
+        };
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&base_url)
+            .await
+            .expect("connect isolated keyring database admin");
+        // A leftover database from a crashed run would carry a stale
+        // singleton generation; drop it so every run starts from scratch.
+        sqlx::query(&format!(
+            "DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"
+        ))
+        .execute(&admin)
+        .await
+        .expect("drop stale isolated keyring database");
+        sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
+            .execute(&admin)
+            .await
+            .expect("create isolated keyring database");
+        admin.close().await;
+        // Same connection settings with only the database replaced: parse
+        // the URL instead of slicing it so query parameters (sslmode, a
+        // Unix-socket `host`, `options`, ...) survive the swap.  String
+        // slicing on the last '/' would drop the whole query string and a
+        // socket-host URL can even place a '/' inside the query.
+        let options = base_url
+            .parse::<sqlx::postgres::PgConnectOptions>()
+            .expect("parse DATABASE_URL for isolated keyring database")
+            .database(&db_name);
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect_with(options)
+            .await
+            .expect("connect isolated keyring database");
+        crate::db::pool::run_migrations(&pool)
+            .await
+            .expect("migrate isolated keyring database");
+        (cleanup, pool)
+    }
+
+    /// Panic-path backstop for [`isolated_database_test_pool`]: drops the
+    /// per-process database even when the test panics before reaching its
+    /// explicit [`drop_isolated_database`] call.  Runs on a dedicated thread
+    /// with its own short-lived runtime so it can block on the async driver
+    /// from synchronous unwind code.
+    pub(crate) struct IsolatedDatabaseCleanup {
+        db_name: String,
+        base_url: String,
+    }
+
+    impl Drop for IsolatedDatabaseCleanup {
+        fn drop(&mut self) {
+            let db_name = self.db_name.clone();
+            let base_url = self.base_url.clone();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build isolated database cleanup runtime");
+                rt.block_on(async move {
+                    let admin = PgPoolOptions::new()
+                        .max_connections(1)
+                        .connect(&base_url)
+                        .await;
+                    if let Ok(admin) = admin {
+                        let _ = sqlx::query(&format!(
+                            "DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"
+                        ))
+                        .execute(&admin)
+                        .await;
+                        admin.close().await;
+                    }
+                });
+            })
+            .join()
+            .expect("isolated database cleanup thread");
+        }
+    }
+
+    /// Companion to [`isolated_database_test_pool`]: closes the pool and
+    /// drops the per-process database.  Without this, every test run leaves
+    /// a fully migrated database behind on the shared PostgreSQL server (the
+    /// pid suffix means a later run's initial `DROP IF EXISTS` targets a
+    /// different name and never reclaims it).
+    pub(crate) async fn drop_isolated_database(name: &str, pool: sqlx::PgPool) {
+        let base_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
+        let db_name = format!("{name}_{}", std::process::id());
+        // All clones share one connection pool, so this closes every handle
+        // the test (and its AppState clones) hold; DROP ... WITH (FORCE)
+        // would terminate any stragglers regardless.
+        pool.close().await;
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&base_url)
+            .await
+            .expect("connect isolated keyring database admin for drop");
+        sqlx::query(&format!(
+            "DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"
+        ))
+        .execute(&admin)
+        .await
+        .expect("drop isolated keyring database");
+        admin.close().await;
     }
 }
