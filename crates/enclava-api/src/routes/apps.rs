@@ -894,6 +894,11 @@ pub(crate) async fn prepare_app_candidate(
         signer_identity_set_at: (body.signer_identity_subject.is_some()
             || body.signer_identity_issuer.is_some())
         .then_some(now),
+        // An initial identity set counts as the first rotation event (the
+        // generation trigger only bumps on UPDATE, so seed it here).
+        signer_rotation_generation: i64::from(
+            body.signer_identity_subject.is_some() || body.signer_identity_issuer.is_some(),
+        ),
         source_provider: body
             .source_provider
             .map(SourceProvider::as_str)
@@ -2075,11 +2080,16 @@ pub(crate) fn signer_rotation_superseded_error() -> (StatusCode, Json<serde_json
 }
 
 // Release authority lanes before external KBS work; reacquire to detect supersession.
+// The comparison uses the rotation generation captured with the committed
+// response in addition to subject/issuer: a rotate-back (A -> B -> C -> B)
+// restores the same identity pair through a NEW authority event, and only
+// the generation distinguishes the two occurrences (PR #187 review).
 async fn confirm_committed_signer_identity(
     state: &AppState,
     app_id: Uuid,
     expected_subject: &str,
     expected_issuer: &str,
+    expected_generation: i64,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     let mut tx = state
         .db
@@ -2098,8 +2108,8 @@ async fn confirm_committed_signer_identity(
     crate::deploy::lock_app_deployment_lane(&mut tx, app_id)
         .await
         .map_err(|_| signer_publication_pending_error())?;
-    let live: Option<(Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT signer_identity_subject, signer_identity_issuer
+    let live: Option<(Option<String>, Option<String>, i64)> = sqlx::query_as(
+        "SELECT signer_identity_subject, signer_identity_issuer, signer_rotation_generation
            FROM apps
           WHERE id = $1
             AND status <> 'deleting'::app_status_enum",
@@ -2112,9 +2122,10 @@ async fn confirm_committed_signer_identity(
         .await
         .map_err(|_| signer_publication_pending_error())?;
     match live {
-        Some((subject, issuer))
+        Some((subject, issuer, generation))
             if subject.as_deref() == Some(expected_subject)
-                && issuer.as_deref() == Some(expected_issuer) =>
+                && issuer.as_deref() == Some(expected_issuer)
+                && generation == expected_generation =>
         {
             Ok(())
         }
@@ -2129,8 +2140,16 @@ pub(crate) async fn reconcile_signer_publication(
     app_id: Uuid,
     expected_subject: &str,
     expected_issuer: &str,
+    expected_generation: i64,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    confirm_committed_signer_identity(state, app_id, expected_subject, expected_issuer).await?;
+    confirm_committed_signer_identity(
+        state,
+        app_id,
+        expected_subject,
+        expected_issuer,
+        expected_generation,
+    )
+    .await?;
     if state.kbs_policy.is_none() {
         // The shared confirm helper fails closed exactly when signed-policy
         // mode is active without configuration, and performs no write on an
@@ -2144,8 +2163,14 @@ pub(crate) async fn reconcile_signer_publication(
             );
             return Err(signer_publication_pending_error());
         }
-        return confirm_committed_signer_identity(state, app_id, expected_subject, expected_issuer)
-            .await;
+        return confirm_committed_signer_identity(
+            state,
+            app_id,
+            expected_subject,
+            expected_issuer,
+            expected_generation,
+        )
+        .await;
     }
     let lease = match crate::mutation_leases::claim_resources(
         state,
@@ -2205,7 +2230,14 @@ pub(crate) async fn reconcile_signer_publication(
         return Err(signer_publication_pending_error());
     }
     // Authority may change during external publication.
-    confirm_committed_signer_identity(state, app_id, expected_subject, expected_issuer).await?;
+    confirm_committed_signer_identity(
+        state,
+        app_id,
+        expected_subject,
+        expected_issuer,
+        expected_generation,
+    )
+    .await?;
     Ok(())
 }
 
@@ -2220,7 +2252,8 @@ pub async fn rotate_signer(
     Path(app_name): Path<String>,
     Json(body): Json<RotateSignerRequest>,
 ) -> Result<Json<AppResponse>, (StatusCode, Json<serde_json::Value>)> {
-    let app = rotate_signer_commit(auth, &state, &app_name, body).await?;
+    let (app, signer_rotation_generation) =
+        rotate_signer_commit(auth, &state, &app_name, body).await?;
     let expected_subject = app
         .signer_identity_subject
         .as_deref()
@@ -2229,7 +2262,14 @@ pub async fn rotate_signer(
         .signer_identity_issuer
         .as_deref()
         .ok_or_else(internal_server_error)?;
-    reconcile_signer_publication(&state, app.id, expected_subject, expected_issuer).await?;
+    reconcile_signer_publication(
+        &state,
+        app.id,
+        expected_subject,
+        expected_issuer,
+        signer_rotation_generation,
+    )
+    .await?;
     Ok(Json(app))
 }
 
@@ -2238,13 +2278,17 @@ pub async fn rotate_signer(
 /// wrapper can persist the committed result as a publication checkpoint:
 /// the email confirmation token is single-use, so a same-key retry of a
 /// committed rotation may only reconcile publication and replay the saved
-/// result, never re-run this mutation.
+/// result, never re-run this mutation. Returns the committed app response
+/// together with the signer rotation generation established by this
+/// transaction (or the current one for the read-only same-identity
+/// confirmation): a deferred retry compares it against the live generation
+/// so a rotate-back through a later authority event counts as superseded.
 pub(crate) async fn rotate_signer_commit(
     auth: AuthContext,
     state: &AppState,
     app_name: &str,
     body: RotateSignerRequest,
-) -> Result<AppResponse, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<(AppResponse, i64), (StatusCode, Json<serde_json::Value>)> {
     scopes::require_owner(&auth)?;
     scopes::require_scope(&auth, "apps:write")?;
     ensure_management_write_allowed(state, &auth).await?;
@@ -2352,7 +2396,8 @@ pub(crate) async fn rotate_signer_commit(
         && previous_issuer.as_deref() == Some(issuer.as_str())
     {
         tx.rollback().await.map_err(|_| internal_server_error())?;
-        return Ok(app.into());
+        let signer_rotation_generation = app.signer_rotation_generation;
+        return Ok((app.into(), signer_rotation_generation));
     }
 
     let confirmation_token = body
@@ -2507,7 +2552,8 @@ pub(crate) async fn rotate_signer_commit(
         .map_err(|_| internal_server_error())?;
     tx.commit().await.map_err(|_| internal_server_error())?;
 
-    Ok(app.into())
+    let signer_rotation_generation = app.signer_rotation_generation;
+    Ok((app.into(), signer_rotation_generation))
 }
 
 #[cfg(test)]

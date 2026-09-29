@@ -1751,6 +1751,7 @@ async fn complete_keyring_result(
 }
 
 const SIGNER_PUBLICATION_CHECKPOINT_RESPONSE_FIELD: &str = "committed_response";
+const SIGNER_PUBLICATION_CHECKPOINT_GENERATION_FIELD: &str = "signer_rotation_generation";
 
 /// Preflight failures are known not applied. A committed rotation instead
 /// retains its result so retries can publish without consuming its token again.
@@ -1786,23 +1787,32 @@ async fn complete_signer_result(
     }
 }
 
-fn signer_publication_checkpoint_error(committed: serde_json::Value) -> InternalRouteError {
+fn signer_publication_checkpoint_error(
+    committed: serde_json::Value,
+    rotation_generation: i64,
+) -> InternalRouteError {
     let mut body = serde_json::json!({
         "code": crate::routes::apps::SIGNER_ROTATION_PUBLICATION_PENDING_CODE,
     });
     body[SIGNER_PUBLICATION_CHECKPOINT_RESPONSE_FIELD] = committed;
+    body[SIGNER_PUBLICATION_CHECKPOINT_GENERATION_FIELD] = serde_json::json!(rotation_generation);
     (StatusCode::SERVICE_UNAVAILABLE, Json(body))
 }
 
 /// A deferred signer publication checkpoint owned by this request's lease,
-/// as `(app_id, committed response)`. The reservation-token CAS preserves
-/// completion ownership: only the lease holder may turn the checkpoint into
-/// a publication-only retry. A malformed checkpoint fails closed instead of
+/// as `(app_id, rotation generation, committed response)`. The
+/// reservation-token CAS preserves completion ownership: only the lease
+/// holder may turn the checkpoint into a publication-only retry. The
+/// rotation generation was captured in the same transaction as the committed
+/// response; a retry compares it against the live generation so a rotate-back
+/// (A -> B -> C -> B) through a later authority event still counts as
+/// superseded. A malformed checkpoint — including one missing the generation
+/// (written before this field existed) — fails closed instead of
 /// re-executing the single-use mutation.
 async fn signer_publication_checkpoint(
     pool: &sqlx::PgPool,
     lease: &IdempotencyLease,
-) -> Result<Option<(Uuid, serde_json::Value)>, InternalRouteError> {
+) -> Result<Option<(Uuid, i64, serde_json::Value)>, InternalRouteError> {
     let row: Option<(Option<i32>, Option<serde_json::Value>)> = sqlx::query_as(
         "SELECT response_status, response_body
            FROM cap_internal_idempotency
@@ -1832,6 +1842,12 @@ async fn signer_publication_checkpoint(
     {
         return Err(db_error());
     }
+    let Some(rotation_generation) = body
+        .get(SIGNER_PUBLICATION_CHECKPOINT_GENERATION_FIELD)
+        .and_then(serde_json::Value::as_i64)
+    else {
+        return Err(db_error());
+    };
     let Some(committed) = body
         .get_mut(SIGNER_PUBLICATION_CHECKPOINT_RESPONSE_FIELD)
         .map(serde_json::Value::take)
@@ -1843,7 +1859,7 @@ async fn signer_publication_checkpoint(
         .and_then(serde_json::Value::as_str)
         .and_then(|value| Uuid::parse_str(value).ok())
         .ok_or_else(db_error)?;
-    Ok(Some((app_id, committed)))
+    Ok(Some((app_id, rotation_generation, committed)))
 }
 
 /// Return an expiring capability exactly once without persisting it in CAP's
@@ -5016,51 +5032,18 @@ pub async fn rotate_paas_signer(
     };
     let checkpoint = signer_publication_checkpoint(&state.db, &idempotency).await?;
     let result: Result<IdempotencyResponse, InternalRouteError> = async {
-        let (app_id, committed, checkpoint_rotation_count) = match checkpoint {
-            Some((app_id, committed)) => {
-                // On retry, extract rotation count from stored checkpoint body.
-                let stored_count = committed
-                    .get("rotation_count")
-                    .and_then(serde_json::Value::as_i64);
-                (app_id, committed, stored_count)
+        let (app_id, rotation_generation, committed) = match checkpoint {
+            Some((app_id, rotation_generation, committed)) => {
+                (app_id, rotation_generation, committed)
             }
             None => {
                 let parsed = parse_internal_body(body)?;
-                let committed =
+                let (committed, rotation_generation) =
                     crate::routes::apps::rotate_signer_commit(auth, &state, &app_name, parsed)
                         .await?;
-                // Capture rotation count at commit time to detect rotate-back supersession.
-                // A rotate-back (A→B→C→B) makes the original pending rotation's
-                // subject/issuer match again, so we must track count to distinguish
-                // a legitimate retry from a superseded one.
-                let rotation_count: i64 = sqlx::query_scalar(
-                    "SELECT count(*) FROM consumed_signer_rotation_tokens WHERE app_id = $1",
-                )
-                .bind(committed.id)
-                .fetch_one(&state.db)
-                .await
-                .map_err(|_| db_error())?;
-                // Store count in the checkpoint for later comparison on retry.
-                let mut committed_value = to_value(&committed)?;
-                committed_value["rotation_count"] = serde_json::json!(rotation_count);
-                (committed.id, committed_value, Some(rotation_count))
+                (committed.id, rotation_generation, to_value(&committed)?)
             }
         };
-        // Verify rotation hasn't been superseded (including rotate-back) by comparing counts.
-        // If current count differs from checkpoint count, a different rotation committed
-        // in the interim, even if the signer identity coincidentally matches.
-        if let Some(stored_count) = checkpoint_rotation_count {
-            let current_count: i64 = sqlx::query_scalar(
-                "SELECT count(*) FROM consumed_signer_rotation_tokens WHERE app_id = $1",
-            )
-            .bind(app_id)
-            .fetch_one(&state.db)
-            .await
-            .map_err(|_| db_error())?;
-            if current_count != stored_count {
-                return Err(crate::routes::apps::signer_rotation_superseded_error());
-            }
-        }
         let (Some(expected_subject), Some(expected_issuer)) = (
             committed
                 .get("signer_identity_subject")
@@ -5071,11 +5054,17 @@ pub async fn rotate_paas_signer(
         ) else {
             return Err(db_error());
         };
+        // The generation captured with the committed response (in the same
+        // transaction) is compared against the live generation before and
+        // after publication, so any interleaved authority event — including
+        // a rotate-back that restores the same subject/issuer — turns this
+        // retry into a terminal superseded result instead of a false success.
         match crate::routes::apps::reconcile_signer_publication(
             &state,
             app_id,
             expected_subject,
             expected_issuer,
+            rotation_generation,
         )
         .await
         {
@@ -5086,7 +5075,10 @@ pub async fn rotate_paas_signer(
             {
                 Err((StatusCode::CONFLICT, Json(body)))
             }
-            Err(_) => Err(signer_publication_checkpoint_error(committed)),
+            Err(_) => Err(signer_publication_checkpoint_error(
+                committed,
+                rotation_generation,
+            )),
         }
     }
     .await;
@@ -12497,6 +12489,239 @@ mod tests {
             .await;
 
         crate::test_support::drop_isolated_database("cap_signer_superseded", pool).await;
+    }
+
+    /// PR #187 review follow-up ("Rotate-back falsely completes superseded
+    /// rotation"): after A→B is deferred, a B→C→B rotate-back leaves the app
+    /// back on B's subject/issuer through NEW authority events. The stale A→B
+    /// checkpoint must still terminate as superseded — its rotation
+    /// generation no longer matches the live one — even with KBS healthy so
+    /// publication would otherwise succeed.
+    #[tokio::test]
+    async fn rotate_signer_rotate_back_retry_is_terminal_conflict() {
+        let _singleton = crate::test_support::SIGNED_POLICY_SINGLETON_LOCK
+            .lock()
+            .await;
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_signer_rotate_back").await;
+        let (org_id, user_id, app_id, app_name, paas_org_id, paas_user_id) =
+            seed_signer_rotation_fixture(&pool).await;
+        sqlx::query(
+            "INSERT INTO kbs_tls_bindings (app_id, binding_key, namespace, service_account, tenant_instance_identity_hash)
+             SELECT id, id::text, namespace, service_account, tenant_instance_identity_hash FROM apps WHERE id = $1",
+        )
+        .bind(app_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 5,
+                    selector_bumps_owed = 0,
+                    configmap_generation = 0,
+                    applied_generation = 0,
+                    configmap_policy_sha256 = NULL,
+                    applied_policy_sha256 = NULL,
+                    configmap_resource_version = NULL
+              WHERE singleton",
+        )
+        .execute(&pool)
+        .await
+        .expect("activate signed-policy mode without a converged generation");
+
+        let mut state = idempotency_test_state(pool.clone());
+        state.management_mode = crate::state::CapManagementMode::PaasManaged;
+        state.kbs_policy = Some(crate::kbs::KbsPolicyConfig {
+            namespace: "kbs-test".into(),
+            configmap_name: "resource-policy".into(),
+            policy_key: "policy.rego".into(),
+            deployment_name: "trustee".into(),
+            required: true,
+            signed_policy_retention: 1,
+            signed_policy_max_bytes: 1_048_576,
+        });
+        let subject_a =
+            "https://github.com/enclava/test/.github/workflows/build.yml@refs/heads/main";
+        let issuer_a = "https://token.actions.githubusercontent.com";
+        let subject_b =
+            "https://github.com/enclava/rotated/.github/workflows/build.yml@refs/heads/main";
+        let issuer_b = "https://rotated-issuer.example.test";
+        let subject_c =
+            "https://github.com/enclava/interim/.github/workflows/build.yml@refs/heads/main";
+        let issuer_c = "https://interim-issuer.example.test";
+
+        let old_token = crate::auth::jwt::issue_signer_rotation_token(
+            state.hmac_key.as_ref(),
+            &crate::auth::jwt::SignerRotationTokenInput {
+                user_id,
+                org_id,
+                app_id,
+                previous_subject: subject_a.to_string(),
+                previous_issuer: issuer_a.to_string(),
+                new_subject: subject_b.to_string(),
+                new_issuer: issuer_b.to_string(),
+            },
+            chrono::Duration::seconds(600),
+        )
+        .expect("issue deferred rotation token");
+        let old_idempotency_key = format!("signer-rotate-back-old-{}", Uuid::new_v4());
+        let old_headers = config_token_actor_headers(&old_idempotency_key, &paas_user_id);
+        let old_request = serde_json::json!({
+            "subject": subject_b,
+            "issuer": issuer_b,
+            "email_confirmation_token": old_token,
+        });
+        let mid_token = crate::auth::jwt::issue_signer_rotation_token(
+            state.hmac_key.as_ref(),
+            &crate::auth::jwt::SignerRotationTokenInput {
+                user_id,
+                org_id,
+                app_id,
+                previous_subject: subject_b.to_string(),
+                previous_issuer: issuer_b.to_string(),
+                new_subject: subject_c.to_string(),
+                new_issuer: issuer_c.to_string(),
+            },
+            chrono::Duration::seconds(600),
+        )
+        .expect("issue interim rotation token");
+        let back_token = crate::auth::jwt::issue_signer_rotation_token(
+            state.hmac_key.as_ref(),
+            &crate::auth::jwt::SignerRotationTokenInput {
+                user_id,
+                org_id,
+                app_id,
+                previous_subject: subject_c.to_string(),
+                previous_issuer: issuer_c.to_string(),
+                new_subject: subject_b.to_string(),
+                new_issuer: issuer_b.to_string(),
+            },
+            chrono::Duration::seconds(600),
+        )
+        .expect("issue rotate-back token");
+
+        let provider = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::test_support::KbsPolicyProvider::new(false),
+        ));
+        crate::kbs::TEST_KUBE_CLIENT
+            .scope(crate::test_support::kbs_policy_kube_client(provider.clone()), async {
+                let deferred = rotate_paas_signer(
+                    internal_test_auth(),
+                    State(state.clone()),
+                    Path((paas_org_id.clone(), app_name.clone())),
+                    old_headers.clone(),
+                    Json(old_request.clone()),
+                )
+                .await
+                .expect_err("committed-but-unconfirmed rotation must defer, not succeed");
+                assert_eq!(deferred.0, StatusCode::CONFLICT);
+                assert_eq!(
+                    deferred.1.0["cause"],
+                    crate::routes::apps::SIGNER_ROTATION_PUBLICATION_PENDING_CODE
+                );
+
+                expire_idempotency_lease(&pool, &old_idempotency_key).await;
+                {
+                    let mut provider = provider.lock().await;
+                    provider.healthy = true;
+                }
+                let mid_headers = config_token_actor_headers(
+                    &format!("signer-rotate-back-mid-{}", Uuid::new_v4()),
+                    &paas_user_id,
+                );
+                let (mid_status, Json(mid_published)) = rotate_paas_signer(
+                    internal_test_auth(),
+                    State(state.clone()),
+                    Path((paas_org_id.clone(), app_name.clone())),
+                    mid_headers,
+                    Json(serde_json::json!({
+                        "subject": subject_c,
+                        "issuer": issuer_c,
+                        "email_confirmation_token": mid_token,
+                    })),
+                )
+                .await
+                .expect("the interim rotation must publish");
+                assert_eq!(mid_status, StatusCode::OK);
+                assert_eq!(mid_published["signer_identity_subject"], subject_c);
+
+                let back_headers = config_token_actor_headers(
+                    &format!("signer-rotate-back-back-{}", Uuid::new_v4()),
+                    &paas_user_id,
+                );
+                let (back_status, Json(back_published)) = rotate_paas_signer(
+                    internal_test_auth(),
+                    State(state.clone()),
+                    Path((paas_org_id.clone(), app_name.clone())),
+                    back_headers,
+                    Json(serde_json::json!({
+                        "subject": subject_b,
+                        "issuer": issuer_b,
+                        "email_confirmation_token": back_token,
+                    })),
+                )
+                .await
+                .expect("the rotate-back must publish");
+                assert_eq!(back_status, StatusCode::OK);
+                assert_eq!(back_published["signer_identity_subject"], subject_b);
+
+                // KBS is healthy: without generation tracking the stale retry
+                // would re-publish and replay its earlier success. The live
+                // identity equals the checkpointed one — only the generation
+                // still marks this retry as superseded.
+                let superseded = rotate_paas_signer(
+                    internal_test_auth(),
+                    State(state.clone()),
+                    Path((paas_org_id.clone(), app_name.clone())),
+                    old_headers.clone(),
+                    Json(old_request.clone()),
+                )
+                .await
+                .expect_err("the rotate-back must supersede the stale retry");
+                assert_eq!(superseded.0, StatusCode::CONFLICT);
+                assert_eq!(
+                    superseded.1.0["code"],
+                    crate::routes::apps::SIGNER_ROTATION_SUPERSEDED_CODE
+                );
+                assert_eq!(superseded.1.0["idempotency_disposition"], "completed");
+                assert_eq!(superseded.1.0["retryable"], false);
+                assert!(superseded.1.0.get("committed_response").is_none());
+
+                let replayed = rotate_paas_signer(
+                    internal_test_auth(),
+                    State(state.clone()),
+                    Path((paas_org_id.clone(), app_name.clone())),
+                    old_headers.clone(),
+                    Json(old_request.clone()),
+                )
+                .await
+                .expect("the terminal receipt must replay as the same conflict");
+                assert_eq!(replayed.0, StatusCode::CONFLICT);
+                assert_eq!(replayed.1.0, superseded.1.0);
+
+                let receipts: (i64, i64, i64) = sqlx::query_as(
+                    "SELECT (SELECT count(*) FROM consumed_signer_rotation_tokens WHERE app_id = $1),
+                            (SELECT count(*) FROM audit_log WHERE org_id = $2 AND action = 'app.signer.rotate'),
+                            (SELECT count(*) FROM withdrawn_signer_artifacts WHERE app_id = $1)",
+                )
+                .bind(app_id)
+                .bind(org_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                assert_eq!(receipts, (3, 3, 0));
+
+                let subject_after: Option<String> =
+                    sqlx::query_scalar("SELECT signer_identity_subject FROM apps WHERE id = $1")
+                        .bind(app_id)
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                assert_eq!(subject_after.as_deref(), Some(subject_b));
+            })
+            .await;
+
+        crate::test_support::drop_isolated_database("cap_signer_rotate_back", pool).await;
     }
 
     #[tokio::test]

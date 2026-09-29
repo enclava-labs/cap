@@ -1258,13 +1258,14 @@ async fn deploy_app_candidate(
                     id, org_id, name, namespace, instance_id, tenant_id, service_account,
                     bootstrap_owner_pubkey_hash, tenant_instance_identity_hash, unlock_mode,
                     domain, tee_domain, custom_domain, status, signer_identity_subject,
-                    signer_identity_issuer, signer_identity_set_at, source_provider,
+                    signer_identity_issuer, signer_identity_set_at, signer_rotation_generation,
+                    source_provider,
                     source_repository, egress_allowlist, egress_mode, created_at, updated_at
                  )
                  VALUES (
                     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10::unlock_enum,
                     $11, $12, $13, $14::app_status_enum, $15, $16, $17, $18,
-                    $19, $20, $21, $22, $23
+                    $19, $20, $21, $22, $23, $24
                  )",
             )
             .bind(app.id)
@@ -1284,6 +1285,7 @@ async fn deploy_app_candidate(
             .bind(app.signer_identity_subject.as_deref())
             .bind(app.signer_identity_issuer.as_deref())
             .bind(app.signer_identity_set_at)
+            .bind(app.signer_rotation_generation)
             .bind(app.source_provider.as_deref())
             .bind(app.source_repository.as_deref())
             .bind(&app.egress_allowlist)
