@@ -52,7 +52,6 @@ pub async fn run_migrations(pool: &PgPool) -> Result<()> {
     let _serial = SERIAL.lock().await;
     MIGRATOR.run(pool).await?;
     verify_nip98_purge_index(pool).await
-
 }
 
 /// Apply migrations for standalone installs, or only verify the schema when a
