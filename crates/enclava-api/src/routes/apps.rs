@@ -925,7 +925,7 @@ pub(crate) fn stale_owner_seed_response() -> (StatusCode, Json<serde_json::Value
         StatusCode::CONFLICT,
         Json(serde_json::json!({
             "error": "stale_owner_seed",
-            "message": "the previous incarnation of this app name was destroyed without completing its confidential teardown; its owner seed may still exist in KBS and a new workload would boot already-claimed. Have the operator erase the stale seed (KBS repository removal per the destroy runbook) or choose a different name.",
+            "message": "the previous incarnation of this app name was destroyed without completing its confidential teardown; its owner seed may still exist in KBS and a new workload would boot already-claimed. Have the operator erase the stale seed (KBS repository removal per the destroy runbook) and clear the recorded waiver (the kbs_owner_seed_waivers row for this binding key), or choose a different name.",
         })),
     )
 }
@@ -1986,6 +1986,39 @@ pub(crate) async fn delete_app_before(
         .commit()
         .await
         .map_err(|_| internal_server_error())?;
+
+    // The signed-policy candidate selectors ran against the pre-delete
+    // world. An abandoned destroy keeps the completion marker NULL, so the
+    // pre-delete reconciliation deliberately retained the app's artifact
+    // (teardown-pending authorization); with the app row now cascaded away,
+    // nothing would re-run publication and the stale Trustee policy would
+    // keep authorizing the deleted workload until some unrelated
+    // reconciliation. Enqueue and best-effort run one now — the app is gone,
+    // so the next candidate selection drops it. A failure only delays the
+    // revocation (the enqueue is durable and the global reconciler
+    // converges); the deletion itself is complete.
+    let mut post_delete_tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|_| internal_server_error())?;
+    crate::kbs::enqueue_signed_policy_reconciliation(&mut post_delete_tx)
+        .await
+        .map_err(|_| internal_server_error())?;
+    post_delete_tx
+        .commit()
+        .await
+        .map_err(|_| internal_server_error())?;
+    if let Err(_error) =
+        crate::kbs::reconcile_pending_signed_policy_artifacts(&state.db, state.kbs_policy.as_ref())
+            .await
+    {
+        tracing::warn!(
+            app_id = %deleting_app.id,
+            code = "app_delete_post_delete_policy_reconcile_failed",
+            "app deleted but its signed-policy revocation is durably pending"
+        );
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }

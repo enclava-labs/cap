@@ -2629,7 +2629,7 @@ pub async fn destroy(args: DestroyArgs) -> Result<(), Box<dyn std::error::Error>
 
     if args.abandon_teardown {
         println!(
-            "Note: destroy completed with --abandon-teardown, which skips teardown confirmation. If the workload was unreachable and its teardown could not complete, the previous owner seed may remain in KBS and recreating '{app_name}' will be refused until it is erased; if the workload was already gone (or its teardown had completed), no waiver is recorded and recreation is unaffected."
+            "Note: destroy completed with --abandon-teardown, which proceeds past a failed workload teardown. If the teardown could not complete, the previous owner seed may remain in KBS and recreating '{app_name}' will be refused until an operator erases it and clears the recorded waiver; if the workload was already gone (or its teardown had completed), no waiver is recorded and recreation is unaffected."
         );
     }
 
