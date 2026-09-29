@@ -269,6 +269,25 @@ async fn verify_or_initialize_remote_keyring(
             // Setup confirms publication before reporting signing readiness.
             if require_write_confirmation {
                 replay_accepted_keyring(api, &org_name, response).await?;
+                // A first `key setup` whose upload exits on the
+                // committed-pending 503 never reaches the 404 branch's
+                // bootstrap; this replay is the last chance to initialize
+                // the signing service before local readiness is persisted.
+                // Idempotent: the server matches the latest keyring
+                // signing owner, which this verified envelope carries.
+                match api
+                    .bootstrap_signing_service_owner(
+                        &org_name,
+                        &BootstrapSigningServiceRequest {
+                            owner_pubkey_hex: hex::encode(envelope.signing_pubkey.to_bytes()),
+                        },
+                    )
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(enclava_cli::api_client::ApiError::Api { status: 503, .. }) => {}
+                    Err(err) => return Err(err.into()),
+                }
             }
             store_trusted_owner(&org_id, &envelope.signing_pubkey)?;
             store_keyring_envelope(&org_id, &envelope)?;
@@ -993,6 +1012,34 @@ mod tests {
                 "org-b",
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn keyring_replay_bootstraps_signing_service_before_persisting_readiness() {
+        let source = include_str!("key.rs");
+        let body = source
+            .split("async fn verify_or_initialize_remote_keyring")
+            .nth(1)
+            .unwrap()
+            .split("async fn status")
+            .next()
+            .unwrap();
+        // Both the initialize (404) and the replay (Ok) path must bootstrap
+        // the signing service before local trust state is stored: a first
+        // `key setup` whose upload exits on the committed-pending 503 never
+        // reaches the 404 branch's bootstrap, so the replay is its last
+        // chance to initialize the signing service (PR #187 review).
+        let replay_branch = body
+            .split("Err(enclava_cli::api_client::ApiError::Api { status: 404")
+            .next()
+            .unwrap();
+        assert!(replay_branch.contains(".bootstrap_signing_service_owner"));
+        assert!(
+            replay_branch
+                .find(".bootstrap_signing_service_owner")
+                .unwrap()
+                < replay_branch.find("store_trusted_owner").unwrap()
         );
     }
 
