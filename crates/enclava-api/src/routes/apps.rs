@@ -31,6 +31,42 @@ fn internal_server_error() -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
+/// The app-lane Busy 409, enriched with what the live lease row knows: the
+/// holding operation's kind and whole seconds until its lock frees. Additive
+/// fields only -- the `error` string is a cross-repo contract (the PaaS
+/// classifies on it byte-exactly) and must stay stable. A row that cannot be
+/// read (or has no holder) yields the bare body: no invented values.
+pub(crate) async fn app_mutation_busy_error(
+    db: &sqlx::PgPool,
+    app_id: Uuid,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let held: Option<(Option<String>, Option<chrono::DateTime<chrono::Utc>>)> = sqlx::query_as(
+        "SELECT operation_kind, locked_until
+               FROM app_mutation_leases
+              WHERE app_id = $1 AND owner_token IS NOT NULL",
+    )
+    .bind(app_id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
+    let mut body = serde_json::json!({"error": "app mutation already in progress"});
+    if let Some((operation_kind, locked_until)) = held {
+        if let Some(operation_kind) = operation_kind {
+            body["held_by"] = serde_json::json!(operation_kind);
+        }
+        if let Some(locked_until) = locked_until {
+            let seconds = (locked_until - chrono::Utc::now()).num_seconds();
+            if seconds > 0 {
+                body["retry_after"] = serde_json::json!(
+                    seconds.min(crate::routes::internal::IDEMPOTENCY_RETRY_HINT_MAX_SECONDS)
+                );
+            }
+        }
+    }
+    (StatusCode::CONFLICT, Json(body))
+}
+
 /// Bounded diagnostics for app deletion failures.
 ///
 /// Deletion dependencies can embed tenant-controlled hostnames, namespaces,
@@ -1069,10 +1105,9 @@ pub async fn create_app(
                 .await
                 .map_err(|_| internal_server_error())?;
             return Err(match error {
-                crate::mutation_leases::MutationLeaseError::Busy => (
-                    StatusCode::CONFLICT,
-                    Json(serde_json::json!({"error": "app mutation already in progress"})),
-                ),
+                crate::mutation_leases::MutationLeaseError::Busy => {
+                    app_mutation_busy_error(&state.db, app_id).await
+                }
                 _ => internal_server_error(),
             });
         }
@@ -1324,16 +1359,22 @@ pub(crate) async fn delete_app_before(
         .collect();
     dns_fences.sort();
     dns_fences.dedup();
-    let mut delete_mutation =
-        crate::mutation_leases::claim(&state, app.id, "app_delete", app.id, true, delete_resources)
-            .await
-            .map_err(|error| match error {
-                crate::mutation_leases::MutationLeaseError::Busy => (
-                    StatusCode::CONFLICT,
-                    Json(serde_json::json!({"error": "app mutation already in progress"})),
-                ),
-                _ => internal_server_error(),
-            })?;
+    let mut delete_mutation = match crate::mutation_leases::claim(
+        &state,
+        app.id,
+        "app_delete",
+        app.id,
+        true,
+        delete_resources,
+    )
+    .await
+    {
+        Ok(mutation) => mutation,
+        Err(crate::mutation_leases::MutationLeaseError::Busy) => {
+            return Err(app_mutation_busy_error(&state.db, app.id).await);
+        }
+        Err(_) => return Err(internal_server_error()),
+    };
     let edge_config_generation = delete_mutation
         .resource_generation(&crate::mutation_leases::ResourceFence::edge_config())
         .ok_or_else(internal_server_error)?;

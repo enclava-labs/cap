@@ -419,6 +419,13 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
     if is_password_mode {
         storage_password.ensure_available_for_password_mode("password-mode deploy")?;
     }
+    // Pre-mutation claim-session gate: a fresh password-mode deploy auto-claims
+    // on first boot; refusing a session that cannot claim BEFORE submitting
+    // keeps the abort side-effect-free (the post-mutation refusal strands a
+    // server-side deployment nothing terminalizes client-side).
+    if deploy_needs_initial_claim(is_password_mode, None, &app.status) {
+        crate::commands::ownership::ensure_claim_session_now(storage_password.is_from_file())?;
+    }
     let capture = mnemonic_capture_from_flags(args.no_store_mnemonic);
     // A fresh password-mode deploy auto-claims ownership on first boot; refuse the
     // no-store sink mode before submitting anything, while the run can still stop
@@ -2598,6 +2605,16 @@ pub async fn destroy(args: DestroyArgs) -> Result<(), Box<dyn std::error::Error>
             match code.as_deref() {
                 Some("app_delete_teardown_unavailable") => Some(
                     "the confidential workload teardown did not complete; the app stays in 'deleting' -- wait for the workload to become reachable and retry destroy, or contact the operator if it keeps failing".to_string(),
+                ),
+                // Lane etiquette (#83/#194): the 409 answers either carry the
+                // server's lease hints in `message` (held by / retry after) or
+                // come from an older server without them -- the prose stays
+                // neutral so both read correctly.
+                Some("app mutation already in progress") => Some(
+                    "another operation holds this app's mutation lane (a deploy or an earlier delete); it retries automatically once free -- retry destroy shortly".to_string(),
+                ),
+                Some("idempotency_request_in_progress") => Some(
+                    "a previous destroy attempt is still settling its idempotency lease; retry destroy with the same command shortly".to_string(),
                 ),
                 _ => None,
             }

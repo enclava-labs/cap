@@ -394,6 +394,9 @@ async fn deploy_with_timings(
         StoragePasswordInput::from_file_option(args.storage_password_file.as_ref())?;
     if template.unlock_mode == "password" {
         storage_password.ensure_available_for_password_mode("password-mode template deploy")?;
+        // Pre-mutation claim-session gate (same rationale as the deploy
+        // path): the template flow always auto-claims on password mode.
+        crate::commands::ownership::ensure_claim_session_now(storage_password.is_from_file())?;
     }
     // Authenticate platform authority before keyring registration or app creation.
     fetch_verified_platform_release(api, &ctx.paths).await?;

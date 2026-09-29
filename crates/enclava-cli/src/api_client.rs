@@ -129,6 +129,15 @@ impl ApiClient {
                         if let Some(cause) = body.cause {
                             message = format!("{message} (cause: {cause})");
                         }
+                        // Carry the lane hints in-band so every surface
+                        // (deploy, destroy, config, domains) shows them without
+                        // per-command plumbing; old servers simply omit them.
+                        if let Some(held_by) = body.held_by {
+                            message = format!("{message} (held by: {held_by})");
+                        }
+                        if let Some(retry_after) = body.retry_after {
+                            message = format!("{message} (retry after ~{retry_after}s)");
+                        }
                         if message == label {
                             (code, message)
                         } else {

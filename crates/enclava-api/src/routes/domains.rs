@@ -372,7 +372,7 @@ pub async fn verify_challenge(
         resources.push(crate::mutation_leases::ResourceFence::dns(old));
         resources.push(crate::mutation_leases::ResourceFence::edge(old));
     }
-    let mut mutation = crate::mutation_leases::claim(
+    let mutation = crate::mutation_leases::claim(
         &state,
         app.id,
         "custom_domain_set",
@@ -380,14 +380,14 @@ pub async fn verify_challenge(
         false,
         resources,
     )
-    .await
-    .map_err(|error| match error {
-        crate::mutation_leases::MutationLeaseError::Busy => (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({"error": "app mutation already in progress"})),
-        ),
-        _ => internal_error(),
-    })?;
+    .await;
+    let mut mutation = match mutation {
+        Ok(mutation) => mutation,
+        Err(crate::mutation_leases::MutationLeaseError::Busy) => {
+            return Err(crate::routes::apps::app_mutation_busy_error(&state.db, app.id).await);
+        }
+        Err(_) => return Err(internal_error()),
+    };
     let edge_config_generation = mutation
         .resource_generation(&crate::mutation_leases::ResourceFence::edge_config())
         .ok_or_else(internal_error)?;
@@ -640,7 +640,7 @@ pub async fn remove_custom_domain(
             )
         })?;
 
-    let mut mutation = crate::mutation_leases::claim(
+    let mutation = crate::mutation_leases::claim(
         &state,
         app.id,
         "custom_domain_remove",
@@ -652,14 +652,14 @@ pub async fn remove_custom_domain(
             crate::mutation_leases::ResourceFence::edge_config(),
         ],
     )
-    .await
-    .map_err(|error| match error {
-        crate::mutation_leases::MutationLeaseError::Busy => (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({"error": "app mutation already in progress"})),
-        ),
-        _ => internal_error(),
-    })?;
+    .await;
+    let mut mutation = match mutation {
+        Ok(mutation) => mutation,
+        Err(crate::mutation_leases::MutationLeaseError::Busy) => {
+            return Err(crate::routes::apps::app_mutation_busy_error(&state.db, app.id).await);
+        }
+        Err(_) => return Err(internal_error()),
+    };
     let edge_config_generation = mutation
         .resource_generation(&crate::mutation_leases::ResourceFence::edge_config())
         .ok_or_else(internal_error)?;
