@@ -249,6 +249,28 @@ async fn bootstrap_signing_service(
     }
 }
 
+// Preserve setup on installations where the optional signing service returns
+// 503; completing key setup does not certify signing-service readiness.
+async fn bootstrap_signing_service(
+    api: &ApiClient,
+    org_name: &str,
+    signing_pubkey: &VerifyingKey,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match api
+        .bootstrap_signing_service_owner(
+            org_name,
+            &BootstrapSigningServiceRequest {
+                owner_pubkey_hex: hex::encode(signing_pubkey.to_bytes()),
+            },
+        )
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(enclava_cli::api_client::ApiError::Api { status: 503, .. }) => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
 fn keyring_has_owner(envelope: &OrgKeyringEnvelope, public: &VerifyingKey) -> bool {
     let public = public.to_bytes();
     envelope
