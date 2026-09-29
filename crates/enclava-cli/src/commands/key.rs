@@ -233,6 +233,28 @@ async fn replay_accepted_keyring(
     Ok(())
 }
 
+// Preserve setup on installations where the optional signing service returns
+// 503; completing key setup does not certify signing-service readiness.
+async fn bootstrap_signing_service(
+    api: &ApiClient,
+    org_name: &str,
+    signing_pubkey: &VerifyingKey,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match api
+        .bootstrap_signing_service_owner(
+            org_name,
+            &BootstrapSigningServiceRequest {
+                owner_pubkey_hex: hex::encode(signing_pubkey.to_bytes()),
+            },
+        )
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(enclava_cli::api_client::ApiError::Api { status: 503, .. }) => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
 fn keyring_has_owner(envelope: &OrgKeyringEnvelope, public: &VerifyingKey) -> bool {
     let public = public.to_bytes();
     envelope
@@ -266,9 +288,12 @@ async fn verify_or_initialize_remote_keyring(
                 .into());
             }
             // Restoring verified key material must not require keyring write authority.
-            // Setup confirms publication before reporting signing readiness.
+            // Setup confirms keyring publication before persisting local authority.
             if require_write_confirmation {
                 replay_accepted_keyring(api, &org_name, response).await?;
+                // Bootstrap the envelope's signing owner: with a shared
+                // keyring the local key can be another authorized owner.
+                bootstrap_signing_service(api, &org_name, &envelope.signing_pubkey).await?;
             }
             store_trusted_owner(&org_id, &envelope.signing_pubkey)?;
             store_keyring_envelope(&org_id, &envelope)?;
@@ -281,19 +306,7 @@ async fn verify_or_initialize_remote_keyring(
             let keyring = single_member_keyring(org_id, 1, &owner, Role::Owner, chrono::Utc::now());
             let envelope = sign_keyring(&owner, keyring);
             upload_keyring(api, &org_name, &envelope).await?;
-            match api
-                .bootstrap_signing_service_owner(
-                    &org_name,
-                    &BootstrapSigningServiceRequest {
-                        owner_pubkey_hex: hex::encode(owner.public.to_bytes()),
-                    },
-                )
-                .await
-            {
-                Ok(_) => {}
-                Err(enclava_cli::api_client::ApiError::Api { status: 503, .. }) => {}
-                Err(err) => return Err(err.into()),
-            }
+            bootstrap_signing_service(api, &org_name, &envelope.signing_pubkey).await?;
             // Pin only authority CAP accepted. A concurrent team owner may win
             // the first upload, in which case this setup must leave no losing
             // local trust state behind.
