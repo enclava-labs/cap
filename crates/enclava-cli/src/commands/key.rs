@@ -246,6 +246,7 @@ async fn verify_or_initialize_remote_keyring(
     api: &ApiClient,
     me: &CurrentUserResponse,
     seed: &[u8; 32],
+    require_write_confirmation: bool,
 ) -> Result<(Uuid, String, String), Box<dyn std::error::Error>> {
     let user_id = Uuid::parse_str(&me.user_id)?;
     let org_id = Uuid::parse_str(&me.active_org.id)?;
@@ -263,6 +264,11 @@ async fn verify_or_initialize_remote_keyring(
                     fingerprint(&owner.public)
                 )
                 .into());
+            }
+            // Restoring verified key material must not require keyring write authority.
+            // Setup confirms publication before reporting signing readiness.
+            if require_write_confirmation {
+                replay_accepted_keyring(api, &org_name, response).await?;
             }
             store_trusted_owner(&org_id, &envelope.signing_pubkey)?;
             store_keyring_envelope(&org_id, &envelope)?;
@@ -552,7 +558,7 @@ async fn restore(
         &me.active_org.name,
     )?;
     let (_org_id, org_name, owner_fingerprint) =
-        verify_or_initialize_remote_keyring(&api, &me, &seed).await?;
+        verify_or_initialize_remote_keyring(&api, &me, &seed, false).await?;
     ensure_mnemonic_restore_will_not_overwrite(&paths, &org_name, &mnemonics, force)?;
 
     if existing_seed == Some(seed) {
@@ -704,7 +710,7 @@ async fn setup(
         .into());
     }
     let (_, org_name, owner_fingerprint) =
-        verify_or_initialize_remote_keyring(&api, &me, &seed).await?;
+        verify_or_initialize_remote_keyring(&api, &me, &seed, true).await?;
     if existing_seed.is_none() {
         // Install restored/new authority only after the remote keyring accepts it.
         // A stale backup must not poison local state and block a corrected retry.
