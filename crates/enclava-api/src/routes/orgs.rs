@@ -1492,17 +1492,16 @@ pub async fn rotate_org_owner(
         scopes::lock_and_read_active_membership_role_in_tx(&mut tx, org_id, auth.user_id).await?;
     scopes::require_owner_role(current_role)?;
     let (latest, version_created_at_floor) = read_rotation_authority(&mut tx, org_id).await?;
-    let Some((base_payload, expected_current_owner, insert_new_version)) =
-        derive_rotation_path(
-            &mut tx,
-            org_id,
-            body.version,
-            latest,
-            &canonical_bytes,
-            &keyring_signature,
-            &replacement_owner,
-        )
-        .await?
+    let Some((base_payload, expected_current_owner, insert_new_version)) = derive_rotation_path(
+        &mut tx,
+        org_id,
+        body.version,
+        latest,
+        &canonical_bytes,
+        &keyring_signature,
+        &replacement_owner,
+    )
+    .await?
     else {
         // Predecessor-less replay of an intact committed rotation: the
         // content equality checks inside derive_rotation_path already
@@ -1729,17 +1728,16 @@ pub async fn rotate_org_owner(
         .await
         .map_err(|_| db_error())?;
     let (latest, version_created_at_floor) = read_rotation_authority(&mut tx, org_id).await?;
-    let Some((base_payload, expected_current_owner, insert_new_version)) =
-        derive_rotation_path(
-            &mut tx,
-            org_id,
-            body.version,
-            latest,
-            &canonical_bytes,
-            &keyring_signature,
-            &replacement_owner,
-        )
-        .await?
+    let Some((base_payload, expected_current_owner, insert_new_version)) = derive_rotation_path(
+        &mut tx,
+        org_id,
+        body.version,
+        latest,
+        &canonical_bytes,
+        &keyring_signature,
+        &replacement_owner,
+    )
+    .await?
     else {
         // Predecessor-less replay of an intact committed rotation (see
         // phase 1): the byte-for-byte equality checks already confirmed

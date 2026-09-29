@@ -227,6 +227,28 @@ async fn upload_keyring(
     Ok(())
 }
 
+// Preserve setup on installations where the optional signing service returns
+// 503; completing key setup does not certify signing-service readiness.
+async fn bootstrap_signing_service(
+    api: &ApiClient,
+    org_name: &str,
+    signing_pubkey: &VerifyingKey,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match api
+        .bootstrap_signing_service_owner(
+            org_name,
+            &BootstrapSigningServiceRequest {
+                owner_pubkey_hex: hex::encode(signing_pubkey.to_bytes()),
+            },
+        )
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(enclava_cli::api_client::ApiError::Api { status: 503, .. }) => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
 fn keyring_has_owner(envelope: &OrgKeyringEnvelope, public: &VerifyingKey) -> bool {
     let public = public.to_bytes();
     envelope
@@ -268,6 +290,9 @@ async fn verify_or_initialize_remote_keyring(
             // success only once the generation is live (PR #187 review).
             if require_write_confirmation {
                 upload_keyring(api, &org_name, &envelope, Some(&raw_payload)).await?;
+                // Bootstrap the envelope's signing owner: with a shared
+                // keyring the local key can be another authorized owner.
+                bootstrap_signing_service(api, &org_name, &envelope.signing_pubkey).await?;
             }
             store_trusted_owner(&org_id, &envelope.signing_pubkey)?;
             store_keyring_envelope(&org_id, &envelope)?;
