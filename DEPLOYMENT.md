@@ -242,6 +242,101 @@ Before using it outside local experimentation:
   registry metadata, DNS, and tenant TEE callbacks;
 - decide whether CAP-managed DNS and KBS policy management are required.
 
+## Keyring Revocation Completion
+
+In signed-policy mode, keyring uploads and owner rotations confirm success only
+after the filtered KBS policy has converged. A `503` response with code
+`keyring_policy_reconciliation_pending` means the keyring change committed, but
+policy publication is still unconfirmed. It does not mean the keyring rolled back.
+
+Retry the same request after restoring KBS availability. Internal PaaS callers
+must retain the same idempotency key when the response is stamped `deferred`.
+For CLI owner-rotation recovery, reuse the encrypted replacement backup:
+
+```bash
+enclava key rotate-owner --backup-out ./owner-replacement.json \
+  --passphrase-file ./backup.pass --yes
+```
+
+Preserve both the replacement backup and the previous backup until a
+fresh login and deployment succeed. Use the updated API and CLI together; drain
+old API replicas before relying on these completion semantics.
+
+`enclava key setup` and owner rotation confirm the accepted keyring's
+publication before finalizing local state, so they require the acting owner's
+keyring write authority and a reachable policy publication path. `enclava key
+restore` is read-and-verify: it validates the signed remote keyring and works
+for any active member whose derived key is still Owner in that keyring,
+without requiring keyring write permission or KBS availability.
+
+Setup also attempts signing-service bootstrap after confirming an existing
+keyring, using the accepted envelope's signing owner even when the caller owns
+a different authorized key. Bootstrap failures stop setup before local authority
+is stored, except for the existing optional-service HTTP `503` compatibility
+case. Successful key setup therefore does not certify signing-service readiness.
+
+## Signer Rotation Completion
+
+In signed-policy mode, missing KBS publication configuration rejects a signer
+rotation before changing the app or consuming its single-use token. This check
+runs under the app authority locks and serializes with signed-mode activation.
+Restore the configuration and retry the same request.
+
+After a rotation commits, a public API publication failure returns HTTP `503`
+with `signer_rotation_publication_pending`. Internal PaaS callers receive a `deferred`
+disposition and must retry with the same idempotency key and request body. CAP
+retains the committed response and retries publication only; it does not consume
+the rotation token or apply the mutation again. Unrelated, uncertain failures
+remain fail-closed and require recovery rather than automatic mutation replay.
+
+CAP checks the committed signer and its database-maintained generation under
+authority lanes before and after publication. The generation is captured inside
+the authority transaction and stored only as private checkpoint metadata, never
+in the successful app response. A later rotation, including a rotation away and
+back to the same identity, app deletion, or deletion in progress terminates a
+still-pending operation with HTTP `409` and `signer_rotation_superseded`. Internal
+callers receive a terminal `completed` disposition; repeating that key returns
+the same conflict without another token consumption. Already completed receipts
+continue to replay their recorded historical result.
+
+Older or malformed publication checkpoints without a verifiable generation fail closed with
+a terminal `idempotency_recovery_required` / `reconcile_then_retry_with_new_key`
+disposition. Repeating that key replays the same terminal result; it does not
+re-execute the mutation or retry indefinitely. Reconcile the app's current signer
+and policy publication before choosing a recovery request with a new key.
+
+The database trigger tracks identity updates from older SQL writers as well.
+Drain old API replicas before relying on these semantics: older checkpoint
+readers do not understand the new generation, so mixed-version operation and
+reader rollback are unsupported.
+
+A currently authorized org owner may confirm an already committed signer
+identity without a new rotation token. The stateless public endpoint confirms
+the current identity, not the historical event behind an earlier request;
+event-attributed retries require the internal idempotency checkpoint. A
+confirmation cannot change the signer or consume another token. A real identity
+transition still requires a fresh, bound, single-use token.
+
+A withdrawn legacy TLS binding stays withdrawn even if a newer artifact has the
+same image and init-data measurements. Those measurements do not bind the old
+entry to the new workload instance. Fresh deployments must authorize through
+signed-policy candidates instead of readmitting the old legacy binding.
+
+Legacy Rego publication is confirmed only when the Trustee pod template carries
+the token for the configured ConfigMap namespace, name, policy key, content hash,
+and publication event, and that rollout is ready. A content update atomically
+persists a new event token in the ConfigMap's publication-token annotation.
+Retries reuse it after a crash, including when an intervening policy write must
+be repaired back to identical bytes. An unmarked legacy install needs one
+adoption rollout; converged retries write neither the ConfigMap nor the Deployment.
+Changes to labels, unrelated data keys, or resourceVersion alone do not restart
+Trustee when the policy content and publication event are unchanged.
+A failed Deployment update is retried. If the template token was already
+stored, retries wait for that rollout without creating another generation.
+Both legacy and signed publication wait for old replicas to leave and all
+updated replicas to become available. Changed policy content or a signed-authority
+handoff during confirmation must be reconciled before success is returned.
+
 ## Smoke Checks
 
 After rollout:

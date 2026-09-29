@@ -1277,10 +1277,23 @@ async fn begin_idempotent_request_with_recovery_and_binding(
             legacy_identity_bound: false
         }
     ) && legacy_unbound;
+    // A deferred publication checkpoint (keyring or signer rotation) is the
+    // one incomplete FailClosed shape a same-key retry may reclaim: the
+    // mutation is known committed, so the retry only reconciles publication.
+    let publication_checkpoint_pending = !legacy_unbound
+        && row.response_status == Some(i32::from(StatusCode::SERVICE_UNAVAILABLE.as_u16()))
+        && matches!(
+            row.response_body
+                .as_ref()
+                .and_then(|body| body.get("code"))
+                .and_then(serde_json::Value::as_str),
+            Some(KEYRING_POLICY_RECONCILIATION_PENDING_CODE)
+                | Some(crate::routes::apps::SIGNER_ROTATION_PUBLICATION_PENDING_CODE)
+        );
     if !row.known_not_applied
         && (policy_changed
             || deterministic_legacy_is_unsafe
-            || recovery == IdempotencyRecovery::FailClosed)
+            || (recovery == IdempotencyRecovery::FailClosed && !publication_checkpoint_pending))
     {
         return complete_unrecoverable_idempotency_request(
             &state.db,
@@ -1398,6 +1411,7 @@ async fn begin_idempotent_request_with_recovery_and_binding(
 }
 
 fn completed_idempotency_response(row: &IdempotencyRow) -> Option<IdempotencyResponse> {
+    row.completed_at?;
     let status = row
         .response_status
         .and_then(|code| StatusCode::from_u16(code as u16).ok())?;
@@ -1578,16 +1592,20 @@ fn stamp_idempotency_completion(body: &mut serde_json::Value) {
     }
 }
 
-/// Defer an idempotent request: stop the heartbeat and push the lease expiry
-/// out by the retry interval, leaving the row incomplete so a same-key retry
-/// re-executes. Returns the stamped body the caller must return to the client.
-async fn defer_idempotent_request(mut lease: IdempotencyLease) -> InternalRouteError {
+/// Keep the request bound until retry. A checkpoint preserves a known committed
+/// outcome across process loss without mislabeling it as not applied.
+async fn defer_idempotent_request(
+    mut lease: IdempotencyLease,
+    checkpoint: Option<&IdempotencyResponse>,
+) -> InternalRouteError {
     lease.stop_heartbeat();
-    let updated = sqlx::query(
+    let update = sqlx::query(
         "UPDATE cap_internal_idempotency
             SET lease_expires_at = clock_timestamp()
                 + ($3::bigint * interval '1 second'),
-                updated_at = clock_timestamp()
+                updated_at = clock_timestamp(),
+                response_status = $4,
+                response_body = $5
           WHERE idempotency_key = $1
             AND reservation_token = $2
             AND completed_at IS NULL",
@@ -1595,8 +1613,24 @@ async fn defer_idempotent_request(mut lease: IdempotencyLease) -> InternalRouteE
     .bind(&lease.key)
     .bind(lease.token)
     .bind(IDEMPOTENCY_RETRY_DEFER_SECONDS)
-    .execute(&lease.pool)
-    .await;
+    .bind(checkpoint.map(|(status, _)| i32::from(status.as_u16())))
+    .bind(checkpoint.map(|(_, body)| body));
+    let updated = if checkpoint.is_some() {
+        let mut tx = match lease.pool.begin().await {
+            Ok(tx) => tx,
+            Err(_) => return db_error(),
+        };
+        if let Err(error) = set_idempotency_completion_owner(&mut tx, lease.token).await {
+            return error;
+        }
+        let updated = update.execute(&mut *tx).await;
+        if updated.is_ok() && tx.commit().await.is_err() {
+            return db_error();
+        }
+        updated
+    } else {
+        update.execute(&lease.pool).await
+    };
     // Both Ok arms return the same deferred body now that the central
     // in-progress helper carries the `deferred` stamp: a 1-row update means the
     // defer landed; a 0-row update means the lease was already completed or
@@ -1678,7 +1712,8 @@ async fn complete_app_delete_result(
             && body.get("error").and_then(serde_json::Value::as_str)
                 == Some("app_delete_teardown_locked");
         if status.is_server_error() || teardown_locked {
-            let (deferred_status, Json(mut deferred_body)) = defer_idempotent_request(lease).await;
+            let (deferred_status, Json(mut deferred_body)) =
+                defer_idempotent_request(lease, None).await;
             if teardown_locked && deferred_status == StatusCode::CONFLICT {
                 deferred_body["cause"] = serde_json::json!("app_delete_teardown_locked");
             }
@@ -1686,6 +1721,152 @@ async fn complete_app_delete_result(
         }
     }
     complete_idempotent_result(lease, result).await
+}
+
+const KEYRING_POLICY_RECONCILIATION_PENDING_CODE: &str = "keyring_policy_reconciliation_pending";
+
+/// Only a known committed keyring may retain a nonterminal publication
+/// checkpoint; unrelated failures keep the generic fail-closed disposition.
+async fn complete_keyring_result(
+    lease: IdempotencyLease,
+    result: Result<IdempotencyResponse, InternalRouteError>,
+) -> Result<IdempotencyResponse, InternalRouteError> {
+    if let Err((status, body)) = &result
+        && *status == StatusCode::SERVICE_UNAVAILABLE
+        && body.get("code").and_then(serde_json::Value::as_str)
+            == Some(KEYRING_POLICY_RECONCILIATION_PENDING_CODE)
+    {
+        let checkpoint = (
+            *status,
+            serde_json::json!({"code": KEYRING_POLICY_RECONCILIATION_PENDING_CODE}),
+        );
+        let (deferred_status, Json(mut deferred_body)) =
+            defer_idempotent_request(lease, Some(&checkpoint)).await;
+        if deferred_status == StatusCode::CONFLICT {
+            deferred_body["cause"] = serde_json::json!(KEYRING_POLICY_RECONCILIATION_PENDING_CODE);
+        }
+        return Err((deferred_status, Json(deferred_body)));
+    }
+    complete_idempotent_result(lease, result).await
+}
+
+const SIGNER_PUBLICATION_CHECKPOINT_RESPONSE_FIELD: &str = "committed_response";
+const SIGNER_PUBLICATION_CHECKPOINT_GENERATION_FIELD: &str = "signer_rotation_generation";
+
+/// Preflight failures are known not applied. A committed rotation instead
+/// retains its result so retries can publish without consuming its token again.
+async fn complete_signer_result(
+    lease: IdempotencyLease,
+    result: Result<IdempotencyResponse, InternalRouteError>,
+) -> Result<IdempotencyResponse, InternalRouteError> {
+    match result {
+        Err((StatusCode::SERVICE_UNAVAILABLE, Json(body)))
+            if body.get("code").and_then(serde_json::Value::as_str)
+                == Some("kbs_publication_not_configured") =>
+        {
+            release_known_not_applied_idempotent_request(lease).await?;
+            let (status, Json(mut body)) = idempotency_in_progress_error();
+            body["cause"] = serde_json::json!("kbs_publication_not_configured");
+            Err((status, Json(body)))
+        }
+        Err((status, Json(body)))
+            if status == StatusCode::SERVICE_UNAVAILABLE
+                && body.get("code").and_then(serde_json::Value::as_str)
+                    == Some(crate::routes::apps::SIGNER_ROTATION_PUBLICATION_PENDING_CODE) =>
+        {
+            let checkpoint = (status, body);
+            let (status, Json(mut body)) = defer_idempotent_request(lease, Some(&checkpoint)).await;
+            if status == StatusCode::CONFLICT {
+                body["cause"] = serde_json::json!(
+                    crate::routes::apps::SIGNER_ROTATION_PUBLICATION_PENDING_CODE
+                );
+            }
+            Err((status, Json(body)))
+        }
+        other => complete_idempotent_result(lease, other).await,
+    }
+}
+
+fn signer_publication_checkpoint_error(
+    committed: serde_json::Value,
+    rotation_generation: i64,
+) -> InternalRouteError {
+    let mut body = serde_json::json!({
+        "code": crate::routes::apps::SIGNER_ROTATION_PUBLICATION_PENDING_CODE,
+    });
+    body[SIGNER_PUBLICATION_CHECKPOINT_RESPONSE_FIELD] = committed;
+    body[SIGNER_PUBLICATION_CHECKPOINT_GENERATION_FIELD] = serde_json::json!(rotation_generation);
+    (StatusCode::SERVICE_UNAVAILABLE, Json(body))
+}
+
+/// Only the reservation-token owner may resume publication. Malformed
+/// checkpoints fail closed instead of re-executing the mutation: the parser
+/// requires the rotation generation captured in the same transaction as the
+/// committed response, and never invents one for a checkpoint written before
+/// the field existed. The caller terminalizes that failure through the
+/// completed channel with the bounded new-key disposition.
+async fn signer_publication_checkpoint(
+    pool: &sqlx::PgPool,
+    lease: &IdempotencyLease,
+) -> Result<Option<(Uuid, i64, serde_json::Value)>, InternalRouteError> {
+    let row: Option<(Option<i32>, Option<serde_json::Value>)> = sqlx::query_as(
+        "SELECT response_status, response_body
+           FROM cap_internal_idempotency
+          WHERE idempotency_key = $1
+            AND reservation_token = $2
+            AND completed_at IS NULL",
+    )
+    .bind(&lease.key)
+    .bind(lease.token)
+    .fetch_optional(pool)
+    .await
+    .map_err(|_| db_error())?;
+    let Some((status, body)) = row else {
+        return Err(idempotency_in_progress_error());
+    };
+    if status.is_none() && body.is_none() {
+        return Ok(None);
+    }
+    if status != Some(i32::from(StatusCode::SERVICE_UNAVAILABLE.as_u16())) {
+        return Err(db_error());
+    }
+    let Some(mut body) = body else {
+        return Err(db_error());
+    };
+    if body.get("code").and_then(serde_json::Value::as_str)
+        != Some(crate::routes::apps::SIGNER_ROTATION_PUBLICATION_PENDING_CODE)
+    {
+        return Err(db_error());
+    }
+    let rotation_generation = body
+        .get(SIGNER_PUBLICATION_CHECKPOINT_GENERATION_FIELD)
+        .and_then(serde_json::Value::as_i64)
+        .filter(|generation| *generation >= 0)
+        .ok_or_else(db_error)?;
+    // A new write never stores a count; a checkpoint carrying both fences is
+    // contradictory and must not downgrade to a generation-only retry.
+    if body.get("rotation_count").is_some() {
+        return Err(db_error());
+    }
+    let Some(committed) = body
+        .get_mut(SIGNER_PUBLICATION_CHECKPOINT_RESPONSE_FIELD)
+        .map(serde_json::Value::take)
+    else {
+        return Err(db_error());
+    };
+    if committed.get("rotation_count").is_some()
+        || committed
+            .get(SIGNER_PUBLICATION_CHECKPOINT_GENERATION_FIELD)
+            .is_some()
+    {
+        return Err(db_error());
+    }
+    let app_id = committed
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .ok_or_else(db_error)?;
+    Ok(Some((app_id, rotation_generation, committed)))
 }
 
 /// Return an expiring capability exactly once without persisting it in CAP's
@@ -4534,7 +4715,7 @@ pub async fn deploy_paas_app(
         {
             Ok(InternalDeploymentAdoption::Missing) => {}
             Ok(InternalDeploymentAdoption::SetupIncomplete) => {
-                return Err(defer_idempotent_request(idempotency).await);
+                return Err(defer_idempotent_request(idempotency, None).await);
             }
             Ok(InternalDeploymentAdoption::Response(response)) => {
                 let (status, response) =
@@ -4702,7 +4883,7 @@ pub async fn put_paas_keyring(
         Ok((status, response))
     }
     .await;
-    let (status, response) = complete_idempotent_result(idempotency, result).await?;
+    let (status, response) = complete_keyring_result(idempotency, result).await?;
     Ok((status, Json(response)))
 }
 
@@ -4785,7 +4966,7 @@ pub async fn rotate_paas_keyring_owner(
         Ok((StatusCode::OK, to_value(response)?))
     }
     .await;
-    let (status, response) = complete_idempotent_result(idempotency, result).await?;
+    let (status, response) = complete_keyring_result(idempotency, result).await?;
     Ok((status, Json(response)))
 }
 
@@ -4854,22 +5035,75 @@ pub async fn rotate_paas_signer(
     .await?
     {
         IdempotencyBegin::Execute(lease) => lease,
-        IdempotencyBegin::Replay((status, body)) => return Ok((status, Json(body))),
+        IdempotencyBegin::Replay((status, mut body)) => {
+            // Older completed receipts may contain private fencing metadata.
+            if let Some(map) = body.as_object_mut() {
+                map.remove("rotation_count");
+                map.remove(SIGNER_PUBLICATION_CHECKPOINT_GENERATION_FIELD);
+            }
+            return Ok((status, Json(body)));
+        }
     };
     let result: Result<IdempotencyResponse, InternalRouteError> = async {
-        let parsed = parse_internal_body(body)?;
-        let Json(response) = crate::routes::apps::rotate_signer(
-            auth,
-            State(state.clone()),
-            Path(app_name),
-            Json(parsed),
+        // The checkpoint lookup runs inside the result scope on purpose: any
+        // failure there — including a malformed or unverifiable checkpoint
+        // such as one written before the generation field existed — must
+        // flow through complete_signer_result, which terminalizes
+        // outcome-unknown failures to the bounded new-key disposition on
+        // the completed channel. Surfacing it with `?` outside would leave
+        // the row incomplete and re-run on every lease expiry forever.
+        let (app_id, rotation_generation, committed) =
+            match signer_publication_checkpoint(&state.db, &idempotency).await? {
+                Some((app_id, rotation_generation, committed)) => {
+                    (app_id, rotation_generation, committed)
+                }
+                None => {
+                    let parsed = parse_internal_body(body)?;
+                    let (committed, rotation_generation) =
+                        crate::routes::apps::rotate_signer_commit(auth, &state, &app_name, parsed)
+                            .await?;
+                    (committed.id, rotation_generation, to_value(&committed)?)
+                }
+            };
+        let (Some(expected_subject), Some(expected_issuer)) = (
+            committed
+                .get("signer_identity_subject")
+                .and_then(serde_json::Value::as_str),
+            committed
+                .get("signer_identity_issuer")
+                .and_then(serde_json::Value::as_str),
+        ) else {
+            return Err(db_error());
+        };
+        // The generation captured with the committed response (in the same
+        // transaction) is compared against the live generation before and
+        // after publication, so any interleaved authority event — including
+        // a rotate-back that restores the same subject/issuer — turns this
+        // retry into a terminal superseded result instead of a false success.
+        match crate::routes::apps::reconcile_signer_publication(
+            &state,
+            app_id,
+            expected_subject,
+            expected_issuer,
+            rotation_generation,
         )
-        .await?;
-        let response = to_value(response)?;
-        Ok((StatusCode::OK, response))
+        .await
+        {
+            Ok(()) => Ok((StatusCode::OK, committed)),
+            Err((StatusCode::CONFLICT, Json(body)))
+                if body.get("code").and_then(serde_json::Value::as_str)
+                    == Some(crate::routes::apps::SIGNER_ROTATION_SUPERSEDED_CODE) =>
+            {
+                Err((StatusCode::CONFLICT, Json(body)))
+            }
+            Err(_) => Err(signer_publication_checkpoint_error(
+                committed,
+                rotation_generation,
+            )),
+        }
     }
     .await;
-    let (status, response) = complete_idempotent_result(idempotency, result).await?;
+    let (status, response) = complete_signer_result(idempotency, result).await?;
     Ok((status, Json(response)))
 }
 
@@ -5252,7 +5486,7 @@ pub async fn create_paas_generic_deployment(
                     == Some("external_id belongs to a deployment whose setup did not complete")
         )
     {
-        return Err(defer_idempotent_request(idempotency).await);
+        return Err(defer_idempotent_request(idempotency, None).await);
     }
     let (status, response) = complete_idempotent_result(idempotency, result).await?;
     Ok((status, Json(response)))
@@ -8361,7 +8595,7 @@ mod tests {
                 .await
                 .expect("reserve deferred handler"),
         );
-        let deferred = defer_idempotent_request(lease).await;
+        let deferred = defer_idempotent_request(lease, None).await;
         assert_eq!(deferred.0, StatusCode::CONFLICT);
         assert_eq!(deferred.1["idempotency_disposition"], "deferred");
         assert_eq!(deferred.1["retryable"], true);
@@ -9095,7 +9329,7 @@ mod tests {
                         assert!(path.contains("/daemonsets/") || path.contains("/deployments/"), "unexpected provider request {path}");
                         serde_json::json!({"apiVersion":"apps/v1", "kind": if path.contains("/daemonsets/") {"DaemonSet"} else {"Deployment"},
                             "metadata":metadata, "spec":{"replicas":1, "selector":{}, "template":{"metadata":{}, "spec":{"containers":[]}}},
-                            "status":{"readyReplicas":1, "availableReplicas":1, "updatedReplicas":1, "observedGeneration":1}})
+                            "status":{"replicas":1, "readyReplicas":1, "availableReplicas":1, "updatedReplicas":1, "observedGeneration":1}})
                     };
                     (StatusCode::OK, Json(resource))
                 }
@@ -9336,7 +9570,7 @@ mod tests {
                             assert!(path.contains("/daemonsets/") || path.contains("/deployments/"), "unexpected provider request {path}");
                             serde_json::json!({"apiVersion":"apps/v1", "kind": if path.contains("/daemonsets/") {"DaemonSet"} else {"Deployment"},
                                 "metadata":metadata, "spec":{"replicas":1, "selector":{}, "template":{"metadata":{}, "spec":{"containers":[]}}},
-                                "status":{"readyReplicas":1, "availableReplicas":1, "updatedReplicas":1, "observedGeneration":1}})
+                                "status":{"replicas":1, "readyReplicas":1, "availableReplicas":1, "updatedReplicas":1, "observedGeneration":1}})
                         };
                         (StatusCode::OK, Json(resource))
                     }
@@ -11034,6 +11268,2075 @@ mod tests {
         .await
         .expect("load shared membership authority");
         assert_eq!(authority, (2, 1, 2));
+    }
+
+    /// Canonical keyring bytes for the single-owner keyrings these tests sign.
+    /// Mirrors routes::orgs's private canonicalization (CE-v1 records) so a
+    /// signature made here verifies inside put_keyring / rotate_org_owner.
+    fn test_canonical_keyring_bytes(
+        org_id: Uuid,
+        version: u64,
+        member: &(Uuid, [u8; 32], chrono::DateTime<chrono::Utc>),
+        updated_at: &chrono::DateTime<chrono::Utc>,
+    ) -> Vec<u8> {
+        let (user_id, pubkey, added_at) = member;
+        let role = b"owner".to_vec();
+        let added_at_bytes = added_at.to_rfc3339().into_bytes();
+        let member_hash = enclava_common::canonical::ce_v1_hash(&[
+            ("user_id", user_id.as_bytes().as_slice()),
+            ("pubkey", pubkey.as_slice()),
+            ("role", &role),
+            ("added_at", &added_at_bytes),
+        ]);
+        let member_label = user_id.to_string();
+        let members_hash = enclava_common::canonical::ce_v1_hash(&[(
+            member_label.as_str(),
+            member_hash.as_slice(),
+        )]);
+        let version_be = version.to_be_bytes();
+        let updated_at_bytes = updated_at.to_rfc3339().into_bytes();
+        enclava_common::canonical::ce_v1_bytes(&[
+            ("purpose", b"enclava-org-keyring-v1"),
+            ("org_id", org_id.as_bytes().as_slice()),
+            ("version", &version_be),
+            ("members", &members_hash),
+            ("updated_at", &updated_at_bytes),
+        ])
+    }
+
+    fn signed_keyring_body(
+        org_id: Uuid,
+        user_id: Uuid,
+        key: &ed25519_dalek::SigningKey,
+        version: i64,
+        updated_second: u32,
+    ) -> serde_json::Value {
+        use chrono::TimeZone;
+        use ed25519_dalek::Signer;
+        let added_at = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let updated_at = chrono::Utc
+            .with_ymd_and_hms(2026, 1, 1, 0, 0, updated_second)
+            .unwrap();
+        let pubkey = key.verifying_key().to_bytes();
+        let canonical = test_canonical_keyring_bytes(
+            org_id,
+            version as u64,
+            &(user_id, pubkey, added_at),
+            &updated_at,
+        );
+        let signature = key.sign(&canonical);
+        serde_json::json!({
+            "version": version,
+            "keyring_payload": {
+                "org_id": org_id,
+                "version": version,
+                "members": [{
+                    "user_id": user_id,
+                    "pubkey": hex::encode(pubkey),
+                    "role": "owner",
+                    "added_at": added_at,
+                }],
+                "updated_at": updated_at,
+            },
+            "signature": hex::encode(signature.to_bytes()),
+            "signing_pubkey": hex::encode(pubkey),
+        })
+    }
+
+    fn signed_rotation_body(
+        org_id: Uuid,
+        user_id: Uuid,
+        current_key: &ed25519_dalek::SigningKey,
+        replacement_key: &ed25519_dalek::SigningKey,
+    ) -> serde_json::Value {
+        use chrono::TimeZone;
+        use ed25519_dalek::Signer;
+        let added_at = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let updated_at = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 1, 0).unwrap();
+        let current_pubkey = current_key.verifying_key().to_bytes();
+        let replacement_pubkey = replacement_key.verifying_key().to_bytes();
+        let canonical = test_canonical_keyring_bytes(
+            org_id,
+            2,
+            &(user_id, replacement_pubkey, added_at),
+            &updated_at,
+        );
+        let keyring_signature = replacement_key.sign(&canonical);
+        let signed_at = chrono::Utc::now();
+        let reason = "owner key compromised";
+        let directive = enclava_common::crypto::owner_rotation_directive_bytes(
+            org_id,
+            &current_pubkey,
+            &replacement_pubkey,
+            signed_at,
+            reason,
+        );
+        let rotation_signature = current_key.sign(&directive);
+        serde_json::json!({
+            "version": 2,
+            "keyring_payload": {
+                "org_id": org_id,
+                "version": 2,
+                "members": [{
+                    "user_id": user_id,
+                    "pubkey": hex::encode(replacement_pubkey),
+                    "role": "owner",
+                    "added_at": added_at,
+                }],
+                "updated_at": updated_at,
+            },
+            "signature": hex::encode(keyring_signature.to_bytes()),
+            "replacement_signing_pubkey": hex::encode(replacement_pubkey),
+            "current_signing_pubkey": hex::encode(current_pubkey),
+            "signed_at": signed_at,
+            "reason": reason,
+            "rotation_signature": hex::encode(rotation_signature.to_bytes()),
+        })
+    }
+
+    async fn seed_keyring_pending_org(
+        pool: &sqlx::PgPool,
+        signing_keys: &[ed25519_dalek::SigningKey],
+    ) -> (Uuid, Uuid, String, String) {
+        let org_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let suffix = org_id.simple().to_string();
+        let org_name = format!("keyring-pending-{}", &suffix[..16]);
+        let paas_org_id = format!("paas-keyring-org-{suffix}");
+        let paas_user_id = format!("paas-keyring-user-{suffix}");
+        insert_config_token_test_actor(
+            pool,
+            org_id,
+            &org_name,
+            &paas_org_id,
+            user_id,
+            &paas_user_id,
+        )
+        .await;
+        for key in signing_keys {
+            sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2)")
+                .bind(user_id)
+                .bind(key.verifying_key().to_bytes().to_vec())
+                .execute(pool)
+                .await
+                .expect("register keyring pending signing key");
+        }
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 5,
+                    selector_bumps_owed = 0,
+                    configmap_generation = 0,
+                    applied_generation = 0,
+                    configmap_policy_sha256 = NULL,
+                    applied_policy_sha256 = NULL,
+                    configmap_resource_version = NULL
+              WHERE singleton",
+        )
+        .execute(pool)
+        .await
+        .expect("activate signed-policy mode without a converged generation");
+        (org_id, user_id, paas_org_id, paas_user_id)
+    }
+
+    /// Insert keyring v1 signed by `key` directly, bypassing the HTTP route
+    /// (routing the seed through put_paas_keyring would defer under pending
+    /// KBS state or terminalize under an unrelated failure).
+    async fn seed_owner_keyring_v1(
+        pool: &sqlx::PgPool,
+        org_id: Uuid,
+        user_id: Uuid,
+        key: &ed25519_dalek::SigningKey,
+    ) {
+        let body = signed_keyring_body(org_id, user_id, key, 1, 0);
+        let signing_key_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM user_signing_keys WHERE user_id = $1 AND pubkey = $2",
+        )
+        .bind(user_id)
+        .bind(key.verifying_key().to_bytes().to_vec())
+        .fetch_one(pool)
+        .await
+        .expect("resolve v1 signing key id");
+        sqlx::query(
+            "INSERT INTO org_keyrings
+                 (org_id, version, keyring_payload, signature, signing_key_id)
+             VALUES ($1, 1, $2, $3, $4)",
+        )
+        .bind(org_id)
+        .bind(serde_json::to_vec(&body["keyring_payload"]).expect("serialize v1 keyring payload"))
+        .bind(
+            hex::decode(body["signature"].as_str().expect("v1 signature"))
+                .expect("decode v1 keyring signature"),
+        )
+        .bind(signing_key_id)
+        .execute(pool)
+        .await
+        .expect("seed keyring v1");
+    }
+
+    #[tokio::test]
+    async fn put_keyring_committed_pending_defers_and_same_key_reexecutes() {
+        let _singleton = crate::test_support::SIGNED_POLICY_SINGLETON_LOCK
+            .lock()
+            .await;
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_keyring_pending_put").await;
+        let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let (org_id, user_id, paas_org_id, paas_user_id) =
+            seed_keyring_pending_org(&pool, std::slice::from_ref(&key)).await;
+        let mut state = idempotency_test_state(pool.clone());
+        state.management_mode = crate::state::CapManagementMode::PaasManaged;
+        let idempotency_key = format!("keyring-pending-put-{}", Uuid::new_v4());
+        let headers = config_token_actor_headers(&idempotency_key, &paas_user_id);
+        let request = signed_keyring_body(org_id, user_id, &key, 1, 0);
+
+        // Active signed mode with no KBS config: the keyring transaction
+        // commits, publication cannot be confirmed, and the wrapper must
+        // defer rather than cache success or a terminal outcome.
+        let deferred = put_paas_keyring(
+            internal_test_auth(),
+            State(state.clone()),
+            Path(paas_org_id.clone()),
+            headers.clone(),
+            Json(request.clone()),
+        )
+        .await
+        .expect_err("committed-but-unconfirmed keyring must defer, not succeed");
+        assert_eq!(deferred.0, StatusCode::CONFLICT);
+        assert_eq!(deferred.1.0["error"], "idempotency_request_in_progress");
+        assert_eq!(deferred.1.0["idempotency_disposition"], "deferred");
+        assert_eq!(deferred.1.0["retryable"], true);
+        assert_eq!(
+            deferred.1.0["cause"],
+            KEYRING_POLICY_RECONCILIATION_PENDING_CODE
+        );
+
+        // The keyring version, its audit row and the request binding are
+        // durable; the idempotency row stays incomplete and not-applied-free.
+        let receipt: (bool, bool) = sqlx::query_as(
+            "SELECT completed_at IS NULL, known_not_applied
+               FROM cap_internal_idempotency WHERE idempotency_key = $1",
+        )
+        .bind(&idempotency_key)
+        .fetch_one(&pool)
+        .await
+        .expect("inspect deferred keyring receipt");
+        assert_eq!(receipt, (true, false));
+        let versions: Vec<i64> = sqlx::query_scalar(
+            "SELECT version FROM org_keyrings WHERE org_id = $1 ORDER BY version",
+        )
+        .bind(org_id)
+        .fetch_all(&pool)
+        .await
+        .expect("read committed keyring versions");
+        assert_eq!(versions, vec![1]);
+        let put_audits: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM audit_log
+              WHERE org_id = $1 AND action = 'org.keyring.put'",
+        )
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count keyring put audits");
+        assert_eq!(put_audits, 1);
+
+        // A same-key retry under the live deferred lease stays deferred, and
+        // a different payload cannot hijack the bound key.
+        let busy = put_paas_keyring(
+            internal_test_auth(),
+            State(state.clone()),
+            Path(paas_org_id.clone()),
+            headers.clone(),
+            Json(request.clone()),
+        )
+        .await
+        .expect_err("a live deferred lease must keep deferring same-key retries");
+        assert_eq!(
+            (busy.0, busy.1.0),
+            (StatusCode::CONFLICT, idempotency_in_progress_error().1.0)
+        );
+        let mut hijack = request.clone();
+        hijack["version"] = serde_json::json!(2);
+        let rejected = put_paas_keyring(
+            internal_test_auth(),
+            State(state.clone()),
+            Path(paas_org_id.clone()),
+            headers.clone(),
+            Json(hijack),
+        )
+        .await
+        .expect_err("a different payload must not reuse the bound key");
+        assert_eq!(rejected.0, StatusCode::CONFLICT);
+        assert_eq!(rejected.1.0["error"], "idempotency_key_reused");
+
+        // A concurrent newer keyring makes the reclaimed same-key retry
+        // re-execute the handler (stale-version conflict, terminal receipt)
+        // instead of replaying the deferred committed-pending response.
+        let signing_key_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM user_signing_keys WHERE user_id = $1 AND pubkey = $2",
+        )
+        .bind(user_id)
+        .bind(key.verifying_key().to_bytes().to_vec())
+        .fetch_one(&pool)
+        .await
+        .expect("resolve signing key id");
+        let concurrent = signed_keyring_body(org_id, user_id, &key, 2, 30);
+        sqlx::query(
+            "INSERT INTO org_keyrings
+                 (org_id, version, keyring_payload, signature, signing_key_id)
+             VALUES ($1, 2, $2, $3, $4)",
+        )
+        .bind(org_id)
+        .bind(
+            serde_json::to_vec(&concurrent["keyring_payload"])
+                .expect("serialize concurrent keyring payload"),
+        )
+        .bind(
+            hex::decode(
+                concurrent["signature"]
+                    .as_str()
+                    .expect("concurrent signature"),
+            )
+            .expect("decode concurrent keyring signature"),
+        )
+        .bind(signing_key_id)
+        .execute(&pool)
+        .await
+        .expect("insert concurrent newer keyring");
+        expire_idempotency_lease(&pool, &idempotency_key).await;
+        let retried = put_paas_keyring(
+            internal_test_auth(),
+            State(state.clone()),
+            Path(paas_org_id.clone()),
+            headers.clone(),
+            Json(request.clone()),
+        )
+        .await
+        .expect_err("the stale-version retry is a conflict, not a success");
+        assert_eq!(retried.0, StatusCode::CONFLICT);
+        assert_eq!(retried.1.0["idempotency_disposition"], "completed");
+        assert_eq!(retried.1.0["retryable"], false);
+        assert_ne!(retried.1.0["error"], "idempotency_request_in_progress");
+        assert_ne!(retried.1.0["error"], "idempotency_recovery_required");
+        assert!(
+            retried.1.0.get("cause").is_none(),
+            "the retry must re-execute against the newer keyring, not replay the defer"
+        );
+        let versions_after: Vec<i64> = sqlx::query_scalar(
+            "SELECT version FROM org_keyrings WHERE org_id = $1 ORDER BY version",
+        )
+        .bind(org_id)
+        .fetch_all(&pool)
+        .await
+        .expect("read keyring versions after retry");
+        assert_eq!(versions_after, vec![1, 2]);
+        let put_audits_after: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM audit_log
+              WHERE org_id = $1 AND action = 'org.keyring.put'",
+        )
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count keyring put audits after retry");
+        assert_eq!(
+            put_audits_after, 1,
+            "the re-executed stale retry must not write another version or audit"
+        );
+
+        // The terminal receipt is now cached and replays exactly.
+        let replayed = put_paas_keyring(
+            internal_test_auth(),
+            State(state.clone()),
+            Path(paas_org_id.clone()),
+            headers.clone(),
+            Json(request.clone()),
+        )
+        .await
+        .expect("the completed stale conflict replays");
+        assert_eq!(replayed.0, retried.0);
+        assert_eq!(replayed.1.0, retried.1.0);
+
+        crate::test_support::drop_isolated_database("cap_keyring_pending_put", pool).await;
+    }
+
+    #[tokio::test]
+    async fn rotate_owner_committed_pending_defers_and_exact_replay_retries_publication() {
+        let _singleton = crate::test_support::SIGNED_POLICY_SINGLETON_LOCK
+            .lock()
+            .await;
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_keyring_pending_rotate").await;
+        let current_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let replacement_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let (org_id, user_id, paas_org_id, paas_user_id) =
+            seed_keyring_pending_org(&pool, &[current_key.clone(), replacement_key.clone()]).await;
+
+        // Publish v1 as the current owner directly: routing the seed through
+        // put_paas_keyring would itself defer under the pending KBS state.
+        seed_owner_keyring_v1(&pool, org_id, user_id, &current_key).await;
+
+        let mut state = idempotency_test_state(pool.clone());
+        state.management_mode = crate::state::CapManagementMode::PaasManaged;
+        // The signing service already reports the replacement owner, so the
+        // rotation commits locally without a remote owner change.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind signing service mock");
+        let address = listener.local_addr().expect("mock signing service address");
+        let replacement_hex = hex::encode(replacement_key.verifying_key().to_bytes());
+        let status_org_id = org_id;
+        let mock = tokio::spawn(async move {
+            use axum::{Json, routing::get};
+            let app = axum::Router::new().route(
+                "/orgs/{org_id}/owner",
+                get(move || {
+                    let org_id = status_org_id;
+                    let owner_hex = replacement_hex.clone();
+                    async move {
+                        Json(serde_json::json!({
+                            "org_id": org_id,
+                            "state": "ready",
+                            "version": 2,
+                            "owner_pubkey_hex": owner_hex,
+                            "last_changed_at": null,
+                        }))
+                    }
+                }),
+            );
+            axum::serve(listener, app).await.expect("serve mock");
+        });
+        state.signing_service = Some(
+            crate::signing_service::SigningServiceClient::new(format!("http://{address}"), None)
+                .expect("mock signing service client"),
+        );
+
+        let idempotency_key = format!("keyring-pending-rotate-{}", Uuid::new_v4());
+        let headers = config_token_actor_headers(&idempotency_key, &paas_user_id);
+        let rotation = signed_rotation_body(org_id, user_id, &current_key, &replacement_key);
+
+        let deferred = rotate_paas_keyring_owner(
+            internal_test_auth(),
+            State(state.clone()),
+            Path(paas_org_id.clone()),
+            headers.clone(),
+            Json(rotation.clone()),
+        )
+        .await
+        .expect_err("committed-but-unconfirmed rotation must defer, not succeed");
+        assert_eq!(deferred.0, StatusCode::CONFLICT);
+        assert_eq!(deferred.1.0["idempotency_disposition"], "deferred");
+        assert_eq!(
+            deferred.1.0["cause"],
+            KEYRING_POLICY_RECONCILIATION_PENDING_CODE
+        );
+
+        // The rotation committed exactly once: version 2 exists with exactly
+        // one rotation audit row, and the idempotency row stays incomplete.
+        let versions: Vec<i64> = sqlx::query_scalar(
+            "SELECT version FROM org_keyrings WHERE org_id = $1 ORDER BY version",
+        )
+        .bind(org_id)
+        .fetch_all(&pool)
+        .await
+        .expect("read rotation keyring versions");
+        assert_eq!(versions, vec![1, 2]);
+        let rotate_audits: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM audit_log
+              WHERE org_id = $1 AND action = 'org.keyring.owner.rotate'",
+        )
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count rotation audits");
+        assert_eq!(rotate_audits, 1);
+        let receipt: (bool, bool) = sqlx::query_as(
+            "SELECT completed_at IS NULL, known_not_applied
+               FROM cap_internal_idempotency WHERE idempotency_key = $1",
+        )
+        .bind(&idempotency_key)
+        .fetch_one(&pool)
+        .await
+        .expect("inspect deferred rotation receipt");
+        assert_eq!(receipt, (true, false));
+
+        // Exact replay after the lease frees re-executes and defers again --
+        // retrying publication -- without repeating the owner rotation.
+        expire_idempotency_lease(&pool, &idempotency_key).await;
+        let retried = rotate_paas_keyring_owner(
+            internal_test_auth(),
+            State(state.clone()),
+            Path(paas_org_id.clone()),
+            headers.clone(),
+            Json(rotation.clone()),
+        )
+        .await
+        .expect_err("exact replay retries publication and defers again");
+        assert_eq!(retried.0, StatusCode::CONFLICT);
+        assert_eq!(retried.1.0["idempotency_disposition"], "deferred");
+        assert_eq!(
+            retried.1.0["cause"],
+            KEYRING_POLICY_RECONCILIATION_PENDING_CODE
+        );
+        let versions_after: Vec<i64> = sqlx::query_scalar(
+            "SELECT version FROM org_keyrings WHERE org_id = $1 ORDER BY version",
+        )
+        .bind(org_id)
+        .fetch_all(&pool)
+        .await
+        .expect("read keyring versions after replay");
+        assert_eq!(versions_after, vec![1, 2]);
+        let rotate_audits_after: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM audit_log
+              WHERE org_id = $1 AND action = 'org.keyring.owner.rotate'",
+        )
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count rotation audits after replay");
+        assert_eq!(
+            rotate_audits_after, 1,
+            "exact replay must never repeat the owner rotation"
+        );
+
+        mock.abort();
+        crate::test_support::drop_isolated_database("cap_keyring_pending_rotate", pool).await;
+    }
+
+    /// An org, a mapped PaaS owner, and an app pinned to the legacy test
+    /// signer identity: exactly what a signer rotation starts from.
+    async fn seed_signer_rotation_fixture(
+        pool: &sqlx::PgPool,
+    ) -> (Uuid, Uuid, Uuid, String, String, String) {
+        let org_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let app_id = Uuid::new_v4();
+        let suffix = org_id.simple().to_string();
+        let org_name = format!("signer-rotate-{}", &suffix[..16]);
+        let paas_org_id = format!("paas-signer-org-{suffix}");
+        let paas_user_id = format!("paas-signer-user-{suffix}");
+        insert_config_token_test_actor(
+            pool,
+            org_id,
+            &org_name,
+            &paas_org_id,
+            user_id,
+            &paas_user_id,
+        )
+        .await;
+        let app_name = format!("signer-app-{}", &suffix[..12]);
+        insert_config_token_test_app(pool, org_id, &org_name, app_id, &app_name, "sr1").await;
+        (org_id, user_id, app_id, app_name, paas_org_id, paas_user_id)
+    }
+
+    #[tokio::test]
+    async fn rotate_signer_committed_pending_defers_and_same_key_retry_is_publication_only() {
+        let _singleton = crate::test_support::SIGNED_POLICY_SINGLETON_LOCK
+            .lock()
+            .await;
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_signer_pending_rotate").await;
+        let (org_id, user_id, app_id, app_name, paas_org_id, paas_user_id) =
+            seed_signer_rotation_fixture(&pool).await;
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 5,
+                    selector_bumps_owed = 0,
+                    configmap_generation = 0,
+                    applied_generation = 0,
+                    configmap_policy_sha256 = NULL,
+                    applied_policy_sha256 = NULL,
+                    configmap_resource_version = NULL
+              WHERE singleton",
+        )
+        .execute(&pool)
+        .await
+        .expect("activate signed-policy mode without a converged generation");
+
+        let mut state = idempotency_test_state(pool.clone());
+        state.management_mode = crate::state::CapManagementMode::PaasManaged;
+        let previous_subject =
+            "https://github.com/enclava/test/.github/workflows/build.yml@refs/heads/main";
+        let previous_issuer = "https://token.actions.githubusercontent.com";
+        let new_subject =
+            "https://github.com/enclava/rotated/.github/workflows/build.yml@refs/heads/main";
+        let new_issuer = "https://rotated-issuer.example.test";
+        let token = crate::auth::jwt::issue_signer_rotation_token(
+            state.hmac_key.as_ref(),
+            &crate::auth::jwt::SignerRotationTokenInput {
+                user_id,
+                org_id,
+                app_id,
+                previous_subject: previous_subject.to_string(),
+                previous_issuer: previous_issuer.to_string(),
+                new_subject: new_subject.to_string(),
+                new_issuer: new_issuer.to_string(),
+            },
+            chrono::Duration::seconds(600),
+        )
+        .expect("issue signer rotation token");
+        let idempotency_key = format!("signer-pending-rotate-{}", Uuid::new_v4());
+        let headers = config_token_actor_headers(&idempotency_key, &paas_user_id);
+        let request = serde_json::json!({
+            "subject": new_subject,
+            "issuer": new_issuer,
+            "email_confirmation_token": token,
+        });
+
+        let unconfigured = rotate_paas_signer(
+            internal_test_auth(),
+            State(state.clone()),
+            Path((paas_org_id.clone(), app_name.clone())),
+            headers.clone(),
+            Json(request.clone()),
+        )
+        .await
+        .expect_err("missing publication configuration must defer before mutation");
+        assert_eq!(unconfigured.0, StatusCode::CONFLICT);
+        assert_eq!(unconfigured.1.0["idempotency_disposition"], "deferred");
+        assert_eq!(unconfigured.1.0["cause"], "kbs_publication_not_configured");
+        let unapplied: (Option<String>, i64, i64) = sqlx::query_as(
+            "SELECT signer_identity_subject,
+                    (SELECT count(*) FROM consumed_signer_rotation_tokens WHERE app_id = $1),
+                    (SELECT count(*) FROM audit_log WHERE app_id = $1 AND action = 'app.signer.rotate')
+               FROM apps WHERE id = $1",
+        )
+        .bind(app_id)
+        .fetch_one(&pool)
+        .await
+        .expect("inspect rejected rotation");
+        assert_eq!(unapplied.0.as_deref(), Some(previous_subject));
+        assert_eq!((unapplied.1, unapplied.2), (0, 0));
+
+        expire_idempotency_lease(&pool, &idempotency_key).await;
+        state.kbs_policy = Some(crate::kbs::KbsPolicyConfig {
+            namespace: "kbs-test".into(),
+            configmap_name: "resource-policy".into(),
+            policy_key: "policy.rego".into(),
+            deployment_name: "trustee".into(),
+            required: true,
+            signed_policy_retention: 1,
+            signed_policy_max_bytes: 1_048_576,
+        });
+        let provider = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::test_support::KbsPolicyProvider::new(false),
+        ));
+        crate::kbs::TEST_KUBE_CLIENT
+            .scope(crate::test_support::kbs_policy_kube_client(provider), async {
+        // The same request may now commit, but failed publication must retain
+        // a checkpoint rather than consume another token on subsequent retries.
+        let deferred = rotate_paas_signer(
+            internal_test_auth(),
+            State(state.clone()),
+            Path((paas_org_id.clone(), app_name.clone())),
+            headers.clone(),
+            Json(request.clone()),
+        )
+        .await
+        .expect_err("committed-but-unconfirmed rotation must defer, not succeed");
+        assert_eq!(deferred.0, StatusCode::CONFLICT);
+        assert_eq!(deferred.1.0["error"], "idempotency_request_in_progress");
+        assert_eq!(deferred.1.0["idempotency_disposition"], "deferred");
+        assert_eq!(deferred.1.0["retryable"], true);
+        assert_eq!(
+            deferred.1.0["cause"],
+            crate::routes::apps::SIGNER_ROTATION_PUBLICATION_PENDING_CODE
+        );
+
+        let committed_subject: Option<String> =
+            sqlx::query_scalar("SELECT signer_identity_subject FROM apps WHERE id = $1")
+                .bind(app_id)
+                .fetch_one(&pool)
+                .await
+                .expect("load app subject after committed rotation");
+        assert_eq!(committed_subject.as_deref(), Some(new_subject));
+        let rotation_receipts: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM consumed_signer_rotation_tokens WHERE app_id = $1),
+                    (SELECT count(*) FROM audit_log WHERE org_id = $2 AND action = 'app.signer.rotate')",
+        )
+        .bind(app_id)
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count rotation receipts");
+        assert_eq!(rotation_receipts, (1, 1));
+
+        // A same-key retry under the live deferred lease stays deferred, and
+        // a different payload cannot hijack the bound key.
+        let busy = rotate_paas_signer(
+            internal_test_auth(),
+            State(state.clone()),
+            Path((paas_org_id.clone(), app_name.clone())),
+            headers.clone(),
+            Json(request.clone()),
+        )
+        .await
+        .expect_err("a live deferred lease must keep deferring same-key retries");
+        assert_eq!(
+            (busy.0, busy.1.0),
+            (StatusCode::CONFLICT, idempotency_in_progress_error().1.0)
+        );
+        let mut hijack = request.clone();
+        hijack["subject"] = serde_json::json!(
+            "https://github.com/enclava/hijack/.github/workflows/build.yml@refs/heads/main"
+        );
+        let rejected = rotate_paas_signer(
+            internal_test_auth(),
+            State(state.clone()),
+            Path((paas_org_id.clone(), app_name.clone())),
+            headers.clone(),
+            Json(hijack),
+        )
+        .await
+        .expect_err("a different payload must not reuse the bound key");
+        assert_eq!(rejected.0, StatusCode::CONFLICT);
+        assert_eq!(rejected.1.0["error"], "idempotency_key_reused");
+
+        // Losing configuration after the commit must not re-run the mutation.
+        expire_idempotency_lease(&pool, &idempotency_key).await;
+        state.kbs_policy = None;
+        let retried = rotate_paas_signer(
+            internal_test_auth(),
+            State(state.clone()),
+            Path((paas_org_id.clone(), app_name.clone())),
+            headers.clone(),
+            Json(request.clone()),
+        )
+        .await
+        .expect_err("publication-only retry defers again while KBS stays unconfigured");
+        assert_eq!(retried.0, StatusCode::CONFLICT);
+        assert_eq!(retried.1.0["idempotency_disposition"], "deferred");
+        assert_eq!(
+            retried.1.0["cause"],
+            crate::routes::apps::SIGNER_ROTATION_PUBLICATION_PENDING_CODE
+        );
+        let rotation_receipts_after: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM consumed_signer_rotation_tokens WHERE app_id = $1),
+                    (SELECT count(*) FROM audit_log WHERE org_id = $2 AND action = 'app.signer.rotate')",
+        )
+        .bind(app_id)
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count rotation receipts after publication-only retry");
+        assert_eq!(
+            rotation_receipts_after,
+            (1, 1),
+            "the publication-only retry must not re-run the rotation"
+        );
+        let subject_after: Option<String> =
+            sqlx::query_scalar("SELECT signer_identity_subject FROM apps WHERE id = $1")
+                .bind(app_id)
+                .fetch_one(&pool)
+                .await
+                .expect("load app subject after publication-only retry");
+        assert_eq!(subject_after.as_deref(), Some(new_subject));
+
+            })
+            .await;
+
+        crate::test_support::drop_isolated_database("cap_signer_pending_rotate", pool).await;
+    }
+
+    /// An unrelated handler 5xx carries no committed signer outcome: it
+    /// must keep the generic fail-closed disposition, never a retryable
+    /// publication checkpoint.
+    #[tokio::test]
+    async fn rotate_signer_unrelated_five_xx_stays_fail_closed() {
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_signer_pending_unrelated").await;
+        let state = idempotency_test_state(pool.clone());
+        let key = format!("signer-pending-unrelated-{}", Uuid::new_v4());
+        let path = "/internal/paas/orgs/paas-org/apps/app/signer";
+        let lease = expect_idempotency_execution(
+            begin_idempotent_request_with_recovery(
+                &state,
+                &key,
+                "PATCH",
+                path,
+                &[1, 2, 3, 4],
+                IdempotencyRecovery::FailClosed,
+            )
+            .await
+            .unwrap(),
+        );
+        let terminal = complete_signer_result(
+            lease,
+            Err(json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "database error",
+            )),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(terminal.0, StatusCode::CONFLICT);
+        assert_eq!(terminal.1.0["error"], "idempotency_recovery_required");
+        assert_eq!(terminal.1.0["idempotency_disposition"], "completed");
+        assert_eq!(terminal.1.0["retryable"], false);
+
+        // The fail-closed receipt is terminal and replays without granting
+        // a publication-only retry.
+        let replay = expect_idempotency_replay(
+            begin_idempotent_request_with_recovery(
+                &state,
+                &key,
+                "PATCH",
+                path,
+                &[1, 2, 3, 4],
+                IdempotencyRecovery::FailClosed,
+            )
+            .await
+            .unwrap(),
+        );
+        let Json(terminal_body) = terminal.1;
+        assert_eq!((replay.0, replay.1), (terminal.0, terminal_body));
+
+        crate::test_support::drop_isolated_database("cap_signer_pending_unrelated", pool).await;
+    }
+
+    /// End-to-end signer rotation publication recovery against the fake
+    /// kube provider: the first attempt commits the rotation and defers
+    /// when the provider fails; after the provider recovers, the exact
+    /// same-key retry publishes and replays the saved committed result
+    /// without re-running the single-use mutation.
+    #[tokio::test]
+    async fn rotate_signer_publication_retry_publishes_after_kbs_recovery() {
+        let _singleton = crate::test_support::SIGNED_POLICY_SINGLETON_LOCK
+            .lock()
+            .await;
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_signer_rot_recovery").await;
+        let (org_id, user_id, app_id, app_name, paas_org_id, paas_user_id) =
+            seed_signer_rotation_fixture(&pool).await;
+        // The legacy Rego render source for the rotation's identity carry.
+        sqlx::query(
+            "INSERT INTO kbs_tls_bindings (app_id, binding_key, namespace, service_account, tenant_instance_identity_hash)
+             SELECT id, id::text, namespace, service_account, tenant_instance_identity_hash FROM apps WHERE id = $1",
+        )
+        .bind(app_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut state = idempotency_test_state(pool.clone());
+        state.management_mode = crate::state::CapManagementMode::PaasManaged;
+        state.kbs_policy = Some(crate::kbs::KbsPolicyConfig {
+            namespace: "kbs-test".into(),
+            configmap_name: "resource-policy".into(),
+            policy_key: "policy.rego".into(),
+            deployment_name: "trustee".into(),
+            required: true,
+            signed_policy_retention: 1,
+            signed_policy_max_bytes: 1_048_576,
+        });
+        let previous_subject =
+            "https://github.com/enclava/test/.github/workflows/build.yml@refs/heads/main";
+        let previous_issuer = "https://token.actions.githubusercontent.com";
+        let new_subject =
+            "https://github.com/enclava/rotated/.github/workflows/build.yml@refs/heads/main";
+        let new_issuer = "https://rotated-issuer.example.test";
+        let token = crate::auth::jwt::issue_signer_rotation_token(
+            state.hmac_key.as_ref(),
+            &crate::auth::jwt::SignerRotationTokenInput {
+                user_id,
+                org_id,
+                app_id,
+                previous_subject: previous_subject.to_string(),
+                previous_issuer: previous_issuer.to_string(),
+                new_subject: new_subject.to_string(),
+                new_issuer: new_issuer.to_string(),
+            },
+            chrono::Duration::seconds(600),
+        )
+        .unwrap();
+        let idempotency_key = format!("signer-rot-recovery-{}", Uuid::new_v4());
+        let headers = config_token_actor_headers(&idempotency_key, &paas_user_id);
+        let request = serde_json::json!({
+            "subject": new_subject,
+            "issuer": new_issuer,
+            "email_confirmation_token": token,
+        });
+        let provider = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::test_support::KbsPolicyProvider::new(false),
+        ));
+        crate::kbs::TEST_KUBE_CLIENT
+            .scope(crate::test_support::kbs_policy_kube_client(provider.clone()), async {
+                // The provider rejects configmap reads: the rotation commits
+                // and the wrapper defers with the incomplete publication
+                // checkpoint.
+                let deferred = rotate_paas_signer(
+                    internal_test_auth(),
+                    State(state.clone()),
+                    Path((paas_org_id.clone(), app_name.clone())),
+                    headers.clone(),
+                    Json(request.clone()),
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(deferred.0, StatusCode::CONFLICT);
+                assert_eq!(deferred.1.0["error"], "idempotency_request_in_progress");
+                assert_eq!(deferred.1.0["idempotency_disposition"], "deferred");
+                assert_eq!(deferred.1.0["retryable"], true);
+                assert_eq!(
+                    deferred.1.0["cause"],
+                    crate::routes::apps::SIGNER_ROTATION_PUBLICATION_PENDING_CODE
+                );
+                let subject: Option<String> =
+                    sqlx::query_scalar("SELECT signer_identity_subject FROM apps WHERE id = $1")
+                        .bind(app_id)
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                assert_eq!(subject.as_deref(), Some(new_subject));
+                let rotation_receipts: (i64, i64) = sqlx::query_as(
+                    "SELECT (SELECT count(*) FROM consumed_signer_rotation_tokens WHERE app_id = $1),
+                            (SELECT count(*) FROM audit_log WHERE org_id = $2 AND action = 'app.signer.rotate')",
+                )
+                .bind(app_id)
+                .bind(org_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                assert_eq!(rotation_receipts, (1, 1));
+
+                // Recovery: the provider heals, the deferred lease frees, and
+                // the exact same-key retry reconciles publication only.
+                {
+                    let mut provider = provider.lock().await;
+                    provider.healthy = true;
+                }
+                expire_idempotency_lease(&pool, &idempotency_key).await;
+                let (status, Json(published)) = rotate_paas_signer(
+                    internal_test_auth(),
+                    State(state.clone()),
+                    Path((paas_org_id.clone(), app_name.clone())),
+                    headers.clone(),
+                    Json(request.clone()),
+                )
+                .await
+                .unwrap();
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(published["signer_identity_subject"], new_subject);
+                assert_eq!(published["id"], app_id.to_string());
+                assert!(
+                    published.get("rotation_count").is_none()
+                        && published.get("signer_rotation_generation").is_none(),
+                    "the confirmed success must expose only the AppResponse contract"
+                );
+                let rotation_receipts_after: (i64, i64) = sqlx::query_as(
+                    "SELECT (SELECT count(*) FROM consumed_signer_rotation_tokens WHERE app_id = $1),
+                            (SELECT count(*) FROM audit_log WHERE org_id = $2 AND action = 'app.signer.rotate')",
+                )
+                .bind(app_id)
+                .bind(org_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                assert_eq!(
+                    rotation_receipts_after, (1, 1),
+                    "the publication-only retry must not re-run the single-use rotation"
+                );
+                let subject_after: Option<String> =
+                    sqlx::query_scalar("SELECT signer_identity_subject FROM apps WHERE id = $1")
+                        .bind(app_id)
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                assert_eq!(subject_after.as_deref(), Some(new_subject));
+
+                // The provider's stored ConfigMap is the real legacy Rego
+                // render: the binding is admitted under the rotated
+                // identity, and nothing under the withdrawn one.
+                {
+                    let provider = provider.lock().await;
+                    let policy = provider.configmap["data"]["policy.rego"]
+                        .as_str()
+                        .expect("published legacy policy body");
+                    assert!(
+                        policy.contains(&format!(
+                            "\"allowed_signer_identity_subjects\": [\"{new_subject}\"]"
+                        )),
+                        "the published policy must admit the rotated signer identity"
+                    );
+                    assert!(
+                        !policy.contains(previous_subject),
+                        "the withdrawn identity must not be readmitted by publication"
+                    );
+                    assert_eq!(
+                        provider.configmap_replaces, 1,
+                        "the retry must publish the configmap exactly once"
+                    );
+                }
+
+                // The completed receipt replays exactly, and an older one that
+                // still carries private fencing metadata has it stripped:
+                // the AppResponse contract never exposes generation or count.
+                rewrite_idempotency_fixture(
+                    &pool,
+                    &idempotency_key,
+                    "UPDATE cap_internal_idempotency
+                        SET response_body = jsonb_set(
+                                jsonb_set(response_body, '{rotation_count}', '1'),
+                                '{signer_rotation_generation}', '2'
+                            )
+                      WHERE idempotency_key = $1",
+                )
+                .await;
+                let (replay_status, Json(replayed)) = rotate_paas_signer(
+                    internal_test_auth(),
+                    State(state.clone()),
+                    Path((paas_org_id.clone(), app_name.clone())),
+                    headers.clone(),
+                    Json(request.clone()),
+                )
+                .await
+                .unwrap();
+                assert_eq!((replay_status, replayed), (status, published));
+            })
+            .await;
+
+        crate::test_support::drop_isolated_database("cap_signer_rot_recovery", pool).await;
+    }
+
+    #[tokio::test]
+    async fn rotate_signer_retry_after_superseding_rotation_is_terminal_conflict() {
+        let _singleton = crate::test_support::SIGNED_POLICY_SINGLETON_LOCK
+            .lock()
+            .await;
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_signer_superseded").await;
+        let (org_id, user_id, app_id, app_name, paas_org_id, paas_user_id) =
+            seed_signer_rotation_fixture(&pool).await;
+        sqlx::query(
+            "INSERT INTO kbs_tls_bindings (app_id, binding_key, namespace, service_account, tenant_instance_identity_hash)
+             SELECT id, id::text, namespace, service_account, tenant_instance_identity_hash FROM apps WHERE id = $1",
+        )
+        .bind(app_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 5,
+                    selector_bumps_owed = 0,
+                    configmap_generation = 0,
+                    applied_generation = 0,
+                    configmap_policy_sha256 = NULL,
+                    applied_policy_sha256 = NULL,
+                    configmap_resource_version = NULL
+              WHERE singleton",
+        )
+        .execute(&pool)
+        .await
+        .expect("activate signed-policy mode without a converged generation");
+
+        let mut state = idempotency_test_state(pool.clone());
+        state.management_mode = crate::state::CapManagementMode::PaasManaged;
+        state.kbs_policy = Some(crate::kbs::KbsPolicyConfig {
+            namespace: "kbs-test".into(),
+            configmap_name: "resource-policy".into(),
+            policy_key: "policy.rego".into(),
+            deployment_name: "trustee".into(),
+            required: true,
+            signed_policy_retention: 1,
+            signed_policy_max_bytes: 1_048_576,
+        });
+        let previous_subject =
+            "https://github.com/enclava/test/.github/workflows/build.yml@refs/heads/main";
+        let previous_issuer = "https://token.actions.githubusercontent.com";
+        let superseded_subject =
+            "https://github.com/enclava/rotated/.github/workflows/build.yml@refs/heads/main";
+        let superseded_issuer = "https://rotated-issuer.example.test";
+        let authority_subject =
+            "https://github.com/enclava/authority/.github/workflows/build.yml@refs/heads/main";
+        let authority_issuer = "https://authority-issuer.example.test";
+
+        let old_token = crate::auth::jwt::issue_signer_rotation_token(
+            state.hmac_key.as_ref(),
+            &crate::auth::jwt::SignerRotationTokenInput {
+                user_id,
+                org_id,
+                app_id,
+                previous_subject: previous_subject.to_string(),
+                previous_issuer: previous_issuer.to_string(),
+                new_subject: superseded_subject.to_string(),
+                new_issuer: superseded_issuer.to_string(),
+            },
+            chrono::Duration::seconds(600),
+        )
+        .expect("issue superseded rotation token");
+        let old_idempotency_key = format!("signer-superseded-old-{}", Uuid::new_v4());
+        let old_headers = config_token_actor_headers(&old_idempotency_key, &paas_user_id);
+        let old_request = serde_json::json!({
+            "subject": superseded_subject,
+            "issuer": superseded_issuer,
+            "email_confirmation_token": old_token,
+        });
+        let authority_token = crate::auth::jwt::issue_signer_rotation_token(
+            state.hmac_key.as_ref(),
+            &crate::auth::jwt::SignerRotationTokenInput {
+                user_id,
+                org_id,
+                app_id,
+                previous_subject: superseded_subject.to_string(),
+                previous_issuer: superseded_issuer.to_string(),
+                new_subject: authority_subject.to_string(),
+                new_issuer: authority_issuer.to_string(),
+            },
+            chrono::Duration::seconds(600),
+        )
+        .expect("issue authority rotation token");
+
+        let provider = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::test_support::KbsPolicyProvider::new(false),
+        ));
+        crate::kbs::TEST_KUBE_CLIENT
+            .scope(crate::test_support::kbs_policy_kube_client(provider.clone()), async {
+                let deferred = rotate_paas_signer(
+                    internal_test_auth(),
+                    State(state.clone()),
+                    Path((paas_org_id.clone(), app_name.clone())),
+                    old_headers.clone(),
+                    Json(old_request.clone()),
+                )
+                .await
+                .expect_err("committed-but-unconfirmed rotation must defer, not succeed");
+                assert_eq!(deferred.0, StatusCode::CONFLICT);
+                assert_eq!(
+                    deferred.1.0["cause"],
+                    crate::routes::apps::SIGNER_ROTATION_PUBLICATION_PENDING_CODE
+                );
+                let committed_subject: Option<String> =
+                    sqlx::query_scalar("SELECT signer_identity_subject FROM apps WHERE id = $1")
+                        .bind(app_id)
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                assert_eq!(committed_subject.as_deref(), Some(superseded_subject));
+
+                expire_idempotency_lease(&pool, &old_idempotency_key).await;
+                {
+                    let mut provider = provider.lock().await;
+                    provider.healthy = true;
+                }
+                let authority_key = format!("signer-superseded-new-{}", Uuid::new_v4());
+                let authority_headers = config_token_actor_headers(&authority_key, &paas_user_id);
+                let (authority_status, Json(published)) = rotate_paas_signer(
+                    internal_test_auth(),
+                    State(state.clone()),
+                    Path((paas_org_id.clone(), app_name.clone())),
+                    authority_headers,
+                    Json(serde_json::json!({
+                        "subject": authority_subject,
+                        "issuer": authority_issuer,
+                        "email_confirmation_token": authority_token,
+                    })),
+                )
+                .await
+                .expect("the legitimate later rotation must publish");
+                assert_eq!(authority_status, StatusCode::OK);
+                assert_eq!(published["signer_identity_subject"], authority_subject);
+                assert!(
+                    published.get("rotation_count").is_none()
+                        && published.get("signer_rotation_generation").is_none(),
+                    "a fresh success must expose only the AppResponse contract"
+                );
+
+                // Supersession must terminate even while KBS is unavailable.
+                {
+                    let mut provider = provider.lock().await;
+                    provider.healthy = false;
+                }
+                let superseded = rotate_paas_signer(
+                    internal_test_auth(),
+                    State(state.clone()),
+                    Path((paas_org_id.clone(), app_name.clone())),
+                    old_headers.clone(),
+                    Json(old_request.clone()),
+                )
+                .await
+                .expect_err("the superseded retry must report a terminal conflict");
+                assert_eq!(superseded.0, StatusCode::CONFLICT);
+                assert_eq!(
+                    superseded.1.0["code"],
+                    crate::routes::apps::SIGNER_ROTATION_SUPERSEDED_CODE
+                );
+                assert_eq!(superseded.1.0["idempotency_disposition"], "completed");
+                assert_eq!(superseded.1.0["retryable"], false);
+                assert!(superseded.1.0.get("committed_response").is_none());
+
+                let receipts: (i64, i64, i64) = sqlx::query_as(
+                    "SELECT (SELECT count(*) FROM consumed_signer_rotation_tokens WHERE app_id = $1),
+                            (SELECT count(*) FROM audit_log WHERE org_id = $2 AND action = 'app.signer.rotate'),
+                            (SELECT count(*) FROM withdrawn_signer_artifacts WHERE app_id = $1)",
+                )
+                .bind(app_id)
+                .bind(org_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                assert_eq!(receipts, (2, 2, 0));
+
+                let replayed = rotate_paas_signer(
+                    internal_test_auth(),
+                    State(state.clone()),
+                    Path((paas_org_id.clone(), app_name.clone())),
+                    old_headers.clone(),
+                    Json(old_request.clone()),
+                )
+                .await
+                .expect("the terminal receipt must replay as the same conflict");
+                assert_eq!(replayed.0, StatusCode::CONFLICT);
+                assert_eq!(replayed.1.0, superseded.1.0);
+
+                let receipts_after: (i64, i64, i64) = sqlx::query_as(
+                    "SELECT (SELECT count(*) FROM consumed_signer_rotation_tokens WHERE app_id = $1),
+                            (SELECT count(*) FROM audit_log WHERE org_id = $2 AND action = 'app.signer.rotate'),
+                            (SELECT count(*) FROM withdrawn_signer_artifacts WHERE app_id = $1)",
+                )
+                .bind(app_id)
+                .bind(org_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                assert_eq!(receipts_after, (2, 2, 0));
+                let subject_after: Option<String> =
+                    sqlx::query_scalar("SELECT signer_identity_subject FROM apps WHERE id = $1")
+                        .bind(app_id)
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                assert_eq!(subject_after.as_deref(), Some(authority_subject));
+            })
+            .await;
+
+        crate::test_support::drop_isolated_database("cap_signer_superseded", pool).await;
+    }
+
+    #[tokio::test]
+    async fn rotate_signer_retry_after_app_removal_is_terminal_conflict() {
+        let _singleton = crate::test_support::SIGNED_POLICY_SINGLETON_LOCK
+            .lock()
+            .await;
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_signer_superseded_removal").await;
+        let (org_id, user_id, app_id, app_name, paas_org_id, paas_user_id) =
+            seed_signer_rotation_fixture(&pool).await;
+        let (org_id_2, user_id_2, app_id_2, app_name_2, paas_org_id_2, paas_user_id_2) =
+            seed_signer_rotation_fixture(&pool).await;
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 5,
+                    selector_bumps_owed = 0,
+                    configmap_generation = 0,
+                    applied_generation = 0,
+                    configmap_policy_sha256 = NULL,
+                    applied_policy_sha256 = NULL,
+                    configmap_resource_version = NULL
+              WHERE singleton",
+        )
+        .execute(&pool)
+        .await
+        .expect("activate signed-policy mode without a converged generation");
+
+        let mut state = idempotency_test_state(pool.clone());
+        state.management_mode = crate::state::CapManagementMode::PaasManaged;
+        state.kbs_policy = Some(crate::kbs::KbsPolicyConfig {
+            namespace: "kbs-test".into(),
+            configmap_name: "resource-policy".into(),
+            policy_key: "policy.rego".into(),
+            deployment_name: "trustee".into(),
+            required: true,
+            signed_policy_retention: 1,
+            signed_policy_max_bytes: 1_048_576,
+        });
+        let previous_subject =
+            "https://github.com/enclava/test/.github/workflows/build.yml@refs/heads/main";
+        let previous_issuer = "https://token.actions.githubusercontent.com";
+        let superseded_subject =
+            "https://github.com/enclava/gone/.github/workflows/build.yml@refs/heads/main";
+        let superseded_issuer = "https://gone-issuer.example.test";
+
+        let issue_request = |org_id: Uuid,
+                             user_id: Uuid,
+                             app_id: Uuid,
+                             paas_user_id: &str|
+         -> (String, HeaderMap, serde_json::Value) {
+            let token = crate::auth::jwt::issue_signer_rotation_token(
+                state.hmac_key.as_ref(),
+                &crate::auth::jwt::SignerRotationTokenInput {
+                    user_id,
+                    org_id,
+                    app_id,
+                    previous_subject: previous_subject.to_string(),
+                    previous_issuer: previous_issuer.to_string(),
+                    new_subject: superseded_subject.to_string(),
+                    new_issuer: superseded_issuer.to_string(),
+                },
+                chrono::Duration::seconds(600),
+            )
+            .expect("issue signer rotation token");
+            let key = format!("signer-removal-{}", Uuid::new_v4());
+            let headers = config_token_actor_headers(&key, paas_user_id);
+            (
+                key,
+                headers,
+                serde_json::json!({
+                    "subject": superseded_subject,
+                    "issuer": superseded_issuer,
+                    "email_confirmation_token": token,
+                }),
+            )
+        };
+
+        let provider = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::test_support::KbsPolicyProvider::new(false),
+        ));
+        crate::kbs::TEST_KUBE_CLIENT
+            .scope(
+                crate::test_support::kbs_policy_kube_client(provider.clone()),
+                async {
+                    let (deleting_key, deleting_headers, deleting_request) =
+                        issue_request(org_id, user_id, app_id, &paas_user_id);
+                    let (missing_key, missing_headers, missing_request) =
+                        issue_request(org_id_2, user_id_2, app_id_2, &paas_user_id_2);
+                    for (app_name, paas_org_id, headers, request) in [
+                        (
+                            &app_name,
+                            &paas_org_id,
+                            &deleting_headers,
+                            &deleting_request,
+                        ),
+                        (
+                            &app_name_2,
+                            &paas_org_id_2,
+                            &missing_headers,
+                            &missing_request,
+                        ),
+                    ] {
+                        let deferred = rotate_paas_signer(
+                            internal_test_auth(),
+                            State(state.clone()),
+                            Path((paas_org_id.clone(), app_name.clone())),
+                            headers.clone(),
+                            Json(request.clone()),
+                        )
+                        .await
+                        .expect_err("committed-but-unconfirmed rotation must defer");
+                        assert_eq!(deferred.0, StatusCode::CONFLICT);
+                        assert_eq!(
+                            deferred.1.0["cause"],
+                            crate::routes::apps::SIGNER_ROTATION_PUBLICATION_PENDING_CODE
+                        );
+                    }
+                    expire_idempotency_lease(&pool, &deleting_key).await;
+                    expire_idempotency_lease(&pool, &missing_key).await;
+
+                    sqlx::query(
+                        "UPDATE apps SET status = 'deleting'::app_status_enum WHERE id = $1",
+                    )
+                    .bind(app_id)
+                    .execute(&pool)
+                    .await
+                    .expect("mark the first app deleting");
+                    let deleting = rotate_paas_signer(
+                        internal_test_auth(),
+                        State(state.clone()),
+                        Path((paas_org_id.clone(), app_name.clone())),
+                        deleting_headers.clone(),
+                        Json(deleting_request.clone()),
+                    )
+                    .await
+                    .expect_err("a deleting app must not keep deferring publication");
+                    assert_eq!(deleting.0, StatusCode::CONFLICT);
+                    assert_eq!(
+                        deleting.1.0["code"],
+                        crate::routes::apps::SIGNER_ROTATION_SUPERSEDED_CODE
+                    );
+                    assert_eq!(deleting.1.0["idempotency_disposition"], "completed");
+
+                    for table in [
+                        "DELETE FROM consumed_signer_rotation_tokens WHERE app_id = $1",
+                        "DELETE FROM audit_log WHERE app_id = $1",
+                        "DELETE FROM kbs_tls_bindings WHERE app_id = $1",
+                        "DELETE FROM apps WHERE id = $1",
+                    ] {
+                        sqlx::query(table)
+                            .bind(app_id_2)
+                            .execute(&pool)
+                            .await
+                            .expect("remove the second app and its dependents");
+                    }
+                    let missing = rotate_paas_signer(
+                        internal_test_auth(),
+                        State(state.clone()),
+                        Path((paas_org_id_2.clone(), app_name_2.clone())),
+                        missing_headers.clone(),
+                        Json(missing_request.clone()),
+                    )
+                    .await
+                    .expect_err("a deleted app must not keep deferring publication");
+                    assert_eq!(missing.0, StatusCode::CONFLICT);
+                    assert_eq!(
+                        missing.1.0["code"],
+                        crate::routes::apps::SIGNER_ROTATION_SUPERSEDED_CODE
+                    );
+                    assert_eq!(missing.1.0["idempotency_disposition"], "completed");
+                },
+            )
+            .await;
+
+        crate::test_support::drop_isolated_database("cap_signer_superseded_removal", pool).await;
+    }
+
+    fn issue_test_signer_rotation_token(
+        state: &AppState,
+        user_id: Uuid,
+        org_id: Uuid,
+        app_id: Uuid,
+        previous_identity: (&str, &str),
+        new_identity: (&str, &str),
+    ) -> String {
+        crate::auth::jwt::issue_signer_rotation_token(
+            state.hmac_key.as_ref(),
+            &crate::auth::jwt::SignerRotationTokenInput {
+                user_id,
+                org_id,
+                app_id,
+                previous_subject: previous_identity.0.to_string(),
+                previous_issuer: previous_identity.1.to_string(),
+                new_subject: new_identity.0.to_string(),
+                new_issuer: new_identity.1.to_string(),
+            },
+            chrono::Duration::seconds(600),
+        )
+        .expect("issue signer rotation token")
+    }
+
+    async fn rewrite_idempotency_fixture(pool: &sqlx::PgPool, key: &str, statement: &str) {
+        let mut tx = pool.begin().await.expect("begin fixture receipt rewrite");
+        let token: Uuid = sqlx::query_scalar(
+            "SELECT reservation_token FROM cap_internal_idempotency
+              WHERE idempotency_key = $1 FOR UPDATE",
+        )
+        .bind(key)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("load the fixture receipt owner");
+        set_idempotency_completion_owner(&mut tx, token)
+            .await
+            .expect("retain the fixture receipt owner guard");
+        sqlx::query(statement)
+            .bind(key)
+            .execute(&mut *tx)
+            .await
+            .expect("rewrite the fixture receipt");
+        tx.commit().await.expect("commit the fixture receipt");
+    }
+
+    async fn signer_rotation_publication_state(
+        pool: &sqlx::PgPool,
+        app_id: Uuid,
+    ) -> (
+        AppState,
+        std::sync::Arc<tokio::sync::Mutex<crate::test_support::KbsPolicyProvider>>,
+    ) {
+        sqlx::query(
+            "INSERT INTO kbs_tls_bindings (app_id, binding_key, namespace, service_account, tenant_instance_identity_hash)
+             SELECT id, id::text, namespace, service_account, tenant_instance_identity_hash FROM apps WHERE id = $1",
+        )
+        .bind(app_id)
+        .execute(pool)
+        .await
+        .expect("seed legacy binding for the rotation");
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 5,
+                    selector_bumps_owed = 0,
+                    configmap_generation = 0,
+                    applied_generation = 0,
+                    configmap_policy_sha256 = NULL,
+                    applied_policy_sha256 = NULL,
+                    configmap_resource_version = NULL
+              WHERE singleton",
+        )
+        .execute(pool)
+        .await
+        .expect("activate signed-policy mode without a converged generation");
+        let mut state = idempotency_test_state(pool.clone());
+        state.management_mode = crate::state::CapManagementMode::PaasManaged;
+        state.kbs_policy = Some(crate::kbs::KbsPolicyConfig {
+            namespace: "kbs-test".into(),
+            configmap_name: "resource-policy".into(),
+            policy_key: "policy.rego".into(),
+            deployment_name: "trustee".into(),
+            required: true,
+            signed_policy_retention: 1,
+            signed_policy_max_bytes: 1_048_576,
+        });
+        let provider = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::test_support::KbsPolicyProvider::new(false),
+        ));
+        (state, provider)
+    }
+
+    async fn signer_rotation_receipts(
+        pool: &sqlx::PgPool,
+        app_id: Uuid,
+        org_id: Uuid,
+    ) -> (i64, i64) {
+        sqlx::query_as(
+            "SELECT (SELECT count(*) FROM consumed_signer_rotation_tokens WHERE app_id = $1),
+                    (SELECT count(*) FROM audit_log WHERE org_id = $2 AND action = 'app.signer.rotate')",
+        )
+        .bind(app_id)
+        .bind(org_id)
+        .fetch_one(pool)
+        .await
+        .expect("count signer rotation receipts")
+    }
+
+    #[tokio::test]
+    async fn rotate_signer_retry_after_rotate_back_is_terminal_conflict() {
+        let _singleton = crate::test_support::SIGNED_POLICY_SINGLETON_LOCK
+            .lock()
+            .await;
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_signer_rotate_back").await;
+        let (org_id, user_id, app_id, app_name, paas_org_id, paas_user_id) =
+            seed_signer_rotation_fixture(&pool).await;
+        let (state, provider) = signer_rotation_publication_state(&pool, app_id).await;
+        let previous_subject =
+            "https://github.com/enclava/test/.github/workflows/build.yml@refs/heads/main";
+        let previous_issuer = "https://token.actions.githubusercontent.com";
+        let pending_subject =
+            "https://github.com/enclava/rotated/.github/workflows/build.yml@refs/heads/main";
+        let pending_issuer = "https://rotated-issuer.example.test";
+        let intervening_subject =
+            "https://github.com/enclava/intervening/.github/workflows/build.yml@refs/heads/main";
+        let intervening_issuer = "https://intervening-issuer.example.test";
+
+        let old_token = issue_test_signer_rotation_token(
+            &state,
+            user_id,
+            org_id,
+            app_id,
+            (previous_subject, previous_issuer),
+            (pending_subject, pending_issuer),
+        );
+        let old_idempotency_key = format!("signer-rotate-back-old-{}", Uuid::new_v4());
+        let old_headers = config_token_actor_headers(&old_idempotency_key, &paas_user_id);
+        let old_request = serde_json::json!({
+            "subject": pending_subject,
+            "issuer": pending_issuer,
+            "email_confirmation_token": old_token,
+        });
+
+        crate::kbs::TEST_KUBE_CLIENT
+            .scope(
+                crate::test_support::kbs_policy_kube_client(provider.clone()),
+                async {
+                    let deferred = rotate_paas_signer(
+                        internal_test_auth(),
+                        State(state.clone()),
+                        Path((paas_org_id.clone(), app_name.clone())),
+                        old_headers.clone(),
+                        Json(old_request.clone()),
+                    )
+                    .await
+                    .expect_err("committed-but-unconfirmed rotation must defer, not succeed");
+                    assert_eq!(deferred.0, StatusCode::CONFLICT);
+                    assert_eq!(
+                        deferred.1.0["cause"],
+                        crate::routes::apps::SIGNER_ROTATION_PUBLICATION_PENDING_CODE
+                    );
+
+                    // A real B -> C -> B: the pending identity matches again, but
+                    // the count proves a later authority intervened.
+                    expire_idempotency_lease(&pool, &old_idempotency_key).await;
+                    provider.lock().await.healthy = true;
+                    let intervening_key = format!("signer-rotate-back-new-{}", Uuid::new_v4());
+                    let intervening_headers =
+                        config_token_actor_headers(&intervening_key, &paas_user_id);
+                    let intervening_token = issue_test_signer_rotation_token(
+                        &state,
+                        user_id,
+                        org_id,
+                        app_id,
+                        (pending_subject, pending_issuer),
+                        (intervening_subject, intervening_issuer),
+                    );
+                    let (intervening_status, Json(intervening_published)) = rotate_paas_signer(
+                        internal_test_auth(),
+                        State(state.clone()),
+                        Path((paas_org_id.clone(), app_name.clone())),
+                        intervening_headers,
+                        Json(serde_json::json!({
+                            "subject": intervening_subject,
+                            "issuer": intervening_issuer,
+                            "email_confirmation_token": intervening_token,
+                        })),
+                    )
+                    .await
+                    .expect("the intervening rotation must publish");
+                    assert_eq!(intervening_status, StatusCode::OK);
+                    assert!(
+                        intervening_published.get("rotation_count").is_none()
+                            && intervening_published
+                                .get("signer_rotation_generation")
+                                .is_none()
+                    );
+                    let rotate_back_key = format!("signer-rotate-back-return-{}", Uuid::new_v4());
+                    let rotate_back_headers =
+                        config_token_actor_headers(&rotate_back_key, &paas_user_id);
+                    let rotate_back_token = issue_test_signer_rotation_token(
+                        &state,
+                        user_id,
+                        org_id,
+                        app_id,
+                        (intervening_subject, intervening_issuer),
+                        (pending_subject, pending_issuer),
+                    );
+                    let (rotate_back_status, Json(rotate_back_published)) = rotate_paas_signer(
+                        internal_test_auth(),
+                        State(state.clone()),
+                        Path((paas_org_id.clone(), app_name.clone())),
+                        rotate_back_headers,
+                        Json(serde_json::json!({
+                            "subject": pending_subject,
+                            "issuer": pending_issuer,
+                            "email_confirmation_token": rotate_back_token,
+                        })),
+                    )
+                    .await
+                    .expect("the rotate-back rotation must publish");
+                    assert_eq!(rotate_back_status, StatusCode::OK);
+                    assert!(
+                        rotate_back_published.get("rotation_count").is_none()
+                            && rotate_back_published
+                                .get("signer_rotation_generation")
+                                .is_none()
+                    );
+                    let live_subject: Option<String> = sqlx::query_scalar(
+                        "SELECT signer_identity_subject FROM apps WHERE id = $1",
+                    )
+                    .bind(app_id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("load app subject after the rotate-back");
+                    assert_eq!(live_subject.as_deref(), Some(pending_subject));
+                    assert_eq!(
+                        signer_rotation_receipts(&pool, app_id, org_id).await,
+                        (3, 3)
+                    );
+
+                    let superseded = rotate_paas_signer(
+                        internal_test_auth(),
+                        State(state.clone()),
+                        Path((paas_org_id.clone(), app_name.clone())),
+                        old_headers.clone(),
+                        Json(old_request.clone()),
+                    )
+                    .await
+                    .expect_err("the rotate-back superseded retry must report a terminal conflict");
+                    assert_eq!(superseded.0, StatusCode::CONFLICT);
+                    assert_eq!(
+                        superseded.1.0["code"],
+                        crate::routes::apps::SIGNER_ROTATION_SUPERSEDED_CODE
+                    );
+                    assert_eq!(superseded.1.0["idempotency_disposition"], "completed");
+                    assert_eq!(superseded.1.0["retryable"], false);
+                    assert!(superseded.1.0.get("committed_response").is_none());
+
+                    // The terminal receipt replays stably without new commits.
+                    let replayed = rotate_paas_signer(
+                        internal_test_auth(),
+                        State(state.clone()),
+                        Path((paas_org_id.clone(), app_name.clone())),
+                        old_headers.clone(),
+                        Json(old_request.clone()),
+                    )
+                    .await
+                    .expect("the terminal receipt must replay as the same conflict");
+                    assert_eq!((replayed.0, replayed.1.0), (superseded.0, superseded.1.0));
+                    assert_eq!(
+                        signer_rotation_receipts(&pool, app_id, org_id).await,
+                        (3, 3)
+                    );
+                },
+            )
+            .await;
+
+        crate::test_support::drop_isolated_database("cap_signer_rotate_back", pool).await;
+    }
+
+    #[tokio::test]
+    async fn rotate_signer_retry_rejects_rotation_committed_during_publication() {
+        let _singleton = crate::test_support::SIGNED_POLICY_SINGLETON_LOCK
+            .lock()
+            .await;
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_signer_during_publication").await;
+        let (org_id, user_id, app_id, app_name, paas_org_id, paas_user_id) =
+            seed_signer_rotation_fixture(&pool).await;
+        let (state, provider) = signer_rotation_publication_state(&pool, app_id).await;
+        let previous_subject =
+            "https://github.com/enclava/test/.github/workflows/build.yml@refs/heads/main";
+        let previous_issuer = "https://token.actions.githubusercontent.com";
+        let pending_subject =
+            "https://github.com/enclava/rotated/.github/workflows/build.yml@refs/heads/main";
+        let pending_issuer = "https://rotated-issuer.example.test";
+        let intervening_subject =
+            "https://github.com/enclava/intervening/.github/workflows/build.yml@refs/heads/main";
+        let intervening_issuer = "https://intervening-issuer.example.test";
+
+        let old_token = issue_test_signer_rotation_token(
+            &state,
+            user_id,
+            org_id,
+            app_id,
+            (previous_subject, previous_issuer),
+            (pending_subject, pending_issuer),
+        );
+        let old_idempotency_key = format!("signer-during-publication-{}", Uuid::new_v4());
+        let old_headers = config_token_actor_headers(&old_idempotency_key, &paas_user_id);
+        let old_request = serde_json::json!({
+            "subject": pending_subject,
+            "issuer": pending_issuer,
+            "email_confirmation_token": old_token,
+        });
+
+        crate::kbs::TEST_KUBE_CLIENT
+            .scope(
+                crate::test_support::kbs_policy_kube_client(provider.clone()),
+                async {
+                    let deferred = rotate_paas_signer(
+                        internal_test_auth(),
+                        State(state.clone()),
+                        Path((paas_org_id.clone(), app_name.clone())),
+                        old_headers.clone(),
+                        Json(old_request.clone()),
+                    )
+                    .await
+                    .expect_err("committed-but-unconfirmed rotation must defer, not succeed");
+                    assert_eq!(deferred.0, StatusCode::CONFLICT);
+                    assert_eq!(
+                        deferred.1.0["cause"],
+                        crate::routes::apps::SIGNER_ROTATION_PUBLICATION_PENDING_CODE
+                    );
+
+                    expire_idempotency_lease(&pool, &old_idempotency_key).await;
+                    let (reached_tx, reached_rx) = tokio::sync::oneshot::channel::<()>();
+                    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+                    {
+                        let mut gated = provider.lock().await;
+                        gated.healthy = true;
+                        gated.configmap_put_hold = Some((reached_tx, release_rx));
+                    }
+
+                    // Both futures run on this task: the test kube client is
+                    // task-local, and the retry must park inside its publication
+                    // while a later writer changes authority underneath it. The
+                    // interleaved writer is raw SQL with no token ledger or
+                    // audit entry, like a pre-generation replica: only the
+                    // trigger-backed generation distinguishes its rotate-back
+                    // from the parked retry's own commit.
+                    let retry_state = state.clone();
+                    let retry_paas_org_id = paas_org_id.clone();
+                    let retry_app_name = app_name.clone();
+                    let retry_headers = old_headers.clone();
+                    let retry_request = old_request.clone();
+                    let interleave_pool = pool.clone();
+                    let (retry_result, ()) = tokio::join!(
+                        async move {
+                            rotate_paas_signer(
+                                internal_test_auth(),
+                                State(retry_state),
+                                Path((retry_paas_org_id, retry_app_name)),
+                                retry_headers,
+                                Json(retry_request),
+                            )
+                            .await
+                        },
+                        async move {
+                            reached_rx
+                                .await
+                                .expect("publication parks at the configmap write");
+                            for (subject, issuer) in [
+                                (intervening_subject, intervening_issuer),
+                                (pending_subject, pending_issuer),
+                            ] {
+                                sqlx::query(
+                                    "UPDATE apps
+                                        SET signer_identity_subject = $2,
+                                            signer_identity_issuer = $3
+                                      WHERE id = $1",
+                                )
+                                .bind(app_id)
+                                .bind(subject)
+                                .bind(issuer)
+                                .execute(&interleave_pool)
+                                .await
+                                .expect("write the interleaved identity directly");
+                            }
+                            release_tx.send(()).expect("release the parked publication");
+                        }
+                    );
+                    let superseded = retry_result
+                        .expect_err("a rotation committed during publication must not pass");
+                    assert_eq!(superseded.0, StatusCode::CONFLICT);
+                    assert_eq!(
+                        superseded.1.0["code"],
+                        crate::routes::apps::SIGNER_ROTATION_SUPERSEDED_CODE
+                    );
+                    assert_eq!(superseded.1.0["idempotency_disposition"], "completed");
+                    assert_eq!(superseded.1.0["retryable"], false);
+                    assert!(superseded.1.0.get("committed_response").is_none());
+
+                    assert_eq!(
+                        signer_rotation_receipts(&pool, app_id, org_id).await,
+                        (1, 1)
+                    );
+                },
+            )
+            .await;
+
+        crate::test_support::drop_isolated_database("cap_signer_during_publication", pool).await;
+    }
+
+    /// A checkpoint written before the generation field existed (or otherwise
+    /// unverifiable: wrong type, negative, or contradictory metadata) must
+    /// terminalize to the bounded new-key disposition on the completed
+    /// channel — not 500 forever: the publication-checkpoint reclaim
+    /// carve-out would otherwise re-run the handler after every lease expiry
+    /// and never complete the row. No generation is ever invented for it.
+    #[tokio::test]
+    async fn signer_checkpoint_without_generation_terminalizes_to_new_key_disposition() {
+        let _singleton = crate::test_support::SIGNED_POLICY_SINGLETON_LOCK
+            .lock()
+            .await;
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_signer_stale_checkpoint").await;
+        let (org_id, user_id, app_id, app_name, paas_org_id, paas_user_id) =
+            seed_signer_rotation_fixture(&pool).await;
+        let (state, provider) = signer_rotation_publication_state(&pool, app_id).await;
+        let mut current_subject =
+            "https://github.com/enclava/test/.github/workflows/build.yml@refs/heads/main"
+                .to_string();
+        let mut current_issuer = "https://token.actions.githubusercontent.com".to_string();
+
+        // Every scenario first defers a real committed rotation, then rewrites
+        // its checkpoint into an unverifiable pre-generation shape.
+        let scenarios: &[(&str, &str)] = &[
+            (
+                "missing",
+                "UPDATE cap_internal_idempotency
+                    SET response_body = response_body - 'signer_rotation_generation'
+                  WHERE idempotency_key = $1",
+            ),
+            (
+                "wrong-type",
+                "UPDATE cap_internal_idempotency
+                    SET response_body = jsonb_set(
+                        response_body,
+                        '{signer_rotation_generation}',
+                        '\"unverifiable\"'::jsonb
+                    )
+                  WHERE idempotency_key = $1",
+            ),
+            (
+                "negative",
+                "UPDATE cap_internal_idempotency
+                    SET response_body = jsonb_set(
+                        response_body,
+                        '{signer_rotation_generation}',
+                        '-1'::jsonb
+                    )
+                  WHERE idempotency_key = $1",
+            ),
+            (
+                "contradictory",
+                "UPDATE cap_internal_idempotency
+                    SET response_body = jsonb_set(
+                        response_body,
+                        '{rotation_count}',
+                        '1'::jsonb
+                    )
+                  WHERE idempotency_key = $1",
+            ),
+            (
+                "embedded-private-metadata",
+                "UPDATE cap_internal_idempotency
+                    SET response_body = jsonb_set(
+                        response_body,
+                        '{committed_response,rotation_count}',
+                        '1'::jsonb
+                    )
+                  WHERE idempotency_key = $1",
+            ),
+        ];
+
+        crate::kbs::TEST_KUBE_CLIENT
+            .scope(
+                crate::test_support::kbs_policy_kube_client(provider.clone()),
+                async {
+                    for (label, rewrite) in scenarios {
+                        let next_subject = format!(
+                            "https://github.com/enclava/{label}/.github/workflows/build.yml@refs/heads/main"
+                        );
+                        let next_issuer = format!("https://{label}-issuer.example.test");
+                        let idempotency_key =
+                            format!("signer-stale-checkpoint-{label}-{}", Uuid::new_v4());
+                        let headers =
+                            config_token_actor_headers(&idempotency_key, &paas_user_id);
+                        let request = serde_json::json!({
+                            "subject": next_subject.clone(),
+                            "issuer": next_issuer.clone(),
+                            "email_confirmation_token": issue_test_signer_rotation_token(
+                                &state,
+                                user_id,
+                                org_id,
+                                app_id,
+                                (&current_subject, &current_issuer),
+                                (&next_subject, &next_issuer),
+                            ),
+                        });
+                        let deferred = rotate_paas_signer(
+                            internal_test_auth(),
+                            State(state.clone()),
+                            Path((paas_org_id.clone(), app_name.clone())),
+                            headers.clone(),
+                            Json(request.clone()),
+                        )
+                        .await
+                        .expect_err("committed-but-unconfirmed rotation must defer");
+                        assert_eq!(deferred.0, StatusCode::CONFLICT);
+                        assert_eq!(
+                            deferred.1.0["cause"],
+                            crate::routes::apps::SIGNER_ROTATION_PUBLICATION_PENDING_CODE
+                        );
+
+                        rewrite_idempotency_fixture(&pool, &idempotency_key, rewrite).await;
+                        expire_idempotency_lease(&pool, &idempotency_key).await;
+                        let terminal = rotate_paas_signer(
+                            internal_test_auth(),
+                            State(state.clone()),
+                            Path((paas_org_id.clone(), app_name.clone())),
+                            headers.clone(),
+                            Json(request.clone()),
+                        )
+                        .await
+                        .expect_err("an unverifiable checkpoint must not report success");
+                        assert_eq!(terminal.0, StatusCode::CONFLICT);
+                        assert_eq!(terminal.1.0["error"], "idempotency_recovery_required");
+                        assert_eq!(terminal.1.0["retryable"], false);
+                        assert_eq!(
+                            terminal.1.0["disposition"],
+                            "reconcile_then_retry_with_new_key"
+                        );
+                        assert_eq!(terminal.1.0["idempotency_disposition"], "completed");
+
+                        // The terminal disposition is persisted on the
+                        // completed channel, so the row is finished and
+                        // replays stably instead of re-running after every
+                        // lease expiry.
+                        let completed: Option<bool> = sqlx::query_scalar(
+                            "SELECT completed_at IS NOT NULL
+                               FROM cap_internal_idempotency WHERE idempotency_key = $1",
+                        )
+                        .bind(&idempotency_key)
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                        assert_eq!(completed, Some(true));
+
+                        let replayed = rotate_paas_signer(
+                            internal_test_auth(),
+                            State(state.clone()),
+                            Path((paas_org_id.clone(), app_name.clone())),
+                            headers.clone(),
+                            Json(request.clone()),
+                        )
+                        .await
+                        .expect("the terminal receipt must replay as the same conflict");
+                        assert_eq!(replayed.0, StatusCode::CONFLICT);
+                        assert_eq!(replayed.1.0, terminal.1.0);
+
+                        current_subject = next_subject;
+                        current_issuer = next_issuer;
+                    }
+                    // Each scenario committed exactly one real rotation and
+                    // consumed exactly one single-use token; no retry re-ran
+                    // the mutation.
+                    assert_eq!(
+                        signer_rotation_receipts(&pool, app_id, org_id).await,
+                        (scenarios.len() as i64, scenarios.len() as i64)
+                    );
+                },
+            )
+            .await;
+
+        crate::test_support::drop_isolated_database("cap_signer_stale_checkpoint", pool).await;
+    }
+
+    #[tokio::test]
+    async fn keyring_unrelated_five_xx_stays_fail_closed() {
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_keyring_pending_unrelated").await;
+        let current_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let replacement_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let (org_id, user_id, paas_org_id, paas_user_id) =
+            seed_keyring_pending_org(&pool, &[current_key.clone(), replacement_key.clone()]).await;
+        seed_owner_keyring_v1(&pool, org_id, user_id, &current_key).await;
+        let mut state = idempotency_test_state(pool.clone());
+        state.management_mode = crate::state::CapManagementMode::PaasManaged;
+        let idempotency_key = format!("keyring-pending-unrelated-{}", Uuid::new_v4());
+        let headers = config_token_actor_headers(&idempotency_key, &paas_user_id);
+        let rotation = signed_rotation_body(org_id, user_id, &current_key, &replacement_key);
+        let call = |state: AppState, headers: HeaderMap| {
+            rotate_paas_keyring_owner(
+                internal_test_auth(),
+                State(state),
+                Path(paas_org_id.clone()),
+                headers,
+                Json(rotation.clone()),
+            )
+        };
+
+        // No signing service is configured: the handler fails with an
+        // unrelated 503 before anything commits, and the wrapper must keep
+        // the generic fail-closed disposition instead of deferring.
+        let terminal = call(state.clone(), headers.clone())
+            .await
+            .expect_err("an unrelated 503 must fail closed, not defer");
+        assert_eq!(terminal.0, StatusCode::CONFLICT);
+        assert_eq!(terminal.1.0["error"], "idempotency_recovery_required");
+        assert_eq!(terminal.1.0["idempotency_disposition"], "completed");
+        assert_eq!(terminal.1.0["retryable"], false);
+
+        // The fail-closed receipt is terminal and replays without
+        // re-executing the handler.
+        let (replayed_status, Json(replayed)) = call(state.clone(), headers.clone())
+            .await
+            .expect("the fail-closed receipt is terminal and replays");
+        assert_eq!((replayed_status, replayed), (terminal.0, terminal.1.0));
+
+        let versions: Vec<i64> = sqlx::query_scalar(
+            "SELECT version FROM org_keyrings WHERE org_id = $1 ORDER BY version",
+        )
+        .bind(org_id)
+        .fetch_all(&pool)
+        .await
+        .expect("read keyring versions after unrelated failure");
+        assert_eq!(versions, vec![1]);
+        let rotate_audits: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM audit_log
+              WHERE org_id = $1 AND action = 'org.keyring.owner.rotate'",
+        )
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count rotation audits after unrelated failure");
+        assert_eq!(rotate_audits, 0);
+
+        crate::test_support::drop_isolated_database("cap_keyring_pending_unrelated", pool).await;
     }
 }
 

@@ -197,7 +197,7 @@ pub struct BootstrapSigningServiceResponse {
     pub owner_pubkey_fingerprint: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct RotateOrgOwnerRequest {
     pub version: i64,
     pub keyring_payload: serde_json::Value,
@@ -337,6 +337,38 @@ fn bad_request(message: &str) -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
+/// keyring payloads are persisted as UTF-8 JSON that PostgreSQL must be able
+/// to re-parse as jsonb (migration 0058's shape CHECK, and the candidate
+/// selector's cast).  serde_json is stricter than jsonb in exactly one
+/// practical way: it accepts `\u0000` escapes that jsonb cannot represent.
+/// The writers persist the client-supplied payload verbatim while
+/// `SignedOrgKeyring` ignores unknown fields, so an extra field carrying a
+/// NUL would pass signature verification and then fail the INSERT with a
+/// database error (500).  Reject it as a 400 up front.  (A NUL cannot appear
+/// in a signature-verified known field: pubkeys are hex, ids/roles/timestamps
+/// are typed, so this scan only ever fires on client-supplied extras.)
+fn reject_jsonb_unrepresentable_payload(
+    payload: &serde_json::Value,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    fn contains_nul(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::String(s) => s.contains('\u{0000}'),
+            serde_json::Value::Array(items) => items.iter().any(contains_nul),
+            serde_json::Value::Object(map) => {
+                map.keys().any(|key| key.contains('\u{0000}')) || map.values().any(contains_nul)
+            }
+            _ => false,
+        }
+    }
+    if contains_nul(payload) {
+        return Err(bad_request(
+            "keyring_payload contains a \\u0000 escape, which PostgreSQL jsonb \
+             cannot represent",
+        ));
+    }
+    Ok(())
+}
+
 fn decode_hex_len(
     name: &'static str,
     value: &str,
@@ -392,6 +424,28 @@ async fn active_membership(
     Ok((org_id, role))
 }
 
+/// The keyring is already committed, so publication failure must remain
+/// retryable without repeating the mutation.
+async fn confirm_keyring_kbs_publication(
+    state: &AppState,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if let Err(error) = crate::kbs::confirm_keyring_kbs_publication(state).await {
+        tracing::warn!(
+            %error,
+            error_code = "keyring_policy_reconciliation_pending",
+            "keyring committed; KBS policy reconciliation pending"
+        );
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "keyring committed; KBS policy reconciliation pending",
+                "code": "keyring_policy_reconciliation_pending",
+            })),
+        ));
+    }
+    Ok(())
+}
+
 pub async fn put_keyring(
     auth: AuthContext,
     State(state): State<AppState>,
@@ -406,6 +460,7 @@ pub async fn put_keyring(
     if body.version < 1 {
         return Err(bad_request("version must be positive"));
     }
+    reject_jsonb_unrepresentable_payload(&body.keyring_payload)?;
     let signature = decode_hex_len("signature", &body.signature, 64)?;
     let signing_pubkey = decode_hex_len("signing_pubkey", &body.signing_pubkey, 32)?;
     let keyring_org_id = body
@@ -473,20 +528,9 @@ pub async fn put_keyring(
         scopes::lock_and_read_active_membership_role_in_tx(&mut tx, org_id, auth.user_id).await?;
     scopes::require_owner_role(current_role)?;
 
-    // Re-read key registration and latest keyring only after acquiring the
-    // shared signing-authority lane. Rotation and signed acceptance therefore
+    // Re-read the latest keyring only after acquiring the shared
+    // signing-authority lane. Rotation and signed acceptance therefore
     // linearize on one exact owner authority generation.
-    let signing_key_id: Uuid = sqlx::query_scalar(
-        "SELECT id FROM user_signing_keys
-         WHERE user_id = $1 AND pubkey = $2 AND revoked_at IS NULL",
-    )
-    .bind(auth.user_id)
-    .bind(&signing_pubkey)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(|_| db_error())?
-    .ok_or_else(|| bad_request("signing_pubkey is not registered for this user"))?;
-
     type LatestKeyringAuthority = (i64, Vec<u8>, Vec<u8>, Vec<u8>);
     let latest: Option<LatestKeyringAuthority> = sqlx::query_as(
         "SELECT ok.version, ok.keyring_payload, ok.signature, usk.pubkey
@@ -502,6 +546,7 @@ pub async fn put_keyring(
     .map_err(|_| db_error())?;
 
     let mut insert_new_version = true;
+    let mut replayed_envelope: Option<(serde_json::Value, String, String)> = None;
     if let Some((latest_version, latest_payload, latest_signature, latest_signing_pubkey)) = latest
     {
         if body.version < latest_version {
@@ -510,20 +555,40 @@ pub async fn put_keyring(
                 Json(serde_json::json!({"error": "keyring version is stale"})),
             ));
         }
-        if body.version == latest_version
-            && (latest_payload != keyring_payload_bytes
-                || latest_signature != signature
-                || latest_signing_pubkey != signing_pubkey)
-        {
-            return Err((
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": "keyring version already exists with different content"
-                })),
-            ));
-        }
         if body.version == latest_version {
+            // Legacy payloads can differ in unsigned fields while signing
+            // identical canonical content.
+            let (latest_payload, latest_keyring) =
+                serde_json::from_slice::<serde_json::Value>(&latest_payload)
+                    .and_then(|payload| {
+                        let keyring = SignedOrgKeyring::deserialize(&payload)?;
+                        Ok((payload, keyring))
+                    })
+                    .map_err(|_| {
+                        (
+                            StatusCode::CONFLICT,
+                            Json(serde_json::json!({
+                                "error": "keyring version already exists with different content"
+                            })),
+                        )
+                    })?;
+            if latest_signature != signature
+                || latest_signing_pubkey != signing_pubkey
+                || canonical_keyring_bytes(&latest_keyring) != canonical_bytes
+            {
+                return Err((
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": "keyring version already exists with different content"
+                    })),
+                ));
+            }
             insert_new_version = false;
+            replayed_envelope = Some((
+                latest_payload,
+                hex::encode(&latest_signature),
+                hex::encode(&latest_signing_pubkey),
+            ));
         }
         let next_version = latest_version
             .checked_add(1)
@@ -554,6 +619,17 @@ pub async fn put_keyring(
     }
 
     if insert_new_version {
+        let signing_key_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM user_signing_keys
+             WHERE user_id = $1 AND pubkey = $2 AND revoked_at IS NULL",
+        )
+        .bind(auth.user_id)
+        .bind(&signing_pubkey)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| db_error())?
+        .ok_or_else(|| bad_request("signing_pubkey is not registered for this user"))?;
+
         sqlx::query(
             "INSERT INTO org_keyrings
                  (org_id, version, keyring_payload, signature, signing_key_id)
@@ -581,19 +657,29 @@ pub async fn put_keyring(
         .execute(&mut *tx)
         .await
         .map_err(|_| db_error())?;
+        // A new keyring generation can revoke the signer of retained signed
+        // policy artifacts; the owed generation bump is deferred to
+        // migration 0058's INSERT trigger (durable selector debt) and
+        // consumed only after the filtered policy body is published, never
+        // bumped directly here.
     }
 
     tx.commit().await.map_err(|_| db_error())?;
+    confirm_keyring_kbs_publication(&state).await?;
 
     let fingerprint = hex::encode(Sha256::digest(&canonical_bytes));
+    let (keyring_payload, signature, signing_pubkey) = match replayed_envelope {
+        Some(envelope) => envelope,
+        None => (body.keyring_payload, body.signature, body.signing_pubkey),
+    };
     Ok((
         StatusCode::OK,
         Json(OrgKeyringResponse {
             org_id,
             version: body.version,
-            keyring_payload: body.keyring_payload,
-            signature: body.signature,
-            signing_pubkey: body.signing_pubkey,
+            keyring_payload,
+            signature,
+            signing_pubkey,
             fingerprint,
         }),
     ))
@@ -848,6 +934,38 @@ pub async fn bootstrap_signing_service_owner(
     }))
 }
 
+async fn ready_service_owner(
+    state: &AppState,
+    org_id: Uuid,
+) -> Result<
+    (
+        &crate::signing_service::SigningServiceClient,
+        Option<Vec<u8>>,
+    ),
+    (StatusCode, Json<serde_json::Value>),
+> {
+    let signing_service = state.signing_service.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({"error": "platform signing service is not configured"})),
+    ))?;
+    let owner_status = signing_service
+        .owner_status(org_id)
+        .await
+        .map_err(crate::routes::deployments::signing_error_response)?;
+    let service_owner = owner_status
+        .owner_pubkey_hex
+        .as_deref()
+        .and_then(|raw| hex::decode(raw).ok());
+    if owner_status.org_id != org_id || owner_status.state != "ready" {
+        return Err(crate::routes::deployments::signing_error_response(
+            crate::signing_service::SigningServiceError::AuthorityStatus(
+                "owner status does not match requested authority".to_string(),
+            ),
+        ));
+    }
+    Ok((signing_service, service_owner))
+}
+
 pub async fn rotate_org_owner(
     auth: AuthContext,
     State(state): State<AppState>,
@@ -864,6 +982,7 @@ pub async fn rotate_org_owner(
     if body.version < 2 {
         return Err(bad_request("rotated keyring version must be at least two"));
     }
+    reject_jsonb_unrepresentable_payload(&body.keyring_payload)?;
 
     let current_owner: [u8; 32] =
         decode_hex_len("current_signing_pubkey", &body.current_signing_pubkey, 32)?
@@ -959,7 +1078,10 @@ pub async fn rotate_org_owner(
                 })),
             ));
         }
-        let previous: (Vec<u8>, Vec<u8>) = sqlx::query_as(
+        // Exact replay of an already-committed rotation; the predecessor row
+        // may legitimately be gone (pruned by migration 0058's repair pass),
+        // so the committed authority alone must confirm it.
+        let previous: Option<(Vec<u8>, Vec<u8>)> = sqlx::query_as(
             "SELECT ok.keyring_payload, usk.pubkey
                    FROM org_keyrings ok
                    JOIN user_signing_keys usk ON usk.id = ok.signing_key_id
@@ -969,8 +1091,31 @@ pub async fn rotate_org_owner(
         .bind(body.version - 1)
         .fetch_optional(&mut *tx)
         .await
-        .map_err(|_| db_error())?
-        .ok_or_else(|| bad_request("previous keyring authority is unavailable"))?;
+        .map_err(|_| db_error())?;
+        let Some(previous) = previous else {
+            // The pruned predecessor was already validated at commit time;
+            // confirm replay against the live signing-service authority
+            // without rotating again.
+            let (_, service_owner) = ready_service_owner(&state, org_id).await?;
+            if service_owner.as_deref() != Some(replacement_owner.as_slice()) {
+                return Err(crate::routes::deployments::signing_error_response(
+                    crate::signing_service::SigningServiceError::AuthorityStatus(
+                        "signing service owner does not match the requested replacement owner"
+                            .to_string(),
+                    ),
+                ));
+            }
+            // The replay is read-only: release the org signing-authority
+            // lane before claiming the global KBS fence for publication.
+            tx.rollback().await.map_err(|_| db_error())?;
+            confirm_keyring_kbs_publication(&state).await?;
+            return Ok(Json(RotateOrgOwnerResponse {
+                org_id,
+                state: "ready",
+                keyring_version: body.version,
+                owner_fingerprint: hex::encode(Sha256::digest(replacement_owner)),
+            }));
+        };
         (previous.0, previous.1, false)
     } else if body.version == latest.0 + 1 {
         (latest.1, latest.3, true)
@@ -1016,26 +1161,7 @@ pub async fn rotate_org_owner(
     .await
     .map_err(|_| db_error())?
     .ok_or_else(|| bad_request("replacement owner key is not registered for this user"))?;
-
-    let signing_service = state.signing_service.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(serde_json::json!({"error": "platform signing service is not configured"})),
-    ))?;
-    let owner_status = signing_service
-        .owner_status(org_id)
-        .await
-        .map_err(crate::routes::deployments::signing_error_response)?;
-    let service_owner = owner_status
-        .owner_pubkey_hex
-        .as_deref()
-        .and_then(|raw| hex::decode(raw).ok());
-    if owner_status.org_id != org_id || owner_status.state != "ready" {
-        return Err(crate::routes::deployments::signing_error_response(
-            crate::signing_service::SigningServiceError::AuthorityStatus(
-                "owner status does not match requested authority".to_string(),
-            ),
-        ));
-    }
+    let (signing_service, service_owner) = ready_service_owner(&state, org_id).await?;
     if service_owner.as_deref() == Some(current_owner.as_slice()) {
         let rotated = signing_service
             .rotate_owner(&crate::signing_service::RotateOwnerRequest {
@@ -1091,8 +1217,12 @@ pub async fn rotate_org_owner(
         .execute(&mut *tx)
         .await
         .map_err(|_| db_error())?;
+        // As with put_keyring, the owed selector bump is deferred to
+        // migration 0058's INSERT trigger and published only after the
+        // filtered policy body is live, never bumped directly here.
     }
     tx.commit().await.map_err(|_| db_error())?;
+    confirm_keyring_kbs_publication(&state).await?;
 
     Ok(Json(RotateOrgOwnerResponse {
         org_id,
@@ -1352,6 +1482,10 @@ pub async fn remove_member(
 mod tests {
     use super::*;
     use crate::auth::api_key::ValidatedApiKey;
+    use crate::test_support::{
+        KbsPolicyProvider, drop_isolated_database, isolated_database_test_pool,
+        kbs_policy_kube_client,
+    };
     use chrono::{TimeZone, Utc};
     use ed25519_dalek::{Signer, SigningKey};
     use rand::rngs::OsRng;
@@ -1607,6 +1741,1204 @@ mod tests {
         assert_eq!(list_orgs_api_key_org_filter(&auth), Some(org_id));
     }
 
+    async fn keyring_enqueue_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        crate::test_support::SIGNED_POLICY_SINGLETON_LOCK
+            .lock()
+            .await
+    }
+
+    fn test_kbs_policy_config() -> crate::kbs::KbsPolicyConfig {
+        crate::kbs::KbsPolicyConfig {
+            namespace: "kbs-test".to_string(),
+            configmap_name: "resource-policy".to_string(),
+            policy_key: "policy.rego".to_string(),
+            deployment_name: "trustee".to_string(),
+            required: true,
+            signed_policy_retention: 6,
+            signed_policy_max_bytes: 900 * 1024,
+        }
+    }
+
+    #[tokio::test]
+    async fn put_keyring_reports_success_only_after_kbs_publication() {
+        let _singleton = keyring_enqueue_guard().await;
+        let (_db_cleanup, pool) = isolated_database_test_pool("cap130_keyring_enqueue_put").await;
+        let org_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let suffix = org_id.simple().to_string();
+        let org_name = format!("keyring-enqueue-{suffix}");
+        crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+            .await
+            .expect("insert keyring enqueue org");
+        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Keyring Enqueuer')")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("insert keyring enqueue user");
+        sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+            .bind(user_id)
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("insert keyring enqueue membership");
+        let key = SigningKey::generate(&mut OsRng);
+        sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2)")
+            .bind(user_id)
+            .bind(key.verifying_key().to_bytes().to_vec())
+            .execute(&pool)
+            .await
+            .expect("insert keyring enqueue signing key");
+
+        // Active signed mode, seeded at a nonzero desired generation: the
+        // keyring insert must owe exactly one selector bump through
+        // migration 0058's trigger (never a direct desired_generation bump),
+        // and the route must not report success until the owed generation is
+        // live in the KBS.
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 5,
+                    selector_bumps_owed = 0,
+                    configmap_generation = 0,
+                    applied_generation = 0,
+                    configmap_policy_sha256 = NULL,
+                    applied_policy_sha256 = NULL,
+                    configmap_resource_version = NULL
+              WHERE singleton",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed signed-policy generation");
+
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        let auth = AuthContext {
+            user_id,
+            org_id,
+            org_name: org_name.clone(),
+            role: Role::Owner,
+            api_key: None,
+            management_origin: crate::auth::middleware::ManagementOrigin::Public,
+        };
+
+        // Active signed mode without KBS configuration fails closed; the
+        // committed mutation stays durable exactly once.
+        let misconfigured = put_keyring(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(signed_keyring_request(org_id, user_id, &key, 1, 1)),
+        )
+        .await
+        .expect_err("active signed mode without KBS configuration must fail closed");
+        assert_eq!(misconfigured.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            misconfigured.1.0["error"],
+            "keyring committed; KBS policy reconciliation pending"
+        );
+        assert_eq!(
+            misconfigured.1.0["code"],
+            "keyring_policy_reconciliation_pending"
+        );
+
+        // Configure the KBS against a failing provider: publication cannot
+        // be confirmed, so the route still must not report success.
+        state.kbs_policy = Some(test_kbs_policy_config());
+        let provider = std::sync::Arc::new(tokio::sync::Mutex::new(KbsPolicyProvider::new(false)));
+        crate::kbs::TEST_KUBE_CLIENT.scope(kbs_policy_kube_client(provider.clone()), async {
+        let blocked = put_keyring(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(signed_keyring_request(org_id, user_id, &key, 1, 1)),
+        )
+        .await
+        .expect_err("blocked publication must not report success");
+        assert_eq!(blocked.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            blocked.1.0["code"],
+            "keyring_policy_reconciliation_pending"
+        );
+        let authority: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT
+                 (SELECT count(*) FROM org_keyrings WHERE org_id = $1),
+                 (SELECT count(*) FROM audit_log
+                   WHERE org_id = $1 AND action = 'org.keyring.put'),
+                 (SELECT desired_generation FROM kbs_signed_policy_reconciliation
+                   WHERE singleton),
+                 (SELECT selector_bumps_owed FROM kbs_signed_policy_reconciliation
+                   WHERE singleton)",
+        )
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read durable keyring authority after blocked publication");
+        assert_eq!(
+            authority, (1, 1, 5, 1),
+            "the committed keyring, audit row, and owed selector bump must remain exactly once"
+        );
+
+        // Healthy provider: exact replay retries publication without another
+        // keyring version or audit row, and succeeds only once the filtered
+        // policy set is live.
+        {
+            let mut provider = provider.lock().await;
+            provider.healthy = true;
+        }
+        // Failed provider calls retain their fence until its reclaim deadline.
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET locked_until = clock_timestamp() - interval '2 seconds',
+                    reclaim_after = clock_timestamp() - interval '1 second'
+              WHERE resource_scope = 'kbs_policy' AND resource_key = 'global'",
+        )
+        .execute(&pool)
+        .await
+        .expect("expire failed publication fence");
+        let published = put_keyring(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(signed_keyring_request(org_id, user_id, &key, 1, 1)),
+        )
+        .await
+        .expect("replay must succeed once publication is confirmed");
+        assert_eq!(published.1.0.version, 1);
+        {
+            let provider = provider.lock().await;
+            assert_eq!(
+                provider.published_generation(),
+                Some(6),
+                "the owed generation must be live before success is reported"
+            );
+            assert_eq!(provider.configmap_replaces, 1);
+        }
+        let reconciled: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT
+                 (SELECT count(*) FROM org_keyrings WHERE org_id = $1),
+                 (SELECT count(*) FROM audit_log
+                   WHERE org_id = $1 AND action = 'org.keyring.put'),
+                 (SELECT desired_generation FROM kbs_signed_policy_reconciliation
+                   WHERE singleton),
+                 (SELECT selector_bumps_owed FROM kbs_signed_policy_reconciliation
+                   WHERE singleton)",
+        )
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read durable keyring authority after publication");
+        assert_eq!(
+            reconciled, (1, 1, 6, 0),
+            "the debt must be consumed exactly once, never re-owed by replay"
+        );
+        let applied: i64 = sqlx::query_scalar(
+            "SELECT applied_generation FROM kbs_signed_policy_reconciliation
+              WHERE singleton",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read applied generation after publication");
+        assert_eq!(applied, 6, "publication must be observed before success");
+
+        // Once current, replay stays idempotent: no re-publication churn.
+        let replayed = put_keyring(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(signed_keyring_request(org_id, user_id, &key, 1, 1)),
+        )
+        .await
+        .expect("idempotent replay succeeds while publication is current");
+        assert_eq!(replayed.1.0.version, 1);
+        {
+            let provider = provider.lock().await;
+            assert_eq!(
+                provider.configmap_replaces, 1,
+                "a current publication must not be replaced again"
+            );
+        }
+
+        }).await;
+        sqlx::query("DELETE FROM audit_log WHERE org_id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete keyring enqueue audit rows");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete keyring enqueue org");
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("delete keyring enqueue user");
+        drop_isolated_database("cap130_keyring_enqueue_put", pool).await;
+    }
+
+    async fn keyring_put_authority(pool: &sqlx::PgPool, org_id: Uuid) -> (i64, i64, i64, i64) {
+        sqlx::query_as(
+            "SELECT
+                 (SELECT count(*) FROM org_keyrings WHERE org_id = $1),
+                 (SELECT count(*) FROM audit_log
+                   WHERE org_id = $1 AND action = 'org.keyring.put'),
+                 (SELECT desired_generation FROM kbs_signed_policy_reconciliation
+                   WHERE singleton),
+                 (SELECT selector_bumps_owed FROM kbs_signed_policy_reconciliation
+                   WHERE singleton)",
+        )
+        .bind(org_id)
+        .fetch_one(pool)
+        .await
+        .expect("read keyring put authority counters")
+    }
+
+    #[tokio::test]
+    async fn put_keyring_second_owner_replays_current_envelope_without_owning_signer_registration()
+    {
+        let _singleton = keyring_enqueue_guard().await;
+        let (_db_cleanup, pool) = isolated_database_test_pool("cap178_second_owner_replay").await;
+        let org_id = Uuid::new_v4();
+        let alice_id = Uuid::new_v4();
+        let bob_id = Uuid::new_v4();
+        let suffix = org_id.simple().to_string();
+        let org_name = format!("keyring-second-owner-{suffix}");
+        crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+            .await
+            .expect("insert second-owner replay org");
+        for (user_id, display_name) in [(alice_id, "Alice"), (bob_id, "Bob")] {
+            sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, $2)")
+                .bind(user_id)
+                .bind(display_name)
+                .execute(&pool)
+                .await
+                .expect("insert second-owner replay user");
+            sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+                .bind(user_id)
+                .bind(org_id)
+                .execute(&pool)
+                .await
+                .expect("insert second-owner replay membership");
+        }
+        let alice_key = SigningKey::generate(&mut OsRng);
+        sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2)")
+            .bind(alice_id)
+            .bind(alice_key.verifying_key().to_bytes().to_vec())
+            .execute(&pool)
+            .await
+            .expect("insert Alice's signing key registration");
+
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 5,
+                    selector_bumps_owed = 0,
+                    configmap_generation = 0,
+                    applied_generation = 0,
+                    configmap_policy_sha256 = NULL,
+                    applied_policy_sha256 = NULL,
+                    configmap_resource_version = NULL
+              WHERE singleton",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed signed-policy generation");
+
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.kbs_policy = Some(test_kbs_policy_config());
+        let auth_for = |user_id| AuthContext {
+            user_id,
+            org_id,
+            org_name: org_name.clone(),
+            role: Role::Owner,
+            api_key: None,
+            management_origin: crate::auth::middleware::ManagementOrigin::Public,
+        };
+        let alice_auth = auth_for(alice_id);
+        let bob_auth = auth_for(bob_id);
+
+        let provider = std::sync::Arc::new(tokio::sync::Mutex::new(KbsPolicyProvider::new(false)));
+        crate::kbs::TEST_KUBE_CLIENT
+            .scope(kbs_policy_kube_client(provider.clone()), async {
+                let alice_envelope = || signed_keyring_request(org_id, alice_id, &alice_key, 1, 1);
+
+                let pending = put_keyring(
+                    alice_auth.clone(),
+                    State(state.clone()),
+                    Path(org_name.clone()),
+                    Json(alice_envelope()),
+                )
+                .await
+                .expect_err("unavailable KBS must leave Alice's write pending");
+                assert_eq!(pending.0, StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(pending.1.0["code"], "keyring_policy_reconciliation_pending");
+                assert_eq!(
+                    keyring_put_authority(&pool, org_id).await,
+                    (1, 1, 5, 1),
+                    "Alice's write must commit the keyring, audit row, and owed selector bump once"
+                );
+
+                sqlx::query(
+                    "UPDATE external_resource_mutation_leases
+                SET locked_until = clock_timestamp() - interval '2 seconds',
+                    reclaim_after = clock_timestamp() - interval '1 second'
+              WHERE resource_scope = 'kbs_policy' AND resource_key = 'global'",
+                )
+                .execute(&pool)
+                .await
+                .expect("expire failed publication fence");
+                let bob_pending = put_keyring(
+                    bob_auth.clone(),
+                    State(state.clone()),
+                    Path(org_name.clone()),
+                    Json(alice_envelope()),
+                )
+                .await
+                .expect_err("second-owner replay must stay pending while KBS is unavailable");
+                assert_eq!(bob_pending.0, StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(
+                    bob_pending.1.0["code"],
+                    "keyring_policy_reconciliation_pending"
+                );
+                assert_eq!(
+                    keyring_put_authority(&pool, org_id).await,
+                    (1, 1, 5, 1),
+                    "the second-owner replay must not write another keyring or audit row"
+                );
+
+                {
+                    let mut provider = provider.lock().await;
+                    provider.healthy = true;
+                }
+                sqlx::query(
+                    "UPDATE external_resource_mutation_leases
+                SET locked_until = clock_timestamp() - interval '2 seconds',
+                    reclaim_after = clock_timestamp() - interval '1 second'
+              WHERE resource_scope = 'kbs_policy' AND resource_key = 'global'",
+                )
+                .execute(&pool)
+                .await
+                .expect("expire failed publication fence");
+                let published = put_keyring(
+                    bob_auth.clone(),
+                    State(state.clone()),
+                    Path(org_name.clone()),
+                    Json(alice_envelope()),
+                )
+                .await
+                .expect("second-owner replay must confirm publication");
+                assert_eq!(published.1.0.version, 1);
+                {
+                    let provider = provider.lock().await;
+                    assert_eq!(
+                        provider.published_generation(),
+                        Some(6),
+                        "the owed generation must be live before success is reported"
+                    );
+                }
+                assert_eq!(
+                    keyring_put_authority(&pool, org_id).await,
+                    (1, 1, 6, 0),
+                    "the healthy second-owner replay must consume the debt without a new write"
+                );
+
+                let denied = put_keyring(
+                    bob_auth.clone(),
+                    State(state.clone()),
+                    Path(org_name.clone()),
+                    Json(signed_keyring_request(org_id, alice_id, &alice_key, 2, 2)),
+                )
+                .await
+                .expect_err("fresh successor must require a caller-owned registration");
+                assert_eq!(denied.0, StatusCode::BAD_REQUEST);
+                assert_eq!(
+                    keyring_put_authority(&pool, org_id).await,
+                    (1, 1, 6, 0),
+                    "the denied successor must not write anything"
+                );
+            })
+            .await;
+        sqlx::query("DELETE FROM audit_log WHERE org_id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete second-owner replay audit rows");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete second-owner replay org");
+        sqlx::query("DELETE FROM users WHERE id = ANY($1)")
+            .bind(vec![alice_id, bob_id])
+            .execute(&pool)
+            .await
+            .expect("delete second-owner replay users");
+        drop_isolated_database("cap178_second_owner_replay", pool).await;
+    }
+
+    #[tokio::test]
+    async fn put_keyring_replay_answers_with_stored_envelope_not_submitted_echo() {
+        let _singleton = keyring_enqueue_guard().await;
+        let (_db_cleanup, pool) = isolated_database_test_pool("cap187_replay_envelope").await;
+        let org_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let suffix = org_id.simple().to_string();
+        let org_name = format!("keyring-replay-envelope-{suffix}");
+        crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+            .await
+            .expect("insert replay envelope org");
+        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Replay Owner')")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("insert replay envelope user");
+        sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+            .bind(user_id)
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("insert replay envelope membership");
+        let key = SigningKey::generate(&mut OsRng);
+        sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2)")
+            .bind(user_id)
+            .bind(key.verifying_key().to_bytes().to_vec())
+            .execute(&pool)
+            .await
+            .expect("insert replay envelope signing key");
+
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 5,
+                    selector_bumps_owed = 0,
+                    configmap_generation = 0,
+                    applied_generation = 0,
+                    configmap_policy_sha256 = NULL,
+                    applied_policy_sha256 = NULL,
+                    configmap_resource_version = NULL
+              WHERE singleton",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed signed-policy generation");
+
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.kbs_policy = Some(test_kbs_policy_config());
+        let auth = AuthContext {
+            user_id,
+            org_id,
+            org_name: org_name.clone(),
+            role: Role::Owner,
+            api_key: None,
+            management_origin: crate::auth::middleware::ManagementOrigin::Public,
+        };
+
+        fn with_memo(mut request: PutOrgKeyringRequest, memo: &str) -> PutOrgKeyringRequest {
+            let serde_json::Value::Object(map) = &mut request.keyring_payload else {
+                panic!("signed keyring payload must be an object");
+            };
+            map.insert(
+                "memo".to_string(),
+                serde_json::Value::String(memo.to_string()),
+            );
+            request
+        }
+
+        let provider = std::sync::Arc::new(tokio::sync::Mutex::new(KbsPolicyProvider::new(true)));
+        crate::kbs::TEST_KUBE_CLIENT
+            .scope(kbs_policy_kube_client(provider), async {
+                let stored = put_keyring(
+                    auth.clone(),
+                    State(state.clone()),
+                    Path(org_name.clone()),
+                    Json(with_memo(
+                        signed_keyring_request(org_id, user_id, &key, 1, 1),
+                        "old",
+                    )),
+                )
+                .await
+                .expect("initial keyring put must succeed");
+                assert_eq!(stored.0, StatusCode::OK);
+                assert_eq!(
+                    keyring_put_authority(&pool, org_id).await,
+                    (1, 1, 6, 0),
+                    "the initial put must commit one keyring and audit row and consume the owed selector bump"
+                );
+
+                let mut replay = with_memo(
+                    signed_keyring_request(org_id, user_id, &key, 1, 1),
+                    "new",
+                );
+                replay.signature = replay.signature.to_uppercase();
+                replay.signing_pubkey = replay.signing_pubkey.to_uppercase();
+                let Some(member_pubkey) = replay
+                    .keyring_payload
+                    .get_mut("members")
+                    .and_then(serde_json::Value::as_array_mut)
+                    .and_then(|members| members.first_mut())
+                    .and_then(|member| member.get_mut("pubkey"))
+                else {
+                    panic!("signed keyring payload must carry a member pubkey");
+                };
+                *member_pubkey = serde_json::Value::String(
+                    member_pubkey
+                        .as_str()
+                        .expect("member pubkey is a string")
+                        .to_uppercase(),
+                );
+                let replayed = put_keyring(
+                    auth.clone(),
+                    State(state.clone()),
+                    Path(org_name.clone()),
+                    Json(replay),
+                )
+                .await
+                .expect("semantic replay must succeed");
+                assert_eq!(replayed.0, StatusCode::OK);
+                assert_eq!(
+                    keyring_put_authority(&pool, org_id).await,
+                    (1, 1, 6, 0),
+                    "the accepted replay must not write another keyring, audit row, or selector bump"
+                );
+
+                let fetched = get_keyring(auth.clone(), State(state.clone()), Path(org_name.clone()))
+                    .await
+                    .expect("get keyring after replay");
+                assert_eq!(
+                    fetched.0.keyring_payload["memo"], "old",
+                    "the stored payload is the first submission's"
+                );
+                assert_eq!(
+                    serde_json::to_value(&replayed.1.0).unwrap(),
+                    serde_json::to_value(&fetched.0).unwrap(),
+                    "the replay response must equal GET's stored envelope"
+                );
+
+                let conflict = put_keyring(
+                    auth.clone(),
+                    State(state.clone()),
+                    Path(org_name.clone()),
+                    Json(with_memo(
+                        signed_keyring_request(org_id, user_id, &key, 1, 2),
+                        "new",
+                    )),
+                )
+                .await
+                .expect_err("different signed content at the same version must conflict");
+                assert_eq!(conflict.0, StatusCode::CONFLICT);
+                assert_eq!(
+                    keyring_put_authority(&pool, org_id).await,
+                    (1, 1, 6, 0),
+                    "the conflicting replay must not write anything"
+                );
+            })
+            .await;
+        drop_isolated_database("cap187_replay_envelope", pool).await;
+    }
+
+    /// Review follow-up: a `\u0000` escape in an unknown field passes
+    /// SignedOrgKeyring deserialization (unknown fields ignored) and would be
+    /// persisted verbatim, but jsonb cannot represent it -- the INSERT would
+    /// surface as a database error (500) once migration 0058's CHECK exists.
+    /// The handler must reject it as a 400 before any signature work, and
+    /// must never leave a row behind.
+    #[tokio::test]
+    async fn put_keyring_rejects_jsonb_unrepresentable_payload() {
+        let mut request = signed_keyring_request(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            &SigningKey::from_bytes(&[7u8; 32]),
+            1,
+            0,
+        );
+        if let serde_json::Value::Object(map) = &mut request.keyring_payload {
+            map.insert(
+                "memo".to_string(),
+                serde_json::Value::String("bad \u{0} nul".to_string()),
+            );
+        } else {
+            panic!("signed_keyring_request payload must be an object");
+        }
+        let err = reject_jsonb_unrepresentable_payload(&request.keyring_payload)
+            .expect_err("NUL escape in an extra field must be rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        // Nested positions must be caught too, and clean payloads pass.
+        let mut nested = serde_json::json!({"outer": ["fine", "x\u{0}y"]});
+        if let serde_json::Value::Object(map) = &mut nested {
+            map.insert(
+                "org_id".into(),
+                serde_json::Value::String(Uuid::new_v4().to_string()),
+            );
+        }
+        assert!(reject_jsonb_unrepresentable_payload(&nested).is_err());
+        // A NUL inside an object KEY must be caught too (self-review C1):
+        // serde_json parses it, serde_json::to_vec round-trips it verbatim,
+        // and jsonb rejects it just like a NUL in a value.
+        let mut nul_key = serde_json::Map::new();
+        nul_key.insert(
+            "a\u{0}b".to_string(),
+            serde_json::Value::String("value is fine".to_string()),
+        );
+        assert!(reject_jsonb_unrepresentable_payload(&serde_json::Value::Object(nul_key)).is_err());
+        assert!(
+            reject_jsonb_unrepresentable_payload(&serde_json::json!({
+                "org_id": Uuid::new_v4(),
+                "members": [],
+                "memo": "no nul here"
+            }))
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn rotate_owner_reports_success_only_after_kbs_publication() {
+        let _singleton = keyring_enqueue_guard().await;
+        let (_db_cleanup, pool) =
+            isolated_database_test_pool("cap130_keyring_enqueue_rotate").await;
+        let org_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let suffix = org_id.simple().to_string();
+        let org_name = format!("keyring-rotate-enqueue-{suffix}");
+        crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+            .await
+            .expect("insert rotate enqueue org");
+        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Rotate Enqueuer')")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("insert rotate enqueue user");
+        sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+            .bind(user_id)
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("insert rotate enqueue membership");
+        let key = SigningKey::generate(&mut OsRng);
+        let replacement_key = SigningKey::generate(&mut OsRng);
+        // Both the current and the replacement owner keys must be registered
+        // for the rotating user: the handler resolves signing_key_id from
+        // user_signing_keys inside the lane-locked transaction.
+        sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2), ($1, $3)")
+            .bind(user_id)
+            .bind(key.verifying_key().to_bytes().to_vec())
+            .bind(replacement_key.verifying_key().to_bytes().to_vec())
+            .execute(&pool)
+            .await
+            .expect("insert rotate enqueue signing keys");
+
+        // Active signed mode: every committed keyring insert (the v1 put
+        // and the rotation v2) must owe exactly one selector bump through
+        // migration 0058's trigger, and the route must not report success
+        // until the owed generation is live in the KBS.
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 5,
+                    selector_bumps_owed = 0,
+                    configmap_generation = 0,
+                    applied_generation = 0,
+                    configmap_policy_sha256 = NULL,
+                    applied_policy_sha256 = NULL,
+                    configmap_resource_version = NULL
+              WHERE singleton",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed signed-policy generation");
+
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.kbs_policy = Some(test_kbs_policy_config());
+        let provider = std::sync::Arc::new(tokio::sync::Mutex::new(KbsPolicyProvider::new(true)));
+        crate::kbs::TEST_KUBE_CLIENT
+            .scope(kbs_policy_kube_client(provider.clone()), async {
+                let auth = AuthContext {
+                    user_id,
+                    org_id,
+                    org_name: org_name.clone(),
+                    role: Role::Owner,
+                    api_key: None,
+                    management_origin: crate::auth::middleware::ManagementOrigin::Public,
+                };
+
+                // Publish v1 as the current owner; its owed selector bump must be
+                // published before the route reports success.
+                let _ = put_keyring(
+                    auth.clone(),
+                    State(state.clone()),
+                    Path(org_name.clone()),
+                    Json(signed_keyring_request(org_id, user_id, &key, 1, 1)),
+                )
+                .await
+                .expect("seed keyring v1");
+                let (desired, owed, applied): (i64, i64, i64) = sqlx::query_as(
+                    "SELECT desired_generation, selector_bumps_owed, applied_generation
+               FROM kbs_signed_policy_reconciliation
+              WHERE singleton",
+                )
+                .fetch_one(&pool)
+                .await
+                .expect("read reconciliation state after v1 publication");
+                assert_eq!((desired, owed, applied), (6, 0, 6));
+
+                // The signing service owner already matches the replacement key, so
+                // the handler takes the no-remote-rotation branch and commits the
+                // keyring v2 insert (and its trigger-owed selector bump) locally.
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind signing service mock");
+                let address = listener.local_addr().expect("mock signing service address");
+                let replacement_hex = hex::encode(replacement_key.verifying_key().to_bytes());
+                let org_id_for_mock = org_id;
+                let owner_status_response =
+                    std::sync::Arc::new(std::sync::Mutex::new(serde_json::json!({
+                        "org_id": org_id_for_mock,
+                        "state": "ready",
+                        "version": 2,
+                        "owner_pubkey_hex": replacement_hex.clone(),
+                        "last_changed_at": null,
+                    })));
+                let rotate_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let status_for_mock = owner_status_response.clone();
+                let rotate_calls_for_mock = rotate_calls.clone();
+                let mock = tokio::spawn(async move {
+                    use axum::{
+                        Json,
+                        routing::{get, post},
+                    };
+                    let app = axum::Router::new()
+                        .route(
+                            "/orgs/{org_id}/owner",
+                            get(move || {
+                                let body = status_for_mock
+                                    .lock()
+                                    .expect("owner status mock lock")
+                                    .clone();
+                                async move { Json(body) }
+                            }),
+                        )
+                        .route(
+                            "/rotate-owner",
+                            post(move || {
+                                let calls = rotate_calls_for_mock.clone();
+                                let rotated_org_id = org_id_for_mock;
+                                let fingerprint = replacement_hex.clone();
+                                async move {
+                                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                    Json(serde_json::json!({
+                                        "org_id": rotated_org_id,
+                                        "version": 2,
+                                        "owner_pubkey_fingerprint": fingerprint,
+                                        "rotated_at": "2026-01-01T00:00:00Z",
+                                    }))
+                                }
+                            }),
+                        );
+                    axum::serve(listener, app).await.expect("serve mock");
+                });
+                state.signing_service = Some(
+                    crate::signing_service::SigningServiceClient::new(
+                        format!("http://{address}"),
+                        None,
+                    )
+                    .expect("mock signing service client"),
+                );
+
+                let added_at = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+                let updated_at = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 30).unwrap();
+                let replacement_pubkey = replacement_key.verifying_key().to_bytes();
+                let keyring = SignedOrgKeyring {
+                    org_id,
+                    version: 2,
+                    members: vec![SignedOrgKeyringMember {
+                        user_id,
+                        pubkey: replacement_pubkey,
+                        role: SignedOrgKeyringRole::Owner,
+                        added_at,
+                    }],
+                    updated_at,
+                };
+                let keyring_payload = serde_json::json!({
+                    "org_id": org_id,
+                    "version": 2,
+                    "members": [{
+                        "user_id": user_id,
+                        "pubkey": hex::encode(replacement_pubkey),
+                        "role": "owner",
+                        "added_at": added_at,
+                    }],
+                    "updated_at": updated_at,
+                });
+                let keyring_signature = replacement_key.sign(&canonical_keyring_bytes(&keyring));
+                let signed_at = Utc::now();
+                let reason = "owner key compromised";
+                let directive = owner_rotation_directive_bytes(
+                    org_id,
+                    &key.verifying_key().to_bytes(),
+                    &replacement_pubkey,
+                    signed_at,
+                    reason,
+                );
+                let rotation_signature = key.sign(&directive);
+                let rotation_request = RotateOrgOwnerRequest {
+                    version: 2,
+                    keyring_payload: keyring_payload.clone(),
+                    signature: hex::encode(keyring_signature.to_bytes()),
+                    replacement_signing_pubkey: hex::encode(replacement_pubkey),
+                    current_signing_pubkey: hex::encode(key.verifying_key().to_bytes()),
+                    signed_at,
+                    reason: reason.to_string(),
+                    rotation_signature: hex::encode(rotation_signature.to_bytes()),
+                };
+                let rotated = rotate_org_owner(
+                    auth.clone(),
+                    State(state.clone()),
+                    Path(org_name.clone()),
+                    Json(rotation_request.clone()),
+                )
+                .await
+                .expect("owner rotation must confirm KBS publication");
+
+                // The rotation consumed the v2 insert's owed selector bump exactly
+                // once and never bumped desired_generation directly.
+                let (desired, owed, applied): (i64, i64, i64) = sqlx::query_as(
+                    "SELECT desired_generation, selector_bumps_owed, applied_generation
+               FROM kbs_signed_policy_reconciliation
+              WHERE singleton",
+                )
+                .fetch_one(&pool)
+                .await
+                .expect("read reconciliation state after rotation");
+                assert_eq!(
+                    (desired, owed, applied),
+                    (7, 0, 7),
+                    "the v1 and v2 selector bumps must be consumed exactly once each"
+                );
+                let latest_version: i64 =
+                    sqlx::query_scalar("SELECT max(version) FROM org_keyrings WHERE org_id = $1")
+                        .bind(org_id)
+                        .fetch_one(&pool)
+                        .await
+                        .expect("read latest keyring version");
+                assert_eq!(latest_version, 2);
+                assert_eq!(rotated.0.state, "ready");
+                {
+                    let provider = provider.lock().await;
+                    assert_eq!(
+                        provider.published_generation(),
+                        Some(7),
+                        "the rotated generation must be live before success is reported"
+                    );
+                }
+
+                // The v1 predecessor row can be pruned by migration 0058's repair
+                // pass while the committed v2 rotation stays intact.  Replaying the
+                // identical request after that prune must still confirm the
+                // rotation, not fail with "previous keyring authority is
+                // unavailable".
+                sqlx::query("DELETE FROM org_keyrings WHERE org_id = $1 AND version = 1")
+                    .bind(org_id)
+                    .execute(&pool)
+                    .await
+                    .expect("prune predecessor keyring row");
+                let replayed = rotate_org_owner(
+                    auth.clone(),
+                    State(state.clone()),
+                    Path(org_name.clone()),
+                    Json(rotation_request.clone()),
+                )
+                .await
+                .expect("replay after predecessor prune must confirm the rotation");
+                assert_eq!(replayed.0.state, "ready");
+                assert_eq!(replayed.0.keyring_version, 2);
+                let versions_after_replay: i64 =
+                    sqlx::query_scalar("SELECT count(*) FROM org_keyrings WHERE org_id = $1")
+                        .bind(org_id)
+                        .fetch_one(&pool)
+                        .await
+                        .expect("count keyring rows after replay");
+                assert_eq!(
+                    versions_after_replay, 1,
+                    "replay must not insert a duplicate row"
+                );
+
+                *owner_status_response
+                    .lock()
+                    .expect("owner status mock lock") = serde_json::json!({
+                    "org_id": org_id,
+                    "state": "ready",
+                    "version": 2,
+                    "owner_pubkey_hex": hex::encode(key.verifying_key().to_bytes()),
+                    "last_changed_at": null,
+                });
+                let drifted = rotate_org_owner(
+                    auth.clone(),
+                    State(state.clone()),
+                    Path(org_name.clone()),
+                    Json(rotation_request.clone()),
+                )
+                .await
+                .expect_err("pruned replay must fail when the service reports a different owner");
+                assert_eq!(drifted.0, StatusCode::BAD_GATEWAY);
+                assert_eq!(drifted.1.0["error"], "signing_authority_status_invalid");
+
+                *owner_status_response
+                    .lock()
+                    .expect("owner status mock lock") = serde_json::json!({
+                    "org_id": org_id,
+                    "state": "pending",
+                    "version": 2,
+                    "owner_pubkey_hex": hex::encode(replacement_key.verifying_key().to_bytes()),
+                    "last_changed_at": null,
+                });
+                let not_ready = rotate_org_owner(
+                    auth.clone(),
+                    State(state.clone()),
+                    Path(org_name.clone()),
+                    Json(rotation_request.clone()),
+                )
+                .await
+                .expect_err("pruned replay must fail when the service is not ready");
+                assert_eq!(not_ready.0, StatusCode::BAD_GATEWAY);
+                assert_eq!(not_ready.1.0["error"], "signing_authority_status_invalid");
+
+                let dead = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind dead signing service address");
+                let dead_address = dead.local_addr().expect("dead signing service address");
+                drop(dead);
+                state.signing_service = Some(
+                    crate::signing_service::SigningServiceClient::new(
+                        format!("http://{dead_address}"),
+                        None,
+                    )
+                    .expect("dead signing service client"),
+                );
+                let unavailable = rotate_org_owner(
+                    auth.clone(),
+                    State(state.clone()),
+                    Path(org_name.clone()),
+                    Json(rotation_request.clone()),
+                )
+                .await
+                .expect_err("pruned replay must fail when the signing service is unreachable");
+                assert_eq!(unavailable.0, StatusCode::BAD_GATEWAY);
+                assert_eq!(unavailable.1.0["error"], "signing_service_unavailable");
+
+                // Replay still requires KBS reconciliation: with the signing
+                // service healthy again but publication blocked, the replay must
+                // defer instead of reporting success.
+                state.signing_service = Some(
+                    crate::signing_service::SigningServiceClient::new(
+                        format!("http://{address}"),
+                        None,
+                    )
+                    .expect("mock signing service client"),
+                );
+                *owner_status_response
+                    .lock()
+                    .expect("owner status mock lock") = serde_json::json!({
+                    "org_id": org_id,
+                    "state": "ready",
+                    "version": 2,
+                    "owner_pubkey_hex": hex::encode(replacement_key.verifying_key().to_bytes()),
+                    "last_changed_at": null,
+                });
+                {
+                    let mut provider = provider.lock().await;
+                    provider.healthy = false;
+                }
+                let pending = rotate_org_owner(
+                    auth.clone(),
+                    State(state.clone()),
+                    Path(org_name.clone()),
+                    Json(rotation_request.clone()),
+                )
+                .await
+                .expect_err("replay must not report success while publication is blocked");
+                assert_eq!(pending.0, StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(pending.1.0["code"], "keyring_policy_reconciliation_pending");
+                let (desired, owed, applied): (i64, i64, i64) = sqlx::query_as(
+                    "SELECT desired_generation, selector_bumps_owed, applied_generation
+               FROM kbs_signed_policy_reconciliation
+              WHERE singleton",
+                )
+                .fetch_one(&pool)
+                .await
+                .expect("read reconciliation state after blocked replay");
+                assert_eq!(
+                    (desired, owed, applied),
+                    (7, 0, 7),
+                    "a blocked replay must not churn the durable rotation state"
+                );
+                {
+                    let mut provider = provider.lock().await;
+                    provider.healthy = true;
+                }
+                sqlx::query(
+                    "UPDATE external_resource_mutation_leases
+                SET locked_until = clock_timestamp() - interval '2 seconds',
+                    reclaim_after = clock_timestamp() - interval '1 second'
+              WHERE resource_scope = 'kbs_policy' AND resource_key = 'global'",
+                )
+                .execute(&pool)
+                .await
+                .expect("expire failed publication fence");
+                let recovered = rotate_org_owner(
+                    auth.clone(),
+                    State(state.clone()),
+                    Path(org_name.clone()),
+                    Json(rotation_request.clone()),
+                )
+                .await
+                .expect("replay must confirm the rotation once publication recovers");
+                assert_eq!(recovered.0.state, "ready");
+                assert_eq!(recovered.0.keyring_version, 2);
+
+                assert_eq!(
+                    rotate_calls.load(std::sync::atomic::Ordering::SeqCst),
+                    0,
+                    "pruned replays must never re-drive the signing service rotation"
+                );
+                let rotate_audit_rows: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM audit_log
+              WHERE org_id = $1 AND action = 'org.keyring.owner.rotate'",
+                )
+                .bind(org_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count owner-rotation audit rows after replays");
+                assert_eq!(rotate_audit_rows, 1);
+                let versions_after_failures: i64 =
+                    sqlx::query_scalar("SELECT count(*) FROM org_keyrings WHERE org_id = $1")
+                        .bind(org_id)
+                        .fetch_one(&pool)
+                        .await
+                        .expect("count keyring rows after failed replays");
+                assert_eq!(versions_after_failures, 1);
+
+                mock.abort();
+            })
+            .await;
+        sqlx::query("DELETE FROM audit_log WHERE org_id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete rotate enqueue audit rows");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete rotate enqueue org");
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("delete rotate enqueue user");
+        drop_isolated_database("cap130_keyring_enqueue_rotate", pool).await;
+    }
+
+    #[tokio::test]
+    async fn put_keyring_replay_ignores_unsigned_extra_payload_fields() {
+        // PR #187 review: a client (e.g. the CLI's owner-recovery retry)
+        // fetches a committed keyring, rebuilds it through the typed
+        // envelope -- dropping unsigned extra JSON fields like "memo" --
+        // and PUTs the same version back. The replay must be idempotent:
+        // the signature is over the canonical keyring bytes, so comparing
+        // those instead of raw payload bytes accepts the semantically
+        // identical payload while still rejecting genuinely different
+        // content. Unsigned-only mode keeps KBS publication out of scope.
+        let (_db_cleanup, pool) = isolated_database_test_pool("cap187_keyring_replay_extra").await;
+        let org_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let suffix = org_id.simple().to_string();
+        let org_name = format!("keyring-replay-{suffix}");
+        crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+            .await
+            .expect("insert keyring replay org");
+        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Keyring Replayer')")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("insert keyring replay user");
+        sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+            .bind(user_id)
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("insert keyring replay membership");
+        let key = SigningKey::generate(&mut OsRng);
+        sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2)")
+            .bind(user_id)
+            .bind(key.verifying_key().to_bytes().to_vec())
+            .execute(&pool)
+            .await
+            .expect("insert keyring replay signing key");
+
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        let auth = AuthContext {
+            user_id,
+            org_id,
+            org_name: org_name.clone(),
+            role: Role::Owner,
+            api_key: None,
+            management_origin: crate::auth::middleware::ManagementOrigin::Public,
+        };
+
+        // Initial put carries an unsigned extra field the typed keyring
+        // does not know about.
+        let mut request = signed_keyring_request(org_id, user_id, &key, 1, 1);
+        request
+            .keyring_payload
+            .as_object_mut()
+            .expect("keyring payload is an object")
+            .insert("memo".to_string(), serde_json::json!("rotation"));
+        let created = put_keyring(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(request),
+        )
+        .await
+        .expect("initial put with an extra field must succeed");
+        assert_eq!(created.1.version, 1);
+
+        // The CLI-style replay drops the extra field before resubmitting
+        // the same version: semantically identical, so idempotent.
+        let stripped = signed_keyring_request(org_id, user_id, &key, 1, 1);
+        let replayed = put_keyring(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(stripped),
+        )
+        .await
+        .expect("typed rebuild replay of the same version must be idempotent");
+        assert_eq!(replayed.1.version, 1);
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM org_keyrings WHERE org_id = $1")
+            .bind(org_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count keyring rows after replay");
+        assert_eq!(rows, 1, "the replay must not insert a duplicate row");
+
+        // Genuinely different content at the same version still conflicts:
+        // a different updated_at changes the canonical bytes, and this
+        // payload carries its own valid signature over those bytes.
+        let conflicting = signed_keyring_request(org_id, user_id, &key, 1, 2);
+        let rejected = put_keyring(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(conflicting),
+        )
+        .await
+        .expect_err("same-version replay with different canonical content must conflict");
+        assert_eq!(rejected.0, StatusCode::CONFLICT);
+
+        drop_isolated_database("cap187_keyring_replay_extra", pool).await;
+    }
+
     #[tokio::test]
     async fn keyring_acceptance_waits_for_membership_removal_and_rejects() {
         let pool = database_test_pool().await;
@@ -1731,7 +3063,28 @@ mod tests {
 
     #[tokio::test]
     async fn keyring_rotation_preserves_pinned_owner_and_one_immutable_v2_winner() {
+        // Holds the singleton lock: this test's committed put_keyring calls
+        // bump the shared signed-policy generation whenever it is nonzero,
+        // which would corrupt concurrent tests asserting exact values.
+        let _singleton = keyring_enqueue_guard().await;
         let pool = database_test_pool().await;
+        // Run as an unsigned install: this test asserts keyring authority,
+        // not KBS publication, and the shared database's singleton row must
+        // stay out of active signed mode for the whole flow.
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 0,
+                    selector_bumps_owed = 0,
+                    configmap_generation = 0,
+                    applied_generation = 0,
+                    configmap_policy_sha256 = NULL,
+                    applied_policy_sha256 = NULL,
+                    configmap_resource_version = NULL
+              WHERE singleton",
+        )
+        .execute(&pool)
+        .await
+        .expect("reset shared signed-policy singleton to unsigned mode");
         let org_id = Uuid::new_v4();
         let user_id = Uuid::new_v4();
         let attacker_user_id = Uuid::new_v4();

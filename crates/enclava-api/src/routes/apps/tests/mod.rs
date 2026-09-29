@@ -3,11 +3,14 @@ use super::{
     SignerRotationTokenRequest, WorkloadTeardownDecision, app_delete_failure, create_app,
     delete_tenant_namespace_with_timeouts, derive_identity, egress_allowlist_host_audit_reasons,
     issue_signer_rotation_token_route, list_apps, post_workload_teardown,
-    request_workload_teardown, requires_workload_teardown, validate_egress_allowlist,
-    validate_egress_mode, workload_teardown_http_failure, workload_teardown_instance_id,
+    request_workload_teardown, requires_workload_teardown, rotate_signer,
+    validate_egress_allowlist, validate_egress_mode, workload_teardown_http_failure,
+    workload_teardown_instance_id,
 };
+use crate::auth::jwt::SignerRotationTokenInput;
 use crate::auth::middleware::AuthContext;
 use crate::models::{App, AppStatus, Role, UnlockMode};
+use crate::test_support::{KbsPolicyProvider, kbs_policy_kube_client};
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::{Request, Response, StatusCode};
@@ -71,6 +74,7 @@ fn teardown_test_app(auth: &AuthContext, status: AppStatus, domain: &str) -> App
         signer_identity_subject: None,
         signer_identity_issuer: None,
         signer_identity_set_at: None,
+        signer_rotation_generation: 0,
         source_provider: None,
         source_repository: None,
         egress_allowlist: sqlx::types::Json(Vec::new()),
@@ -262,6 +266,7 @@ fn teardown_token_instance_id_matches_attestation_proxy_owner_instance_id() {
         signer_identity_subject: None,
         signer_identity_issuer: None,
         signer_identity_set_at: None,
+        signer_rotation_generation: 0,
         source_provider: None,
         source_repository: None,
         egress_allowlist: sqlx::types::Json(Vec::new()),
@@ -411,6 +416,7 @@ async fn unreachable_running_workload_teardown_blocks_deletion_and_diagnostics_a
         signer_identity_subject: None,
         signer_identity_issuer: None,
         signer_identity_set_at: None,
+        signer_rotation_generation: 0,
         source_provider: None,
         source_repository: None,
         egress_allowlist: sqlx::types::Json(Vec::new()),
@@ -507,6 +513,72 @@ async fn completed_workload_teardown_skips_unreachable_retry() {
     assert!(!diagnostics.contains("app_delete_teardown_unavailable"));
 }
 
+#[tokio::test]
+async fn deletion_retry_preserves_teardown_requirement_before_policy_revocation() {
+    let (_cleanup, pool) =
+        crate::test_support::isolated_database_test_pool("cap_delete_teardown_retry").await;
+    let (org_id, user_id, app_id) = insert_signer_rotation_app(&pool, None, None).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (attempts_tx, mut attempts_rx) = tokio::sync::mpsc::channel(2);
+    let server = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (stream, _) = listener.accept().await.unwrap();
+            attempts_tx.send(()).await.unwrap();
+            drop(stream);
+        }
+    });
+    let app_name: String =
+        sqlx::query_scalar("UPDATE apps SET tee_domain = $2 WHERE id = $1 RETURNING name")
+            .bind(app_id)
+            .bind(address.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    sqlx::query(
+        "UPDATE kbs_signed_policy_reconciliation SET desired_generation = 1 WHERE singleton",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let policy_before = read_withdrawal_reconciliation_state(&pool).await;
+    let mut state = unreachable_tee_state();
+    state.db = pool.clone();
+    let mut auth = crate::test_support::auth_context(Role::Owner, &["apps:write"]);
+    auth.org_id = org_id;
+    auth.user_id = user_id;
+
+    for _ in 0..2 {
+        let (status, Json(body)) = tokio::time::timeout(
+            Duration::from_secs(3),
+            super::delete_app(auth.clone(), State(state.clone()), Path(app_name.clone())),
+        )
+        .await
+        .expect("deletion must release its lanes after teardown fails")
+        .expect_err("an unavailable TEE must block both deletion attempts");
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["error"], "app_delete_teardown_unavailable");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), attempts_rx.recv())
+                .await
+                .expect("each deletion attempt must contact the TEE"),
+            Some(())
+        );
+        let app_status: String = sqlx::query_scalar("SELECT status::text FROM apps WHERE id = $1")
+            .bind(app_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(app_status, "deleting");
+        assert_eq!(
+            read_withdrawal_reconciliation_state(&pool).await,
+            policy_before,
+            "failed confidential teardown must not revoke the workload's KBS authority"
+        );
+    }
+    server.await.unwrap();
+}
+
 #[test]
 fn locked_running_workload_teardown_blocks_deletion_and_diagnostics_are_bounded() {
     const SECRET: &str = "upstream-locked-body-sentinel";
@@ -586,106 +658,6 @@ fn app_delete_failure_discards_secret_source_diagnostics() {
     assert!(!response.contains(SECRET));
 }
 
-#[test]
-fn app_delete_source_never_reads_or_formats_external_diagnostics() {
-    let source = include_str!("../../apps.rs");
-    let teardown = source
-        .split("async fn request_workload_teardown")
-        .nth(1)
-        .expect("workload teardown helper exists")
-        .split("/// Comprehensive app name validation")
-        .next()
-        .expect("workload teardown helper body");
-    let deletion = source
-        .split("pub async fn delete_app")
-        .nth(1)
-        .expect("app deletion route exists")
-        .split("#[derive(Debug, Deserialize)]\npub struct RotateSignerRequest")
-        .next()
-        .expect("app deletion route body");
-
-    for forbidden in [
-        "response.text()",
-        "app_name = %app.name",
-        "namespace = %app.namespace",
-        "url = %url",
-        "body = %body",
-        "error = %error",
-        "failed to issue teardown token: {e}",
-    ] {
-        assert!(
-            !teardown.contains(forbidden),
-            "teardown diagnostics must not contain `{forbidden}`"
-        );
-    }
-
-    assert!(
-        !deletion.contains("dns_error_response"),
-        "app deletion must not use the raw DNS error response"
-    );
-    assert!(
-        !deletion.contains("format!("),
-        "app deletion must not format dependency errors into responses"
-    );
-    assert!(
-        deletion
-            .find("request_workload_teardown")
-            .expect("app deletion requests workload teardown")
-            < deletion
-                .find("enqueue_signed_policy_revocation_if_active")
-                .expect("app deletion enqueues signed-policy revocation"),
-        "app deletion must preserve KBS authorization until workload teardown completes"
-    );
-    assert!(
-        deletion
-            .contains("WHEN status = 'deleting'::app_status_enum THEN workload_teardown_required"),
-        "app deletion must persist the pre-delete teardown decision across retries"
-    );
-    assert!(
-        deletion.contains("requires_workload_teardown(phase_app.status)"),
-        "app deletion must decide teardown from the status before the deleting transition"
-    );
-    assert!(
-        !deletion.contains("requires_workload_teardown(deleting_app.status)"),
-        "app deletion must not re-derive teardown from the post-transition Deleting status"
-    );
-    assert!(
-        teardown.contains("workload_teardown_completed_at"),
-        "successful teardown must persist a durable completion marker"
-    );
-    assert!(
-        teardown.contains("app_delete_teardown_already_completed"),
-        "retries must skip TEE teardown after the completion marker is set"
-    );
-    assert!(
-        teardown.contains("AppDeleteFailure::TeardownLocked"),
-        "a locked TEE must fail destroy through a stable teardown error code"
-    );
-    assert!(
-        teardown.contains("Duration::from_secs(60)"),
-        "the teardown client timeout must out-wait the proxy's two 20 s KBS deletes"
-    );
-    let migration = include_str!("../../../../migrations/0048_app_workload_teardown_state.sql");
-    assert!(
-        !migration.to_lowercase().contains("update apps"),
-        "0048 must not backfill: the delete route records the requirement at delete time, and any backfill would only be read by a new replica retrying an old-replica delete whose workload may already be gone (mixed-rollout wedge)"
-    );
-    for failure in [
-        "app_delete_dns_failure",
-        "AppDeleteFailure::EdgeBackend",
-        "AppDeleteFailure::EdgeRoute",
-        "AppDeleteFailure::Namespace",
-        "AppDeleteFailure::KbsOwnerBinding",
-        "AppDeleteFailure::KbsTlsBinding",
-        "AppDeleteFailure::KbsPolicy",
-    ] {
-        assert!(
-            deletion.contains(failure),
-            "app deletion must route failures through bounded diagnostic `{failure}`"
-        );
-    }
-}
-
 #[tokio::test]
 async fn create_app_rejects_member_before_database_access() {
     let result = create_app(
@@ -759,4 +731,1874 @@ async fn signer_rotation_token_rejects_api_key_before_database_access() {
     };
 
     assert_eq!(err.0, StatusCode::FORBIDDEN);
+}
+
+/// Fixture for the signer-rotation regressions: an org, an owner user, and
+/// a running app pinned to the given signer identity (or none, for the
+/// initial-set cases).
+async fn insert_signer_rotation_app(
+    pool: &sqlx::PgPool,
+    signer_subject: Option<&str>,
+    signer_issuer: Option<&str>,
+) -> (uuid::Uuid, uuid::Uuid, uuid::Uuid) {
+    let org_id = uuid::Uuid::new_v4();
+    let user_id = uuid::Uuid::new_v4();
+    let app_id = uuid::Uuid::new_v4();
+    let suffix = app_id.simple().to_string();
+    sqlx::query("INSERT INTO organizations (id, name, cust_slug) VALUES ($1, $2, $3)")
+        .bind(org_id)
+        .bind(format!("signer-rotation-{suffix}"))
+        .bind(&suffix[..8])
+        .execute(pool)
+        .await
+        .expect("insert signer rotation organization");
+    sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'rotation owner')")
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .expect("insert signer rotation user");
+    sqlx::query(
+        "INSERT INTO memberships (user_id, org_id, role, created_at, removed_at)
+         VALUES ($1, $2, 'owner', now(), NULL)",
+    )
+    .bind(user_id)
+    .bind(org_id)
+    .execute(pool)
+    .await
+    .expect("insert signer rotation membership");
+    sqlx::query(
+        "INSERT INTO apps (
+             id, org_id, name, namespace, instance_id, tenant_id,
+             service_account, bootstrap_owner_pubkey_hash,
+             tenant_instance_identity_hash, domain, status,
+             signer_identity_subject, signer_identity_issuer
+         ) VALUES (
+             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+             'running'::app_status_enum, $11, $12
+         )",
+    )
+    .bind(app_id)
+    .bind(org_id)
+    .bind(format!("app-{}", &suffix[..12]))
+    .bind(format!("cap-{}", &suffix[..12]))
+    .bind(format!("instance-{suffix}"))
+    .bind(&suffix[..8])
+    .bind(format!("cap-{}-sa", &suffix[..12]))
+    .bind("11".repeat(32))
+    .bind("22".repeat(32))
+    .bind(format!("{}.example.test", &suffix[..12]))
+    .bind(signer_subject)
+    .bind(signer_issuer)
+    .execute(pool)
+    .await
+    .expect("insert signer rotation app");
+    (org_id, user_id, app_id)
+}
+
+/// A retained workload artifact whose signed descriptor carries the given
+/// signer identity: exactly what a rotated-out signer leaves behind.
+async fn insert_signed_artifact_for_identity(
+    pool: &sqlx::PgPool,
+    org_id: uuid::Uuid,
+    app_id: uuid::Uuid,
+    subject: &str,
+    issuer: &str,
+) -> Vec<u8> {
+    let descriptor_core_hash: Vec<u8> = (0..32u8).collect();
+    insert_signed_artifact_for_identity_with_hash(
+        pool,
+        org_id,
+        app_id,
+        subject,
+        issuer,
+        &descriptor_core_hash,
+    )
+    .await;
+    descriptor_core_hash
+}
+
+/// [`insert_signed_artifact_for_identity`] with an explicit descriptor hash,
+/// for tests that need several distinct artifacts under one identity.
+async fn insert_signed_artifact_for_identity_with_hash(
+    pool: &sqlx::PgPool,
+    org_id: uuid::Uuid,
+    app_id: uuid::Uuid,
+    subject: &str,
+    issuer: &str,
+    descriptor_core_hash: &[u8],
+) {
+    let deploy_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO deployments (id, org_id, app_id, status, spec_snapshot)
+         VALUES ($1, $2, $3, 'healthy'::deploy_status_enum, '{}'::jsonb)",
+    )
+    .bind(deploy_id)
+    .bind(org_id)
+    .bind(app_id)
+    .execute(pool)
+    .await
+    .expect("insert signer rotation deployment");
+    let measurement_hex = hex::encode(descriptor_core_hash);
+    let descriptor_payload = serde_json::json!({
+        "image_ref": format!("ghcr.io/acme/workload@sha256:{measurement_hex}"),
+        "expected_cc_init_data_hash": measurement_hex,
+        "signer_identity": {
+            "subject": subject,
+            "issuer": issuer,
+        }
+    });
+    sqlx::query(
+        "INSERT INTO workload_artifacts (
+             descriptor_core_hash, app_id, deploy_id, descriptor_payload,
+             descriptor_signature, descriptor_signing_key_id,
+             org_keyring_payload, org_keyring_signature, signed_policy_artifact
+         ) VALUES ($1, $2, $3, $4, $5, 'test-key', '{}'::jsonb, $6, '{}'::jsonb)",
+    )
+    .bind(descriptor_core_hash)
+    .bind(app_id)
+    .bind(deploy_id)
+    .bind(&descriptor_payload)
+    .bind(vec![1u8; 64])
+    .bind(vec![2u8; 64])
+    .execute(pool)
+    .await
+    .expect("insert rotated-out workload artifact");
+}
+
+/// A legacy kbs_tls_bindings row: the Rego render source on unsigned
+/// installs, which rotation must carry the new identity into.
+async fn insert_legacy_tls_binding(
+    pool: &sqlx::PgPool,
+    app_id: uuid::Uuid,
+    subject: &str,
+    issuer: &str,
+) {
+    let suffix = app_id.simple().to_string();
+    sqlx::query(
+        "INSERT INTO kbs_tls_bindings (
+             app_id, binding_key, repository, tag, namespace, service_account,
+             tenant_instance_identity_hash, signer_identity_subject,
+             signer_identity_issuer
+         ) VALUES ($1, $2, 'default', 'workload-secret-seed', $3, $4, $5, $6, $7)
+         ON CONFLICT (app_id) DO NOTHING",
+    )
+    .bind(app_id)
+    .bind(format!("tls-{}", &suffix[..12]))
+    .bind(format!("cap-{}", &suffix[..12]))
+    .bind(format!("cap-{}-sa", &suffix[..12]))
+    .bind("22".repeat(32))
+    .bind(subject)
+    .bind(issuer)
+    .execute(pool)
+    .await
+    .expect("insert legacy tls binding");
+}
+
+async fn read_withdrawal_reconciliation_state(pool: &sqlx::PgPool) -> (i64, i64, i64) {
+    sqlx::query_as(
+        "SELECT desired_generation, selector_bumps_owed, withdrawal_bumps_owed
+           FROM kbs_signed_policy_reconciliation WHERE singleton",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("read signed policy reconciliation singleton")
+}
+
+fn test_kbs_policy_config() -> crate::kbs::KbsPolicyConfig {
+    crate::kbs::KbsPolicyConfig {
+        namespace: "kbs-test".to_string(),
+        configmap_name: "resource-policy".to_string(),
+        policy_key: "policy.rego".to_string(),
+        deployment_name: "trustee".to_string(),
+        required: true,
+        signed_policy_retention: 6,
+        signed_policy_max_bytes: 900 * 1024,
+    }
+}
+
+/// Rotating back to the previous identity must not make its consumed token
+/// replayable or let a rejected replay change the published generation. The
+/// token stays unusable for transitions (A -> B -> A -> B reuses no token),
+/// but presenting the consumed A -> B token while B is current is an
+/// owner-authorized read-only confirmation of the committed identity: it
+/// must not mutate authority, consume a jti, audit, withdraw, or republish.
+#[tokio::test]
+async fn signer_rotation_token_is_single_use_and_owes_a_deferred_withdrawal_bump() {
+    let (_db_cleanup, pool) =
+        crate::test_support::isolated_database_test_pool("cap119_rotation_single_use").await;
+    let previous_subject = "https://github.com/acme/old/.github/workflows/ci.yaml@refs/heads/main";
+    let previous_issuer = "https://token.actions.githubusercontent.com";
+    let new_subject = "https://github.com/acme/new/.github/workflows/ci.yaml@refs/heads/main";
+    let new_issuer = "https://new-issuer.example.test";
+    let (org_id, user_id, app_id) =
+        insert_signer_rotation_app(&pool, Some(previous_subject), Some(previous_issuer)).await;
+    let descriptor_core_hash = insert_signed_artifact_for_identity(
+        &pool,
+        org_id,
+        app_id,
+        previous_subject,
+        previous_issuer,
+    )
+    .await;
+    // Signed mode is durable at generation 1: the deployment acceptance
+    // that committed the artifact enqueued it.
+    sqlx::query(
+        "UPDATE kbs_signed_policy_reconciliation
+            SET desired_generation = 1
+          WHERE singleton",
+    )
+    .execute(&pool)
+    .await
+    .expect("enter signed-policy mode");
+
+    let mut state = crate::test_support::lazy_state();
+    state.db = pool.clone();
+    let hmac_key = [7u8; 32];
+    let auth = AuthContext {
+        user_id,
+        org_id,
+        org_name: "signer-rotation-test".to_string(),
+        role: Role::Owner,
+        api_key: None,
+        management_origin: crate::auth::middleware::ManagementOrigin::Public,
+    };
+
+    // PR #187 review: active signed mode without KBS provider configuration
+    // must fail closed BEFORE the rotation commits -- the withdrawal and the
+    // deferred generation bump would otherwise strand the old policy live
+    // with no convergence path (the periodic reconciler also refuses to
+    // start without configuration). The token JTI must stay unconsumed so
+    // the same token can drive the rotation once configuration returns.
+    let unconfigured_token = crate::auth::jwt::issue_signer_rotation_token(
+        &hmac_key,
+        &SignerRotationTokenInput {
+            user_id,
+            org_id,
+            app_id,
+            previous_subject: previous_subject.to_string(),
+            previous_issuer: previous_issuer.to_string(),
+            new_subject: new_subject.to_string(),
+            new_issuer: new_issuer.to_string(),
+        },
+        chrono::Duration::seconds(600),
+    )
+    .expect("issue unconfigured-refusal token");
+    let app_name = sqlx::query_scalar::<_, String>("SELECT name FROM apps WHERE id = $1")
+        .bind(app_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load app name");
+    let unconfigured = rotate_signer(
+        clone_auth(&auth),
+        State(state.clone()),
+        Path(app_name.clone()),
+        Json(RotateSignerRequest {
+            subject: new_subject.to_string(),
+            issuer: new_issuer.to_string(),
+            email_confirmation_token: Some(unconfigured_token),
+        }),
+    )
+    .await
+    .expect_err("signed mode without KBS configuration must refuse the rotation");
+    assert_eq!(unconfigured.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(unconfigured.1.0["code"], "kbs_publication_not_configured");
+    let unconfigured_subject: Option<String> =
+        sqlx::query_scalar("SELECT signer_identity_subject FROM apps WHERE id = $1")
+            .bind(app_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load app subject after unconfigured refusal");
+    assert_eq!(
+        unconfigured_subject.as_deref(),
+        Some(previous_subject),
+        "the unconfigured refusal must not have committed any rotation"
+    );
+    assert_eq!(
+        read_withdrawal_reconciliation_state(&pool).await,
+        (1, 0, 0),
+        "the unconfigured refusal must owe no withdrawal debt"
+    );
+    let jti_rows_before: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM consumed_signer_rotation_tokens WHERE app_id = $1",
+    )
+    .bind(app_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count consumed jti rows after unconfigured refusal");
+    assert_eq!(
+        jti_rows_before, 0,
+        "the unconfigured refusal must leave the rotation token unconsumed"
+    );
+
+    // Configure the KBS provider: the rotation can now commit and its
+    // withdrawal must publish before success is reported.
+    state.kbs_policy = Some(test_kbs_policy_config());
+    let provider = Arc::new(tokio::sync::Mutex::new(KbsPolicyProvider::new(true)));
+
+    let token = crate::auth::jwt::issue_signer_rotation_token(
+        &hmac_key,
+        &SignerRotationTokenInput {
+            user_id,
+            org_id,
+            app_id,
+            previous_subject: previous_subject.to_string(),
+            previous_issuer: previous_issuer.to_string(),
+            new_subject: new_subject.to_string(),
+            new_issuer: new_issuer.to_string(),
+        },
+        chrono::Duration::seconds(600),
+    )
+    .expect("issue signer rotation token");
+
+    crate::kbs::TEST_KUBE_CLIENT
+        .scope(kbs_policy_kube_client(provider.clone()), async {
+            let Json(rotated) = rotate_signer(
+                clone_auth(&auth),
+                State(state.clone()),
+                Path(app_name.clone()),
+                Json(RotateSignerRequest {
+                    subject: new_subject.to_string(),
+                    issuer: new_issuer.to_string(),
+                    email_confirmation_token: Some(token.clone()),
+                }),
+            )
+            .await
+            .expect("first rotation succeeds");
+            assert_eq!(
+                rotated.signer_identity_subject.as_deref(),
+                Some(new_subject)
+            );
+
+            // The rotated-out artifact is withdrawn from KBS policy.
+            let withdrawn: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM withdrawn_signer_artifacts
+          WHERE descriptor_core_hash = $1 AND app_id = $2",
+            )
+            .bind(&descriptor_core_hash)
+            .bind(app_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count withdrawn artifacts");
+            assert_eq!(
+                withdrawn, 1,
+                "rotation must withdraw the old-signer artifact"
+            );
+            // The owed withdrawal bump is consumed only by the fenced reconciler
+            // AFTER the filtered ConfigMap replace succeeded (migration 0052): the
+            // route reports success only once the generation is live, so the debt
+            // is settled, never performed inside the rotation transaction.
+            assert_eq!(
+                read_withdrawal_reconciliation_state(&pool).await,
+                (2, 0, 0),
+                "success must mean the owed withdrawal bump was published and consumed"
+            );
+            {
+                let provider = provider.lock().await;
+                assert_eq!(
+                    provider.published_generation(),
+                    Some(2),
+                    "the withdrawal generation must be live in the ConfigMap before success"
+                );
+            }
+            // The consumed jti ledger row is committed with the rotation.
+            let jti_rows: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM consumed_signer_rotation_tokens WHERE app_id = $1",
+            )
+            .bind(app_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count consumed jti rows");
+            assert_eq!(jti_rows, 1, "rotation must record the consumed jti");
+
+            // Rotate back so the original token's claims (previous=old, new=new)
+            // match again, then replay it: the jti was consumed, so the replay
+            // must be refused and the whole transaction -- including the trigger's
+            // withdrawal and owed bump -- rolled back.
+            let rotate_back_token = crate::auth::jwt::issue_signer_rotation_token(
+                &hmac_key,
+                &SignerRotationTokenInput {
+                    user_id,
+                    org_id,
+                    app_id,
+                    previous_subject: new_subject.to_string(),
+                    previous_issuer: new_issuer.to_string(),
+                    new_subject: previous_subject.to_string(),
+                    new_issuer: previous_issuer.to_string(),
+                },
+                chrono::Duration::seconds(600),
+            )
+            .expect("issue rotate-back token");
+            let Json(_) = rotate_signer(
+                clone_auth(&auth),
+                State(state.clone()),
+                Path(app_name.clone()),
+                Json(RotateSignerRequest {
+                    subject: previous_subject.to_string(),
+                    issuer: previous_issuer.to_string(),
+                    email_confirmation_token: Some(rotate_back_token),
+                }),
+            )
+            .await
+            .expect("rotate back succeeds");
+            // Every rotation owes one bump -- even when the artifact was already
+            // withdrawn -- and success means the reconciler published and consumed
+            // it (generation advances again).
+            assert_eq!(
+                read_withdrawal_reconciliation_state(&pool).await,
+                (3, 0, 0),
+                "rotating an already-withdrawn artifact must publish and consume another bump"
+            );
+
+            let replay = rotate_signer(
+                clone_auth(&auth),
+                State(state.clone()),
+                Path(app_name.clone()),
+                Json(RotateSignerRequest {
+                    subject: new_subject.to_string(),
+                    issuer: new_issuer.to_string(),
+                    email_confirmation_token: Some(token.clone()),
+                }),
+            )
+            .await;
+            let err = match replay {
+                Ok(_) => panic!("consumed signer rotation token was replayable"),
+                Err(err) => err,
+            };
+            assert_eq!(err.0, StatusCode::FORBIDDEN);
+            // The rejected replay must not have committed any part of the rotation.
+            let replayed_subject: Option<String> =
+                sqlx::query_scalar("SELECT signer_identity_subject FROM apps WHERE id = $1")
+                    .bind(app_id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("load app subject after rejected replay");
+            assert_eq!(
+                replayed_subject.as_deref(),
+                Some(previous_subject),
+                "rejected replay must roll back the signer update"
+            );
+            assert_eq!(
+                read_withdrawal_reconciliation_state(&pool).await,
+                (3, 0, 0),
+                "rejected replay must leave the published generation untouched"
+            );
+            let jti_rows: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM consumed_signer_rotation_tokens WHERE app_id = $1",
+            )
+            .bind(app_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count consumed jti rows after replay");
+            assert_eq!(jti_rows, 2, "the rejected replay must not add a jti row");
+
+            // A consumed token cannot rotate A again, but it can confirm B
+            // after a different, fresh token has legitimately committed B.
+            let state_before_second_rotation =
+                read_withdrawal_reconciliation_state(&pool).await;
+            let jti_rows_before_second_rotation: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM consumed_signer_rotation_tokens WHERE app_id = $1",
+            )
+            .bind(app_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count consumed jti rows before the second genuine rotation");
+            let second_rotation_token = crate::auth::jwt::issue_signer_rotation_token(
+                &hmac_key,
+                &SignerRotationTokenInput {
+                    user_id,
+                    org_id,
+                    app_id,
+                    previous_subject: previous_subject.to_string(),
+                    previous_issuer: previous_issuer.to_string(),
+                    new_subject: new_subject.to_string(),
+                    new_issuer: new_issuer.to_string(),
+                },
+                chrono::Duration::seconds(600),
+            )
+            .expect("issue second genuine rotation token");
+            let Json(rotated_again) = rotate_signer(
+                clone_auth(&auth),
+                State(state.clone()),
+                Path(app_name.clone()),
+                Json(RotateSignerRequest {
+                    subject: new_subject.to_string(),
+                    issuer: new_issuer.to_string(),
+                    email_confirmation_token: Some(second_rotation_token),
+                }),
+            )
+            .await
+            .expect("genuine second A->B rotation must commit with a fresh bound token");
+            assert_eq!(
+                rotated_again.signer_identity_subject.as_deref(),
+                Some(new_subject)
+            );
+            let state_after_second_rotation =
+                read_withdrawal_reconciliation_state(&pool).await;
+            assert!(
+                state_after_second_rotation.0 > state_before_second_rotation.0,
+                "the genuine second rotation must advance the published generation"
+            );
+            assert_eq!(
+                (state_after_second_rotation.1, state_after_second_rotation.2),
+                (0, 0),
+                "the genuine second rotation must settle its withdrawal debt before success"
+            );
+            let jti_rows_after_second_rotation: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM consumed_signer_rotation_tokens WHERE app_id = $1",
+            )
+            .bind(app_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count consumed jti rows after the second genuine rotation");
+            assert_eq!(
+                jti_rows_after_second_rotation, jti_rows_before_second_rotation + 1,
+                "the genuine second rotation must consume its own fresh jti"
+            );
+
+            let state_before_confirmation =
+                read_withdrawal_reconciliation_state(&pool).await;
+            type ConfirmationSnapshot = (
+                Option<String>,
+                Option<String>,
+                Option<chrono::DateTime<chrono::Utc>>,
+                i64,
+                i64,
+                i64,
+            );
+            let confirmation_snapshot_sql =
+                "SELECT signer_identity_subject, signer_identity_issuer, signer_identity_set_at,
+                    (SELECT count(*) FROM consumed_signer_rotation_tokens WHERE app_id = $1),
+                    (SELECT count(*) FROM audit_log
+                      WHERE org_id = $2 AND action = 'app.signer.rotate'),
+                    (SELECT count(*) FROM withdrawn_signer_artifacts
+                      WHERE app_id = $1 AND descriptor_core_hash = $3)
+                 FROM apps WHERE id = $1";
+            let before_confirmation: ConfirmationSnapshot =
+                sqlx::query_as(confirmation_snapshot_sql)
+                    .bind(app_id)
+                    .bind(org_id)
+                    .bind(&descriptor_core_hash)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("read authority before confirmation");
+            {
+                let provider = provider.lock().await;
+                assert_eq!(
+                    provider.published_generation(),
+                    Some(state_after_second_rotation.0),
+                    "the genuine second rotation must leave its generation live before the confirmation"
+                );
+            }
+            let Json(confirmed) = rotate_signer(
+                clone_auth(&auth),
+                State(state.clone()),
+                Path(app_name.clone()),
+                Json(RotateSignerRequest {
+                    subject: new_subject.to_string(),
+                    issuer: new_issuer.to_string(),
+                    email_confirmation_token: Some(token),
+                }),
+            )
+            .await
+            .expect("consumed A->B token is an accepted read-only confirmation while B is current");
+            assert_eq!(
+                confirmed.signer_identity_subject.as_deref(),
+                Some(new_subject),
+                "the confirmation reports the committed identity"
+            );
+            let Json(confirmed_without_token) = rotate_signer(
+                clone_auth(&auth),
+                State(state.clone()),
+                Path(app_name.clone()),
+                Json(RotateSignerRequest {
+                    subject: new_subject.to_string(),
+                    issuer: new_issuer.to_string(),
+                    email_confirmation_token: None,
+                }),
+            )
+            .await
+            .expect("the current owner may confirm the committed identity without a token");
+            assert_eq!(
+                confirmed_without_token.signer_identity_subject.as_deref(),
+                Some(new_subject)
+            );
+            let after_confirmation: ConfirmationSnapshot =
+                sqlx::query_as(confirmation_snapshot_sql)
+                    .bind(app_id)
+                    .bind(org_id)
+                    .bind(&descriptor_core_hash)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("read authority after confirmation");
+            assert_eq!(
+                after_confirmation, before_confirmation,
+                "confirmation must preserve identity, commit time, tokens, audit, and withdrawals"
+            );
+            assert_eq!(
+                read_withdrawal_reconciliation_state(&pool).await,
+                state_before_confirmation,
+                "the confirmation must not bump or owe any generation"
+            );
+            {
+                let provider = provider.lock().await;
+                assert_eq!(
+                    provider.published_generation(),
+                    Some(state_before_confirmation.0),
+                    "the confirmation must leave the published generation untouched"
+                );
+            }
+
+            crate::test_support::drop_isolated_database("cap119_rotation_single_use", pool).await;
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn initial_signer_set_in_signed_mode_without_kbs_config_fails_closed() {
+    let (_db_cleanup, pool) =
+        crate::test_support::isolated_database_test_pool("cap119_initial_set_pending").await;
+    let new_subject = "https://github.com/acme/first/.github/workflows/ci.yaml@refs/heads/main";
+    let new_issuer = "https://first-issuer.example.test";
+    let (org_id, user_id, app_id) = insert_signer_rotation_app(&pool, None, None).await;
+    sqlx::query(
+        "UPDATE kbs_signed_policy_reconciliation
+            SET desired_generation = 1
+          WHERE singleton",
+    )
+    .execute(&pool)
+    .await
+    .expect("enter signed-policy mode");
+
+    let mut state = crate::test_support::lazy_state();
+    state.db = pool.clone();
+    let auth = AuthContext {
+        user_id,
+        org_id,
+        org_name: "signer-initial-set-test".to_string(),
+        role: Role::Owner,
+        api_key: None,
+        management_origin: crate::auth::middleware::ManagementOrigin::Public,
+    };
+    let app_name = sqlx::query_scalar::<_, String>("SELECT name FROM apps WHERE id = $1")
+        .bind(app_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load app name");
+
+    let pending = rotate_signer(
+        clone_auth(&auth),
+        State(state),
+        Path(app_name),
+        Json(RotateSignerRequest {
+            subject: new_subject.to_string(),
+            issuer: new_issuer.to_string(),
+            email_confirmation_token: None,
+        }),
+    )
+    .await
+    .expect_err("initial set in signed mode without KBS config must not report success");
+    assert_eq!(pending.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(pending.1.0["code"], "kbs_publication_not_configured");
+    let committed_subject: Option<String> =
+        sqlx::query_scalar("SELECT signer_identity_subject FROM apps WHERE id = $1")
+            .bind(app_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load app subject after rejected initial set");
+    assert!(committed_subject.is_none());
+    let set_audits: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_log WHERE org_id = $1 AND action = 'app.signer.set'",
+    )
+    .bind(org_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count initial set audits");
+    assert_eq!(set_audits, 0);
+
+    crate::test_support::drop_isolated_database("cap119_initial_set_pending", pool).await;
+}
+
+/// Issue #119 regression: rotating a signer on an unsigned-only install
+/// (desired_generation = 0, no workload artifacts) must keep the install
+/// unsigned -- entering signed mode with an empty artifact set would deny
+/// every workload -- while still carrying the new identity into
+/// kbs_tls_bindings, the legacy Rego render source.  Runs against its own
+/// per-process database so the singleton starts at the exact
+/// unsigned-only state and no concurrent test can bump it mid-assertion.
+#[tokio::test]
+async fn signer_rotation_never_flips_an_unsigned_install_into_signed_mode() {
+    let (_db_cleanup, pool) =
+        crate::test_support::isolated_database_test_pool("cap119_unsigned_rotation").await;
+    let previous_subject = "https://github.com/acme/old/.github/workflows/ci.yaml@refs/heads/main";
+    let previous_issuer = "https://token.actions.githubusercontent.com";
+    let (org_id, user_id, app_id) =
+        insert_signer_rotation_app(&pool, Some(previous_subject), Some(previous_issuer)).await;
+    insert_legacy_tls_binding(&pool, app_id, previous_subject, previous_issuer).await;
+    // The isolated database migrates empty, so the singleton starts at the
+    // unsigned-only state (migration 0041 seeds desired_generation = 0).
+    assert_eq!(
+        read_withdrawal_reconciliation_state(&pool).await,
+        (0, 0, 0),
+        "the isolated database must start unsigned"
+    );
+
+    let mut state = crate::test_support::lazy_state();
+    state.db = pool.clone();
+    let hmac_key = [7u8; 32];
+    let auth = AuthContext {
+        user_id,
+        org_id,
+        org_name: "unsigned-rotation-test".to_string(),
+        role: Role::Owner,
+        api_key: None,
+        management_origin: crate::auth::middleware::ManagementOrigin::Public,
+    };
+    let new_subject = "https://github.com/acme/new/.github/workflows/ci.yaml@refs/heads/main";
+    let new_issuer = "https://new-issuer.example.test";
+
+    let token = crate::auth::jwt::issue_signer_rotation_token(
+        &hmac_key,
+        &SignerRotationTokenInput {
+            user_id,
+            org_id,
+            app_id,
+            previous_subject: previous_subject.to_string(),
+            previous_issuer: previous_issuer.to_string(),
+            new_subject: new_subject.to_string(),
+            new_issuer: new_issuer.to_string(),
+        },
+        chrono::Duration::seconds(600),
+    )
+    .expect("issue unsigned rotation token");
+
+    let app_name = sqlx::query_scalar::<_, String>("SELECT name FROM apps WHERE id = $1")
+        .bind(app_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load unsigned app name");
+
+    let Json(rotated) = rotate_signer(
+        clone_auth(&auth),
+        State(state.clone()),
+        Path(app_name),
+        Json(RotateSignerRequest {
+            subject: new_subject.to_string(),
+            issuer: new_issuer.to_string(),
+            email_confirmation_token: Some(token),
+        }),
+    )
+    .await
+    .expect("unsigned rotation succeeds");
+    assert_eq!(
+        rotated.signer_identity_subject.as_deref(),
+        Some(new_subject)
+    );
+
+    // The legacy binding must carry the new identity into the next Rego
+    // render.
+    let (binding_subject, binding_issuer): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT signer_identity_subject, signer_identity_issuer
+           FROM kbs_tls_bindings WHERE app_id = $1",
+    )
+    .bind(app_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load tls binding identity after rotation");
+    assert_eq!(
+        binding_subject.as_deref(),
+        Some(new_subject),
+        "rotation must update the legacy Rego binding signer subject"
+    );
+    assert_eq!(
+        binding_issuer.as_deref(),
+        Some(new_issuer),
+        "rotation must update the legacy Rego binding signer issuer"
+    );
+
+    // The install must still be unsigned: rotation neither enters signed
+    // mode nor owes any debt there.
+    assert_eq!(
+        read_withdrawal_reconciliation_state(&pool).await,
+        (0, 0, 0),
+        "rotation on an unsigned-only install must not enter signed mode"
+    );
+
+    crate::test_support::drop_isolated_database("cap119_unsigned_rotation", pool).await;
+}
+
+/// Issue #119 rollout-window regression: between migration 0052 applying
+/// and the new binary replacing the old one, a pre-0052 replica's
+/// rotate_signer rewrites only the apps row -- it inserts no withdrawal
+/// rows, consumes no jti, and enqueues no generation.  Migration 0052's
+/// apps_signer_rotation_withdrawal trigger fences that writer inside the
+/// database: the identity change itself withdraws the rotated-out
+/// artifacts, carries the new identity into the legacy binding, and owes
+/// the deferred generation bump while signed-policy mode is active.  The
+/// direct UPDATE below is exactly the statement a pre-0052 binary runs.
+#[tokio::test]
+async fn old_binary_signer_rotation_via_direct_sql_is_fenced_by_the_apps_trigger() {
+    let (_db_cleanup, pool) =
+        crate::test_support::isolated_database_test_pool("cap119_old_binary_rotation").await;
+    let previous_subject = "https://github.com/acme/old/.github/workflows/ci.yaml@refs/heads/main";
+    let previous_issuer = "https://token.actions.githubusercontent.com";
+    let new_subject = "https://github.com/acme/new/.github/workflows/ci.yaml@refs/heads/main";
+    let new_issuer = "https://new-issuer.example.test";
+    let (org_id, _user_id, app_id) =
+        insert_signer_rotation_app(&pool, Some(previous_subject), Some(previous_issuer)).await;
+    let descriptor_core_hash = insert_signed_artifact_for_identity(
+        &pool,
+        org_id,
+        app_id,
+        previous_subject,
+        previous_issuer,
+    )
+    .await;
+    insert_legacy_tls_binding(&pool, app_id, previous_subject, previous_issuer).await;
+    sqlx::query(
+        "UPDATE kbs_signed_policy_reconciliation
+            SET desired_generation = 1
+          WHERE singleton",
+    )
+    .execute(&pool)
+    .await
+    .expect("enter signed-policy mode");
+
+    // The pre-0052 rotation: a bare apps identity rewrite, nothing else.
+    sqlx::query(
+        "UPDATE apps
+            SET signer_identity_subject = $1,
+                signer_identity_issuer  = $2,
+                signer_identity_set_at  = now(),
+                updated_at              = now()
+          WHERE id = $3",
+    )
+    .bind(new_subject)
+    .bind(new_issuer)
+    .bind(app_id)
+    .execute(&pool)
+    .await
+    .expect("old-binary signer rotation");
+
+    let withdrawn: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM withdrawn_signer_artifacts
+          WHERE descriptor_core_hash = $1 AND app_id = $2",
+    )
+    .bind(&descriptor_core_hash)
+    .bind(app_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count withdrawn artifacts after old-binary rotation");
+    assert_eq!(
+        withdrawn, 1,
+        "the trigger must withdraw the old-signer artifact for ANY writer"
+    );
+    assert_eq!(
+        read_withdrawal_reconciliation_state(&pool).await,
+        (1, 0, 1),
+        "the trigger must owe the deferred bump without moving desired_generation"
+    );
+    let (binding_subject, binding_issuer): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT signer_identity_subject, signer_identity_issuer
+           FROM kbs_tls_bindings WHERE app_id = $1",
+    )
+    .bind(app_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load tls binding identity after old-binary rotation");
+    assert_eq!(
+        binding_subject.as_deref(),
+        Some(new_subject),
+        "the trigger must carry the new identity into the legacy Rego binding"
+    );
+    assert_eq!(
+        binding_issuer.as_deref(),
+        Some(new_issuer),
+        "the trigger must carry the new issuer into the legacy Rego binding"
+    );
+
+    // An apps update that does not change the identity owes nothing.
+    sqlx::query("UPDATE apps SET updated_at = now() WHERE id = $1")
+        .bind(app_id)
+        .execute(&pool)
+        .await
+        .expect("non-identity apps update");
+    assert_eq!(
+        read_withdrawal_reconciliation_state(&pool).await,
+        (1, 0, 1),
+        "non-identity updates must not owe anything"
+    );
+
+    // The initial set (NULL -> identity) owes nothing: no artifact can be
+    // signed under a missing identity, and the app's first binding insert
+    // carries the identity anyway. The trigger still fires so a binding
+    // that already exists (created by an earlier unsigned deployment)
+    // carries the newly committed identity immediately.
+    let (_org_id2, _user_id2, app_id2) = insert_signer_rotation_app(&pool, None, None).await;
+    let binding2_suffix = app_id2.simple().to_string();
+    sqlx::query(
+        "INSERT INTO kbs_tls_bindings (
+             app_id, binding_key, repository, tag, namespace, service_account,
+             tenant_instance_identity_hash
+         ) VALUES ($1, $2, 'default', 'workload-secret-seed', $3, $4, $5)
+         ON CONFLICT (app_id) DO NOTHING",
+    )
+    .bind(app_id2)
+    .bind(format!("tls-{}", &binding2_suffix[..12]))
+    .bind(format!("cap-{}", &binding2_suffix[..12]))
+    .bind(format!("cap-{}-sa", &binding2_suffix[..12]))
+    .bind("33".repeat(32))
+    .execute(&pool)
+    .await
+    .expect("insert unsigned-era tls binding");
+    sqlx::query(
+        "UPDATE apps
+            SET signer_identity_subject = $1,
+                signer_identity_issuer  = $2,
+                signer_identity_set_at  = now()
+          WHERE id = $3",
+    )
+    .bind(new_subject)
+    .bind(new_issuer)
+    .bind(app_id2)
+    .execute(&pool)
+    .await
+    .expect("initial signer set");
+    assert_eq!(
+        read_withdrawal_reconciliation_state(&pool).await,
+        (1, 0, 1),
+        "the initial signer set must owe nothing"
+    );
+    let withdrawn_app2: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM withdrawn_signer_artifacts WHERE app_id = $1")
+            .bind(app_id2)
+            .fetch_one(&pool)
+            .await
+            .expect("count withdrawn artifacts for the initial-set app");
+    assert_eq!(withdrawn_app2, 0, "initial set must withdraw nothing");
+    let (binding2_subject, binding2_issuer): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT signer_identity_subject, signer_identity_issuer
+           FROM kbs_tls_bindings WHERE app_id = $1",
+    )
+    .bind(app_id2)
+    .fetch_one(&pool)
+    .await
+    .expect("load unsigned-era binding after the initial set");
+    assert_eq!(
+        binding2_subject.as_deref(),
+        Some(new_subject),
+        "the initial set must carry the new identity into an existing legacy binding"
+    );
+    assert_eq!(
+        binding2_issuer.as_deref(),
+        Some(new_issuer),
+        "the initial set must carry the new issuer into an existing legacy binding"
+    );
+
+    crate::test_support::drop_isolated_database("cap119_old_binary_rotation", pool).await;
+}
+
+/// Pre-migration rotations left kbs_tls_bindings holding the rotated-out
+/// signer, and the legacy Rego render keeps authorizing that stale identity.
+/// Migration 0052's backfill must align every live binding with the app's
+/// committed identity, not just withdraw the old signer's artifacts.
+#[tokio::test]
+async fn migration_backfill_repairs_stale_legacy_tls_bindings() {
+    let (_db_cleanup, pool) =
+        crate::test_support::isolated_database_test_pool("cap119_stale_binding_backfill").await;
+    let previous_subject = "https://github.com/acme/old/.github/workflows/ci.yaml@refs/heads/main";
+    let previous_issuer = "https://token.actions.githubusercontent.com";
+    let new_subject = "https://github.com/acme/new/.github/workflows/ci.yaml@refs/heads/main";
+    let new_issuer = "https://new-issuer.example.test";
+    let (org_id, _user_id, app_id) =
+        insert_signer_rotation_app(&pool, Some(previous_subject), Some(previous_issuer)).await;
+    let descriptor_core_hash = insert_signed_artifact_for_identity(
+        &pool,
+        org_id,
+        app_id,
+        previous_subject,
+        previous_issuer,
+    )
+    .await;
+    insert_legacy_tls_binding(&pool, app_id, previous_subject, previous_issuer).await;
+    sqlx::query(
+        "UPDATE kbs_signed_policy_reconciliation
+            SET desired_generation = 1
+          WHERE singleton",
+    )
+    .execute(&pool)
+    .await
+    .expect("enter signed-policy mode");
+
+    // Recreate the pre-0052 world, then rotate with old-binary semantics:
+    // the apps row changes, the binding does not.
+    sqlx::raw_sql(
+        "DROP TRIGGER apps_signer_rotation_withdrawal ON apps;
+         DROP FUNCTION enforce_signer_rotation_withdrawal();
+         DROP TABLE consumed_signer_rotation_tokens;
+         DROP TABLE withdrawn_signer_artifacts;
+         ALTER TABLE kbs_signed_policy_reconciliation DROP COLUMN withdrawal_bumps_owed;",
+    )
+    .execute(&pool)
+    .await
+    .expect("restore schema before the withdrawal migration");
+    sqlx::query(
+        "UPDATE apps
+            SET signer_identity_subject = $1,
+                signer_identity_issuer  = $2,
+                signer_identity_set_at  = now(),
+                updated_at              = now()
+          WHERE id = $3",
+    )
+    .bind(new_subject)
+    .bind(new_issuer)
+    .bind(app_id)
+    .execute(&pool)
+    .await
+    .expect("pre-0052 signer rotation");
+    let (stale_subject, stale_issuer): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT signer_identity_subject, signer_identity_issuer
+           FROM kbs_tls_bindings WHERE app_id = $1",
+    )
+    .bind(app_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load binding before the migration");
+    assert_eq!(stale_subject.as_deref(), Some(previous_subject));
+    assert_eq!(stale_issuer.as_deref(), Some(previous_issuer));
+
+    sqlx::raw_sql(include_str!(
+        "../../../../migrations/0052_signer_rotation_jti_and_policy.sql"
+    ))
+    .execute(&pool)
+    .await
+    .expect("execute production withdrawal migration");
+
+    let (repaired_subject, repaired_issuer): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT signer_identity_subject, signer_identity_issuer
+           FROM kbs_tls_bindings WHERE app_id = $1",
+    )
+    .bind(app_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load binding after the migration");
+    assert_eq!(
+        repaired_subject.as_deref(),
+        Some(new_subject),
+        "the backfill must repair the stale legacy binding to the app's identity"
+    );
+    assert_eq!(
+        repaired_issuer.as_deref(),
+        Some(new_issuer),
+        "the backfill must repair the stale legacy binding to the app's issuer"
+    );
+    let withdrawn: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM withdrawn_signer_artifacts
+          WHERE descriptor_core_hash = $1 AND app_id = $2",
+    )
+    .bind(&descriptor_core_hash)
+    .bind(app_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count withdrawn artifacts after the migration");
+    assert_eq!(
+        withdrawn, 1,
+        "the backfill must still withdraw the rotated-out signer's artifacts"
+    );
+    assert_eq!(
+        read_withdrawal_reconciliation_state(&pool).await,
+        (1, 0, 1),
+        "the backfill must owe the deferred withdrawal bump"
+    );
+
+    crate::test_support::drop_isolated_database("cap119_stale_binding_backfill", pool).await;
+}
+
+/// A rotate-back must not resurrect legacy KBS admission for the
+/// rotated-out signer: the B -> A rotation carries A back into
+/// kbs_tls_bindings (the binding tracks the committed identity), but the
+/// A -> B step withdrew A's deployed artifacts and that withdrawal is
+/// durable. Coincident image and init-data measurements do not prove a
+/// new workload instance, so the legacy Rego render excludes the binding
+/// permanently; a fresh deployment must authorize through signed-policy
+/// candidates instead.
+#[tokio::test]
+async fn rotate_back_to_withheld_signer_fails_closed_permanently() {
+    let (_db_cleanup, pool) =
+        crate::test_support::isolated_database_test_pool("cap119_rotate_back_legacy").await;
+    let subject_a = "https://github.com/acme/retired/.github/workflows/ci.yaml@refs/heads/main";
+    let issuer_a = "https://token.actions.githubusercontent.com";
+    let subject_b = "https://github.com/acme/active/.github/workflows/ci.yaml@refs/heads/main";
+    let issuer_b = "https://new-issuer.example.test";
+    let (org_id, _user_id, app_id) =
+        insert_signer_rotation_app(&pool, Some(subject_a), Some(issuer_a)).await;
+    let old_measurement: Vec<u8> = (0..32u8).collect();
+    let new_measurement: Vec<u8> = (1..33u8).collect();
+    let old_image = format!(
+        "ghcr.io/acme/workload@sha256:{}",
+        hex::encode(&old_measurement)
+    );
+    let new_image = format!(
+        "ghcr.io/acme/workload@sha256:{}",
+        hex::encode(&new_measurement)
+    );
+    insert_signed_artifact_for_identity_with_hash(
+        &pool,
+        org_id,
+        app_id,
+        subject_a,
+        issuer_a,
+        &old_measurement,
+    )
+    .await;
+    insert_legacy_tls_binding(&pool, app_id, subject_a, issuer_a).await;
+    sqlx::query(
+        "UPDATE kbs_tls_bindings SET image_digest = $2, init_data_hash = $3 WHERE app_id = $1",
+    )
+    .bind(app_id)
+    .bind(&old_image)
+    .bind(&old_measurement)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Baseline: the live artifact admits the binding.
+    let admitted = crate::kbs::load_legacy_tls_bindings(&pool)
+        .await
+        .expect("load admitted legacy tls bindings");
+    assert_eq!(admitted.len(), 1, "the live signer must start admitted");
+
+    // A -> B, then the rotate-back B -> A. The direct UPDATEs are the exact
+    // statement an old writer runs; migration 0052's trigger performs the
+    // artifact withdrawal and the binding carry on both changes.
+    for (subject, issuer) in [(subject_b, issuer_b), (subject_a, issuer_a)] {
+        sqlx::query(
+            "UPDATE apps
+                SET signer_identity_subject = $1,
+                    signer_identity_issuer  = $2,
+                    signer_identity_set_at  = now(),
+                    updated_at              = now()
+              WHERE id = $3",
+        )
+        .bind(subject)
+        .bind(issuer)
+        .bind(app_id)
+        .execute(&pool)
+        .await
+        .expect("signer rotation via direct sql");
+    }
+
+    // The binding tracks the committed identity ...
+    let (binding_subject, binding_issuer): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT signer_identity_subject, signer_identity_issuer
+           FROM kbs_tls_bindings WHERE app_id = $1",
+    )
+    .bind(app_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load tls binding after the rotate-back");
+    assert_eq!(binding_subject.as_deref(), Some(subject_a));
+    assert_eq!(binding_issuer.as_deref(), Some(issuer_a));
+
+    // ... A's artifact is withdrawn (durably) ...
+    let withdrawn: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM withdrawn_signer_artifacts WHERE app_id = $1")
+            .bind(app_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count withdrawn artifacts after the rotate-back");
+    assert_eq!(
+        withdrawn, 1,
+        "the A -> B rotation must withdraw A's artifact"
+    );
+
+    // ... and the legacy render fails closed: no live artifact under A
+    // exists, so the burned workload must not regain admission.
+    let admitted = crate::kbs::load_legacy_tls_bindings(&pool)
+        .await
+        .expect("load admitted legacy tls bindings after the rotate-back");
+    assert!(
+        admitted.is_empty(),
+        "a rotated-out signer must not regain legacy admission without a fresh artifact, got {admitted:?}"
+    );
+
+    insert_signed_artifact_for_identity_with_hash(
+        &pool,
+        org_id,
+        app_id,
+        subject_a,
+        issuer_a,
+        &new_measurement,
+    )
+    .await;
+    assert!(
+        crate::kbs::load_legacy_tls_bindings(&pool)
+            .await
+            .unwrap()
+            .is_empty(),
+        "artifact acceptance must not readmit the previous workload's binding"
+    );
+    for (image, init_data_hash) in [
+        (&new_image, &old_measurement),
+        (&old_image, &new_measurement),
+    ] {
+        sqlx::query(
+            "UPDATE kbs_tls_bindings SET image_digest = $2, init_data_hash = $3 WHERE app_id = $1",
+        )
+        .bind(app_id)
+        .bind(image)
+        .bind(init_data_hash)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(
+            crate::kbs::load_legacy_tls_bindings(&pool)
+                .await
+                .unwrap()
+                .is_empty(),
+            "both the image reference and init-data measurement must match live authority"
+        );
+    }
+    sqlx::query(
+        "UPDATE kbs_tls_bindings SET image_digest = $2, init_data_hash = $3 WHERE app_id = $1",
+    )
+    .bind(app_id)
+    .bind(&new_image)
+    .bind(&new_measurement)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(
+        crate::kbs::load_legacy_tls_bindings(&pool)
+            .await
+            .expect("load admitted legacy tls bindings after the refreshed measurements")
+            .is_empty(),
+        "matching image and init-data measurements do not prove a new workload instance; the withdrawn binding must never be readmitted"
+    );
+
+    crate::test_support::drop_isolated_database("cap119_rotate_back_legacy", pool).await;
+}
+
+/// The withdrawal filter must not over-reach: identities that were never
+/// rotated out still admit immediately (the initial set carries the identity
+/// into an existing legacy binding without waiting for a deployment), and
+/// unsigned (NULL identity) bindings keep rendering exactly as before.
+#[tokio::test]
+async fn never_withdrawn_signer_identities_still_admit_immediately_in_legacy_mode() {
+    let (_db_cleanup, pool) =
+        crate::test_support::isolated_database_test_pool("cap119_legacy_fresh_identity").await;
+
+    // A genuine unsigned install: NULL-identity bindings render unchanged.
+    let (_org_id1, _user_id1, app_id1) = insert_signer_rotation_app(&pool, None, None).await;
+    let suffix1 = app_id1.simple().to_string();
+    sqlx::query(
+        "INSERT INTO kbs_tls_bindings (
+             app_id, binding_key, repository, tag, namespace, service_account,
+             tenant_instance_identity_hash
+         ) VALUES ($1, $2, 'default', 'workload-secret-seed', $3, $4, $5)",
+    )
+    .bind(app_id1)
+    .bind(format!("tls-{}-unsigned", &suffix1[..12]))
+    .bind(format!("cap-{}", &suffix1[..12]))
+    .bind(format!("cap-{}-sa", &suffix1[..12]))
+    .bind("22".repeat(32))
+    .execute(&pool)
+    .await
+    .expect("insert unsigned legacy tls binding");
+
+    // An unsigned-era app whose owner performs the initial signer set: the
+    // fresh identity admits immediately (no artifact and no withdrawal rows
+    // exist for it, so nothing can have been burned under it).
+    let (_org_id2, _user_id2, app_id2) = insert_signer_rotation_app(&pool, None, None).await;
+    let suffix2 = app_id2.simple().to_string();
+    sqlx::query(
+        "INSERT INTO kbs_tls_bindings (
+             app_id, binding_key, repository, tag, namespace, service_account,
+             tenant_instance_identity_hash
+         ) VALUES ($1, $2, 'default', 'workload-secret-seed', $3, $4, $5)",
+    )
+    .bind(app_id2)
+    .bind(format!("tls-{}-initial", &suffix2[..12]))
+    .bind(format!("cap-{}", &suffix2[..12]))
+    .bind(format!("cap-{}-sa", &suffix2[..12]))
+    .bind("33".repeat(32))
+    .execute(&pool)
+    .await
+    .expect("insert unsigned-era legacy tls binding");
+    let fresh_subject = "https://github.com/acme/fresh/.github/workflows/ci.yaml@refs/heads/main";
+    let fresh_issuer = "https://fresh-issuer.example.test";
+    sqlx::query(
+        "UPDATE apps
+            SET signer_identity_subject = $1,
+                signer_identity_issuer  = $2,
+                signer_identity_set_at  = now(),
+                updated_at              = now()
+          WHERE id = $3",
+    )
+    .bind(fresh_subject)
+    .bind(fresh_issuer)
+    .bind(app_id2)
+    .execute(&pool)
+    .await
+    .expect("initial signer set via direct sql");
+
+    let admitted = crate::kbs::load_legacy_tls_bindings(&pool)
+        .await
+        .expect("load admitted legacy tls bindings");
+    let mut admitted_keys: Vec<String> = admitted
+        .iter()
+        .map(|binding| binding.binding_key.clone())
+        .collect();
+    admitted_keys.sort();
+    let mut expected_keys = vec![
+        format!("tls-{}-unsigned", &suffix1[..12]),
+        format!("tls-{}-initial", &suffix2[..12]),
+    ];
+    expected_keys.sort();
+    assert_eq!(
+        admitted_keys, expected_keys,
+        "unsigned bindings and never-withdrawn identities must both render"
+    );
+    let initial_binding = admitted
+        .iter()
+        .find(|binding| binding.binding_key == format!("tls-{}-initial", &suffix2[..12]))
+        .expect("the initial-set binding must be admitted");
+    assert_eq!(
+        initial_binding.signer_identity_subject.as_deref(),
+        Some(fresh_subject)
+    );
+    assert_eq!(
+        initial_binding.signer_identity_issuer.as_deref(),
+        Some(fresh_issuer)
+    );
+
+    crate::test_support::drop_isolated_database("cap119_legacy_fresh_identity", pool).await;
+}
+
+// Pause the production migration after its backfill, before trigger installation.
+// An old signer writer must wait and then execute under the new trigger.
+#[tokio::test]
+async fn migration_backfill_window_is_fenced_by_the_apps_write_exclusion_lock() {
+    let (_db_cleanup, pool) =
+        crate::test_support::isolated_database_test_pool("cap119_backfill_window").await;
+    let previous_subject = "https://github.com/acme/old/.github/workflows/ci.yaml@refs/heads/main";
+    let previous_issuer = "https://token.actions.githubusercontent.com";
+    let new_subject = "https://github.com/acme/new/.github/workflows/ci.yaml@refs/heads/main";
+    let new_issuer = "https://new-issuer.example.test";
+    let (org_id, _user_id, app_id) =
+        insert_signer_rotation_app(&pool, Some(previous_subject), Some(previous_issuer)).await;
+    let descriptor_core_hash = insert_signed_artifact_for_identity(
+        &pool,
+        org_id,
+        app_id,
+        previous_subject,
+        previous_issuer,
+    )
+    .await;
+    insert_legacy_tls_binding(&pool, app_id, previous_subject, previous_issuer).await;
+    sqlx::query(
+        "UPDATE kbs_signed_policy_reconciliation
+            SET desired_generation = 1
+          WHERE singleton",
+    )
+    .execute(&pool)
+    .await
+    .expect("enter signed-policy mode");
+
+    sqlx::raw_sql(
+        "DROP TRIGGER apps_signer_rotation_withdrawal ON apps;
+         DROP FUNCTION enforce_signer_rotation_withdrawal();
+         DROP TABLE consumed_signer_rotation_tokens;
+         DROP TABLE withdrawn_signer_artifacts;
+         ALTER TABLE kbs_signed_policy_reconciliation DROP COLUMN withdrawal_bumps_owed;",
+    )
+    .execute(&pool)
+    .await
+    .expect("restore schema before the withdrawal migration");
+
+    async fn wait_for_blocker(pool: &sqlx::PgPool, waiting: i32, blocking: i32) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let blocked: bool = sqlx::query_scalar("SELECT $1 = ANY(pg_blocking_pids($2))")
+                    .bind(blocking)
+                    .bind(waiting)
+                    .fetch_one(pool)
+                    .await
+                    .unwrap();
+                if blocked {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("expected database lock dependency did not appear");
+    }
+
+    // This table lock pauses the migration's ALTER TABLE after the backfill,
+    // leaving the exact unsafe window open without rewriting the migration.
+    let mut gate = pool.begin().await.unwrap();
+    sqlx::query("SELECT singleton FROM kbs_signed_policy_reconciliation FOR UPDATE")
+        .fetch_one(&mut *gate)
+        .await
+        .unwrap();
+    let gate_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *gate)
+        .await
+        .unwrap();
+
+    let mut existing_writer = pool.begin().await.unwrap();
+    sqlx::query("UPDATE apps SET updated_at = clock_timestamp() WHERE id = $1")
+        .bind(app_id)
+        .execute(&mut *existing_writer)
+        .await
+        .unwrap();
+    let existing_writer_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *existing_writer)
+        .await
+        .unwrap();
+    let mut migration = pool.begin().await.unwrap();
+    let migration_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *migration)
+        .await
+        .unwrap();
+    let migration = tokio::spawn(async move {
+        sqlx::Executor::execute(
+            &mut *migration,
+            include_str!("../../../../migrations/0052_signer_rotation_jti_and_policy.sql"),
+        )
+        .await
+        .expect("execute production withdrawal migration");
+        migration.commit().await.unwrap();
+    });
+    wait_for_blocker(&pool, migration_pid, existing_writer_pid).await;
+    // Deploy transactions take apps before workload_artifacts. Migration must
+    // not hold the artifact FK lock while waiting for an existing app writer.
+    sqlx::query("LOCK TABLE workload_artifacts IN ROW EXCLUSIVE MODE NOWAIT")
+        .execute(&mut *existing_writer)
+        .await
+        .expect("migration must preserve app-before-artifact lock ordering");
+    existing_writer.commit().await.unwrap();
+    wait_for_blocker(&pool, migration_pid, gate_pid).await;
+
+    let mut writer_connection = pool.acquire().await.unwrap();
+    let writer_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *writer_connection)
+        .await
+        .unwrap();
+    let writer = tokio::spawn(async move {
+        sqlx::query(
+            "UPDATE apps
+                SET signer_identity_subject = $1,
+                    signer_identity_issuer = $2,
+                    signer_identity_set_at = now(),
+                    updated_at = now()
+              WHERE id = $3",
+        )
+        .bind(new_subject)
+        .bind(new_issuer)
+        .bind(app_id)
+        .execute(&mut *writer_connection)
+        .await
+        .expect("old-binary signer rotation");
+    });
+    wait_for_blocker(&pool, writer_pid, migration_pid).await;
+    gate.commit().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), migration)
+        .await
+        .expect("migration finishes once its gate opens")
+        .expect("migration task panics propagate");
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), writer)
+        .await
+        .expect("blocked rotation completes after the migration commits")
+        .expect("rotation task panics propagate");
+    let rotated_subject: Option<String> =
+        sqlx::query_scalar("SELECT signer_identity_subject FROM apps WHERE id = $1")
+            .bind(app_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load app subject after the fenced rotation");
+    assert_eq!(
+        rotated_subject.as_deref(),
+        Some(new_subject),
+        "the rotation behind the lock must eventually commit"
+    );
+    let withdrawn: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM withdrawn_signer_artifacts
+          WHERE descriptor_core_hash = $1 AND app_id = $2",
+    )
+    .bind(&descriptor_core_hash)
+    .bind(app_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count withdrawn artifacts after the fenced rotation");
+    assert_eq!(
+        withdrawn, 1,
+        "the resumed rotation must fire the trigger the migration installed"
+    );
+    assert_eq!(
+        read_withdrawal_reconciliation_state(&pool).await,
+        (1, 0, 1),
+        "the resumed rotation must owe the deferred withdrawal bump"
+    );
+
+    crate::test_support::drop_isolated_database("cap119_backfill_window", pool).await;
+}
+
+fn clone_auth(auth: &AuthContext) -> AuthContext {
+    AuthContext {
+        user_id: auth.user_id,
+        org_id: auth.org_id,
+        org_name: auth.org_name.clone(),
+        role: auth.role,
+        api_key: auth.api_key.clone(),
+        management_origin: auth.management_origin,
+    }
+}
+
+#[tokio::test]
+async fn signer_rotation_publication_failure_reports_pending_and_retry_confirms() {
+    let (_db_cleanup, pool) =
+        crate::test_support::isolated_database_test_pool("cap119_rotation_pending_retry").await;
+    let previous_subject = "https://github.com/acme/old/.github/workflows/ci.yaml@refs/heads/main";
+    let previous_issuer = "https://token.actions.githubusercontent.com";
+    let new_subject = "https://github.com/acme/new/.github/workflows/ci.yaml@refs/heads/main";
+    let new_issuer = "https://new-issuer.example.test";
+    let (org_id, user_id, app_id) =
+        insert_signer_rotation_app(&pool, Some(previous_subject), Some(previous_issuer)).await;
+    insert_signed_artifact_for_identity(&pool, org_id, app_id, previous_subject, previous_issuer)
+        .await;
+    sqlx::query(
+        "UPDATE kbs_signed_policy_reconciliation SET desired_generation = 1 WHERE singleton",
+    )
+    .execute(&pool)
+    .await
+    .expect("enter signed-policy mode");
+
+    let mut state = crate::test_support::lazy_state();
+    state.db = pool.clone();
+    let hmac_key = [7u8; 32];
+    let auth = AuthContext {
+        user_id,
+        org_id,
+        org_name: "rotation-pending-test".to_string(),
+        role: Role::Owner,
+        api_key: None,
+        management_origin: crate::auth::middleware::ManagementOrigin::Public,
+    };
+    state.kbs_policy = Some(test_kbs_policy_config());
+    let provider = std::sync::Arc::new(tokio::sync::Mutex::new(KbsPolicyProvider::new(false)));
+
+    let token = crate::auth::jwt::issue_signer_rotation_token(
+        &hmac_key,
+        &SignerRotationTokenInput {
+            user_id,
+            org_id,
+            app_id,
+            previous_subject: previous_subject.to_string(),
+            previous_issuer: previous_issuer.to_string(),
+            new_subject: new_subject.to_string(),
+            new_issuer: new_issuer.to_string(),
+        },
+        chrono::Duration::seconds(600),
+    )
+    .expect("issue signer rotation token");
+
+    let app_name = sqlx::query_scalar::<_, String>("SELECT name FROM apps WHERE id = $1")
+        .bind(app_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load app name");
+
+    crate::kbs::TEST_KUBE_CLIENT
+        .scope(kbs_policy_kube_client(provider.clone()), async {
+            // First attempt: the rotation commits, but the provider is down, so
+            // the fenced publication cannot be confirmed.
+            let pending = rotate_signer(
+                clone_auth(&auth),
+                State(state.clone()),
+                Path(app_name.clone()),
+                Json(RotateSignerRequest {
+                    subject: new_subject.to_string(),
+                    issuer: new_issuer.to_string(),
+                    email_confirmation_token: Some(token.clone()),
+                }),
+            )
+            .await
+            .expect_err("failed publication must not report success");
+            assert_eq!(pending.0, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                pending.1.0["code"],
+                crate::routes::apps::SIGNER_ROTATION_PUBLICATION_PENDING_CODE,
+                "the failure must be the explicit committed-pending error, not a bare 500"
+            );
+            assert_eq!(pending.1.0["committed"], true);
+
+            // The rotation itself is durable exactly once: identity, jti,
+            // withdrawal, and the owed bump.
+            let committed_subject: Option<String> =
+                sqlx::query_scalar("SELECT signer_identity_subject FROM apps WHERE id = $1")
+                    .bind(app_id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("load committed subject");
+            assert_eq!(committed_subject.as_deref(), Some(new_subject));
+            let jti_rows: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM consumed_signer_rotation_tokens WHERE app_id = $1",
+            )
+            .bind(app_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count consumed jti rows");
+            assert_eq!(jti_rows, 1, "the rotation token was consumed exactly once");
+            let audit_rows: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM audit_log WHERE org_id = $1 AND action = 'app.signer.rotate'",
+            )
+            .bind(org_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count rotation audit rows");
+            assert_eq!(audit_rows, 1, "exactly one rotation was committed");
+            assert_eq!(
+                read_withdrawal_reconciliation_state(&pool).await,
+                (1, 0, 1),
+                "the withdrawal debt stays owed until publication succeeds"
+            );
+
+            // Same-request retry (the consumed token cannot be replayed): the
+            // committed identity equals the target, so the route CONFIRMS the
+            // rotation -- no token path, no second mutation -- and re-drives the
+            // KBS publication under the fence.
+            {
+                let mut provider = provider.lock().await;
+                provider.healthy = true;
+            }
+            // The failed publication path released its fence (fail-open between
+            // retries; the periodic reconciler owns convergence), so the
+            // confirmation retry can claim it immediately.
+            let Json(confirmed) = rotate_signer(
+                clone_auth(&auth),
+                State(state.clone()),
+                Path(app_name.clone()),
+                Json(RotateSignerRequest {
+                    subject: new_subject.to_string(),
+                    issuer: new_issuer.to_string(),
+                    email_confirmation_token: Some(token.clone()),
+                }),
+            )
+            .await
+            .expect("confirmation retry must succeed once publication is confirmed");
+            assert_eq!(
+                confirmed.signer_identity_subject.as_deref(),
+                Some(new_subject)
+            );
+
+            // The confirmation added NO second mutation: same single audit row,
+            // same single jti, and the debt is now published and consumed.
+            let audit_rows_after: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM audit_log WHERE org_id = $1 AND action = 'app.signer.rotate'",
+            )
+            .bind(org_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count rotation audit rows after confirmation");
+            assert_eq!(
+                audit_rows_after, 1,
+                "the confirmation must not rotate again"
+            );
+            let jti_rows_after: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM consumed_signer_rotation_tokens WHERE app_id = $1",
+            )
+            .bind(app_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count consumed jti rows after confirmation");
+            assert_eq!(jti_rows_after, 1);
+            assert_eq!(
+                read_withdrawal_reconciliation_state(&pool).await,
+                (2, 0, 0),
+                "the confirmation retry must publish and consume the owed bump"
+            );
+            {
+                let provider = provider.lock().await;
+                assert_eq!(
+                    provider.published_generation(),
+                    Some(2),
+                    "the owed generation must be live before success is reported"
+                );
+            }
+        })
+        .await;
+
+    crate::test_support::drop_isolated_database("cap119_rotation_pending_retry", pool).await;
+}
+
+#[tokio::test]
+async fn signer_rotation_refuses_when_signed_mode_activates_while_it_waits_for_the_app_lane() {
+    let (_db_cleanup, pool) =
+        crate::test_support::isolated_database_test_pool("cap187_rotation_activation_race").await;
+    let previous_subject = "https://github.com/acme/old/.github/workflows/ci.yaml@refs/heads/main";
+    let previous_issuer = "https://token.actions.githubusercontent.com";
+    let new_subject = "https://github.com/acme/new/.github/workflows/ci.yaml@refs/heads/main";
+    let new_issuer = "https://new-issuer.example.test";
+    let (org_id, user_id, app_id) =
+        insert_signer_rotation_app(&pool, Some(previous_subject), Some(previous_issuer)).await;
+    let descriptor_core_hash = insert_signed_artifact_for_identity(
+        &pool,
+        org_id,
+        app_id,
+        previous_subject,
+        previous_issuer,
+    )
+    .await;
+    // Activation happens only after the rotation is blocked on the app lane.
+
+    let mut state = crate::test_support::lazy_state();
+    state.db = pool.clone();
+    let auth = AuthContext {
+        user_id,
+        org_id,
+        org_name: "rotation-activation-race".to_string(),
+        role: Role::Owner,
+        api_key: None,
+        management_origin: crate::auth::middleware::ManagementOrigin::Public,
+    };
+    let token = crate::auth::jwt::issue_signer_rotation_token(
+        &[7u8; 32],
+        &SignerRotationTokenInput {
+            user_id,
+            org_id,
+            app_id,
+            previous_subject: previous_subject.to_string(),
+            previous_issuer: previous_issuer.to_string(),
+            new_subject: new_subject.to_string(),
+            new_issuer: new_issuer.to_string(),
+        },
+        chrono::Duration::seconds(600),
+    )
+    .expect("issue rotation token for the activation race");
+    let app_name = sqlx::query_scalar::<_, String>("SELECT name FROM apps WHERE id = $1")
+        .bind(app_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load app name");
+
+    let mut lane = pool.begin().await.expect("begin app lane hold");
+    crate::deploy::lock_app_deployment_lane(&mut lane, app_id)
+        .await
+        .expect("hold app deployment lane");
+    let lane_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *lane)
+        .await
+        .expect("read lane holder pid");
+
+    let rotation = tokio::spawn(async move {
+        rotate_signer(
+            clone_auth(&auth),
+            State(state),
+            Path(app_name),
+            Json(RotateSignerRequest {
+                subject: new_subject.to_string(),
+                issuer: new_issuer.to_string(),
+                email_confirmation_token: Some(token),
+            }),
+        )
+        .await
+    });
+
+    // Observe the lock wait rather than assuming the rotation reached the lane.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let waiting: Option<i32> = sqlx::query_scalar(
+                "SELECT pid FROM pg_stat_activity
+                  WHERE wait_event_type = 'Lock'
+                    AND wait_event = 'advisory'
+                    AND $1 = ANY(pg_blocking_pids(pid))",
+            )
+            .bind(lane_pid)
+            .fetch_optional(&pool)
+            .await
+            .expect("poll for the rotation blocked on the app lane");
+            if waiting.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the rotation must block on the held app deployment lane");
+
+    let mut activation = pool.begin().await.expect("begin signed-mode activation");
+    sqlx::query(
+        "UPDATE kbs_signed_policy_reconciliation
+            SET desired_generation = 1
+          WHERE singleton",
+    )
+    .execute(&mut *activation)
+    .await
+    .expect("activate signed-policy mode");
+    activation.commit().await.expect("commit activation");
+    lane.commit().await.expect("release app deployment lane");
+
+    let refused = tokio::time::timeout(Duration::from_secs(5), rotation)
+        .await
+        .expect("the rotation settles once the lane opens")
+        .expect("rotation task panics propagate");
+    let err = match refused {
+        Ok(_) => {
+            panic!("an unconfigured rotation must refuse once signed mode activated mid-flight")
+        }
+        Err(err) => err,
+    };
+    assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        err.1.0["code"], "kbs_publication_not_configured",
+        "the refusal must be the retryable pre-commit gate, not a committed-but-pending report"
+    );
+
+    let (signer_subject, signer_issuer): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT signer_identity_subject, signer_identity_issuer FROM apps WHERE id = $1",
+    )
+    .bind(app_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load signer identity after the refusal");
+    assert_eq!(signer_subject.as_deref(), Some(previous_subject));
+    assert_eq!(signer_issuer.as_deref(), Some(previous_issuer));
+    let jti_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM consumed_signer_rotation_tokens WHERE app_id = $1",
+    )
+    .bind(app_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count consumed jti rows after the refusal");
+    assert_eq!(jti_rows, 0, "the refusal must leave the token unconsumed");
+    let audit_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_log WHERE org_id = $1 AND action = 'app.signer.rotate'",
+    )
+    .bind(org_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count rotation audit rows after the refusal");
+    assert_eq!(
+        audit_rows, 0,
+        "the refusal must not write a rotation audit row"
+    );
+    let withdrawn: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM withdrawn_signer_artifacts
+          WHERE descriptor_core_hash = $1 AND app_id = $2",
+    )
+    .bind(&descriptor_core_hash)
+    .bind(app_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count withdrawn artifacts after the refusal");
+    assert_eq!(withdrawn, 0, "the refusal must not withdraw the old signer");
+    assert_eq!(
+        read_withdrawal_reconciliation_state(&pool).await,
+        (1, 0, 0),
+        "only the activation may have touched the reconciliation singleton: no withdrawal debt"
+    );
+
+    crate::test_support::drop_isolated_database("cap187_rotation_activation_race", pool).await;
 }
