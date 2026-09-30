@@ -2582,23 +2582,32 @@ pub async fn destroy(args: DestroyArgs) -> Result<(), Box<dyn std::error::Error>
     spinner.enable_steady_tick(Duration::from_millis(100));
 
     let result = api.delete_app(&app_name).await;
-    // Teardown failures leave the app in 'deleting' and are retryable once the
-    // workload is reachable again; without this hint the raw API code is the
-    // only signal an operator gets. A hosted delete surfaces the locked
-    // teardown only as the deferral cause on a generic in-progress error, so
-    // the message carries it too.
+    // Teardown failures either restore the app to its pre-delete state (the
+    // delete is atomic) or leave it marked deleting when restoring would
+    // misrepresent an app whose live operation was superseded; the error
+    // body's `reason` tells the two apart (older servers without it get the
+    // neutral wording). Without this hint the raw API code is the only
+    // signal an operator gets. A hosted delete surfaces the locked teardown
+    // only as the deferral cause on a generic in-progress error, so the
+    // message carries it too.
     if let Err(ApiError::Api { code, message, .. }) = &result {
         let teardown_cause = code.as_deref() == Some("app_delete_teardown_locked")
             || message.contains("app_delete_teardown_locked");
         let hint = if teardown_cause {
             Some(format!(
-                "the confidential workload is locked; unlock it with its storage password (`enclava unlock --app {app_name}`), then retry destroy"
+                "the confidential workload is locked and the app remains intact; unlock it with its storage password (`enclava unlock --app {app_name}`), then retry destroy"
             ))
         } else {
             match code.as_deref() {
-                Some("app_delete_teardown_unavailable") => Some(
-                    "the confidential workload teardown did not complete; the app stays in 'deleting' -- wait for the workload to become reachable and retry destroy, or contact the operator if it keeps failing".to_string(),
-                ),
+                Some("app_delete_teardown_unavailable") => {
+                    Some(if message.contains("(app_restored)") {
+                        "the confidential workload teardown did not complete and the app was restored to its previous state -- retry destroy when the workload becomes reachable, or contact the operator if it keeps failing".to_string()
+                    } else if message.contains("(app_kept_deleting)") {
+                        "the confidential workload teardown did not complete and the app remains in the deleting state -- it stays wired and the destroy is retryable once the workload becomes reachable; contact the operator if it keeps failing".to_string()
+                    } else {
+                        "the confidential workload teardown did not complete -- retry destroy when the workload becomes reachable, or contact the operator if it keeps failing".to_string()
+                    })
+                }
                 _ => None,
             }
         };
