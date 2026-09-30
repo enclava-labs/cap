@@ -2546,6 +2546,11 @@ pub struct DestroyArgs {
     /// Skip confirmation prompt
     #[arg(long)]
     pub force: bool,
+    /// Finish the destroy even if the confidential workload teardown cannot
+    /// complete. The previous owner seed may remain in KBS; recreating this
+    /// app name will be refused until it is erased.
+    #[arg(long)]
+    pub abandon_teardown: bool,
 }
 
 pub async fn destroy(args: DestroyArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -2581,7 +2586,9 @@ pub async fn destroy(args: DestroyArgs) -> Result<(), Box<dyn std::error::Error>
     spinner.set_message(format!("Destroying {app_name}..."));
     spinner.enable_steady_tick(Duration::from_millis(100));
 
-    let result = api.delete_app(&app_name).await;
+    let result = api
+        .delete_app_with_options(&app_name, args.abandon_teardown)
+        .await;
     // Teardown failures either restore the app to its pre-delete state (the
     // delete is atomic) or leave it marked deleting when restoring would
     // misrepresent an app whose live operation was superseded; the error
@@ -2603,7 +2610,7 @@ pub async fn destroy(args: DestroyArgs) -> Result<(), Box<dyn std::error::Error>
                     Some(if message.contains("(app_restored)") {
                         "the confidential workload teardown did not complete and the app was restored to its previous state -- retry destroy when the workload becomes reachable, or contact the operator if it keeps failing".to_string()
                     } else if message.contains("(app_kept_deleting)") {
-                        "the confidential workload teardown did not complete and the app remains in the deleting state -- it stays wired and the destroy is retryable once the workload becomes reachable; contact the operator if it keeps failing".to_string()
+                        "the confidential workload teardown did not complete and the app remains in the deleting state -- it stays wired and the destroy is retryable once the workload becomes reachable, or use `destroy --abandon-teardown` once recovery is ruled out".to_string()
                     } else {
                         "the confidential workload teardown did not complete -- retry destroy when the workload becomes reachable, or contact the operator if it keeps failing".to_string()
                     })
@@ -2619,6 +2626,12 @@ pub async fn destroy(args: DestroyArgs) -> Result<(), Box<dyn std::error::Error>
     result?;
 
     spinner.finish_with_message(format!("App '{app_name}' destroyed."));
+
+    if args.abandon_teardown {
+        println!(
+            "Note: destroy completed with --abandon-teardown, which proceeds past a failed workload teardown. If the teardown could not complete, the previous owner seed may remain in KBS and recreating '{app_name}' will be refused until an operator erases it and clears the recorded waiver; if the workload was already gone (or its teardown had completed), no waiver is recorded and recreation is unaffected."
+        );
+    }
 
     Ok(())
 }
