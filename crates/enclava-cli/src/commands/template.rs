@@ -31,7 +31,7 @@ use enclava_engine::types::WorkloadSecurityProfile;
 use crate::commands::app::{
     BootstrapEndpointStatusDecision, DeploymentWait, SignedDeployBlobParams, StoragePasswordInput,
     bootstrap_endpoint_status_decision, build_signed_deploy_blobs, claim_initial_ownership,
-    deploy_needs_initial_claim, deployment_bound_tee_status,
+    deploy_preflight_needs_claim, deployment_bound_tee_status,
     deployment_bound_terminal_bootstrap_error,
     deployment_bound_terminal_bootstrap_error_on_channel, ensure_manual_deploy_keyring,
     fetch_verified_platform_release, generate_log_key_for_app,
@@ -397,16 +397,15 @@ async fn deploy_with_timings(
         storage_password.ensure_available_for_password_mode("password-mode template deploy")?;
         // Pre-mutation claim-session gate (same rationale as the deploy
         // path). The post-submit flow auto-claims only while ownership is
-        // unclaimed (the bootstrap wait skips claimed apps), so mirror that
-        // decision here; an unavailable ownership read -- a fresh create, or
-        // an endpoint not up yet -- falls back to the create posture, since
-        // password templates auto-claim on first boot.
+        // unclaimed (the bootstrap wait skips claimed apps); unresolved
+        // ownership fails closed the same way, since password templates
+        // auto-claim on first boot.
         let preflight_ownership = api
             .get_unlock_status(&instance_name)
             .await
             .ok()
             .and_then(|status| status.ownership_state);
-        if deploy_needs_initial_claim(true, preflight_ownership.as_deref(), "creating") {
+        if deploy_preflight_needs_claim(true, preflight_ownership.as_deref(), "creating") {
             crate::commands::ownership::ensure_claim_session_now(storage_password.is_from_file())?;
         }
     }

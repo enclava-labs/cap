@@ -243,6 +243,28 @@ pub(crate) fn deploy_needs_initial_claim(
     }
 }
 
+/// The pre-mutation claim gate's decision: the post-submit
+/// [`deploy_needs_initial_claim`] predicate, except that unresolved
+/// ownership fails CLOSED before submission. The status read is a TEE
+/// query: a window that closes between this read and the post-submit one
+/// is exactly the strand this gate exists to prevent, so an unreadable
+/// state gates. The cost -- an unattended redeploy of an already-claimed
+/// app while its TEE status is unreachable now needs a session -- leaves
+/// no residue, while the strand leaves a submitted deployment with no
+/// claimant. The post-submit predicate keeps its own None fallback
+/// unchanged (gating there would strand claimed redeploys in the claim
+/// wait instead).
+pub(crate) fn deploy_preflight_needs_claim(
+    is_password_mode: bool,
+    ownership_state: Option<&str>,
+    app_status: &str,
+) -> bool {
+    match ownership_state {
+        None => is_password_mode,
+        Some(state) => deploy_needs_initial_claim(is_password_mode, Some(state), app_status),
+    }
+}
+
 mod signing;
 pub(crate) use enclava_cli::descriptor::TrustedDeploymentExpectation;
 #[cfg(test)]
@@ -423,17 +445,15 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
     // on first boot; refusing a session that cannot claim BEFORE submitting
     // keeps the abort side-effect-free (the post-mutation refusal strands a
     // server-side deployment nothing terminalizes client-side). Live ownership
-    // is read first and fed to the same decision the post-submit claim uses:
-    // a failed first deploy leaves the app unclaimed outside `creating`, and a
-    // status-only decision would skip the gate here and strand the post-submit
-    // claim the same way. An unavailable ownership read falls back to the old
-    // status-only behavior (gate while `creating`).
+    // is read first and fed to the same decision the post-submit claim uses
+    // (a failed first deploy leaves the app unclaimed outside `creating`);
+    // unresolved ownership fails closed -- see `deploy_preflight_needs_claim`.
     let preflight_ownership = api
         .get_unlock_status(&app_name)
         .await
         .ok()
         .and_then(|status| status.ownership_state);
-    let preflight_needs_claim = deploy_needs_initial_claim(
+    let preflight_needs_claim = deploy_preflight_needs_claim(
         is_password_mode,
         preflight_ownership.as_deref(),
         &app.status,

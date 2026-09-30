@@ -433,6 +433,27 @@ fn deploy_gate_follows_live_ownership_outside_creating() {
 }
 
 #[test]
+fn deploy_preflight_gate_fails_closed_on_unresolved_ownership() {
+    // The preflight status read is a TEE query: unresolved ownership must
+    // gate before submission (the strand this gate exists to prevent), while
+    // the post-submit predicate keeps its None fallback (above) so claimed
+    // redeploys never loop into the claim wait.
+    assert!(deploy_preflight_needs_claim(true, None, "failed"));
+    assert!(deploy_preflight_needs_claim(true, None, "creating"));
+    assert!(!deploy_preflight_needs_claim(false, None, "failed"));
+    assert!(deploy_preflight_needs_claim(
+        true,
+        Some("unclaimed"),
+        "failed"
+    ));
+    assert!(!deploy_preflight_needs_claim(
+        true,
+        Some("locked"),
+        "failed"
+    ));
+}
+
+#[test]
 fn deploy_preflight_reads_live_ownership_before_the_claim_gate() {
     // CRLF checkouts (Windows autocrlf) must not break source matching.
     let source = include_str!("../../app.rs").replace("\r\n", "\n");
