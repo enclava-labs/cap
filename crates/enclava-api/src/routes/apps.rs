@@ -444,20 +444,24 @@ pub(crate) async fn post_workload_teardown(
 
     if response.status().is_success() {
         // The wrap is erased on the TEE at this point. The marker is what lets
-        // a later-step retry skip the proxy's non-idempotent teardown re-POST,
-        // so ride out transient pool/database blips with a few bounded
-        // attempts. If it still fails, failing the delete here would guarantee
-        // that wedge on the retry, so log and proceed: the wrap is erased and
-        // the marker only matters if a later step fails and a retry runs.
+        // a later-step retry skip re-POSTing teardown, so ride out transient
+        // pool/database blips with a few bounded attempts. If it still fails,
+        // proceeding is the lesser evil: the wrap is erased, the marker only
+        // matters if a later step fails and a retry runs, and that retry's
+        // re-POST converges once the in-guest teardown treats an
+        // already-erased resource as success (attestation-proxy #11). Until
+        // that ships, a lost marker plus a later-step failure can still wedge
+        // the retry at the non-idempotent endpoint; the bounded-recovery
+        // delete (cap #194 recovery half) is the backstop for that corner.
         let mut marker_persisted = false;
-        for attempt in 0..3u32 {
+        for attempt in 0..5u32 {
             match persist_workload_teardown_completed(&state.db, app.id).await {
                 Ok(()) => {
                     marker_persisted = true;
                     break;
                 }
-                Err(_) if attempt < 2 => {
-                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                Err(_) if attempt < 4 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 }
                 Err(_) => break,
             }
@@ -1451,8 +1455,11 @@ pub(crate) async fn delete_app_before(
     // Persist the durable deleting phase and whether confidential teardown is
     // required before any external call. Retries must reuse that decision
     // instead of inferring it from status='deleting', which every in-flight
-    // delete shares. The same transaction terminalizes every queued or leased
-    // deployment generation before releasing the app lane.
+    // delete shares. The completion marker is monotonic: it records that the
+    // wrap is erased, a fact that outlives status transitions (including the
+    // teardown-failure restore below) and must never be re-cleared. The same
+    // transaction terminalizes every queued or leased deployment generation
+    // before releasing the app lane.
     let mut phase_tx = state
         .db
         .begin()
@@ -1521,10 +1528,6 @@ pub(crate) async fn delete_app_before(
                     WHEN status = 'deleting'::app_status_enum THEN workload_teardown_required
                     ELSE $2
                 END,
-                workload_teardown_completed_at = CASE
-                    WHEN status = 'deleting'::app_status_enum THEN workload_teardown_completed_at
-                    ELSE NULL
-                END,
                 updated_at = clock_timestamp()
           WHERE id = $1",
     )
@@ -1533,34 +1536,35 @@ pub(crate) async fn delete_app_before(
     .execute(&mut *phase_tx)
     .await
     .map_err(|_| internal_server_error())?;
-    match crate::deploy::supersede_incomplete_deployments(&mut phase_tx, phase_app.id).await {
-        Ok(_) => {}
-        Err(crate::deploy::SupersedeDeploymentError::Busy) => {
-            // A deployment mutation is still in progress, so this delete is
-            // known-not-applied: only the in-transaction `status = 'deleting'`
-            // transition ran, and it is discarded by the rollback below. The
-            // delete mutation lease must be released too — leaving it abandoned
-            // (Drop only stops the heartbeat; the lock rows persist until
-            // quarantine expiry) would block a same-key retry from re-claiming
-            // until then, turning the cancel disposition into a self-inflicted
-            // busy loop on this app's own abandoned lease.
-            phase_tx
-                .rollback()
-                .await
-                .map_err(|_| internal_server_error())?;
-            delete_mutation
-                .finish()
-                .await
-                .map_err(|_| internal_server_error())?;
-            return Err((
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({"error": "deployment mutation is still in progress"})),
-            ));
-        }
-        Err(crate::deploy::SupersedeDeploymentError::Database(_)) => {
-            return Err(internal_server_error());
-        }
-    }
+    let superseded_by_this_attempt: u64 =
+        match crate::deploy::supersede_incomplete_deployments(&mut phase_tx, phase_app.id).await {
+            Ok(superseded) => superseded,
+            Err(crate::deploy::SupersedeDeploymentError::Busy) => {
+                // A deployment mutation is still in progress, so this delete is
+                // known-not-applied: only the in-transaction `status = 'deleting'`
+                // transition ran, and it is discarded by the rollback below. The
+                // delete mutation lease must be released too — leaving it abandoned
+                // (Drop only stops the heartbeat; the lock rows persist until
+                // quarantine expiry) would block a same-key retry from re-claiming
+                // until then, turning the cancel disposition into a self-inflicted
+                // busy loop on this app's own abandoned lease.
+                phase_tx
+                    .rollback()
+                    .await
+                    .map_err(|_| internal_server_error())?;
+                delete_mutation
+                    .finish()
+                    .await
+                    .map_err(|_| internal_server_error())?;
+                return Err((
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({"error": "deployment mutation is still in progress"})),
+                ));
+            }
+            Err(crate::deploy::SupersedeDeploymentError::Database(_)) => {
+                return Err(internal_server_error());
+            }
+        };
     phase_tx
         .commit()
         .await
@@ -1634,8 +1638,37 @@ pub(crate) async fn delete_app_before(
         .await
         .map_err(|_| internal_server_error())?;
     if let Err(failure) = teardown {
-        // A failed teardown exits before any fenced resource is touched, but
-        // merely dropping the lease would hold the cluster-wide edge_config
+        // A failed teardown exits before any fenced resource is touched: the
+        // delete is atomic — restore the pre-delete status instead of
+        // stranding the app in 'deleting' — but only when this attempt
+        // really left the app unchanged. If the flip transaction
+        // superseded a nonterminal deployment, that deployment is now
+        // failed and a status flip alone would present an app whose
+        // serving state cannot be reconstructed (its live operation is
+        // terminal): keep 'deleting' (wired and retryable under the
+        // teardown-pending rules) instead. A failure AFTER teardown keeps
+        // 'deleting': its wrap is erased, and the retry (skipping teardown
+        // via the monotonic completion marker) must finish the cleanup.
+        // (unless it was already 'deleting' from an earlier attempt, whose
+        // pre-attempt status is unknown) The disposition rides the error
+        // body's `reason` so clients can tell an intact, restored app from
+        // one that must finish (or abandon) its deletion.
+        let restored = phase_app.status != AppStatus::Deleting && superseded_by_this_attempt == 0;
+        if restored {
+            sqlx::query(
+                "UPDATE apps
+                    SET status = $2::app_status_enum,
+                        updated_at = clock_timestamp()
+                  WHERE id = $1
+                    AND status = 'deleting'::app_status_enum",
+            )
+            .bind(phase_app.id)
+            .bind(phase_app.status)
+            .execute(&mut *delete_lane)
+            .await
+            .map_err(|_| internal_server_error())?;
+        }
+        // Merely dropping the lease would hold the cluster-wide edge_config
         // and kbs_policy fences through reclaim quarantine (~9 min), blocking
         // every tenant's deploys until then. Nothing in this attempt wrote
         // provider state yet, so release durably in the already-held lane
@@ -1649,7 +1682,18 @@ pub(crate) async fn delete_app_before(
             .commit()
             .await
             .map_err(|_| internal_server_error())?;
-        return Err(failure);
+        let (status, mut body) = failure;
+        if let Some(object) = body.0.as_object_mut() {
+            object.insert(
+                "reason".to_string(),
+                serde_json::json!(if restored {
+                    "app_restored"
+                } else {
+                    "app_kept_deleting"
+                }),
+            );
+        }
+        return Err((status, body));
     }
 
     // The running workload needs its current KBS authorization to erase the

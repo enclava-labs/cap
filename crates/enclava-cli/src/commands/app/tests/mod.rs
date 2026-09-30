@@ -510,7 +510,30 @@ fn destroy_failure_hint_covers_lane_conflicts_and_teardown_failures() {
 
     let unavailable = destroy_failure_hint(Some("app_delete_teardown_unavailable"), "", "shell")
         .expect("failed teardown gets operator prose");
-    assert!(unavailable.contains("'deleting'"), "got: {unavailable}");
+    assert!(
+        unavailable.contains("did not complete") && unavailable.contains("retry destroy"),
+        "got: {unavailable}"
+    );
+    let restored = destroy_failure_hint(
+        Some("app_delete_teardown_unavailable"),
+        "app_delete_teardown_unavailable (app_restored)",
+        "shell",
+    )
+    .expect("restored disposition gets operator prose");
+    assert!(
+        restored.contains("restored to its previous state"),
+        "got: {restored}"
+    );
+    let kept = destroy_failure_hint(
+        Some("app_delete_teardown_unavailable"),
+        "app_delete_teardown_unavailable (app_kept_deleting)",
+        "shell",
+    )
+    .expect("kept-deleting disposition gets operator prose");
+    assert!(
+        kept.contains("remains in the deleting state"),
+        "got: {kept}"
+    );
 
     assert!(destroy_failure_hint(Some("other_error"), "", "shell").is_none());
     assert!(destroy_failure_hint(None, "", "shell").is_none());
