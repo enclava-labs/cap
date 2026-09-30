@@ -228,7 +228,7 @@ impl DeployRuntimeTarget {
     }
 }
 
-fn deploy_needs_initial_claim(
+pub(crate) fn deploy_needs_initial_claim(
     is_password_mode: bool,
     ownership_state: Option<&str>,
     app_status: &str,
@@ -422,8 +422,23 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
     // Pre-mutation claim-session gate: a fresh password-mode deploy auto-claims
     // on first boot; refusing a session that cannot claim BEFORE submitting
     // keeps the abort side-effect-free (the post-mutation refusal strands a
-    // server-side deployment nothing terminalizes client-side).
-    if deploy_needs_initial_claim(is_password_mode, None, &app.status) {
+    // server-side deployment nothing terminalizes client-side). Live ownership
+    // is read first and fed to the same decision the post-submit claim uses:
+    // a failed first deploy leaves the app unclaimed outside `creating`, and a
+    // status-only decision would skip the gate here and strand the post-submit
+    // claim the same way. An unavailable ownership read falls back to the old
+    // status-only behavior (gate while `creating`).
+    let preflight_ownership = api
+        .get_unlock_status(&app_name)
+        .await
+        .ok()
+        .and_then(|status| status.ownership_state);
+    let preflight_needs_claim = deploy_needs_initial_claim(
+        is_password_mode,
+        preflight_ownership.as_deref(),
+        &app.status,
+    );
+    if preflight_needs_claim {
         crate::commands::ownership::ensure_claim_session_now(storage_password.is_from_file())?;
     }
     let capture = mnemonic_capture_from_flags(args.no_store_mnemonic);
@@ -431,9 +446,7 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
     // no-store sink mode before submitting anything, while the run can still stop
     // without side effects. (The authoritative pre-claim gate also re-checks this
     // inside `claim_initial_ownership`.)
-    if capture == MnemonicCapture::Skip
-        && deploy_needs_initial_claim(is_password_mode, None, &app.status)
-    {
+    if capture == MnemonicCapture::Skip && preflight_needs_claim {
         crate::commands::ownership::validate_recovery_mnemonic_sink_mode(capture)?;
     }
     let pb = ProgressBar::new(5);
@@ -2589,40 +2602,11 @@ pub async fn destroy(args: DestroyArgs) -> Result<(), Box<dyn std::error::Error>
     spinner.enable_steady_tick(Duration::from_millis(100));
 
     let result = api.delete_app(&app_name).await;
-    // Teardown failures leave the app in 'deleting' and are retryable once the
-    // workload is reachable again; without this hint the raw API code is the
-    // only signal an operator gets. A hosted delete surfaces the locked
-    // teardown only as the deferral cause on a generic in-progress error, so
-    // the message carries it too.
-    if let Err(ApiError::Api { code, message, .. }) = &result {
-        let teardown_cause = code.as_deref() == Some("app_delete_teardown_locked")
-            || message.contains("app_delete_teardown_locked");
-        let hint = if teardown_cause {
-            Some(format!(
-                "the confidential workload is locked; unlock it with its storage password (`enclava unlock --app {app_name}`), then retry destroy"
-            ))
-        } else {
-            match code.as_deref() {
-                Some("app_delete_teardown_unavailable") => Some(
-                    "the confidential workload teardown did not complete; the app stays in 'deleting' -- wait for the workload to become reachable and retry destroy, or contact the operator if it keeps failing".to_string(),
-                ),
-                // Lane etiquette (#83/#194): the 409 answers either carry the
-                // server's lease hints in `message` (held by / retry after) or
-                // come from an older server without them -- the prose stays
-                // neutral so both read correctly.
-                Some("app mutation already in progress") => Some(
-                    "another operation holds this app's mutation lane (a deploy or an earlier delete); it retries automatically once free -- retry destroy shortly".to_string(),
-                ),
-                Some("idempotency_request_in_progress") => Some(
-                    "a previous destroy attempt is still settling its idempotency lease; retry destroy with the same command shortly".to_string(),
-                ),
-                _ => None,
-            }
-        };
-        if let Some(hint) = hint {
-            spinner.finish_with_message(format!("Destroy of '{app_name}' did not complete."));
-            eprintln!("Hint: {hint}");
-        }
+    if let Err(ApiError::Api { code, message, .. }) = &result
+        && let Some(hint) = destroy_failure_hint(code.as_deref(), message, &app_name)
+    {
+        spinner.finish_with_message(format!("Destroy of '{app_name}' did not complete."));
+        eprintln!("Hint: {hint}");
     }
     result?;
 
@@ -2634,3 +2618,37 @@ pub async fn destroy(args: DestroyArgs) -> Result<(), Box<dyn std::error::Error>
 #[cfg(test)]
 #[path = "app/tests/mod.rs"]
 mod tests;
+
+/// Operator guidance for a failed destroy, keyed on the stable API code (or
+/// the in-band cause text hosted deferrals carry). Pure so the prose mapping
+/// stays pinned by unit tests before other surfaces match on it.
+fn destroy_failure_hint(code: Option<&str>, message: &str, app_name: &str) -> Option<String> {
+    // Teardown failures leave the app in 'deleting' and are retryable once the
+    // workload is reachable again; without this hint the raw API code is the
+    // only signal an operator gets. A hosted delete surfaces the locked
+    // teardown only as the deferral cause on a generic in-progress error, so
+    // the message carries it too.
+    let teardown_cause = code == Some("app_delete_teardown_locked")
+        || message.contains("app_delete_teardown_locked");
+    if teardown_cause {
+        return Some(format!(
+            "the confidential workload is locked; unlock it with its storage password (`enclava unlock --app {app_name}`), then retry destroy"
+        ));
+    }
+    match code {
+        Some("app_delete_teardown_unavailable") => Some(
+            "the confidential workload teardown did not complete; the app stays in 'deleting' -- wait for the workload to become reachable and retry destroy, or contact the operator if it keeps failing".to_string(),
+        ),
+        // Lane etiquette (#83/#194): the 409 answers either carry the
+        // server's lease hints in `message` (held by / retry after) or
+        // come from an older server without them -- the prose stays
+        // neutral so both read correctly.
+        Some("app mutation already in progress") => Some(
+            "another operation holds this app's mutation lane (a deploy or an earlier delete); it retries automatically once free -- retry destroy shortly".to_string(),
+        ),
+        Some("idempotency_request_in_progress") => Some(
+            "a previous destroy attempt is still settling its idempotency lease; retry destroy with the same command shortly".to_string(),
+        ),
+        _ => None,
+    }
+}

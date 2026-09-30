@@ -378,13 +378,16 @@ pub async fn verify_challenge(
         "custom_domain_set",
         challenge_id,
         false,
-        resources,
+        resources.clone(),
     )
     .await;
     let mut mutation = match mutation {
         Ok(mutation) => mutation,
         Err(crate::mutation_leases::MutationLeaseError::Busy) => {
-            return Err(crate::routes::apps::app_mutation_busy_error(&state.db, app.id).await);
+            return Err(crate::routes::apps::app_mutation_busy_error(
+                &state.db, app.id, &resources,
+            )
+            .await);
         }
         Err(_) => return Err(internal_error()),
     };
@@ -640,23 +643,27 @@ pub async fn remove_custom_domain(
             )
         })?;
 
+    let resources = vec![
+        crate::mutation_leases::ResourceFence::dns(&domain),
+        crate::mutation_leases::ResourceFence::edge(&domain),
+        crate::mutation_leases::ResourceFence::edge_config(),
+    ];
     let mutation = crate::mutation_leases::claim(
         &state,
         app.id,
         "custom_domain_remove",
         Uuid::new_v4(),
         false,
-        vec![
-            crate::mutation_leases::ResourceFence::dns(&domain),
-            crate::mutation_leases::ResourceFence::edge(&domain),
-            crate::mutation_leases::ResourceFence::edge_config(),
-        ],
+        resources.clone(),
     )
     .await;
     let mut mutation = match mutation {
         Ok(mutation) => mutation,
         Err(crate::mutation_leases::MutationLeaseError::Busy) => {
-            return Err(crate::routes::apps::app_mutation_busy_error(&state.db, app.id).await);
+            return Err(crate::routes::apps::app_mutation_busy_error(
+                &state.db, app.id, &resources,
+            )
+            .await);
         }
         Err(_) => return Err(internal_error()),
     };

@@ -31,40 +31,102 @@ fn internal_server_error() -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
-/// The app-lane Busy 409, enriched with what the live lease row knows: the
-/// holding operation's kind and whole seconds until its lock frees. Additive
-/// fields only -- the `error` string is a cross-repo contract (the PaaS
-/// classifies on it byte-exactly) and must stay stable. A row that cannot be
-/// read (or has no holder) yields the bare body: no invented values.
+/// Lease-window columns the busy hint derives from: the holding operation's
+/// kind, its renewable lock expiry, and the reclaim-quarantine deadline.
+/// Poisoned/parked fences carry `reclaim_after = infinity` (never claimable),
+/// mapped to NULL so the row still reads and no finite hint is invented.
+type LeaseHintRow = (
+    Option<String>,
+    Option<chrono::DateTime<chrono::Utc>>,
+    Option<chrono::DateTime<chrono::Utc>>,
+);
+
+/// The app-lane Busy 409, enriched with what the live lease rows know: the
+/// holding operation's kind and whole seconds until a retry may be admitted.
+/// Additive fields only -- the `error` string is a cross-repo contract (the
+/// PaaS classifies on it byte-exactly) and must stay stable. The holder is
+/// resolved from the app-lane row when it is held (the app-row claim
+/// conflicted), else from the caller's contested fences: a resource claim
+/// rolls the app-row claim back and conflicts on a fence whose row -- not
+/// this app's -- carries the holder. A row that cannot be read (or has no
+/// holder) yields the bare body: no invented values. The `.ok()`s are
+/// deliberate: a transient read failure under real contention degrades to
+/// "unknown wait", never to a 500.
 pub(crate) async fn app_mutation_busy_error(
     db: &sqlx::PgPool,
     app_id: Uuid,
+    fences: &[crate::mutation_leases::ResourceFence],
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let held: Option<(Option<String>, Option<chrono::DateTime<chrono::Utc>>)> = sqlx::query_as(
-        "SELECT operation_kind, locked_until
-               FROM app_mutation_leases
-              WHERE app_id = $1 AND owner_token IS NOT NULL",
+    let held: Option<LeaseHintRow> = sqlx::query_as(
+        "SELECT operation_kind,
+                locked_until,
+                NULLIF(reclaim_after, 'infinity'::timestamptz)
+           FROM app_mutation_leases
+          WHERE app_id = $1 AND owner_token IS NOT NULL",
     )
     .bind(app_id)
     .fetch_optional(db)
     .await
     .ok()
     .flatten();
+    let held = match held {
+        Some(held) => Some(held),
+        None => {
+            let mut found = None;
+            for fence in fences {
+                found = sqlx::query_as::<_, LeaseHintRow>(
+                    "SELECT operation_kind,
+                            locked_until,
+                            NULLIF(reclaim_after, 'infinity'::timestamptz)
+                       FROM external_resource_mutation_leases
+                      WHERE resource_scope = $1 AND resource_key = $2
+                        AND owner_token IS NOT NULL",
+                )
+                .bind(&fence.scope)
+                .bind(&fence.key)
+                .fetch_optional(db)
+                .await
+                .ok()
+                .flatten();
+                if found.is_some() {
+                    break;
+                }
+            }
+            found
+        }
+    };
     let mut body = serde_json::json!({"error": "app mutation already in progress"});
-    if let Some((operation_kind, locked_until)) = held {
+    if let Some((operation_kind, locked_until, reclaim_after)) = held {
         if let Some(operation_kind) = operation_kind {
             body["held_by"] = serde_json::json!(operation_kind);
         }
-        if let Some(locked_until) = locked_until {
-            let seconds = (locked_until - chrono::Utc::now()).num_seconds();
-            if seconds > 0 {
-                body["retry_after"] = serde_json::json!(
-                    seconds.min(crate::routes::internal::IDEMPOTENCY_RETRY_HINT_MAX_SECONDS)
-                );
-            }
+        if let Some(seconds) = lease_retry_after_seconds(locked_until, reclaim_after) {
+            body["retry_after"] = serde_json::json!(seconds);
         }
     }
     (StatusCode::CONFLICT, Json(body))
+}
+
+/// Whole seconds for the in-band `retry_after` hint: the next point at which
+/// the lane may admit the claim. While the holder's lock is live that is its
+/// renewable expiry -- the holder can release at any checkpoint before then,
+/// and hinting the later quarantine would only delay a retry that can already
+/// succeed. Once the lock has lapsed the row IS the lost-owner reclaim
+/// quarantine, so the hint follows `reclaim_after` and never the dead lock
+/// expiry, which no longer admits anything. Poisoned/parked fences carry no
+/// finite window (`reclaim_after = infinity`) and get no hint.
+fn lease_retry_after_seconds(
+    locked_until: Option<chrono::DateTime<chrono::Utc>>,
+    reclaim_after: Option<chrono::DateTime<chrono::Utc>>,
+) -> Option<i64> {
+    let now = chrono::Utc::now();
+    let deadline = match (locked_until, reclaim_after) {
+        (Some(locked_until), _) if locked_until > now => locked_until,
+        (_, Some(reclaim_after)) => reclaim_after,
+        _ => return None,
+    };
+    let seconds = (deadline - now).num_seconds();
+    (seconds > 0).then(|| seconds.min(crate::routes::internal::IDEMPOTENCY_RETRY_HINT_MAX_SECONDS))
 }
 
 /// Bounded diagnostics for app deletion failures.
@@ -1049,21 +1111,22 @@ pub async fn create_app(
 
     tx.commit().await.map_err(|_| internal_server_error())?;
 
+    let dns_fences = vec![
+        crate::mutation_leases::ResourceFence::dns(&app_candidate.domain),
+        crate::mutation_leases::ResourceFence::dns(
+            app_candidate
+                .tee_domain
+                .as_deref()
+                .unwrap_or(&app_candidate.domain),
+        ),
+    ];
     let mut dns_mutation = match crate::mutation_leases::claim(
         &state,
         app_id,
         "app_create_dns",
         app_id,
         false,
-        vec![
-            crate::mutation_leases::ResourceFence::dns(&app_candidate.domain),
-            crate::mutation_leases::ResourceFence::dns(
-                app_candidate
-                    .tee_domain
-                    .as_deref()
-                    .unwrap_or(&app_candidate.domain),
-            ),
-        ],
+        dns_fences.clone(),
     )
     .await
     {
@@ -1106,7 +1169,7 @@ pub async fn create_app(
                 .map_err(|_| internal_server_error())?;
             return Err(match error {
                 crate::mutation_leases::MutationLeaseError::Busy => {
-                    app_mutation_busy_error(&state.db, app_id).await
+                    app_mutation_busy_error(&state.db, app_id, &dns_fences).await
                 }
                 _ => internal_server_error(),
             });
@@ -1365,13 +1428,13 @@ pub(crate) async fn delete_app_before(
         "app_delete",
         app.id,
         true,
-        delete_resources,
+        delete_resources.clone(),
     )
     .await
     {
         Ok(mutation) => mutation,
         Err(crate::mutation_leases::MutationLeaseError::Busy) => {
-            return Err(app_mutation_busy_error(&state.db, app.id).await);
+            return Err(app_mutation_busy_error(&state.db, app.id, &delete_resources).await);
         }
         Err(_) => return Err(internal_server_error()),
     };

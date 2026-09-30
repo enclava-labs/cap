@@ -3695,7 +3695,7 @@ pub async fn put_paas_app_desired_state(
         let desired_state = body.desired_state.as_str();
         let resource =
             crate::mutation_leases::ResourceFence::new("kubernetes_namespace", &namespace);
-        let mut mutation = crate::mutation_leases::claim(
+        let mut mutation = match crate::mutation_leases::claim(
             &state,
             app_id,
             "app_desired_state",
@@ -3704,12 +3704,25 @@ pub async fn put_paas_app_desired_state(
             vec![resource.clone()],
         )
         .await
-        .map_err(|error| match error {
-            crate::mutation_leases::MutationLeaseError::Busy => {
-                json_error(StatusCode::CONFLICT, "app mutation already in progress")
+        {
+            Ok(mutation) => mutation,
+            // Lane etiquette: this fifth Busy arm carries the same lease hints
+            // as the HTTP-facing ones so the contract is uniform.
+            Err(crate::mutation_leases::MutationLeaseError::Busy) => {
+                return Err(crate::routes::apps::app_mutation_busy_error(
+                    &state.db,
+                    app_id,
+                    std::slice::from_ref(&resource),
+                )
+                .await);
             }
-            _ => json_error(StatusCode::SERVICE_UNAVAILABLE, "desired_state_retryable"),
-        })?;
+            Err(_) => {
+                return Err(json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "desired_state_retryable",
+                ));
+            }
+        };
         let mut tx = state.db.begin().await.map_err(|_| db_error())?;
         crate::deploy::lock_app_deployment_lane(&mut tx, app_id)
             .await
@@ -8682,7 +8695,7 @@ mod tests {
         .await
         .unwrap();
         let (status, Json(body)) =
-            crate::routes::apps::app_mutation_busy_error(&state.db, app_id).await;
+            crate::routes::apps::app_mutation_busy_error(&state.db, app_id, &[]).await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body["error"], "app mutation already in progress");
         assert_eq!(body["held_by"], "deployment");
@@ -8705,11 +8718,94 @@ mod tests {
         .await
         .unwrap();
         let (status, Json(body)) =
-            crate::routes::apps::app_mutation_busy_error(&state.db, app_id).await;
+            crate::routes::apps::app_mutation_busy_error(&state.db, app_id, &[]).await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body["error"], "app mutation already in progress");
         assert!(body.get("held_by").is_none());
         assert!(body.get("retry_after").is_none());
+    }
+
+    #[tokio::test]
+    async fn app_mutation_busy_hint_follows_reclaim_quarantine() {
+        let (state, _auth, _app_name, app_id) = app_delete_fixture().await;
+        // A lost owner: the renewable lock lapsed but the row still blocks
+        // claims until the reclaim quarantine expires. The hint must track
+        // THAT deadline -- the dead lock expiry admits nothing, and a hint
+        // there leaves the caller retried into a hintless Busy.
+        sqlx::query(
+            "INSERT INTO app_mutation_leases (app_id) VALUES ($1)
+             ON CONFLICT (app_id) DO NOTHING",
+        )
+        .bind(app_id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE app_mutation_leases
+                SET owner_token = gen_random_uuid(),
+                    operation_kind = 'deployment',
+                    operation_id = gen_random_uuid(),
+                    locked_until = clock_timestamp() - interval '60 seconds',
+                    reclaim_after = clock_timestamp() + interval '240 seconds'
+              WHERE app_id = $1",
+        )
+        .bind(app_id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+        let (status, Json(body)) =
+            crate::routes::apps::app_mutation_busy_error(&state.db, app_id, &[]).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["held_by"], "deployment");
+        let retry_after = body["retry_after"].as_i64().expect("retry_after hint");
+        assert!(
+            (230..=240).contains(&retry_after),
+            "hint should follow the reclaim quarantine (240s), got {retry_after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn app_mutation_busy_resolves_resource_fence_holder() {
+        let (state, _auth, _app_name, app_id) = app_delete_fixture().await;
+        // A resource-fence conflict rolls the app-row claim back, so the
+        // holder lives on the contested fence's row (which can belong to
+        // another app or a global provider operation): the hint must read
+        // THAT row, not this app's empty one.
+        let fence = crate::mutation_leases::ResourceFence::new("test_scope", "test_key");
+        sqlx::query(
+            "INSERT INTO external_resource_mutation_leases (resource_scope, resource_key)
+             VALUES ('test_scope', 'test_key')
+             ON CONFLICT (resource_scope, resource_key) DO NOTHING",
+        )
+        .execute(&state.db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET owner_token = gen_random_uuid(),
+                    operation_kind = 'custom_domain_set',
+                    operation_id = gen_random_uuid(),
+                    locked_until = clock_timestamp() + interval '90 seconds',
+                    reclaim_after = clock_timestamp() + interval '450 seconds'
+              WHERE resource_scope = 'test_scope' AND resource_key = 'test_key'",
+        )
+        .execute(&state.db)
+        .await
+        .unwrap();
+        let (status, Json(body)) = crate::routes::apps::app_mutation_busy_error(
+            &state.db,
+            app_id,
+            std::slice::from_ref(&fence),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "app mutation already in progress");
+        assert_eq!(body["held_by"], "custom_domain_set");
+        let retry_after = body["retry_after"].as_i64().expect("retry_after hint");
+        assert!(
+            (80..=90).contains(&retry_after),
+            "hint should track the fence holder's 90s lock, got {retry_after}"
+        );
     }
 
     #[tokio::test]
