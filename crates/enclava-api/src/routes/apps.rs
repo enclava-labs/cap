@@ -501,8 +501,13 @@ async fn persist_workload_teardown_completed(
     pool: &sqlx::PgPool,
     app_id: Uuid,
 ) -> Result<(), sqlx::Error> {
-    // Single statement: atomic on its own, and committed independently of the
-    // delete lane so a later step failure cannot roll back the marker.
+    // Single transaction: the marker and the waiver clear commit together, so
+    // a teardown that erased the seed can never leave a stale tombstone
+    // behind — an abandoned attempt's waiver would otherwise outlive a
+    // successful retry and refuse every same-name recreate despite the
+    // erasure. Still committed independently of the delete lane so a later
+    // step failure cannot roll back the marker.
+    let mut tx = pool.begin().await?;
     sqlx::query(
         "UPDATE apps
             SET workload_teardown_completed_at = COALESCE(workload_teardown_completed_at, clock_timestamp()),
@@ -510,8 +515,13 @@ async fn persist_workload_teardown_completed(
           WHERE id = $1",
     )
     .bind(app_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    sqlx::query("DELETE FROM kbs_owner_seed_waivers WHERE app_id = $1")
+        .bind(app_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -935,6 +945,12 @@ pub(crate) async fn prepare_app_candidate(
                 Json(serde_json::json!({"error": error})),
             )
         })?;
+    // Every create path derives the KBS owner binding key from the tenant
+    // namespace and app name, so it is identical across incarnations of the
+    // same name: refuse the create here (the shared chokepoint) when the
+    // previous incarnation was destroyed without completing its confidential
+    // teardown.
+    refuse_stale_owner_seed(state, &namespace, &body.name).await?;
     let app_host =
         enclava_common::hostnames::app_hostname(&body.name, &org.cust_slug, &state.platform_domain)
             .map_err(|error| {
@@ -998,6 +1014,34 @@ pub(crate) async fn prepare_app_candidate(
 }
 
 /// POST /apps -- create a new app.
+/// Refuse a create whose binding key carries a recorded teardown waiver: the
+/// previous incarnation of this name was destroyed while its owner seed may
+/// still exist in KBS, and a fresh workload would boot already-claimed.
+/// Shared by every create path (public, generic-deployment, hosted).
+pub(crate) fn stale_owner_seed_response() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "error": "stale_owner_seed",
+            "message": "the previous incarnation of this app name was destroyed without completing its confidential teardown; its owner seed may still exist in KBS and a new workload would boot already-claimed. Have the operator erase the stale seed (KBS repository removal per the destroy runbook) and clear the recorded waiver (the kbs_owner_seed_waivers row for this binding key), or choose a different name.",
+        })),
+    )
+}
+
+pub(crate) async fn refuse_stale_owner_seed(
+    state: &AppState,
+    namespace: &str,
+    name: &str,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let stale_owner_seed = crate::kbs::stale_owner_seed_for_binding(&state.db, namespace, name)
+        .await
+        .map_err(|_| internal_server_error())?;
+    if stale_owner_seed {
+        return Err(stale_owner_seed_response());
+    }
+    Ok(())
+}
+
 pub async fn create_app(
     auth: AuthContext,
     State(state): State<AppState>,
@@ -1048,7 +1092,11 @@ pub async fn create_app(
          unlock_mode, domain, tee_domain,
          signer_identity_subject, signer_identity_issuer, signer_identity_set_at,
         source_provider, source_repository, egress_allowlist, egress_mode)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::unlock_enum, $11, $12, $13, $14, $15, $16, $17, $18, $19)",
+         SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10::unlock_enum, $11, $12, $13, $14, $15, $16, $17, $18, $19
+         WHERE NOT EXISTS (
+             SELECT 1 FROM kbs_owner_seed_waivers
+              WHERE binding_key = $20
+         )",
     )
     .bind(app_id)
     .bind(app_candidate.org_id)
@@ -1069,17 +1117,33 @@ pub async fn create_app(
     .bind(app_candidate.source_repository.as_deref())
     .bind(&app_candidate.egress_allowlist)
     .bind(&app_candidate.egress_mode)
+    .bind(crate::kbs::owner_binding_key_for(
+        &app_candidate.namespace,
+        &app_candidate.name,
+    ))
     .execute(&mut *tx)
     .await;
 
-    if let Err(e) = result {
-        if e.to_string().contains("duplicate key") || e.to_string().contains("unique") {
-            return Err((
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({"error": "app name already taken in this org"})),
-            ));
+    let insert_result = match result {
+        Ok(executed) => executed,
+        Err(e) => {
+            if e.to_string().contains("duplicate key") || e.to_string().contains("unique") {
+                return Err((
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({"error": "app name already taken in this org"})),
+                ));
+            }
+            return Err(internal_server_error());
         }
-        return Err(internal_server_error());
+    };
+    // The waiver check in `prepare_app_candidate` runs before this
+    // transaction, so an abandoned destroy committing between the check and
+    // this insert could slip a recreate past the tombstone (the insert waits
+    // out the old row's unique constraint and resumes only after the destroy
+    // commits). The NOT EXISTS above re-checks atomically with the insert:
+    // zero rows inserted means the waiver landed in between - refuse.
+    if insert_result.rows_affected() == 0 {
+        return Err(stale_owner_seed_response());
     }
 
     sqlx::query(
@@ -1355,8 +1419,33 @@ pub async fn delete_app(
     auth: AuthContext,
     State(state): State<AppState>,
     Path(app_name): Path<String>,
+    body: axum::body::Bytes,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
-    delete_app_before(auth, State(state), Path(app_name), None).await
+    let abandon_teardown = parse_abandon_teardown(&body)?;
+    delete_app_before(auth, State(state), Path(app_name), None, abandon_teardown).await
+}
+
+/// Parses the optional `{"abandon_teardown": true}` request body shared by the
+/// public and PaaS-internal delete surfaces: an explicit operator override to
+/// finish a destroy whose confidential workload teardown cannot complete.
+fn parse_abandon_teardown(body: &[u8]) -> Result<bool, (StatusCode, Json<serde_json::Value>)> {
+    if body.is_empty() {
+        return Ok(false);
+    }
+    let value: serde_json::Value = serde_json::from_slice(body).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "invalid_request_body"})),
+        )
+    })?;
+    match value.get("abandon_teardown") {
+        None => Ok(false),
+        Some(serde_json::Value::Bool(flag)) => Ok(*flag),
+        Some(_) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "invalid_abandon_teardown"})),
+        )),
+    }
 }
 
 pub(crate) async fn delete_app_before(
@@ -1364,6 +1453,7 @@ pub(crate) async fn delete_app_before(
     State(state): State<AppState>,
     Path(app_name): Path<String>,
     created_before: Option<chrono::DateTime<chrono::Utc>>,
+    abandon_teardown: bool,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
     scopes::require_admin(&auth)?;
     scopes::require_scope(&auth, "apps:write")?;
@@ -1638,62 +1728,75 @@ pub(crate) async fn delete_app_before(
         .await
         .map_err(|_| internal_server_error())?;
     if let Err(failure) = teardown {
-        // A failed teardown exits before any fenced resource is touched: the
-        // delete is atomic — restore the pre-delete status instead of
-        // stranding the app in 'deleting' — but only when this attempt
-        // really left the app unchanged. If the flip transaction
-        // superseded a nonterminal deployment, that deployment is now
-        // failed and a status flip alone would present an app whose
-        // serving state cannot be reconstructed (its live operation is
-        // terminal): keep 'deleting' (wired and retryable under the
-        // teardown-pending rules) instead. A failure AFTER teardown keeps
-        // 'deleting': its wrap is erased, and the retry (skipping teardown
-        // via the monotonic completion marker) must finish the cleanup.
-        // (unless it was already 'deleting' from an earlier attempt, whose
-        // pre-attempt status is unknown) The disposition rides the error
-        // body's `reason` so clients can tell an intact, restored app from
-        // one that must finish (or abandon) its deletion.
-        let restored = phase_app.status != AppStatus::Deleting && superseded_by_this_attempt == 0;
-        if restored {
-            sqlx::query(
-                "UPDATE apps
-                    SET status = $2::app_status_enum,
-                        updated_at = clock_timestamp()
-                  WHERE id = $1
-                    AND status = 'deleting'::app_status_enum",
-            )
-            .bind(phase_app.id)
-            .bind(phase_app.status)
-            .execute(&mut *delete_lane)
-            .await
-            .map_err(|_| internal_server_error())?;
+        if !abandon_teardown {
+            // A failed teardown exits before any fenced resource is touched:
+            // the delete is atomic — restore the pre-delete status instead of
+            // stranding the app in 'deleting' — but only when this attempt
+            // really left the app unchanged. If the flip transaction
+            // superseded a nonterminal deployment, that deployment is now
+            // failed and a status flip alone would present an app whose
+            // serving state cannot be reconstructed (its live operation is
+            // terminal): keep 'deleting' (wired and retryable under the
+            // teardown-pending rules) instead. A failure AFTER teardown keeps
+            // 'deleting': its wrap is erased, and the retry (skipping teardown
+            // via the monotonic completion marker) must finish the cleanup.
+            // (unless it was already 'deleting' from an earlier attempt, whose
+            // pre-attempt status is unknown) The disposition rides the error
+            // body's `reason` so clients can tell an intact, restored app from
+            // one that must finish (or abandon) its deletion.
+            let restored =
+                phase_app.status != AppStatus::Deleting && superseded_by_this_attempt == 0;
+            if restored {
+                sqlx::query(
+                    "UPDATE apps
+                        SET status = $2::app_status_enum,
+                            updated_at = clock_timestamp()
+                      WHERE id = $1
+                        AND status = 'deleting'::app_status_enum",
+                )
+                .bind(phase_app.id)
+                .bind(phase_app.status)
+                .execute(&mut *delete_lane)
+                .await
+                .map_err(|_| internal_server_error())?;
+            }
+            // Merely dropping the lease would hold the cluster-wide
+            // edge_config and kbs_policy fences through reclaim quarantine
+            // (~9 min), blocking every tenant's deploys until then. Nothing in
+            // this attempt wrote provider state yet, so release durably in the
+            // already-held lane transaction (finish() would re-take the
+            // advisory lane lock and deadlock) and surface the failure for a
+            // same-key retry.
+            delete_mutation
+                .finish_in_tx(&mut delete_lane)
+                .await
+                .map_err(|_| internal_server_error())?;
+            delete_lane
+                .commit()
+                .await
+                .map_err(|_| internal_server_error())?;
+            let (status, mut body) = failure;
+            if let Some(object) = body.0.as_object_mut() {
+                object.insert(
+                    "reason".to_string(),
+                    serde_json::json!(if restored {
+                        "app_restored"
+                    } else {
+                        "app_kept_deleting"
+                    }),
+                );
+            }
+            return Err((status, body));
         }
-        // Merely dropping the lease would hold the cluster-wide edge_config
-        // and kbs_policy fences through reclaim quarantine (~9 min), blocking
-        // every tenant's deploys until then. Nothing in this attempt wrote
-        // provider state yet, so release durably in the already-held lane
-        // transaction (finish() would re-take the advisory lane lock and
-        // deadlock) and surface the failure for a same-key retry.
-        delete_mutation
-            .finish_in_tx(&mut delete_lane)
-            .await
-            .map_err(|_| internal_server_error())?;
-        delete_lane
-            .commit()
-            .await
-            .map_err(|_| internal_server_error())?;
-        let (status, mut body) = failure;
-        if let Some(object) = body.0.as_object_mut() {
-            object.insert(
-                "reason".to_string(),
-                serde_json::json!(if restored {
-                    "app_restored"
-                } else {
-                    "app_kept_deleting"
-                }),
-            );
-        }
-        return Err((status, body));
+        // Operator override: the workload is confirmed unreachable (or its
+        // teardown cannot complete for good), so proceed with the deletion and
+        // record the waiver on the owner binding — a future create under this
+        // name will be refused until the possibly-surviving seed is erased.
+        tracing::warn!(
+            app_id = %deleting_app.id,
+            code = "app_delete_teardown_abandoned",
+            "proceeding with deletion after failed workload teardown (operator override)"
+        );
     }
 
     // The running workload needs its current KBS authorization to erase the
@@ -1922,11 +2025,16 @@ pub(crate) async fn delete_app_before(
         .commit()
         .await
         .map_err(|_| internal_server_error())?;
-    crate::kbs::soft_delete_owner_binding(&state.db, deleting_app.id)
-        .await
-        .map_err(|error| {
-            app_delete_failure(deleting_app.id, AppDeleteFailure::KbsOwnerBinding, error)
-        })?;
+    crate::kbs::soft_delete_owner_binding(
+        &state.db,
+        deleting_app.id,
+        &deleting_app.namespace,
+        &deleting_app.name,
+    )
+    .await
+    .map_err(|error| {
+        app_delete_failure(deleting_app.id, AppDeleteFailure::KbsOwnerBinding, error)
+    })?;
     crate::kbs::soft_delete_tls_binding(&state.db, state.kbs_policy.as_ref(), deleting_app.id)
         .await
         .map_err(|error| {
@@ -1982,6 +2090,47 @@ pub(crate) async fn delete_app_before(
         .commit()
         .await
         .map_err(|_| internal_server_error())?;
+
+    // The signed-policy candidate selectors ran against the pre-delete
+    // world. An abandoned destroy keeps the completion marker NULL, so the
+    // pre-delete reconciliation deliberately retained the app's artifact
+    // (teardown-pending authorization); with the app row now cascaded away,
+    // nothing would re-run publication and the stale Trustee policy would
+    // keep authorizing the deleted workload until some unrelated
+    // reconciliation. Enqueue and best-effort run one now — the app is gone,
+    // so the next candidate selection drops it — but only when CAP has
+    // already entered signed-policy mode: a delete must never *activate*
+    // signed mode on a legacy Rego installation (generation 0, no signed
+    // artifacts), where publication would replace the Rego policy still
+    // authorizing other apps with an empty artifact set. A failure of the
+    // immediate run only delays the revocation (the enqueue is durable and
+    // the global reconciler converges); the deletion itself is complete.
+    let mut post_delete_tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|_| internal_server_error())?;
+    let post_delete_reconcile =
+        crate::kbs::enqueue_signed_policy_revocation_if_active(&mut post_delete_tx)
+            .await
+            .map_err(|_| internal_server_error())?;
+    post_delete_tx
+        .commit()
+        .await
+        .map_err(|_| internal_server_error())?;
+    if post_delete_reconcile.is_some()
+        && let Err(_error) = crate::kbs::reconcile_pending_signed_policy_artifacts(
+            &state.db,
+            state.kbs_policy.as_ref(),
+        )
+        .await
+    {
+        tracing::warn!(
+            app_id = %deleting_app.id,
+            code = "app_delete_post_delete_policy_reconcile_failed",
+            "app deleted but its signed-policy revocation is durably pending"
+        );
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }

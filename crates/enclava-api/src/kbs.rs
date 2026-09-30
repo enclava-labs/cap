@@ -311,17 +311,94 @@ pub async fn ensure_tls_binding(
     Ok(())
 }
 
-pub async fn soft_delete_owner_binding(db: &PgPool, app_id: Uuid) -> Result<(), KbsPolicyError> {
+pub async fn soft_delete_owner_binding(
+    db: &PgPool,
+    app_id: Uuid,
+    namespace: &str,
+    app_name: &str,
+) -> Result<(), KbsPolicyError> {
+    // If the confidential teardown never completed, the owner seed may still
+    // exist in KBS: record the waiver FIRST, in a table that survives the app
+    // row (kbs_owner_bindings cascades away with it), so a later recreate of
+    // the same binding key is refused until the seed is erased.
+    //
+    // "Never completed" is derived from seed existence, not the flip-time
+    // requirement flag alone: a teardown-required workload (signed paths
+    // never create a binding row — the key is name-derived either way) OR
+    // any workload with a live owner binding (a running-then-stopped app
+    // keeps its seed; PaaS desired-state only scales it to zero) waives
+    // when the completion marker is absent. Completed teardowns and
+    // never-deployed apps record nothing: absence of a waiver means
+    // recreate is allowed.
     sqlx::query(
-        "UPDATE kbs_owner_bindings
-         SET deleted_at = COALESCE(deleted_at, now()), updated_at = now()
-         WHERE app_id = $1",
+        "INSERT INTO kbs_owner_seed_waivers (binding_key, app_id, org_name, app_name)
+         SELECT $2, app.id, org.name, app.name
+           FROM apps AS app
+           JOIN organizations AS org ON org.id = app.org_id
+          WHERE app.id = $1
+            AND app.workload_teardown_completed_at IS NULL
+            AND (
+                app.workload_teardown_required
+                OR EXISTS (
+                    SELECT 1
+                      FROM kbs_owner_bindings AS binding
+                     WHERE binding.app_id = app.id
+                )
+            )
+         ON CONFLICT (binding_key) DO UPDATE
+            SET app_id = EXCLUDED.app_id,
+                org_name = EXCLUDED.org_name,
+                app_name = EXCLUDED.app_name,
+                waived_at = now()",
+    )
+    .bind(app_id)
+    .bind(owner_binding_key(namespace, app_name))
+    .execute(db)
+    .await?;
+    sqlx::query(
+        "UPDATE kbs_owner_bindings AS binding
+            SET deleted_at = COALESCE(binding.deleted_at, now()),
+                updated_at = now()
+           WHERE binding.app_id = $1",
     )
     .bind(app_id)
     .execute(db)
     .await?;
 
     Ok(())
+}
+
+/// Mirrors `enclava_engine::types::ConfidentialApp::owner_resource_type`: the
+/// KBS owner binding key is derived from the tenant namespace and app name, so
+/// it is identical across incarnations of the same name.
+fn owner_binding_key(namespace: &str, name: &str) -> String {
+    format!("{namespace}-{name}-owner")
+}
+
+/// Create-path re-check helper: the same derivation, callable from the
+/// routes that guard their app inserts against a recorded waiver.
+pub(crate) fn owner_binding_key_for(namespace: &str, name: &str) -> String {
+    owner_binding_key(namespace, name)
+}
+
+/// Whether a soft-deleted owner binding with this key was destroyed without a
+/// completed confidential teardown — its owner seed may still exist in KBS,
+/// and a fresh create under the same name would boot already-claimed.
+pub async fn stale_owner_seed_for_binding(
+    db: &PgPool,
+    namespace: &str,
+    name: &str,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1
+               FROM kbs_owner_seed_waivers
+              WHERE binding_key = $1
+         )",
+    )
+    .bind(owner_binding_key(namespace, name))
+    .fetch_one(db)
+    .await
 }
 
 pub async fn soft_delete_tls_binding(
@@ -2751,21 +2828,9 @@ resource_bindings := {
         );
     }
 
-    async fn database_test_pool() -> PgPool {
-        let database_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
-        let pool = PgPool::connect(&database_url)
-            .await
-            .expect("connect KBS authority test database");
-        crate::db::pool::run_migrations(&pool)
-            .await
-            .expect("migrate KBS authority test database");
-        pool
-    }
-
     #[tokio::test]
     async fn signed_policy_bootstrap_generation_is_atomic_and_idempotent() {
-        let pool = database_test_pool().await;
+        let pool = crate::test_support::database_test_pool().await;
         let mut tx = pool.begin().await.unwrap();
         sqlx::query(
             "UPDATE kbs_signed_policy_reconciliation
@@ -2958,7 +3023,7 @@ resource_bindings := {
 
     #[tokio::test]
     async fn selector_uses_current_operation_binding_and_legacy_fallback() {
-        let pool = database_test_pool().await;
+        let pool = crate::test_support::database_test_pool().await;
         let now = Utc::now();
 
         // A rollback operation points to an older exact artifact. It must rank
@@ -3191,7 +3256,7 @@ resource_bindings := {
 
     #[tokio::test]
     async fn latest_deployment_prefers_jobs_then_deterministic_legacy_identity() {
-        let pool = database_test_pool().await;
+        let pool = crate::test_support::database_test_pool().await;
         let (org_id, app_id) = insert_test_app(&pool, "running").await;
         let created_at = Utc::now();
         let older_id = Uuid::parse_str("10000000-0000-0000-0000-000000000001").unwrap();
@@ -3221,7 +3286,7 @@ resource_bindings := {
 
     #[tokio::test]
     async fn receipt_authority_is_immutable_but_app_cascade_remains_available() {
-        let pool = database_test_pool().await;
+        let pool = crate::test_support::database_test_pool().await;
         let (org_id, app_id) = insert_test_app(&pool, "running").await;
         let deployment_id = Uuid::new_v4();
         insert_test_deployment(&pool, org_id, app_id, deployment_id, "healthy", Utc::now()).await;
@@ -3325,7 +3390,7 @@ resource_bindings := {
 
     #[tokio::test]
     async fn deleting_app_keeps_authorization_only_while_teardown_pending() {
-        let pool = database_test_pool().await;
+        let pool = crate::test_support::database_test_pool().await;
         let now = Utc::now();
 
         let (pending_org, pending_app) = insert_test_app(&pool, "deleting").await;
@@ -3416,7 +3481,7 @@ resource_bindings := {
 
     #[tokio::test]
     async fn teardown_pending_authorization_survives_deployment_supersession() {
-        let pool = database_test_pool().await;
+        let pool = crate::test_support::database_test_pool().await;
         let now = Utc::now();
         let (org_id, app_id) = insert_test_app(&pool, "deleting").await;
         sqlx::query("UPDATE apps SET workload_teardown_required = true WHERE id = $1")
@@ -3553,9 +3618,253 @@ resource_bindings := {
             .expect("delete supersession fixture organization");
     }
 
+    async fn seed_owner_binding_for_app(pool: &PgPool, app_id: Uuid) {
+        sqlx::query(
+            "INSERT INTO kbs_owner_bindings (
+                 app_id, binding_key, repository, allowed_tags, namespace,
+                 service_account, tenant_instance_identity_hash, deleted_at
+             )
+             SELECT id,
+                    namespace || '-' || name || '-owner',
+                    'default', ARRAY['seed-encrypted', 'seed-sealed'],
+                    namespace, service_account, tenant_instance_identity_hash, NULL
+               FROM apps WHERE id = $1",
+        )
+        .bind(app_id)
+        .execute(pool)
+        .await
+        .expect("insert owner binding fixture");
+    }
+
+    async fn owner_binding_outcome(pool: &PgPool, app_id: Uuid) -> Option<chrono::DateTime<Utc>> {
+        sqlx::query_scalar("SELECT waived_at FROM kbs_owner_seed_waivers WHERE app_id = $1")
+            .bind(app_id)
+            .fetch_optional(pool)
+            .await
+            .expect("read owner binding waiver")
+    }
+
+    #[tokio::test]
+    async fn soft_delete_owner_binding_records_teardown_outcome() {
+        let pool = crate::test_support::database_test_pool().await;
+
+        // The mirrored binding-key format is load-bearing for the guard: a
+        // drift in either string silently disables it. Pin it against the
+        // engine's own derivation.
+        {
+            use enclava_engine::types::{
+                AttestationConfig, BindMount, ConfidentialApp, Container, DomainSpec, StorageSpec,
+                VolumeSpec,
+            };
+            let dummy_digest = format!("sha256:{}", "a".repeat(64));
+            let engine_app = ConfidentialApp {
+                app_id: Uuid::new_v4(),
+                deployment_id: Uuid::new_v4(),
+                name: "mirror".into(),
+                namespace: "cap-org-mirror".into(),
+                instance_id: "org-mirror".into(),
+                tenant_id: "org".into(),
+                bootstrap_owner_pubkey_hash: "00".repeat(32),
+                tenant_instance_identity_hash: "11".repeat(32),
+                service_account: "cap-mirror-sa".into(),
+                image_pull_secret_name: None,
+                signer_identity_subject: None,
+                signer_identity_issuer: None,
+                containers: vec![Container {
+                    name: "mirror".into(),
+                    image: enclava_common::image::ImageRef::parse(&format!(
+                        "ghcr.io/enclava-labs/demo@{dummy_digest}"
+                    ))
+                    .unwrap(),
+                    port: Some(3000),
+                    command: None,
+                    env: std::collections::HashMap::new(),
+                    storage_paths: vec![],
+                    workload_security_profile:
+                        enclava_engine::types::WorkloadSecurityProfile::Restricted,
+                    is_primary: true,
+                }],
+                storage: StorageSpec {
+                    app_data: VolumeSpec {
+                        size: "1Gi".into(),
+                        device_path: "/dev/csi0".into(),
+                        mount_path: "/data".into(),
+                        durability: enclava_common::types::Durability::DurableState,
+                        bootstrap_policy: enclava_common::types::BootstrapPolicy::FirstBootOnly,
+                        bind_mounts: vec![BindMount {
+                            source: "/data/app".into(),
+                            destination: "/app/data".into(),
+                        }],
+                    },
+                    tls_data: VolumeSpec {
+                        size: "1Gi".into(),
+                        device_path: "/dev/csi1".into(),
+                        mount_path: "/tls".into(),
+                        durability: enclava_common::types::Durability::DisposableState,
+                        bootstrap_policy: enclava_common::types::BootstrapPolicy::AllowReinit,
+                        bind_mounts: vec![],
+                    },
+                },
+                unlock_mode: enclava_common::types::UnlockMode::Password,
+                domain: DomainSpec {
+                    platform_domain: "mirror.example.test".into(),
+                    tee_domain: "mirror.tee.example.test".into(),
+                    custom_domain: None,
+                },
+                api_signing_pubkey: String::new(),
+                api_url: String::new(),
+                resources: enclava_common::types::ResourceLimits {
+                    cpu: "1".into(),
+                    memory: "512Mi".into(),
+                },
+                attestation: AttestationConfig {
+                    proxy_image: enclava_common::image::ImageRef::parse(&format!(
+                        "ghcr.io/enclava-labs/attestation-proxy@{dummy_digest}"
+                    ))
+                    .unwrap(),
+                    caddy_image: enclava_common::image::ImageRef::parse(&format!(
+                        "ghcr.io/enclava-labs/caddy-ingress@{dummy_digest}"
+                    ))
+                    .unwrap(),
+                    acme_ca_url: enclava_engine::types::default_acme_ca_url(),
+                    caddy_tls_mode: enclava_engine::types::CaddyTlsMode::Acme,
+                    trustee_policy_read_available: true,
+                    workload_artifacts_url: None,
+                    tls_certificate_broker_url: None,
+                    amd_kds_base_url: None,
+                    trustee_policy_url: None,
+                    local_workload_artifacts_json: None,
+                    local_trustee_policy_json: None,
+                    platform_trustee_policy_pubkey_hex: None,
+                    signing_service_pubkey_hex: None,
+                    verification_material: None,
+                },
+                egress_mode: enclava_engine::types::EgressMode::Restricted,
+                public_internet_egress_excluded_cidrs: vec![],
+                allow_internal_egress: false,
+                egress_allowlist: vec![],
+                log_encryption: None,
+                workload_artifact_binding: None,
+                generated_agent_policy: None,
+            };
+            assert_eq!(
+                owner_binding_key("cap-org-mirror", "mirror"),
+                engine_app.owner_resource_type(),
+                "kbs.rs and the engine must derive the same KBS owner binding key"
+            );
+        }
+
+        async fn app_identity(pool: &PgPool, app_id: Uuid) -> (String, String) {
+            sqlx::query_as("SELECT namespace, name FROM apps WHERE id = $1")
+                .bind(app_id)
+                .fetch_one(pool)
+                .await
+                .expect("read app identity")
+        }
+
+        // Required teardown, never completed: the wrap may survive — waived.
+        let (waived_org, waived_app) = insert_test_app(&pool, "running").await;
+        seed_owner_binding_for_app(&pool, waived_app).await;
+        let waived_identity = app_identity(&pool, waived_app).await;
+        soft_delete_owner_binding(&pool, waived_app, &waived_identity.0, &waived_identity.1)
+            .await
+            .expect("soft delete waived binding");
+        assert!(owner_binding_outcome(&pool, waived_app).await.is_some());
+        assert!(
+            stale_owner_seed_for_binding(&pool, &waived_identity.0, &waived_identity.1)
+                .await
+                .expect("guard lookup"),
+            "a waived binding must refuse recreation of the same name"
+        );
+        // The tombstone must survive the app row: the delete tail records the
+        // waiver and then hard-deletes the app (kbs_owner_bindings cascades
+        // away; the waiver table has no foreign keys by design).
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(waived_org)
+            .execute(&pool)
+            .await
+            .expect("delete waived fixture organization (cascades the app)");
+        assert!(
+            stale_owner_seed_for_binding(&pool, &waived_identity.0, &waived_identity.1)
+                .await
+                .expect("guard lookup after cascade"),
+            "the waiver must survive the app row deletion"
+        );
+
+        // A stopped app keeps its owner binding (PaaS desired-state only
+        // scales the workload to zero, the seed survives) even though the
+        // flip records teardown as not required: the binding row is the
+        // seed-existence signal — waived.
+        let (stopped_org, stopped_app) = insert_test_app(&pool, "stopped").await;
+        seed_owner_binding_for_app(&pool, stopped_app).await;
+        let stopped_identity = app_identity(&pool, stopped_app).await;
+        soft_delete_owner_binding(&pool, stopped_app, &stopped_identity.0, &stopped_identity.1)
+            .await
+            .expect("soft delete stopped binding");
+        assert!(
+            owner_binding_outcome(&pool, stopped_app).await.is_some(),
+            "a binding row without a completion marker means the seed may survive"
+        );
+
+        // A signed workload is teardown-required but never creates a binding
+        // row: the key is name-derived either way — waived.
+        let (signed_org, signed_app) = insert_test_app(&pool, "running").await;
+        sqlx::query("UPDATE apps SET workload_teardown_required = true WHERE id = $1")
+            .bind(signed_app)
+            .execute(&pool)
+            .await
+            .expect("mark signed workload teardown required");
+        let signed_identity = app_identity(&pool, signed_app).await;
+        soft_delete_owner_binding(&pool, signed_app, &signed_identity.0, &signed_identity.1)
+            .await
+            .expect("soft delete signed binding");
+        assert!(
+            owner_binding_outcome(&pool, signed_app).await.is_some(),
+            "a teardown-required workload waives without a binding row (signed path)"
+        );
+
+        // Required teardown, completed: nothing survives — recreate freely.
+        let (done_org, done_app) = insert_test_app(&pool, "running").await;
+        seed_owner_binding_for_app(&pool, done_app).await;
+        sqlx::query(
+            "UPDATE apps SET workload_teardown_completed_at = clock_timestamp()
+              WHERE id = $1",
+        )
+        .bind(done_app)
+        .execute(&pool)
+        .await
+        .expect("mark teardown completed");
+        let done_identity = app_identity(&pool, done_app).await;
+        soft_delete_owner_binding(&pool, done_app, &done_identity.0, &done_identity.1)
+            .await
+            .expect("soft delete completed binding");
+        assert!(owner_binding_outcome(&pool, done_app).await.is_none());
+
+        // Never deployed: no binding, no teardown requirement, no wrap ever
+        // existed — recreate freely.
+        let (fresh_org, fresh_app) = insert_test_app(&pool, "creating").await;
+        let fresh_identity = app_identity(&pool, fresh_app).await;
+        soft_delete_owner_binding(&pool, fresh_app, &fresh_identity.0, &fresh_identity.1)
+            .await
+            .expect("soft delete never-deployed binding");
+        assert!(owner_binding_outcome(&pool, fresh_app).await.is_none());
+        let fresh_stale = stale_owner_seed_for_binding(&pool, &fresh_identity.0, &fresh_identity.1)
+            .await
+            .expect("guard lookup");
+        assert!(!fresh_stale);
+
+        for cleanup_org in [stopped_org, signed_org, done_org, fresh_org] {
+            sqlx::query("DELETE FROM organizations WHERE id = $1")
+                .bind(cleanup_org)
+                .execute(&pool)
+                .await
+                .expect("delete teardown-outcome fixture organization");
+        }
+    }
+
     #[tokio::test]
     async fn teardown_pending_authorization_survives_stacked_failed_generations() {
-        let pool = database_test_pool().await;
+        let pool = crate::test_support::database_test_pool().await;
         let now = Utc::now();
         let (org_id, app_id) = insert_test_app(&pool, "deleting").await;
         sqlx::query("UPDATE apps SET workload_teardown_required = true WHERE id = $1")
@@ -3673,7 +3982,7 @@ resource_bindings := {
 
     #[tokio::test]
     async fn queued_supersessions_do_not_crowd_out_live_teardown_authority() {
-        let pool = database_test_pool().await;
+        let pool = crate::test_support::database_test_pool().await;
         let now = Utc::now();
         let (org_id, app_id) = insert_test_app(&pool, "deleting").await;
         sqlx::query("UPDATE apps SET workload_teardown_required = true WHERE id = $1")

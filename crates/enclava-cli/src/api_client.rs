@@ -297,12 +297,19 @@ impl ApiClient {
     }
 
     pub async fn delete_app(&self, name: &str) -> Result<(), ApiError> {
-        let resp = self
-            .http
-            .delete(self.url(&format!("/apps/{name}")))
-            .headers(self.auth_headers()?)
-            .send()
-            .await?;
+        self.delete_app_with_options(name, false).await
+    }
+
+    pub async fn delete_app_with_options(
+        &self,
+        name: &str,
+        abandon_teardown: bool,
+    ) -> Result<(), ApiError> {
+        let mut request = self.http.delete(self.url(&format!("/apps/{name}")));
+        if abandon_teardown {
+            request = request.json(&serde_json::json!({ "abandon_teardown": true }));
+        }
+        let resp = request.headers(self.auth_headers()?).send().await?;
         self.check_response(resp).await?;
         Ok(())
     }
