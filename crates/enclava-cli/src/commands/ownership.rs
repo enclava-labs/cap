@@ -319,6 +319,22 @@ pub(crate) fn claim_session_is_interactive(
     }
 }
 
+/// Pre-mutation gate for flows that will auto-claim ownership (password-mode
+/// first deploys): fail with the claim-session requirements BEFORE the deploy
+/// request creates server-side rows. The same check inside
+/// `claim_initial_ownership` fires post-mutation, and a client abort there
+/// strands the server-side deployment with nothing client-side to clean it
+/// up (#194 residue). Same predicate, same message -- only earlier.
+pub(crate) fn ensure_claim_session_now(
+    password_from_file: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    ensure_claim_session_for(
+        std::io::IsTerminal::is_terminal(&std::io::stdin()),
+        std::io::IsTerminal::is_terminal(&std::io::stderr()),
+        password_from_file,
+    )
+}
+
 fn ensure_claim_session_for(
     stdin_is_terminal: bool,
     stderr_is_terminal: bool,

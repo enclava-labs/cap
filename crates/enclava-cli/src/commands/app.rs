@@ -228,7 +228,7 @@ impl DeployRuntimeTarget {
     }
 }
 
-fn deploy_needs_initial_claim(
+pub(crate) fn deploy_needs_initial_claim(
     is_password_mode: bool,
     ownership_state: Option<&str>,
     app_status: &str,
@@ -240,6 +240,28 @@ fn deploy_needs_initial_claim(
         Some("unclaimed") => true,
         Some(_) => false,
         None => app_status == "creating",
+    }
+}
+
+/// The pre-mutation claim gate's decision: the post-submit
+/// [`deploy_needs_initial_claim`] predicate, except that unresolved
+/// ownership fails CLOSED before submission. The status read is a TEE
+/// query: a window that closes between this read and the post-submit one
+/// is exactly the strand this gate exists to prevent, so an unreadable
+/// state gates. The cost -- an unattended redeploy of an already-claimed
+/// app while its TEE status is unreachable now needs a session -- leaves
+/// no residue, while the strand leaves a submitted deployment with no
+/// claimant. The post-submit predicate keeps its own None fallback
+/// unchanged (gating there would strand claimed redeploys in the claim
+/// wait instead).
+pub(crate) fn deploy_preflight_needs_claim(
+    is_password_mode: bool,
+    ownership_state: Option<&str>,
+    app_status: &str,
+) -> bool {
+    match ownership_state {
+        None => is_password_mode,
+        Some(state) => deploy_needs_initial_claim(is_password_mode, Some(state), app_status),
     }
 }
 
@@ -419,14 +441,32 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
     if is_password_mode {
         storage_password.ensure_available_for_password_mode("password-mode deploy")?;
     }
+    // Pre-mutation claim-session gate: a fresh password-mode deploy auto-claims
+    // on first boot; refusing a session that cannot claim BEFORE submitting
+    // keeps the abort side-effect-free (the post-mutation refusal strands a
+    // server-side deployment nothing terminalizes client-side). Live ownership
+    // is read first and fed to the same decision the post-submit claim uses
+    // (a failed first deploy leaves the app unclaimed outside `creating`);
+    // unresolved ownership fails closed -- see `deploy_preflight_needs_claim`.
+    let preflight_ownership = api
+        .get_unlock_status(&app_name)
+        .await
+        .ok()
+        .and_then(|status| status.ownership_state);
+    let preflight_needs_claim = deploy_preflight_needs_claim(
+        is_password_mode,
+        preflight_ownership.as_deref(),
+        &app.status,
+    );
+    if preflight_needs_claim {
+        crate::commands::ownership::ensure_claim_session_now(storage_password.is_from_file())?;
+    }
     let capture = mnemonic_capture_from_flags(args.no_store_mnemonic);
     // A fresh password-mode deploy auto-claims ownership on first boot; refuse the
     // no-store sink mode before submitting anything, while the run can still stop
     // without side effects. (The authoritative pre-claim gate also re-checks this
     // inside `claim_initial_ownership`.)
-    if capture == MnemonicCapture::Skip
-        && deploy_needs_initial_claim(is_password_mode, None, &app.status)
-    {
+    if capture == MnemonicCapture::Skip && preflight_needs_claim {
         crate::commands::ownership::validate_recovery_mnemonic_sink_mode(capture)?;
     }
     let pb = ProgressBar::new(5);
@@ -2589,39 +2629,11 @@ pub async fn destroy(args: DestroyArgs) -> Result<(), Box<dyn std::error::Error>
     let result = api
         .delete_app_with_options(&app_name, args.abandon_teardown)
         .await;
-    // Teardown failures either restore the app to its pre-delete state (the
-    // delete is atomic) or leave it marked deleting when restoring would
-    // misrepresent an app whose live operation was superseded; the error
-    // body's `reason` tells the two apart (older servers without it get the
-    // neutral wording). Without this hint the raw API code is the only
-    // signal an operator gets. A hosted delete surfaces the locked teardown
-    // only as the deferral cause on a generic in-progress error, so the
-    // message carries it too.
-    if let Err(ApiError::Api { code, message, .. }) = &result {
-        let teardown_cause = code.as_deref() == Some("app_delete_teardown_locked")
-            || message.contains("app_delete_teardown_locked");
-        let hint = if teardown_cause {
-            Some(format!(
-                "the confidential workload is locked and the app remains intact; unlock it with its storage password (`enclava unlock --app {app_name}`), then retry destroy"
-            ))
-        } else {
-            match code.as_deref() {
-                Some("app_delete_teardown_unavailable") => {
-                    Some(if message.contains("(app_restored)") {
-                        "the confidential workload teardown did not complete and the app was restored to its previous state -- retry destroy when the workload becomes reachable, or contact the operator if it keeps failing".to_string()
-                    } else if message.contains("(app_kept_deleting)") {
-                        "the confidential workload teardown did not complete and the app remains in the deleting state -- it stays wired and the destroy is retryable once the workload becomes reachable, or use `destroy --abandon-teardown` once recovery is ruled out".to_string()
-                    } else {
-                        "the confidential workload teardown did not complete -- retry destroy when the workload becomes reachable, or contact the operator if it keeps failing".to_string()
-                    })
-                }
-                _ => None,
-            }
-        };
-        if let Some(hint) = hint {
-            spinner.finish_with_message(format!("Destroy of '{app_name}' did not complete."));
-            eprintln!("Hint: {hint}");
-        }
+    if let Err(ApiError::Api { code, message, .. }) = &result
+        && let Some(hint) = destroy_failure_hint(code.as_deref(), message, &app_name)
+    {
+        spinner.finish_with_message(format!("Destroy of '{app_name}' did not complete."));
+        eprintln!("Hint: {hint}");
     }
     result?;
 
@@ -2639,3 +2651,44 @@ pub async fn destroy(args: DestroyArgs) -> Result<(), Box<dyn std::error::Error>
 #[cfg(test)]
 #[path = "app/tests/mod.rs"]
 mod tests;
+
+/// Operator guidance for a failed destroy, keyed on the stable API code (or
+/// the in-band cause text hosted deferrals carry). Pure so the prose mapping
+/// stays pinned by unit tests before other surfaces match on it.
+fn destroy_failure_hint(code: Option<&str>, message: &str, app_name: &str) -> Option<String> {
+    // Teardown failures either restore the app to its pre-delete state (the
+    // delete is atomic) or leave it marked deleting when restoring would
+    // misrepresent an app whose live operation was superseded; the error
+    // body's `reason` tells the two apart (older servers without it get the
+    // neutral wording). Without this hint the raw API code is the only
+    // signal an operator gets. A hosted delete surfaces the locked teardown
+    // only as the deferral cause on a generic in-progress error, so the
+    // message carries it too.
+    let teardown_cause = code == Some("app_delete_teardown_locked")
+        || message.contains("app_delete_teardown_locked");
+    if teardown_cause {
+        return Some(format!(
+            "the confidential workload is locked and the app remains intact; unlock it with its storage password (`enclava unlock --app {app_name}`), then retry destroy"
+        ));
+    }
+    match code {
+        Some("app_delete_teardown_unavailable") => Some(if message.contains("(app_restored)") {
+            "the confidential workload teardown did not complete and the app was restored to its previous state -- retry destroy when the workload becomes reachable, or contact the operator if it keeps failing".to_string()
+        } else if message.contains("(app_kept_deleting)") {
+            "the confidential workload teardown did not complete and the app remains in the deleting state -- it stays wired and the destroy is retryable once the workload becomes reachable, or use `destroy --abandon-teardown` once recovery is ruled out".to_string()
+        } else {
+            "the confidential workload teardown did not complete -- retry destroy when the workload becomes reachable, or contact the operator if it keeps failing".to_string()
+        }),
+        // Lane etiquette (#83/#194): the 409 answers either carry the
+        // server's lease hints in `message` (held by / retry after) or
+        // come from an older server without them -- the prose stays
+        // neutral so both read correctly.
+        Some("app mutation already in progress") => Some(
+            "another operation holds this app's mutation lane (a deploy or an earlier delete); it retries automatically once free -- retry destroy shortly".to_string(),
+        ),
+        Some("idempotency_request_in_progress") => Some(
+            "a previous destroy attempt is still settling its idempotency lease; retry destroy with the same command shortly".to_string(),
+        ),
+        _ => None,
+    }
+}

@@ -24,6 +24,12 @@ type IdempotencyResponse = (StatusCode, serde_json::Value);
 const IDEMPOTENCY_DEFAULT_LEASE_SECONDS: i64 = 60;
 const IDEMPOTENCY_LEGACY_STALE_SECONDS: i64 = 30 * 60;
 const IDEMPOTENCY_RETRY_DEFER_SECONDS: i64 = 5;
+
+/// Upper bound for a stamped `retry_after` hint. The deferral lease windows
+/// are seconds-to-minutes; the cap only exists so a corrupt or hand-edited
+/// lease row cannot push callers into absurd waits. Raise it if a legitimate
+/// deferral lease ever exceeds it (today: 5s defer, 60s reservation leases).
+pub(crate) const IDEMPOTENCY_RETRY_HINT_MAX_SECONDS: i64 = 300;
 const CONFIG_TOKEN_HARD_ATTEMPT_SECONDS: u64 = 30;
 const CONFIG_TOKEN_CANCELLATION_SECONDS: u64 = 5;
 const CONFIG_TOKEN_RECEIPT_LEASE_SECONDS: i64 = 60;
@@ -488,6 +494,18 @@ fn idempotency_in_progress_error() -> InternalRouteError {
             "idempotency_disposition": "deferred",
         })),
     )
+}
+
+/// The deferred-409 contract with a server-clock lease hint attached: whole
+/// seconds until a same-key retry can re-execute. Only call this where the
+/// lease window is actually known (the live-lease `!reclaimable` branch and
+/// the explicit defer, which both know the expiry they just read/wrote);
+/// sites without a known window return the bare contract and callers treat a
+/// missing `retry_after` as "retry same key, unknown wait".
+fn idempotency_in_progress_with_retry(seconds: i64) -> InternalRouteError {
+    let (status, Json(mut body)) = idempotency_in_progress_error();
+    body["retry_after"] = serde_json::json!(seconds.clamp(1, IDEMPOTENCY_RETRY_HINT_MAX_SECONDS));
+    (status, Json(body))
 }
 
 fn idempotency_key_reused_error() -> InternalRouteError {
@@ -1190,7 +1208,17 @@ async fn begin_idempotent_request_with_recovery_and_binding(
                 .is_some_and(|lease_expires_at| lease_expires_at <= row.database_now),
         };
     if !reclaimable && recovery != IdempotencyRecovery::DeterministicExpiringCapability {
-        return Err(idempotency_in_progress_error());
+        // The lease is live and not expired (every reclaimable arm requires
+        // expiry or staleness), so the window to its freeing is a known,
+        // positive quantity -- stamp it so callers stop scheduling into the
+        // lease (the #194 self-inflicted 409 loop). Legacy rows without a
+        // lease expiry fall back to the bare contract.
+        return Err(match row.lease_expires_at {
+            Some(lease_expires_at) => idempotency_in_progress_with_retry(
+                (lease_expires_at - row.database_now).num_seconds(),
+            ),
+            None => idempotency_in_progress_error(),
+        });
     }
 
     if recovery == IdempotencyRecovery::DeterministicExpiringCapability
@@ -1602,7 +1630,9 @@ async fn defer_idempotent_request(mut lease: IdempotencyLease) -> InternalRouteE
     // defer landed; a 0-row update means the lease was already completed or
     // reclaimed. Either way the client guidance is retry-same-key.
     match updated {
-        Ok(_) => idempotency_in_progress_error(),
+        // The defer just re-armed the lease for exactly
+        // IDEMPOTENCY_RETRY_DEFER_SECONDS, so the retry hint is exact.
+        Ok(_) => idempotency_in_progress_with_retry(IDEMPOTENCY_RETRY_DEFER_SECONDS),
         Err(_) => db_error(),
     }
 }
@@ -3706,7 +3736,7 @@ pub async fn put_paas_app_desired_state(
         let desired_state = body.desired_state.as_str();
         let resource =
             crate::mutation_leases::ResourceFence::new("kubernetes_namespace", &namespace);
-        let mut mutation = crate::mutation_leases::claim(
+        let mut mutation = match crate::mutation_leases::claim(
             &state,
             app_id,
             "app_desired_state",
@@ -3715,12 +3745,25 @@ pub async fn put_paas_app_desired_state(
             vec![resource.clone()],
         )
         .await
-        .map_err(|error| match error {
-            crate::mutation_leases::MutationLeaseError::Busy => {
-                json_error(StatusCode::CONFLICT, "app mutation already in progress")
+        {
+            Ok(mutation) => mutation,
+            // Lane etiquette: this fifth Busy arm carries the same lease hints
+            // as the HTTP-facing ones so the contract is uniform.
+            Err(crate::mutation_leases::MutationLeaseError::Busy) => {
+                return Err(crate::routes::apps::app_mutation_busy_error(
+                    &state.db,
+                    app_id,
+                    std::slice::from_ref(&resource),
+                )
+                .await);
             }
-            _ => json_error(StatusCode::SERVICE_UNAVAILABLE, "desired_state_retryable"),
-        })?;
+            Err(_) => {
+                return Err(json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "desired_state_retryable",
+                ));
+            }
+        };
         let mut tx = state.db.begin().await.map_err(|_| db_error())?;
         crate::deploy::lock_app_deployment_lane(&mut tx, app_id)
             .await
@@ -8667,6 +8710,146 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn app_mutation_busy_names_holder_and_retry_window() {
+        let (state, _auth, _app_name, app_id) = app_delete_fixture().await;
+        // Ensure a lane row exists, then simulate a live holder (a deployment
+        // that claimed the lane ~60s ago).
+        sqlx::query(
+            "INSERT INTO app_mutation_leases (app_id) VALUES ($1)
+             ON CONFLICT (app_id) DO NOTHING",
+        )
+        .bind(app_id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE app_mutation_leases
+                SET owner_token = gen_random_uuid(),
+                    operation_kind = 'deployment',
+                    operation_id = gen_random_uuid(),
+                    locked_until = clock_timestamp() + interval '60 seconds',
+                    reclaim_after = clock_timestamp() + interval '120 seconds'
+              WHERE app_id = $1",
+        )
+        .bind(app_id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+        let (status, Json(body)) =
+            crate::routes::apps::app_mutation_busy_error(&state.db, app_id, &[]).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "app mutation already in progress");
+        assert_eq!(body["held_by"], "deployment");
+        let retry_after = body["retry_after"].as_i64().expect("retry_after hint");
+        assert!(
+            (1..=60).contains(&retry_after),
+            "hint should track the 60s lock, got {retry_after}"
+        );
+        assert!(retry_after <= IDEMPOTENCY_RETRY_HINT_MAX_SECONDS);
+
+        // Free lane: the same answer carries no invented hints.
+        sqlx::query(
+            "UPDATE app_mutation_leases
+                SET owner_token = NULL, operation_kind = NULL, operation_id = NULL,
+                    locked_until = NULL, reclaim_after = NULL
+              WHERE app_id = $1",
+        )
+        .bind(app_id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+        let (status, Json(body)) =
+            crate::routes::apps::app_mutation_busy_error(&state.db, app_id, &[]).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "app mutation already in progress");
+        assert!(body.get("held_by").is_none());
+        assert!(body.get("retry_after").is_none());
+    }
+
+    #[tokio::test]
+    async fn app_mutation_busy_hint_follows_reclaim_quarantine() {
+        let (state, _auth, _app_name, app_id) = app_delete_fixture().await;
+        // A lost owner: the renewable lock lapsed but the row still blocks
+        // claims until the reclaim quarantine expires. The hint must track
+        // THAT deadline -- the dead lock expiry admits nothing, and a hint
+        // there leaves the caller retried into a hintless Busy.
+        sqlx::query(
+            "INSERT INTO app_mutation_leases (app_id) VALUES ($1)
+             ON CONFLICT (app_id) DO NOTHING",
+        )
+        .bind(app_id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE app_mutation_leases
+                SET owner_token = gen_random_uuid(),
+                    operation_kind = 'deployment',
+                    operation_id = gen_random_uuid(),
+                    locked_until = clock_timestamp() - interval '60 seconds',
+                    reclaim_after = clock_timestamp() + interval '240 seconds'
+              WHERE app_id = $1",
+        )
+        .bind(app_id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+        let (status, Json(body)) =
+            crate::routes::apps::app_mutation_busy_error(&state.db, app_id, &[]).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["held_by"], "deployment");
+        let retry_after = body["retry_after"].as_i64().expect("retry_after hint");
+        assert!(
+            (230..=240).contains(&retry_after),
+            "hint should follow the reclaim quarantine (240s), got {retry_after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn app_mutation_busy_resolves_resource_fence_holder() {
+        let (state, _auth, _app_name, app_id) = app_delete_fixture().await;
+        // A resource-fence conflict rolls the app-row claim back, so the
+        // holder lives on the contested fence's row (which can belong to
+        // another app or a global provider operation): the hint must read
+        // THAT row, not this app's empty one.
+        let fence = crate::mutation_leases::ResourceFence::new("test_scope", "test_key");
+        sqlx::query(
+            "INSERT INTO external_resource_mutation_leases (resource_scope, resource_key)
+             VALUES ('test_scope', 'test_key')
+             ON CONFLICT (resource_scope, resource_key) DO NOTHING",
+        )
+        .execute(&state.db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET owner_token = gen_random_uuid(),
+                    operation_kind = 'custom_domain_set',
+                    operation_id = gen_random_uuid(),
+                    locked_until = clock_timestamp() + interval '90 seconds',
+                    reclaim_after = clock_timestamp() + interval '450 seconds'
+              WHERE resource_scope = 'test_scope' AND resource_key = 'test_key'",
+        )
+        .execute(&state.db)
+        .await
+        .unwrap();
+        let (status, Json(body)) = crate::routes::apps::app_mutation_busy_error(
+            &state.db,
+            app_id,
+            std::slice::from_ref(&fence),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "app mutation already in progress");
+        assert_eq!(body["held_by"], "custom_domain_set");
+        let retry_after = body["retry_after"].as_i64().expect("retry_after hint");
+        assert!(
+            (80..=90).contains(&retry_after),
+            "hint should track the fence holder's 90s lock, got {retry_after}"
+        );
+    }
+
+    #[tokio::test]
     async fn app_delete_partial_failure_defers_and_same_key_reexecutes() {
         let (state, auth, app_name, _) = app_delete_fixture().await;
         let key = format!("partial-delete-{}", Uuid::new_v4());
@@ -8688,9 +8871,11 @@ mod tests {
         )
         .await
         .unwrap_err();
+        assert_eq!(failure.0, StatusCode::CONFLICT);
         assert_eq!(
-            (failure.0, failure.1.0),
-            (StatusCode::CONFLICT, idempotency_in_progress_error().1.0)
+            failure.1.0["error"], "idempotency_request_in_progress",
+            "the deferral shape stays intact: {:?}",
+            failure.1.0
         );
         let receipt: (bool, bool, bool, bool) = sqlx::query_as(
             "SELECT completed_at IS NULL, response_status IS NULL,
@@ -8706,10 +8891,16 @@ mod tests {
             .await
             .err()
             .expect("live lease must defer");
+        assert_eq!(busy.0, StatusCode::CONFLICT);
         assert_eq!(
-            (busy.0, busy.1.0),
-            (StatusCode::CONFLICT, idempotency_in_progress_error().1.0)
+            busy.1.0["error"], "idempotency_request_in_progress",
+            "the deferral shape stays intact: {:?}",
+            busy.1.0
         );
+        // Lane etiquette: a live-lease deferral must carry the server-clock
+        // retry hint so callers stop scheduling into the lease.
+        let retry_after = busy.1.0["retry_after"].as_i64().expect("retry_after hint");
+        assert!((1..=IDEMPOTENCY_RETRY_HINT_MAX_SECONDS).contains(&retry_after));
         expire_idempotency_lease(&state.db, &key).await;
         let retry = expect_idempotency_execution(
             begin_app_delete_request(&state, &headers, &path, &auth, &body, &app_name)
@@ -9033,10 +9224,10 @@ mod tests {
         for attempt in [a, b] {
             match attempt {
                 Ok(IdempotencyBegin::Execute(lease)) => winners.push(lease),
-                Err(error) => assert_eq!(
-                    (error.0, error.1.0),
-                    (StatusCode::CONFLICT, idempotency_in_progress_error().1.0)
-                ),
+                Err(error) => {
+                    assert_eq!(error.0, StatusCode::CONFLICT);
+                    assert_eq!(error.1.0["error"], "idempotency_request_in_progress");
+                }
                 Ok(IdempotencyBegin::Replay(_)) => panic!("failed receipt must not replay"),
             }
         }
