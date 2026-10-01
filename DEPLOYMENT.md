@@ -242,6 +242,50 @@ Before using it outside local experimentation:
   registry metadata, DNS, and tenant TEE callbacks;
 - decide whether CAP-managed DNS and KBS policy management are required.
 
+## Rollout Compatibility: initdata uid/gid claims
+
+`cc_init_data` uid/gid claims (`app_uid`, `app_gid`, `caddy_uid`,
+`caddy_gid`, `managed_config_gid`, `managed_config_dir_mode`) are rendered
+as quoted TOML strings, matching kata-agent's requirement that every
+`[data]` value be a string. On Kata installations enforcing that format,
+the old integer form fails pod creation with `FailedCreatePodSandBox`.
+
+Quoting changes the rendered bytes, and a signed descriptor's
+`expected_cc_init_data_hash` covers exactly those bytes. Descriptors signed
+with the old integer renderer therefore cannot be replayed against a fixed
+API: unlock and rollback validation re-render with the corrected encoder
+and reject them with HTTP 400 `signed_artifact_mismatch`
+(`expected_cc_init_data_hash`); deployment jobs fail with
+`artifact_invalid` on the same mismatch. This is deliberate fail-closed
+behavior — the API holds no deployer signing key and cannot re-sign
+stored artifacts, and preserving the old render would keep initdata that
+Kata rejects anyway. No compatibility fallback exists.
+
+Roll out and recover as follows:
+
+1. Deploy an API image built from a tree containing this change
+   (see [Images](#images)).
+2. Upgrade the `enclava` CLI to a build from the same tree. The CLI renders
+   `expected_cc_init_data_hash` locally when signing and the API re-renders
+   and compares it at deploy, so a mixed old/new CLI+API pair is rejected
+   at deploy time. Upgrade both before signing new deployments.
+3. Re-deploy each app signed before the change, from its app directory
+   (the one containing `enclava.toml`):
+
+   ```bash
+   enclava deploy --image <image>@sha256:<digest>
+   ```
+
+   The CLI signs a fresh descriptor with the deployer key and the API
+   verifies the re-rendered hash before applying a new workload rollout.
+   Use the existing app configuration, signing identity, and persistent
+   volumes; do not delete the app or reset its storage to recover.
+   Roll forward with a fresh deploy rather than rolling back — rollback to
+   a pre-change deployment artifact hits the same hash rejection.
+4. Verify the public boot, claim/unlock, HTTPS, and persistence flow before
+   treating the rollout as accepted. CI alone does not establish runtime
+   compatibility.
+
 ## Smoke Checks
 
 After rollout:
