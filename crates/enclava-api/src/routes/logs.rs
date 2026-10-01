@@ -309,6 +309,65 @@ fn parse_socket_addr(target: &str) -> Option<SocketAddr> {
     Some(SocketAddr::new(ip, port))
 }
 
+/// Resolve the instance tenant Gateway and build the IP-pinned,
+/// SNI-preserving client for an in-cluster TEE call, falling back to the
+/// caller's shared public client on every failure mode.
+///
+/// Bounded by a short outer timeout: a hung Kubernetes API read must not
+/// stall the caller's mutation lane (deletion holds leases and resource
+/// fences across this call) — every failure degrades to the pre-Gateway
+/// public-origin behavior instead. Identity appears only at debug level;
+/// the warn is deliberately content-free so bounded-diagnostics callers
+/// (app deletion) inherit nothing tenant-controlled.
+pub(crate) async fn resolved_tenant_tee_client(
+    app_name: &str,
+    namespace: &str,
+    confidential_domain: &str,
+) -> Option<reqwest::Client> {
+    let address = match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        crate::edge::resolve_gateway_address(app_name, namespace),
+    )
+    .await
+    {
+        Err(_) => {
+            tracing::warn!(
+                code = "tenant_tee_gateway_unavailable",
+                "tenant Gateway resolution timed out; in-cluster TEE call uses public origin"
+            );
+            return None;
+        }
+        Ok(Err(_)) => {
+            tracing::warn!(
+                code = "tenant_tee_gateway_unavailable",
+                "tenant Gateway resolution failed; in-cluster TEE call uses public origin"
+            );
+            return None;
+        }
+        Ok(Ok(None)) => {
+            tracing::debug!(
+                app = %app_name,
+                namespace = %namespace,
+                "no tenant Gateway for app; in-cluster TEE call uses public origin"
+            );
+            return None;
+        }
+        Ok(Ok(Some(ip))) => ip,
+    };
+    match build_resolved_tenant_tee_http_client(confidential_domain, SocketAddr::new(address, 443))
+    {
+        Ok(client) => Some(client),
+        Err(_) => {
+            tracing::debug!(
+                app = %app_name,
+                namespace = %namespace,
+                "gateway-resolved TEE client build failed; in-cluster TEE call uses public origin"
+            );
+            None
+        }
+    }
+}
+
 pub(crate) fn build_resolved_tenant_tee_http_client(
     confidential_domain: &str,
     socket: SocketAddr,

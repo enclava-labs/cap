@@ -400,31 +400,16 @@ async fn request_workload_teardown(
     // hairpin-blocked deployments (pods cannot reach their own external
     // edge address), which made every teardown POST time out and the
     // TEE-side owner-seed erasure fail open. Prefer the instance tenant
-    // Gateway dataplane, which routes by SNI to the same guest endpoint —
-    // the pattern the proof-bundle fetch and config-token responses
-    // already use — and fall back to the shared public client when no
-    // Gateway exists (deployments without the Gateway API layer).
+    // Gateway dataplane via the shared bounded resolver; every failure
+    // mode falls back to the public client — the pre-Gateway behavior,
+    // which on a Gateway deployment still carries the original defect
+    // (#204): if teardown-unavailable symptoms persist after this ships,
+    // the fallback is the first place to look.
     let mut teardown_state = state.clone();
-    match crate::edge::resolve_gateway_address(&app.name, &app.namespace).await {
-        Ok(Some(ip)) => {
-            match crate::routes::logs::build_resolved_tenant_tee_http_client(
-                domain,
-                std::net::SocketAddr::new(ip, 443),
-            ) {
-                Ok(client) => teardown_state.tee_http_client = client,
-                Err(_) => tracing::warn!(
-                    app_id = %app.id,
-                    code = "app_delete_teardown_gateway_client_unavailable",
-                    "failed to build gateway-resolved teardown client; using public origin"
-                ),
-            }
-        }
-        Ok(None) => {}
-        Err(_) => tracing::warn!(
-            app_id = %app.id,
-            code = "app_delete_teardown_gateway_unresolvable",
-            "could not resolve tenant Gateway address for teardown; using public origin"
-        ),
+    if let Some(client) =
+        crate::routes::logs::resolved_tenant_tee_client(&app.name, &app.namespace, domain).await
+    {
+        teardown_state.tee_http_client = client;
     }
     post_workload_teardown(&teardown_state, app, &token, &workload_teardown_url(domain)).await
 }
