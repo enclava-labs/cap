@@ -4017,6 +4017,7 @@ pub async fn get_paas_proof_bundle(
         .and_then(|url| url.host_str().map(str::to_owned))
         .ok_or_else(|| json_error(StatusCode::BAD_REQUEST, "origin_not_allowed"))?;
     let client = crate::routes::logs::resolved_tenant_tee_client(
+        app_id,
         &app_name,
         &artifacts.descriptor.namespace,
         &domain,

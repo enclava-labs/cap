@@ -407,7 +407,8 @@ async fn request_workload_teardown(
     // the fallback is the first place to look.
     let mut teardown_state = state.clone();
     if let Some(client) =
-        crate::routes::logs::resolved_tenant_tee_client(&app.name, &app.namespace, domain).await
+        crate::routes::logs::resolved_tenant_tee_client(app.id, &app.name, &app.namespace, domain)
+            .await
     {
         teardown_state.tee_http_client = client;
     }

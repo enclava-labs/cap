@@ -316,10 +316,12 @@ fn parse_socket_addr(target: &str) -> Option<SocketAddr> {
 /// Bounded by a short outer timeout: a hung Kubernetes API read must not
 /// stall the caller's mutation lane (deletion holds leases and resource
 /// fences across this call) — every failure degrades to the pre-Gateway
-/// public-origin behavior instead. Identity appears only at debug level;
-/// the warn is deliberately content-free so bounded-diagnostics callers
-/// (app deletion) inherit nothing tenant-controlled.
+/// public-origin behavior instead. Warns carry the server-assigned
+/// `app_id` for correlation under concurrent deletes (never the
+/// tenant-controlled name/namespace/domain, which the app-deletion
+/// diagnostics contract forbids at warn level).
 pub(crate) async fn resolved_tenant_tee_client(
+    app_id: uuid::Uuid,
     app_name: &str,
     namespace: &str,
     confidential_domain: &str,
@@ -332,6 +334,7 @@ pub(crate) async fn resolved_tenant_tee_client(
     {
         Err(_) => {
             tracing::warn!(
+                app_id = %app_id,
                 code = "tenant_tee_gateway_unavailable",
                 "tenant Gateway resolution timed out; in-cluster TEE call uses public origin"
             );
@@ -339,6 +342,7 @@ pub(crate) async fn resolved_tenant_tee_client(
         }
         Ok(Err(_)) => {
             tracing::warn!(
+                app_id = %app_id,
                 code = "tenant_tee_gateway_unavailable",
                 "tenant Gateway resolution failed; in-cluster TEE call uses public origin"
             );
