@@ -395,7 +395,38 @@ async fn request_workload_teardown(
     .map_err(|error| app_delete_failure(app.id, AppDeleteFailure::TeardownToken, error))?;
 
     let domain = app.tee_domain.as_deref().unwrap_or(&app.domain);
-    post_workload_teardown(state, app, &token, &workload_teardown_url(domain)).await
+
+    // The public tee origin is unreachable from inside the cluster on
+    // hairpin-blocked deployments (pods cannot reach their own external
+    // edge address), which made every teardown POST time out and the
+    // TEE-side owner-seed erasure fail open. Prefer the instance tenant
+    // Gateway dataplane, which routes by SNI to the same guest endpoint —
+    // the pattern the proof-bundle fetch and config-token responses
+    // already use — and fall back to the shared public client when no
+    // Gateway exists (deployments without the Gateway API layer).
+    let mut teardown_state = state.clone();
+    match crate::edge::resolve_gateway_address(&app.name, &app.namespace).await {
+        Ok(Some(ip)) => {
+            match crate::routes::logs::build_resolved_tenant_tee_http_client(
+                domain,
+                std::net::SocketAddr::new(ip, 443),
+            ) {
+                Ok(client) => teardown_state.tee_http_client = client,
+                Err(_) => tracing::warn!(
+                    app_id = %app.id,
+                    code = "app_delete_teardown_gateway_client_unavailable",
+                    "failed to build gateway-resolved teardown client; using public origin"
+                ),
+            }
+        }
+        Ok(None) => {}
+        Err(_) => tracing::warn!(
+            app_id = %app.id,
+            code = "app_delete_teardown_gateway_unresolvable",
+            "could not resolve tenant Gateway address for teardown; using public origin"
+        ),
+    }
+    post_workload_teardown(&teardown_state, app, &token, &workload_teardown_url(domain)).await
 }
 
 pub(crate) async fn post_workload_teardown(
