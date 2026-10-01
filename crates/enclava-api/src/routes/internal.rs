@@ -3418,15 +3418,17 @@ pub async fn create_paas_app(
             db_error()
         }
     })?;
-    // The waiver guard above runs before this transaction; the NOT EXISTS in
-    // the insert re-checks atomically so an abandoned destroy committing in
-    // between cannot slip a recreate past the tombstone.
-    let inserted = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM apps WHERE id = $1")
-        .bind(app_id)
-        .fetch_one(&mut *tx)
+    // The waiver guard above runs before this transaction, and under READ
+    // COMMITTED the insert's NOT EXISTS is evaluated on its statement
+    // snapshot — an abandoned destroy committing while the insert waits out
+    // the old row's unique constraint is invisible to both. The recheck
+    // takes a fresh statement snapshot in this transaction: it sees every
+    // waiver that predates the insert (zero rows inserted, filtered by NOT
+    // EXISTS) and every waiver committed while the insert was blocked.
+    if crate::kbs::owner_seed_waiver_recorded_in_tx(&mut tx, &namespace, &body.name)
         .await
-        .map_err(|_| db_error())?;
-    if inserted == 0 {
+        .map_err(|_| db_error())?
+    {
         return Err(json_error(StatusCode::CONFLICT, "stale_owner_seed"));
     }
     sqlx::query(

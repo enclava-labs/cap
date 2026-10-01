@@ -1138,11 +1138,25 @@ pub async fn create_app(
     };
     // The waiver check in `prepare_app_candidate` runs before this
     // transaction, so an abandoned destroy committing between the check and
-    // this insert could slip a recreate past the tombstone (the insert waits
-    // out the old row's unique constraint and resumes only after the destroy
-    // commits). The NOT EXISTS above re-checks atomically with the insert:
-    // zero rows inserted means the waiver landed in between - refuse.
+    // this insert could slip a recreate past the tombstone: the insert waits
+    // out the old row's unique constraint, but under READ COMMITTED the NOT
+    // EXISTS above was evaluated on the statement snapshot taken before the
+    // destroy committed, so it cannot see a waiver that landed while the
+    // insert was blocked. Two guards close it: zero rows inserted means the
+    // waiver predated the statement; the recheck below takes a fresh
+    // statement snapshot after the insert completes and sees any waiver the
+    // destroy committed in between.
     if insert_result.rows_affected() == 0 {
+        return Err(stale_owner_seed_response());
+    }
+    if crate::kbs::owner_seed_waiver_recorded_in_tx(
+        &mut tx,
+        &app_candidate.namespace,
+        &app_candidate.name,
+    )
+    .await
+    .map_err(|_| internal_server_error())?
+    {
         return Err(stale_owner_seed_response());
     }
 
@@ -2086,35 +2100,31 @@ pub(crate) async fn delete_app_before(
         .execute(&mut *delete_lane)
         .await
         .map_err(|_| internal_server_error())?;
-    delete_lane
-        .commit()
-        .await
-        .map_err(|_| internal_server_error())?;
-
     // The signed-policy candidate selectors ran against the pre-delete
     // world. An abandoned destroy keeps the completion marker NULL, so the
     // pre-delete reconciliation deliberately retained the app's artifact
     // (teardown-pending authorization); with the app row now cascaded away,
     // nothing would re-run publication and the stale Trustee policy would
     // keep authorizing the deleted workload until some unrelated
-    // reconciliation. Enqueue and best-effort run one now — the app is gone,
-    // so the next candidate selection drops it — but only when CAP has
-    // already entered signed-policy mode: a delete must never *activate*
+    // reconciliation. Enqueue the revocation generation in this delete
+    // transaction itself — a separate post-commit enqueue can be lost to a
+    // transient transaction failure, and the periodic reconciler only
+    // advances committed generations — and best-effort run one now (the app
+    // is gone, so the next candidate selection drops it), but only when CAP
+    // has already entered signed-policy mode: a delete must never *activate*
     // signed mode on a legacy Rego installation (generation 0, no signed
     // artifacts), where publication would replace the Rego policy still
-    // authorizing other apps with an empty artifact set. A failure of the
-    // immediate run only delays the revocation (the enqueue is durable and
-    // the global reconciler converges); the deletion itself is complete.
-    let mut post_delete_tx = state
-        .db
-        .begin()
-        .await
-        .map_err(|_| internal_server_error())?;
+    // authorizing other apps with an empty artifact set. Inside this
+    // transaction the deleting app's artifacts have already cascaded, so
+    // the guard reads the remaining world exactly as a post-commit enqueue
+    // would. A failure of the immediate run only delays the revocation (the
+    // enqueue is durable and the global reconciler converges); the deletion
+    // itself is complete.
     let post_delete_reconcile =
-        crate::kbs::enqueue_signed_policy_revocation_if_active(&mut post_delete_tx)
+        crate::kbs::enqueue_signed_policy_revocation_if_active(&mut delete_lane)
             .await
             .map_err(|_| internal_server_error())?;
-    post_delete_tx
+    delete_lane
         .commit()
         .await
         .map_err(|_| internal_server_error())?;

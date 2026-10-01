@@ -523,6 +523,28 @@ async fn completed_workload_teardown_skips_unreachable_retry() {
 }
 
 #[test]
+fn create_paths_recheck_the_stale_seed_waiver_after_insert() {
+    // Under READ COMMITTED the insert's NOT EXISTS rides the statement
+    // snapshot: an abandoned destroy committing while the insert waits out
+    // the old row's unique constraint is invisible to it. Every create path
+    // must re-read the waiver with a fresh statement inside the insert
+    // transaction (owner_seed_waiver_recorded_in_tx).
+    let apps_source = include_str!("../../apps.rs");
+    let deployments_source = include_str!("../../deployments.rs");
+    let internal_source = include_str!("../../internal.rs");
+    for (name, source) in [
+        ("apps", apps_source),
+        ("deployments", deployments_source),
+        ("internal", internal_source),
+    ] {
+        assert!(
+            source.contains("owner_seed_waiver_recorded_in_tx"),
+            "{name} create path must post-insert-recheck the stale-seed waiver"
+        );
+    }
+}
+
+#[test]
 fn locked_running_workload_teardown_blocks_deletion_and_diagnostics_are_bounded() {
     const SECRET: &str = "upstream-locked-body-sentinel";
     let app_id = uuid::Uuid::new_v4();
@@ -650,6 +672,10 @@ fn app_delete_source_never_reads_or_formats_external_diagnostics() {
                 .find("enqueue_signed_policy_revocation_if_active")
                 .expect("app deletion enqueues signed-policy revocation"),
         "app deletion must preserve KBS authorization until workload teardown completes"
+    );
+    assert!(
+        deletion.contains("enqueue_signed_policy_revocation_if_active(&mut delete_lane)"),
+        "the delete-tail revocation enqueue must ride the delete transaction — a post-commit enqueue can be lost to a transient transaction failure, and the periodic reconciler only advances committed generations"
     );
     assert!(
         deletion
