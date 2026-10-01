@@ -395,7 +395,24 @@ async fn request_workload_teardown(
     .map_err(|error| app_delete_failure(app.id, AppDeleteFailure::TeardownToken, error))?;
 
     let domain = app.tee_domain.as_deref().unwrap_or(&app.domain);
-    post_workload_teardown(state, app, &token, &workload_teardown_url(domain)).await
+
+    // The public tee origin is unreachable from inside the cluster on
+    // hairpin-blocked deployments (pods cannot reach their own external
+    // edge address), which made every teardown POST time out and the
+    // TEE-side owner-seed erasure fail open. Prefer the instance tenant
+    // Gateway dataplane via the shared bounded resolver; every failure
+    // mode falls back to the public client — the pre-Gateway behavior,
+    // which on a Gateway deployment still carries the original defect
+    // (#204): if teardown-unavailable symptoms persist after this ships,
+    // the fallback is the first place to look.
+    let mut teardown_state = state.clone();
+    if let Some(client) =
+        crate::routes::logs::resolved_tenant_tee_client(app.id, &app.name, &app.namespace, domain)
+            .await
+    {
+        teardown_state.tee_http_client = client;
+    }
+    post_workload_teardown(&teardown_state, app, &token, &workload_teardown_url(domain)).await
 }
 
 pub(crate) async fn post_workload_teardown(

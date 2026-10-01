@@ -713,6 +713,27 @@ fn app_delete_source_never_reads_or_formats_external_diagnostics() {
         teardown.contains("Duration::from_secs(60)"),
         "the teardown client timeout must out-wait the proxy's two 20 s KBS deletes"
     );
+    assert!(
+        teardown.contains("resolved_tenant_tee_client"),
+        "teardown must resolve the instance tenant Gateway instead of dialing the public tee origin — in-cluster pods cannot hairpin to the deployment's own external edge, so the public-origin POST times out and the TEE-side erasure fails open"
+    );
+    assert!(
+        teardown.contains("post_workload_teardown(&teardown_state"),
+        "the teardown POST must ride the (possibly gateway-resolved) state, not the shared public client unconditionally"
+    );
+    let logs_source = include_str!("../../logs.rs");
+    let resolver = logs_source
+        .split("pub(crate) async fn resolved_tenant_tee_client")
+        .nth(1)
+        .expect("shared tenant Gateway client resolver exists");
+    assert!(
+        resolver.contains("Duration::from_secs(5)"),
+        "the Gateway resolution read must be bounded — a hung Kubernetes API must not stall the caller's mutation lane (deletion holds leases and fences across this call)"
+    );
+    assert!(
+        resolver.contains("tenant_tee_gateway_unavailable"),
+        "resolution failure/timeout must fall back under a bounded, content-free code"
+    );
     let migration = include_str!("../../../../migrations/0048_app_workload_teardown_state.sql");
     assert!(
         !migration.to_lowercase().contains("update apps"),
