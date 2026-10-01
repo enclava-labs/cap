@@ -541,6 +541,13 @@ fn create_paths_recheck_the_stale_seed_waiver_after_insert() {
             source.contains("owner_seed_waiver_recorded_in_tx"),
             "{name} create path must post-insert-recheck the stale-seed waiver"
         );
+        assert!(
+            source.find("INSERT INTO apps").unwrap_or(usize::MAX)
+                < source
+                    .find("owner_seed_waiver_recorded_in_tx")
+                    .unwrap_or(usize::MAX),
+            "{name} create path must run the recheck after the app insert"
+        );
     }
 }
 
