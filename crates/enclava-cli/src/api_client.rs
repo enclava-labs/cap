@@ -114,27 +114,7 @@ impl ApiClient {
             // to stream an unbounded "error" body into CLI memory either.
             let (code, message) = match read_bounded_body(resp, MAX_API_ERROR_BODY_BYTES).await {
                 Ok(bytes) => match serde_json::from_slice::<ApiErrorBody>(&bytes) {
-                    Ok(body) => {
-                        let code = body.code.or_else(|| body.error.clone());
-                        let label = code
-                            .clone()
-                            .unwrap_or_else(|| format!("HTTP {status_code}"));
-                        let mut message = body
-                            .message
-                            .or(body.detail)
-                            .unwrap_or_else(|| label.clone());
-                        if let Some(reason) = body.reason {
-                            message = format!("{message} ({reason})");
-                        }
-                        if let Some(cause) = body.cause {
-                            message = format!("{message} (cause: {cause})");
-                        }
-                        if message == label {
-                            (code, message)
-                        } else {
-                            (code, format!("{label}: {message}"))
-                        }
-                    }
+                    Ok(body) => compose_api_error(status_code, body),
                     Err(_) => (None, format!("HTTP {status_code}")),
                 },
                 Err(ApiError::ResponseTooLarge(cap)) => (
@@ -317,12 +297,19 @@ impl ApiClient {
     }
 
     pub async fn delete_app(&self, name: &str) -> Result<(), ApiError> {
-        let resp = self
-            .http
-            .delete(self.url(&format!("/apps/{name}")))
-            .headers(self.auth_headers()?)
-            .send()
-            .await?;
+        self.delete_app_with_options(name, false).await
+    }
+
+    pub async fn delete_app_with_options(
+        &self,
+        name: &str,
+        abandon_teardown: bool,
+    ) -> Result<(), ApiError> {
+        let mut request = self.http.delete(self.url(&format!("/apps/{name}")));
+        if abandon_teardown {
+            request = request.json(&serde_json::json!({ "abandon_teardown": true }));
+        }
+        let resp = request.headers(self.auth_headers()?).send().await?;
         self.check_response(resp).await?;
         Ok(())
     }
@@ -970,9 +957,89 @@ fn optional_sha256_hex(value: Option<&str>) -> Option<String> {
     value.map(|value| hex::encode(Sha256::digest(value.as_bytes())))
 }
 
+/// Compose the display code/message pair from a structured API error body.
+/// Pure so the in-band lane-hint suffix format -- a cross-repo display
+/// surface -- stays pinned by unit tests. The `label: message` prefix is
+/// decided before the parenthetical suffixes so a body that carries only a
+/// code (the Busy/defer shapes) prints the label once, not twice.
+fn compose_api_error(status_code: u16, body: ApiErrorBody) -> (Option<String>, String) {
+    let code = body.code.or_else(|| body.error.clone());
+    let label = code
+        .clone()
+        .unwrap_or_else(|| format!("HTTP {status_code}"));
+    let mut message = body
+        .message
+        .or(body.detail)
+        .unwrap_or_else(|| label.clone());
+    let prefixed = message != label;
+    if let Some(reason) = body.reason {
+        message = format!("{message} ({reason})");
+    }
+    if let Some(cause) = body.cause {
+        message = format!("{message} (cause: {cause})");
+    }
+    // Carry the lane hints in-band so every surface
+    // (deploy, destroy, config, domains) shows them without
+    // per-command plumbing; old servers simply omit them.
+    if let Some(held_by) = body.held_by {
+        message = format!("{message} (held by: {held_by})");
+    }
+    if let Some(retry_after) = body.retry_after {
+        message = format!("{message} (retry after ~{retry_after}s)");
+    }
+    if prefixed {
+        (code, format!("{label}: {message}"))
+    } else {
+        (code, message)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn api_error_message_carries_lane_hints_in_band() {
+        let body: ApiErrorBody = serde_json::from_value(serde_json::json!({
+            "error": "app mutation already in progress",
+            "held_by": "app_delete",
+            "retry_after": 42
+        }))
+        .expect("busy body decodes");
+        let (code, message) = compose_api_error(409, body);
+        assert_eq!(code.as_deref(), Some("app mutation already in progress"));
+        assert_eq!(
+            message,
+            "app mutation already in progress (held by: app_delete) (retry after ~42s)"
+        );
+    }
+
+    #[test]
+    fn api_error_message_prints_code_only_bodies_once() {
+        let body: ApiErrorBody = serde_json::from_value(serde_json::json!({
+            "error": "idempotency_request_in_progress"
+        }))
+        .expect("defer body decodes");
+        let (code, message) = compose_api_error(409, body);
+        assert_eq!(code.as_deref(), Some("idempotency_request_in_progress"));
+        assert_eq!(message, "idempotency_request_in_progress");
+    }
+
+    #[test]
+    fn api_error_message_prefixes_distinct_message_text() {
+        let body: ApiErrorBody = serde_json::from_value(serde_json::json!({
+            "code": "app_delete_teardown_unavailable",
+            "message": "the confidential workload teardown did not complete",
+            "cause": "app_delete_teardown_unavailable"
+        }))
+        .expect("teardown body decodes");
+        let (code, message) = compose_api_error(502, body);
+        assert_eq!(code.as_deref(), Some("app_delete_teardown_unavailable"));
+        assert_eq!(
+            message,
+            "app_delete_teardown_unavailable: the confidential workload teardown did not complete (cause: app_delete_teardown_unavailable)"
+        );
+    }
 
     fn template_request(endpoint: &str) -> CreateTemplateInstanceRequest {
         CreateTemplateInstanceRequest {

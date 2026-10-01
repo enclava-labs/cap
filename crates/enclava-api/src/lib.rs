@@ -2002,6 +2002,18 @@ pub(crate) mod test_support {
     use std::sync::Arc;
     use uuid::Uuid;
 
+    pub(crate) async fn database_test_pool() -> sqlx::PgPool {
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
+        let pool = sqlx::PgPool::connect(&database_url)
+            .await
+            .expect("connect test database");
+        crate::db::pool::run_migrations(&pool)
+            .await
+            .expect("migrate test database");
+        pool
+    }
+
     pub(crate) fn auth_context(role: Role, scopes: &[&str]) -> AuthContext {
         AuthContext {
             user_id: Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),

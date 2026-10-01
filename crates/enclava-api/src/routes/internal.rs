@@ -24,6 +24,12 @@ type IdempotencyResponse = (StatusCode, serde_json::Value);
 const IDEMPOTENCY_DEFAULT_LEASE_SECONDS: i64 = 60;
 const IDEMPOTENCY_LEGACY_STALE_SECONDS: i64 = 30 * 60;
 const IDEMPOTENCY_RETRY_DEFER_SECONDS: i64 = 5;
+
+/// Upper bound for a stamped `retry_after` hint. The deferral lease windows
+/// are seconds-to-minutes; the cap only exists so a corrupt or hand-edited
+/// lease row cannot push callers into absurd waits. Raise it if a legitimate
+/// deferral lease ever exceeds it (today: 5s defer, 60s reservation leases).
+pub(crate) const IDEMPOTENCY_RETRY_HINT_MAX_SECONDS: i64 = 300;
 const CONFIG_TOKEN_HARD_ATTEMPT_SECONDS: u64 = 30;
 const CONFIG_TOKEN_CANCELLATION_SECONDS: u64 = 5;
 const CONFIG_TOKEN_RECEIPT_LEASE_SECONDS: i64 = 60;
@@ -488,6 +494,18 @@ fn idempotency_in_progress_error() -> InternalRouteError {
             "idempotency_disposition": "deferred",
         })),
     )
+}
+
+/// The deferred-409 contract with a server-clock lease hint attached: whole
+/// seconds until a same-key retry can re-execute. Only call this where the
+/// lease window is actually known (the live-lease `!reclaimable` branch and
+/// the explicit defer, which both know the expiry they just read/wrote);
+/// sites without a known window return the bare contract and callers treat a
+/// missing `retry_after` as "retry same key, unknown wait".
+fn idempotency_in_progress_with_retry(seconds: i64) -> InternalRouteError {
+    let (status, Json(mut body)) = idempotency_in_progress_error();
+    body["retry_after"] = serde_json::json!(seconds.clamp(1, IDEMPOTENCY_RETRY_HINT_MAX_SECONDS));
+    (status, Json(body))
 }
 
 fn idempotency_key_reused_error() -> InternalRouteError {
@@ -1190,7 +1208,17 @@ async fn begin_idempotent_request_with_recovery_and_binding(
                 .is_some_and(|lease_expires_at| lease_expires_at <= row.database_now),
         };
     if !reclaimable && recovery != IdempotencyRecovery::DeterministicExpiringCapability {
-        return Err(idempotency_in_progress_error());
+        // The lease is live and not expired (every reclaimable arm requires
+        // expiry or staleness), so the window to its freeing is a known,
+        // positive quantity -- stamp it so callers stop scheduling into the
+        // lease (the #194 self-inflicted 409 loop). Legacy rows without a
+        // lease expiry fall back to the bare contract.
+        return Err(match row.lease_expires_at {
+            Some(lease_expires_at) => idempotency_in_progress_with_retry(
+                (lease_expires_at - row.database_now).num_seconds(),
+            ),
+            None => idempotency_in_progress_error(),
+        });
     }
 
     if recovery == IdempotencyRecovery::DeterministicExpiringCapability
@@ -1602,7 +1630,9 @@ async fn defer_idempotent_request(mut lease: IdempotencyLease) -> InternalRouteE
     // defer landed; a 0-row update means the lease was already completed or
     // reclaimed. Either way the client guidance is retry-same-key.
     match updated {
-        Ok(_) => idempotency_in_progress_error(),
+        // The defer just re-armed the lease for exactly
+        // IDEMPOTENCY_RETRY_DEFER_SECONDS, so the retry hint is exact.
+        Ok(_) => idempotency_in_progress_with_retry(IDEMPOTENCY_RETRY_DEFER_SECONDS),
         Err(_) => db_error(),
     }
 }
@@ -1681,6 +1711,16 @@ async fn complete_app_delete_result(
             let (deferred_status, Json(mut deferred_body)) = defer_idempotent_request(lease).await;
             if teardown_locked && deferred_status == StatusCode::CONFLICT {
                 deferred_body["cause"] = serde_json::json!("app_delete_teardown_locked");
+            }
+            // Surface the teardown disposition (restored vs kept deleting)
+            // on the deferral too: hosted callers retry through the deferral
+            // and would otherwise never see why the attempt failed — the
+            // original failure body is dropped by the deferral shape. The
+            // teardown branch attaches `reason` for every deferral-worthy
+            // status (token 500, transport 502, locked 423); other delete
+            // step failures carry none, so copy whatever is present.
+            if let Some(reason) = body.get("reason") {
+                deferred_body["reason"] = reason.clone();
             }
             return Err((deferred_status, Json(deferred_body)));
         }
@@ -3320,6 +3360,10 @@ pub async fn create_paas_app(
             body.bootstrap_pubkey_hash.as_deref(),
         )
         .map_err(|error| json_error(StatusCode::BAD_REQUEST, error))?;
+    // Same-name recreate guard as the public create path: the hosted create
+    // derives its own identity instead of going through prepare_app_candidate,
+    // so the check runs here explicitly and the 409 passes through as-is.
+    crate::routes::apps::refuse_stale_owner_seed(&state, &namespace, &body.name).await?;
 
     let mut tx = state.db.begin().await.map_err(|_| db_error())?;
     crate::entitlements::lock_org_entitlement_lane(&mut tx, cap_org_id)
@@ -3341,7 +3385,11 @@ pub async fn create_paas_app(
             signer_identity_subject, signer_identity_issuer, signer_identity_set_at,
             egress_allowlist, egress_mode
          )
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::unlock_enum, $11, $12, $13, $14, $15, $16, $17)",
+         SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10::unlock_enum, $11, $12, $13, $14, $15, $16, $17
+         WHERE NOT EXISTS (
+             SELECT 1 FROM kbs_owner_seed_waivers
+              WHERE binding_key = $18
+         )",
     )
     .bind(app_id)
     .bind(cap_org_id)
@@ -3360,6 +3408,7 @@ pub async fn create_paas_app(
     .bind(signer_set_at)
     .bind(sqlx::types::Json(egress_allowlist.clone()))
     .bind(egress_mode.as_str())
+    .bind(crate::kbs::owner_binding_key_for(&namespace, &body.name))
     .execute(&mut *tx)
     .await
     .map_err(|error| {
@@ -3369,6 +3418,17 @@ pub async fn create_paas_app(
             db_error()
         }
     })?;
+    // The waiver guard above runs before this transaction; the NOT EXISTS in
+    // the insert re-checks atomically so an abandoned destroy committing in
+    // between cannot slip a recreate past the tombstone.
+    let inserted = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM apps WHERE id = $1")
+        .bind(app_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| db_error())?;
+    if inserted == 0 {
+        return Err(json_error(StatusCode::CONFLICT, "stale_owner_seed"));
+    }
     sqlx::query(
         "INSERT INTO app_resources (
              app_id, cpu_limit, memory_limit, app_data_size, tls_data_size
@@ -3598,11 +3658,22 @@ pub async fn delete_paas_app(
         .fetch_one(&state.db)
         .await
         .map_err(|_| db_error())?;
+        let abandon_teardown = match body.get("abandon_teardown") {
+            None | Some(serde_json::Value::Bool(false)) => false,
+            Some(serde_json::Value::Bool(true)) => true,
+            Some(_) => {
+                return Err(json_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_abandon_teardown",
+                ));
+            }
+        };
         let status = match crate::routes::apps::delete_app_before(
             auth,
             State(state.clone()),
             Path(app_name),
             Some(created_before),
+            abandon_teardown,
         )
         .await
         {
@@ -3665,7 +3736,7 @@ pub async fn put_paas_app_desired_state(
         let desired_state = body.desired_state.as_str();
         let resource =
             crate::mutation_leases::ResourceFence::new("kubernetes_namespace", &namespace);
-        let mut mutation = crate::mutation_leases::claim(
+        let mut mutation = match crate::mutation_leases::claim(
             &state,
             app_id,
             "app_desired_state",
@@ -3674,12 +3745,25 @@ pub async fn put_paas_app_desired_state(
             vec![resource.clone()],
         )
         .await
-        .map_err(|error| match error {
-            crate::mutation_leases::MutationLeaseError::Busy => {
-                json_error(StatusCode::CONFLICT, "app mutation already in progress")
+        {
+            Ok(mutation) => mutation,
+            // Lane etiquette: this fifth Busy arm carries the same lease hints
+            // as the HTTP-facing ones so the contract is uniform.
+            Err(crate::mutation_leases::MutationLeaseError::Busy) => {
+                return Err(crate::routes::apps::app_mutation_busy_error(
+                    &state.db,
+                    app_id,
+                    std::slice::from_ref(&resource),
+                )
+                .await);
             }
-            _ => json_error(StatusCode::SERVICE_UNAVAILABLE, "desired_state_retryable"),
-        })?;
+            Err(_) => {
+                return Err(json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "desired_state_retryable",
+                ));
+            }
+        };
         let mut tx = state.db.begin().await.map_err(|_| db_error())?;
         crate::deploy::lock_app_deployment_lane(&mut tx, app_id)
             .await
@@ -8626,6 +8710,146 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn app_mutation_busy_names_holder_and_retry_window() {
+        let (state, _auth, _app_name, app_id) = app_delete_fixture().await;
+        // Ensure a lane row exists, then simulate a live holder (a deployment
+        // that claimed the lane ~60s ago).
+        sqlx::query(
+            "INSERT INTO app_mutation_leases (app_id) VALUES ($1)
+             ON CONFLICT (app_id) DO NOTHING",
+        )
+        .bind(app_id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE app_mutation_leases
+                SET owner_token = gen_random_uuid(),
+                    operation_kind = 'deployment',
+                    operation_id = gen_random_uuid(),
+                    locked_until = clock_timestamp() + interval '60 seconds',
+                    reclaim_after = clock_timestamp() + interval '120 seconds'
+              WHERE app_id = $1",
+        )
+        .bind(app_id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+        let (status, Json(body)) =
+            crate::routes::apps::app_mutation_busy_error(&state.db, app_id, &[]).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "app mutation already in progress");
+        assert_eq!(body["held_by"], "deployment");
+        let retry_after = body["retry_after"].as_i64().expect("retry_after hint");
+        assert!(
+            (1..=60).contains(&retry_after),
+            "hint should track the 60s lock, got {retry_after}"
+        );
+        assert!(retry_after <= IDEMPOTENCY_RETRY_HINT_MAX_SECONDS);
+
+        // Free lane: the same answer carries no invented hints.
+        sqlx::query(
+            "UPDATE app_mutation_leases
+                SET owner_token = NULL, operation_kind = NULL, operation_id = NULL,
+                    locked_until = NULL, reclaim_after = NULL
+              WHERE app_id = $1",
+        )
+        .bind(app_id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+        let (status, Json(body)) =
+            crate::routes::apps::app_mutation_busy_error(&state.db, app_id, &[]).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "app mutation already in progress");
+        assert!(body.get("held_by").is_none());
+        assert!(body.get("retry_after").is_none());
+    }
+
+    #[tokio::test]
+    async fn app_mutation_busy_hint_follows_reclaim_quarantine() {
+        let (state, _auth, _app_name, app_id) = app_delete_fixture().await;
+        // A lost owner: the renewable lock lapsed but the row still blocks
+        // claims until the reclaim quarantine expires. The hint must track
+        // THAT deadline -- the dead lock expiry admits nothing, and a hint
+        // there leaves the caller retried into a hintless Busy.
+        sqlx::query(
+            "INSERT INTO app_mutation_leases (app_id) VALUES ($1)
+             ON CONFLICT (app_id) DO NOTHING",
+        )
+        .bind(app_id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE app_mutation_leases
+                SET owner_token = gen_random_uuid(),
+                    operation_kind = 'deployment',
+                    operation_id = gen_random_uuid(),
+                    locked_until = clock_timestamp() - interval '60 seconds',
+                    reclaim_after = clock_timestamp() + interval '240 seconds'
+              WHERE app_id = $1",
+        )
+        .bind(app_id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+        let (status, Json(body)) =
+            crate::routes::apps::app_mutation_busy_error(&state.db, app_id, &[]).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["held_by"], "deployment");
+        let retry_after = body["retry_after"].as_i64().expect("retry_after hint");
+        assert!(
+            (230..=240).contains(&retry_after),
+            "hint should follow the reclaim quarantine (240s), got {retry_after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn app_mutation_busy_resolves_resource_fence_holder() {
+        let (state, _auth, _app_name, app_id) = app_delete_fixture().await;
+        // A resource-fence conflict rolls the app-row claim back, so the
+        // holder lives on the contested fence's row (which can belong to
+        // another app or a global provider operation): the hint must read
+        // THAT row, not this app's empty one.
+        let fence = crate::mutation_leases::ResourceFence::new("test_scope", "test_key");
+        sqlx::query(
+            "INSERT INTO external_resource_mutation_leases (resource_scope, resource_key)
+             VALUES ('test_scope', 'test_key')
+             ON CONFLICT (resource_scope, resource_key) DO NOTHING",
+        )
+        .execute(&state.db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET owner_token = gen_random_uuid(),
+                    operation_kind = 'custom_domain_set',
+                    operation_id = gen_random_uuid(),
+                    locked_until = clock_timestamp() + interval '90 seconds',
+                    reclaim_after = clock_timestamp() + interval '450 seconds'
+              WHERE resource_scope = 'test_scope' AND resource_key = 'test_key'",
+        )
+        .execute(&state.db)
+        .await
+        .unwrap();
+        let (status, Json(body)) = crate::routes::apps::app_mutation_busy_error(
+            &state.db,
+            app_id,
+            std::slice::from_ref(&fence),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "app mutation already in progress");
+        assert_eq!(body["held_by"], "custom_domain_set");
+        let retry_after = body["retry_after"].as_i64().expect("retry_after hint");
+        assert!(
+            (80..=90).contains(&retry_after),
+            "hint should track the fence holder's 90s lock, got {retry_after}"
+        );
+    }
+
+    #[tokio::test]
     async fn app_delete_partial_failure_defers_and_same_key_reexecutes() {
         let (state, auth, app_name, _) = app_delete_fixture().await;
         let key = format!("partial-delete-{}", Uuid::new_v4());
@@ -8647,9 +8871,11 @@ mod tests {
         )
         .await
         .unwrap_err();
+        assert_eq!(failure.0, StatusCode::CONFLICT);
         assert_eq!(
-            (failure.0, failure.1.0),
-            (StatusCode::CONFLICT, idempotency_in_progress_error().1.0)
+            failure.1.0["error"], "idempotency_request_in_progress",
+            "the deferral shape stays intact: {:?}",
+            failure.1.0
         );
         let receipt: (bool, bool, bool, bool) = sqlx::query_as(
             "SELECT completed_at IS NULL, response_status IS NULL,
@@ -8665,10 +8891,16 @@ mod tests {
             .await
             .err()
             .expect("live lease must defer");
+        assert_eq!(busy.0, StatusCode::CONFLICT);
         assert_eq!(
-            (busy.0, busy.1.0),
-            (StatusCode::CONFLICT, idempotency_in_progress_error().1.0)
+            busy.1.0["error"], "idempotency_request_in_progress",
+            "the deferral shape stays intact: {:?}",
+            busy.1.0
         );
+        // Lane etiquette: a live-lease deferral must carry the server-clock
+        // retry hint so callers stop scheduling into the lease.
+        let retry_after = busy.1.0["retry_after"].as_i64().expect("retry_after hint");
+        assert!((1..=IDEMPOTENCY_RETRY_HINT_MAX_SECONDS).contains(&retry_after));
         expire_idempotency_lease(&state.db, &key).await;
         let retry = expect_idempotency_execution(
             begin_app_delete_request(&state, &headers, &path, &auth, &body, &app_name)
@@ -8691,6 +8923,60 @@ mod tests {
                     .unwrap(),
             ),
             response
+        );
+    }
+
+    #[tokio::test]
+    async fn app_delete_deferral_carries_teardown_disposition() {
+        let (state, auth, app_name, _) = app_delete_fixture().await;
+        let key = format!("disposition-delete-{}", Uuid::new_v4());
+        let headers = idempotency_headers(&key);
+        let path = format!("/internal/paas/orgs/{}/apps/{app_name}", auth.org_id);
+        let body = serde_json::json!({});
+        let lease = expect_idempotency_execution(
+            begin_app_delete_request(&state, &headers, &path, &auth, &body, &app_name)
+                .await
+                .unwrap(),
+        );
+        let mut failure = json_error(StatusCode::BAD_GATEWAY, "app_delete_teardown_unavailable");
+        failure.1.0["reason"] = serde_json::json!("app_kept_deleting");
+        let deferred = complete_app_delete_result(lease, Err(failure))
+            .await
+            .unwrap_err();
+        assert_eq!(deferred.0, StatusCode::CONFLICT);
+        assert_eq!(
+            deferred.1.0["error"], "idempotency_request_in_progress",
+            "the deferral shape stays intact"
+        );
+        assert_eq!(
+            deferred.1.0["reason"], "app_kept_deleting",
+            "the teardown disposition must ride the deferral for hosted callers"
+        );
+
+        // A locked teardown (423) carries the same disposition — the handler
+        // attaches `reason` for every deferral-worthy teardown status — and
+        // must keep its `cause` too.
+        let (state, auth, app_name, _) = app_delete_fixture().await;
+        let key = format!("disposition-locked-{}", Uuid::new_v4());
+        let headers = idempotency_headers(&key);
+        let path = format!("/internal/paas/orgs/{}/apps/{app_name}", auth.org_id);
+        let body = serde_json::json!({});
+        let lease = expect_idempotency_execution(
+            begin_app_delete_request(&state, &headers, &path, &auth, &body, &app_name)
+                .await
+                .unwrap(),
+        );
+        let mut locked =
+            crate::routes::apps::workload_teardown_http_failure(Uuid::new_v4(), StatusCode::LOCKED);
+        locked.1.0["reason"] = serde_json::json!("app_restored");
+        let deferred = complete_app_delete_result(lease, Err(locked))
+            .await
+            .unwrap_err();
+        assert_eq!(deferred.0, StatusCode::CONFLICT);
+        assert_eq!(deferred.1.0["cause"], "app_delete_teardown_locked");
+        assert_eq!(
+            deferred.1.0["reason"], "app_restored",
+            "locked teardowns keep the app disposition on the deferral"
         );
     }
 
@@ -8896,6 +9182,7 @@ mod tests {
             State(state.clone()),
             Path(app_name),
             Some(created_before),
+            false,
         )
         .await
         .unwrap_err();
@@ -8937,10 +9224,10 @@ mod tests {
         for attempt in [a, b] {
             match attempt {
                 Ok(IdempotencyBegin::Execute(lease)) => winners.push(lease),
-                Err(error) => assert_eq!(
-                    (error.0, error.1.0),
-                    (StatusCode::CONFLICT, idempotency_in_progress_error().1.0)
-                ),
+                Err(error) => {
+                    assert_eq!(error.0, StatusCode::CONFLICT);
+                    assert_eq!(error.1.0["error"], "idempotency_request_in_progress");
+                }
                 Ok(IdempotencyBegin::Replay(_)) => panic!("failed receipt must not replay"),
             }
         }
@@ -9203,9 +9490,16 @@ mod tests {
         )
         .await
         .unwrap_err();
+        assert_eq!(failed.0, StatusCode::CONFLICT);
         assert_eq!(
-            (failed.0, failed.1.0),
-            (StatusCode::CONFLICT, idempotency_in_progress_error().1.0)
+            failed.1.0["error"], "idempotency_request_in_progress",
+            "the deferral shape stays intact: {:?}",
+            failed.1.0
+        );
+        assert!(
+            failed.1.0.get("reason").is_none(),
+            "non-teardown 502 deferrals carry no disposition: {:?}",
+            failed.1.0
         );
         let state_after_failure: (String, bool, bool, i64) = sqlx::query_as(
             "SELECT status::text,
@@ -9265,12 +9559,29 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(final_rows, (0, 1));
+        // Legacy-install guard (fresh schema: no signed acceptance ever ran,
+        // so signed-policy mode was never active). The post-delete
+        // reconciliation must not activate signed mode here — publishing an
+        // empty artifact set would strip every other app's Rego-authorized
+        // KBS access on an unsigned installation.
+        let signed_generation: Option<i64> = sqlx::query_scalar(
+            "SELECT desired_generation FROM kbs_signed_policy_reconciliation WHERE singleton",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(
+            signed_generation,
+            Some(0),
+            "a delete must never activate signed-policy mode on a legacy install"
+        );
     }
 
     /// Route-level pin of the durable teardown decision and completion marker
     /// (the #109 retry contract): a running app requires teardown, an
-    /// unreachable TEE blocks the first attempt before any other cleanup, and
-    /// once the completion marker exists the retry finishes with the TEE gone.
+    /// unreachable TEE fails the first attempt atomically (the app is restored
+    /// before any other cleanup), and once the completion marker exists the
+    /// retry finishes with the TEE gone.
     #[tokio::test]
     async fn app_delete_retry_finishes_after_teardown_completion_marker() {
         const CHILD: &str = "CAP_APP_DELETE_TEST_TEARDOWN_CHILD";
@@ -9468,9 +9779,15 @@ mod tests {
         )
         .await
         .unwrap_err();
+        assert_eq!(failed.0, StatusCode::CONFLICT);
         assert_eq!(
-            (failed.0, failed.1.0),
-            (StatusCode::CONFLICT, idempotency_in_progress_error().1.0)
+            failed.1.0["error"], "idempotency_request_in_progress",
+            "the deferral shape stays intact: {:?}",
+            failed.1.0
+        );
+        assert_eq!(
+            failed.1.0["reason"], "app_restored",
+            "this attempt restored the app; the deferral must say so"
         );
         let after_first: (String, bool, bool, bool) = sqlx::query_as(
             "SELECT status::text, workload_teardown_required,
@@ -9484,8 +9801,8 @@ mod tests {
         .unwrap();
         assert_eq!(
             after_first,
-            ("deleting".into(), true, false, true),
-            "unreachable teardown must block the delete before KBS revocation"
+            ("running".into(), true, false, true),
+            "unreachable teardown must fail atomically: restored and untouched before KBS revocation"
         );
         // The failed teardown must release the shared fences immediately: an
         // abandoned lease would hold cluster-wide edge_config and kbs_policy
@@ -9535,6 +9852,328 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(final_rows, (0, 1));
+    }
+
+    /// An abandoned destroy (unreachable teardown + the operator override)
+    /// must complete the cleanup tail, record the waiver in a table that
+    /// survives the app row, and refuse a same-name recreate with
+    /// `stale_owner_seed`.
+    #[tokio::test]
+    async fn abandoned_destroy_records_waiver_and_blocks_recreate() {
+        const CHILD: &str = "CAP_APP_DELETE_TEST_ABANDON_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let pool = database_test_pool().await;
+            let schema = format!("app_delete_ab_{}", Uuid::new_v4().simple());
+            sqlx::query(&format!("CREATE SCHEMA {schema}"))
+                .execute(&pool)
+                .await
+                .unwrap();
+            let mut database_url = reqwest::Url::parse(
+                &std::env::var("DATABASE_URL")
+                    .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".into()),
+            )
+            .unwrap();
+            database_url
+                .query_pairs_mut()
+                .append_pair("options", &format!("-csearch_path={schema}"));
+            let mock_deleted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let resources = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+                String,
+                serde_json::Value,
+            >::new()));
+            let deleted = mock_deleted.clone();
+            let mock_resources = resources.clone();
+            let server = axum::Router::new().fallback(
+                move |request: axum::extract::Request| {
+                    let deleted = deleted.clone();
+                    let resources = mock_resources.clone();
+                    async move {
+                        let path = request.uri().path().to_string();
+                        let method = request.method().clone();
+                        if path.starts_with("/zones/") {
+                            return (StatusCode::OK, Json(serde_json::json!({"success":true, "result":[], "errors":[]})));
+                        }
+                        let name = path.rsplit('/').next().unwrap();
+                        let metadata = serde_json::json!({"name": name, "uid": "fixture", "resourceVersion": "1"});
+                        if path.starts_with("/api/v1/namespaces/cap-") {
+                            if method == axum::http::Method::DELETE {
+                                deleted.store(true, std::sync::atomic::Ordering::SeqCst);
+                                return (StatusCode::OK, Json(serde_json::json!({"apiVersion":"v1", "kind":"Status", "status":"Success", "code":200})));
+                            }
+                            if deleted.load(std::sync::atomic::Ordering::SeqCst) {
+                                return (StatusCode::NOT_FOUND, Json(serde_json::json!({"apiVersion":"v1", "kind":"Status", "status":"Failure", "reason":"NotFound", "message":"absent", "code":404})));
+                            }
+                            return (StatusCode::OK, Json(serde_json::json!({"apiVersion":"v1", "kind":"Namespace", "metadata":metadata})));
+                        }
+                        if method == axum::http::Method::PUT {
+                            let bytes = axum::body::to_bytes(request.into_body(), 1_048_576).await.unwrap();
+                            let resource: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                            resources.lock().unwrap().insert(path, resource.clone());
+                            return (StatusCode::OK, Json(resource));
+                        }
+                        if let Some(resource) = resources.lock().unwrap().get(&path).cloned() {
+                            return (StatusCode::OK, Json(resource));
+                        }
+                        let resource = if path.contains("/configmaps/") {
+                            serde_json::json!({"apiVersion":"v1", "kind":"ConfigMap", "metadata":metadata,
+                                "data":{"haproxy.cfg":"", "policy.rego":"package policy\nresource_bindings := {}\nowner_resource_bindings := {}\n"}})
+                        } else {
+                            assert!(path.contains("/daemonsets/") || path.contains("/deployments/"), "unexpected provider request {path}");
+                            serde_json::json!({"apiVersion":"apps/v1", "kind": if path.contains("/daemonsets/") {"DaemonSet"} else {"Deployment"},
+                                "metadata":metadata, "spec":{"replicas":1, "selector":{}, "template":{"metadata":{}, "spec":{"containers":[]}}},
+                                "status":{"readyReplicas":1, "availableReplicas":1, "updatedReplicas":1, "observedGeneration":1}})
+                        };
+                        (StatusCode::OK, Json(resource))
+                    }
+                },
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let task = tokio::spawn(async move { axum::serve(listener, server).await.unwrap() });
+            let config =
+                std::env::temp_dir().join(format!("cap-delete-ab-{}.json", Uuid::new_v4()));
+            std::fs::write(
+                &config,
+                serde_json::to_vec(&serde_json::json!({
+                    "apiVersion":"v1", "kind":"Config", "current-context":"test",
+                    "clusters":[{"name":"test", "cluster":{"server":format!("http://{address}")}}],
+                    "contexts":[{"name":"test", "context":{"cluster":"test", "user":"test"}}],
+                    "users":[{"name":"test", "user":{}}]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "routes::internal::tests::abandoned_destroy_records_waiver_and_blocks_recreate",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .env("DATABASE_URL", database_url.as_str())
+                .env("KUBECONFIG", &config)
+                .env(
+                    "CAP_APP_DELETE_TEST_PROVIDER_URL",
+                    format!("http://{address}"),
+                )
+                .env("TENANT_HAPROXY_NAMESPACE", "tenant-envoy")
+                .env("TENANT_HAPROXY_CONFIGMAP", "haproxy-tenant")
+                .env("TENANT_HAPROXY_DAEMONSET", "haproxy-tenant")
+                .kill_on_drop(true)
+                .output();
+            let output = tokio::time::timeout(std::time::Duration::from_secs(60), output).await;
+            task.abort();
+            std::fs::remove_file(config).unwrap();
+            sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+                .execute(&pool)
+                .await
+                .unwrap();
+            let output = output
+                .expect("abandoned destroy must not deadlock")
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(
+                stdout.matches("app_delete_teardown_abandoned").count(),
+                1,
+                "exactly one abandoned teardown"
+            );
+            return;
+        }
+
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_test_writer()
+            .init();
+        let (mut state, auth, app_name, app_id) = app_delete_fixture().await;
+        sqlx::query("UPDATE apps SET status = 'running' WHERE id = $1")
+            .bind(app_id)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        // The hosted create path needs an authoritative entitlement for the
+        // recreate attempt to reach the stale-owner-seed guard.
+        sqlx::query(
+            "INSERT INTO organization_entitlements
+                 (org_id, version, deploy_allowed, limits)
+             VALUES ($1, 1, true, $2)",
+        )
+        .bind(auth.org_id)
+        .bind(serde_json::json!({
+            "max_apps": 10, "max_cpu": "10", "max_memory": "10Gi", "max_storage": "100Gi"
+        }))
+        .execute(&state.db)
+        .await
+        .unwrap();
+        // The waiver must be keyed by the REAL derivation (namespace =
+        // cap-{org}-{name}, binding key = {namespace}-{name}-owner): the
+        // fixture's namespace carries an identity suffix and its binding key
+        // is a placeholder, both of which would hide a key-derivation
+        // mismatch between the destroy and the recreate.
+        sqlx::query(
+            "UPDATE apps
+                SET namespace = 'cap-' || (SELECT name FROM organizations WHERE id = org_id)
+                           || '-' || name
+              WHERE id = $1",
+        )
+        .bind(app_id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO kbs_owner_bindings (
+                 app_id, binding_key, namespace, service_account,
+                 tenant_instance_identity_hash
+             )
+             SELECT id, namespace || '-' || name || '-owner', namespace,
+                    service_account, tenant_instance_identity_hash
+               FROM apps WHERE id = $1",
+        )
+        .bind(app_id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO kbs_tls_bindings (
+                 app_id, binding_key, namespace, service_account,
+                 tenant_instance_identity_hash
+             )
+             SELECT id, id::text, namespace, service_account,
+                    tenant_instance_identity_hash
+               FROM apps WHERE id = $1",
+        )
+        .bind(app_id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+        state.management_mode = crate::state::CapManagementMode::PaasManaged;
+        state.dns = Some(crate::dns::DnsConfig {
+            cloudflare_api_token: "test".into(),
+            cloudflare_api_base_url: std::env::var("CAP_APP_DELETE_TEST_PROVIDER_URL").unwrap(),
+            cloudflare_zone_id: Some("test".into()),
+            cloudflare_zone_name: "enclava.test".into(),
+            target: "192.0.2.1".into(),
+            required: true,
+        });
+        state.kbs_policy = Some(crate::kbs::KbsPolicyConfig {
+            namespace: "kbs-test".into(),
+            configmap_name: "resource-policy".into(),
+            policy_key: "policy.rego".into(),
+            deployment_name: "trustee".into(),
+            required: true,
+            signed_policy_retention: 1,
+            signed_policy_max_bytes: 1_048_576,
+        });
+        state.tee_http_client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_millis(10))
+            .connect_timeout(std::time::Duration::from_millis(500))
+            .build()
+            .unwrap();
+        let paas_id = auth.org_id.simple().to_string();
+
+        // Abandoned attempt: the override proceeds past the unreachable
+        // teardown, completes the cleanup tail, and deletes the app row.
+        let key_abandon = format!("abandon-waiver-2-{}", Uuid::new_v4());
+        let (status, _) = delete_paas_app(
+            internal_test_auth(),
+            State(state.clone()),
+            Path((paas_id.clone(), app_name.clone())),
+            config_token_actor_headers(&key_abandon, &paas_id),
+            Json(serde_json::json!({"abandon_teardown": true})),
+        )
+        .await
+        .expect("abandoned destroy must complete the tail");
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let app_rows: i64 = sqlx::query_scalar("SELECT count(*) FROM apps WHERE id = $1")
+            .bind(app_id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(app_rows, 0, "the abandoned destroy must delete the app row");
+        let binding_rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM kbs_owner_bindings WHERE app_id = $1")
+                .bind(app_id)
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(
+            binding_rows, 0,
+            "kbs_owner_bindings cascades away with the app row"
+        );
+        let waiver: Option<String> =
+            sqlx::query_scalar("SELECT binding_key FROM kbs_owner_seed_waivers LIMIT 1")
+                .fetch_optional(&state.db)
+                .await
+                .unwrap();
+        assert!(
+            waiver.is_some(),
+            "the waiver must survive the app row deletion"
+        );
+
+        // A same-name recreate must be refused: the previous incarnation's
+        // owner seed may still exist in KBS.
+        let key_create = format!("abandon-waiver-3-{}", Uuid::new_v4());
+        let create_headers = config_token_actor_headers(&key_create, &paas_id);
+        let recreate = create_paas_app(
+            internal_test_auth(),
+            State(state.clone()),
+            Path(paas_id.clone()),
+            create_headers.clone(),
+            Json(InternalCreateAppRequest {
+                name: app_name.clone(),
+                unlock_mode: "auto".into(),
+                bootstrap_pubkey_hash: None,
+                signer_identity_subject: None,
+                signer_identity_issuer: None,
+                egress_allowlist: vec![],
+                egress_mode: crate::routes::apps::default_egress_mode(),
+                resources: None,
+            }),
+        )
+        .await;
+        // The create also rides the idempotency lane: defer once, then the
+        // same-key retry must hit the stale-owner-seed guard.
+        let recreate = match recreate {
+            Err((StatusCode::CONFLICT, body))
+                if (body.0)["error"] == idempotency_in_progress_error().1.0["error"] =>
+            {
+                expire_idempotency_lease(&state.db, &key_create).await;
+                create_paas_app(
+                    internal_test_auth(),
+                    State(state.clone()),
+                    Path(paas_id.clone()),
+                    create_headers,
+                    Json(InternalCreateAppRequest {
+                        name: app_name.clone(),
+                        unlock_mode: "auto".into(),
+                        bootstrap_pubkey_hash: None,
+                        signer_identity_subject: None,
+                        signer_identity_issuer: None,
+                        egress_allowlist: vec![],
+                        egress_mode: crate::routes::apps::default_egress_mode(),
+                        resources: None,
+                    }),
+                )
+                .await
+            }
+            other => other,
+        };
+        match recreate {
+            Err((StatusCode::CONFLICT, body)) => {
+                assert_eq!(
+                    body["error"], "stale_owner_seed",
+                    "recreate must be refused with the stale-owner-seed guard"
+                );
+            }
+            other => panic!("expected 409 stale_owner_seed, got {other:?}"),
+        }
     }
 
     #[tokio::test]

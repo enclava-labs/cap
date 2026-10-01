@@ -420,6 +420,126 @@ fn deploy_claims_fresh_created_password_app_when_unlock_status_is_unavailable() 
 }
 
 #[test]
+fn deploy_gate_follows_live_ownership_outside_creating() {
+    // A failed first deploy leaves the app `failed` + unclaimed: the gate
+    // must fire on the live ownership state, not on the status alone.
+    assert!(deploy_needs_initial_claim(
+        true,
+        Some("unclaimed"),
+        "failed"
+    ));
+    assert!(!deploy_needs_initial_claim(true, Some("locked"), "failed"));
+    assert!(!deploy_needs_initial_claim(true, None, "failed"));
+}
+
+#[test]
+fn deploy_preflight_gate_fails_closed_on_unresolved_ownership() {
+    // The preflight status read is a TEE query: unresolved ownership must
+    // gate before submission (the strand this gate exists to prevent), while
+    // the post-submit predicate keeps its None fallback (above) so claimed
+    // redeploys never loop into the claim wait.
+    assert!(deploy_preflight_needs_claim(true, None, "failed"));
+    assert!(deploy_preflight_needs_claim(true, None, "creating"));
+    assert!(!deploy_preflight_needs_claim(false, None, "failed"));
+    assert!(deploy_preflight_needs_claim(
+        true,
+        Some("unclaimed"),
+        "failed"
+    ));
+    assert!(!deploy_preflight_needs_claim(
+        true,
+        Some("locked"),
+        "failed"
+    ));
+}
+
+#[test]
+fn deploy_preflight_reads_live_ownership_before_the_claim_gate() {
+    // CRLF checkouts (Windows autocrlf) must not break source matching.
+    let source = include_str!("../../app.rs").replace("\r\n", "\n");
+    let deploy_start = source.find("pub async fn deploy").expect("deploy exists");
+    let deploy_end = source[deploy_start..]
+        .find("// Phase 1: Deploy")
+        .expect("phase 1 follows deploy setup")
+        + deploy_start;
+    let setup = &source[deploy_start..deploy_end];
+
+    let ownership_read = setup
+        .find("preflight_ownership = api")
+        .expect("deploy reads live ownership before the gate");
+    let gate = setup
+        .find("ensure_claim_session_now")
+        .expect("deploy gates the claim session");
+    let gate_decision = setup
+        .find("preflight_ownership.as_deref()")
+        .expect("the gate decision consumes the prefetched ownership state");
+    assert!(
+        ownership_read < gate_decision && gate_decision < gate,
+        "ownership must be read before the gate decision, and the decision before the session gate"
+    );
+}
+
+#[test]
+fn destroy_failure_hint_covers_lane_conflicts_and_teardown_failures() {
+    let busy = destroy_failure_hint(
+        Some("app mutation already in progress"),
+        "app mutation already in progress (held by: app_delete) (retry after ~30s)",
+        "shell",
+    )
+    .expect("busy 409 gets operator prose");
+    assert!(busy.contains("mutation lane"), "got: {busy}");
+
+    let deferred = destroy_failure_hint(Some("idempotency_request_in_progress"), "", "shell")
+        .expect("deferred 409 gets operator prose");
+    assert!(deferred.contains("idempotency lease"), "got: {deferred}");
+
+    let locked = destroy_failure_hint(Some("app_delete_teardown_locked"), "", "shell")
+        .expect("locked teardown gets operator prose");
+    assert!(
+        locked.contains("enclava unlock --app shell"),
+        "got: {locked}"
+    );
+    // Hosted deferrals carry the locked cause only in-band.
+    let locked_in_band = destroy_failure_hint(
+        Some("app mutation already in progress"),
+        "cause: app_delete_teardown_locked",
+        "shell",
+    )
+    .expect("in-band cause gets operator prose");
+    assert!(locked_in_band.contains("enclava unlock --app shell"));
+
+    let unavailable = destroy_failure_hint(Some("app_delete_teardown_unavailable"), "", "shell")
+        .expect("failed teardown gets operator prose");
+    assert!(
+        unavailable.contains("did not complete") && unavailable.contains("retry destroy"),
+        "got: {unavailable}"
+    );
+    let restored = destroy_failure_hint(
+        Some("app_delete_teardown_unavailable"),
+        "app_delete_teardown_unavailable (app_restored)",
+        "shell",
+    )
+    .expect("restored disposition gets operator prose");
+    assert!(
+        restored.contains("restored to its previous state"),
+        "got: {restored}"
+    );
+    let kept = destroy_failure_hint(
+        Some("app_delete_teardown_unavailable"),
+        "app_delete_teardown_unavailable (app_kept_deleting)",
+        "shell",
+    )
+    .expect("kept-deleting disposition gets operator prose");
+    assert!(
+        kept.contains("remains in the deleting state"),
+        "got: {kept}"
+    );
+
+    assert!(destroy_failure_hint(Some("other_error"), "", "shell").is_none());
+    assert!(destroy_failure_hint(None, "", "shell").is_none());
+}
+
+#[test]
 fn deploy_preflights_password_input_before_remote_side_effects() {
     // CRLF checkouts (Windows autocrlf) must not break source matching.
     let source = include_str!("../../app.rs").replace("\r\n", "\n");

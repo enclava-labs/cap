@@ -13,6 +13,14 @@ pub enum EnvGateError {
         "ACME directory `{0}` points at production Let's Encrypt; set CAP_ALLOW_PRODUCTION_ACME=true only for production CAP"
     )]
     ProductionAcmeWithoutExplicitAllow(&'static str),
+    #[error(
+        "env var `{0}` must use https; cleartext ACME would leak account credentials and challenge traffic"
+    )]
+    CleartextAcmeUrl(&'static str),
+    #[error(
+        "env var `{0}` must start with literal lowercase 'https://' — the value is interpolated verbatim into the tenant Caddyfile, whose renderer only accepts the lowercase prefix"
+    )]
+    NonCanonicalAcmeUrl(&'static str),
 }
 
 const CAP_ALLOW_PRODUCTION_ACME: &str = "CAP_ALLOW_PRODUCTION_ACME";
@@ -48,7 +56,20 @@ fn validate_acme_directory_url(
     source_name: &'static str,
     value: &str,
     production_acme_allowed: bool,
+    debug_assertions: bool,
 ) -> Result<(), EnvGateError> {
+    // Cleartext ACME directory URLs would leak ACME account credentials and
+    // challenge traffic; same rule as the signed-release field and
+    // TRUSTEE_KBS_URL. The parsed scheme must be exactly https — same
+    // strictness as the signed-release validator (`ws://`, `file://`, or
+    // schemeless values are not acceptable ACME directories) — and parsing
+    // makes the check case-insensitive (`HTTP://` must not slip a prefix
+    // check). Debug builds are exempt so developers can run against a local
+    // cleartext ACME directory (e.g. pebble), matching how the other
+    // dangerous settings below are debug-permitted.
+    if !debug_assertions && !https_scheme(value) {
+        return Err(EnvGateError::CleartextAcmeUrl(source_name));
+    }
     if is_letsencrypt_production_acme_url(value) && !production_acme_allowed {
         return Err(EnvGateError::ProductionAcmeWithoutExplicitAllow(
             source_name,
@@ -64,7 +85,16 @@ pub fn ensure_acme_directory_allowed(
     let production_acme_allowed = std::env::var(CAP_ALLOW_PRODUCTION_ACME)
         .ok()
         .is_some_and(|value| flag_is_truthy(&value));
-    validate_acme_directory_url(source_name, value, production_acme_allowed)
+    // Debug builds may point the ACME client at a local cleartext directory
+    // (e.g. pebble); the https-only rule is enforced in release builds by
+    // `enforce_production_env_gates`, like every other debug-permitted
+    // dangerous setting.
+    validate_acme_directory_url(
+        source_name,
+        value,
+        production_acme_allowed,
+        debug_assertions_on(),
+    )
 }
 
 /// Apply Phase-0 production gates. Should be called early in `main`, before
@@ -103,8 +133,34 @@ fn enforce_with(
         let production_acme_allowed =
             lookup(CAP_ALLOW_PRODUCTION_ACME).is_some_and(|value| flag_is_truthy(&value));
         for acme_source_name in ["ACME_DIRECTORY_URL", "TENANT_CADDY_ACME_CA"] {
-            if let Some(value) = lookup(acme_source_name) {
-                validate_acme_directory_url(acme_source_name, &value, production_acme_allowed)?;
+            // Empty/whitespace-only values are treated as unset, matching
+            // the runtime config path (env_nonempty): a manifest that
+            // defines the var empty selects the signed-release value or
+            // default CA and must not trip the https gate.
+            if let Some(value) = lookup(acme_source_name).filter(|v| !v.trim().is_empty()) {
+                validate_acme_directory_url(
+                    acme_source_name,
+                    &value,
+                    production_acme_allowed,
+                    false,
+                )?;
+                // Codex P1 (cap#165): TENANT_CADDY_ACME_CA is interpolated
+                // verbatim into tenant Caddyfiles. Url::parse scheme checks
+                // (and prefix-only checks) are NOT the renderer's
+                // predicate — `HTTPS://`, `;`, braces, quotes, tabs, and
+                // non-ASCII all parse as https but fail rendering. Apply
+                // the engine's exact validator so the value can never be
+                // accepted here while every ACME-mode render fails.
+                // ACME_DIRECTORY_URL keeps parsed-scheme semantics — the
+                // API's own ACME client consumes it via Url::parse only.
+                // Release builds only, matching the https gate's debug
+                // exemption for local cleartext directories.
+                if acme_source_name == "TENANT_CADDY_ACME_CA"
+                    && !debug_assertions
+                    && enclava_engine::manifest::ingress::validate_https_url(value.trim()).is_err()
+                {
+                    return Err(EnvGateError::NonCanonicalAcmeUrl(acme_source_name));
+                }
             }
         }
 
@@ -147,6 +203,12 @@ fn enforce_with(
     }
 
     Ok(())
+}
+
+/// True when `value` parses as an https:// URL. Parsing makes the scheme
+/// check case-insensitive (`HTTPS://` normalizes to `https`).
+fn https_scheme(value: &str) -> bool {
+    reqwest::Url::parse(value.trim()).is_ok_and(|url| url.scheme() == "https")
 }
 
 /// True when `value` parses as an http:// URL (any host). Parsing makes the
@@ -222,6 +284,24 @@ mod tests {
     fn release_rejects_insecure_tee_tls_mode() {
         let mut env = ok_required();
         env.insert("TENANT_TEE_TLS_MODE", "insecure");
+        assert!(run(env, false).is_err());
+    }
+
+    #[test]
+    fn release_treats_empty_optional_acme_overrides_as_unset() {
+        // Codex P2: an empty/whitespace-only optional ACME var must not
+        // trip the https gate — the runtime path (env_nonempty) treats it
+        // as unset and would select the signed-release value / default.
+        for value in ["", "  \t"] {
+            for name in ["ACME_DIRECTORY_URL", "TENANT_CADDY_ACME_CA"] {
+                let mut env = ok_required();
+                env.insert(name, value);
+                run(env, false).expect("empty optional ACME value must pass the release gate");
+            }
+        }
+        // But a real cleartext value is still rejected.
+        let mut env = ok_required();
+        env.insert("ACME_DIRECTORY_URL", "http://pebble.example:14000/dir");
         assert!(run(env, false).is_err());
     }
 
@@ -430,5 +510,103 @@ mod tests {
             "https://acme-v02.api.letsencrypt.org/directory",
         );
         run(env, false).expect("explicit production ACME override should be allowed");
+    }
+
+    #[test]
+    fn release_rejects_uppercase_scheme_tenant_caddy_acme_ca() {
+        // Codex P1 (cap#165): HTTPS:// parses with scheme https (the
+        // cleartext gate passes), but the value is interpolated verbatim
+        // into tenant Caddyfiles whose renderer requires the literal
+        // lowercase prefix — release builds must refuse it up front.
+        let mut env = ok_required();
+        env.insert(
+            "TENANT_CADDY_ACME_CA",
+            "HTTPS://acme-staging-v02.api.letsencrypt.org/directory",
+        );
+        let err = run(env, false).unwrap_err();
+        assert!(matches!(
+            err,
+            EnvGateError::NonCanonicalAcmeUrl("TENANT_CADDY_ACME_CA")
+        ));
+        // The gate applies the renderer's full predicate, not just a
+        // prefix check: URL-parseable but unrenderable values too.
+        for bad in [
+            "https://acme-staging-v02.api.letsencrypt.org/directory;extra",
+            "https://acme-staging-v02.api.letsencrypt.org/dir{x}",
+        ] {
+            let mut env = ok_required();
+            env.insert("TENANT_CADDY_ACME_CA", bad);
+            assert!(
+                matches!(
+                    run(env, false).unwrap_err(),
+                    EnvGateError::NonCanonicalAcmeUrl(_)
+                ),
+                "unrenderable {bad:?} must be rejected"
+            );
+        }
+        // ACME_DIRECTORY_URL keeps parsed-scheme semantics (consumed via
+        // Url::parse by the API's own ACME client): HTTPS:// stays valid.
+        let mut env = ok_required();
+        env.insert(
+            "ACME_DIRECTORY_URL",
+            "HTTPS://acme-staging-v02.api.letsencrypt.org/directory",
+        );
+        assert!(run(env, false).is_ok());
+        // Debug builds are exempt, matching the cleartext exemption.
+        let mut env = ok_required();
+        env.insert(
+            "TENANT_CADDY_ACME_CA",
+            "HTTPS://acme-staging-v02.api.letsencrypt.org/directory",
+        );
+        assert!(run(env, true).is_ok());
+    }
+
+    #[test]
+    fn release_rejects_cleartext_acme_directory_urls() {
+        for name in ["ACME_DIRECTORY_URL", "TENANT_CADDY_ACME_CA"] {
+            let mut env = ok_required();
+            env.insert(
+                name,
+                "http://acme-staging-v02.api.letsencrypt.org/directory",
+            );
+            let err = run(env, false).unwrap_err();
+            assert!(
+                matches!(err, EnvGateError::CleartextAcmeUrl(rejected) if rejected == name),
+                "{name} http URL must be rejected in release builds"
+            );
+
+            // Scheme parsing is case-insensitive: HTTP:// must not slip a
+            // prefix-shaped check.
+            let mut env = ok_required();
+            env.insert(
+                name,
+                "HTTP://acme-staging-v02.api.letsencrypt.org/directory",
+            );
+            assert!(matches!(
+                run(env, false).unwrap_err(),
+                EnvGateError::CleartextAcmeUrl(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn debug_builds_allow_cleartext_acme_directory() {
+        // `load_acme_config` calls `ensure_acme_directory_allowed` in every
+        // build; under `cargo test` (debug profile) a local cleartext ACME
+        // directory (e.g. pebble) must pass so dev setups keep working. The
+        // release behavior is pinned by
+        // `release_rejects_cleartext_acme_directory_urls` above.
+        ensure_acme_directory_allowed("ACME_DIRECTORY_URL", "http://127.0.0.1:14000/dir")
+            .expect("debug builds must allow cleartext ACME directories");
+        // The Let's Encrypt production gate still applies in debug builds.
+        let err = ensure_acme_directory_allowed(
+            "ACME_DIRECTORY_URL",
+            "https://acme-v02.api.letsencrypt.org/directory",
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            EnvGateError::ProductionAcmeWithoutExplicitAllow(_)
+        ));
     }
 }

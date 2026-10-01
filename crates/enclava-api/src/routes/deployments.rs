@@ -1261,10 +1261,12 @@ async fn deploy_app_candidate(
                     signer_identity_issuer, signer_identity_set_at, source_provider,
                     source_repository, egress_allowlist, egress_mode, created_at, updated_at
                  )
-                 VALUES (
-                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10::unlock_enum,
+                 SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10::unlock_enum,
                     $11, $12, $13, $14::app_status_enum, $15, $16, $17, $18,
                     $19, $20, $21, $22, $23
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM kbs_owner_seed_waivers
+                      WHERE binding_key = $24
                  )",
             )
             .bind(app.id)
@@ -1290,6 +1292,7 @@ async fn deploy_app_candidate(
             .bind(&app.egress_mode)
             .bind(app.created_at)
             .bind(app.updated_at)
+            .bind(crate::kbs::owner_binding_key_for(&app.namespace, &app.name))
             .execute(&mut *tx)
             .await
             .map_err(|error| {
@@ -1301,6 +1304,18 @@ async fn deploy_app_candidate(
                     json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
                 }
             })?;
+            // The waiver guard runs before this transaction; the NOT EXISTS
+            // above re-checks atomically with the insert so an abandoned
+            // destroy committing in between cannot slip a recreate past the
+            // tombstone (zero rows inserted = the waiver landed - refuse).
+            let inserted = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM apps WHERE id = $1")
+                .bind(app.id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+            if inserted == 0 {
+                return Err(json_error(StatusCode::CONFLICT, "stale_owner_seed"));
+            }
             insert_transaction_audit(
                 &mut tx,
                 auth.org_id,
