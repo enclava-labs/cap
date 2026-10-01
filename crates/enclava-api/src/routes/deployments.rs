@@ -1304,16 +1304,31 @@ async fn deploy_app_candidate(
                     json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
                 }
             })?;
-            // The waiver guard runs before this transaction; the NOT EXISTS
-            // above re-checks atomically with the insert so an abandoned
-            // destroy committing in between cannot slip a recreate past the
-            // tombstone (zero rows inserted = the waiver landed - refuse).
-            let inserted = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM apps WHERE id = $1")
-                .bind(app.id)
-                .fetch_one(&mut *tx)
+            // The waiver guard runs before this transaction, and under READ
+            // COMMITTED the insert's NOT EXISTS is evaluated on its statement
+            // snapshot — an abandoned destroy committing while the insert
+            // waits out the old row's unique constraint is invisible to both.
+            // Two guards close it: zero rows inserted means the NOT EXISTS
+            // filtered the create (a waiver existed at statement time — the
+            // recheck alone must not decide this, because the waiver can be
+            // cleared between the filtered insert and the lookup, e.g. by a
+            // teardown retry completing, and proceeding would fail the
+            // dependent inserts on the missing app row); the recheck then
+            // takes a fresh statement snapshot in this transaction and sees
+            // every waiver committed while the insert was blocked.
+            let insert_result =
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM apps WHERE id = $1")
+                    .bind(app.id)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+            if insert_result == 0 {
+                return Err(json_error(StatusCode::CONFLICT, "stale_owner_seed"));
+            }
+            if crate::kbs::owner_seed_waiver_recorded_in_tx(&mut tx, &app.namespace, &app.name)
                 .await
-                .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
-            if inserted == 0 {
+                .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?
+            {
                 return Err(json_error(StatusCode::CONFLICT, "stale_owner_seed"));
             }
             insert_transaction_audit(

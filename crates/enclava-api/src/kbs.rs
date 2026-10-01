@@ -326,10 +326,13 @@ pub async fn soft_delete_owner_binding(
     // requirement flag alone: a teardown-required workload (signed paths
     // never create a binding row — the key is name-derived either way) OR
     // any workload with a live owner binding (a running-then-stopped app
-    // keeps its seed; PaaS desired-state only scales it to zero) waives
-    // when the completion marker is absent. Completed teardowns and
-    // never-deployed apps record nothing: absence of a waiver means
-    // recreate is allowed.
+    // keeps its seed; PaaS desired-state only scales it to zero) OR any
+    // workload that ever deployed (requires_workload_teardown only matches
+    // Running, so a stopped or failed app records teardown as not required —
+    // and a signed deployment leaves no binding row, yet its name-derived
+    // seed survives the scale-to-zero) waives when the completion marker is
+    // absent. Completed teardowns and never-deployed apps record nothing:
+    // absence of a waiver means recreate is allowed.
     sqlx::query(
         "INSERT INTO kbs_owner_seed_waivers (binding_key, app_id, org_name, app_name)
          SELECT $2, app.id, org.name, app.name
@@ -343,6 +346,11 @@ pub async fn soft_delete_owner_binding(
                     SELECT 1
                       FROM kbs_owner_bindings AS binding
                      WHERE binding.app_id = app.id
+                )
+                OR EXISTS (
+                    SELECT 1
+                      FROM deployments AS deployment
+                     WHERE deployment.app_id = app.id
                 )
             )
          ON CONFLICT (binding_key) DO UPDATE
@@ -384,6 +392,32 @@ pub(crate) fn owner_binding_key_for(namespace: &str, name: &str) -> String {
 /// Whether a soft-deleted owner binding with this key was destroyed without a
 /// completed confidential teardown — its owner seed may still exist in KBS,
 /// and a fresh create under the same name would boot already-claimed.
+/// Post-insert recheck for the create paths: `stale_owner_seed_for_binding`
+/// runs before the insert transaction, and the insert's own NOT EXISTS is
+/// evaluated on its statement snapshot — under READ COMMITTED, an abandoned
+/// destroy that commits while the insert waits out the old row's unique
+/// constraint is invisible to both. A fresh statement inside the same
+/// transaction sees every waiver committed by then. Callers refuse with the
+/// shared `stale_owner_seed` response when this returns true (which also
+/// covers the zero-rows-inserted case: a waiver that predates the statement
+/// still exists when re-read).
+pub(crate) async fn owner_seed_waiver_recorded_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    namespace: &str,
+    name: &str,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1
+               FROM kbs_owner_seed_waivers
+              WHERE binding_key = $1
+         )",
+    )
+    .bind(owner_binding_key(namespace, name))
+    .fetch_one(&mut **tx)
+    .await
+}
+
 pub async fn stale_owner_seed_for_binding(
     db: &PgPool,
     namespace: &str,
@@ -3859,6 +3893,70 @@ resource_bindings := {
                 .execute(&pool)
                 .await
                 .expect("delete teardown-outcome fixture organization");
+        }
+    }
+
+    #[tokio::test]
+    async fn soft_delete_owner_binding_waives_ever_deployed_workload_without_binding() {
+        let pool = crate::test_support::database_test_pool().await;
+
+        // A signed deployment leaves no owner binding row and a stopped (or
+        // failed) workload records teardown as not required — the deployment
+        // row is the only durable signal that a TEE boot may have left the
+        // name-derived seed behind. The seed survives a scale-to-zero, so
+        // the destroy must waive.
+        let (org_id, app_id) = insert_test_app(&pool, "stopped").await;
+        sqlx::query(
+            "INSERT INTO deployments (id, org_id, app_id, status, spec_snapshot)
+             VALUES ($1, $2, $3, 'healthy'::deploy_status_enum, '{}'::jsonb)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(org_id)
+        .bind(app_id)
+        .execute(&pool)
+        .await
+        .expect("seed historical deployment row");
+        let (namespace, name): (String, String) =
+            sqlx::query_as("SELECT namespace, name FROM apps WHERE id = $1")
+                .bind(app_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read ever-deployed app identity");
+        soft_delete_owner_binding(&pool, app_id, &namespace, &name)
+            .await
+            .expect("soft delete ever-deployed signed app");
+        assert!(
+            stale_owner_seed_for_binding(&pool, &namespace, &name)
+                .await
+                .expect("guard lookup"),
+            "an ever-deployed workload without a binding row must still waive"
+        );
+
+        // The same stopped shape with no deployment row never booted a TEE:
+        // no seed can exist, so recreate stays open.
+        let (fresh_org, fresh_app) = insert_test_app(&pool, "stopped").await;
+        let (fresh_namespace, fresh_name): (String, String) =
+            sqlx::query_as("SELECT namespace, name FROM apps WHERE id = $1")
+                .bind(fresh_app)
+                .fetch_one(&pool)
+                .await
+                .expect("read never-deployed app identity");
+        soft_delete_owner_binding(&pool, fresh_app, &fresh_namespace, &fresh_name)
+            .await
+            .expect("soft delete never-deployed app");
+        assert!(
+            !stale_owner_seed_for_binding(&pool, &fresh_namespace, &fresh_name)
+                .await
+                .expect("guard lookup"),
+            "a never-deployed workload must not waive"
+        );
+
+        for cleanup_org in [org_id, fresh_org] {
+            sqlx::query("DELETE FROM organizations WHERE id = $1")
+                .bind(cleanup_org)
+                .execute(&pool)
+                .await
+                .expect("delete ever-deployed fixture organization");
         }
     }
 
