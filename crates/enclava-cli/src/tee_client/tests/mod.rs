@@ -879,8 +879,8 @@ fn builds_amd_kds_product_crl_url_from_snp_report() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)] // env serialization guard must span the awaits
 async fn complete_transition_quote_crl_rejects_invalid_collateral_before_mutation() {
-    // The captured CRL expired on 2026-09-09. Even a successful HTTP fetch
-    // must fail before ownership.rs changes the seed wrap inside the TEE.
+    // Verify real HTTP completion both at capture time and after expiry:
+    // rejection must precede ownership.rs changing the seed wrap in the TEE.
     use base64::Engine;
     use x509_cert::der::{Decode, Encode};
     let _guard = env_lock();
@@ -914,10 +914,18 @@ async fn complete_transition_quote_crl_rejects_invalid_collateral_before_mutatio
         }),
     };
 
-    let quote = attestation.quote.as_ref().expect("quote present");
     const CAPTURE_TIME: u64 = 1_785_844_800;
-    super::verify_transition_quote_revocation(quote, &crl_der, CAPTURE_TIME)
-        .expect("valid collateral at capture time must pass");
+    tee.complete_transition_quote_crl_at(&mut attestation, Some(CAPTURE_TIME as i64))
+        .await
+        .expect("fresh fetched collateral must complete the transition quote");
+    let quote = attestation.quote.as_ref().expect("quote present");
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(&quote.crl_der_b64)
+            .unwrap(),
+        crl_der,
+        "verified fetched CRL must be attached verbatim"
+    );
     for invalid_crl in [&[][..], b"not DER".as_slice()] {
         assert!(
             super::verify_transition_quote_revocation(quote, invalid_crl, CAPTURE_TIME).is_err()
@@ -946,8 +954,9 @@ async fn complete_transition_quote_crl_rejects_invalid_collateral_before_mutatio
             .contains("ASK is revoked")
     );
 
+    attestation.quote.as_mut().unwrap().crl_der_b64.clear();
     let error = tee
-        .complete_transition_quote_crl(&mut attestation)
+        .complete_transition_quote_crl_at(&mut attestation, Some(1_792_761_600))
         .await
         .expect_err("expired CRL must stop the transition before any TEE mutation");
     assert!(error.to_string().contains("expired"));

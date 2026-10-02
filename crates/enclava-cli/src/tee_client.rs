@@ -728,6 +728,15 @@ impl TeeClient {
         &self,
         attestation: &mut TransitionReceiptAttestation,
     ) -> Result<(), TeeError> {
+        self.complete_transition_quote_crl_at(attestation, None)
+            .await
+    }
+
+    async fn complete_transition_quote_crl_at(
+        &self,
+        attestation: &mut TransitionReceiptAttestation,
+        now_unix_seconds: Option<i64>,
+    ) -> Result<(), TeeError> {
         let Some(quote) = attestation.quote.as_mut() else {
             // Quote-less development evidence cannot satisfy the API's unlock-mode
             // transition gate. Fail here rather than let the TEE modification
@@ -741,7 +750,8 @@ impl TeeClient {
             .decode(quote.report_b64.as_bytes())
             .map_err(|_| TeeError::Attestation("SNP quote report is not base64".to_string()))?;
         let crl_der = fetch_snp_product_crl_der(&report_bytes).await?;
-        let now = u64::try_from(Utc::now().timestamp())
+        // Production reads the clock after fetching; tests supply fixture time.
+        let now = u64::try_from(now_unix_seconds.unwrap_or_else(|| Utc::now().timestamp()))
             .map_err(|_| TeeError::Attestation("system clock is before Unix epoch".to_string()))?;
         verify_transition_quote_revocation(quote, &crl_der, now)?;
         quote.crl_der_b64 = B64_STANDARD.encode(&crl_der);
