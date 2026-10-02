@@ -86,7 +86,69 @@ pub struct TransitionReceiptAttestation {
     pub leaf_spki_sha256: String,
     pub receipt_pubkey_sha256: String,
     pub attestation_evidence_sha256: String,
+    /// Raw AMD SNP quote and the DER certificate chain the client verified,
+    /// so the API can independently verify the TEE launch evidence instead of
+    /// trusting caller-supplied hash consistency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quote: Option<TransitionSnpQuote>,
 }
+
+/// Raw SNP launch evidence for an unlock-mode transition.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TransitionSnpQuote {
+    /// Raw 1184-byte AMD SNP attestation report, standard base64.
+    pub report_b64: String,
+    /// ARK certificate DER, standard base64. Must anchor to a pinned AMD root.
+    pub ark_der_b64: String,
+    /// ASK certificate DER, standard base64.
+    pub ask_der_b64: String,
+    /// VCEK certificate DER, standard base64.
+    pub vcek_der_b64: String,
+    /// ARK-signed AMD product CRL DER, standard base64, fetched from AMD
+    /// KDS by the CLI. The API enforces certificate validity intervals,
+    /// CRL signature/freshness, and the revoked-serial walk against it, so
+    /// a retired ASK or VCEK can no longer certify a transition.
+    pub crl_der_b64: String,
+}
+
+/// SHA-256 pins of the AMD ARK roots compiled into the `sev` crate the
+/// platform CLI uses to anchor SNP chains (Milan, Genoa, Turin). The API
+/// accepts only chains whose ARK byte-matches one of these roots, mirroring
+/// the client-side `ark_is_pinned_to_builtin_root` trust anchor.
+const BUILTIN_AMD_ARK_SHA256_PINS: [[u8; 32]; 3] = [
+    // sev 7.1.0 builtin milan ARK
+    [
+        0x69, 0xd0, 0x63, 0xb4, 0x53, 0x44, 0xd2, 0x6a, 0x2e, 0x94, 0xe1, 0xf4, 0x21, 0x0d, 0xe4,
+        0x9e, 0xf5, 0x55, 0x30, 0x82, 0x87, 0xd4, 0xc1, 0x74, 0x44, 0x5c, 0x95, 0x63, 0x9a, 0x54,
+        0x0b, 0xcd,
+    ],
+    // sev 7.1.0 builtin genoa ARK (matches the pinned ARK in the platform
+    // verifier fixtures)
+    [
+        0x4c, 0x65, 0x98, 0xd1, 0x9c, 0x18, 0x71, 0x9c, 0x5d, 0xfd, 0x4a, 0x7d, 0x33, 0x5f, 0x67,
+        0x4e, 0x5b, 0xfe, 0x1d, 0x8f, 0x80, 0x0c, 0xea, 0x2c, 0xf2, 0x70, 0xc1, 0x0d, 0x10, 0x3d,
+        0xb2, 0xf1,
+    ],
+    // sev 7.1.0 builtin turin ARK
+    [
+        0x1f, 0x08, 0x41, 0x61, 0xa4, 0x4b, 0xb6, 0xd9, 0x37, 0x78, 0xa9, 0x04, 0x87, 0x7d, 0x48,
+        0x19, 0xca, 0xfa, 0x5d, 0x05, 0xef, 0x41, 0x93, 0xb2, 0xde, 0xd9, 0xdd, 0x9c, 0x73, 0xdd,
+        0x3f, 0x6a,
+    ],
+];
+
+/// Maximum accepted size of a single submitted AMD certificate DER. Real
+/// ARK/ASK/VCEK certificates are under 2 KiB; anything larger is rejected
+/// before X.509 parsing.
+const MAX_QUOTE_CERTIFICATE_DER_BYTES: usize = 16_384;
+
+/// Maximum accepted AMD product CRL DER, in bytes. Deliberately larger
+/// than the certificate bound: a mass ASK/VCEK revocation event — exactly
+/// when this gate matters most — is the scenario where AMD's product CRL
+/// grows, and rejecting an oversized (but ARK-signed, valid) CRL would
+/// fail every transition platform-wide. Matches the CLI's KDS body-read
+/// bound, so anything the CLI can submit the API can evaluate.
+const MAX_QUOTE_CRL_DER_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestedUnlockMode {
@@ -282,6 +344,267 @@ fn verify_transition_attestation(
     )?;
     if evidence_hash != verified_receipt.attestation_quote_sha256 {
         return Err("transition_attestation.attestation_evidence_sha256".to_string());
+    }
+
+    Ok(())
+}
+
+/// Error type for API-side SNP quote verification on unlock-mode
+/// transitions. The variants deliberately carry no caller-controlled detail.
+#[derive(Debug, PartialEq, Eq)]
+enum TransitionQuoteError {
+    /// The request did not include the raw SNP quote.
+    Missing,
+    /// A submitted field failed decoding or a structural bound.
+    Malformed,
+    /// The AMD chain did not anchor to a pinned AMD root.
+    UntrustedAnchor,
+    /// Report signature / VCEK binding / report_data binding failed.
+    InvalidEvidence,
+    /// The quote does not match the evidence hash the receipt signed.
+    EvidenceMismatch,
+    /// The report's guest policy allows debug: not a confidential workload.
+    DebugPolicy,
+    /// Revocation/validity collateral was missing, malformed, stale, or it
+    /// revoked the ASK/VCEK.
+    RevocationRejected,
+}
+
+impl TransitionQuoteError {
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::Missing => "transition_attestation.quote required for unlock mode change",
+            Self::Malformed => "transition_attestation.quote is malformed",
+            Self::UntrustedAnchor => {
+                "transition_attestation.quote chain is not anchored to a trusted AMD root"
+            }
+            Self::InvalidEvidence => "transition_attestation.quote failed SNP verification",
+            Self::EvidenceMismatch => {
+                "transition_attestation.quote does not match the receipt-signed evidence hash"
+            }
+            Self::DebugPolicy => {
+                "transition_attestation.quote guest policy allows debug; not a confidential workload"
+            }
+            Self::RevocationRejected => {
+                "transition_attestation.quote failed AMD revocation/validity checking"
+            }
+        }
+    }
+}
+
+/// SNP guest policy bit 19 (DEBUG): when set, debugging the guest is
+/// allowed and the PSP exposes the guest's memory-encryption keys to the
+/// debugger. A guest launched with this bit is never confidential,
+/// regardless of how valid its attestation chain is.
+const SNP_GUEST_POLICY_DEBUG_BIT: u64 = 1 << 19;
+
+/// Mirrors the CLI's `ensure_snp_report_production_policy`: reports from
+/// debug-enabled guests must not be trusted as TEE-consent evidence.
+fn snp_guest_policy_allows_debug(guest_policy: u64) -> bool {
+    guest_policy & SNP_GUEST_POLICY_DEBUG_BIT != 0
+}
+
+/// A transition receipt older than this is rejected. Without a window,
+/// quote/receipt replay is bounded only by per-app receipt-timestamp
+/// monotonicity and the unique receipt index, both of which permit a
+/// first reuse of captured evidence.
+const TRANSITION_RECEIPT_MAX_AGE_SECONDS: i64 = 15 * 60;
+
+/// Maximum accepted age of the submitted AMD product CRL, in seconds.
+/// Matches the appraiser policy bound (`revocation_max_age_seconds`) and
+/// AMD's ~45-day CRL publication cadence; an older (or nextUpdate-lapsed)
+/// CRL fails the transition closed.
+const TRANSITION_REVOCATION_MAX_AGE_SECONDS: u64 = 3_888_000;
+
+/// Trusted time for quote revocation math. Wall-clock now, clamped to a
+/// floor: the CRL freshness window already bounds how old accepted
+/// collateral can be, and a zero/negative reading (clock not yet set on a
+/// freshly booted host) must reject rather than panic in u64 conversions.
+fn quote_verification_now() -> u64 {
+    let now = Utc::now();
+    if now.timestamp() <= 0 {
+        return 1;
+    }
+    now.timestamp() as u64
+}
+
+/// Tolerance for clock skew between the signing TEE and the API on
+/// future-dated receipt timestamps.
+const TRANSITION_RECEIPT_MAX_FUTURE_SKEW_SECONDS: i64 = 5 * 60;
+
+/// Server-side freshness window for a transition receipt: the receipt must
+/// have been signed within [`TRANSITION_RECEIPT_MAX_AGE_SECONDS`] of now
+/// (and not be dated further ahead than the allowed skew).
+fn transition_receipt_is_fresh(receipt_timestamp: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    // age = now - ts: a recent receipt has a small positive age; a slightly
+    // future-dated one (clock skew) has a small negative age.
+    let age_seconds = now.signed_duration_since(receipt_timestamp).num_seconds();
+    (-TRANSITION_RECEIPT_MAX_FUTURE_SKEW_SECONDS..=TRANSITION_RECEIPT_MAX_AGE_SECONDS)
+        .contains(&age_seconds)
+}
+
+/// Standard base64 of at most `max_der_bytes` bytes is exactly
+/// `4 * ceil(max/3)` characters (padding included), so a longer string can
+/// never decode to an in-bounds value. Checking the string length first
+/// bounds the decode allocation: `base64::decode` allocates output
+/// proportional to its input, and oversized caller-submitted quote fields
+/// must be rejected by a length comparison, not by allocating for them
+/// first.
+fn decode_bounded_quote_b64(field: &str, max_der_bytes: usize) -> Option<Vec<u8>> {
+    let max_b64_len = max_der_bytes.div_ceil(3) * 4;
+    if field.len() > max_b64_len {
+        return None;
+    }
+    B64.decode(field).ok()
+}
+
+/// Independently verify the raw AMD SNP quote bound to an unlock-mode
+/// transition:
+///
+/// - the SHA-256 of the submitted report bytes equals the
+///   `attestation_quote_sha256` the receipt signature covers, so the API
+///   verifies exactly the evidence the receipt identified,
+/// - the ARK/ASK/VCEK chain is internally consistent and anchored to one of
+///   the pinned builtin AMD roots (the same anchor set the platform CLI
+///   uses),
+/// - the certificate validity intervals hold at `now_unix_seconds` and the
+///   submitted ARK-signed product CRL is signature-valid, fresh, and does
+///   not revoke the ASK or VCEK (`verify_amd_revocation`, the same
+///   revocation gate the appraiser applies),
+/// - the report's guest policy disables debug (a debug-enabled guest is
+///   not confidential, mirroring the CLI's
+///   `ensure_snp_report_production_policy`),
+/// - the report is signed by the VCEK and the VCEK binds to the report's
+///   chipID and reported TCB, and
+/// - the guest-committed `report_data` binds the TEE domain, the caller
+///   nonce, the observed TLS leaf SPKI, and the TEE receipt key -- the same
+///   values `verify_transition_receipt`/`verify_transition_attestation`
+///   validated, so a self-consistent package fabricated without a genuine
+///   TEE cannot satisfy this check.
+fn verify_transition_snp_quote(
+    attestation: &TransitionReceiptAttestation,
+    receipt: &SignedReceiptResponse,
+    now_unix_seconds: u64,
+) -> Result<(), TransitionQuoteError> {
+    use enclava_verifier::{
+        expected_report_data, parse_snp_report, verify_amd_certificate_chain,
+        verify_amd_revocation, verify_snp_signature, verify_vcek_report_binding,
+    };
+
+    let quote = attestation
+        .quote
+        .as_ref()
+        .ok_or(TransitionQuoteError::Missing)?;
+    // Pre-decode length gate: base64 decoding allocates proportionally to
+    // the submitted string, so bound the string length BEFORE decoding.
+    // This keeps a repeated oversized submission from consuming memory and
+    // CPU ahead of its inevitable rejection. The exact DER/report length
+    // bounds are still enforced after decoding, below.
+    let report_bytes =
+        decode_bounded_quote_b64(&quote.report_b64, enclava_verifier::SNP_REPORT_BYTES)
+            .ok_or(TransitionQuoteError::Malformed)?;
+    if report_bytes.len() != enclava_verifier::SNP_REPORT_BYTES {
+        return Err(TransitionQuoteError::Malformed);
+    }
+    // Bind the submitted quote bytes to the evidence hash the receipt
+    // signed. The receipt's signature covers attestation_quote_sha256, so
+    // this closes the gap where the caller submits evidence hash X in the
+    // receipt while the API verifies an unrelated (genuine but different)
+    // quote.
+    let signed_evidence_hash = parse_hex32(
+        "transition_receipt.payload.attestation_quote_sha256",
+        receipt
+            .payload
+            .attestation_quote_sha256
+            .as_deref()
+            .unwrap_or(""),
+    )
+    .map_err(|_| TransitionQuoteError::Malformed)?;
+    if Sha256::digest(&report_bytes).as_slice() != signed_evidence_hash.as_slice() {
+        return Err(TransitionQuoteError::EvidenceMismatch);
+    }
+
+    let decode_cert = |field: &String| -> Result<Vec<u8>, TransitionQuoteError> {
+        // Same pre-decode bound as the report: cap the b64 string length
+        // before allocating decode output for it.
+        let der = decode_bounded_quote_b64(field, MAX_QUOTE_CERTIFICATE_DER_BYTES)
+            .ok_or(TransitionQuoteError::Malformed)?;
+        if der.is_empty() || der.len() > MAX_QUOTE_CERTIFICATE_DER_BYTES {
+            return Err(TransitionQuoteError::Malformed);
+        }
+        Ok(der)
+    };
+    let ark_der = decode_cert(&quote.ark_der_b64)?;
+    let ask_der = decode_cert(&quote.ask_der_b64)?;
+    let vcek_der = decode_cert(&quote.vcek_der_b64)?;
+
+    // Anchor: only builtin AMD roots may authenticate the chain.
+    let ark_sha256: [u8; 32] = Sha256::digest(&ark_der).into();
+    if !BUILTIN_AMD_ARK_SHA256_PINS.contains(&ark_sha256) {
+        return Err(TransitionQuoteError::UntrustedAnchor);
+    }
+    verify_amd_certificate_chain(&ark_der, &ask_der, &vcek_der, &ark_sha256)
+        .map_err(|_| TransitionQuoteError::InvalidEvidence)?;
+
+    // Revocation/validity gate (#115 follow-up): the chain being
+    // well-signed is not sufficient when AMD has retired an ASK/VCEK or a
+    // certificate has expired. The caller-submitted CRL must itself be
+    // ARK-signed and fresh; `verify_amd_revocation` re-checks the ARK pin
+    // before any RSA math, enforces the ARK/ASK/VCEK validity intervals at
+    // `now_unix_seconds`, verifies the CRL signature and this/nextUpdate
+    // window, and walks the revoked serials for the exact ASK and VCEK
+    // under verification. Missing or stale collateral fails closed.
+    let crl_der = decode_bounded_quote_b64(&quote.crl_der_b64, MAX_QUOTE_CRL_DER_BYTES)
+        .ok_or(TransitionQuoteError::Malformed)?;
+    if crl_der.is_empty() || crl_der.len() > MAX_QUOTE_CRL_DER_BYTES {
+        return Err(TransitionQuoteError::Malformed);
+    }
+    verify_amd_revocation(
+        &ark_der,
+        &ask_der,
+        &vcek_der,
+        &crl_der,
+        now_unix_seconds,
+        TRANSITION_REVOCATION_MAX_AGE_SECONDS,
+        &BUILTIN_AMD_ARK_SHA256_PINS,
+    )
+    .map_err(|_| TransitionQuoteError::RevocationRejected)?;
+
+    let report = parse_snp_report(&report_bytes).map_err(|_| TransitionQuoteError::Malformed)?;
+    // A debug-enabled guest is not confidential (the PSP hands its keys to a
+    // debugger), so its receipt key is untrusted even with a valid chain.
+    if snp_guest_policy_allows_debug(report.guest_policy) {
+        return Err(TransitionQuoteError::DebugPolicy);
+    }
+    verify_snp_signature(&report, &vcek_der).map_err(|_| TransitionQuoteError::InvalidEvidence)?;
+    verify_vcek_report_binding(&report, &vcek_der)
+        .map_err(|_| TransitionQuoteError::InvalidEvidence)?;
+
+    // The report_data binding reproduces the client-side
+    // `tee_tls_report_data` contract: transcript hash over domain, nonce,
+    // leaf SPKI, then a binding hash including the receipt key hash. The
+    // verifier helper hashes the raw receipt public key itself, so decode it
+    // from the signature-verified receipt envelope.
+    let nonce: [u8; 32] = URL_SAFE_NO_PAD
+        .decode(&attestation.nonce)
+        .or_else(|_| B64.decode(&attestation.nonce))
+        .map_err(|_| TransitionQuoteError::Malformed)?
+        .try_into()
+        .map_err(|_| TransitionQuoteError::Malformed)?;
+    let leaf_spki_sha256 = parse_hex32("leaf_spki_sha256", &attestation.leaf_spki_sha256)
+        .map_err(|_| TransitionQuoteError::Malformed)?
+        .try_into()
+        .map_err(|_| TransitionQuoteError::Malformed)?;
+    let receipt_pubkey: [u8; 32] = B64
+        .decode(&receipt.receipt.pubkey)
+        .map_err(|_| TransitionQuoteError::Malformed)?
+        .try_into()
+        .map_err(|_| TransitionQuoteError::Malformed)?;
+    let origin = format!("https://{}", attestation.tee_domain);
+    let expected = expected_report_data(&origin, &nonce, &leaf_spki_sha256, &receipt_pubkey)
+        .map_err(|_| TransitionQuoteError::Malformed)?;
+    if report.report_data != expected {
+        return Err(TransitionQuoteError::InvalidEvidence);
     }
 
     Ok(())
@@ -1007,6 +1330,30 @@ pub async fn update_unlock_mode(
             )
         },
     )?;
+    verify_transition_snp_quote(transition_attestation, receipt, quote_verification_now())
+        .map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "invalid transition_attestation",
+                    "field": "transition_attestation.quote",
+                    "reason": error.reason(),
+                })),
+            )
+        })?;
+    // Server-side freshness window: without it, captured quote/receipt
+    // pairs can be replayed once (monotonicity and the unique receipt
+    // index only block reuse after the first consumption).
+    if !transition_receipt_is_fresh(verified_receipt.receipt_timestamp, Utc::now()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid transition_receipt",
+                "field": "transition_receipt.payload.timestamp",
+                "reason": "transition receipt outside freshness window",
+            })),
+        ));
+    }
 
     let signing_artifacts = crate::signing_service::decode_optional_blobs(
         body.customer_descriptor_blob.clone(),
@@ -1255,16 +1602,21 @@ pub async fn update_unlock_mode(
 #[cfg(test)]
 mod tests {
     use axum::http::StatusCode;
-    use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+    use base64::{
+        Engine as _,
+        engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD},
+    };
     use chrono::Utc;
     use ed25519_dalek::{Signer, SigningKey};
     use sha2::{Digest, Sha256};
     use uuid::Uuid;
 
     use super::{
-        ReceiptEnvelope, ReceiptPayloadView, RequestedUnlockMode, SignedReceiptResponse,
-        TransitionReceiptAttestation, UnlockModeCommitRequest, commit_unlock_mode_transition,
-        validate_transition, verify_transition_attestation, verify_transition_receipt,
+        BUILTIN_AMD_ARK_SHA256_PINS, ReceiptEnvelope, ReceiptPayloadView, RequestedUnlockMode,
+        SignedReceiptResponse, TransitionQuoteError, TransitionReceiptAttestation,
+        TransitionSnpQuote, UnlockModeCommitRequest, commit_unlock_mode_transition,
+        snp_guest_policy_allows_debug, transition_receipt_is_fresh, validate_transition,
+        verify_transition_attestation, verify_transition_receipt, verify_transition_snp_quote,
     };
     use crate::models::{App, AppContainer, AppStatus, UnlockMode};
 
@@ -1376,6 +1728,7 @@ mod tests {
                 signing_key.verifying_key().to_bytes(),
             )),
             attestation_evidence_sha256: quote_hash.to_string(),
+            quote: None,
         }
     }
 
@@ -1831,6 +2184,473 @@ mod tests {
         assert_eq!(
             verify_transition_attestation(&attestation, &test_app(), &verified).unwrap_err(),
             "transition_attestation.receipt_pubkey_sha256"
+        );
+    }
+
+    /// Decoded fields of the prove-it-live fixture bundle: a real VCEK-signed
+    /// Genoa SNP report, its AMD chain (ARK byte-matches the builtin Genoa
+    /// root the CLI pins), the recorded nonce, TLS leaf SPKI hash, and the
+    /// attested receipt key.
+    struct LiveQuoteFixture {
+        report: Vec<u8>,
+        ark_der: Vec<u8>,
+        ask_der: Vec<u8>,
+        vcek_der: Vec<u8>,
+        crl_der: Vec<u8>,
+        nonce: [u8; 32],
+        leaf_spki_sha256: [u8; 32],
+        receipt_pubkey: [u8; 32],
+        tee_domain: String,
+    }
+
+    fn live_quote_fixture() -> LiveQuoteFixture {
+        let encoded =
+            include_str!("../../../enclava-verifier/tests/fixtures/prove-it-live.bundle.b64")
+                .bytes()
+                .filter(|byte| !byte.is_ascii_whitespace())
+                .collect::<Vec<_>>();
+        let bundle = B64.decode(encoded).expect("decode prove-it-live bundle");
+        let records = enclava_common::canonical::ce_v1_decode(&bundle)
+            .expect("parse prove-it-live bundle")
+            .into_iter()
+            .map(|record| (record.label.to_string(), record.value.to_vec()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let snp_report = records
+            .get("snp_report")
+            .expect("bundle snp report")
+            .clone();
+        let endorsements = records
+            .get("amd_endorsements")
+            .expect("bundle endorsements")
+            .clone();
+        let endorsement_records = enclava_common::canonical::ce_v1_decode(&endorsements)
+            .expect("parse bundle endorsements")
+            .into_iter()
+            .map(|record| (record.label.to_string(), record.value.to_vec()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let field = |name: &str| {
+            endorsement_records
+                .get(name)
+                .expect("endorsement field")
+                .clone()
+        };
+        let leaf_spki_sha256 = enclava_verifier::tls_leaf_spki_sha256(
+            records.get("tls_leaf_der").expect("bundle TLS leaf"),
+        )
+        .expect("bundle TLS leaf SPKI hash");
+
+        LiveQuoteFixture {
+            report: snp_report,
+            ark_der: field("ark_der"),
+            ask_der: field("ask_der"),
+            vcek_der: field("vcek_der"),
+            crl_der: field("crl_der"),
+            nonce: records
+                .get("challenge_nonce")
+                .expect("bundle nonce")
+                .as_slice()
+                .try_into()
+                .expect("32-byte nonce"),
+            leaf_spki_sha256,
+            receipt_pubkey: records
+                .get("proxy_receipt_public_key")
+                .expect("bundle receipt key")
+                .as_slice()
+                .try_into()
+                .expect("32-byte receipt key"),
+            tee_domain: "prove-it-independent-dev.e72a13df.dev.enclava.work".to_string(),
+        }
+    }
+
+    fn live_quote_attestation(fixture: &LiveQuoteFixture) -> TransitionReceiptAttestation {
+        TransitionReceiptAttestation {
+            tee_domain: fixture.tee_domain.clone(),
+            nonce: URL_SAFE_NO_PAD.encode(fixture.nonce),
+            leaf_spki_sha256: hex::encode(fixture.leaf_spki_sha256),
+            receipt_pubkey_sha256: hex::encode(Sha256::digest(fixture.receipt_pubkey)),
+            attestation_evidence_sha256: hex::encode(Sha256::digest(&fixture.report)),
+            quote: Some(TransitionSnpQuote {
+                report_b64: B64.encode(&fixture.report),
+                ark_der_b64: B64.encode(&fixture.ark_der),
+                ask_der_b64: B64.encode(&fixture.ask_der),
+                vcek_der_b64: B64.encode(&fixture.vcek_der),
+                crl_der_b64: B64.encode(&fixture.crl_der),
+            }),
+        }
+    }
+
+    fn live_quote_receipt(fixture: &LiveQuoteFixture) -> SignedReceiptResponse {
+        // A receipt whose envelope carries exactly the attested TEE receipt
+        // key. `verify_transition_snp_quote` binds report_data to this key,
+        // so the envelope must hold the fixture's public key bytes (deriving
+        // a SigningKey from them would produce an unrelated key).
+        SignedReceiptResponse {
+            operation: "unlock_mode_transition".to_string(),
+            payload: ReceiptPayloadView {
+                purpose: "enclava-unlock-receipt-v1".to_string(),
+                app_id: test_app().id.to_string(),
+                resource_path: None,
+                from_mode: Some("password".to_string()),
+                to_mode: Some("auto".to_string()),
+                attestation_quote_sha256: Some(hex::encode(Sha256::digest(&fixture.report))),
+                new_value_sha256: None,
+                timestamp: "2026-04-28T12:00:00Z".to_string(),
+            },
+            receipt: ReceiptEnvelope {
+                pubkey: B64.encode(fixture.receipt_pubkey),
+                pubkey_sha256: hex::encode(Sha256::digest(fixture.receipt_pubkey)),
+                payload_canonical_bytes: B64.encode([0u8; 64]),
+                signature: B64.encode([0u8; 64]),
+            },
+        }
+    }
+
+    /// Trusted time for the prove-it-live fixture: the capture time
+    /// recorded by `enclava-verifier`'s `live_bundle.rs` (2026-08-04
+    /// 12:00:00 UTC), inside the bundle CRL's this/nextUpdate window.
+    const LIVE_QUOTE_TRUSTED_TIME_UNIX: u64 = 1_785_844_800;
+
+    #[test]
+    fn verifies_transition_snp_quote_from_live_vcek_signed_report() {
+        let fixture = live_quote_fixture();
+        let attestation = live_quote_attestation(&fixture);
+        let receipt = live_quote_receipt(&fixture);
+        verify_transition_snp_quote(&attestation, &receipt, LIVE_QUOTE_TRUSTED_TIME_UNIX)
+            .expect("live VCEK-signed SNP quote with matching binding verifies");
+    }
+
+    /// Combined check against a fully valid signed receipt: the route's
+    /// ordering (receipt signature first, then the SNP quote gate) applied
+    /// to a receipt that passes `verify_transition_receipt` and a quote
+    /// that fails only the quote gate. A positive end-to-end pass of both
+    /// the signed-receipt and quote checks is impossible with the
+    /// prove-it-live fixture: the fixture deliberately contains only the
+    /// TEE receipt key's public half, so no signature valid under
+    /// `verify_transition_receipt` can also bind the fixture quote's
+    /// report_data (which commits that same public key). This test pins
+    /// the next-best thing: a receipt that clears every signed check and a
+    /// live VCEK-signed quote, rejected solely by the quote binding.
+    #[test]
+    fn signed_receipt_with_foreign_quote_is_rejected_by_quote_gate() {
+        let fixture = live_quote_fixture();
+        let attestation = live_quote_attestation(&fixture);
+        // A genuine, correctly signed transition receipt under an
+        // unrelated Ed25519 key: passes verify_transition_receipt when
+        // paired with a matching attestation, but its key is not the key
+        // the live quote commits, so the quote gate must reject.
+        let signing_key = SigningKey::from_bytes(&[0x2a; 32]);
+        let quote_hash = hex::encode(Sha256::digest(&fixture.report));
+        let receipt = signed_transition_receipt("password", "auto", &quote_hash, &signing_key);
+        verify_transition_receipt(
+            &receipt,
+            &test_app(),
+            RequestedUnlockMode::Password,
+            RequestedUnlockMode::Auto,
+        )
+        .expect("receipt passes every signature/payload check on its own");
+        assert_eq!(
+            verify_transition_snp_quote(&attestation, &receipt, LIVE_QUOTE_TRUSTED_TIME_UNIX)
+                .unwrap_err(),
+            TransitionQuoteError::InvalidEvidence
+        );
+    }
+
+    #[test]
+    fn rejects_transition_snp_quote_that_differs_from_receipt_signed_evidence_hash() {
+        let fixture = live_quote_fixture();
+        let mut attestation = live_quote_attestation(&fixture);
+        let mut receipt = live_quote_receipt(&fixture);
+        // Receipt signs evidence hash X (here: SHA256 of the TLS leaf),
+        // while a genuinely valid quote of the report bytes verifies --
+        // previously accepted, now must fail closed.
+        let foreign_hash = hex::encode(fixture.leaf_spki_sha256);
+        receipt.payload.attestation_quote_sha256 = Some(foreign_hash.clone());
+        attestation.attestation_evidence_sha256 = foreign_hash;
+        assert_eq!(
+            verify_transition_snp_quote(&attestation, &receipt, LIVE_QUOTE_TRUSTED_TIME_UNIX)
+                .unwrap_err(),
+            TransitionQuoteError::EvidenceMismatch
+        );
+    }
+
+    #[test]
+    fn rejects_transition_snp_quote_from_debug_enabled_guest() {
+        let fixture = live_quote_fixture();
+        let mut attestation = live_quote_attestation(&fixture);
+        let mut receipt = live_quote_receipt(&fixture);
+        // Set the guest policy DEBUG bit (bit 19) in the raw report bytes.
+        // The debug gate runs before VCEK signature verification, so the
+        // rejection is deterministically DebugPolicy even though the
+        // tampered bytes would also break the signature.
+        let mut report = fixture.report.clone();
+        let policy = u64::from_le_bytes(report[0x08..0x10].try_into().unwrap());
+        assert!(
+            !snp_guest_policy_allows_debug(policy),
+            "fixture policy must not have debug set"
+        );
+        report[0x0a] |= 0x08; // set bit 19 of the LE u64 policy
+        let tampered_policy = u64::from_le_bytes(report[0x08..0x10].try_into().unwrap());
+        assert!(snp_guest_policy_allows_debug(tampered_policy));
+        attestation.quote = Some(TransitionSnpQuote {
+            report_b64: B64.encode(&report),
+            ..attestation.quote.clone().expect("quote present")
+        });
+        // Keep the receipt-signed evidence hash consistent with the
+        // tampered bytes so the earlier hash gate passes and the debug
+        // gate is the rejection reason under test.
+        let tampered_hash = hex::encode(Sha256::digest(&report));
+        receipt.payload.attestation_quote_sha256 = Some(tampered_hash.clone());
+        attestation.attestation_evidence_sha256 = tampered_hash;
+        assert_eq!(
+            verify_transition_snp_quote(&attestation, &receipt, LIVE_QUOTE_TRUSTED_TIME_UNIX)
+                .unwrap_err(),
+            TransitionQuoteError::DebugPolicy
+        );
+    }
+
+    #[test]
+    fn transition_receipt_freshness_window_bounds_replay() {
+        let now = Utc::now();
+        assert!(transition_receipt_is_fresh(now, now));
+        assert!(transition_receipt_is_fresh(
+            now - chrono::Duration::seconds(14 * 60),
+            now
+        ));
+        // Just inside the future-skew bound.
+        assert!(transition_receipt_is_fresh(
+            now + chrono::Duration::seconds(4 * 60),
+            now
+        ));
+        // Too old and too far in the future are both rejected.
+        assert!(!transition_receipt_is_fresh(
+            now - chrono::Duration::seconds(16 * 60),
+            now
+        ));
+        assert!(!transition_receipt_is_fresh(
+            now + chrono::Duration::seconds(6 * 60),
+            now
+        ));
+    }
+
+    #[test]
+    fn rejects_transition_snp_quote_when_report_data_is_tampered() {
+        let fixture = live_quote_fixture();
+        let mut attestation = live_quote_attestation(&fixture);
+        let mut receipt = live_quote_receipt(&fixture);
+        let mut report = fixture.report.clone();
+        report[0x50] ^= 1; // flip one report_data byte
+        attestation.quote = Some(TransitionSnpQuote {
+            report_b64: B64.encode(&report),
+            ..attestation.quote.clone().expect("quote present")
+        });
+        // Re-sync the receipt-signed evidence hash to the tampered bytes so
+        // the earlier hash gate passes and the rejection demonstrably comes
+        // from SNP verification itself. The signature no longer covers the
+        // mutated bytes, so the quote must fail closed -- exactly the
+        // fabricated-self-consistent-package case from the issue.
+        let tampered_hash = hex::encode(Sha256::digest(&report));
+        receipt.payload.attestation_quote_sha256 = Some(tampered_hash.clone());
+        attestation.attestation_evidence_sha256 = tampered_hash;
+        assert_eq!(
+            verify_transition_snp_quote(&attestation, &receipt, LIVE_QUOTE_TRUSTED_TIME_UNIX)
+                .unwrap_err(),
+            TransitionQuoteError::InvalidEvidence
+        );
+    }
+
+    #[test]
+    fn rejects_transition_snp_quote_for_wrong_tee_domain() {
+        let fixture = live_quote_fixture();
+        let mut attestation = live_quote_attestation(&fixture);
+        let receipt = live_quote_receipt(&fixture);
+        attestation.tee_domain = "attacker.example".to_string();
+        assert_eq!(
+            verify_transition_snp_quote(&attestation, &receipt, LIVE_QUOTE_TRUSTED_TIME_UNIX)
+                .unwrap_err(),
+            TransitionQuoteError::InvalidEvidence
+        );
+    }
+
+    #[test]
+    fn rejects_transition_snp_quote_with_unanchored_chain() {
+        let fixture = live_quote_fixture();
+        let mut attestation = live_quote_attestation(&fixture);
+        let receipt = live_quote_receipt(&fixture);
+        // Replace the ARK with the (pinned) Milan root: a real AMD root, but
+        // not the one that signed this chain, so anchoring must reject it.
+        let milan_ark_der = milan_builtin_ark_der();
+        attestation.quote = Some(TransitionSnpQuote {
+            ark_der_b64: B64.encode(&milan_ark_der),
+            ..attestation.quote.clone().expect("quote present")
+        });
+        assert_eq!(
+            verify_transition_snp_quote(&attestation, &receipt, LIVE_QUOTE_TRUSTED_TIME_UNIX)
+                .unwrap_err(),
+            TransitionQuoteError::InvalidEvidence
+        );
+    }
+
+    #[test]
+    fn rejects_transition_snp_quote_when_missing() {
+        let fixture = live_quote_fixture();
+        let mut attestation = live_quote_attestation(&fixture);
+        let receipt = live_quote_receipt(&fixture);
+        attestation.quote = None;
+        assert_eq!(
+            verify_transition_snp_quote(&attestation, &receipt, LIVE_QUOTE_TRUSTED_TIME_UNIX)
+                .unwrap_err(),
+            TransitionQuoteError::Missing
+        );
+    }
+
+    #[test]
+    fn rejects_transition_snp_quote_without_revocation_collateral() {
+        let fixture = live_quote_fixture();
+        let mut attestation = live_quote_attestation(&fixture);
+        let receipt = live_quote_receipt(&fixture);
+        // Drop the CRL entirely: a chain that internally verifies but has no
+        // revocation collateral must fail closed, not pass on signature
+        // alone.
+        attestation.quote = Some(TransitionSnpQuote {
+            crl_der_b64: String::new(),
+            ..attestation.quote.clone().expect("quote present")
+        });
+        assert_eq!(
+            verify_transition_snp_quote(&attestation, &receipt, LIVE_QUOTE_TRUSTED_TIME_UNIX)
+                .unwrap_err(),
+            TransitionQuoteError::Malformed
+        );
+    }
+
+    #[test]
+    fn rejects_transition_snp_quote_with_stale_crl() {
+        let fixture = live_quote_fixture();
+        let attestation = live_quote_attestation(&fixture);
+        let receipt = live_quote_receipt(&fixture);
+        // Same bundle verified at a time past the CRL's nextUpdate
+        // (2026-09-09): the revocation gate must treat the collateral as
+        // expired. 2027-01-01T00:00:00Z.
+        const PAST_NEXT_UPDATE: u64 = 1_792_761_600;
+        assert_eq!(
+            verify_transition_snp_quote(&attestation, &receipt, PAST_NEXT_UPDATE).unwrap_err(),
+            TransitionQuoteError::RevocationRejected
+        );
+    }
+
+    #[test]
+    fn rejects_transition_snp_quote_with_oversized_fields_before_decoding() {
+        // Base64 decoding allocates proportionally to the submitted string:
+        // an oversized field must be rejected by a length comparison before
+        // any decode allocation, not by allocating for it first.
+        let fixture = live_quote_fixture();
+        let receipt = live_quote_receipt(&fixture);
+        // A multi-megabyte base64 blob: without the pre-decode length gate
+        // this allocates the full decoded buffer before rejection.
+        let oversized_b64 = "A".repeat(8 * 1024 * 1024);
+        for oversized in [
+            TransitionSnpQuote {
+                report_b64: oversized_b64.clone(),
+                ..live_quote_attestation(&fixture)
+                    .quote
+                    .clone()
+                    .expect("quote present")
+            },
+            TransitionSnpQuote {
+                ark_der_b64: oversized_b64.clone(),
+                ..live_quote_attestation(&fixture)
+                    .quote
+                    .clone()
+                    .expect("quote present")
+            },
+            TransitionSnpQuote {
+                crl_der_b64: oversized_b64,
+                ..live_quote_attestation(&fixture)
+                    .quote
+                    .clone()
+                    .expect("quote present")
+            },
+        ] {
+            let mut attestation = live_quote_attestation(&fixture);
+            attestation.quote = Some(oversized);
+            assert_eq!(
+                verify_transition_snp_quote(&attestation, &receipt, LIVE_QUOTE_TRUSTED_TIME_UNIX)
+                    .unwrap_err(),
+                TransitionQuoteError::Malformed
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_transition_snp_quote_with_tampered_crl() {
+        let fixture = live_quote_fixture();
+        let mut attestation = live_quote_attestation(&fixture);
+        let receipt = live_quote_receipt(&fixture);
+        // Flip one byte of the ARK-signed CRL: the RSA-PSS signature check
+        // must reject the forged revocation list.
+        let mut crl = fixture.crl_der.clone();
+        let last = crl.len() - 1;
+        crl[last] ^= 0xff;
+        attestation.quote = Some(TransitionSnpQuote {
+            crl_der_b64: B64.encode(&crl),
+            ..attestation.quote.clone().expect("quote present")
+        });
+        assert_eq!(
+            verify_transition_snp_quote(&attestation, &receipt, LIVE_QUOTE_TRUSTED_TIME_UNIX)
+                .unwrap_err(),
+            TransitionQuoteError::RevocationRejected
+        );
+    }
+
+    /// The builtin Milan ARK DER, as `sev::certs::snp::builtin::milan::ark()`
+    /// delivers it. Hash-pinned here so a `sev` bump that changes the root
+    /// is caught: it is one of the API's accepted anchors.
+    fn milan_builtin_ark_der() -> Vec<u8> {
+        let der = B64
+            .decode(
+                include_str!("../../../enclava-verifier/tests/fixtures/milan-builtin-ark.der.b64")
+                    .trim(),
+            )
+            .expect("decode Milan builtin ARK fixture");
+        assert_eq!(
+            hex::encode(Sha256::digest(&der)),
+            "69d063b45344d26a2e94e1f4210de49ef555308287d4c174445c95639a540bcd",
+            "Milan builtin ARK pin must match BUILTIN_AMD_ARK_SHA256_PINS[0]"
+        );
+        der
+    }
+
+    /// Sync guard against sev root rotation: every ARK the sev crate ships
+    /// as a builtin must be pinned in BUILTIN_AMD_ARK_SHA256_PINS, and the
+    /// pin set must not contain roots sev no longer ships. Without this a
+    /// sev upgrade that rotates a root would leave the API rejecting every
+    /// unlock transition (UntrustedAnchor) while the CLI happily verifies
+    /// the new chain client-side.
+    #[test]
+    fn ark_pin_set_matches_sev_builtin_roots() {
+        let mut sev_roots: Vec<String> = Vec::new();
+        for ark in [
+            sev::certs::snp::builtin::milan::ark(),
+            sev::certs::snp::builtin::genoa::ark(),
+            sev::certs::snp::builtin::turin::ark(),
+        ] {
+            let ark = ark.expect("load sev builtin ARK");
+            let der = ark.to_der().expect("serialize sev builtin ARK to DER");
+            sev_roots.push(hex::encode(Sha256::digest(&der)));
+        }
+        let pinned: Vec<String> = BUILTIN_AMD_ARK_SHA256_PINS
+            .iter()
+            .map(hex::encode)
+            .collect();
+        for root in &sev_roots {
+            assert!(
+                pinned.contains(root),
+                "sev builtin ARK {root} is not pinned; a sev bump rotated the root set"
+            );
+        }
+        assert_eq!(
+            sev_roots.len(),
+            pinned.len(),
+            "pin set and sev builtin root set have drifted"
         );
     }
 
