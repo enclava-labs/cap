@@ -365,9 +365,20 @@ async fn load_desired_edge_apps(pool: &PgPool) -> Result<Vec<DesiredEdgeApp>, sq
                  ORDER BY job.generation DESC
                  LIMIT 1
            ) AS latest ON true
-          WHERE app.status IN (
-                'creating'::app_status_enum,
-                'running'::app_status_enum
+          WHERE (
+                app.status IN (
+                    'creating'::app_status_enum,
+                    'running'::app_status_enum
+                )
+                -- A deleting app whose confidential teardown is still pending
+                -- must keep its routes: the teardown POST dials the app's TEE
+                -- edge route, and dropping it here strands every retry once the
+                -- delete failure path releases the shared edge fence.
+                OR (
+                    app.status = 'deleting'::app_status_enum
+                    AND app.workload_teardown_required
+                    AND app.workload_teardown_completed_at IS NULL
+                )
           )
           ORDER BY app.id",
     )
@@ -2154,6 +2165,142 @@ mod tests {
             json!({"status": {"addresses": [{"type": "IPAddress", "value": "not-an-ip"}]}}),
         ] {
             assert_eq!(gateway_resolve_ip_from_value(&gateway), None);
+        }
+    }
+
+    async fn database_test_pool() -> PgPool {
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
+        let pool = PgPool::connect(&database_url)
+            .await
+            .expect("connect edge test database");
+        crate::db::pool::run_migrations(&pool)
+            .await
+            .expect("migrate edge test database");
+        pool
+    }
+
+    async fn insert_edge_app_with_healthy_deployment(
+        pool: &PgPool,
+        status: &str,
+    ) -> (uuid::Uuid, uuid::Uuid) {
+        let org_id = uuid::Uuid::new_v4();
+        let app_id = uuid::Uuid::new_v4();
+        let suffix = app_id.simple().to_string();
+        sqlx::query("INSERT INTO organizations (id, name, cust_slug) VALUES ($1, $2, $3)")
+            .bind(org_id)
+            .bind(format!("edge-{suffix}"))
+            .bind(&suffix[..8])
+            .execute(pool)
+            .await
+            .expect("insert edge test organization");
+        sqlx::query(
+            "INSERT INTO apps (
+                 id, org_id, name, namespace, instance_id, tenant_id,
+                 service_account, bootstrap_owner_pubkey_hash,
+                 tenant_instance_identity_hash, domain, status
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::app_status_enum)",
+        )
+        .bind(app_id)
+        .bind(org_id)
+        .bind(format!("app-{}", &suffix[..12]))
+        .bind(format!("cap-{}", &suffix[..12]))
+        .bind(format!("instance-{suffix}"))
+        .bind(&suffix[..8])
+        .bind(format!("cap-{}-sa", &suffix[..12]))
+        .bind("11".repeat(32))
+        .bind("22".repeat(32))
+        .bind(format!("{}.example.test", &suffix[..12]))
+        .bind(status)
+        .execute(pool)
+        .await
+        .expect("insert edge test app");
+        let deployment_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO deployments (id, org_id, app_id, status, spec_snapshot, created_at)
+             VALUES ($1, $2, $3, 'healthy'::deploy_status_enum, '{}'::jsonb, $4)",
+        )
+        .bind(deployment_id)
+        .bind(org_id)
+        .bind(app_id)
+        .bind(chrono::Utc::now())
+        .execute(pool)
+        .await
+        .expect("insert edge test deployment");
+        sqlx::query(
+            "INSERT INTO deployment_apply_jobs (
+                 deployment_id, app_id, org_id, source_deployment_id,
+                 payload_version, payload, payload_sha256,
+                 cleanup_app_on_setup_failure, signed_required,
+                 log_encryption, state
+             ) VALUES ($1, $2, $3, $4, 1,
+                       '{\"version\":1,\"log_encryption\":null}'::jsonb,
+                       $5, false, false, NULL, 'completed')",
+        )
+        .bind(deployment_id)
+        .bind(app_id)
+        .bind(org_id)
+        .bind(deployment_id)
+        .bind(vec![3u8; 32])
+        .execute(pool)
+        .await
+        .expect("insert edge test apply job");
+        (org_id, app_id)
+    }
+
+    #[tokio::test]
+    async fn teardown_pending_deleting_apps_keep_their_edge_routes() {
+        let pool = database_test_pool().await;
+
+        let (running_org, running_app) =
+            insert_edge_app_with_healthy_deployment(&pool, "running").await;
+
+        let (pending_org, pending_app) =
+            insert_edge_app_with_healthy_deployment(&pool, "deleting").await;
+        sqlx::query("UPDATE apps SET workload_teardown_required = true WHERE id = $1")
+            .bind(pending_app)
+            .execute(&pool)
+            .await
+            .expect("mark workload teardown pending");
+
+        let (done_org, done_app) = insert_edge_app_with_healthy_deployment(&pool, "deleting").await;
+        sqlx::query(
+            "UPDATE apps
+                SET workload_teardown_required = true,
+                    workload_teardown_completed_at = clock_timestamp()
+              WHERE id = $1",
+        )
+        .bind(done_app)
+        .execute(&pool)
+        .await
+        .expect("mark workload teardown completed");
+
+        let (skip_org, skip_app) = insert_edge_app_with_healthy_deployment(&pool, "deleting").await;
+
+        let desired = load_desired_edge_apps(&pool)
+            .await
+            .expect("load desired edge apps");
+        let ids: std::collections::HashSet<_> = desired.iter().map(|app| app.app_id).collect();
+        assert!(ids.contains(&running_app));
+        assert!(
+            ids.contains(&pending_app),
+            "a deleting app with teardown still pending must keep its edge route"
+        );
+        assert!(
+            !ids.contains(&done_app),
+            "a deleting app whose teardown completed must drop out of the edge config"
+        );
+        assert!(
+            !ids.contains(&skip_app),
+            "a deleting app that never required teardown must drop out"
+        );
+
+        for cleanup_org in [running_org, pending_org, done_org, skip_org] {
+            sqlx::query("DELETE FROM organizations WHERE id = $1")
+                .bind(cleanup_org)
+                .execute(&pool)
+                .await
+                .expect("delete edge fixture organization");
         }
     }
 }

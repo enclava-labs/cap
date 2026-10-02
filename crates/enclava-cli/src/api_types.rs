@@ -1008,6 +1008,14 @@ pub struct ApiErrorBody {
     /// workload blocking app delete). Never tenant-controlled data.
     #[serde(default)]
     pub cause: Option<String>,
+    /// Server-clock lease hints from CAP's lane-etiquette contract: the
+    /// operation kind holding the app lane, and whole seconds until a
+    /// same-key retry can re-execute. Absent on old servers and on errors
+    /// with no known window -- never invented client-side.
+    #[serde(default)]
+    pub held_by: Option<String>,
+    #[serde(default)]
+    pub retry_after: Option<i64>,
 }
 
 #[cfg(test)]
