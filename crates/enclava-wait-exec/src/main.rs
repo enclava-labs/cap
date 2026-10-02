@@ -1,7 +1,7 @@
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
@@ -26,6 +26,41 @@ const DEFAULT_STARTUP: &str = "/startup/startup.sh";
 const DEFAULT_LOG_SPOOL_DIR: &str = "/run/enclava-logs";
 const STARTED_DIR_MODE: u32 = 0o2770;
 const O_NOFOLLOW: i32 = 0o400000;
+/// Soft cap on the encrypted log spool before rotation. The `logs` emptyDir
+/// is capped at 64 MiB by the engine manifest (see
+/// `LOGS_EMPTY_DIR_SIZE_LIMIT`); rotating well below that (aligned to the
+/// relay's 2 MiB MAX_TAIL_BYTES tail window, with ample margin) keeps the
+/// volume from ever hitting ENOSPC, which would otherwise kill the forwarding
+/// thread and expose the child to SIGPIPE on its next stdout/stderr write.
+const LOG_SPOOL_ROTATE_BYTES: u64 = 32 * 1024 * 1024;
+/// After rotation, keep this prefix of the pre-rotation spool so the relay's
+/// tail reads still span the rotation boundary.
+const LOG_SPOOL_KEEP_BYTES: u64 = 8 * 1024 * 1024;
+/// Cap on a single input record buffered from the child. Longer lines are
+/// split at this boundary into consecutive frames (same stream, consecutive
+/// sequence numbers, order preserved) so a pathological writer cannot grow
+/// the wrapper's memory without bound or produce a frame larger than the
+/// rotation headroom below the 64 MiB volume cap. 256 KiB of plaintext
+/// encodes to well under 512 KiB of framed output.
+const MAX_LOG_RECORD_BYTES: usize = 256 * 1024;
+/// Cap on one spool line during the startup sequence scan. This MUST
+/// equal the relay's `MAX_TAIL_BYTES` line cap (`enclava-init`
+/// `log_relay.rs`): the scan has to SEE every line the relay can forward
+/// and remember in a follower's delivered set. A smaller scan cap would
+/// let one workload-forged line just above it (but below the relay cap)
+/// be remembered by a connected follower while staying invisible to the
+/// resume scan — after a restart the writer would resume below the
+/// forged sequence and the next rotation resync would drop the
+/// legitimate frame that reuses it (round-15 self-check P2). Lines above
+/// this bound are discarded by the relay too and can stay skipped on
+/// both sides. The bound is what keeps the scan's allocation fixed: a
+/// writer-produced frame is `MAX_LOG_RECORD_BYTES` of plaintext "encoded
+/// to well under 512 KiB of framed output" (see `MAX_LOG_RECORD_BYTES`),
+/// and the round-15 review P2 hazard was `BufRead::lines()` turning one
+/// newline-free record — up to the whole 64 MiB volume — into a single
+/// String allocation before the child spawned, OOM-looping a constrained
+/// container while the same spool remained.
+const MAX_SPOOL_LINE_BYTES: u64 = 2 * 1024 * 1024;
 const TERMINATION_SIGNALS: [Signal; 4] = [
     Signal::SIGHUP,
     Signal::SIGINT,
@@ -349,9 +384,22 @@ fn run_with_encrypted_logs(
     logs: EncryptedLogConfig,
 ) -> Result<i32, String> {
     install_signal_forwarding()?;
-    let spool = open_log_spool(&logs.spool_path)?;
+    let mut spool = open_log_spool(&logs.spool_path)?;
+    // The spool lives on the shared `logs` emptyDir, which SURVIVES a
+    // container restart without replacing the Pod — and so do the frames
+    // the previous wrapper process wrote. Sequence numbers must therefore
+    // stay monotonic across the restart, not restart at 1: the relay's
+    // rotation dedup is the SET of sequences it actually sent (round-14 —
+    // never a max frontier), and a reset sequence that collides with a set
+    // member is silently suppressed as an apparent rotation replay. Scan
+    // the surviving spool tail (the rotation-retained window is the only
+    // part whose sequences a connected relay can still hold in its dedup
+    // set) for the highest frame sequence and resume from it. Non-frame
+    // lines are skipped; a spool with no
+    // parseable frame sequences resumes at 1.
+    let sequence_start = initial_spool_sequence(&mut spool)?;
     let spool = Arc::new(Mutex::new(spool));
-    let sequence = Arc::new(AtomicU64::new(1));
+    let sequence = Arc::new(AtomicU64::new(sequence_start));
     let mut child = Command::new(&program)
         .args(&args)
         .stdin(Stdio::inherit())
@@ -443,9 +491,19 @@ fn open_log_spool(path: &Path) -> Result<File, String> {
         fs::create_dir_all(parent)
             .map_err(|err| format!("failed to create log spool dir {}: {err}", parent.display()))?;
     }
-    OpenOptions::new()
+    // read+append: appends position writes at end-of-file, while the read
+    // side lets the rotation path retain the newest frames in place.
+    // S_ISREG check (round-19 self-check Critical): the logs dir is
+    // group-writable by the workload, so a compromised workload could
+    // replace the spool path with a FIFO (rename race or direct swap). An
+    // O_RDWR|O_CREAT open of a FIFO does not block — the hang lands on
+    // the next write once the pipe buffer fills, under the spool mutex.
+    // Refusing non-regular files here keeps the forwarder on its old
+    // (unlinked) inode: rotation retries, logs stay lossless-visible.
+    let file = OpenOptions::new()
         .create(true)
         .append(true)
+        .read(true)
         .mode(0o640)
         .custom_flags(O_NOFOLLOW)
         .open(path)
@@ -454,7 +512,137 @@ fn open_log_spool(path: &Path) -> Result<File, String> {
                 "failed to open encrypted log spool {}: {err}",
                 path.display()
             )
-        })
+        })?;
+    let meta = file
+        .metadata()
+        .map_err(|err| format!("stat encrypted log spool {}: {err}", path.display()))?;
+    if !meta.is_file() {
+        return Err(format!(
+            "encrypted log spool {} is not a regular file",
+            path.display()
+        ));
+    }
+    Ok(file)
+}
+
+/// Highest frame sequence present in the surviving spool, plus one. Called
+/// once at wrapper startup so a restarted process resumes sequence numbers
+/// ABOVE everything the previous process wrote (the `logs` emptyDir and its
+/// spool survive container restarts; the relay's rotation dedup would drop
+/// post-restart frames whose reset sequences land at or below its retained
+/// frontier). The spool is bounded by the rotation threshold, so one
+/// startup scan is cheap; lines that do not parse as frames are skipped.
+/// The spool directory is workload-writable, so the scan is over
+/// attacker-influenced content: a forged `{"sequence":u64::MAX}` line must
+/// not wrap the resumed counter to 0 (round-14 self-check Critical), so
+/// the resume point is wrap-guarded with a small reserve below u64::MAX
+/// that a legitimate monotonic writer can never reach (round-17 review
+/// P2: the earlier u32::MAX ceiling wrongly LOWERED the resume point of
+/// a long-lived workload past u32::MAX real frames, re-using sequence
+/// numbers still resident in the relay's dedup set).
+///
+/// The scan is per-record BOUNDED (round-15 review P2):
+/// `BufRead::lines()` buffers a complete record with no size limit, so a
+/// newline-free or malformed record left in the workload-writable spool
+/// before the container restarted became one String allocation as large as
+/// the whole volume (64 MiB) — before the child even spawned — and on a
+/// constrained app container that is a persistent wrapper OOM/restart loop
+/// while the same spool remains. Records are now read through a capped
+/// reader (MAX_SPOOL_LINE_BYTES) and oversized or incomplete records are
+/// consumed-and-SKIPPED without ever being buffered whole. Skipping is
+/// safe for sequence recovery: only newline-terminated records can ever
+/// have been delivered by the relay (it withholds in-flight fragments),
+/// so an oversized or incomplete record cannot hold a sequence any
+/// connected relay dedup set references — and it cannot be a
+/// writer-produced frame at all (those are capped well below the bound).
+fn initial_spool_sequence(spool: &mut File) -> Result<u64, String> {
+    spool
+        .seek(SeekFrom::Start(0))
+        .map_err(|err| format!("failed to seek log spool for sequence scan: {err}"))?;
+    let read_err = |err: io::Error| format!("failed to read log spool for sequence scan: {err}");
+    let mut max_sequence = 0u64;
+    let mut reader = BufReader::new(&mut *spool);
+    let mut line: Vec<u8> = Vec::new();
+    loop {
+        line.clear();
+        // Bounded per-record read: the take cap is one past
+        // MAX_SPOOL_LINE_BYTES so a record of exactly that many content
+        // bytes plus its newline stays in-bounds.
+        let n = reader
+            .by_ref()
+            .take(MAX_SPOOL_LINE_BYTES + 1)
+            .read_until(b'\n', &mut line)
+            .map_err(read_err)?;
+        if n == 0 {
+            break;
+        }
+        if !line.ends_with(b"\n") {
+            if (n as u64) < MAX_SPOOL_LINE_BYTES + 1 {
+                // Incomplete trailing record (writer mid-append when the
+                // previous wrapper exited): skipped like a non-frame line.
+                // It cannot have been delivered by the relay — in-flight
+                // fragments are withheld — so its sequence cannot poison
+                // any frontier and need not steer the resume point.
+                break;
+            }
+            // Oversized record: consume-and-discard the REST of it without
+            // buffering — it cannot be a writer-produced frame. The scan
+            // resumes at the next record.
+            let mut terminated = false;
+            while !terminated {
+                let available = reader.fill_buf().map_err(read_err)?;
+                if available.is_empty() {
+                    break;
+                }
+                match available.iter().position(|&b| b == b'\n') {
+                    Some(i) => {
+                        reader.consume(i + 1);
+                        terminated = true;
+                    }
+                    None => {
+                        let m = available.len();
+                        reader.consume(m);
+                    }
+                }
+            }
+            if !terminated {
+                // EOF mid-oversized-record: incomplete tail, skip.
+                break;
+            }
+            continue;
+        }
+        // Complete record INCLUDING its terminating newline. Strip the
+        // terminators exactly like `BufRead::lines()` did (LF, or CRLF).
+        let mut content = &line[..line.len() - 1];
+        if content.ends_with(b"\r") {
+            content = &content[..content.len() - 1];
+        }
+        if let Ok(frame) =
+            serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(content))
+            && let Some(sequence) = frame.get("sequence").and_then(|s| s.as_u64())
+            && sequence > max_sequence
+        {
+            max_sequence = sequence;
+        }
+    }
+    // Wrap guard before +1: a forged sequence adjacent to u64::MAX must
+    // not wrap the counter to 0, which would make every post-restart
+    // frame replay-suppressed (the old frontier dedup) or duplicate
+    // earlier sequence numbers. Round-17 review P2 (Codex): the OLD clamp
+    // (`min(u32::MAX)`) also LOWERED the resume point of a legitimately
+    // long-lived workload past u32::MAX real frames back down to
+    // u32::MAX + 1 — those re-used sequence numbers were still resident
+    // in the relay's DeliveredSequences dedup set (capacity 65,536,
+    // FIFO-evicted), so up to 65,536 live frames were silently suppressed
+    // as apparent rotation replays after a restart. Only wrap-adjacent
+    // values are clamped now: the reserve matches the relay's dedup
+    // window (DELIVERED_SET_CAP), a legitimate monotonic writer can never
+    // reach it (u64::MAX frames is unreachable), and a forged near-MAX
+    // sequence merely loses headroom it never owned.
+    const SEQUENCE_RESUME_WRAP_RESERVE: u64 = 65_536;
+    Ok(max_sequence
+        .saturating_add(1)
+        .min(u64::MAX - SEQUENCE_RESUME_WRAP_RESERVE))
 }
 
 fn spawn_log_forwarder<R>(
@@ -470,6 +658,37 @@ where
     thread::spawn(move || forward_encrypted_logs(reader, stream, &logs, &spool, &sequence))
 }
 
+/// Allocate the next log-frame sequence without ever WRAPPING (round-18
+/// self-check Warning). `AtomicU64::fetch_add` wraps to 0 at the top of the
+/// sequence space: with a forged `{"sequence":u64::MAX}` line in the
+/// workload-writable spool the wrap-reserved resume point sits 65,537
+/// frames below the top, and the old allocator would then wrap and
+/// re-issue numbers the relay's dedup set can still hold (silently
+/// suppressing real frames) or that collide with pre-restart frames
+/// (duplicates). Saturation makes exhaustion an EXPLICIT logged drop — the
+/// same policy as a spool write failure — and the caller keeps draining
+/// the child pipe. The top value `u64::MAX` is deliberately never issued:
+/// it is the forgery sentinel and has no room for a monotonic successor. A
+/// legitimate writer cannot approach the top (~584 billion years at 1,000
+/// frames/s), so the only path to exhaustion is self-inflicted forgery.
+fn next_sequence(counter: &AtomicU64) -> Option<u64> {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        if current == u64::MAX {
+            return None;
+        }
+        match counter.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        ) {
+            Ok(previous) => return Some(previous),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 fn forward_encrypted_logs<R>(
     reader: R,
     stream: &'static str,
@@ -482,21 +701,71 @@ where
 {
     let mut reader = BufReader::new(reader);
     let mut buf = Vec::new();
+    let mut dropped_frames: u64 = 0;
+    let mut exhausted_frames: u64 = 0;
+    // Round-12: carries a lone `\r` peeked at the cap boundary whose `\n`
+    // had not yet arrived (pipes may split the CRLF terminator across
+    // writes) — see `read_capped_record`.
+    let mut pending_cr = false;
     loop {
         buf.clear();
-        let n = reader
-            .read_until(b'\n', &mut buf)
+        let record = read_capped_record(&mut reader, &mut buf, &mut pending_cr)
             .map_err(|err| format!("failed to read child {stream}: {err}"))?;
-        if n == 0 {
+        if record.terminator_only {
+            // The previous capped chunk's boundary CRLF was resolved here,
+            // or its parked boundary CR turned out to be the historical
+            // trailing-CR cleanup byte at EOF: its record was already
+            // framed and appended — just read on.
+            continue;
+        }
+        if record.len == 0 {
             return Ok(());
         }
-        while buf.ends_with(b"\n") || buf.ends_with(b"\r") {
-            buf.pop();
+        // Strip CR/LF line terminators only from records that actually ended
+        // at a newline (or at EOF, preserving the historical cleanup): an
+        // artificially capped chunk that happens to end in `\r` carries
+        // record content, not a terminator — stripping it would corrupt the
+        // encrypted plaintext of the reassembled record.
+        if !record.capped {
+            while buf.ends_with(b"\n") || buf.ends_with(b"\r") {
+                buf.pop();
+            }
         }
+        // Genuine blank records (a lone `\n`, or `\r\n`) survive the strip as
+        // an empty buffer and MUST still be encrypted and appended — they are
+        // real log entries the previous implementation preserved. The only
+        // other historical source of an empty buffer, the synthetic
+        // newline-only read after an exact capped-boundary chunk, can no
+        // longer occur: read_capped_record consumes that newline itself.
+        // Allocate the sequence number while HOLDING the spool mutex and
+        // only after acquiring it: encrypt_log_frame runs here, inside the
+        // lock, so a faster forwarder cannot reserve a higher sequence,
+        // lose the CPU to its peer, and let the lower sequence reach the
+        // spool second. File order therefore always equals sequence order,
+        // which the relay's rotation-resync dedup relies on: sent
+        // sequences are a SET (round-14 self-check — never a max
+        // frontier), and set membership only matches replayed lines to
+        // their originals when spool position orders sequences.
+        let mut spool = spool
+            .lock()
+            .map_err(|_| "encrypted log spool lock poisoned".to_string())?;
+        // Sequence exhaustion (round-18 self-check Warning): drop the frame
+        // EXPLICITLY rather than let the allocator wrap to 0 and re-issue
+        // sequences — counted and logged like a spool write failure below.
+        let Some(sequence_number) = next_sequence(sequence) else {
+            exhausted_frames += 1;
+            if exhausted_frames == 1 || exhausted_frames % 1000 == 0 {
+                eprintln!(
+                    "enclava-wait-exec: encrypted log sequence space exhausted, dropping \
+                     {stream} frame ({exhausted_frames} frames dropped so far)"
+                );
+            }
+            continue;
+        };
         let frame = encrypt_log_frame(
             &logs.recipient,
             &logs.context,
-            sequence.fetch_add(1, Ordering::Relaxed),
+            sequence_number,
             stream,
             &logs.container,
             Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
@@ -505,15 +774,376 @@ where
         .map_err(|err| format!("failed to encrypt child {stream} log frame: {err}"))?;
         let line = serde_json::to_vec(&frame)
             .map_err(|err| format!("failed to encode encrypted log frame: {err}"))?;
-        let mut spool = spool
-            .lock()
-            .map_err(|_| "encrypted log spool lock poisoned".to_string())?;
-        spool
-            .write_all(&line)
-            .and_then(|_| spool.write_all(b"\n"))
+        // Rotate BEFORE writing, projected against the encoded frame length:
+        // records are capped (see MAX_LOG_RECORD_BYTES), so the spool never
+        // grows past the rotate threshold between checks and a single frame
+        // can never outrun the headroom below the emptyDir cap. Best-effort
+        // by design — a rotation failure is logged and skipped so the
+        // forwarding thread keeps draining the child's pipe.
+        if let Err(err) =
+            rotate_spool_if_needed(&mut spool, line.len() as u64 + 1, &logs.spool_path)
+        {
+            eprintln!("enclava-wait-exec: log spool rotation failed: {err}");
+        }
+        // A spool write failure (e.g. a transient ENOSPC against the volume
+        // cap) must not terminate the forwarding thread either: exiting here
+        // closes the child's pipe and exposes a healthy workload to SIGPIPE.
+        // Drop the frame instead and keep draining; report the first failure
+        // and then every 1000th dropped frame so persistent loss is visible.
+        // Use a single atomic write (line + newline) to avoid partial-frame
+        // corruption: if the write succeeds, both frame and newline are on disk;
+        // if it fails, neither is, so the log stream stays valid NDJSON.
+        let mut frame_with_newline = line;
+        frame_with_newline.push(b'\n');
+        // A single write_all is not transactional: a short write followed by
+        // an error (e.g. ENOSPC) can leave a frame prefix on disk. Snapshot
+        // the pre-write file length from the inode (NOT stream_position():
+        // the spool is O_APPEND and rotation reopens the handle, so the fd's
+        // cached offset can be stale relative to end-of-file) and truncate
+        // back to it on any write/flush failure, so the spool never carries
+        // a partial NDJSON line that the next successful append would extend
+        // into a permanently malformed record.
+        let pre_write_len = spool.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+        if let Err(err) = spool
+            .write_all(&frame_with_newline)
             .and_then(|_| spool.flush())
-            .map_err(|err| format!("failed to write encrypted log spool: {err}"))?;
+        {
+            if spool.set_len(pre_write_len).is_ok() {
+                let _ = spool.seek(SeekFrom::Start(pre_write_len));
+            }
+            dropped_frames += 1;
+            if dropped_frames == 1 || dropped_frames % 1000 == 0 {
+                eprintln!(
+                    "enclava-wait-exec: encrypted log spool write failed \
+                     ({dropped_frames} frames dropped so far): {err}"
+                );
+            }
+        }
     }
+}
+
+/// One input record (or capped chunk of one) returned by `read_capped_record`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CappedRecord {
+    /// Bytes buffered into `buf` for this record/chunk.
+    len: usize,
+    /// True when the chunk was cut at `MAX_LOG_RECORD_BYTES` before any
+    /// newline was seen — the record continues in the next chunk, so its
+    /// final byte is record content, not a line terminator. A chunk whose
+    /// boundary terminator was consumed by the reader is also reported
+    /// `capped` (the terminator is already gone; the caller must not
+    /// strip payload bytes).
+    capped: bool,
+    /// True when this call produced no record bytes because it only
+    /// resolved a parked boundary CR into a consumed terminator (see
+    /// `pending_cr`): the terminated record was already returned by the
+    /// previous call, so the caller must just call again. Distinct from
+    /// EOF, which also returns `len == 0`.
+    terminator_only: bool,
+}
+
+/// Read one input record from the child, capped at
+/// `MAX_LOG_RECORD_BYTES`: a longer line is returned as consecutive
+/// chunks (each without a trailing newline except the final chunk), which
+/// the caller frames separately — same stream, consecutive sequence
+/// numbers, order preserved, no data dropped. The cap bounds both the
+/// wrapper's memory and the largest frame the spool can ever see.
+/// Implemented via fill_buf/consume rather than `Take::read_until` so the
+/// cap boundary is exact (no byte duplication or loss at the limit).
+///
+/// `pending_cr` carries split-terminator state ACROSS calls (round-12):
+/// pipes may deliver the `\r` of a record's CRLF terminator in a
+/// different write/fill_buf window than its `\n`. When a chunk fills to
+/// exactly the cap and the boundary peek exposes ONLY a lone `\r`, that
+/// byte is consumed from the reader and parked in `pending_cr`; the next
+/// call resolves it — `\n` next means the pair was the record's
+/// terminator (consumed, nothing returned), anything else means the `\r`
+/// was record content (round-5) and is prepended to the next chunk, and
+/// EOF means the historical trailing-CR cleanup byte — already excluded
+/// from the framed capped chunk — and is discarded with no record
+/// (round-16 self-check P2).
+fn read_capped_record<R: BufRead>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    pending_cr: &mut bool,
+) -> std::io::Result<CappedRecord> {
+    buf.clear();
+    // Round-12: resolve a CR parked at the previous call's cap boundary.
+    // It was already consumed from the reader, so decide from the next
+    // visible byte only: `\n` next means the pair was the record's
+    // terminator (consumed, nothing returned), a non-LF byte means the
+    // `\r` was record content (round-5) and is prepended to the next chunk,
+    // and EOF means the historical trailing-CR cleanup byte (discarded —
+    // round-16 self-check P2).
+    if *pending_cr {
+        *pending_cr = false;
+        let peek = reader.fill_buf()?;
+        if peek.is_empty() {
+            // EOF right after the parked CR (round-16 self-check P2): the
+            // capped chunk that parked it has already been framed WITHOUT
+            // this byte, and a trailing CR at EOF is exactly the historical
+            // cleanup case (one record, trailing CR stripped). Returning
+            // the parked byte as a record here produced a CR-only final
+            // record that the caller's strip emptied and then encrypted —
+            // a fabricated blank frame after every cap-boundary record
+            // whose stream ended on a lone CR. Discard it: no record, just
+            // read on to the EOF return.
+            return Ok(CappedRecord {
+                len: 0,
+                capped: false,
+                terminator_only: true,
+            });
+        }
+        if let Some(b'\n') = peek.first() {
+            reader.consume(1);
+            // The parked `\r` plus this `\n` were the capped record's
+            // terminator. That record was returned by the previous call
+            // (as a capped chunk that has already been framed and
+            // appended); the terminator is consumed here with no record
+            // bytes — signal the caller to just read on.
+            return Ok(CappedRecord {
+                len: 0,
+                capped: false,
+                terminator_only: true,
+            });
+        }
+        // EOF or a non-LF byte: the parked `\r` was record CONTENT.
+        // Prepend it so the chunk below starts with it.
+        buf.push(b'\r');
+    }
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(CappedRecord {
+                len: buf.len(),
+                capped: false,
+                terminator_only: false,
+            });
+        }
+        let remaining = MAX_LOG_RECORD_BYTES - buf.len();
+        let search = &available[..available.len().min(remaining)];
+        match search.iter().position(|&b| b == b'\n') {
+            Some(i) => {
+                buf.extend_from_slice(&search[..=i]);
+                reader.consume(i + 1);
+                return Ok(CappedRecord {
+                    len: buf.len(),
+                    capped: false,
+                    terminator_only: false,
+                });
+            }
+            None => {
+                buf.extend_from_slice(search);
+                let n = search.len();
+                reader.consume(n);
+                if buf.len() == MAX_LOG_RECORD_BYTES {
+                    // If the record's terminator lands EXACTLY at the cap
+                    // boundary, consume it here instead of letting the
+                    // next call return it as a lone-terminator record: the
+                    // caller's terminator strip would leave an empty
+                    // plaintext that still gets encrypted and appended,
+                    // fabricating an empty log frame after every record
+                    // whose length is an exact multiple of the cap. Both
+                    // terminator forms are recognized — `\n` and `\r\n`
+                    // (round-11). Consuming the boundary terminator keeps
+                    // the chunk marked `capped` (its last byte is record
+                    // content, not a terminator — the round-5 strip
+                    // protection), because the caller's strip-all-CR/LF
+                    // would otherwise eat a legitimate content `\r` that
+                    // happens to sit at payload position cap-1 (latent
+                    // hazard in the round-11 shape). At EOF there is no
+                    // terminator to consume and the chunk also stays
+                    // `capped`. A lone `\r` with NO following byte yet is
+                    // undecidable (round-12): consume it and park it in
+                    // `pending_cr` for the next call to resolve.
+                    let peek = reader.fill_buf()?;
+                    match peek.first() {
+                        Some(b'\n') => {
+                            reader.consume(1);
+                            // Round-13 review P2: a CRLF-terminated record
+                            // with exactly cap-1 payload bytes fills the
+                            // buffer with the terminator's `\r` (the `\n`
+                            // sits just past the cap window). The buffered
+                            // `\r` plus this consumed `\n` IS the two-byte
+                            // terminator — pop exactly that one byte,
+                            // matching what the short-record path's strip
+                            // does at every other record length. A content
+                            // `\r` ADJACENT to the terminator's CR (a
+                            // buffered `\r\r` before this LF) keeps its
+                            // content byte: only the terminator's CR goes,
+                            // the same content-preservation policy the
+                            // consume-`\r\n` arm below applies to a
+                            // payload-ending CR (round-5/round-12).
+                            // (`\rX` content is untouched — that case
+                            // never reaches this arm: the `\r` would be
+                            // followed by `X`, not `\n`.)
+                            if buf.last() == Some(&b'\r') {
+                                buf.pop();
+                            }
+                        }
+                        Some(b'\r') if peek.get(1) == Some(&b'\n') => {
+                            reader.consume(2);
+                        }
+                        Some(b'\r') if peek.len() == 1 => {
+                            reader.consume(1);
+                            *pending_cr = true;
+                        }
+                        _ => {}
+                    }
+                    return Ok(CappedRecord {
+                        len: buf.len(),
+                        capped: true,
+                        terminator_only: false,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Bound the encrypted log spool: rotate when the current length plus the
+/// incoming encoded frame would exceed `LOG_SPOOL_ROTATE_BYTES`, retaining
+/// only the last `LOG_SPOOL_KEEP_BYTES` of frames. Rotation writes the
+/// retained tail to a sibling temp file and atomically renames it over the
+/// spool path, so the spool always becomes a NEW inode and readers never
+/// observe a half-truncated file: the relay's `follow_spool` tracks the
+/// file identity (dev/ino) and restarts from offset 0 when it changes
+/// (with `len < offset` kept as a belt-and-braces fallback), and `tail_lines`
+/// reads the last MAX_TAIL_BYTES by path regardless. The caller holds the
+/// spool mutex, and the handle is reopened onto the new inode in-place, so
+/// the check-rotate-rename sequence is race-free for both forwarders.
+/// Rotation is best-effort: failures are logged by the caller and never
+/// terminate the forwarding threads, which keep draining the child pipes.
+/// If the reopen fails after a successful rename, the old handle keeps
+/// absorbing appends on the unlinked inode and the next call retries —
+/// writes stay lossless-visible once a reopen succeeds.
+/// Random component for rotation temp names (round-19 review P2): hex
+/// from /dev/urandom (32 random bits per attempt — a racing workload must
+/// guess among ~4 billion names per try, and create_new still enforces
+/// exclusivity with retry on collision), falling back to pid + nanos if
+/// the read fails. Only uniqueness and unpredictability matter.
+fn random_suffix() -> String {
+    let mut buf = [0u8; 4];
+    let ok = std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut buf))
+        .is_ok();
+    if ok {
+        format!("{:08x}", u32::from_ne_bytes(buf))
+    } else {
+        format!("{}-{}", process::id(), monotonic_nanos())
+    }
+}
+
+/// Monotonic-ish nanosecond timestamp for the urandom-failure fallback.
+fn monotonic_nanos() -> u128 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
+
+fn rotate_spool_if_needed(spool: &mut File, incoming: u64, path: &Path) -> std::io::Result<()> {
+    let len = spool.metadata()?.len();
+    if len + incoming <= LOG_SPOOL_ROTATE_BYTES {
+        return Ok(());
+    }
+    // Copy the retained tail to a scratch buffer from the old inode, then
+    // atomically swap the spool to a fresh inode carrying only that tail.
+    let keep_from = len.saturating_sub(LOG_SPOOL_KEEP_BYTES);
+    let mut retain_buf = Vec::new();
+    spool.seek(SeekFrom::Start(keep_from))?;
+    // Bounded retention read (round-19 review P2): never read past the
+    // sampled `len`. The workload shares the group-writable logs volume and
+    // can append directly to the spool inode while rotation runs; an
+    // unbounded read_to_end would keep consuming those bytes (allocating
+    // up to the 64 MiB volume cap) while the spool mutex is held, starving
+    // both forwarders and eventually blocking the child's stdout/stderr.
+    // Only the snapshot that existed when `len` was sampled is retained.
+    Read::by_ref(spool)
+        .take(len - keep_from)
+        .read_to_end(&mut retain_buf)?;
+    // Align the retained window to the next frame boundary: rotation can
+    // start mid-line, and the relay's tail_lines only discards a partial
+    // first line when its read offset is nonzero.
+    if keep_from > 0 {
+        if let Some(nl) = retain_buf.iter().position(|b| *b == b'\n') {
+            retain_buf.drain(..=nl);
+        } else {
+            // No newline in the retained window (one gigantic frame);
+            // dropping it entirely is the only safe truncation point.
+            retain_buf.clear();
+        }
+    }
+    // Fresh randomized exclusive temp name (round-19 review P2): the logs
+    // directory is group-writable by the workload, so a compromised
+    // workload could race the old predictable `<spool>.rotate.<pid>` path —
+    // re-creating a FIFO between the remove_file and the open. Unlike the
+    // symlink case (guarded by O_NOFOLLOW), opening a FIFO with no reader
+    // BLOCKS indefinitely while the spool mutex is held, hanging both
+    // forwarders and the workload's stdout/stderr. A randomized
+    // create_new (O_EXCL) name cannot be pre-planted: the workload cannot
+    // guess it, and any collision (astronomically unlikely) retries with a
+    // fresh name.
+    let mut rotate_tmp: Option<(PathBuf, File)> = None;
+    for _ in 0..8 {
+        let candidate = PathBuf::from(format!("{}.rotate.{}", path.display(), random_suffix()));
+        match OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o640)
+            .custom_flags(O_NOFOLLOW)
+            .open(&candidate)
+        {
+            Ok(mut tmp) => {
+                if let Err(err) = tmp.write_all(&retain_buf).and_then(|()| tmp.sync_all()) {
+                    // Don't leak the half-written temp on failure.
+                    drop(tmp);
+                    let _ = fs::remove_file(&candidate);
+                    return Err(err);
+                }
+                rotate_tmp = Some((candidate, tmp));
+                break;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    let (rotate_tmp, tmp) =
+        rotate_tmp.ok_or_else(|| io::Error::other("rotation temp name collisions exhausted"))?;
+    // Inode-identity guard (round-19 self-check Critical): the temp's NAME
+    // is visible in the group-writable dir while it is written, and the
+    // workload shares our uid — it can unlink the temp and park a FIFO (or
+    // its own file) at the name between our write and the rename. Renaming
+    // by path would then install the impostor as the spool. fstat the fd
+    // we hold (it still points at OUR inode even if the name was swapped)
+    // and stat the path: they must agree on dev+ino, else the name no
+    // longer refers to our temp — abort (the leaked temp is inert; later
+    // rotations use fresh names) and let the next rotation call retry.
+    // The fd staying open also keeps our inode alive across the rename.
+    use std::os::unix::fs::MetadataExt as _;
+    let fd_meta = tmp.metadata()?;
+    let path_meta = fs::metadata(&rotate_tmp).map_err(|err| {
+        io::Error::other(format!(
+            "rotation temp {} disappeared before rename: {err}",
+            rotate_tmp.display()
+        ))
+    })?;
+    if fd_meta.dev() != path_meta.dev() || fd_meta.ino() != path_meta.ino() {
+        return Err(io::Error::other(format!(
+            "rotation temp {} was replaced before rename (dev/ino mismatch) — aborting rotation",
+            rotate_tmp.display()
+        )));
+    }
+    drop(tmp);
+    fs::rename(&rotate_tmp, path)?;
+    // Reopen the spool path so subsequent appends land on the new inode.
+    // An error here leaves the old handle appending to the unlinked inode —
+    // visible to no reader, but safe (no pipe close); the next rotation
+    // call retries the swap.
+    *spool = open_log_spool(path)
+        .map_err(|message| io::Error::other(format!("spool reopen after rotation: {message}")))?;
+    Ok(())
 }
 
 fn signal_started(started_dir: &Path, name: &str) -> Result<(), String> {
@@ -1160,5 +1790,891 @@ mod tests {
         assert_eq!(config.context.app_name, "secure-app");
         assert_eq!(config.context.deployment_id, "deploy-123");
         assert_eq!(config.container, "web");
+    }
+
+    // ---- spool rotation (round-3 review) ----
+
+    /// Rotation must bound the spool: once past the rotate threshold the
+    /// file shrinks to roughly the retained window, the retained content is
+    /// the newest frames (line-aligned), rotation swaps in a NEW inode, and
+    /// subsequent appends still land at end-of-file. Regression test for the
+    /// round-3 review SIGPIPE/ENOSPC finding: without rotation a full
+    /// `logs` emptyDir killed the forwarder thread and exposed the child
+    /// to SIGPIPE.
+    #[test]
+    fn spool_rotation_bounds_file_and_keeps_newest_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.jsonl");
+        let mut spool = open_log_spool(&path).unwrap();
+        let inode_before = fs::metadata(&path).unwrap().ino();
+
+        // Write just past the rotate threshold using complete frames.
+        let line: String = "x".repeat(63);
+        let frame = format!("{line}\n");
+        let frame_len = frame.len() as u64;
+        let total = (LOG_SPOOL_ROTATE_BYTES + 1024 * 1024) / frame_len;
+        for i in 0..total {
+            write!(spool, "{i:06}{frame}").unwrap();
+        }
+        spool.flush().unwrap();
+
+        rotate_spool_if_needed(&mut spool, 0, &path).unwrap();
+
+        let len = fs::metadata(&path).unwrap().len();
+        assert!(
+            len <= LOG_SPOOL_KEEP_BYTES + frame_len,
+            "spool must shrink to ~KEEP_BYTES, got {len}"
+        );
+        // Rotation swaps in a new inode so identity-tracking followers
+        // (the relay's follow_spool) resynchronize deterministically.
+        assert_ne!(
+            fs::metadata(&path).unwrap().ino(),
+            inode_before,
+            "rotation must replace the spool inode"
+        );
+        // Appends still land at end-of-file after rotation.
+        let before = fs::metadata(&path).unwrap().len();
+        writeln!(spool, "tail-marker").unwrap();
+        spool.flush().unwrap();
+        let after = fs::metadata(&path).unwrap().len();
+        assert_eq!(after, before + b"tail-marker\n".len() as u64);
+        // The retained window starts at a frame boundary: the first line is
+        // a complete 6-digit-prefixed frame.
+        let content = fs::read_to_string(&path).unwrap();
+        let first_line = content.lines().next().unwrap();
+        assert!(
+            first_line.len() == 69 && first_line.starts_with(|c: char| c.is_ascii_digit()),
+            "first retained line must be a complete frame, got {first_line:?}"
+        );
+    }
+
+    /// No rotation below the threshold: the benign-layout invariant.
+    #[test]
+    fn spool_rotation_is_noop_below_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.jsonl");
+        let mut spool = open_log_spool(&path).unwrap();
+        writeln!(spool, "small").unwrap();
+        spool.flush().unwrap();
+        let len_before = fs::metadata(&path).unwrap().len();
+        let inode_before = fs::metadata(&path).unwrap().ino();
+        rotate_spool_if_needed(&mut spool, 0, &path).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), len_before);
+        assert_eq!(fs::metadata(&path).unwrap().ino(), inode_before);
+    }
+
+    /// Round-18 self-check Warning: the sequence allocator must saturate,
+    /// not wrap. `AtomicU64::fetch_add` wraps to 0 at the top of the space,
+    /// so a forged `{"sequence":u64::MAX}` line (workload-writable spool)
+    /// plus 65,537 real frames would re-issue sequences the relay's dedup
+    /// set can still hold — silently suppressing real frames — and
+    /// duplicate pre-restart numbers. Exhaustion now drops frames
+    /// explicitly instead. The top value `u64::MAX` is deliberately never
+    /// issued: it is the forgery sentinel and has no room for a successor.
+    #[test]
+    fn sequence_allocation_saturates_instead_of_wrapping() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(next_sequence(&counter), Some(u64::MAX - 1));
+        assert_eq!(next_sequence(&counter), None);
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            u64::MAX,
+            "the counter parks at the top instead of wrapping to 0"
+        );
+        assert_eq!(next_sequence(&counter), None, "exhaustion is sticky");
+    }
+
+    /// Round-6 review finding: the relay's rotation dedup is set membership
+    /// over sequences actually sent (round-14 — never a max frontier), and
+    /// set membership only matches replayed lines to their originals when
+    /// spool file order is monotonic in sequence order. The sequence must
+    /// therefore be allocated (and the frame encrypted) while HOLDING the
+    /// spool mutex — previously `fetch_add` ran before the lock, so a
+    /// forwarder could reserve a higher sequence, lose the CPU, and let its
+    /// peer's lower sequence reach the file first; a later rotation resync
+    /// would then drop that unseen lower frame as "already delivered".
+    /// This test drives both forwarder threads concurrently and pins that
+    /// the spool's sequence numbers are strictly increasing in file order.
+    #[test]
+    fn concurrent_forwarders_keep_spool_order_monotonic_in_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.jsonl");
+        let spool = Arc::new(Mutex::new(open_log_spool(&path).unwrap()));
+
+        let keypair = enclava_common::log_encryption::generate_log_keypair();
+        let recipient = validate_public_key(
+            "logs-prod",
+            &keypair.public_key_base64url,
+            &keypair.public_key_sha256,
+        )
+        .unwrap();
+        let logs = EncryptedLogConfig {
+            recipient,
+            context: enclava_common::log_encryption::LogFrameContext {
+                org_id: "org-123".to_string(),
+                app_name: "secure-app".to_string(),
+                deployment_id: "deploy-123".to_string(),
+            },
+            spool_path: path.clone(),
+            container: "web".to_string(),
+        };
+
+        let sequence = Arc::new(AtomicU64::new(1));
+        let handles: Vec<_> = ["stdout", "stderr"]
+            .iter()
+            .map(|stream| {
+                let input = (0..400)
+                    .map(|i| format!("{stream} record {i} {}\n", "x".repeat(i % 97)))
+                    .collect::<String>();
+                let reader = std::io::Cursor::new(input);
+                let spool = Arc::clone(&spool);
+                let sequence = Arc::clone(&sequence);
+                let logs = logs.clone();
+                let stream: &'static str = match *stream {
+                    "stdout" => "stdout",
+                    _ => "stderr",
+                };
+                thread::spawn(move || {
+                    forward_encrypted_logs(reader, stream, &logs, &spool, &sequence).unwrap()
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("forwarder panicked");
+        }
+
+        let content = fs::read_to_string(&path).unwrap();
+        let mut prev = 0u64;
+        let mut count = 0u64;
+        for line in content.lines() {
+            let frame: serde_json::Value =
+                serde_json::from_str(line).expect("spool must contain valid NDJSON frames");
+            let seq = frame["sequence"].as_u64().expect("sequence is plaintext");
+            assert!(
+                seq > prev,
+                "spool order must be monotonic in sequence: {seq} followed {prev}"
+            );
+            prev = seq;
+            count += 1;
+        }
+        assert_eq!(count, 800, "both streams' 400 frames must be on disk");
+    }
+
+    /// Rotation is projected against the incoming frame: the spool never
+    /// grows past the rotate threshold even when the check races a large
+    /// frame (round-4 review finding — oversized lines previously filled
+    /// the volume before the post-write check could fire).
+    #[test]
+    fn spool_rotation_projects_incoming_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.jsonl");
+        let mut spool = open_log_spool(&path).unwrap();
+
+        let line: String = "x".repeat(63);
+        let frame = format!("{line}\n");
+        let frame_len = frame.len() as u64;
+        // Each record is the 6-digit index + the 64-byte frame; stop below
+        // the rotate threshold with room for a 1 MiB incoming frame.
+        let record_len = 6 + frame.len() as u64;
+        let total = (LOG_SPOOL_ROTATE_BYTES - 1024) / record_len;
+        for i in 0..total {
+            write!(spool, "{i:06}{frame}").unwrap();
+        }
+        spool.flush().unwrap();
+        let len_before = fs::metadata(&path).unwrap().len();
+        assert!(len_before <= LOG_SPOOL_ROTATE_BYTES - 1024);
+
+        // A 1 MiB incoming frame would push past the threshold: rotation
+        // must fire now, not after the write.
+        rotate_spool_if_needed(&mut spool, 1024 * 1024, &path).unwrap();
+        let len_after = fs::metadata(&path).unwrap().len();
+        assert!(
+            len_after <= LOG_SPOOL_KEEP_BYTES + frame_len,
+            "projected rotation must bound the spool, got {len_after}"
+        );
+    }
+
+    /// Input records are capped at MAX_LOG_RECORD_BYTES: a longer line is
+    /// returned as consecutive chunks preserving order and content, so the
+    /// wrapper's memory and the maximum frame size stay bounded (round-4
+    /// review finding — one unbounded line previously bypassed rotation).
+    #[test]
+    fn read_capped_record_splits_oversized_lines() {
+        // The newline must land beyond the cap so the first read is a
+        // newline-free chunk of exactly MAX_LOG_RECORD_BYTES.
+        let chunk = "a".repeat(MAX_LOG_RECORD_BYTES + 8);
+        let input = format!("{chunk}BCDEFGHIJKLMNOPQRSTUVWXYZ\nsecond line\n");
+        let mut reader = std::io::BufReader::new(input.as_bytes());
+        let mut pending_cr = false;
+
+        let mut first = Vec::new();
+        let r1 = read_capped_record(&mut reader, &mut first, &mut pending_cr).unwrap();
+        assert_eq!(r1.len, MAX_LOG_RECORD_BYTES);
+        assert_eq!(first.len(), MAX_LOG_RECORD_BYTES);
+        assert!(!first.ends_with(b"\n"), "capped chunk has no newline yet");
+        assert!(r1.capped, "chunk hit the cap before any newline");
+
+        // The remainder of the same line (up to its newline) is the next
+        // record — content is preserved across the split, nothing dropped.
+        let mut second = Vec::new();
+        let r2 = read_capped_record(&mut reader, &mut second, &mut pending_cr).unwrap();
+        let expected_remainder = format!("{}BCDEFGHIJKLMNOPQRSTUVWXYZ\n", "a".repeat(8));
+        assert_eq!(second, expected_remainder.as_bytes());
+        assert!(r2.len > 0);
+        assert!(!r2.capped);
+
+        let mut third = Vec::new();
+        let r3 = read_capped_record(&mut reader, &mut third, &mut pending_cr).unwrap();
+        assert_eq!(third, b"second line\n");
+        assert!(r3.len > 0);
+        assert!(!r3.capped);
+
+        let mut fourth = Vec::new();
+        let r4 = read_capped_record(&mut reader, &mut fourth, &mut pending_cr).unwrap();
+        assert_eq!(r4.len, 0);
+        assert!(fourth.is_empty());
+
+        // Reassembled content equals the input minus the record split.
+        let mut reassembled = first.clone();
+        reassembled.extend_from_slice(&second);
+        reassembled.extend_from_slice(&third);
+        assert_eq!(reassembled, input.as_bytes());
+    }
+
+    /// Genuine blank records must be preserved as empty-plaintext frames;
+    /// a capped-boundary newline must not fabricate one. Round-7 finding.
+    #[test]
+    fn blank_records_are_preserved_and_boundary_newlines_fabricate_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.jsonl");
+        let spool = Arc::new(Mutex::new(open_log_spool(&path).unwrap()));
+
+        let keypair = enclava_common::log_encryption::generate_log_keypair();
+        let recipient = validate_public_key(
+            "logs-prod",
+            &keypair.public_key_base64url,
+            &keypair.public_key_sha256,
+        )
+        .unwrap();
+        let logs = EncryptedLogConfig {
+            recipient,
+            context: enclava_common::log_encryption::LogFrameContext {
+                org_id: "org-123".to_string(),
+                app_name: "secure-app".to_string(),
+                deployment_id: "deploy-123".to_string(),
+            },
+            spool_path: path.clone(),
+            container: "web".to_string(),
+        };
+
+        let sequence = Arc::new(AtomicU64::new(1));
+        // `before`, one blank line, `after`, then a record whose length is an
+        // EXACT multiple of the cap followed by `next`: the boundary newline
+        // must be consumed by the reader, not become an empty frame.
+        let mut input = "before\n\nafter\n".to_string();
+        input.push_str(&"a".repeat(MAX_LOG_RECORD_BYTES));
+        input.push_str("\nnext\n");
+        let reader = std::io::Cursor::new(input);
+        forward_encrypted_logs(reader, "stdout", &logs, &spool, &sequence).unwrap();
+
+        // Exactly 5 frames: before, blank, after, capped record, next — the
+        // genuine blank record preserved, no fabricated empty frame at the cap.
+        let content = fs::read_to_string(&path).unwrap();
+        let frames: Vec<&str> = content.lines().collect();
+        assert_eq!(
+            frames.len(),
+            5,
+            "before, blank, after, capped record, next — and no fabricated empty frame"
+        );
+    }
+
+    /// Round-11 review finding (P2): a record of EXACTLY
+    /// MAX_LOG_RECORD_BYTES followed by `\r\n` must have the two-byte
+    /// terminator consumed at the boundary. Previously the peek saw `\r`
+    /// (not `\n`), returned the chunk as capped, and the next read
+    /// returned only `\r\n` — stripped to an empty buffer and encrypted as
+    /// a fabricated blank frame between the capped record and `next`.
+    /// Round-12: the chunk stays `capped: true` even though its terminator
+    /// was consumed — the flag means "do not strip" and the payload's last
+    /// byte may be a content `\r` that the strip would corrupt.
+    #[test]
+    fn read_capped_record_consumes_crlf_at_chunk_boundary() {
+        let payload = "a".repeat(MAX_LOG_RECORD_BYTES);
+        let input = format!("{payload}\r\nnext\r\n");
+        let mut reader = std::io::BufReader::new(input.as_bytes());
+        let mut pending_cr = false;
+
+        let mut first = Vec::new();
+        let r1 = read_capped_record(&mut reader, &mut first, &mut pending_cr).unwrap();
+        assert_eq!(r1.len, MAX_LOG_RECORD_BYTES);
+        assert_eq!(first, payload.as_bytes());
+        assert!(
+            r1.capped,
+            "boundary-terminated chunk stays capped so the caller never strips payload bytes"
+        );
+
+        // The next record is `next`, not a leftover `\r\n` terminator.
+        let mut second = Vec::new();
+        let r2 = read_capped_record(&mut reader, &mut second, &mut pending_cr).unwrap();
+        assert_eq!(second, b"next\r\n");
+        assert!(!r2.capped);
+
+        let mut third = Vec::new();
+        let r3 = read_capped_record(&mut reader, &mut third, &mut pending_cr).unwrap();
+        assert_eq!(r3.len, 0);
+        assert!(third.is_empty());
+    }
+
+    /// Round-5 review finding: a `\r` that happens to sit exactly at an
+    /// artificial chunk boundary is record content, not a line terminator.
+    /// `read_capped_record` must report the chunk as capped so the caller
+    /// does not strip that byte (previously the trailing-CR cleanup
+    /// corrupted the encrypted plaintext of the reassembled record).
+    #[test]
+    fn read_capped_record_marks_cr_at_chunk_boundary_as_content() {
+        // 262,143 ordinary bytes followed by `\rX\n`: byte at index
+        // MAX_LOG_RECORD_BYTES - 1 (the chunk's last byte) is the `\r`.
+        let prefix = "a".repeat(MAX_LOG_RECORD_BYTES - 1);
+        let input = format!("{prefix}\rX\nsecond line\n");
+        let mut reader = std::io::BufReader::new(input.as_bytes());
+        let mut pending_cr = false;
+
+        let mut first = Vec::new();
+        let r1 = read_capped_record(&mut reader, &mut first, &mut pending_cr).unwrap();
+        assert_eq!(r1.len, MAX_LOG_RECORD_BYTES);
+        assert!(r1.capped, "chunk must be marked capped so CR survives");
+        assert_eq!(first.last(), Some(&b'\r'), "boundary CR is record content");
+
+        let mut second = Vec::new();
+        let r2 = read_capped_record(&mut reader, &mut second, &mut pending_cr).unwrap();
+        assert_eq!(second, b"X\n");
+        assert!(!r2.capped);
+
+        let mut third = Vec::new();
+        read_capped_record(&mut reader, &mut third, &mut pending_cr).unwrap();
+        assert_eq!(third, b"second line\n");
+
+        // Full record reassembly preserves the CR byte.
+        let mut reassembled = first.clone();
+        reassembled.extend_from_slice(&second);
+        reassembled.extend_from_slice(&third);
+        assert_eq!(reassembled, input.as_bytes());
+    }
+
+    /// Cross-restart sequence monotonicity (round-8 review finding): the
+    /// spool on the shared `logs` emptyDir survives a container restart,
+    /// so a restarted wrapper must resume ABOVE the highest sequence the
+    /// previous process wrote — the relay's rotation dedup keeps the max
+    /// delivered sequence as its frontier and would silently drop every
+    /// post-restart frame whose reset counter lands at or below it.
+    #[test]
+    fn initial_spool_sequence_resumes_above_surviving_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.jsonl");
+        let frame = |seq: u64| format!(r#"{{"version":"enclava-log-frame-v1","sequence":{seq}}}"#);
+        // A surviving spool whose highest frame is 417 (rotation retains
+        // only a tail, so the lowest present sequence is not 1).
+        let body: String = (400..=417).map(|s| format!("{}\n", frame(s))).collect();
+        std::fs::write(&path, body).unwrap();
+        let mut spool = open_log_spool(&path).unwrap();
+        assert_eq!(initial_spool_sequence(&mut spool).unwrap(), 418);
+
+        // An empty spool resumes at 1.
+        std::fs::write(&path, "").unwrap();
+        let mut spool = open_log_spool(&path).unwrap();
+        assert_eq!(initial_spool_sequence(&mut spool).unwrap(), 1);
+
+        // A spool with no parseable frames resumes at 1.
+        std::fs::write(&path, "not-json\nalso not json\n").unwrap();
+        let mut spool = open_log_spool(&path).unwrap();
+        assert_eq!(initial_spool_sequence(&mut spool).unwrap(), 1);
+    }
+
+    /// Round-14 self-check Critical: the spool directory is
+    /// workload-writable, so a forged `{"sequence":u64::MAX}` line must
+    /// not wrap the resumed counter to 0 — that would make every
+    /// post-restart frame land at/below the relay's dedup state and be
+    /// silently dropped. The resume point is wrap-guarded: only values
+    /// within SEQUENCE_RESUME_WRAP_RESERVE of u64::MAX are lowered.
+    #[test]
+    fn initial_spool_sequence_does_not_wrap_on_forged_max() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.jsonl");
+        let frame = |seq: u64| format!(r#"{{"version":"enclava-log-frame-v1","sequence":{seq}}}"#);
+        // A poisoned spool: one real frame plus the forged u64::MAX line.
+        let body = format!("{}\n{}\n", frame(417), frame(u64::MAX));
+        std::fs::write(&path, body).unwrap();
+        let mut spool = open_log_spool(&path).unwrap();
+        let resumed = initial_spool_sequence(&mut spool).unwrap();
+        assert_eq!(
+            resumed,
+            u64::MAX - 65_536,
+            "wrap-adjacent forged sequence resumes just below the wrap reserve, never 0"
+        );
+
+        // A forged sequence just outside the reserve passes through
+        // unclamped (only wrap-adjacent values are guarded).
+        let body = format!("{}\n{}\n", frame(417), frame(u64::MAX - 100_000));
+        std::fs::write(&path, body).unwrap();
+        let mut spool = open_log_spool(&path).unwrap();
+        assert_eq!(
+            initial_spool_sequence(&mut spool).unwrap(),
+            u64::MAX - 100_000 + 1
+        );
+    }
+
+    /// Round-17 review P2 (Codex): the OLD `min(u32::MAX)` ceiling lowered
+    /// the resume point of a legitimately long-lived workload (more than
+    /// u32::MAX real frames emitted) back down to u32::MAX + 1 after a
+    /// restart — every re-used sequence number still resident in the
+    /// relay's DeliveredSequences dedup set (capacity 65,536) was
+    /// suppressed as an apparent rotation replay. Sequence allocation must
+    /// stay monotonic past the old ceiling.
+    #[test]
+    fn initial_spool_sequence_stays_monotonic_past_u32_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.jsonl");
+        let frame = |seq: u64| format!(r#"{{"version":"enclava-log-frame-v1","sequence":{seq}}}"#);
+        // A surviving spool from a workload well past the old u32::MAX
+        // ceiling (rotation retains only a tail; only the head room of
+        // the counter matters here).
+        let high = u32::MAX as u64 + 12_345;
+        let body: String = (high - 3..=high)
+            .map(|s| format!("{}\n", frame(s)))
+            .collect();
+        std::fs::write(&path, body).unwrap();
+        let mut spool = open_log_spool(&path).unwrap();
+        assert_eq!(
+            initial_spool_sequence(&mut spool).unwrap(),
+            high + 1,
+            "resume continues after the real highest u64 sequence, not u32::MAX + 1"
+        );
+    }
+
+    /// Round-15 review P2: the startup sequence scan must not buffer a
+    /// whole workload-controlled record. The old `BufRead::lines()` scan
+    /// accumulated a complete record with no size limit, so one
+    /// newline-free (or gigantic) record left in the shared spool before
+    /// the container restarted became a single String allocation up to the
+    /// whole 64 MiB volume — before the child spawned — and OOM-looped a
+    /// constrained container while the same spool remained. The scan now
+    /// reads through a capped reader (MAX_SPOOL_LINE_BYTES) and
+    /// consumes-and-SKIPS oversized and incomplete records without
+    /// buffering them; skipping is safe because only newline-terminated
+    /// records can ever have been delivered by the relay (it withholds
+    /// in-flight fragments), so their sequences cannot poison any
+    /// frontier.
+    #[test]
+    fn initial_spool_sequence_skips_oversized_and_incomplete_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.jsonl");
+        let frame = |seq: u64| format!(r#"{{"version":"enclava-log-frame-v1","sequence":{seq}}}"#);
+        let mut body = Vec::new();
+        // A workload-forged oversized record (well past the scan cap):
+        // newline-terminated garbage, never a writer-produced frame.
+        body.extend(std::iter::repeat_n(
+            b'z',
+            MAX_SPOOL_LINE_BYTES as usize + 4096,
+        ));
+        body.push(b'\n');
+        // A real frame after it — the scan must resume past the skipped
+        // record and still see this one.
+        body.extend_from_slice(frame(42).as_bytes());
+        body.push(b'\n');
+        // A second forged oversized record, then another real frame, then
+        // an in-flight trailing fragment (no newline at EOF).
+        body.extend(std::iter::repeat_n(
+            b'y',
+            MAX_SPOOL_LINE_BYTES as usize + 4096,
+        ));
+        body.push(b'\n');
+        body.extend_from_slice(frame(43).as_bytes());
+        body.push(b'\n');
+        body.extend_from_slice(b"{\"version\":\"enclava-log-frag"); // partial record at EOF
+        std::fs::write(&path, &body).unwrap();
+        let mut spool = open_log_spool(&path).unwrap();
+        // Oversized and incomplete records are skipped; both real frames
+        // are seen; the resume point is the highest real sequence + 1.
+        // (Under the old unbounded scan this fixture buffered the forged
+        // records whole.)
+        assert_eq!(initial_spool_sequence(&mut spool).unwrap(), 44);
+    }
+
+    /// Round-11 review finding (P2): a record whose payload is EXACTLY
+    /// MAX_LOG_RECORD_BYTES followed by `\r\n` — the boundary peek sees
+    /// `\r` (not `\n`), and previously fell through as a capped chunk whose
+    /// next read returned only the `\r\n` remainder. Terminator stripping
+    /// reduced that remainder to an empty buffer which the caller still
+    /// encrypted, fabricating a blank log frame. The two-byte CRLF
+    /// terminator must be recognized and consumed at the boundary.
+    #[test]
+    fn read_capped_record_consumes_crlf_at_exact_chunk_boundary() {
+        let payload = "a".repeat(MAX_LOG_RECORD_BYTES);
+        let input = format!("{payload}\r\nnext\r\n");
+        let mut reader = std::io::BufReader::new(input.as_bytes());
+        let mut pending_cr = false;
+
+        // First read: the full cap of payload with the boundary CRLF
+        // consumed as the record terminator. Round-12: the chunk is still
+        // `capped` — that flag tells the caller "do not strip", and the
+        // payload's last byte may be legitimate content (a `\r` at
+        // position cap-1 would previously have been eaten by the strip).
+        let mut first = Vec::new();
+        let r1 = read_capped_record(&mut reader, &mut first, &mut pending_cr).unwrap();
+        assert_eq!(r1.len, MAX_LOG_RECORD_BYTES);
+        assert!(
+            r1.capped,
+            "boundary-terminated chunk stays capped (no strip)"
+        );
+        assert_eq!(first.as_slice(), payload.as_bytes());
+
+        // Second read is `next\r\n` — NOT the orphaned `\r\n` remainder.
+        let mut second = Vec::new();
+        let r2 = read_capped_record(&mut reader, &mut second, &mut pending_cr).unwrap();
+        assert_eq!(
+            second, b"next\r\n",
+            "no fabricated blank frame before `next`"
+        );
+        assert!(!r2.capped);
+
+        // EOF.
+        let mut third = Vec::new();
+        let r3 = read_capped_record(&mut reader, &mut third, &mut pending_cr).unwrap();
+        assert_eq!(r3.len, 0);
+        assert!(third.is_empty());
+    }
+
+    /// A lone `\r` at the cap boundary (not followed by `\n`) is record
+    /// content, not a terminator — the chunk stays capped (round-5 rule
+    /// still holds under the round-11 CRLF handling).
+    #[test]
+    fn read_capped_record_lone_cr_at_boundary_stays_capped() {
+        let prefix = "a".repeat(MAX_LOG_RECORD_BYTES - 1);
+        let input = format!("{prefix}\rX\n");
+        let mut reader = std::io::BufReader::new(input.as_bytes());
+        let mut pending_cr = false;
+        let mut first = Vec::new();
+        let r1 = read_capped_record(&mut reader, &mut first, &mut pending_cr).unwrap();
+        assert_eq!(r1.len, MAX_LOG_RECORD_BYTES);
+        assert!(r1.capped, "lone CR at the boundary is content, not CRLF");
+        assert_eq!(first.last(), Some(&b'\r'));
+    }
+
+    /// Round-16 self-check P2: a CR parked at the cap boundary when the
+    /// stream ENDS must not come back as a record. The capped chunk was
+    /// already framed without the parked byte, and a trailing CR at EOF is
+    /// the historical cleanup case — one record, trailing CR stripped.
+    /// Returning the parked byte as a CR-only record made the caller's
+    /// strip produce an empty buffer that was still encrypted and appended:
+    /// a fabricated blank frame after every cap-boundary record whose stream
+    /// ended on a lone CR (where the pre-chunker emitted exactly one frame).
+    #[test]
+    fn read_capped_record_pending_cr_at_eof_is_discarded_not_a_record() {
+        let payload = "a".repeat(MAX_LOG_RECORD_BYTES);
+        // Windows: exactly the cap of payload, then the lone `\r` — and the
+        // stream ends (the `X` of the `\rX` content case never comes).
+        let mut reader = ChunkedReader {
+            parts: [payload.clone().into_bytes(), b"\r".to_vec()]
+                .into_iter()
+                .collect(),
+        };
+
+        // First read: the capped chunk; the lone `\r` is parked (it could
+        // still be content per round-5 if a byte follows).
+        let mut pending_cr = false;
+        let mut first = Vec::new();
+        let r1 = read_capped_record(&mut reader, &mut first, &mut pending_cr).unwrap();
+        assert_eq!(r1.len, MAX_LOG_RECORD_BYTES);
+        assert!(r1.capped);
+        assert!(pending_cr);
+        assert_eq!(first.as_slice(), payload.as_bytes());
+
+        // EOF resolution: the parked CR is the historical trailing-CR
+        // cleanup byte — no record (previously len=1, capped=false, which
+        // the caller stripped to empty and encrypted as a blank frame).
+        let mut second = Vec::new();
+        let r2 = read_capped_record(&mut reader, &mut second, &mut pending_cr).unwrap();
+        assert!(r2.terminator_only, "EOF-parked CR must not become a record");
+        assert_eq!(r2.len, 0);
+        assert!(second.is_empty());
+        assert!(!pending_cr);
+
+        // The stream is at EOF.
+        let mut third = Vec::new();
+        let r3 = read_capped_record(&mut reader, &mut third, &mut pending_cr).unwrap();
+        assert_eq!(r3.len, 0);
+        assert!(!r3.terminator_only);
+    }
+
+    /// A `BufRead` whose fill_buf windows are exactly the given parts —
+    /// models a pipe that splits writes at arbitrary boundaries (far
+    /// coarser control than BufReader's fixed 8 KiB coalescing).
+    struct ChunkedReader {
+        parts: std::collections::VecDeque<Vec<u8>>,
+    }
+    impl std::io::Read for ChunkedReader {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.fill_buf()?.len().min(out.len());
+            out[..n].copy_from_slice(&self.fill_buf()?[..n]);
+            self.consume(n);
+            Ok(n)
+        }
+    }
+    impl std::io::BufRead for ChunkedReader {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            while self.parts.front().is_some_and(Vec::is_empty) {
+                self.parts.pop_front();
+            }
+            Ok(self.parts.front().map(|v| v.as_slice()).unwrap_or(&[]))
+        }
+        fn consume(&mut self, n: usize) {
+            if let Some(front) = self.parts.front_mut() {
+                front.drain(..n);
+            }
+        }
+    }
+
+    /// Round-12 review finding (P2, split CRLF at the record cap): when a
+    /// child writes exactly MAX_LOG_RECORD_BYTES of payload and the pipe
+    /// exposes the trailing `\r` before the `\n`, the boundary peek sees
+    /// only a lone `\r` and cannot classify it. The pending-CR state must
+    /// defer the decision to the next call, which resolves the pair into
+    /// a consumed terminator — no fabricated blank frame and no orphaned
+    /// `\r\n` record between the capped chunk and `next`.
+    #[test]
+    fn read_capped_record_handles_split_crlf_at_cap() {
+        let payload = "a".repeat(MAX_LOG_RECORD_BYTES);
+        // Windows: exactly the cap of payload, then the lone `\r`, then
+        // the `\n` and the next record — a pipe that split the CRLF
+        // terminator across writes.
+        let mut reader = ChunkedReader {
+            parts: [
+                payload.clone().into_bytes(),
+                b"\r".to_vec(),
+                b"\nnext\n".to_vec(),
+            ]
+            .into_iter()
+            .collect(),
+        };
+
+        // First read: the capped chunk. The lone `\r` is parked as
+        // pending state (undecidable — it could be content per round-5),
+        // NOT consumed into the record.
+        let mut pending_cr = false;
+        let mut first = Vec::new();
+        let r1 = read_capped_record(&mut reader, &mut first, &mut pending_cr).unwrap();
+        assert_eq!(r1.len, MAX_LOG_RECORD_BYTES);
+        assert!(r1.capped, "undecided boundary CR keeps the chunk capped");
+        assert!(pending_cr, "boundary CR is preserved as pending state");
+        assert_eq!(first.as_slice(), payload.as_bytes());
+        assert!(
+            !first.ends_with(b"\r"),
+            "the CR byte is not record content here"
+        );
+
+        // Second read resolves the pending CR into the CRLF terminator: no
+        // record bytes — the caller just reads on. Previously this call
+        // returned the orphaned `\r\n`, which the caller's strip emptied
+        // and encrypted as a bogus blank frame between the capped record
+        // and `next`.
+        let mut second = Vec::new();
+        let r2 = read_capped_record(&mut reader, &mut second, &mut pending_cr).unwrap();
+        assert!(r2.terminator_only, "pending CR resolves into consumed CRLF");
+        assert!(second.is_empty());
+        assert!(!pending_cr);
+
+        // The stream continues with `next` — no `\r\n` remainder.
+        let mut third = Vec::new();
+        let r3 = read_capped_record(&mut reader, &mut third, &mut pending_cr).unwrap();
+        assert_eq!(third.as_slice(), b"next\n");
+        assert!(!r3.capped);
+        assert!(!r3.terminator_only);
+
+        // EOF.
+        let mut fourth = Vec::new();
+        let r4 = read_capped_record(&mut reader, &mut fourth, &mut pending_cr).unwrap();
+        assert_eq!(r4.len, 0);
+        assert!(!r4.terminator_only);
+    }
+
+    /// Round-5 rule under the round-12 pending-CR machinery: a lone `\r`
+    /// parked at the boundary that turns out to be CONTENT (the next byte
+    /// is not `\n`) must survive verbatim at the head of the next chunk —
+    /// the pending state must neither swallow it nor duplicate it.
+    #[test]
+    fn read_capped_record_pending_cr_resolved_as_content() {
+        let payload = "a".repeat(MAX_LOG_RECORD_BYTES);
+        let input = format!("{payload}\rX\nsecond\n");
+        let mut reader = ChunkedReader {
+            parts: [
+                payload.clone().into_bytes(),
+                b"\r".to_vec(),
+                b"X\nsecond\n".to_vec(),
+            ]
+            .into_iter()
+            .collect(),
+        };
+
+        let mut pending_cr = false;
+        let mut first = Vec::new();
+        let r1 = read_capped_record(&mut reader, &mut first, &mut pending_cr).unwrap();
+        assert_eq!(r1.len, MAX_LOG_RECORD_BYTES);
+        assert!(r1.capped, "undecided CR keeps the chunk capped");
+        assert_eq!(first.as_slice(), payload.as_bytes());
+        assert!(pending_cr);
+
+        // Next window exposes `X...`: the parked CR was content and is
+        // prepended to this chunk — nothing swallowed, nothing replayed.
+        let mut second = Vec::new();
+        let r2 = read_capped_record(&mut reader, &mut second, &mut pending_cr).unwrap();
+        assert!(!r2.terminator_only);
+        assert_eq!(second.as_slice(), b"\rX\n");
+
+        let mut third = Vec::new();
+        let r3 = read_capped_record(&mut reader, &mut third, &mut pending_cr).unwrap();
+        assert_eq!(third.as_slice(), b"second\n");
+        assert!(!r3.terminator_only);
+
+        // Full reassembly preserves the CR byte exactly once.
+        let mut reassembled = first.clone();
+        reassembled.extend_from_slice(&second);
+        reassembled.extend_from_slice(&third);
+        assert_eq!(reassembled, input.as_bytes());
+    }
+
+    /// Round-13 review P2: a CRLF-terminated record with exactly
+    /// cap-1 payload bytes fills the capped buffer with the terminator's
+    /// `\r` and leaves the `\n` just past the cap window. The buffered
+    /// `\r` plus the consumed `\n` are the two-byte terminator: the `\r`
+    /// must be popped, matching what the short-record strip does at every
+    /// other record length (previously the `\r` was encrypted as record
+    /// content, so CLI output differed for the same record at cap-1).
+    #[test]
+    fn read_capped_record_strips_crlf_when_cr_fills_last_cap_byte() {
+        let payload = "a".repeat(MAX_LOG_RECORD_BYTES - 1);
+        let input = format!("{payload}\r\nnext\n");
+        let mut reader = std::io::BufReader::new(input.as_bytes());
+        let mut pending_cr = false;
+        let mut first = Vec::new();
+        let r1 = read_capped_record(&mut reader, &mut first, &mut pending_cr).unwrap();
+        // The buffer held cap bytes (payload + the terminator's CR) and
+        // the pop removed the CR: the record is the cap-1 payload bytes.
+        assert_eq!(r1.len, MAX_LOG_RECORD_BYTES - 1);
+        // The chunk stays `capped` (do-not-strip by the caller) — the
+        // terminator was already removed by read_capped_record itself.
+        assert!(r1.capped);
+        assert_eq!(first.as_slice(), payload.as_bytes());
+        assert_eq!(first.last(), Some(&b'a'), "the terminator CR is stripped");
+
+        // The next record is `next` — no orphaned terminator bytes.
+        let mut second = Vec::new();
+        let r2 = read_capped_record(&mut reader, &mut second, &mut pending_cr).unwrap();
+        assert_eq!(second.as_slice(), b"next\n");
+        assert!(!r2.capped);
+
+        // EOF.
+        let mut third = Vec::new();
+        let r3 = read_capped_record(&mut reader, &mut third, &mut pending_cr).unwrap();
+        assert_eq!(r3.len, 0);
+    }
+
+    /// The boundary-LF pop removes exactly ONE buffered byte — the
+    /// terminator's CR. A record whose CONTENT ends in a CR right before a
+    /// CRLF terminator landing at the boundary keeps that content CR, the
+    /// same content-preservation policy the consume-`\r\n`-at-boundary arm
+    /// pins (round-12): the terminator's own CR is consumed, everything
+    /// before it is record content.
+    #[test]
+    fn read_capped_record_keeps_content_cr_before_boundary_lf() {
+        // Content is cap-1 bytes ending in `\r`; the terminator CRLF
+        // straddles the cap window: its `\r` is the buffer's last byte,
+        // its `\n` is the boundary peek.
+        let payload = format!("{}\r", "a".repeat(MAX_LOG_RECORD_BYTES - 2));
+        let input = format!("{payload}\r\nnext\n");
+        let mut reader = std::io::BufReader::new(input.as_bytes());
+        let mut pending_cr = false;
+        let mut first = Vec::new();
+        let r1 = read_capped_record(&mut reader, &mut first, &mut pending_cr).unwrap();
+        assert_eq!(r1.len, MAX_LOG_RECORD_BYTES - 1);
+        assert!(r1.capped);
+        assert_eq!(
+            first.as_slice(),
+            payload.as_bytes(),
+            "the terminator's CR is popped, the content CR survives"
+        );
+
+        let mut second = Vec::new();
+        let r2 = read_capped_record(&mut reader, &mut second, &mut pending_cr).unwrap();
+        assert_eq!(second.as_slice(), b"next\n");
+        assert!(!r2.capped);
+    }
+
+    /// CR/LF terminators are still stripped from records that ended at a
+    /// real newline (or EOF) — the historical cleanup behavior.
+    #[test]
+    fn read_capped_record_strips_terminators_on_complete_records() {
+        let input = "line-one\nline-two\r\nline-three\r\n";
+        let mut reader = std::io::BufReader::new(input.as_bytes());
+        let mut pending_cr = false;
+        let mut buf = Vec::new();
+        let r1 = read_capped_record(&mut reader, &mut buf, &mut pending_cr).unwrap();
+        assert_eq!(buf, b"line-one\n");
+        assert!(!r1.capped);
+        let r2 = read_capped_record(&mut reader, &mut buf, &mut pending_cr).unwrap();
+        assert_eq!(buf, b"line-two\r\n");
+        assert!(!r2.capped);
+        let r3 = read_capped_record(&mut reader, &mut buf, &mut pending_cr).unwrap();
+        assert_eq!(buf, b"line-three\r\n");
+        assert!(!r3.capped);
+    }
+}
+
+#[cfg(test)]
+mod round19_tests {
+    use super::*;
+    use std::fs::OpenOptions;
+
+    /// Round-19 review P2: rotation temps must be unpredictable AND
+    /// exclusive — the old predictable `<spool>.rotate.<pid>` path let a
+    /// racing workload plant a FIFO that `create(true)` then opened (and
+    /// blocked on) while the spool mutex was held. Now every temp gets a
+    /// fresh random suffix under create_new (O_EXCL), so a pre-planted
+    /// FIFO at any guessed name is simply never opened.
+    #[test]
+    fn rotation_temps_are_random_and_exclusive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.jsonl");
+        let mut spool = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .read(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
+        // Force one rotation and capture the temp name in use.
+        let big = vec![b'x'; LOG_SPOOL_ROTATE_BYTES as usize + 1];
+        spool.write_all(&big).unwrap();
+        let names_before: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        rotate_spool_if_needed(&mut spool, 0, &path).unwrap();
+        let names_after: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        // No leftover temp files remain after a successful rotation.
+        assert!(
+            !names_after.iter().any(|n| n.contains(".rotate.")),
+            "successful rotation must not leave temp files: {names_after:?}"
+        );
+        // And the temp name is not the predictable pid-based one.
+        assert!(
+            !names_before
+                .iter()
+                .chain(names_after.iter())
+                .any(|n| n == &format!("spool.jsonl.rotate.{}", process::id())),
+            "the predictable pid-based temp name must never be used"
+        );
     }
 }

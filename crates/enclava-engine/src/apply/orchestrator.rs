@@ -133,6 +133,17 @@ pub async fn apply_and_watch(
     app: &ConfidentialApp,
     generation: MutationGeneration,
 ) -> Result<DeployStatus, ApplyError> {
+    // Validate at the engine's primary deployment boundary (round-19
+    // review P2): validate_app was only invoked on the API-specific deploy
+    // paths, so a CLI or service calling this public entry directly with
+    // a legacy/corrupt ConfidentialApp could reach Kubernetes with
+    // malformed quantities, domains, egress rules, or log-encryption
+    // metadata. Manifest generation runs on the SAME input, so reject
+    // before generating anything.
+    crate::validate::validate_app(app).map_err(|err| {
+        ApplyError::ManifestGeneration(format!("confidential app validation failed: {err}"))
+    })?;
+
     // Generate manifests
     let manifests = generate_all_manifests(app);
 

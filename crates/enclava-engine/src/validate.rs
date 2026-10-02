@@ -1,3 +1,6 @@
+use enclava_common::log_encryption;
+use enclava_common::validate::validate_fqdn;
+
 use crate::types::ConfidentialApp;
 
 #[derive(Debug, thiserror::Error)]
@@ -28,6 +31,18 @@ pub enum ValidationError {
     SidecarImageNotPinned { name: String, detail: String },
     #[error("verification material exceeds 716800 bytes")]
     VerificationMaterialTooLarge,
+    #[error("resource quantity is invalid: {field} ({detail})")]
+    InvalidResourceQuantity { field: &'static str, detail: String },
+    #[error("storage size is invalid: {field} ({detail})")]
+    InvalidStorageSize { field: &'static str, detail: String },
+    #[error("domain is invalid: {field} ({detail})")]
+    InvalidDomain { field: &'static str, detail: String },
+    #[error("egress_allowlist entry {index} is invalid: {detail}")]
+    InvalidEgressAllowlist { index: usize, detail: String },
+    #[error("attestation pubkey is invalid: {field} ({detail})")]
+    InvalidAttestationPubkey { field: &'static str, detail: String },
+    #[error("log_encryption config is invalid: {0}")]
+    InvalidLogEncryption(String),
 }
 
 /// Validates that a ConfidentialApp spec is well-formed.
@@ -112,6 +127,228 @@ pub fn validate_app(app: &ConfidentialApp) -> Result<(), ValidationError> {
         return Err(ValidationError::VerificationMaterialTooLarge);
     }
 
+    // The engine interpolates resources, storage sizes, domains, egress
+    // rules, and attestation/log-encryption material into Kubernetes
+    // manifests and cc_init_data. The API validates these on admission;
+    // the engine re-validates as defense in depth so a DB write that
+    // bypassed the API (or a future admission gap) cannot reach manifest
+    // generation with malformed values (#138).
+    validate_resource_quantity("cpu", &app.resources.cpu).map_err(|detail| {
+        ValidationError::InvalidResourceQuantity {
+            field: "cpu",
+            detail,
+        }
+    })?;
+    // Memory limits use the same binary Mi/Gi/Ti grammar as storage sizes
+    // (the API's parse_binary_mib), not the CPU millicore grammar, so the
+    // shared binary-quantity validator is reused here; the error is filed
+    // as a resource-quantity error with field "memory" for caller clarity.
+    validate_storage_size("memory", &app.resources.memory).map_err(|detail| {
+        ValidationError::InvalidResourceQuantity {
+            field: "memory",
+            detail: format!("memory uses binary Mi/Gi/Ti units: {detail}"),
+        }
+    })?;
+    validate_storage_size("storage.app_data.size", &app.storage.app_data.size).map_err(
+        |detail| ValidationError::InvalidStorageSize {
+            field: "storage.app_data.size",
+            detail,
+        },
+    )?;
+    validate_storage_size("storage.tls_data.size", &app.storage.tls_data.size).map_err(
+        |detail| ValidationError::InvalidStorageSize {
+            field: "storage.tls_data.size",
+            detail,
+        },
+    )?;
+
+    validate_domain("domain.platform_domain", &app.domain.platform_domain)?;
+    // tee_domain flows into the attestation container's TEE_DOMAIN env and
+    // the TEE TLSRoute hostname, so it gets the same FQDN gate as the other
+    // domains (defense in depth for rows that bypassed API admission).
+    validate_domain("domain.tee_domain", &app.domain.tee_domain)?;
+    if let Some(custom) = app.domain.custom_domain.as_deref() {
+        validate_domain("domain.custom_domain", custom)?;
+    }
+
+    for (index, rule) in app.egress_allowlist.iter().enumerate() {
+        validate_egress_rule(rule)
+            .map_err(|detail| ValidationError::InvalidEgressAllowlist { index, detail })?;
+    }
+
+    validate_attestation_pubkey(
+        "attestation.platform_trustee_policy_pubkey_hex",
+        app.attestation
+            .platform_trustee_policy_pubkey_hex
+            .as_deref(),
+    )?;
+    validate_attestation_pubkey(
+        "attestation.signing_service_pubkey_hex",
+        app.attestation.signing_service_pubkey_hex.as_deref(),
+    )?;
+
+    if let Some(config) = app.log_encryption.as_ref() {
+        log_encryption::validate_public_key(
+            config.key_id.clone(),
+            config.public_key_base64url.clone(),
+            config.public_key_sha256.clone(),
+        )
+        .map_err(|e| ValidationError::InvalidLogEncryption(e.to_string()))?;
+        if config.algorithm != log_encryption::LOG_ENCRYPTION_ALGORITHM {
+            return Err(ValidationError::InvalidLogEncryption(format!(
+                "unsupported algorithm {:?}; expected {:?}",
+                config.algorithm,
+                log_encryption::LOG_ENCRYPTION_ALGORITHM
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// CPU quantity: millicore (`250m`) or whole cores (`1`, `1.5`), matching the
+/// API's `parse_cpu_cores` admission grammar — including the
+/// `ScaledDecimal::parse` digit/scale bounds (≤38 total digits, ≤24
+/// fractional digits, non-zero, no u128 overflow) so values the API would
+/// never persist are rejected here too.
+fn validate_resource_quantity(field: &'static str, value: &str) -> Result<(), String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed != value {
+        return Err(format!("{field} must be a non-empty CPU quantity"));
+    }
+    let numeric = trimmed.strip_suffix('m').unwrap_or(trimmed);
+    validate_scaled_decimal(numeric, 1)
+        .map_err(|_| format!("{field} must be a positive number or millicpu quantity"))
+}
+
+/// Storage/memory binary quantity with an explicit Mi/Gi/Ti (or MiB/GiB/TiB)
+/// suffix, matching the API's `parse_binary_mib` admission grammar. The value
+/// must be a positive number; a bare number without a unit is rejected so the
+/// quota/summing code never silently treats bytes as MiB. The exact-Mi
+/// conversion must not overflow, exactly as the API's `checked_mul` requires.
+fn validate_storage_size(field: &'static str, value: &str) -> Result<(), String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed != value {
+        return Err(format!("{field} must be a non-empty binary quantity"));
+    }
+    // (suffix, multiplier-in-Mi) pairs mirroring the API's parse_binary_mib.
+    const BINARY_UNITS: [(&str, u128); 6] = [
+        ("TiB", 1024 * 1024),
+        ("Ti", 1024 * 1024),
+        ("GiB", 1024),
+        ("Gi", 1024),
+        ("MiB", 1),
+        ("Mi", 1),
+    ];
+    let Some((number, multiplier)) = BINARY_UNITS
+        .iter()
+        .find_map(|(suffix, multiplier)| trimmed.strip_suffix(*suffix).map(|n| (n, *multiplier)))
+    else {
+        return Err(format!("{field} must use Mi, Gi, or Ti binary units"));
+    };
+    validate_scaled_decimal(number, multiplier)
+        .map_err(|_| format!("{field} must be a positive binary quantity"))
+}
+
+/// Digit, scale, and overflow bounds mirroring the API's
+/// `ScaledDecimal::parse` + `checked_mul` (entitlements.rs): plain decimal
+/// grammar, at most 38 total digits, at most 24 fractional digits, non-zero
+/// coefficient, and an exact-Mi conversion (`multiplier`) that must not
+/// overflow u128. f64 parsing would silently admit all of those.
+fn validate_scaled_decimal(number: &str, multiplier: u128) -> Result<(), String> {
+    if !is_plain_decimal(number) {
+        return Err("must be a positive decimal quantity".to_string());
+    }
+    let (integer, fraction) = number.split_once('.').unwrap_or((number, ""));
+    if integer.len() + fraction.len() > 38 || fraction.len() > 24 {
+        return Err("has too much precision".to_string());
+    }
+    let coefficient: u128 = format!("{integer}{fraction}")
+        .parse()
+        .map_err(|_| "is too large".to_string())?;
+    if coefficient == 0 {
+        return Err("must be positive".to_string());
+    }
+    // Mirror `ScaledDecimal::parse`'s trailing-zero normalization
+    // (entitlements.rs `normalized()`) before the exact-Mi multiply: the
+    // API divides trailing zeros out of the coefficient as it lowers the
+    // scale, so `10000000000000.000000000000000000000000Ti` multiplies
+    // 10^13 by 2^20 there — while the raw 38-digit coefficient (10^37)
+    // times 2^20 overflows u128. Without this step the engine gate
+    // rejected quantities the API accepts (round-16 self-check P3).
+    let mut coefficient = coefficient;
+    let mut scale = fraction.len();
+    while scale > 0 && coefficient.is_multiple_of(10) {
+        coefficient /= 10;
+        scale -= 1;
+    }
+    coefficient
+        .checked_mul(multiplier)
+        .ok_or_else(|| "is too large".to_string())?;
+    Ok(())
+}
+
+/// True for plain decimal digits with at most one interior `.` — the grammar
+/// the API's `ScaledDecimal::parse` accepts.
+fn is_plain_decimal(s: &str) -> bool {
+    let mut seen_dot = false;
+    !s.is_empty()
+        && !s.starts_with('.')
+        && !s.ends_with('.')
+        && s.chars().all(|c| match c {
+            '0'..='9' => true,
+            '.' if !seen_dot => {
+                seen_dot = true;
+                true
+            }
+            _ => false,
+        })
+}
+
+fn validate_domain(field: &'static str, value: &str) -> Result<(), ValidationError> {
+    validate_fqdn(value).map_err(|e| ValidationError::InvalidDomain {
+        field,
+        detail: e.to_string(),
+    })
+}
+
+/// Structural egress-rule validation only. The API additionally enforces the
+/// internal-host denylist (localhost, metadata, *.svc, rebinding helpers)
+/// with an operator opt-in env (`enforce_egress_allowlist_host`); that policy
+/// decision stays API-side so the engine does not second-guess operator
+/// opt-outs on rows the API already admitted.
+fn validate_egress_rule(rule: &crate::types::EgressRule) -> Result<(), String> {
+    if rule.host.parse::<std::net::IpAddr>().is_ok() {
+        return Err("host must be a DNS hostname, not an IP address".to_string());
+    }
+    validate_fqdn(&rule.host).map_err(|e| format!("invalid host: {e}"))?;
+    if rule.ports.is_empty() {
+        return Err("ports must not be empty".to_string());
+    }
+    if rule.ports.contains(&0) {
+        return Err("ports must be non-zero".to_string());
+    }
+    Ok(())
+}
+
+/// Optional Ed25519 public key, hex encoded (64 hex chars) when present.
+fn validate_attestation_pubkey(
+    field: &'static str,
+    value: Option<&str>,
+) -> Result<(), ValidationError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if value.len() != 64
+        || !value
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    {
+        return Err(ValidationError::InvalidAttestationPubkey {
+            field,
+            detail: "must be 64 lowercase hex characters (Ed25519 public key)".to_string(),
+        });
+    }
     Ok(())
 }
 
