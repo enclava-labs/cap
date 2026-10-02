@@ -453,6 +453,11 @@ pub async fn rollback(
                 &image_digest,
                 &crate::auth::jwt::public_key_base64(&state.signing_key),
                 signing_service_pubkey_hex,
+                &crate::signing_service::descriptor_platform_binding_for(
+                    &state,
+                    &target_resources.memory_limit,
+                )
+                .map_err(signing_error_response)?,
             )
             .await
             .map_err(signing_error_response)?;
