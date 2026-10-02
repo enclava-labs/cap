@@ -741,6 +741,9 @@ impl TeeClient {
             .decode(quote.report_b64.as_bytes())
             .map_err(|_| TeeError::Attestation("SNP quote report is not base64".to_string()))?;
         let crl_der = fetch_snp_product_crl_der(&report_bytes).await?;
+        let now = u64::try_from(Utc::now().timestamp())
+            .map_err(|_| TeeError::Attestation("system clock is before Unix epoch".to_string()))?;
+        verify_transition_quote_revocation(quote, &crl_der, now)?;
         quote.crl_der_b64 = B64_STANDARD.encode(&crl_der);
         Ok(())
     }
@@ -1983,6 +1986,39 @@ fn ark_is_pinned_to_builtin_root(ark_der: &[u8]) -> bool {
         roots
     });
     pinned.iter().any(|root| root == ark_der)
+}
+
+/// Validate collateral before changing the TEE's seed wrap: the API would
+/// reject expired, revoked, or malformed collateral after that mutation.
+fn verify_transition_quote_revocation(
+    quote: &crate::api_types::TransitionSnpQuote,
+    crl_der: &[u8],
+    now_unix_seconds: u64,
+) -> Result<(), TeeError> {
+    let decode = |field: &str| {
+        B64_STANDARD
+            .decode(field)
+            .map_err(|_| TeeError::Attestation("SNP quote certificate is not base64".to_string()))
+    };
+    let ark = decode(&quote.ark_der_b64)?;
+    let ask = decode(&quote.ask_der_b64)?;
+    let vcek = decode(&quote.vcek_der_b64)?;
+    if !ark_is_pinned_to_builtin_root(&ark) {
+        return Err(TeeError::Attestation(
+            "SNP quote ARK is not a trusted AMD root".to_string(),
+        ));
+    }
+    // Match the API transition gate's 45-day maximum collateral age.
+    enclava_verifier::verify_amd_revocation(
+        &ark,
+        &ask,
+        &vcek,
+        crl_der,
+        now_unix_seconds,
+        3_888_000,
+        &[Sha256::digest(&ark).into()],
+    )
+    .map_err(|error| TeeError::Attestation(format!("AMD revocation check failed: {error}")))
 }
 
 fn amd_kds_base_url() -> String {

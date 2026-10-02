@@ -878,11 +878,11 @@ fn builds_amd_kds_product_crl_url_from_snp_report() {
 
 #[tokio::test]
 #[allow(clippy::await_holding_lock)] // env serialization guard must span the awaits
-async fn complete_transition_quote_crl_fetches_and_attaches_crl() {
-    // The CRL must be attached only on the transition path: point the KDS
-    // base at a local relay serving the (sanitized) live Genoa CRL and
-    // verify the quote's CRL field goes from empty to the relayed DER.
+async fn complete_transition_quote_crl_rejects_invalid_collateral_before_mutation() {
+    // The captured CRL expired on 2026-09-09. Even a successful HTTP fetch
+    // must fail before ownership.rs changes the seed wrap inside the TEE.
     use base64::Engine;
+    use x509_cert::der::{Decode, Encode};
     let _guard = env_lock();
     super::crl_cache_clear_for_tests();
     let fixture = prove_it_live_fixture();
@@ -907,24 +907,51 @@ async fn complete_transition_quote_crl_fetches_and_attaches_crl() {
         attestation_evidence_sha256: "00".repeat(32),
         quote: Some(crate::api_types::TransitionSnpQuote {
             report_b64: base64::engine::general_purpose::STANDARD.encode(&fixture.snp_report),
-            ark_der_b64: String::new(),
-            ask_der_b64: String::new(),
-            vcek_der_b64: String::new(),
+            ark_der_b64: base64::engine::general_purpose::STANDARD.encode(&fixture.ark_der),
+            ask_der_b64: base64::engine::general_purpose::STANDARD.encode(&fixture.ask_der),
+            vcek_der_b64: base64::engine::general_purpose::STANDARD.encode(&fixture.vcek_der),
             crl_der_b64: String::new(),
         }),
     };
 
-    tee.complete_transition_quote_crl(&mut attestation)
-        .await
-        .expect("CRL completion via relay must succeed");
     let quote = attestation.quote.as_ref().expect("quote present");
-    assert_eq!(
-        base64::engine::general_purpose::STANDARD
-            .decode(quote.crl_der_b64.as_bytes())
-            .unwrap(),
-        crl_der,
-        "the relayed product CRL must be attached verbatim"
+    const CAPTURE_TIME: u64 = 1_785_844_800;
+    super::verify_transition_quote_revocation(quote, &crl_der, CAPTURE_TIME)
+        .expect("valid collateral at capture time must pass");
+    for invalid_crl in [&[][..], b"not DER".as_slice()] {
+        assert!(
+            super::verify_transition_quote_revocation(quote, invalid_crl, CAPTURE_TIME).is_err()
+        );
+    }
+    let mut tampered_crl = crl_der.clone();
+    *tampered_crl.last_mut().unwrap() ^= 1;
+    assert!(super::verify_transition_quote_revocation(quote, &tampered_crl, CAPTURE_TIME).is_err());
+    assert!(super::verify_transition_quote_revocation(quote, &crl_der, 1_792_761_600).is_err());
+
+    // The ARK-signed CRL lists the retired ASK's serial. Exercise the same
+    // revoked-serial rejection as the API, independently of wall-clock time.
+    let crl = x509_cert::crl::CertificateList::from_der(&crl_der).unwrap();
+    let mut revoked_ask = x509_cert::Certificate::from_der(&fixture.ask_der).unwrap();
+    revoked_ask.tbs_certificate.serial_number =
+        crl.tbs_cert_list.revoked_certificates.as_ref().unwrap()[0]
+            .serial_number
+            .clone();
+    let mut revoked_quote = quote.clone();
+    revoked_quote.ask_der_b64 =
+        base64::engine::general_purpose::STANDARD.encode(revoked_ask.to_der().unwrap());
+    assert!(
+        super::verify_transition_quote_revocation(&revoked_quote, &crl_der, CAPTURE_TIME)
+            .unwrap_err()
+            .to_string()
+            .contains("ASK is revoked")
     );
+
+    let error = tee
+        .complete_transition_quote_crl(&mut attestation)
+        .await
+        .expect_err("expired CRL must stop the transition before any TEE mutation");
+    assert!(error.to_string().contains("expired"));
+    assert!(attestation.quote.as_ref().unwrap().crl_der_b64.is_empty());
     assert_eq!(requests.load(Ordering::Relaxed), 1);
 
     // Quote-less development evidence cannot satisfy the API's unlock-mode
