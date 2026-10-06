@@ -973,11 +973,32 @@ pub async fn reconcile_signed_policy_once(
 pub async fn reconcile_signed_policy_at_startup(
     state: &crate::state::AppState,
 ) -> Result<(), KbsPolicyReconciliationError> {
+    let mut fence_busy_logged = false;
     loop {
         match reconcile_signed_policy_once(state).await {
             Err(KbsPolicyReconciliationError::Mutation(
-                crate::mutation_leases::MutationLeaseError::Busy,
-            )) => tokio::time::sleep(Duration::from_secs(2)).await,
+                err @ crate::mutation_leases::MutationLeaseError::Busy,
+            )) => {
+                if fence_busy_logged {
+                    tracing::debug!(
+                        %err,
+                        "startup KBS policy reconciliation still waiting on the kbs_policy fence"
+                    );
+                } else {
+                    // Log the Busy arm at least once: while this spins, readiness
+                    // answers 503 and an operator cannot tell a recovering lease
+                    // from a hung reconcile without a disambiguating line.
+                    tracing::warn!(
+                        %err,
+                        error_code = "kbs_policy_fence_busy",
+                        "startup KBS policy reconciliation is waiting on the kbs_policy fence \
+                         (another replica holds it or a dead lease is awaiting its finite \
+                         reclaim); readiness stays pending until it clears"
+                    );
+                    fence_busy_logged = true;
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
             result => return result,
         }
     }
@@ -2136,6 +2157,18 @@ pub fn config_from_env() -> Option<KbsPolicyConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_fence_busy_spin_logs_disambiguation() {
+        // The Busy spin answers readiness with 503 the whole time; without a
+        // logged arm an operator cannot distinguish "recovering lease" from
+        // "hung reconcile" (as it looked during a real roll's ~9-minute reclaim).
+        let source = include_str!("kbs.rs");
+        assert!(
+            source.contains("error_code = \"kbs_policy_fence_busy\""),
+            "the startup kbs_policy fence Busy arm must keep its disambiguating log line"
+        );
+    }
 
     #[test]
     fn reconciliation_error_display_redacts_upstream_detail() {
