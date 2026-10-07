@@ -6,7 +6,7 @@ use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use enclava_cli::api_client::ApiClient;
+use enclava_cli::api_client::{ApiClient, ApiError};
 use enclava_cli::api_types::{UnlockEndpointResponse, UpdateUnlockModeRequest};
 use enclava_cli::app_config::AppConfig;
 use enclava_cli::config::{self, CliPaths};
@@ -110,6 +110,49 @@ async fn resolve_tee_endpoint(
     app_name: &str,
 ) -> Result<UnlockEndpointResponse, Box<dyn std::error::Error>> {
     Ok(api.get_unlock_endpoint(app_name).await?)
+}
+
+/// True only for the hosted placeholder answer (`501 not_implemented_hosted`).
+/// Every other outcome (implemented surface, auth error, unknown app, invalid
+/// transition) belongs to the real flow and must not abort here.
+fn is_unimplemented_hosted(err: &ApiError) -> bool {
+    matches!(
+        err,
+        ApiError::Api {
+            status: 501,
+            code: Some(code),
+            ..
+        } if code == "not_implemented_hosted"
+    )
+}
+
+/// Preflight the unlock-mode change before any TEE mutation. A mode-only
+/// request is side-effect-free on every surface: the CAP transition handler
+/// rejects it `400 transition_receipt required` before any write, and the
+/// hosted placeholder route answers `501 not_implemented_hosted` before auth.
+/// A 501 here therefore means the platform cannot accept the change at all —
+/// fail early instead of leaving the TEE seal half-applied (enclava-paas#189).
+async fn ensure_unlock_mode_change_supported(
+    api: &ApiClient,
+    app_name: &str,
+    mode: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let probe = UpdateUnlockModeRequest {
+        mode: mode.to_string(),
+        transition_receipt: None,
+        transition_attestation: None,
+        customer_descriptor_blob: None,
+        org_keyring_blob: None,
+        signed_policy_artifact: None,
+    };
+    if let Err(err) = api.update_unlock_mode(app_name, &probe).await
+        && is_unimplemented_hosted(&err)
+    {
+        return Err("unlock-mode switching is not implemented on this platform \
+             (the apps route answers not_implemented_hosted); no TEE changes were made"
+            .into());
+    }
+    Ok(())
 }
 
 /// Build an authenticated API client from stored config/credentials.
@@ -733,6 +776,7 @@ pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::erro
         } => {
             let app_name = resolve_app_name(&app)?;
             let (api, paths) = build_api_client()?;
+            ensure_unlock_mode_change_supported(&api, &app_name, "auto-unlock").await?;
             let cli_config = config::load_config(&paths)?;
             let creds = config::load_credentials(&paths)?;
             let app_config = AppConfig::find_and_load()?;
@@ -813,6 +857,7 @@ pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::erro
         } => {
             let app_name = resolve_app_name(&app)?;
             let (api, paths) = build_api_client()?;
+            ensure_unlock_mode_change_supported(&api, &app_name, "password").await?;
             let cli_config = config::load_config(&paths)?;
             let creds = config::load_credentials(&paths)?;
             let app_config = AppConfig::find_and_load()?;
@@ -895,6 +940,54 @@ mod tests {
 
     // Synthetic, publicly-documented BIP39 test vector; never a real secret.
     const SYNTHETIC_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    #[test]
+    fn unimplemented_hosted_classification_is_exact() {
+        // False positives abort a working transition; false negatives leave
+        // the half-applied TEE seal (enclava-paas#189). Pin both directions.
+        let err = |status, code: Option<&str>| ApiError::Api {
+            status,
+            code: code.map(str::to_string),
+            message: String::new(),
+        };
+        assert!(is_unimplemented_hosted(&err(
+            501,
+            Some("not_implemented_hosted")
+        )));
+        assert!(!is_unimplemented_hosted(&err(501, Some("other_code"))));
+        assert!(!is_unimplemented_hosted(&err(501, None)));
+        assert!(!is_unimplemented_hosted(&err(
+            400,
+            Some("not_implemented_hosted")
+        )));
+    }
+
+    #[test]
+    fn unlock_mode_preflight_precedes_the_tee_seal() {
+        let source = include_str!("ownership.rs");
+        assert!(
+            source.contains(
+                "ensure_unlock_mode_change_supported(&api, &app_name, \"auto-unlock\").await?;"
+            ),
+            "the Enable arm must probe before any TEE mutation"
+        );
+        assert!(
+            source.contains(
+                "ensure_unlock_mode_change_supported(&api, &app_name, \"password\").await?;"
+            ),
+            "the Disable arm must probe before any TEE mutation"
+        );
+        let probe = source
+            .find("ensure_unlock_mode_change_supported(&api, &app_name, \"auto-unlock\")")
+            .expect("Enable probe wired");
+        let manifest = source
+            .find("let app_config = AppConfig::find_and_load()?")
+            .expect("manifest load present");
+        assert!(
+            probe < manifest,
+            "the probe must run before the manifest load so a 501 is not masked by a raw file error"
+        );
+    }
 
     #[test]
     fn claim_session_interactivity_matrix() {
