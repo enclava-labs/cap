@@ -973,12 +973,49 @@ pub async fn reconcile_signed_policy_once(
 pub async fn reconcile_signed_policy_at_startup(
     state: &crate::state::AppState,
 ) -> Result<(), KbsPolicyReconciliationError> {
+    let mut fence_busy_logged = false;
+    let mut busy_wait_started: Option<std::time::Instant> = None;
     loop {
         match reconcile_signed_policy_once(state).await {
             Err(KbsPolicyReconciliationError::Mutation(
-                crate::mutation_leases::MutationLeaseError::Busy,
-            )) => tokio::time::sleep(Duration::from_secs(2)).await,
-            result => return result,
+                err @ crate::mutation_leases::MutationLeaseError::Busy,
+            )) => {
+                if fence_busy_logged {
+                    tracing::debug!(
+                        %err,
+                        "startup KBS policy reconciliation still waiting on the kbs_policy fence"
+                    );
+                } else {
+                    // Log the Busy arm at least once: while this spins, readiness
+                    // answers 503 and an operator cannot tell a recovering lease
+                    // from a hung reconcile without a disambiguating line.
+                    tracing::warn!(
+                        %err,
+                        error_code = "kbs_policy_fence_busy",
+                        "startup KBS policy reconciliation is waiting on the kbs_policy fence \
+                         (another replica holds it or a dead lease is awaiting its finite \
+                         reclaim); readiness stays pending until it clears"
+                    );
+                    fence_busy_logged = true;
+                    busy_wait_started = Some(std::time::Instant::now());
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            result => {
+                if fence_busy_logged && result.is_ok() {
+                    // Close the window the WARN opened so an operator can
+                    // correlate the 503 span end-to-end without inferring its
+                    // end from the generic readiness line.
+                    tracing::info!(
+                        error_code = "kbs_policy_fence_busy",
+                        elapsed_secs = busy_wait_started
+                            .map(|started| started.elapsed().as_secs())
+                            .unwrap_or_default(),
+                        "startup KBS policy reconciliation cleared the kbs_policy fence"
+                    );
+                }
+                return result;
+            }
         }
     }
 }
@@ -2136,6 +2173,30 @@ pub fn config_from_env() -> Option<KbsPolicyConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_fence_busy_spin_logs_disambiguation() {
+        // The Busy spin answers readiness with 503 the whole time; without a
+        // logged arm an operator cannot distinguish "recovering lease" from
+        // "hung reconcile" (as it looked during a real roll's ~9-minute reclaim).
+        let source = include_str!("kbs.rs");
+        assert!(
+            source.contains("error_code = \"kbs_policy_fence_busy\""),
+            "the startup kbs_policy fence Busy arm must keep its disambiguating log line"
+        );
+        assert!(
+            source.contains("fence_busy_logged = true"),
+            "the Busy arm must flip its flag so the WARN fires once, not per retry"
+        );
+        assert!(
+            source.contains("still waiting on the kbs_policy fence"),
+            "retries must demote to DEBUG instead of flooding WARN every 2s"
+        );
+        assert!(
+            source.contains("cleared the kbs_policy fence"),
+            "the WARN's window must be closed with an elapsed-time line an operator can correlate"
+        );
+    }
 
     #[test]
     fn reconciliation_error_display_redacts_upstream_detail() {
