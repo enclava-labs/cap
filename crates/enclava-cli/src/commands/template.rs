@@ -892,12 +892,14 @@ async fn ensure_template_app(
         .await
     {
         Ok(app) => Ok(app),
-        // A 409 is the "name already taken" idempotent fallback; if the lookup
-        // then fails, report the original rejection (e.g. a permanent create
-        // refusal), never the fallback's not-found.
+        // A 409 is the "name already taken" idempotent fallback; only a
+        // not-found lookup proves the app absent, and then the original
+        // rejection (e.g. a permanent create refusal) is the real outcome.
+        // Any other lookup failure is the actionable error — propagate it.
         Err(error @ ApiError::Api { status: 409, .. }) => match api.get_app(instance_name).await {
             Ok(app) => Ok(app),
-            Err(_) => Err(error.into()),
+            Err(ApiError::Api { status: 404, .. }) => Err(error.into()),
+            Err(lookup_error) => Err(lookup_error.into()),
         },
         Err(error) => Err(error.into()),
     }
@@ -4426,6 +4428,41 @@ mod tests {
             .await
             .expect("a name-conflict 409 still resolves the existing app");
         assert_eq!(app.id, "app-1");
+        handle.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn template_create_conflict_surfaces_lookup_outage_not_the_conflict() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            for (status_line, body) in [
+                ("404 Not Found", r#"{"error":"app_not_found"}"#),
+                ("409 Conflict", r#"{"error":"app_name_conflict"}"#),
+                (
+                    "503 Service Unavailable",
+                    r#"{"error":"backend_unavailable"}"#,
+                ),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap();
+                let _ = &buf[..n];
+                let response = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+
+        let api = ApiClient::new(&format!("http://{addr}"), Some("test-token".to_string()));
+        let err = ensure_template_app(&api, &hosted_template_with_stable_ssh(), "shell-x", None)
+            .await
+            .expect_err("a failed fallback lookup must surface");
+        let message = err.to_string();
+        assert!(message.contains("backend_unavailable"), "{message}");
+        assert!(!message.contains("app_name_conflict"), "{message}");
         handle.join().unwrap();
     }
 
