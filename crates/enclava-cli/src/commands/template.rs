@@ -897,7 +897,8 @@ async fn ensure_template_app(
         // rejection (e.g. a permanent create refusal) is the real outcome.
         // Any other lookup failure leads (it is the immediate blocker) but
         // the create refusal is kept as context — a permanent rejection and
-        // its remediation must not vanish behind a transient outage.
+        // its remediation must not vanish behind a transient outage (incl.
+        // transport/decode failures, not just HTTP status errors).
         Err(error @ ApiError::Api { status: 409, .. }) => match api.get_app(instance_name).await {
             Ok(app) => Ok(app),
             Err(ApiError::Api { status: 404, .. }) => Err(error.into()),
@@ -910,10 +911,10 @@ async fn ensure_template_app(
                     status,
                     code,
                     message: format!("{message} (earlier create attempt: {error})"),
-                },
-                other => other,
-            }
-            .into()),
+                }
+                .into(),
+                other => format!("{other} (earlier create attempt: {error})").into(),
+            }),
         },
         Err(error) => Err(error.into()),
     }
@@ -4481,6 +4482,44 @@ mod tests {
             "{message}"
         );
         // … but the permanent create refusal and its remediation survive as context.
+        assert!(message.contains("stale_owner_seed"), "{message}");
+        assert!(message.contains("erase the stale owner seed"), "{message}");
+        handle.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn template_create_refusal_context_survives_transport_failures() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            for (status_line, body) in [
+                ("404 Not Found", Some(r#"{"error":"app_not_found"}"#)),
+                ("409 Conflict", Some(r#"{"error":"stale_owner_seed"}"#)),
+                // Third connection: accept and drop — a transport failure,
+                // not an HTTP status error.
+                ("", None),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap();
+                let _ = &buf[..n];
+                if let Some(body) = body {
+                    let response = format!(
+                        "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).unwrap();
+                }
+            }
+        });
+
+        let api = ApiClient::new(&format!("http://{addr}"), Some("test-token".to_string()));
+        let err = ensure_template_app(&api, &hosted_template_with_stable_ssh(), "shell-x", None)
+            .await
+            .expect_err("a transport-failed fallback lookup must surface");
+        let message = err.to_string();
+        assert!(message.starts_with("HTTP error:"), "{message}");
+        assert!(message.contains("earlier create attempt"), "{message}");
         assert!(message.contains("stale_owner_seed"), "{message}");
         assert!(message.contains("erase the stale owner seed"), "{message}");
         handle.join().unwrap();
