@@ -987,6 +987,13 @@ fn compose_api_error(status_code: u16, body: ApiErrorBody) -> (Option<String>, S
     if let Some(retry_after) = body.retry_after {
         message = format!("{message} (retry after ~{retry_after}s)");
     }
+    // The hosted sanitizer drops provider message text by design, so this one
+    // known code carries its remediation client-side.
+    if code.as_deref() == Some("stale_owner_seed") {
+        message = format!(
+            "{message} (a previous instance's teardown is incomplete: ask the platform operator to erase the stale owner seed in KBS and clear the recorded waiver, or choose a different app name)"
+        );
+    }
     if prefixed {
         (code, format!("{label}: {message}"))
     } else {
@@ -1023,6 +1030,18 @@ mod tests {
         let (code, message) = compose_api_error(409, body);
         assert_eq!(code.as_deref(), Some("idempotency_request_in_progress"));
         assert_eq!(message, "idempotency_request_in_progress");
+    }
+
+    #[test]
+    fn api_error_message_carries_stale_seed_remediation() {
+        let body: ApiErrorBody = serde_json::from_value(serde_json::json!({
+            "error": "stale_owner_seed"
+        }))
+        .expect("stale-seed body decodes");
+        let (code, message) = compose_api_error(409, body);
+        assert_eq!(code.as_deref(), Some("stale_owner_seed"));
+        assert!(message.starts_with("stale_owner_seed"), "{message}");
+        assert!(message.contains("erase the stale owner seed"), "{message}");
     }
 
     #[test]
