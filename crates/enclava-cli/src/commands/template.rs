@@ -895,11 +895,25 @@ async fn ensure_template_app(
         // A 409 is the "name already taken" idempotent fallback; only a
         // not-found lookup proves the app absent, and then the original
         // rejection (e.g. a permanent create refusal) is the real outcome.
-        // Any other lookup failure is the actionable error — propagate it.
+        // Any other lookup failure leads (it is the immediate blocker) but
+        // the create refusal is kept as context — a permanent rejection and
+        // its remediation must not vanish behind a transient outage.
         Err(error @ ApiError::Api { status: 409, .. }) => match api.get_app(instance_name).await {
             Ok(app) => Ok(app),
             Err(ApiError::Api { status: 404, .. }) => Err(error.into()),
-            Err(lookup_error) => Err(lookup_error.into()),
+            Err(lookup_error) => Err(match lookup_error {
+                ApiError::Api {
+                    status,
+                    code,
+                    message,
+                } => ApiError::Api {
+                    status,
+                    code,
+                    message: format!("{message} (earlier create attempt: {error})"),
+                },
+                other => other,
+            }
+            .into()),
         },
         Err(error) => Err(error.into()),
     }
@@ -4432,13 +4446,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn template_create_conflict_surfaces_lookup_outage_not_the_conflict() {
+    async fn template_create_refusal_surfaces_lookup_outage_with_refusal_context() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = std::thread::spawn(move || {
             for (status_line, body) in [
                 ("404 Not Found", r#"{"error":"app_not_found"}"#),
-                ("409 Conflict", r#"{"error":"app_name_conflict"}"#),
+                ("409 Conflict", r#"{"error":"stale_owner_seed"}"#),
                 (
                     "503 Service Unavailable",
                     r#"{"error":"backend_unavailable"}"#,
@@ -4461,8 +4475,14 @@ mod tests {
             .await
             .expect_err("a failed fallback lookup must surface");
         let message = err.to_string();
-        assert!(message.contains("backend_unavailable"), "{message}");
-        assert!(!message.contains("app_name_conflict"), "{message}");
+        // The lookup outage leads (it is the immediate blocker) …
+        assert!(
+            message.starts_with("API error (503): backend_unavailable"),
+            "{message}"
+        );
+        // … but the permanent create refusal and its remediation survive as context.
+        assert!(message.contains("stale_owner_seed"), "{message}");
+        assert!(message.contains("erase the stale owner seed"), "{message}");
         handle.join().unwrap();
     }
 
