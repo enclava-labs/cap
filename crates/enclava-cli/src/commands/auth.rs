@@ -125,6 +125,42 @@ fn no_supported_method_error(discovery: Option<&AuthDiscoveryResponse>, action: 
     }
 }
 
+/// Build the NIP-98 HTTP Auth event (kind 27235) for one login attempt.
+///
+/// Every attempt carries a fresh random `nonce` tag so that re-signing
+/// within the same second after a burned event id — a retry after a lost
+/// response or a failed later login step — produces a distinct event id
+/// instead of colliding with the one the server already recorded as
+/// consumed. Without per-attempt entropy, the same key + same tags + same
+/// `created_at` second re-derive the identical id and the retry is rejected
+/// as a replay (#116).
+fn build_nip98_login_event(
+    keys: &nostr::Keys,
+    api_url: &str,
+    created_at: nostr::Timestamp,
+) -> Result<nostr::Event, String> {
+    use rand::RngCore;
+    let mut nonce = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+
+    nostr::EventBuilder::new(nostr::Kind::HttpAuth, "")
+        .tag(
+            nostr::Tag::parse(["u".to_string(), api_url.to_string()])
+                .map_err(|e| format!("tag error: {e}"))?,
+        )
+        .tag(
+            nostr::Tag::parse(["method".to_string(), "POST".to_string()])
+                .map_err(|e| format!("tag error: {e}"))?,
+        )
+        .tag(
+            nostr::Tag::parse(["nonce".to_string(), hex::encode(nonce)])
+                .map_err(|e| format!("tag error: {e}"))?,
+        )
+        .custom_created_at(created_at)
+        .sign_with_keys(keys)
+        .map_err(|e| format!("failed to sign NIP-98 event: {e}"))
+}
+
 pub async fn signup() -> Result<(), Box<dyn std::error::Error>> {
     let paths = CliPaths::resolve()?;
     let cli_config = config::load_config(&paths)?;
@@ -295,17 +331,7 @@ pub async fn login(args: LoginArgs) -> Result<(), Box<dyn std::error::Error>> {
 
         // Construct NIP-98 HTTP Auth event (kind 27235)
         let api_url = client.auth_login_url();
-        let event = nostr::EventBuilder::new(nostr::Kind::HttpAuth, "")
-            .tag(
-                nostr::Tag::parse(["u".to_string(), api_url])
-                    .map_err(|e| format!("tag error: {e}"))?,
-            )
-            .tag(
-                nostr::Tag::parse(["method".to_string(), "POST".to_string()])
-                    .map_err(|e| format!("tag error: {e}"))?,
-            )
-            .sign_with_keys(&keys)
-            .map_err(|e| format!("failed to sign NIP-98 event: {e}"))?;
+        let event = build_nip98_login_event(&keys, &api_url, nostr::Timestamp::now())?;
 
         let signed_event_json = nostr::JsonUtil::as_json(&event);
 
@@ -555,7 +581,8 @@ mod tests {
     use super::{
         ApiClient, ApiError, AuthDiscoveryResponse, LoginArgs, auth_api_url,
         auth_discovery_or_legacy, auth_method_error, browser_safe_device_url,
-        default_uses_device_login, device_login, no_supported_method_error, supported_methods,
+        build_nip98_login_event, default_uses_device_login, device_login,
+        no_supported_method_error, supported_methods,
     };
     use enclava_cli::config::{self, CliConfig, CliPaths};
     use std::io::{Read, Write};
@@ -794,6 +821,41 @@ mod tests {
                 .to_ascii_lowercase()
                 .contains("authorization: bearer redeemed-token")
         );
+    }
+
+    /// Regression test for #116 retry usability: re-signing a login event
+    /// within the same second (a retry after a lost response or a failed
+    /// later login step) must yield a fresh event id — the server has
+    /// already burned the previous one. The per-attempt `nonce` tag is what
+    /// breaks the id collision.
+    #[test]
+    fn nip98_login_event_gives_same_second_retry_a_fresh_event_id() {
+        let keys = nostr::Keys::generate();
+        let created = nostr::Timestamp::now();
+        let url = "https://api.example/auth/login";
+
+        let first = build_nip98_login_event(&keys, url, created).unwrap();
+        let retry = build_nip98_login_event(&keys, url, created).unwrap();
+
+        assert_eq!(first.created_at, retry.created_at);
+        assert_ne!(
+            first.id, retry.id,
+            "re-signing in the same second must not reproduce a burned event id"
+        );
+
+        let nonce = |event: &nostr::Event| {
+            event
+                .tags
+                .iter()
+                .find(|t| t.kind().as_str() == "nonce")
+                .and_then(|t| t.content().map(str::to_string))
+                .expect("each attempt must carry a nonce tag")
+        };
+        assert_ne!(nonce(&first), nonce(&retry));
+
+        // The retry must remain a valid, verifiable NIP-98 event for the
+        // same request binding.
+        retry.verify().expect("re-signed event must verify");
     }
 
     #[test]
