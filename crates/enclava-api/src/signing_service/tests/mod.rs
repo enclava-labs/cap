@@ -95,7 +95,7 @@ fn descriptor() -> DeploymentDescriptor {
             independent_verification: true,
             expected_firmware_measurement: [3; 32].into(),
             expected_runtime_class: "kata-qemu-snp".to_string(),
-            kbs_resource_path: "default/cap-abcd1234-demo-owner".to_string(),
+            kbs_resource_path: "default/cap-abcd1234-demo-demo-owner/seed-encrypted".to_string(),
             unlock_mode: "password".to_string(),
             policy_template_id: "enclava-kbs-policy-v1".to_string(),
             policy_template_sha256: [4; 32],
@@ -108,6 +108,25 @@ fn descriptor() -> DeploymentDescriptor {
             expected_kbs_policy_hash: Sha256::digest(b"package policy\n\ndefault allow := false\n")
                 .into(),
         }
+}
+
+/// Platform binding matching the fixture descriptor: the sidecar digests and
+/// runtime class this fake platform runs, mirroring how a real API instance
+/// derives them from its attestation config and platform release.
+fn platform_binding() -> DescriptorPlatformBinding {
+    DescriptorPlatformBinding {
+        platform_release_version: Some("cap-test".to_string()),
+        policy_template_id: Some("enclava-kbs-policy-v1".to_string()),
+        policy_template_sha256: Some([4; 32]),
+        expected_firmware_measurement: Some([3; 32]),
+        expected_runtime_class: Some("kata-qemu-snp".to_string()),
+        attestation_proxy_digest: Some(
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111".to_string(),
+        ),
+        caddy_digest: Some(
+            "sha256:2222222222222222222222222222222222222222222222222222222222222222".to_string(),
+        ),
+    }
 }
 
 fn signing_artifacts(descriptor: DeploymentDescriptor) -> DeploymentSigningArtifacts {
@@ -268,6 +287,7 @@ fn rejects_descriptor_unlock_mode_that_does_not_match_app() {
             &app,
             &descriptor.image_digest,
             &descriptor.api_signing_pubkey,
+            &platform_binding(),
         )
         .unwrap_err();
 
@@ -281,7 +301,12 @@ fn rejects_descriptor_for_different_api_signing_key() {
     let app = api_app_for_descriptor(&descriptor, crate::models::UnlockMode::Password);
 
     let err = artifacts
-        .validate_deployment_inputs(&app, &descriptor.image_digest, "other-api-signing-pubkey")
+        .validate_deployment_inputs(
+            &app,
+            &descriptor.image_digest,
+            "other-api-signing-pubkey",
+            &platform_binding(),
+        )
         .unwrap_err();
 
     assert!(matches!(err, SigningServiceError::Mismatch(field) if field == "api_signing_pubkey"));
@@ -299,6 +324,7 @@ fn rejects_descriptor_without_independent_verification_contract() {
             &app,
             &descriptor.image_digest,
             &descriptor.api_signing_pubkey,
+            &platform_binding(),
         )
         .unwrap_err();
 
@@ -319,6 +345,7 @@ fn rejects_descriptor_for_different_app_signer_and_image() {
             &app,
             &descriptor.image_digest,
             &descriptor.api_signing_pubkey,
+            &platform_binding(),
         )
         .unwrap_err();
     assert!(matches!(err, SigningServiceError::Mismatch(field) if field == "app_id"));
@@ -330,6 +357,7 @@ fn rejects_descriptor_for_different_app_signer_and_image() {
             &app,
             &descriptor.image_digest,
             &descriptor.api_signing_pubkey,
+            &platform_binding(),
         )
         .unwrap_err();
     assert!(
@@ -341,6 +369,7 @@ fn rejects_descriptor_for_different_app_signer_and_image() {
             &app,
             "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
             &descriptor.api_signing_pubkey,
+            &platform_binding(),
         )
         .unwrap_err();
     assert!(matches!(err, SigningServiceError::Mismatch(field) if field == "image_digest"));
@@ -358,12 +387,274 @@ fn rejects_descriptor_without_workload_command() {
             &app,
             &descriptor.image_digest,
             &descriptor.api_signing_pubkey,
+            &platform_binding(),
         )
         .unwrap_err();
 
     assert!(
         matches!(err, SigningServiceError::Mismatch(field) if field == "oci_runtime_spec.args")
     );
+}
+
+#[test]
+fn accepts_descriptor_matching_platform_binding() {
+    let descriptor = descriptor();
+    let artifacts = signing_artifacts(descriptor.clone());
+    let app = api_app_for_descriptor(&descriptor, crate::models::UnlockMode::Password);
+
+    artifacts
+        .validate_deployment_inputs(
+            &app,
+            &descriptor.image_digest,
+            &descriptor.api_signing_pubkey,
+            &platform_binding(),
+        )
+        .expect("descriptor matching the app row and platform binding validates");
+}
+
+#[test]
+fn rejects_descriptor_platform_fields_not_matching_platform_runtime() {
+    let base = descriptor();
+    let app = api_app_for_descriptor(&base, crate::models::UnlockMode::Password);
+    type DescriptorMutation = Box<dyn Fn(&mut DeploymentDescriptor)>;
+    let cases: Vec<(&'static str, DescriptorMutation)> = vec![
+        (
+            "platform_release_version",
+            Box::new(|d: &mut DeploymentDescriptor| d.platform_release_version = "old".into()),
+        ),
+        (
+            "policy_template_id",
+            Box::new(|d: &mut DeploymentDescriptor| d.policy_template_id = "other".into()),
+        ),
+        (
+            "policy_template_sha256",
+            Box::new(|d: &mut DeploymentDescriptor| d.policy_template_sha256 = [0xee; 32]),
+        ),
+        (
+            "expected_firmware_measurement",
+            Box::new(|d: &mut DeploymentDescriptor| {
+                d.expected_firmware_measurement = [0xee; 32].into();
+            }),
+        ),
+        (
+            "expected_runtime_class",
+            Box::new(|d: &mut DeploymentDescriptor| {
+                d.expected_runtime_class = "kata-qemu-coco-dev".into();
+            }),
+        ),
+        (
+            "sidecars.attestation_proxy_digest",
+            Box::new(|d: &mut DeploymentDescriptor| {
+                d.sidecars.attestation_proxy_digest =
+                    "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                        .into();
+            }),
+        ),
+        (
+            "sidecars.caddy_digest",
+            Box::new(|d: &mut DeploymentDescriptor| {
+                d.sidecars.caddy_digest =
+                    "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                        .into();
+            }),
+        ),
+        (
+            "kbs_resource_path",
+            Box::new(|d: &mut DeploymentDescriptor| {
+                // Point at another app's owner resources.
+                d.kbs_resource_path = "default/cap-abcd1234-victim-owner/seed-encrypted".into();
+            }),
+        ),
+    ];
+    for (expected_field, mutate) in cases {
+        let mut descriptor = base.clone();
+        mutate(&mut descriptor);
+        let artifacts = signing_artifacts(descriptor.clone());
+        let err = artifacts
+            .validate_deployment_inputs(
+                &app,
+                &descriptor.image_digest,
+                &descriptor.api_signing_pubkey,
+                &platform_binding(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&err, SigningServiceError::Mismatch(field) if field == expected_field),
+            "expected Mismatch({expected_field}), got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn rejects_descriptor_custom_domains_not_matching_app_row() {
+    let mut descriptor = descriptor();
+    descriptor.custom_domains = vec!["app.example.com".to_string()];
+    let artifacts = signing_artifacts(descriptor.clone());
+    let app = api_app_for_descriptor(&descriptor, crate::models::UnlockMode::Password);
+
+    let err = artifacts
+        .validate_deployment_inputs(
+            &app,
+            &descriptor.image_digest,
+            &descriptor.api_signing_pubkey,
+            &platform_binding(),
+        )
+        .unwrap_err();
+    assert!(matches!(err, SigningServiceError::Mismatch(field) if field == "custom_domains"));
+
+    // The same descriptor is accepted once the app row carries the domain.
+    let mut app_with_domain = app;
+    app_with_domain.custom_domain = Some("app.example.com".to_string());
+    signing_artifacts(descriptor.clone())
+        .validate_deployment_inputs(
+            &app_with_domain,
+            &descriptor.image_digest,
+            &descriptor.api_signing_pubkey,
+            &platform_binding(),
+        )
+        .expect("descriptor custom domain matching the app row validates");
+
+    // Pin the empty-string semantics: the CLI signer maps a Some("") app row
+    // to custom_domains [""] (no empty filter), so [] must not match it.
+    // Guards against reintroducing a filter that would silently accept a
+    // descriptor whose custom_domains list is empty.
+    let mut app_empty_domain =
+        api_app_for_descriptor(&descriptor, crate::models::UnlockMode::Password);
+    app_empty_domain.custom_domain = Some(String::new());
+    let mut empty_list_descriptor = descriptor.clone();
+    empty_list_descriptor.custom_domains = Vec::new();
+    let err = signing_artifacts(empty_list_descriptor)
+        .validate_deployment_inputs(
+            &app_empty_domain,
+            &descriptor.image_digest,
+            &descriptor.api_signing_pubkey,
+            &platform_binding(),
+        )
+        .unwrap_err();
+    assert!(matches!(err, SigningServiceError::Mismatch(field) if field == "custom_domains"));
+}
+
+#[test]
+fn rejects_full_width_firmware_measurement_under_v1_release() {
+    // The v1 platform release carries a 32-byte measurement; a v2 descriptor
+    // with a 48-byte measurement must be rejected (fail-closed) until the
+    // release format grows a full-width value and an explicit width policy.
+    let mut descriptor = descriptor();
+    descriptor.expected_firmware_measurement =
+        enclava_common::descriptor::FirmwareMeasurement::Full([3; 48]);
+    let artifacts = signing_artifacts(descriptor.clone());
+    let app = api_app_for_descriptor(&descriptor, crate::models::UnlockMode::Password);
+
+    let err = artifacts
+        .validate_deployment_inputs(
+            &app,
+            &descriptor.image_digest,
+            &descriptor.api_signing_pubkey,
+            &platform_binding(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(&err, SigningServiceError::Mismatch(field) if field == "expected_firmware_measurement"),
+        "48-byte measurement must not silently match the 32-byte release prefix, got {err:?}"
+    );
+}
+
+fn test_platform_release() -> crate::platform_release::PlatformRelease {
+    serde_json::from_str::<crate::platform_release::PlatformReleaseEnvelope>(include_str!(
+        "../../../../enclava-cli/platform-release.json"
+    ))
+    .unwrap()
+    .payload
+}
+
+fn test_attestation_config() -> AttestationConfig {
+    AttestationConfig {
+        proxy_image: ImageRef::parse(
+            "ghcr.io/enclava-labs/attestation-proxy@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .unwrap(),
+        caddy_image: ImageRef::parse(
+            "ghcr.io/enclava-labs/caddy-ingress@sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        )
+        .unwrap(),
+        acme_ca_url: enclava_engine::types::default_acme_ca_url(),
+        caddy_tls_mode: enclava_engine::types::CaddyTlsMode::Acme,
+        trustee_policy_read_available: true,
+        workload_artifacts_url: None,
+        tls_certificate_broker_url: None,
+        amd_kds_base_url: None,
+        trustee_policy_url: None,
+        local_workload_artifacts_json: None,
+        local_trustee_policy_json: None,
+        platform_trustee_policy_pubkey_hex: None,
+        signing_service_pubkey_hex: None,
+        verification_material: None,
+    }
+}
+
+#[test]
+fn from_runtime_resolves_sidecar_and_release_fields() {
+    let release = test_platform_release();
+    let attestation = test_attestation_config();
+    let binding =
+        DescriptorPlatformBinding::from_runtime(Some(&release), Some(&attestation), "1Gi").unwrap();
+    assert_eq!(
+        binding.attestation_proxy_digest.as_deref(),
+        Some(attestation.proxy_image.digest())
+    );
+    assert_eq!(
+        binding.caddy_digest.as_deref(),
+        Some(attestation.caddy_image.digest())
+    );
+    assert_eq!(
+        binding.platform_release_version.as_deref(),
+        Some(release.platform_release_version.as_str())
+    );
+    assert_eq!(
+        binding.policy_template_sha256,
+        Some(release.policy_template_sha256_bytes().unwrap())
+    );
+    // 1Gi is a standard shape: the release default class applies.
+    assert_eq!(
+        binding.expected_runtime_class.as_deref(),
+        Some(release.expected_runtime_class.as_str())
+    );
+}
+
+#[test]
+fn from_runtime_small_memory_limit_selects_small_runtime_class() {
+    let release = test_platform_release();
+    let binding = DescriptorPlatformBinding::from_runtime(Some(&release), None, "256Mi").unwrap();
+    assert_eq!(
+        binding.expected_runtime_class.as_deref(),
+        Some(enclava_engine::manifest::shape::SMALL_RUNTIME_CLASS)
+    );
+    // No attestation config: sidecar digests are skipped, release fields stay.
+    assert_eq!(binding.attestation_proxy_digest, None);
+    assert_eq!(binding.caddy_digest, None);
+    assert_eq!(
+        binding.platform_release_version.as_deref(),
+        Some(release.platform_release_version.as_str())
+    );
+}
+
+#[test]
+fn platform_binding_skips_unconfigured_fields() {
+    let descriptor = descriptor();
+    let artifacts = signing_artifacts(descriptor.clone());
+    let app = api_app_for_descriptor(&descriptor, crate::models::UnlockMode::Password);
+
+    // No platform release and no attestation config: only the canonical
+    // kbs_resource_path check applies; the hand-rolled descriptor still
+    // passes because its path is canonical.
+    artifacts
+        .validate_deployment_inputs(
+            &app,
+            &descriptor.image_digest,
+            &descriptor.api_signing_pubkey,
+            &DescriptorPlatformBinding::default(),
+        )
+        .expect("unconfigured platform fields are skipped, canonical path still enforced");
 }
 
 #[test]
