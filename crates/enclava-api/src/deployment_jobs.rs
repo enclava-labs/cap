@@ -59,16 +59,27 @@ pub fn customer_config_roll_hold_applies(
     }
 }
 
-/// The open hold's stored expiry while this deployment's roll is still
-/// waiting for the handshake. `None` when the roll is not held. The returned
-/// timestamp is the authority CAP set at accept time; a lost-response retry
-/// must reuse it instead of budgeting a fresh window from the retry.
-pub async fn customer_config_open_hold_until(
+/// The open hold's deadline state while this deployment's roll is still
+/// waiting for the handshake. `until` is the stored authority set at accept
+/// time — a lost-response retry replays it instead of budgeting a fresh
+/// window — and `remaining_ms` is recomputed from the database clock at
+/// response time so a client can derive a monotonic deadline without
+/// trusting its own wall clock. `remaining_ms` is negative once the stored
+/// expiry has passed.
+#[derive(Debug, Clone, Copy)]
+pub struct CustomerConfigOpenHold {
+    pub until: chrono::DateTime<chrono::Utc>,
+    pub remaining_ms: i64,
+}
+
+pub async fn customer_config_open_hold(
     pool: &PgPool,
     deployment_id: Uuid,
-) -> Result<Option<chrono::DateTime<chrono::Utc>>, sqlx::Error> {
-    sqlx::query_scalar(
-        "SELECT customer_config_hold_until
+) -> Result<Option<CustomerConfigOpenHold>, sqlx::Error> {
+    sqlx::query_as::<_, (Option<chrono::DateTime<chrono::Utc>>, Option<f64>)>(
+        "SELECT customer_config_hold_until,
+                FLOOR(EXTRACT(EPOCH FROM (customer_config_hold_until
+                        - clock_timestamp())) * 1000)::float8
            FROM deployment_apply_jobs
           WHERE deployment_id = $1
             AND customer_config_hold
@@ -78,7 +89,16 @@ pub async fn customer_config_open_hold_until(
     .bind(deployment_id)
     .fetch_optional(pool)
     .await
-    .map(|row| row.flatten())
+    .map(|row| {
+        row.and_then(|(until, remaining)| {
+            Some(CustomerConfigOpenHold {
+                until: until?,
+                // The hold check above guarantees a finite expiry; saturate
+                // at the f64->i64 conversion boundary instead of panicking.
+                remaining_ms: remaining.unwrap_or(0.0) as i64,
+            })
+        })
+    })
 }
 
 /// Clamp a caller-requested hold. `None` and zero mean the roll starts
@@ -4635,10 +4655,18 @@ mod tests {
             .await
             .expect("claim while held");
         assert!(claimed.is_none(), "an unreleased hold must not start setup");
-        let open_until = customer_config_open_hold_until(&pool, deployment_id)
+        let open_hold = customer_config_open_hold(&pool, deployment_id)
             .await
-            .expect("read open hold");
-        assert!(open_until.is_some(), "an armed hold must expose its expiry");
+            .expect("read open hold")
+            .expect("an armed hold must expose its expiry");
+        // The deadline state pairs the stored expiry with a live database
+        // remainder inside the armed window (the fixture armed one hour).
+        assert!(open_hold.until > chrono::Utc::now());
+        assert!(open_hold.remaining_ms > 0);
+        assert!(
+            open_hold.remaining_ms <= 3_600_000,
+            "remaining must not exceed the armed hour"
+        );
 
         let release = release_customer_config_hold(&pool, app.org_id, deployment_id)
             .await

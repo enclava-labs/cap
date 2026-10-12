@@ -403,6 +403,11 @@ pub struct TemplateInstanceResponse {
     /// window, so retry deadlines must derive from it.
     #[serde(default)]
     pub customer_config_hold_until: Option<String>,
+    /// Milliseconds left on the stored hold, computed on CAP's database
+    /// clock at response time. Derive monotonic deadlines from this instead
+    /// of subtracting wall clocks; zero or negative means already expired.
+    #[serde(default)]
+    pub customer_config_hold_remaining_ms: Option<i64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
