@@ -921,6 +921,53 @@ fn genpolicy_sized_agent_policy_passes_ingress_decode_caps_and_budgets() {
 }
 
 #[test]
+fn base64_artifact_form_decodes_within_the_payload_budget() {
+    // decode_json_blob accepts the base64 form and must bound the DECODED
+    // payload: the 4/3 encoded-input inflation must not reject a valid
+    // near-cap artifact (#213 review).
+    use base64::Engine as _;
+    let artifacts = signing_artifacts(descriptor());
+    let mut artifact = signed_policy_artifact(&artifacts, &SigningKey::from_bytes(&[0x23; 32]));
+    artifact.agent_policy_text = "a".repeat(MAX_POLICY_TEXT_BYTES);
+    artifact.rego_text = "r".repeat(MAX_REGO_TEXT_BYTES);
+    let raw = serde_json::to_string(&artifact).unwrap();
+    assert!(raw.len() < super::keyring::MAX_SIGNED_POLICY_ARTIFACT_BLOB_BYTES);
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&raw);
+    assert!(
+        encoded.len() > super::keyring::MAX_SIGNED_POLICY_ARTIFACT_BLOB_BYTES,
+        "test must exercise the encoded-input inflation case"
+    );
+    let decoded = decode_optional_policy_artifact(Some(encoded))
+        .unwrap()
+        .unwrap();
+    assert_eq!(decoded.agent_policy_text.len(), MAX_POLICY_TEXT_BYTES);
+}
+
+#[test]
+// Pin canary: assertions are constant by design — they fail CI if a cap is
+// recalibrated below the measured generator output (#212).
+#[allow(clippy::assertions_on_constants)]
+fn measured_genpolicy_size_class_fits_the_caps() {
+    // Recalibration trigger: the signing service's genpolicy output
+    // (kata-containers/genpolicy 3.28.0) measured 116,287 / 116,963 raw
+    // bytes (~125 KiB JSON-escaped) on two unrelated apps, and the
+    // serialized artifact measured 133,947 bytes. Shrinking a cap below
+    // these would reject the platform's own generator output again (#212).
+    // Generator-side growth detection belongs in the signing service's
+    // tests, where genpolicy runs.
+    assert!(
+        MAX_POLICY_TEXT_BYTES >= 125_058,
+        "agent policy cap {} is below the measured genpolicy escaped size 125058",
+        MAX_POLICY_TEXT_BYTES
+    );
+    assert!(
+        super::keyring::MAX_SIGNED_POLICY_ARTIFACT_BLOB_BYTES >= 133_947,
+        "artifact blob cap {} is below the measured serialized artifact size 133947",
+        super::keyring::MAX_SIGNED_POLICY_ARTIFACT_BLOB_BYTES
+    );
+}
+
+#[test]
 fn legacy_padded_stored_artifact_is_rejected_at_dispatch() {
     // #128 review follow-up (Codex P2): a legacy row whose stored
     // signed_policy_artifact carries unknown-field padding inside

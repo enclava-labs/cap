@@ -94,7 +94,16 @@ pub(super) fn decode_json_blob<T: for<'de> Deserialize<'de>>(
     if trimmed.is_empty() {
         return Err(SigningServiceError::Blob(format!("{name} is required")));
     }
-    if trimmed.len() > max_bytes {
+    // The cap bounds the DECODED payload; the base64 form (supported below)
+    // inflates the input by up to 4/3, so the encoded form gets the
+    // proportional allowance instead of rejecting a valid decoded payload
+    // (#213 review). JSON blobs start with '{', base64 never does.
+    let input_cap = if trimmed.starts_with('{') {
+        max_bytes
+    } else {
+        (max_bytes / 3 + 1) * 4
+    };
+    if trimmed.len() > input_cap {
         return Err(SigningServiceError::Blob(format!(
             "{name} exceeds {max_bytes} bytes (got {})",
             trimmed.len()

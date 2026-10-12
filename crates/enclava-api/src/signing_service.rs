@@ -1063,7 +1063,8 @@ fn app_unlock_mode(mode: crate::models::UnlockMode) -> &'static str {
 /// workload_artifacts_json budget (196_608, enforced by
 /// validate_proof_bundle_budget at ingress and again at dispatch) is the
 /// authoritative launchability bound and rejects field combinations whose
-/// composition overflows.
+/// composition overflows. The escaped-length measurement (up to 6x raw for
+/// quote/backslash-heavy input) is what makes this a true cost bound.
 pub(crate) const MAX_POLICY_TEXT_BYTES: usize = 160 * 1024;
 pub(crate) const MAX_REGO_TEXT_BYTES: usize = 24 * 1024;
 pub(crate) const MAX_POLICY_METADATA_FIELD_BYTES: usize = 256;
