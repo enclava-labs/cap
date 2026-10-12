@@ -31,7 +31,7 @@ use enclava_engine::types::WorkloadSecurityProfile;
 use crate::commands::app::{
     BootstrapEndpointStatusDecision, DeploymentWait, SignedDeployBlobParams, StoragePasswordInput,
     bootstrap_endpoint_status_decision, bounded_request, build_signed_deploy_blobs,
-    claim_initial_ownership, deployment_bound_tee_status,
+    claim_initial_ownership, deploy_preflight_needs_claim, deployment_bound_tee_status,
     deployment_bound_terminal_bootstrap_error,
     deployment_bound_terminal_bootstrap_error_on_channel, ensure_manual_deploy_keyring,
     fetch_verified_platform_release, generate_log_key_for_app,
@@ -395,6 +395,19 @@ async fn deploy_with_timings(
         StoragePasswordInput::from_file_option(args.storage_password_file.as_ref())?;
     if template.unlock_mode == "password" {
         storage_password.ensure_available_for_password_mode("password-mode template deploy")?;
+        // Pre-mutation claim-session gate (same rationale as the deploy
+        // path). The post-submit flow auto-claims only while ownership is
+        // unclaimed (the bootstrap wait skips claimed apps); unresolved
+        // ownership fails closed the same way, since password templates
+        // auto-claim on first boot.
+        let preflight_ownership = api
+            .get_unlock_status(&instance_name)
+            .await
+            .ok()
+            .and_then(|status| status.ownership_state);
+        if deploy_preflight_needs_claim(true, preflight_ownership.as_deref(), "creating") {
+            crate::commands::ownership::ensure_claim_session_now(storage_password.is_from_file())?;
+        }
     }
     // Authenticate platform authority before keyring registration or app creation.
     fetch_verified_platform_release(api, &ctx.paths).await?;
@@ -1091,10 +1104,30 @@ async fn ensure_template_app(
         .await
     {
         Ok(app) => Ok(app),
-        // A concurrent create won. The app already exists; fetch it.
-        Err(ApiError::Api { status: 409, .. }) => {
-            api.get_app(instance_name).await.map_err(Into::into)
-        }
+        // A 409 is the "name already taken" idempotent fallback; only a
+        // not-found lookup proves the app absent, and then the original
+        // rejection (e.g. a permanent create refusal) is the real outcome.
+        // Any other lookup failure leads (it is the immediate blocker) but
+        // the create refusal is kept as context — a permanent rejection and
+        // its remediation must not vanish behind a transient outage (incl.
+        // transport/decode failures, not just HTTP status errors).
+        Err(error @ ApiError::Api { status: 409, .. }) => match api.get_app(instance_name).await {
+            Ok(app) => Ok(app),
+            Err(ApiError::Api { status: 404, .. }) => Err(error.into()),
+            Err(lookup_error) => Err(match lookup_error {
+                ApiError::Api {
+                    status,
+                    code,
+                    message,
+                } => ApiError::Api {
+                    status,
+                    code,
+                    message: format!("{message} (earlier create attempt: {error})"),
+                }
+                .into(),
+                other => format!("{other} (earlier create attempt: {error})").into(),
+            }),
+        },
         Err(error) => Err(error.into()),
     }
 }
@@ -3787,6 +3820,7 @@ fn ensure_ssh_command_matches_endpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
 
     #[tokio::test]
     async fn bootstrap_subphase_timings_are_nested_fixed_and_opt_in() {
@@ -4651,6 +4685,155 @@ mod tests {
             },
             created_at: "2026-06-24T00:00:00Z".to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn template_create_rejection_surfaces_the_create_error_not_the_fallback_404() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for (status_line, body) in [
+                ("404 Not Found", r#"{"error":"app_not_found"}"#),
+                ("409 Conflict", r#"{"error":"stale_owner_seed"}"#),
+                ("404 Not Found", r#"{"error":"app_not_found"}"#),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap();
+                seen.push(String::from_utf8_lossy(&buf[..n]).to_string());
+                let response = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+            seen
+        });
+
+        let api = ApiClient::new(&format!("http://{addr}"), Some("test-token".to_string()));
+        let err = ensure_template_app(&api, &hosted_template_with_stable_ssh(), "shell-x", None)
+            .await
+            .expect_err("a permanent create rejection must surface");
+        let message = err.to_string();
+        assert!(message.contains("stale_owner_seed"), "{message}");
+        assert!(!message.contains("404"), "{message}");
+        let seen = handle.join().unwrap();
+        assert!(seen[0].starts_with("GET /apps/shell-x "), "{}", seen[0]);
+        assert!(seen[1].starts_with("POST /apps "), "{}", seen[1]);
+        assert!(seen[2].starts_with("GET /apps/shell-x "), "{}", seen[2]);
+    }
+
+    #[tokio::test]
+    async fn template_create_name_conflict_still_falls_back_to_the_existing_app() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            for (status_line, body) in [
+                ("404 Not Found", r#"{"error":"app_not_found"}"#),
+                ("409 Conflict", r#"{"error":"app_name_conflict"}"#),
+                (
+                    "200 OK",
+                    r#"{"id":"app-1","name":"shell","namespace":"ns","instance_id":"i-1","domain":"shell.example","custom_domain":null,"status":"running","unlock_mode":"password","created_at":"2026-06-24T00:00:00Z"}"#,
+                ),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap();
+                let _ = &buf[..n];
+                let response = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+
+        let api = ApiClient::new(&format!("http://{addr}"), Some("test-token".to_string()));
+        let app = ensure_template_app(&api, &hosted_template_with_stable_ssh(), "shell-x", None)
+            .await
+            .expect("a name-conflict 409 still resolves the existing app");
+        assert_eq!(app.id, "app-1");
+        handle.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn template_create_refusal_surfaces_lookup_outage_with_refusal_context() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            for (status_line, body) in [
+                ("404 Not Found", r#"{"error":"app_not_found"}"#),
+                ("409 Conflict", r#"{"error":"stale_owner_seed"}"#),
+                (
+                    "503 Service Unavailable",
+                    r#"{"error":"backend_unavailable"}"#,
+                ),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap();
+                let _ = &buf[..n];
+                let response = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+
+        let api = ApiClient::new(&format!("http://{addr}"), Some("test-token".to_string()));
+        let err = ensure_template_app(&api, &hosted_template_with_stable_ssh(), "shell-x", None)
+            .await
+            .expect_err("a failed fallback lookup must surface");
+        let message = err.to_string();
+        // The lookup outage leads (it is the immediate blocker) …
+        assert!(
+            message.starts_with("API error (503): backend_unavailable"),
+            "{message}"
+        );
+        // … but the permanent create refusal and its remediation survive as context.
+        assert!(message.contains("stale_owner_seed"), "{message}");
+        assert!(message.contains("erase the stale owner seed"), "{message}");
+        handle.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn template_create_refusal_context_survives_transport_failures() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            for (status_line, body) in [
+                ("404 Not Found", Some(r#"{"error":"app_not_found"}"#)),
+                ("409 Conflict", Some(r#"{"error":"stale_owner_seed"}"#)),
+                // Third connection: accept and drop — a transport failure,
+                // not an HTTP status error.
+                ("", None),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap();
+                let _ = &buf[..n];
+                if let Some(body) = body {
+                    let response = format!(
+                        "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).unwrap();
+                }
+            }
+        });
+
+        let api = ApiClient::new(&format!("http://{addr}"), Some("test-token".to_string()));
+        let err = ensure_template_app(&api, &hosted_template_with_stable_ssh(), "shell-x", None)
+            .await
+            .expect_err("a transport-failed fallback lookup must surface");
+        let message = err.to_string();
+        assert!(message.starts_with("HTTP error:"), "{message}");
+        assert!(message.contains("earlier create attempt"), "{message}");
+        assert!(message.contains("stale_owner_seed"), "{message}");
+        assert!(message.contains("erase the stale owner seed"), "{message}");
+        handle.join().unwrap();
     }
 
     #[test]

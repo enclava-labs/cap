@@ -199,6 +199,7 @@ pub(crate) async fn resolve_signed_policy_artifact(
     signing_service_pubkey_hex: Option<&str>,
     log_encryption: Option<LogEncryptionConfig>,
 ) -> Result<crate::signing_service::SignedPolicyArtifact, (StatusCode, Json<serde_json::Value>)> {
+    use crate::signing_service::validate_proof_bundle_budget;
     artifacts
         .validate_customer_authority(&state.db)
         .await
@@ -243,6 +244,7 @@ pub(crate) async fn resolve_signed_policy_artifact(
             artifacts
                 .attach_customer_authority(&mut artifact)
                 .map_err(signing_error_response)?;
+            validate_proof_bundle_budget(artifacts, &artifact).map_err(signing_error_response)?;
             return Ok(artifact);
         }
     }
@@ -260,6 +262,7 @@ pub(crate) async fn resolve_signed_policy_artifact(
     artifacts
         .attach_customer_authority(&mut artifact)
         .map_err(signing_error_response)?;
+    validate_proof_bundle_budget(artifacts, &artifact).map_err(signing_error_response)?;
     Ok(artifact)
 }
 
@@ -987,7 +990,16 @@ async fn deploy_app_candidate(
     if let Some(artifacts) = signing_artifacts.as_ref() {
         let api_signing_pubkey = crate::auth::jwt::public_key_base64(&state.signing_key);
         artifacts
-            .validate_deployment_inputs(&app, &image_digest, &api_signing_pubkey)
+            .validate_deployment_inputs(
+                &app,
+                &image_digest,
+                &api_signing_pubkey,
+                &crate::signing_service::descriptor_platform_binding_for(
+                    &state,
+                    &candidate_resources.memory_limit,
+                )
+                .map_err(signing_error_response)?,
+            )
             .map_err(signing_error_response)?;
         let attestation = state.attestation.as_ref().ok_or((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1278,10 +1290,12 @@ async fn deploy_app_candidate(
                     signer_identity_issuer, signer_identity_set_at, source_provider,
                     source_repository, egress_allowlist, egress_mode, created_at, updated_at
                  )
-                 VALUES (
-                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10::unlock_enum,
+                 SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10::unlock_enum,
                     $11, $12, $13, $14::app_status_enum, $15, $16, $17, $18,
                     $19, $20, $21, $22, $23
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM kbs_owner_seed_waivers
+                      WHERE binding_key = $24
                  )",
             )
             .bind(app.id)
@@ -1307,6 +1321,7 @@ async fn deploy_app_candidate(
             .bind(&app.egress_mode)
             .bind(app.created_at)
             .bind(app.updated_at)
+            .bind(crate::kbs::owner_binding_key_for(&app.namespace, &app.name))
             .execute(&mut *tx)
             .await
             .map_err(|error| {
@@ -1318,6 +1333,33 @@ async fn deploy_app_candidate(
                     json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
                 }
             })?;
+            // The waiver guard runs before this transaction, and under READ
+            // COMMITTED the insert's NOT EXISTS is evaluated on its statement
+            // snapshot — an abandoned destroy committing while the insert
+            // waits out the old row's unique constraint is invisible to both.
+            // Two guards close it: zero rows inserted means the NOT EXISTS
+            // filtered the create (a waiver existed at statement time — the
+            // recheck alone must not decide this, because the waiver can be
+            // cleared between the filtered insert and the lookup, e.g. by a
+            // teardown retry completing, and proceeding would fail the
+            // dependent inserts on the missing app row); the recheck then
+            // takes a fresh statement snapshot in this transaction and sees
+            // every waiver committed while the insert was blocked.
+            let insert_result =
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM apps WHERE id = $1")
+                    .bind(app.id)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+            if insert_result == 0 {
+                return Err(json_error(StatusCode::CONFLICT, "stale_owner_seed"));
+            }
+            if crate::kbs::owner_seed_waiver_recorded_in_tx(&mut tx, &app.namespace, &app.name)
+                .await
+                .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?
+            {
+                return Err(json_error(StatusCode::CONFLICT, "stale_owner_seed"));
+            }
             insert_transaction_audit(
                 &mut tx,
                 auth.org_id,

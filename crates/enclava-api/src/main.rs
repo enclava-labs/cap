@@ -951,6 +951,7 @@ async fn main() {
     }
     enclava_api::kbs::spawn_signed_policy_reconciler(state.clone());
     enclava_api::routes::auth::spawn_device_login_reaper(state.db.clone());
+    enclava_api::auth::nostr::spawn_nip98_replay_cache_reaper(state.db.clone());
     if deployment_dispatch_enabled {
         enclava_api::deployment_jobs::spawn_deployment_dispatcher(state.clone());
     } else {

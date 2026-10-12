@@ -62,8 +62,15 @@ pub enum KbsPolicyError {
     },
     #[error("signed KBS policy generation metadata is invalid")]
     InvalidPolicyGeneration,
-    #[error("signed KBS policy generation has conflicting content")]
-    PolicyGenerationConflict,
+    #[error(
+        "signed KBS policy generation has conflicting content: existing generation {existing_generation:?} annotates {existing_hash:?}, desired generation {desired_generation} hashes {desired_hash}"
+    )]
+    PolicyGenerationConflict {
+        existing_generation: Option<i64>,
+        existing_hash: Option<String>,
+        desired_generation: i64,
+        desired_hash: String,
+    },
     #[error("signed KBS policy artifact is not current deployment authority")]
     ArtifactNotCurrent,
     #[error("signed KBS policy compare-and-swap retries were exhausted")]
@@ -304,17 +311,128 @@ pub async fn ensure_tls_binding(
     Ok(())
 }
 
-pub async fn soft_delete_owner_binding(db: &PgPool, app_id: Uuid) -> Result<(), KbsPolicyError> {
+pub async fn soft_delete_owner_binding(
+    db: &PgPool,
+    app_id: Uuid,
+    namespace: &str,
+    app_name: &str,
+) -> Result<(), KbsPolicyError> {
+    // If the confidential teardown never completed, the owner seed may still
+    // exist in KBS: record the waiver FIRST, in a table that survives the app
+    // row (kbs_owner_bindings cascades away with it), so a later recreate of
+    // the same binding key is refused until the seed is erased.
+    //
+    // "Never completed" is derived from seed existence, not the flip-time
+    // requirement flag alone: a teardown-required workload (signed paths
+    // never create a binding row — the key is name-derived either way) OR
+    // any workload with a live owner binding (a running-then-stopped app
+    // keeps its seed; PaaS desired-state only scales it to zero) OR any
+    // workload that ever deployed (requires_workload_teardown only matches
+    // Running, so a stopped or failed app records teardown as not required —
+    // and a signed deployment leaves no binding row, yet its name-derived
+    // seed survives the scale-to-zero) waives when the completion marker is
+    // absent. Completed teardowns and never-deployed apps record nothing:
+    // absence of a waiver means recreate is allowed.
     sqlx::query(
-        "UPDATE kbs_owner_bindings
-         SET deleted_at = COALESCE(deleted_at, now()), updated_at = now()
-         WHERE app_id = $1",
+        "INSERT INTO kbs_owner_seed_waivers (binding_key, app_id, org_name, app_name)
+         SELECT $2, app.id, org.name, app.name
+           FROM apps AS app
+           JOIN organizations AS org ON org.id = app.org_id
+          WHERE app.id = $1
+            AND app.workload_teardown_completed_at IS NULL
+            AND (
+                app.workload_teardown_required
+                OR EXISTS (
+                    SELECT 1
+                      FROM kbs_owner_bindings AS binding
+                     WHERE binding.app_id = app.id
+                )
+                OR EXISTS (
+                    SELECT 1
+                      FROM deployments AS deployment
+                     WHERE deployment.app_id = app.id
+                )
+            )
+         ON CONFLICT (binding_key) DO UPDATE
+            SET app_id = EXCLUDED.app_id,
+                org_name = EXCLUDED.org_name,
+                app_name = EXCLUDED.app_name,
+                waived_at = now()",
+    )
+    .bind(app_id)
+    .bind(owner_binding_key(namespace, app_name))
+    .execute(db)
+    .await?;
+    sqlx::query(
+        "UPDATE kbs_owner_bindings AS binding
+            SET deleted_at = COALESCE(binding.deleted_at, now()),
+                updated_at = now()
+           WHERE binding.app_id = $1",
     )
     .bind(app_id)
     .execute(db)
     .await?;
 
     Ok(())
+}
+
+/// Mirrors `enclava_engine::types::ConfidentialApp::owner_resource_type`: the
+/// KBS owner binding key is derived from the tenant namespace and app name, so
+/// it is identical across incarnations of the same name.
+fn owner_binding_key(namespace: &str, name: &str) -> String {
+    format!("{namespace}-{name}-owner")
+}
+
+/// Create-path re-check helper: the same derivation, callable from the
+/// routes that guard their app inserts against a recorded waiver.
+pub(crate) fn owner_binding_key_for(namespace: &str, name: &str) -> String {
+    owner_binding_key(namespace, name)
+}
+
+/// Whether a soft-deleted owner binding with this key was destroyed without a
+/// completed confidential teardown — its owner seed may still exist in KBS,
+/// and a fresh create under the same name would boot already-claimed.
+/// Post-insert recheck for the create paths: `stale_owner_seed_for_binding`
+/// runs before the insert transaction, and the insert's own NOT EXISTS is
+/// evaluated on its statement snapshot — under READ COMMITTED, an abandoned
+/// destroy that commits while the insert waits out the old row's unique
+/// constraint is invisible to both. A fresh statement inside the same
+/// transaction sees every waiver committed by then. Callers refuse with the
+/// shared `stale_owner_seed` response when this returns true (which also
+/// covers the zero-rows-inserted case: a waiver that predates the statement
+/// still exists when re-read).
+pub(crate) async fn owner_seed_waiver_recorded_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    namespace: &str,
+    name: &str,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1
+               FROM kbs_owner_seed_waivers
+              WHERE binding_key = $1
+         )",
+    )
+    .bind(owner_binding_key(namespace, name))
+    .fetch_one(&mut **tx)
+    .await
+}
+
+pub async fn stale_owner_seed_for_binding(
+    db: &PgPool,
+    namespace: &str,
+    name: &str,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1
+               FROM kbs_owner_seed_waivers
+              WHERE binding_key = $1
+         )",
+    )
+    .bind(owner_binding_key(namespace, name))
+    .fetch_one(db)
+    .await
 }
 
 pub async fn soft_delete_tls_binding(
@@ -514,7 +632,17 @@ async fn signed_policy_mode_active(db: &PgPool) -> Result<bool, KbsPolicyError> 
     .await?)
 }
 
-/// Select the current operation's exact authority, including rollback sources.
+/// Select policy authority from the latest operation generation, not from the
+/// historical deployment that owns an artifact.  A rollback therefore makes
+/// its exact source artifact required.  The active operation is authoritative
+/// even while the app row still projects the preceding failed/stopped state.
+/// Failed, unsigned, or deleting latest operations contribute no authorization,
+/// except that a deleting app with confidential teardown still pending keeps
+/// the authorization of every workload generation it may still be running
+/// under — the newest completed generation (the last workload known applied;
+/// supersession never rewrites completed jobs) plus any later generation that
+/// reached the apply phase (apply failures are never reverted, and the delete
+/// flip itself supersedes leased work) — until the teardown completes.
 /// The prior healthy workload remains required until a replacement is healthy,
 /// including when replacement setup fails without stopping the running workload.
 async fn load_signed_policy_candidates(
@@ -533,6 +661,10 @@ async fn load_signed_policy_candidates(
                 job.state AS job_state,
                 deployment.status::text AS deployment_status,
                 app.status::text AS app_status,
+                app.workload_teardown_required,
+                app.workload_teardown_completed_at,
+                job.last_error_code,
+                deployment.spec_snapshot->>'setup_state' AS deployment_setup_state,
                 ROW_NUMBER() OVER (
                     PARTITION BY job.app_id
                     ORDER BY job.generation DESC
@@ -554,10 +686,86 @@ async fn load_signed_policy_candidates(
         eligible_current_job_operations AS (
             SELECT *
               FROM ranked_job_operations
-             WHERE current_operation_rank = 1
-               AND app_status <> 'deleting'
-               AND deployment_status IN ('pending', 'applying', 'watching', 'healthy')
-               AND job_state IN ('setup_pending', 'setting_up', 'pending', 'running', 'completed')
+             WHERE (
+                    (
+                        current_operation_rank = 1
+                        AND app_status <> 'deleting'
+                        AND deployment_status IN ('pending', 'applying', 'watching', 'healthy')
+                        AND job_state IN ('setup_pending', 'setting_up', 'pending', 'running', 'completed')
+                    )
+                    OR (
+                        -- Deleting with confidential teardown still pending:
+                        -- every workload generation the app may still be
+                        -- running under stays authorized until the teardown
+                        -- completes, so the teardown's policy-governed KBS
+                        -- deletes cannot be stranded by a reconciliation.
+                        --
+                        -- Soundness does not come from a generation count:
+                        -- single-flight leases serialize concurrent
+                        -- deployments, but sequentially failed generations
+                        -- stack, so the live workload can sit at any rank.
+                        -- It comes from workload state instead:
+                        --   * the newest completed job is the last workload
+                        --     known applied (a watching generation's job
+                        --     completes, and supersession only rewrites
+                        --     queued/leased jobs, so it stays completed) —
+                        --     admitted however many later generations
+                        --     failed;
+                        --   * any later generation that reached the apply
+                        --     phase may have written (or still be rolling
+                        --     out) a workload spec — apply failures are
+                        --     never reverted and the delete flip itself
+                        --     supersedes leased work with
+                        --     'deployment_superseded'. Two signals gate
+                        --     this arm: only provable setup failures are
+                        --     excluded by error code (setup completes
+                        --     before any workload spec is written), and
+                        --     the deployment must carry setup_state
+                        --     'accepted' (the durable setup machine in
+                        --     spec_snapshot, which supersession never
+                        --     rewrites) — a deployment superseded while
+                        --     still queued never entered the apply phase,
+                        --     wrote no spec, and admitting a pile of them
+                        --     would crowd the per-app retention slots and
+                        --     could push the live workload's artifact out
+                        --     of the published policy.
+                        app_status = 'deleting'
+                        AND workload_teardown_required
+                        AND workload_teardown_completed_at IS NULL
+                        AND (
+                            (
+                                job_state = 'completed'
+                                AND NOT EXISTS (
+                                    SELECT 1
+                                      FROM deployment_apply_jobs AS newer
+                                     WHERE newer.app_id = ranked_job_operations.app_id
+                                       AND newer.state = 'completed'
+                                       AND newer.generation
+                                           > ranked_job_operations.generation
+                                )
+                            )
+                            OR (
+                                job_state <> 'completed'
+                                AND COALESCE(
+                                       ranked_job_operations.last_error_code,
+                                       ''
+                                   ) <> 'deployment_setup_failed'
+                                AND ranked_job_operations.deployment_setup_state
+                                    = 'accepted'
+                                AND ranked_job_operations.generation > COALESCE(
+                                       (
+                                           SELECT MAX(applied.generation)
+                                             FROM deployment_apply_jobs AS applied
+                                            WHERE applied.app_id
+                                                = ranked_job_operations.app_id
+                                              AND applied.state = 'completed'
+                                       ),
+                                       0
+                                   )
+                            )
+                        )
+                    )
+               )
                AND artifact_deployment_id IS NOT NULL
                AND artifact_descriptor_core_hash IS NOT NULL
                AND EXISTS (
@@ -617,11 +825,34 @@ async fn load_signed_policy_candidates(
                  historical.customer_config_hold
                  AND historical.customer_config_released_at IS NULL
              )
+             AND (
+                  -- A deleting app contributes no optional (rollback/
+                  -- retention) artifacts — there is no rollback from a
+                  -- delete. Restricting the historical side to the current
+                  -- row's own artifact keeps its candidate set bounded to
+                  -- the admitted operations instead of cross-joining every
+                  -- historical artifact, and keeps `required` deterministic
+                  -- per artifact (every admitted row is its own current row).
+                  current.app_status <> 'deleting'
+                  OR (
+                      historical.artifact_deployment_id
+                          = current.artifact_deployment_id
+                      AND historical.artifact_descriptor_core_hash
+                          = current.artifact_descriptor_core_hash
+                  )
+             )
             JOIN deployments AS historical_deployment
               ON historical_deployment.id = historical.deployment_id
              AND historical_deployment.app_id = historical.app_id
-             AND historical_deployment.status::text
-                 IN ('pending', 'applying', 'watching', 'healthy')
+             AND (
+                  historical_deployment.status::text
+                      IN ('pending', 'applying', 'watching', 'healthy')
+                  OR (
+                      current.app_status = 'deleting'
+                      AND current.workload_teardown_required
+                      AND current.workload_teardown_completed_at IS NULL
+                  )
+             )
             JOIN workload_artifacts AS artifact
               ON artifact.app_id = historical.app_id
              AND artifact.deploy_id = historical.artifact_deployment_id
@@ -630,6 +861,10 @@ async fn load_signed_policy_candidates(
             ORDER BY
                 current.app_id,
                 artifact.descriptor_core_hash,
+                -- Prefer a required row when an artifact reaches this point
+                -- with both required and optional bindings: DISTINCT ON must
+                -- not let an optional row displace the running workload's
+                -- authorization.
                 required DESC,
                 historical.generation DESC
         ),
@@ -655,6 +890,8 @@ async fn load_signed_policy_candidates(
                 deployment.app_id,
                 deployment.status::text AS deployment_status,
                 app.status::text AS app_status,
+                app.workload_teardown_required,
+                app.workload_teardown_completed_at,
                 deployment.created_at,
                 ROW_NUMBER() OVER (
                     PARTITION BY deployment.app_id
@@ -690,7 +927,11 @@ async fn load_signed_policy_candidates(
              AND artifact.deploy_id = legacy.deployment_id
             WHERE legacy.current_operation_rank = 1
               -- App failure alone does not retire the last healthy workload.
-              AND legacy.app_status IN ('creating', 'running', 'failed')
+              AND (
+                  legacy.app_status IN ('creating', 'running', 'failed')
+                  OR (legacy.workload_teardown_required
+                      AND legacy.workload_teardown_completed_at IS NULL)
+              )
               AND legacy.deployment_status = 'healthy'
         ),
         selected AS (
@@ -788,12 +1029,49 @@ pub async fn reconcile_signed_policy_once(
 pub async fn reconcile_signed_policy_at_startup(
     state: &crate::state::AppState,
 ) -> Result<(), KbsPolicyReconciliationError> {
+    let mut fence_busy_logged = false;
+    let mut busy_wait_started: Option<std::time::Instant> = None;
     loop {
         match reconcile_signed_policy_once(state).await {
             Err(KbsPolicyReconciliationError::Mutation(
-                crate::mutation_leases::MutationLeaseError::Busy,
-            )) => tokio::time::sleep(Duration::from_secs(2)).await,
-            result => return result,
+                err @ crate::mutation_leases::MutationLeaseError::Busy,
+            )) => {
+                if fence_busy_logged {
+                    tracing::debug!(
+                        %err,
+                        "startup KBS policy reconciliation still waiting on the kbs_policy fence"
+                    );
+                } else {
+                    // Log the Busy arm at least once: while this spins, readiness
+                    // answers 503 and an operator cannot tell a recovering lease
+                    // from a hung reconcile without a disambiguating line.
+                    tracing::warn!(
+                        %err,
+                        error_code = "kbs_policy_fence_busy",
+                        "startup KBS policy reconciliation is waiting on the kbs_policy fence \
+                         (another replica holds it or a dead lease is awaiting its finite \
+                         reclaim); readiness stays pending until it clears"
+                    );
+                    fence_busy_logged = true;
+                    busy_wait_started = Some(std::time::Instant::now());
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            result => {
+                if fence_busy_logged && result.is_ok() {
+                    // Close the window the WARN opened so an operator can
+                    // correlate the 503 span end-to-end without inferring its
+                    // end from the generic readiness line.
+                    tracing::info!(
+                        error_code = "kbs_policy_fence_busy",
+                        elapsed_secs = busy_wait_started
+                            .map(|started| started.elapsed().as_secs())
+                            .unwrap_or_default(),
+                        "startup KBS policy reconciliation cleared the kbs_policy fence"
+                    );
+                }
+                return result;
+            }
         }
     }
 }
@@ -1056,7 +1334,12 @@ fn generation_decision(
         return if allow_generation_reset {
             Ok(GenerationDecision::Replace)
         } else {
-            Err(KbsPolicyError::PolicyGenerationConflict)
+            Err(KbsPolicyError::PolicyGenerationConflict {
+                existing_generation: Some(existing_generation),
+                existing_hash: Some(annotated_hash.to_string()),
+                desired_generation,
+                desired_hash: desired_hash.to_string(),
+            })
         };
     }
     // The generation annotation is content-bound. If a stale legacy writer
@@ -1352,7 +1635,12 @@ async fn wait_for_deployment_policy_generation(
             return Ok(GenerationDecision::Superseded);
         }
         if decision != GenerationDecision::Current {
-            return Err(KbsPolicyError::PolicyGenerationConflict);
+            return Err(KbsPolicyError::PolicyGenerationConflict {
+                existing_generation: annotated.map(|(generation, _)| generation),
+                existing_hash: annotated.map(|(_, policy_hash)| policy_hash.to_string()),
+                desired_generation,
+                desired_hash: desired_hash.to_string(),
+            });
         }
 
         let spec_replicas = deployment
@@ -1943,7 +2231,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reconciliation_error_redacts_provider_detail() {
+    fn startup_fence_busy_spin_logs_disambiguation() {
+        // The Busy spin answers readiness with 503 the whole time; without a
+        // logged arm an operator cannot distinguish "recovering lease" from
+        // "hung reconcile" (as it looked during a real roll's ~9-minute reclaim).
+        let source = include_str!("kbs.rs");
+        assert!(
+            source.contains("error_code = \"kbs_policy_fence_busy\""),
+            "the startup kbs_policy fence Busy arm must keep its disambiguating log line"
+        );
+        assert!(
+            source.contains("fence_busy_logged = true"),
+            "the Busy arm must flip its flag so the WARN fires once, not per retry"
+        );
+        assert!(
+            source.contains("still waiting on the kbs_policy fence"),
+            "retries must demote to DEBUG instead of flooding WARN every 2s"
+        );
+        assert!(
+            source.contains("cleared the kbs_policy fence"),
+            "the WARN's window must be closed with an elapsed-time line an operator can correlate"
+        );
+    }
+
+    #[test]
+    fn reconciliation_error_display_redacts_upstream_detail() {
         let db = KbsPolicyReconciliationError::from(KbsPolicyError::Db(sqlx::Error::Protocol(
             "tenant-sensitive database detail".to_string(),
         )));
@@ -1958,6 +2270,64 @@ mod tests {
             .boxed(),
         )));
         assert!(!kube.to_string().contains("tenant-sensitive"));
+    }
+
+    #[tokio::test]
+    async fn rollout_without_policy_annotations_rejects_healthy_deployment() {
+        let client = kube::Client::new(
+            tower::service_fn(|_: axum::http::Request<kube::client::Body>| async {
+                let deployment = serde_json::json!({
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "metadata": {"name": "trustee", "generation": 1},
+                    "spec": {
+                        "replicas": 1,
+                        "selector": {"matchLabels": {"app": "trustee"}},
+                        "template": {
+                            "metadata": {"labels": {"app": "trustee"}},
+                            "spec": {
+                                "containers": [{"name": "trustee", "image": "trustee:test"}]
+                            }
+                        }
+                    },
+                    "status": {
+                        "observedGeneration": 1,
+                        "updatedReplicas": 1,
+                        "availableReplicas": 1
+                    }
+                });
+                Ok::<_, std::io::Error>(axum::http::Response::new(kube::client::Body::from(
+                    serde_json::to_vec(&deployment).unwrap(),
+                )))
+            }),
+            "default",
+        );
+        let deployments = Api::<Deployment>::namespaced(client, "trustee");
+        let desired_hash = "cc".repeat(32);
+        let error = wait_for_deployment_policy_generation(
+            &deployments,
+            "trustee",
+            4,
+            &desired_hash,
+            "publication-token",
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            &error,
+            KbsPolicyError::PolicyGenerationConflict {
+                existing_generation: None,
+                existing_hash: None,
+                desired_generation: 4,
+                desired_hash: hash,
+            } if hash == &desired_hash
+        ));
+        assert!(
+            KbsPolicyReconciliationError::from(error)
+                .to_string()
+                .contains(&desired_hash)
+        );
     }
 
     fn binding(key: &str) -> KbsOwnerBinding {
@@ -2566,16 +2936,31 @@ resource_bindings := {
             GenerationDecision::Replace,
             "reset bootstrap replaces an equal generation from a retired database"
         );
+        let conflict = generation_decision(
+            Some((3, &"bb".repeat(32))),
+            Some(&"bb".repeat(32)),
+            3,
+            &"aa".repeat(32),
+            false,
+        )
+        .unwrap_err();
         assert!(matches!(
-            generation_decision(
-                Some((3, &"bb".repeat(32))),
-                Some(&"bb".repeat(32)),
-                3,
-                &"aa".repeat(32),
-                false,
-            ),
-            Err(KbsPolicyError::PolicyGenerationConflict)
+            conflict,
+            KbsPolicyError::PolicyGenerationConflict {
+                existing_generation: Some(3),
+                desired_generation: 3,
+                ..
+            }
         ));
+        let message = conflict.to_string();
+        assert!(
+            message.contains(&"bb".repeat(32)),
+            "conflict names the annotated hash: {message}"
+        );
+        assert!(
+            message.contains(&"aa".repeat(32)),
+            "conflict names the desired hash: {message}"
+        );
         assert_eq!(
             generation_decision(
                 Some((3, &"aa".repeat(32))),
@@ -2590,21 +2975,9 @@ resource_bindings := {
         );
     }
 
-    async fn database_test_pool() -> PgPool {
-        let database_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
-        let pool = PgPool::connect(&database_url)
-            .await
-            .expect("connect KBS authority test database");
-        crate::db::pool::run_migrations(&pool)
-            .await
-            .expect("migrate KBS authority test database");
-        pool
-    }
-
     #[tokio::test]
     async fn signed_policy_bootstrap_generation_is_atomic_and_idempotent() {
-        let pool = database_test_pool().await;
+        let pool = crate::test_support::database_test_pool().await;
         let mut tx = pool.begin().await.unwrap();
         sqlx::query(
             "UPDATE kbs_signed_policy_reconciliation
@@ -2705,6 +3078,28 @@ resource_bindings := {
         .expect("insert KBS test deployment");
     }
 
+    /// Stamp the durable setup machine a deployment would carry in
+    /// spec_snapshot: 'accepted' once setup finished (the apply phase was
+    /// entered), 'dns_pending' while still queued. Supersession never
+    /// rewrites it, which is exactly why the selector can trust it.
+    async fn set_test_setup_state(pool: &PgPool, deployment_id: Uuid, state: &str) {
+        sqlx::query(
+            "UPDATE deployments
+                SET spec_snapshot = jsonb_set(
+                        spec_snapshot,
+                        '{setup_state}',
+                        to_jsonb($2::text),
+                        true
+                    )
+              WHERE id = $1",
+        )
+        .bind(deployment_id)
+        .bind(state)
+        .execute(pool)
+        .await
+        .expect("stamp KBS test setup state");
+    }
+
     async fn insert_test_artifact(
         pool: &PgPool,
         app_id: Uuid,
@@ -2775,7 +3170,7 @@ resource_bindings := {
 
     #[tokio::test]
     async fn selector_uses_current_operation_binding_and_legacy_fallback() {
-        let pool = database_test_pool().await;
+        let pool = crate::test_support::database_test_pool().await;
         let now = Utc::now();
 
         // A rollback operation points to an older exact artifact. It must rank
@@ -3832,7 +4227,7 @@ resource_bindings := {
 
     #[tokio::test]
     async fn latest_deployment_prefers_jobs_then_deterministic_legacy_identity() {
-        let pool = database_test_pool().await;
+        let pool = crate::test_support::database_test_pool().await;
         let (org_id, app_id) = insert_test_app(&pool, "running").await;
         let created_at = Utc::now();
         let older_id = Uuid::parse_str("10000000-0000-0000-0000-000000000001").unwrap();
@@ -3862,7 +4257,7 @@ resource_bindings := {
 
     #[tokio::test]
     async fn receipt_authority_is_immutable_but_app_cascade_remains_available() {
-        let pool = database_test_pool().await;
+        let pool = crate::test_support::database_test_pool().await;
         let (org_id, app_id) = insert_test_app(&pool, "running").await;
         let deployment_id = Uuid::new_v4();
         insert_test_deployment(&pool, org_id, app_id, deployment_id, "healthy", Utc::now()).await;
@@ -3962,5 +4357,788 @@ resource_bindings := {
                 .await
                 .expect("delete receipt fixture organization");
         }
+    }
+
+    #[tokio::test]
+    async fn deleting_app_keeps_authorization_only_while_teardown_pending() {
+        let pool = crate::test_support::database_test_pool().await;
+        let now = Utc::now();
+
+        let (pending_org, pending_app) = insert_test_app(&pool, "deleting").await;
+        sqlx::query("UPDATE apps SET workload_teardown_required = true WHERE id = $1")
+            .bind(pending_app)
+            .execute(&pool)
+            .await
+            .expect("mark workload teardown pending");
+        let pending_deployment = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            pending_org,
+            pending_app,
+            pending_deployment,
+            "healthy",
+            now,
+        )
+        .await;
+        let pending_artifact =
+            insert_test_artifact(&pool, pending_app, pending_deployment, "de").await;
+        insert_test_job(
+            &pool,
+            pending_org,
+            pending_app,
+            pending_deployment,
+            pending_deployment,
+            Some((pending_deployment, &pending_artifact)),
+        )
+        .await;
+
+        let (completed_org, completed_app) = insert_test_app(&pool, "deleting").await;
+        sqlx::query(
+            "UPDATE apps
+                SET workload_teardown_required = true,
+                    workload_teardown_completed_at = clock_timestamp()
+              WHERE id = $1",
+        )
+        .bind(completed_app)
+        .execute(&pool)
+        .await
+        .expect("mark workload teardown completed");
+        let completed_deployment = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            completed_org,
+            completed_app,
+            completed_deployment,
+            "healthy",
+            now,
+        )
+        .await;
+        let completed_artifact =
+            insert_test_artifact(&pool, completed_app, completed_deployment, "ef").await;
+        insert_test_job(
+            &pool,
+            completed_org,
+            completed_app,
+            completed_deployment,
+            completed_deployment,
+            Some((completed_deployment, &completed_artifact)),
+        )
+        .await;
+
+        let candidates = load_signed_policy_candidates(&pool, 1)
+            .await
+            .expect("select teardown-pending KBS authority");
+        let hashes: HashSet<_> = candidates
+            .iter()
+            .map(|candidate| candidate.artifact.metadata.descriptor_core_hash.as_str())
+            .collect();
+        assert!(
+            hashes.contains(pending_artifact.metadata.descriptor_core_hash.as_str()),
+            "a deleting app with teardown still pending must keep its authorization"
+        );
+        assert!(
+            !hashes.contains(completed_artifact.metadata.descriptor_core_hash.as_str()),
+            "a deleting app whose teardown completed must drop out"
+        );
+
+        for cleanup_org in [pending_org, completed_org] {
+            sqlx::query("DELETE FROM organizations WHERE id = $1")
+                .bind(cleanup_org)
+                .execute(&pool)
+                .await
+                .expect("delete teardown-pending fixture organization");
+        }
+    }
+
+    #[tokio::test]
+    async fn teardown_pending_authorization_survives_deployment_supersession() {
+        let pool = crate::test_support::database_test_pool().await;
+        let now = Utc::now();
+        let (org_id, app_id) = insert_test_app(&pool, "deleting").await;
+        sqlx::query("UPDATE apps SET workload_teardown_required = true WHERE id = $1")
+            .bind(app_id)
+            .execute(&pool)
+            .await
+            .expect("mark workload teardown pending");
+
+        // A long-dead historical operation (failed two generations back).
+        // Its artifact must NOT re-enter the policy: nothing can still be
+        // running under it, and re-admitting it would balloon the shared
+        // signed-policy budget. Inserted first so its apply job gets the
+        // lowest generation.
+        let dead = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, dead, "failed", now).await;
+        let dead_artifact = insert_test_artifact(&pool, app_id, dead, "ef").await;
+        insert_test_job(
+            &pool,
+            org_id,
+            app_id,
+            dead,
+            dead,
+            Some((dead, &dead_artifact)),
+        )
+        .await;
+
+        // The still-running workload's signed deployment.
+        let healthy = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, healthy, "healthy", now).await;
+        let healthy_artifact = insert_test_artifact(&pool, app_id, healthy, "ab").await;
+        insert_test_job(
+            &pool,
+            org_id,
+            app_id,
+            healthy,
+            healthy,
+            Some((healthy, &healthy_artifact)),
+        )
+        .await;
+
+        // A newer upgrade that never finished applying. The three rows share
+        // one transaction: a nonterminal deployment requires its apply job at
+        // INSERT time (schema trigger), while the job's artifact binding and
+        // the artifact's deployment reference are deferred FKs.
+        let pending = Uuid::new_v4();
+        let mut pending_artifact = test_signed_policy_artifact("cd", 16);
+        pending_artifact.metadata.app_id = app_id.to_string();
+        pending_artifact.metadata.deploy_id = pending.to_string();
+        let pending_hash = hex::decode(&pending_artifact.metadata.descriptor_core_hash).unwrap();
+        let mut fx = pool.begin().await.unwrap();
+        sqlx::query(
+            "INSERT INTO deployment_apply_jobs (
+                 deployment_id, app_id, org_id, source_deployment_id,
+                 payload_version, payload, payload_sha256,
+                 cleanup_app_on_setup_failure, signed_required,
+                 artifact_deployment_id, artifact_descriptor_core_hash,
+                 log_encryption, state
+             ) VALUES ($1, $2, $3, $4, 1,
+                       '{\"version\":1,\"log_encryption\":null}'::jsonb,
+                       $5, true, true, $4, $6, NULL, 'pending')",
+        )
+        .bind(pending)
+        .bind(app_id)
+        .bind(org_id)
+        .bind(pending)
+        .bind(vec![4u8; 32])
+        .bind(&pending_hash)
+        .execute(&mut *fx)
+        .await
+        .expect("insert pending apply job");
+        sqlx::query(
+            "INSERT INTO workload_artifacts (
+                 descriptor_core_hash, app_id, deploy_id, descriptor_payload,
+                 descriptor_signature, descriptor_signing_key_id,
+                 org_keyring_payload, org_keyring_signature,
+                 signed_policy_artifact
+             ) VALUES ($1, $2, $3, '{}'::jsonb, $4, 'test-key',
+                       '{}'::jsonb, $5, $6)",
+        )
+        .bind(&pending_hash)
+        .bind(app_id)
+        .bind(pending)
+        .bind(vec![1u8; 64])
+        .bind(vec![2u8; 64])
+        .bind(serde_json::to_value(&pending_artifact).unwrap())
+        .execute(&mut *fx)
+        .await
+        .expect("insert pending apply artifact");
+        sqlx::query(
+            "INSERT INTO deployments (id, org_id, app_id, status, spec_snapshot, created_at)
+             VALUES ($1, $2, $3, 'pending'::deploy_status_enum, '{\"setup_state\":\"accepted\"}'::jsonb, $4)",
+        )
+        .bind(pending)
+        .bind(org_id)
+        .bind(app_id)
+        .bind(now + chrono::Duration::seconds(1))
+        .execute(&mut *fx)
+        .await
+        .expect("insert pending deployment");
+        fx.commit().await.unwrap();
+
+        // The delete supersedes the unfinished operation before teardown runs:
+        // its job and deployment rows are marked failed.
+        let mut tx = pool.begin().await.unwrap();
+        crate::deploy::supersede_incomplete_deployments(&mut tx, app_id)
+            .await
+            .expect("supersede incomplete deployments");
+        tx.commit().await.unwrap();
+
+        let candidates = load_signed_policy_candidates(&pool, 2)
+            .await
+            .expect("select teardown-pending authority after supersession");
+        let hashes: HashSet<_> = candidates
+            .iter()
+            .map(|candidate| candidate.artifact.metadata.descriptor_core_hash.as_str())
+            .collect();
+        assert!(
+            hashes.contains(healthy_artifact.metadata.descriptor_core_hash.as_str()),
+            "the still-running workload's artifact must stay authorized through teardown"
+        );
+        assert!(
+            hashes.contains(pending_artifact.metadata.descriptor_core_hash.as_str()),
+            "a superseded-but-maybe-applied operation's artifact must stay authorized through teardown"
+        );
+        assert!(
+            !hashes.contains(dead_artifact.metadata.descriptor_core_hash.as_str()),
+            "a long-dead historical operation's artifact must not re-enter the policy"
+        );
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete supersession fixture organization");
+    }
+
+    async fn seed_owner_binding_for_app(pool: &PgPool, app_id: Uuid) {
+        sqlx::query(
+            "INSERT INTO kbs_owner_bindings (
+                 app_id, binding_key, repository, allowed_tags, namespace,
+                 service_account, tenant_instance_identity_hash, deleted_at
+             )
+             SELECT id,
+                    namespace || '-' || name || '-owner',
+                    'default', ARRAY['seed-encrypted', 'seed-sealed'],
+                    namespace, service_account, tenant_instance_identity_hash, NULL
+               FROM apps WHERE id = $1",
+        )
+        .bind(app_id)
+        .execute(pool)
+        .await
+        .expect("insert owner binding fixture");
+    }
+
+    async fn owner_binding_outcome(pool: &PgPool, app_id: Uuid) -> Option<chrono::DateTime<Utc>> {
+        sqlx::query_scalar("SELECT waived_at FROM kbs_owner_seed_waivers WHERE app_id = $1")
+            .bind(app_id)
+            .fetch_optional(pool)
+            .await
+            .expect("read owner binding waiver")
+    }
+
+    #[tokio::test]
+    async fn soft_delete_owner_binding_records_teardown_outcome() {
+        let pool = crate::test_support::database_test_pool().await;
+
+        // The mirrored binding-key format is load-bearing for the guard: a
+        // drift in either string silently disables it. Pin it against the
+        // engine's own derivation.
+        {
+            use enclava_engine::types::{
+                AttestationConfig, BindMount, ConfidentialApp, Container, DomainSpec, StorageSpec,
+                VolumeSpec,
+            };
+            let dummy_digest = format!("sha256:{}", "a".repeat(64));
+            let engine_app = ConfidentialApp {
+                app_id: Uuid::new_v4(),
+                deployment_id: Uuid::new_v4(),
+                name: "mirror".into(),
+                namespace: "cap-org-mirror".into(),
+                instance_id: "org-mirror".into(),
+                tenant_id: "org".into(),
+                bootstrap_owner_pubkey_hash: "00".repeat(32),
+                tenant_instance_identity_hash: "11".repeat(32),
+                service_account: "cap-mirror-sa".into(),
+                image_pull_secret_name: None,
+                signer_identity_subject: None,
+                signer_identity_issuer: None,
+                containers: vec![Container {
+                    name: "mirror".into(),
+                    image: enclava_common::image::ImageRef::parse(&format!(
+                        "ghcr.io/enclava-labs/demo@{dummy_digest}"
+                    ))
+                    .unwrap(),
+                    port: Some(3000),
+                    command: None,
+                    env: std::collections::HashMap::new(),
+                    storage_paths: vec![],
+                    workload_security_profile:
+                        enclava_engine::types::WorkloadSecurityProfile::Restricted,
+                    is_primary: true,
+                }],
+                storage: StorageSpec {
+                    app_data: VolumeSpec {
+                        size: "1Gi".into(),
+                        device_path: "/dev/csi0".into(),
+                        mount_path: "/data".into(),
+                        durability: enclava_common::types::Durability::DurableState,
+                        bootstrap_policy: enclava_common::types::BootstrapPolicy::FirstBootOnly,
+                        bind_mounts: vec![BindMount {
+                            source: "/data/app".into(),
+                            destination: "/app/data".into(),
+                        }],
+                    },
+                    tls_data: VolumeSpec {
+                        size: "1Gi".into(),
+                        device_path: "/dev/csi1".into(),
+                        mount_path: "/tls".into(),
+                        durability: enclava_common::types::Durability::DisposableState,
+                        bootstrap_policy: enclava_common::types::BootstrapPolicy::AllowReinit,
+                        bind_mounts: vec![],
+                    },
+                },
+                unlock_mode: enclava_common::types::UnlockMode::Password,
+                domain: DomainSpec {
+                    platform_domain: "mirror.example.test".into(),
+                    tee_domain: "mirror.tee.example.test".into(),
+                    custom_domain: None,
+                },
+                api_signing_pubkey: String::new(),
+                api_url: String::new(),
+                resources: enclava_common::types::ResourceLimits {
+                    cpu: "1".into(),
+                    memory: "512Mi".into(),
+                },
+                attestation: AttestationConfig {
+                    proxy_image: enclava_common::image::ImageRef::parse(&format!(
+                        "ghcr.io/enclava-labs/attestation-proxy@{dummy_digest}"
+                    ))
+                    .unwrap(),
+                    caddy_image: enclava_common::image::ImageRef::parse(&format!(
+                        "ghcr.io/enclava-labs/caddy-ingress@{dummy_digest}"
+                    ))
+                    .unwrap(),
+                    acme_ca_url: enclava_engine::types::default_acme_ca_url(),
+                    caddy_tls_mode: enclava_engine::types::CaddyTlsMode::Acme,
+                    trustee_policy_read_available: true,
+                    workload_artifacts_url: None,
+                    tls_certificate_broker_url: None,
+                    amd_kds_base_url: None,
+                    trustee_policy_url: None,
+                    local_workload_artifacts_json: None,
+                    local_trustee_policy_json: None,
+                    platform_trustee_policy_pubkey_hex: None,
+                    signing_service_pubkey_hex: None,
+                    verification_material: None,
+                },
+                egress_mode: enclava_engine::types::EgressMode::Restricted,
+                public_internet_egress_excluded_cidrs: vec![],
+                allow_internal_egress: false,
+                egress_allowlist: vec![],
+                log_encryption: None,
+                workload_artifact_binding: None,
+                generated_agent_policy: None,
+            };
+            assert_eq!(
+                owner_binding_key("cap-org-mirror", "mirror"),
+                engine_app.owner_resource_type(),
+                "kbs.rs and the engine must derive the same KBS owner binding key"
+            );
+        }
+
+        async fn app_identity(pool: &PgPool, app_id: Uuid) -> (String, String) {
+            sqlx::query_as("SELECT namespace, name FROM apps WHERE id = $1")
+                .bind(app_id)
+                .fetch_one(pool)
+                .await
+                .expect("read app identity")
+        }
+
+        // Required teardown, never completed: the wrap may survive — waived.
+        let (waived_org, waived_app) = insert_test_app(&pool, "running").await;
+        seed_owner_binding_for_app(&pool, waived_app).await;
+        let waived_identity = app_identity(&pool, waived_app).await;
+        soft_delete_owner_binding(&pool, waived_app, &waived_identity.0, &waived_identity.1)
+            .await
+            .expect("soft delete waived binding");
+        assert!(owner_binding_outcome(&pool, waived_app).await.is_some());
+        assert!(
+            stale_owner_seed_for_binding(&pool, &waived_identity.0, &waived_identity.1)
+                .await
+                .expect("guard lookup"),
+            "a waived binding must refuse recreation of the same name"
+        );
+        // The tombstone must survive the app row: the delete tail records the
+        // waiver and then hard-deletes the app (kbs_owner_bindings cascades
+        // away; the waiver table has no foreign keys by design).
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(waived_org)
+            .execute(&pool)
+            .await
+            .expect("delete waived fixture organization (cascades the app)");
+        assert!(
+            stale_owner_seed_for_binding(&pool, &waived_identity.0, &waived_identity.1)
+                .await
+                .expect("guard lookup after cascade"),
+            "the waiver must survive the app row deletion"
+        );
+
+        // A stopped app keeps its owner binding (PaaS desired-state only
+        // scales the workload to zero, the seed survives) even though the
+        // flip records teardown as not required: the binding row is the
+        // seed-existence signal — waived.
+        let (stopped_org, stopped_app) = insert_test_app(&pool, "stopped").await;
+        seed_owner_binding_for_app(&pool, stopped_app).await;
+        let stopped_identity = app_identity(&pool, stopped_app).await;
+        soft_delete_owner_binding(&pool, stopped_app, &stopped_identity.0, &stopped_identity.1)
+            .await
+            .expect("soft delete stopped binding");
+        assert!(
+            owner_binding_outcome(&pool, stopped_app).await.is_some(),
+            "a binding row without a completion marker means the seed may survive"
+        );
+
+        // A signed workload is teardown-required but never creates a binding
+        // row: the key is name-derived either way — waived.
+        let (signed_org, signed_app) = insert_test_app(&pool, "running").await;
+        sqlx::query("UPDATE apps SET workload_teardown_required = true WHERE id = $1")
+            .bind(signed_app)
+            .execute(&pool)
+            .await
+            .expect("mark signed workload teardown required");
+        let signed_identity = app_identity(&pool, signed_app).await;
+        soft_delete_owner_binding(&pool, signed_app, &signed_identity.0, &signed_identity.1)
+            .await
+            .expect("soft delete signed binding");
+        assert!(
+            owner_binding_outcome(&pool, signed_app).await.is_some(),
+            "a teardown-required workload waives without a binding row (signed path)"
+        );
+
+        // Required teardown, completed: nothing survives — recreate freely.
+        let (done_org, done_app) = insert_test_app(&pool, "running").await;
+        seed_owner_binding_for_app(&pool, done_app).await;
+        sqlx::query(
+            "UPDATE apps SET workload_teardown_completed_at = clock_timestamp()
+              WHERE id = $1",
+        )
+        .bind(done_app)
+        .execute(&pool)
+        .await
+        .expect("mark teardown completed");
+        let done_identity = app_identity(&pool, done_app).await;
+        soft_delete_owner_binding(&pool, done_app, &done_identity.0, &done_identity.1)
+            .await
+            .expect("soft delete completed binding");
+        assert!(owner_binding_outcome(&pool, done_app).await.is_none());
+
+        // Never deployed: no binding, no teardown requirement, no wrap ever
+        // existed — recreate freely.
+        let (fresh_org, fresh_app) = insert_test_app(&pool, "creating").await;
+        let fresh_identity = app_identity(&pool, fresh_app).await;
+        soft_delete_owner_binding(&pool, fresh_app, &fresh_identity.0, &fresh_identity.1)
+            .await
+            .expect("soft delete never-deployed binding");
+        assert!(owner_binding_outcome(&pool, fresh_app).await.is_none());
+        let fresh_stale = stale_owner_seed_for_binding(&pool, &fresh_identity.0, &fresh_identity.1)
+            .await
+            .expect("guard lookup");
+        assert!(!fresh_stale);
+
+        for cleanup_org in [stopped_org, signed_org, done_org, fresh_org] {
+            sqlx::query("DELETE FROM organizations WHERE id = $1")
+                .bind(cleanup_org)
+                .execute(&pool)
+                .await
+                .expect("delete teardown-outcome fixture organization");
+        }
+    }
+
+    #[tokio::test]
+    async fn soft_delete_owner_binding_waives_ever_deployed_workload_without_binding() {
+        let pool = crate::test_support::database_test_pool().await;
+
+        // A signed deployment leaves no owner binding row and a stopped (or
+        // failed) workload records teardown as not required — the deployment
+        // row is the only durable signal that a TEE boot may have left the
+        // name-derived seed behind. The seed survives a scale-to-zero, so
+        // the destroy must waive.
+        let (org_id, app_id) = insert_test_app(&pool, "stopped").await;
+        sqlx::query(
+            "INSERT INTO deployments (id, org_id, app_id, status, spec_snapshot)
+             VALUES ($1, $2, $3, 'healthy'::deploy_status_enum, '{}'::jsonb)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(org_id)
+        .bind(app_id)
+        .execute(&pool)
+        .await
+        .expect("seed historical deployment row");
+        let (namespace, name): (String, String) =
+            sqlx::query_as("SELECT namespace, name FROM apps WHERE id = $1")
+                .bind(app_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read ever-deployed app identity");
+        soft_delete_owner_binding(&pool, app_id, &namespace, &name)
+            .await
+            .expect("soft delete ever-deployed signed app");
+        assert!(
+            stale_owner_seed_for_binding(&pool, &namespace, &name)
+                .await
+                .expect("guard lookup"),
+            "an ever-deployed workload without a binding row must still waive"
+        );
+
+        // The same stopped shape with no deployment row never booted a TEE:
+        // no seed can exist, so recreate stays open.
+        let (fresh_org, fresh_app) = insert_test_app(&pool, "stopped").await;
+        let (fresh_namespace, fresh_name): (String, String) =
+            sqlx::query_as("SELECT namespace, name FROM apps WHERE id = $1")
+                .bind(fresh_app)
+                .fetch_one(&pool)
+                .await
+                .expect("read never-deployed app identity");
+        soft_delete_owner_binding(&pool, fresh_app, &fresh_namespace, &fresh_name)
+            .await
+            .expect("soft delete never-deployed app");
+        assert!(
+            !stale_owner_seed_for_binding(&pool, &fresh_namespace, &fresh_name)
+                .await
+                .expect("guard lookup"),
+            "a never-deployed workload must not waive"
+        );
+
+        for cleanup_org in [org_id, fresh_org] {
+            sqlx::query("DELETE FROM organizations WHERE id = $1")
+                .bind(cleanup_org)
+                .execute(&pool)
+                .await
+                .expect("delete ever-deployed fixture organization");
+        }
+    }
+
+    #[tokio::test]
+    async fn teardown_pending_authorization_survives_stacked_failed_generations() {
+        let pool = crate::test_support::database_test_pool().await;
+        let now = Utc::now();
+        let (org_id, app_id) = insert_test_app(&pool, "deleting").await;
+        sqlx::query("UPDATE apps SET workload_teardown_required = true WHERE id = $1")
+            .bind(app_id)
+            .execute(&pool)
+            .await
+            .expect("mark workload teardown pending");
+
+        // The still-running workload: a watching generation's job completed,
+        // and two later generations failed on top of it. Generation-count
+        // bounds would rank the live workload third and drop exactly the
+        // artifact the teardown needs.
+        let live = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, live, "healthy", now).await;
+        let live_artifact = insert_test_artifact(&pool, app_id, live, "ab").await;
+        insert_test_job(
+            &pool,
+            org_id,
+            app_id,
+            live,
+            live,
+            Some((live, &live_artifact)),
+        )
+        .await;
+
+        // A failed generation that never reached the apply phase: setup
+        // completes before any workload spec is written, so nothing can be
+        // running under it and it contributes no authorization.
+        let setup_failed = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, setup_failed, "failed", now).await;
+        let setup_failed_artifact = insert_test_artifact(&pool, app_id, setup_failed, "cd").await;
+        sqlx::query(
+            "INSERT INTO deployment_apply_jobs (
+                 deployment_id, app_id, org_id, source_deployment_id,
+                 payload_version, payload, payload_sha256,
+                 cleanup_app_on_setup_failure, signed_required,
+                 artifact_deployment_id, artifact_descriptor_core_hash,
+                 log_encryption, state, last_error_code
+             ) VALUES ($1, $2, $3, $1, 1,
+                       '{\"version\":1,\"log_encryption\":null}'::jsonb,
+                       $4, false, true, $1, $5, NULL, 'failed',
+                       'deployment_setup_failed')",
+        )
+        .bind(setup_failed)
+        .bind(app_id)
+        .bind(org_id)
+        .bind(vec![5u8; 32])
+        .bind(hex::decode(&setup_failed_artifact.metadata.descriptor_core_hash).unwrap())
+        .execute(&pool)
+        .await
+        .expect("insert setup-failed apply job");
+
+        // A failed generation that reached the apply phase: apply failures
+        // are never reverted, so its workload spec may be the one the
+        // teardown hits.
+        let apply_failed = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            org_id,
+            app_id,
+            apply_failed,
+            "failed",
+            now + chrono::Duration::seconds(1),
+        )
+        .await;
+        set_test_setup_state(&pool, apply_failed, "accepted").await;
+        let apply_failed_artifact = insert_test_artifact(&pool, app_id, apply_failed, "de").await;
+        sqlx::query(
+            "INSERT INTO deployment_apply_jobs (
+                 deployment_id, app_id, org_id, source_deployment_id,
+                 payload_version, payload, payload_sha256,
+                 cleanup_app_on_setup_failure, signed_required,
+                 artifact_deployment_id, artifact_descriptor_core_hash,
+                 log_encryption, state, last_error_code
+             ) VALUES ($1, $2, $3, $1, 1,
+                       '{\"version\":1,\"log_encryption\":null}'::jsonb,
+                       $4, false, true, $1, $5, NULL, 'failed',
+                       'deployment_apply_failed')",
+        )
+        .bind(apply_failed)
+        .bind(app_id)
+        .bind(org_id)
+        .bind(vec![6u8; 32])
+        .bind(hex::decode(&apply_failed_artifact.metadata.descriptor_core_hash).unwrap())
+        .execute(&pool)
+        .await
+        .expect("insert apply-failed apply job");
+
+        let candidates = load_signed_policy_candidates(&pool, 2)
+            .await
+            .expect("select teardown-pending authority with stacked failures");
+        let hashes: HashSet<_> = candidates
+            .iter()
+            .map(|candidate| candidate.artifact.metadata.descriptor_core_hash.as_str())
+            .collect();
+        assert!(
+            hashes.contains(live_artifact.metadata.descriptor_core_hash.as_str()),
+            "the live workload under two stacked failures must stay authorized"
+        );
+        assert!(
+            hashes.contains(apply_failed_artifact.metadata.descriptor_core_hash.as_str()),
+            "an apply-phase failure newer than the last applied workload must stay authorized"
+        );
+        assert!(
+            !hashes.contains(setup_failed_artifact.metadata.descriptor_core_hash.as_str()),
+            "a provable setup failure never wrote a workload spec and must stay excluded"
+        );
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete stacked-failures fixture organization");
+    }
+
+    #[tokio::test]
+    async fn queued_supersessions_do_not_crowd_out_live_teardown_authority() {
+        let pool = crate::test_support::database_test_pool().await;
+        let now = Utc::now();
+        let (org_id, app_id) = insert_test_app(&pool, "deleting").await;
+        sqlx::query("UPDATE apps SET workload_teardown_required = true WHERE id = $1")
+            .bind(app_id)
+            .execute(&pool)
+            .await
+            .expect("mark workload teardown pending");
+
+        // The live workload: watching generation, its apply job completed.
+        let live = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, live, "healthy", now).await;
+        let live_artifact = insert_test_artifact(&pool, app_id, live, "ab").await;
+        insert_test_job(
+            &pool,
+            org_id,
+            app_id,
+            live,
+            live,
+            Some((live, &live_artifact)),
+        )
+        .await;
+
+        // A pile of replacement deployments superseded while still queued:
+        // their setup never completed (spec_snapshot stays at the initial
+        // state), so they entered no apply phase and wrote no workload spec.
+        // Admitting them as required artifacts would consume the per-app
+        // retention slots ahead of the live workload and could push its
+        // descriptor out of the published policy.
+        let mut queued_hashes = Vec::new();
+        for index in 0..4u32 {
+            let queued = Uuid::new_v4();
+            let mut artifact = test_signed_policy_artifact(&format!("{index:x}0"), 16);
+            artifact.metadata.app_id = app_id.to_string();
+            artifact.metadata.deploy_id = queued.to_string();
+            let hash = hex::decode(&artifact.metadata.descriptor_core_hash).unwrap();
+            let mut fx = pool.begin().await.unwrap();
+            sqlx::query(
+                "INSERT INTO deployment_apply_jobs (
+                     deployment_id, app_id, org_id, source_deployment_id,
+                     payload_version, payload, payload_sha256,
+                     cleanup_app_on_setup_failure, signed_required,
+                     artifact_deployment_id, artifact_descriptor_core_hash,
+                     log_encryption, state, last_error_code
+                 ) VALUES ($1, $2, $3, $1, 1,
+                           '{\"version\":1,\"log_encryption\":null}'::jsonb,
+                           $4, false, true, $1, $5, NULL, 'failed',
+                           'deployment_superseded')",
+            )
+            .bind(queued)
+            .bind(app_id)
+            .bind(org_id)
+            .bind(vec![7u8 + index as u8; 32])
+            .bind(&hash)
+            .execute(&mut *fx)
+            .await
+            .expect("insert queued-superseded apply job");
+            sqlx::query(
+                "INSERT INTO workload_artifacts (
+                     descriptor_core_hash, app_id, deploy_id, descriptor_payload,
+                     descriptor_signature, descriptor_signing_key_id,
+                     org_keyring_payload, org_keyring_signature,
+                     signed_policy_artifact
+                 ) VALUES ($1, $2, $3, '{}'::jsonb, $4, 'test-key',
+                           '{}'::jsonb, $5, $6)",
+            )
+            .bind(&hash)
+            .bind(app_id)
+            .bind(queued)
+            .bind(vec![3u8; 64])
+            .bind(vec![4u8; 64])
+            .bind(serde_json::to_value(&artifact).unwrap())
+            .execute(&mut *fx)
+            .await
+            .expect("insert queued-superseded artifact");
+            sqlx::query(
+                "INSERT INTO deployments (
+                     id, org_id, app_id, status, spec_snapshot, created_at
+                 ) VALUES ($1, $2, $3, 'failed'::deploy_status_enum,
+                           '{\"setup_state\":\"dns_pending\"}'::jsonb, $4)",
+            )
+            .bind(queued)
+            .bind(org_id)
+            .bind(app_id)
+            .bind(now + chrono::Duration::seconds((index + 2) as i64))
+            .execute(&mut *fx)
+            .await
+            .expect("insert queued-superseded deployment");
+            fx.commit().await.unwrap();
+            queued_hashes.push(artifact.metadata.descriptor_core_hash.clone());
+        }
+
+        // Retention 1: exactly one artifact per app survives. It must be the
+        // live workload's — the queued supersessions never reached the apply
+        // phase and must not even be admitted, let alone win the slot.
+        let candidates = load_signed_policy_candidates(&pool, 1)
+            .await
+            .expect("select teardown-pending authority with queued supersessions");
+        let hashes: HashSet<_> = candidates
+            .iter()
+            .map(|candidate| candidate.artifact.metadata.descriptor_core_hash.as_str())
+            .collect();
+        assert_eq!(
+            hashes.len(),
+            1,
+            "with retention 1 exactly one artifact survives: {hashes:?}"
+        );
+        assert!(
+            hashes.contains(live_artifact.metadata.descriptor_core_hash.as_str()),
+            "the live workload must keep the retention slot, not a queued supersession"
+        );
+        for hash in &queued_hashes {
+            assert!(
+                !hashes.contains(hash.as_str()),
+                "a queued supersession must not enter the policy"
+            );
+        }
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete queued-supersessions fixture organization");
     }
 }

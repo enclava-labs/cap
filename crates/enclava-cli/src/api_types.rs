@@ -785,6 +785,27 @@ pub struct TransitionReceiptAttestation {
     pub leaf_spki_sha256: String,
     pub receipt_pubkey_sha256: String,
     pub attestation_evidence_sha256: String,
+    /// Raw AMD SNP quote and DER chain the CLI verified, submitted so the API
+    /// can independently verify the TEE launch evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quote: Option<TransitionSnpQuote>,
+}
+
+/// Raw AMD SNP launch evidence for an unlock-mode transition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransitionSnpQuote {
+    /// Raw 1184-byte AMD SNP attestation report, standard base64.
+    pub report_b64: String,
+    /// ARK certificate DER, standard base64.
+    pub ark_der_b64: String,
+    /// ASK certificate DER, standard base64.
+    pub ask_der_b64: String,
+    /// VCEK certificate DER, standard base64.
+    pub vcek_der_b64: String,
+    /// ARK-signed AMD product CRL DER, standard base64, fetched fresh from
+    /// AMD KDS. The API's revocation gate requires it: a transition whose
+    /// endorsement chain has no revocation collateral fails closed.
+    pub crl_der_b64: String,
 }
 
 #[derive(Debug)]
@@ -997,6 +1018,14 @@ pub struct ApiErrorBody {
     /// workload blocking app delete). Never tenant-controlled data.
     #[serde(default)]
     pub cause: Option<String>,
+    /// Server-clock lease hints from CAP's lane-etiquette contract: the
+    /// operation kind holding the app lane, and whole seconds until a
+    /// same-key retry can re-execute. Absent on old servers and on errors
+    /// with no known window -- never invented client-side.
+    #[serde(default)]
+    pub held_by: Option<String>,
+    #[serde(default)]
+    pub retry_after: Option<i64>,
 }
 
 #[cfg(test)]

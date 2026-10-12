@@ -10,24 +10,28 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SignerIdentity {
     pub subject: String,
     pub issuer: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EnvVar {
     pub name: String,
     pub value: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Port {
     pub container_port: u32,
     pub protocol: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Mount {
     pub source: String,
     pub destination: String,
@@ -37,6 +41,7 @@ pub struct Mount {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Capabilities {
     #[serde(default)]
     pub add: Vec<String>,
@@ -45,6 +50,7 @@ pub struct Capabilities {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SecurityContext {
     pub run_as_user: u32,
     pub run_as_group: u32,
@@ -54,6 +60,7 @@ pub struct SecurityContext {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Resources {
     #[serde(default)]
     pub requests: Vec<EnvVar>,
@@ -62,6 +69,7 @@ pub struct Resources {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OciRuntimeSpec {
     pub command: Vec<String>,
     pub args: Vec<String>,
@@ -75,6 +83,7 @@ pub struct OciRuntimeSpec {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Sidecars {
     pub attestation_proxy_digest: String,
     pub caddy_digest: String,
@@ -115,6 +124,7 @@ impl From<[u8; 48]> for FirmwareMeasurement {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeploymentDescriptor {
     pub schema_version: String,
     pub org_id: Uuid,

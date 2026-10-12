@@ -20,9 +20,103 @@ use sqlx::{Executor, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::models::App;
+use crate::platform_release::PlatformRelease;
+use enclava_engine::manifest::shape::runtime_class_for;
+use enclava_engine::types::AttestationConfig;
+
+/// Platform-authoritative values a signed descriptor must agree with.
+///
+/// `validate_deployment_inputs` binds the descriptor to the app row; this
+/// binding pins the platform-derived descriptor fields to what this API
+/// instance actually runs: the loaded signed platform release (version,
+/// policy template, firmware measurement expectation, default runtime class)
+/// and the attestation sidecar digests (proxy / caddy ingress). `None` fields
+/// have no configured source of truth in this deployment mode and are
+/// skipped; every field is cross-checked whenever its source of truth exists.
+#[derive(Debug, Clone, Default)]
+pub struct DescriptorPlatformBinding {
+    pub platform_release_version: Option<String>,
+    pub policy_template_id: Option<String>,
+    pub policy_template_sha256: Option<[u8; 32]>,
+    pub expected_firmware_measurement: Option<[u8; 32]>,
+    pub expected_runtime_class: Option<String>,
+    pub attestation_proxy_digest: Option<String>,
+    pub caddy_digest: Option<String>,
+}
+
+impl DescriptorPlatformBinding {
+    /// A binding with no configured sources of truth: every platform-field
+    /// cross-check is skipped except the canonical `kbs_resource_path` shape,
+    /// which is always derived from the app row's namespace/name (never the
+    /// descriptor's own copies of those fields).
+    pub const EMPTY: Self = Self {
+        platform_release_version: None,
+        policy_template_id: None,
+        policy_template_sha256: None,
+        expected_firmware_measurement: None,
+        expected_runtime_class: None,
+        attestation_proxy_digest: None,
+        caddy_digest: None,
+    };
+
+    /// Derive the binding from the API runtime: the verified platform release
+    /// (when enabled) plus the attestation sidecar configuration. The expected
+    /// runtime class is resolved from the app's memory limit the same way the
+    /// manifest renderer resolves it for the pod.
+    pub fn from_runtime(
+        release: Option<&PlatformRelease>,
+        attestation: Option<&AttestationConfig>,
+        memory_limit: &str,
+    ) -> Result<Self, SigningServiceError> {
+        let decode = |field: &'static str, value: Result<[u8; 32], _>| {
+            value.map_err(|err| SigningServiceError::Blob(format!("{field}: {err}")))
+        };
+        Ok(Self {
+            platform_release_version: release
+                .map(|release| release.platform_release_version.clone()),
+            policy_template_id: release.map(|release| release.policy_template_id.clone()),
+            policy_template_sha256: match release {
+                Some(release) => Some(decode(
+                    "platform_release.policy_template_sha256",
+                    release.policy_template_sha256_bytes(),
+                )?),
+                None => None,
+            },
+            expected_firmware_measurement: match release {
+                Some(release) => Some(decode(
+                    "platform_release.expected_firmware_measurement",
+                    release.expected_firmware_measurement_bytes(),
+                )?),
+                None => None,
+            },
+            expected_runtime_class: release
+                .map(|release| runtime_class_for(memory_limit, &release.expected_runtime_class)),
+            attestation_proxy_digest: attestation
+                .map(|config| config.proxy_image.digest().to_string()),
+            caddy_digest: attestation.map(|config| config.caddy_image.digest().to_string()),
+        })
+    }
+}
 
 const DEFAULT_SIGNING_SERVICE_TIMEOUT_SECONDS: u64 = 120;
 const ORG_SIGNING_AUTHORITY_LANE_DOMAIN: i32 = 0x5349_474e;
+
+/// Build the platform binding for descriptor validation from the API runtime
+/// state and the app's persisted memory limit (which selects the small vs
+/// standard runtime class exactly like the manifest renderer).
+pub fn descriptor_platform_binding_for(
+    state: &crate::state::AppState,
+    memory_limit: &str,
+) -> Result<DescriptorPlatformBinding, SigningServiceError> {
+    DescriptorPlatformBinding::from_runtime(
+        state
+            .platform_release_envelope
+            .as_ref()
+            .map(|envelope| &envelope.payload),
+        state.attestation.as_ref(),
+        memory_limit,
+    )
+}
 
 fn org_signing_advisory_key(id: Uuid) -> i32 {
     let bytes = id.as_bytes();
@@ -343,6 +437,13 @@ pub struct SignRequest {
     pub log_encryption: Option<LogEncryptionConfig>,
 }
 
+// NOTE: deny_unknown_fields is deliberately NOT set on SignedPolicyArtifact /
+// PolicyMetadata: this struct also deserializes HTTP responses from the
+// policy-signing-service (separate repo, coordinated rollout per AGENTS.md),
+// so unknown-field strictness here would fail deployments whenever the
+// service ships an additive field. Customer-supplied artifacts are bounded
+// by the decode_json_blob cap and validate_signed_artifact_field_caps.
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SignedPolicyArtifact {
     pub metadata: PolicyMetadata,
@@ -413,6 +514,7 @@ impl DeploymentSigningArtifacts {
         app: &App,
         image_digest: &str,
         api_signing_pubkey: &str,
+        platform: &DescriptorPlatformBinding,
     ) -> Result<(), SigningServiceError> {
         self.validate_workload_runtime_spec()?;
         if self.descriptor.org_id != app.org_id {
@@ -437,6 +539,10 @@ impl DeploymentSigningArtifacts {
             != app.tee_domain.clone().unwrap_or_else(|| app.domain.clone())
         {
             return Err(SigningServiceError::Mismatch("tee_domain".into()));
+        }
+        let app_custom_domains: Vec<&str> = app.custom_domain.as_deref().into_iter().collect();
+        if self.descriptor.custom_domains != app_custom_domains {
+            return Err(SigningServiceError::Mismatch("custom_domains".into()));
         }
         if self.descriptor.identity_hash
             != decode_hex32(
@@ -478,6 +584,68 @@ impl DeploymentSigningArtifacts {
         }
         if self.org_keyring.org_id != app.org_id {
             return Err(SigningServiceError::Mismatch("org_keyring.org_id".into()));
+        }
+        self.validate_platform_binding(app, platform)?;
+        Ok(())
+    }
+
+    /// Cross-check the platform-derived descriptor fields against the values
+    /// this API instance actually runs (issue #129): the descriptor's
+    /// customer-signed platform fields must match the loaded signed platform
+    /// release and the configured attestation sidecar digests, and the KBS
+    /// owner resource path must match the canonical path derived from the
+    /// app row itself so a descriptor cannot self-authorize access to
+    /// another app's owner resources.
+    fn validate_platform_binding(
+        &self,
+        app: &App,
+        platform: &DescriptorPlatformBinding,
+    ) -> Result<(), SigningServiceError> {
+        let mismatch = |field: &'static str| SigningServiceError::Mismatch(field.into());
+        if let Some(expected) = platform.platform_release_version.as_deref()
+            && self.descriptor.platform_release_version != expected
+        {
+            return Err(mismatch("platform_release_version"));
+        }
+        if let Some(expected) = platform.policy_template_id.as_deref()
+            && self.descriptor.policy_template_id != expected
+        {
+            return Err(mismatch("policy_template_id"));
+        }
+        if let Some(expected) = platform.policy_template_sha256
+            && self.descriptor.policy_template_sha256 != expected
+        {
+            return Err(mismatch("policy_template_sha256"));
+        }
+        if let Some(expected) = platform.expected_firmware_measurement
+            && self.descriptor.expected_firmware_measurement.as_bytes() != expected.as_slice()
+        {
+            return Err(mismatch("expected_firmware_measurement"));
+        }
+        if let Some(expected) = platform.expected_runtime_class.as_deref()
+            && self.descriptor.expected_runtime_class != expected
+        {
+            return Err(mismatch("expected_runtime_class"));
+        }
+        if let Some(expected) = platform.attestation_proxy_digest.as_deref()
+            && self.descriptor.sidecars.attestation_proxy_digest != expected
+        {
+            return Err(mismatch("sidecars.attestation_proxy_digest"));
+        }
+        if let Some(expected) = platform.caddy_digest.as_deref()
+            && self.descriptor.sidecars.caddy_digest != expected
+        {
+            return Err(mismatch("sidecars.caddy_digest"));
+        }
+        // Derived from the app row, not the descriptor's own copy of the
+        // same fields: this stays a cross-check even if the descriptor
+        // equality checks above are ever relaxed or reordered.
+        let expected_kbs_resource_path = format!(
+            "default/{}-{}-owner/seed-encrypted",
+            app.namespace, app.name
+        );
+        if self.descriptor.kbs_resource_path != expected_kbs_resource_path {
+            return Err(mismatch("kbs_resource_path"));
         }
         Ok(())
     }
@@ -567,9 +735,14 @@ impl DeploymentSigningArtifacts {
         artifact: &SignedPolicyArtifact,
         signing_service_pubkey_hex: &str,
     ) -> Result<(), SigningServiceError> {
-        self.validate_signed_artifact_common(artifact)?;
+        // Field caps, then the platform signature over the canonical blob,
+        // then semantic payload compares (#128). Hashing rego_text to build
+        // the signing input is unavoidable pre-verify work; every semantic
+        // mismatch diagnostic is gated behind a valid platform signature.
+        validate_signed_artifact_field_caps(artifact)?;
         let rego_hash: [u8; 32] = Sha256::digest(artifact.rego_text.as_bytes()).into();
         verify_signed_policy_artifact(artifact, &rego_hash, signing_service_pubkey_hex)?;
+        self.validate_signed_artifact_common(artifact, &rego_hash)?;
         Ok(())
     }
 
@@ -648,7 +821,7 @@ impl DeploymentSigningArtifacts {
         artifact: &mut SignedPolicyArtifact,
     ) -> Result<(), SigningServiceError> {
         if let Some(existing) = artifact.org_keyring.as_ref() {
-            let existing: OrgKeyringEnvelope = serde_json::from_value(existing.clone())?;
+            let existing: OrgKeyringEnvelope = parse_org_keyring_envelope_tolerant(existing)?;
             if keyring_fingerprint(&existing.keyring) != self.org_keyring_fingerprint {
                 return Err(SigningServiceError::Mismatch(
                     "artifact.org_keyring does not match deployment org_keyring".into(),
@@ -664,6 +837,12 @@ impl DeploymentSigningArtifacts {
                     "artifact.org_keyring.signing_pubkey".into(),
                 ));
             }
+            // #128: the matched envelope may carry unknown-field padding from
+            // a customer-supplied artifact (the platform signature does not
+            // cover org_keyring). Replace it with the normalized envelope so
+            // only the typed schema is persisted and forwarded to the
+            // proof bundle / in-enclave parse path.
+            artifact.org_keyring = Some(self.org_keyring_envelope.clone());
             return Ok(());
         }
 
@@ -674,6 +853,7 @@ impl DeploymentSigningArtifacts {
     fn validate_signed_artifact_common(
         &self,
         artifact: &SignedPolicyArtifact,
+        rego_hash: &[u8; 32],
     ) -> Result<(), SigningServiceError> {
         let metadata = &artifact.metadata;
         if metadata.app_id != self.descriptor.app_id.to_string() {
@@ -717,12 +897,11 @@ impl DeploymentSigningArtifacts {
             ));
         }
 
-        let rego_hash: [u8; 32] = Sha256::digest(artifact.rego_text.as_bytes()).into();
         let artifact_rego_hash = decode_hex32("rego_sha256", &artifact.rego_sha256)?;
-        if artifact_rego_hash != rego_hash {
+        if artifact_rego_hash != *rego_hash {
             return Err(SigningServiceError::Mismatch("artifact.rego_sha256".into()));
         }
-        if self.descriptor.expected_kbs_policy_hash != rego_hash {
+        if self.descriptor.expected_kbs_policy_hash != *rego_hash {
             return Err(SigningServiceError::Mismatch(
                 "expected_kbs_policy_hash".into(),
             ));
@@ -745,6 +924,15 @@ impl DeploymentSigningArtifacts {
     }
 
     fn verify_keyring_signature(&self) -> Result<(), SigningServiceError> {
+        // #128: run the ed25519 check before the owner-membership lookup so an
+        // unauthenticated keyring surfaces InvalidSignature (not a semantic
+        // Mismatch) regardless of which check would fail.
+        let verifying_key = VerifyingKey::from_bytes(&self.org_keyring_signing_pubkey)
+            .map_err(|_| SigningServiceError::Mismatch("org_keyring.signing_pubkey".into()))?;
+        let signature = Signature::from_bytes(&self.org_keyring_signature);
+        verifying_key
+            .verify(&canonical_keyring_bytes(&self.org_keyring), &signature)
+            .map_err(|_| SigningServiceError::InvalidSignature)?;
         if !self.org_keyring.members.iter().any(|member| {
             member.pubkey == self.org_keyring_signing_pubkey
                 && matches!(member.role, KeyringRole::Owner)
@@ -753,12 +941,7 @@ impl DeploymentSigningArtifacts {
                 "org_keyring.signing_pubkey owner member".into(),
             ));
         }
-        let verifying_key = VerifyingKey::from_bytes(&self.org_keyring_signing_pubkey)
-            .map_err(|_| SigningServiceError::Mismatch("org_keyring.signing_pubkey".into()))?;
-        let signature = Signature::from_bytes(&self.org_keyring_signature);
-        verifying_key
-            .verify(&canonical_keyring_bytes(&self.org_keyring), &signature)
-            .map_err(|_| SigningServiceError::InvalidSignature)
+        Ok(())
     }
 
     fn verify_descriptor_signature(&self) -> Result<(), SigningServiceError> {
@@ -804,7 +987,15 @@ impl DeploymentSigningArtifacts {
                 "org_keyring not registered with CAP".into(),
             ));
         };
-        let stored: OrgKeyring = serde_json::from_slice(&payload)?;
+        // #128: rows registered before normalization stored the raw request
+        // JSON; parse tolerantly (known fields only) so legacy rows keep
+        // re-verifying. The fingerprint compare below still pins the exact
+        // keyring content the customer authority was checked against.
+        let stored: OrgKeyring = {
+            let value: serde_json::Value =
+                serde_json::from_slice(&payload).map_err(SigningServiceError::Serde)?;
+            parse_org_keyring_tolerant(&value)?
+        };
         if keyring_fingerprint(&stored) != self.org_keyring_fingerprint {
             return Err(SigningServiceError::Mismatch(
                 "org_keyring does not match latest CAP keyring".into(),
@@ -854,6 +1045,254 @@ fn app_unlock_mode(mode: crate::models::UnlockMode) -> &'static str {
     }
 }
 
+/// Per-field byte caps for customer-supplied signed policy artifacts (#128).
+/// Even though the request body limit bounds total size, each policy field is
+/// capped independently so a signed-or-unsigned artifact cannot carry
+/// multi-megabyte policy text into hashing, storage, or in-enclave parsing.
+/// Caps are enforced on the JSON-ESCAPED length (see json_escaped_len): the
+/// composed proof-bundle budgets charge the escaped form, and quotes,
+/// backslashes, or control characters can inflate a field up to 6x its raw
+/// byte length. rego_text must fit alone inside the 49,152-byte
+/// trustee_policy_json
+/// proof-bundle field (it also carries metadata, signature, and the attached
+/// keyring envelope); 24 KiB leaves headroom for those. agent_policy_text is
+/// capped at 48 KiB: together with a 32 KiB descriptor, 16 KiB keyring, 24 KiB
+/// rego text, and envelope/metadata overhead the composed
+/// workload_artifacts_json stays under its 196_608-byte field budget;
+/// validate_proof_bundle_budget enforces the composed size exactly.
+pub(crate) const MAX_POLICY_TEXT_BYTES: usize = 48 * 1024;
+pub(crate) const MAX_REGO_TEXT_BYTES: usize = 24 * 1024;
+pub(crate) const MAX_POLICY_METADATA_FIELD_BYTES: usize = 256;
+pub(crate) const MAX_POLICY_SIGNATURE_FIELD_BYTES: usize = 128;
+
+/// Length a string occupies inside a serde_json-serialized value (quotes,
+/// backslashes, and control characters escaped). #128 review follow-up: this
+/// is the length the composed proof-bundle budgets actually charge, so the
+/// per-field caps above must be checked in escaped form.
+fn json_escaped_len(value: &str) -> usize {
+    // serde_json::to_string yields "escaped" including the surrounding quote
+    // pair; drop it so the cap measures the escaped CONTENT — escape
+    // inflation (quotes/backslashes/control chars, up to 6x) is what matters
+    // against the budgets, and fixed 2-byte overhead would make a legal
+    // 128-hex-char signature measure 130 against a 128 cap.
+    serde_json::to_string(value)
+        .map(|escaped| escaped.len().saturating_sub(2))
+        .unwrap_or(usize::MAX)
+}
+
+/// #128 review follow-up (P1): enforce the enveloped `org_keyring_blob`
+/// budget at registration time (put_keyring / rotate_org_owner), not only at
+/// deploy time. A registered keyring that the CLI later wraps into an
+/// envelope larger than MAX_ORG_KEYRING_BLOB_BYTES would make every signed
+/// deployment fail decode_optional_blobs even though CAP already made that
+/// keyring authoritative. The check composes the exact envelope the CLI
+/// builds from a GET /orgs/{name}/keyring response (typed keyring payload,
+/// hex signature, hex signing pubkey) so accepted authority stays deployable.
+pub(crate) fn validate_org_keyring_registration_budget(
+    keyring_json_len: usize,
+    signature: &[u8],
+    signing_pubkey: &[u8],
+) -> Result<(), SigningServiceError> {
+    // serde_json::to_string of the CLI envelope:
+    // {"keyring":<keyring_json>,"signature":"<128 hex>","signing_pubkey":"<64 hex>"}
+    let envelope_len = keyring_json_len
+        .saturating_add("{\"keyring\":".len())
+        .saturating_add(",\"signature\":\"".len())
+        .saturating_add(signature.len() * 2)
+        .saturating_add("\",\"signing_pubkey\":\"".len())
+        .saturating_add(signing_pubkey.len() * 2)
+        .saturating_add("\"}".len());
+    if envelope_len > MAX_ORG_KEYRING_BLOB_BYTES {
+        return Err(SigningServiceError::Blob(format!(
+            "org keyring envelope exceeds {MAX_ORG_KEYRING_BLOB_BYTES}-byte deploy-time budget \
+             (enveloped size {envelope_len} bytes); reduce keyring members"
+        )));
+    }
+    Ok(())
+}
+
+/// Proof-bundle field budgets mirrored from deploy.rs build_verification_material
+/// and enclava-verifier bundle.rs; the ingress caps above are derived from them.
+pub(crate) const MAX_TRUSTEE_POLICY_JSON_BYTES: usize = 49_152;
+pub(crate) const MAX_WORKLOAD_ARTIFACTS_JSON_BYTES: usize = 196_608;
+
+/// Composed proof-bundle budget check (#128): the exact JSON the deploy
+/// pipeline stores and forwards into the verifier proof bundle
+/// (workload_artifacts_json 196_608 B / trustee_policy_json 49_152 B) is
+/// composed here and rejected at ingress with a 400, instead of failing at
+/// apply time with a generic "verification material field exceeds v1 limit"
+/// after the deployment row was already committed. The composed value is the
+/// authoritative one: after attach_customer_authority the artifact embeds the
+/// normalized typed keyring envelope, so padding cannot ride in via
+/// artifact.org_keyring either.
+pub(crate) fn validate_proof_bundle_budget(
+    artifacts: &DeploymentSigningArtifacts,
+    signed_policy_artifact: &SignedPolicyArtifact,
+) -> Result<(), SigningServiceError> {
+    let workload = workload_artifacts_json(artifacts, signed_policy_artifact)?;
+    if workload.len() > MAX_WORKLOAD_ARTIFACTS_JSON_BYTES {
+        return Err(SigningServiceError::Blob(format!(
+            "workload_artifacts_json exceeds {MAX_WORKLOAD_ARTIFACTS_JSON_BYTES}-byte proof-bundle field budget (got {})",
+            workload.len()
+        )));
+    }
+    let trustee = trustee_policy_json(signed_policy_artifact)?;
+    if trustee.len() > MAX_TRUSTEE_POLICY_JSON_BYTES {
+        return Err(SigningServiceError::Blob(format!(
+            "trustee_policy_json exceeds {MAX_TRUSTEE_POLICY_JSON_BYTES}-byte proof-bundle field budget (got {})",
+            trustee.len()
+        )));
+    }
+    Ok(())
+}
+
+/// #128 review follow-up (Codex P2): dispatch forwards the RAW stored
+/// strings — LoadedWorkloadArtifacts::workload_artifacts_json and
+/// ::trustee_policy_json are composed from row.signed_policy_artifact
+/// verbatim — and build_verification_material charges those exact bytes.
+/// validate_proof_bundle_budget alone measures the NORMALIZED artifact
+/// (attach_customer_authority strips unknown-field padding from
+/// artifact.org_keyring), so a legacy row whose raw stored org_keyring
+/// padding blows a budget would pass that check and still fail at apply
+/// time. This checks the exact strings that will be forwarded.
+pub(crate) fn validate_forwarded_proof_bundle_budget(
+    workload_artifacts_json: &str,
+    trustee_policy_json: &str,
+) -> Result<(), SigningServiceError> {
+    if workload_artifacts_json.len() > MAX_WORKLOAD_ARTIFACTS_JSON_BYTES {
+        return Err(SigningServiceError::Blob(format!(
+            "stored workload_artifacts_json exceeds {MAX_WORKLOAD_ARTIFACTS_JSON_BYTES}-byte proof-bundle field budget (got {})",
+            workload_artifacts_json.len()
+        )));
+    }
+    if trustee_policy_json.len() > MAX_TRUSTEE_POLICY_JSON_BYTES {
+        return Err(SigningServiceError::Blob(format!(
+            "stored trustee_policy_json exceeds {MAX_TRUSTEE_POLICY_JSON_BYTES}-byte proof-bundle field budget (got {})",
+            trustee_policy_json.len()
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_signed_artifact_field_caps(
+    artifact: &SignedPolicyArtifact,
+) -> Result<(), SigningServiceError> {
+    // #128 review follow-up: caps measure the JSON-escaped length — the form
+    // the composed proof-bundle budgets actually see. A rego/agent-policy
+    // text made of quotes, backslashes, or control characters serializes up
+    // to 6x its raw byte length, so a raw-length cap could accept a field
+    // whose escaped form blows the trustee_policy_json budget.
+    fn cap(name: &'static str, value: &str, max: usize) -> Result<(), SigningServiceError> {
+        let escaped = json_escaped_len(value);
+        if escaped > max {
+            return Err(SigningServiceError::Blob(format!(
+                "{name} exceeds {max} bytes (JSON-escaped length {escaped})"
+            )));
+        }
+        Ok(())
+    }
+    let metadata = &artifact.metadata;
+    cap(
+        "artifact.rego_text",
+        &artifact.rego_text,
+        MAX_REGO_TEXT_BYTES,
+    )?;
+    cap(
+        "artifact.agent_policy_text",
+        &artifact.agent_policy_text,
+        MAX_POLICY_TEXT_BYTES,
+    )?;
+    cap(
+        "artifact.rego_sha256",
+        &artifact.rego_sha256,
+        MAX_POLICY_SIGNATURE_FIELD_BYTES,
+    )?;
+    cap(
+        "artifact.agent_policy_sha256",
+        &artifact.agent_policy_sha256,
+        MAX_POLICY_SIGNATURE_FIELD_BYTES,
+    )?;
+    cap(
+        "artifact.signature",
+        &artifact.signature,
+        MAX_POLICY_SIGNATURE_FIELD_BYTES,
+    )?;
+    cap(
+        "artifact.verify_pubkey_b64",
+        &artifact.verify_pubkey_b64,
+        MAX_POLICY_SIGNATURE_FIELD_BYTES,
+    )?;
+    cap(
+        "artifact.metadata.app_id",
+        &metadata.app_id,
+        MAX_POLICY_METADATA_FIELD_BYTES,
+    )?;
+    cap(
+        "artifact.metadata.deploy_id",
+        &metadata.deploy_id,
+        MAX_POLICY_METADATA_FIELD_BYTES,
+    )?;
+    cap(
+        "artifact.metadata.descriptor_core_hash",
+        &metadata.descriptor_core_hash,
+        MAX_POLICY_METADATA_FIELD_BYTES,
+    )?;
+    cap(
+        "artifact.metadata.descriptor_signing_pubkey",
+        &metadata.descriptor_signing_pubkey,
+        MAX_POLICY_METADATA_FIELD_BYTES,
+    )?;
+    cap(
+        "artifact.metadata.platform_release_version",
+        &metadata.platform_release_version,
+        MAX_POLICY_METADATA_FIELD_BYTES,
+    )?;
+    cap(
+        "artifact.metadata.policy_template_id",
+        &metadata.policy_template_id,
+        MAX_POLICY_METADATA_FIELD_BYTES,
+    )?;
+    cap(
+        "artifact.metadata.policy_template_sha256",
+        &metadata.policy_template_sha256,
+        MAX_POLICY_METADATA_FIELD_BYTES,
+    )?;
+    cap(
+        "artifact.metadata.agent_policy_sha256",
+        &metadata.agent_policy_sha256,
+        MAX_POLICY_METADATA_FIELD_BYTES,
+    )?;
+    cap(
+        "artifact.metadata.genpolicy_version_pin",
+        &metadata.genpolicy_version_pin,
+        MAX_POLICY_METADATA_FIELD_BYTES,
+    )?;
+    cap(
+        "artifact.metadata.signed_at",
+        &metadata.signed_at,
+        MAX_POLICY_METADATA_FIELD_BYTES,
+    )?;
+    cap(
+        "artifact.metadata.key_id",
+        &metadata.key_id,
+        MAX_POLICY_METADATA_FIELD_BYTES,
+    )?;
+    // The attached org keyring envelope is a free-form serde_json::Value on
+    // the wire; bound its serialized size so it cannot carry padding into
+    // storage, the verifier proof bundle, or the in-enclave parse path.
+    if let Some(org_keyring) = artifact.org_keyring.as_ref() {
+        let len = serde_json::to_string(org_keyring)
+            .map_err(SigningServiceError::Serde)?
+            .len();
+        if len > MAX_ORG_KEYRING_BLOB_BYTES {
+            return Err(SigningServiceError::Blob(format!(
+                "artifact.org_keyring exceeds {MAX_ORG_KEYRING_BLOB_BYTES} bytes (got {len})"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn verify_signed_policy_artifact(
     artifact: &SignedPolicyArtifact,
     rego_hash: &[u8; 32],
@@ -874,18 +1313,27 @@ fn verify_signed_policy_artifact_with_pubkey(
     expected_pubkey: &[u8; 32],
     pubkey_field: &'static str,
 ) -> Result<(), SigningServiceError> {
+    // The ed25519 check runs first (#128): verify_pubkey_b64 is a diagnostic
+    // echo, not part of policy_artifact_signing_input, so an artifact with a
+    // bad signature must surface InvalidSignature even when the echoed pubkey
+    // also disagrees — no semantic signal before the crypto check.
+    let verifying_key = VerifyingKey::from_bytes(expected_pubkey)
+        .map_err(|_| SigningServiceError::Mismatch(pubkey_field.into()))?;
+    let signature = Signature::from_bytes(&decode_signature(&artifact.signature)?);
+    // #128: building the signing input parses attacker-controlled metadata
+    // (UUID/hex fields). A malformed field must surface the same error as a
+    // failed crypto check — InvalidSignature — so the response does not
+    // distinguish "bad signature" from "signature over unparsable metadata".
+    let signing_input = policy_artifact_signing_input(&artifact.metadata, rego_hash)
+        .map_err(|_| SigningServiceError::InvalidSignature)?;
+    verifying_key
+        .verify(&signing_input, &signature)
+        .map_err(|_| SigningServiceError::InvalidSignature)?;
     let diagnostic_pubkey = decode_pubkey_b64("verify_pubkey_b64", &artifact.verify_pubkey_b64)?;
     if &diagnostic_pubkey != expected_pubkey {
         return Err(SigningServiceError::Mismatch(pubkey_field.into()));
     }
-
-    let verifying_key = VerifyingKey::from_bytes(expected_pubkey)
-        .map_err(|_| SigningServiceError::Mismatch(pubkey_field.into()))?;
-    let signature = Signature::from_bytes(&decode_signature(&artifact.signature)?);
-    let signing_input = policy_artifact_signing_input(&artifact.metadata, rego_hash)?;
-    verifying_key
-        .verify(&signing_input, &signature)
-        .map_err(|_| SigningServiceError::InvalidSignature)
+    Ok(())
 }
 
 fn canonical_policy_metadata_hash(
@@ -958,36 +1406,57 @@ pub fn decode_optional_blobs(
             _ => return Err(SigningServiceError::PartialBlobs),
         };
 
-    let descriptor_envelope: DeploymentDescriptorEnvelope =
-        decode_json_blob("customer_descriptor_blob", &customer_descriptor_blob)?;
-    let keyring_envelope: OrgKeyringEnvelope =
-        decode_json_blob("org_keyring_blob", &org_keyring_blob)?;
-    let org_keyring_envelope: serde_json::Value =
-        decode_json_blob("org_keyring_blob", &org_keyring_blob)?;
-    let descriptor_core_hash = descriptor_core_hash(&descriptor_envelope.descriptor);
-    let org_keyring_fingerprint = keyring_fingerprint(&keyring_envelope.keyring);
-
-    Ok(Some(DeploymentSigningArtifacts {
+    let descriptor_envelope: DeploymentDescriptorEnvelope = decode_json_blob(
+        "customer_descriptor_blob",
+        &customer_descriptor_blob,
+        MAX_DESCRIPTOR_BLOB_BYTES,
+    )?;
+    let keyring_envelope: OrgKeyringEnvelope = decode_json_blob(
+        "org_keyring_blob",
+        &org_keyring_blob,
+        MAX_ORG_KEYRING_BLOB_BYTES,
+    )?;
+    // Verify both customer signatures immediately after the capped decode,
+    // BEFORE descriptor_core_hash/keyring_fingerprint work and before any
+    // caller-side semantic comparison (#128): an unauthenticated descriptor
+    // or keyring must fail as InvalidSignature, not leak which descriptor
+    // fields disagree with server state.
+    let artifact = DeploymentSigningArtifacts {
         customer_descriptor_blob,
         org_keyring_blob,
-        org_keyring_envelope,
+        org_keyring_envelope: serde_json::to_value(&keyring_envelope)?,
         descriptor: descriptor_envelope.descriptor,
         descriptor_signature: descriptor_envelope.signature,
         descriptor_signing_key_id: descriptor_envelope.signing_key_id,
         descriptor_signing_pubkey: descriptor_envelope.signing_pubkey,
-        descriptor_core_hash,
+        descriptor_core_hash: [0; 32],
         org_keyring: keyring_envelope.keyring,
         org_keyring_signature: keyring_envelope.signature,
         org_keyring_signing_pubkey: keyring_envelope.signing_pubkey,
-        org_keyring_fingerprint,
-    }))
+        org_keyring_fingerprint: [0; 32],
+    };
+    artifact.verify_keyring_signature()?;
+    artifact.verify_descriptor_signature()?;
+    let artifact = DeploymentSigningArtifacts {
+        descriptor_core_hash: descriptor_core_hash(&artifact.descriptor),
+        org_keyring_fingerprint: keyring_fingerprint(&artifact.org_keyring),
+        ..artifact
+    };
+
+    Ok(Some(artifact))
 }
 
 pub fn decode_optional_policy_artifact(
     signed_policy_artifact: Option<String>,
 ) -> Result<Option<SignedPolicyArtifact>, SigningServiceError> {
     signed_policy_artifact
-        .map(|artifact| decode_json_blob("signed_policy_artifact", &artifact))
+        .map(|artifact| {
+            decode_json_blob(
+                "signed_policy_artifact",
+                &artifact,
+                MAX_SIGNED_POLICY_ARTIFACT_BLOB_BYTES,
+            )
+        })
         .transpose()
 }
 
@@ -1146,6 +1615,15 @@ where
     Ok(())
 }
 
+/// Test-support re-exports: canonical keyring bytes and keyring types for
+/// fixtures that must produce a validly signed org keyring envelope (#128:
+/// decode_optional_blobs now verifies customer signatures).
+#[cfg(test)]
+pub(crate) use keyring::{
+    KeyringMember as TestKeyringMember, KeyringRole as TestKeyringRole,
+    OrgKeyring as TestOrgKeyring, canonical_keyring_bytes_test,
+};
+
 pub fn workload_artifacts_json(
     artifacts: &DeploymentSigningArtifacts,
     signed_policy_artifact: &SignedPolicyArtifact,
@@ -1205,9 +1683,14 @@ impl LoadedWorkloadArtifacts {
         image_digest: &str,
         api_signing_pubkey: &str,
         signing_service_pubkey_hex: &str,
+        platform: &DescriptorPlatformBinding,
     ) -> Result<(), SigningServiceError> {
-        self.signing_artifacts
-            .validate_deployment_inputs(app, image_digest, api_signing_pubkey)?;
+        self.signing_artifacts.validate_deployment_inputs(
+            app,
+            image_digest,
+            api_signing_pubkey,
+            platform,
+        )?;
         self.signing_artifacts
             .validate_customer_authority(pool)
             .await?;
@@ -1218,6 +1701,24 @@ impl LoadedWorkloadArtifacts {
         let mut artifact = self.signed_policy_artifact.clone();
         self.signing_artifacts
             .attach_customer_authority(&mut artifact)?;
+        // #128: the composed proof-bundle budgets must hold for stored rows
+        // too — rows accepted before the caps, or tampered storage, fail
+        // dispatch with the specific budget error rather than the generic
+        // apply-time "verification material field exceeds v1 limit".
+        validate_proof_bundle_budget(&self.signing_artifacts, &artifact)?;
+        // #128 review follow-up (Codex P2): the check above measures the
+        // NORMALIZED artifact — attach_customer_authority strips unknown-field
+        // padding from artifact.org_keyring — but dispatch forwards the RAW
+        // stored strings: self.workload_artifacts_json / self.trustee_policy_json
+        // are composed from row.signed_policy_artifact verbatim in
+        // decode_loaded_workload_artifacts, and build_verification_material
+        // charges those exact bytes. A legacy row whose stored org_keyring
+        // padding blows a budget would pass the normalized check and still
+        // fail at apply time, so measure the exact forwarded strings too.
+        validate_forwarded_proof_bundle_budget(
+            &self.workload_artifacts_json,
+            &self.trustee_policy_json,
+        )?;
         Ok(())
     }
 
@@ -1287,10 +1788,12 @@ fn decode_loaded_workload_artifacts(
         "artifact.metadata.descriptor_signing_pubkey",
         &signed_policy_artifact.metadata.descriptor_signing_pubkey,
     )?;
-    let attached_keyring: OrgKeyringEnvelope =
-        serde_json::from_value(signed_policy_artifact.org_keyring.clone().ok_or_else(|| {
-            SigningServiceError::Mismatch("artifact.org_keyring missing".into())
-        })?)?;
+    let attached_keyring: OrgKeyringEnvelope = parse_org_keyring_envelope_tolerant(
+        signed_policy_artifact
+            .org_keyring
+            .as_ref()
+            .ok_or_else(|| SigningServiceError::Mismatch("artifact.org_keyring missing".into()))?,
+    )?;
     let descriptor_signature: [u8; 64] =
         row.descriptor_signature
             .clone()
@@ -1524,9 +2027,11 @@ pub async fn load_workload_artifact_binding(
 
 mod keyring;
 use keyring::{
-    DeploymentDescriptorEnvelope, KeyringRole, OrgKeyring, OrgKeyringEnvelope,
-    canonical_keyring_bytes, decode_hex32, decode_json_blob, decode_pubkey_b64, decode_signature,
-    keyring_fingerprint,
+    DeploymentDescriptorEnvelope, KeyringRole, MAX_DESCRIPTOR_BLOB_BYTES,
+    MAX_ORG_KEYRING_BLOB_BYTES, MAX_SIGNED_POLICY_ARTIFACT_BLOB_BYTES, OrgKeyring,
+    OrgKeyringEnvelope, canonical_keyring_bytes, decode_hex32, decode_json_blob, decode_pubkey_b64,
+    decode_signature, keyring_fingerprint, parse_org_keyring_envelope_tolerant,
+    parse_org_keyring_tolerant,
 };
 
 #[cfg(test)]

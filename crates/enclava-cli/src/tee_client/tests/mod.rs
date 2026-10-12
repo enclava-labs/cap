@@ -210,14 +210,15 @@ async fn verifies_attestation_evidence_report_data_binding() {
         })),
     };
 
-    // The development JSON evidence path yields no trusted launch identity:
-    // callers fail closed on deployment binding.
-    assert!(
+    // The development JSON evidence path yields no trusted launch identity
+    // and no portable transition quote: callers fail closed on deployment
+    // binding and the API rejects quote-less unlock transitions.
+    let (identity, quote) =
         super::verify_evidence_report_data_with_json_fallback(&evidence, b"", &expected, true)
             .await
-            .unwrap()
-            .is_none()
-    );
+            .unwrap();
+    assert!(identity.is_none());
+    assert!(quote.is_none());
 }
 
 #[tokio::test]
@@ -256,6 +257,98 @@ async fn rejects_json_only_attestation_evidence_by_default() {
             .await
             .unwrap_err();
     assert!(err.to_string().contains("raw AMD SNP report"));
+}
+
+/// Sanitized live Genoa bundle (see enclava-verifier fixtures README): real
+/// AMD chain and report, no secrets, verifiable fully offline.
+struct ProveItLiveFixture {
+    snp_report: Vec<u8>,
+    ark_der: Vec<u8>,
+    ask_der: Vec<u8>,
+    vcek_der: Vec<u8>,
+}
+
+fn prove_it_live_fixture() -> ProveItLiveFixture {
+    use base64::Engine;
+    let encoded =
+        include_str!("../../../../enclava-verifier/tests/fixtures/prove-it-live.bundle.b64")
+            .bytes()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .collect::<Vec<_>>();
+    let bundle = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .expect("decode prove-it-live bundle");
+    let records = enclava_common::canonical::ce_v1_decode(&bundle)
+        .expect("parse prove-it-live bundle")
+        .into_iter()
+        .map(|record| (record.label.to_string(), record.value.to_vec()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let endorsement_records = enclava_common::canonical::ce_v1_decode(
+        records
+            .get("amd_endorsements")
+            .expect("bundle endorsements"),
+    )
+    .expect("parse bundle endorsements")
+    .into_iter()
+    .map(|record| (record.label.to_string(), record.value.to_vec()))
+    .collect::<std::collections::BTreeMap<_, _>>();
+    let field = |name: &str| {
+        endorsement_records
+            .get(name)
+            .expect("endorsement field")
+            .clone()
+    };
+    ProveItLiveFixture {
+        snp_report: records.get("snp_report").expect("bundle report").clone(),
+        ark_der: field("ark_der"),
+        ask_der: field("ask_der"),
+        vcek_der: field("vcek_der"),
+    }
+}
+
+#[tokio::test]
+async fn attest_evidence_path_returns_quote_without_kds_crl() {
+    // Regression for the KDS-outage bug: the shared attestation path (used
+    // by unlock, recover, change-password, and config delivery) must verify
+    // evidence-embedded chains WITHOUT any KDS CRL request. A KDS outage
+    // must degrade only the CRL-gated unlock-mode transition, never
+    // ordinary TEE operations.
+    let fixture = prove_it_live_fixture();
+    let expected_report_data =
+        sev::firmware::guest::AttestationReport::from_bytes(&fixture.snp_report)
+            .expect("parse fixture report")
+            .report_data;
+    let evidence = super::AttestationEvidence {
+        payload_b64: String::new(),
+        json: Some(serde_json::json!({
+            "quote": fixture.snp_report,
+            "cert_chain": [
+                {"cert_type": "ARK", "data": fixture.ark_der},
+                {"cert_type": "ASK", "data": fixture.ask_der},
+                {"cert_type": "VCEK", "data": fixture.vcek_der},
+            ],
+        })),
+    };
+
+    let (identity, quote) = super::verify_evidence_report_data_with_json_fallback(
+        &evidence,
+        b"",
+        &expected_report_data,
+        false,
+    )
+    .await
+    .expect("embedded-chain evidence must verify without any KDS CRL request");
+    assert!(
+        identity.is_some(),
+        "anchored chain yields a launch identity"
+    );
+    let quote = quote.expect("raw SNP report yields a portable transition quote");
+    assert_eq!(
+        quote.crl_der_b64, "",
+        "CRL collateral is deferred to the transition site"
+    );
+    assert!(!quote.report_b64.is_empty());
+    assert!(!quote.vcek_der_b64.is_empty());
 }
 
 #[test]
@@ -764,6 +857,175 @@ async fn vcek_fetch_errors_do_not_leak_url_or_hwid() {
 }
 
 #[test]
+fn builds_amd_kds_product_crl_url_from_snp_report() {
+    let mut report = sev::firmware::guest::AttestationReport {
+        version: 3,
+        cpuid_fam_id: Some(25),
+        cpuid_mod_id: Some(160),
+        cpuid_step: Some(2),
+        chip_id: [7; 64],
+        ..Default::default()
+    };
+    report.reported_tcb.bootloader = 10;
+    report.reported_tcb.snp = 24;
+    report.reported_tcb.microcode = 84;
+    let url = super::amd_kds_product_crl_url(&report, "https://kdsintf.amd.com/").unwrap();
+    assert_eq!(url, "https://kdsintf.amd.com/vcek/v1/Genoa/crl");
+    // The relay override applies to the CRL endpoint exactly as to VCEK.
+    let relayed = super::amd_kds_product_crl_url(&report, "https://relay.internal").unwrap();
+    assert_eq!(relayed, "https://relay.internal/vcek/v1/Genoa/crl");
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // env serialization guard must span the awaits
+async fn complete_transition_quote_crl_rejects_invalid_collateral_before_mutation() {
+    // Verify real HTTP completion both at capture time and after expiry:
+    // rejection must precede ownership.rs changing the seed wrap in the TEE.
+    use base64::Engine;
+    use x509_cert::der::{Decode, Encode};
+    let _guard = env_lock();
+    super::crl_cache_clear_for_tests();
+    let fixture = prove_it_live_fixture();
+    let crl_encoded = include_str!("../../../../enclava-verifier/tests/fixtures/genoa-crl.der.b64")
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect::<Vec<_>>();
+    let crl_der = base64::engine::general_purpose::STANDARD
+        .decode(crl_encoded)
+        .expect("decode genoa CRL fixture");
+    let (address, requests, server) = counting_upstream("200 OK", crl_der.clone(), None).await;
+    unsafe {
+        std::env::set_var("ENCLAVA_AMD_KDS_BASE_URL", format!("http://{address}"));
+    }
+
+    let tee = TeeClient::new("relay-kds.test");
+    let mut attestation = crate::api_types::TransitionReceiptAttestation {
+        tee_domain: "relay-kds.test".to_string(),
+        nonce: url_safe_no_pad_nonce(),
+        leaf_spki_sha256: "00".repeat(32),
+        receipt_pubkey_sha256: "00".repeat(32),
+        attestation_evidence_sha256: "00".repeat(32),
+        quote: Some(crate::api_types::TransitionSnpQuote {
+            report_b64: base64::engine::general_purpose::STANDARD.encode(&fixture.snp_report),
+            ark_der_b64: base64::engine::general_purpose::STANDARD.encode(&fixture.ark_der),
+            ask_der_b64: base64::engine::general_purpose::STANDARD.encode(&fixture.ask_der),
+            vcek_der_b64: base64::engine::general_purpose::STANDARD.encode(&fixture.vcek_der),
+            crl_der_b64: String::new(),
+        }),
+    };
+
+    const CAPTURE_TIME: u64 = 1_785_844_800;
+    tee.complete_transition_quote_crl_at(&mut attestation, Some(CAPTURE_TIME as i64))
+        .await
+        .expect("fresh fetched collateral must complete the transition quote");
+    let quote = attestation.quote.as_ref().expect("quote present");
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(&quote.crl_der_b64)
+            .unwrap(),
+        crl_der,
+        "verified fetched CRL must be attached verbatim"
+    );
+    for invalid_crl in [&[][..], b"not DER".as_slice()] {
+        assert!(
+            super::verify_transition_quote_revocation(quote, invalid_crl, CAPTURE_TIME).is_err()
+        );
+    }
+    let mut tampered_crl = crl_der.clone();
+    *tampered_crl.last_mut().unwrap() ^= 1;
+    assert!(super::verify_transition_quote_revocation(quote, &tampered_crl, CAPTURE_TIME).is_err());
+    assert!(super::verify_transition_quote_revocation(quote, &crl_der, 1_792_761_600).is_err());
+
+    // The ARK-signed CRL lists the retired ASK's serial. Exercise the same
+    // revoked-serial rejection as the API, independently of wall-clock time.
+    let crl = x509_cert::crl::CertificateList::from_der(&crl_der).unwrap();
+    let mut revoked_ask = x509_cert::Certificate::from_der(&fixture.ask_der).unwrap();
+    revoked_ask.tbs_certificate.serial_number =
+        crl.tbs_cert_list.revoked_certificates.as_ref().unwrap()[0]
+            .serial_number
+            .clone();
+    let mut revoked_quote = quote.clone();
+    revoked_quote.ask_der_b64 =
+        base64::engine::general_purpose::STANDARD.encode(revoked_ask.to_der().unwrap());
+    assert!(
+        super::verify_transition_quote_revocation(&revoked_quote, &crl_der, CAPTURE_TIME)
+            .unwrap_err()
+            .to_string()
+            .contains("ASK is revoked")
+    );
+
+    attestation.quote.as_mut().unwrap().crl_der_b64.clear();
+    let error = tee
+        .complete_transition_quote_crl_at(&mut attestation, Some(1_792_761_600))
+        .await
+        .expect_err("expired CRL must stop the transition before any TEE mutation");
+    assert!(error.to_string().contains("expired"));
+    assert!(attestation.quote.as_ref().unwrap().crl_der_b64.is_empty());
+    assert_eq!(requests.load(Ordering::Relaxed), 1);
+
+    // Quote-less development evidence cannot satisfy the API's unlock-mode
+    // transition gate - it must fail here rather than proceeding with a
+    // transition that the API will reject.
+    let mut quoteless = attestation.clone();
+    quoteless.quote = None;
+    let err = tee
+        .complete_transition_quote_crl(&mut quoteless)
+        .await
+        .expect_err("quote-less transition must fail");
+    assert!(
+        err.to_string()
+            .contains("unlock-mode transition requires a raw AMD SNP quote"),
+        "error message should mention SNP quote requirement"
+    );
+
+    unsafe {
+        std::env::remove_var("ENCLAVA_AMD_KDS_BASE_URL");
+    }
+    server.abort();
+}
+
+fn url_safe_no_pad_nonce() -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 32])
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // env serialization guard must span the awaits
+async fn crl_fetch_caches_per_product_and_fails_closed_on_errors() {
+    // The CRL cache is a process-global static and the KDS base URL comes
+    // from the environment: serialize with every other test that touches
+    // either (env_lock) and start from a clean cache.
+    let _guard = env_lock();
+    super::crl_cache_clear_for_tests();
+    let crl = b"fake-crl-der".to_vec();
+    let (address, requests, server) = counting_upstream("200 OK", crl.clone(), None).await;
+    let client = reqwest::Client::new();
+    let url = format!("http://{address}/vcek/v1/Genoa/crl");
+    let first = super::fetch_amd_kds_crl_der(&client, &url).await.unwrap();
+    assert_eq!(first.as_slice(), crl.as_slice());
+    // Second fetch is served from the in-memory cache: no new upstream hit.
+    let second = super::fetch_amd_kds_crl_der(&client, &url).await.unwrap();
+    assert_eq!(second.as_slice(), crl.as_slice());
+    assert_eq!(requests.load(Ordering::Relaxed), 1);
+    // A distinct product misses the cache and hits the upstream again.
+    let other = format!("http://{address}/vcek/v1/Milan/crl");
+    assert!(super::fetch_amd_kds_crl_der(&client, &other).await.is_ok());
+    assert_eq!(requests.load(Ordering::Relaxed), 2);
+    server.abort();
+
+    // Fail closed: an upstream that never succeeds must produce an error,
+    // never an empty CRL. 404 is non-retryable, so this returns promptly.
+    let (address, _requests, server) = counting_upstream("404 Not Found", Vec::new(), None).await;
+    let url = format!("http://{address}/vcek/v1/Turin/crl");
+    let error = super::fetch_amd_kds_crl_der(&client, &url)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("404"));
+    server.abort();
+}
+
+#[test]
 fn kds_retry_delay_honors_bounded_retry_after_and_jitter() {
     assert_eq!(
         super::amd_kds_vcek_sleep_duration(0, Some(Duration::from_secs(7))),
@@ -1153,4 +1415,37 @@ fn recognized_terminal_body_is_parsed_from_bounded_json_slice() {
         super::parse_terminal_bootstrap_error_body(&oversized).is_none(),
         "oversized status bodies must be rejected before parsing"
     );
+}
+
+#[test]
+fn transition_evidence_hash_binds_raw_snp_report_not_envelope() {
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+
+    use crate::api_types::TransitionSnpQuote;
+
+    let report_bytes = vec![0x5a; 1184];
+    let envelope = br#"{"snp_report":"<base64 of report_bytes>"}"#;
+    let quote = TransitionSnpQuote {
+        report_b64: base64::engine::general_purpose::STANDARD.encode(&report_bytes),
+        ark_der_b64: String::new(),
+        ask_der_b64: String::new(),
+        vcek_der_b64: String::new(),
+        crl_der_b64: String::new(),
+    };
+
+    // With a quote the hash must be SHA256(report bytes) — the exact value
+    // the API gate compares against SHA256(quote.report_b64).
+    let hashed = super::transition_attestation_evidence_sha256(Some(&quote), envelope).unwrap();
+    assert_eq!(hashed, hex::encode(Sha256::digest(&report_bytes)));
+    assert_ne!(hashed, hex::encode(Sha256::digest(envelope)));
+
+    // Quote-less development path keeps the envelope hash.
+    let dev_hashed = super::transition_attestation_evidence_sha256(None, envelope).unwrap();
+    assert_eq!(dev_hashed, hex::encode(Sha256::digest(envelope)));
+
+    // A quote whose report decodes to the wrong length is rejected.
+    let mut short = quote;
+    short.report_b64 = base64::engine::general_purpose::STANDARD.encode([0x5a; 16]);
+    assert!(super::transition_attestation_evidence_sha256(Some(&short), envelope).is_err());
 }

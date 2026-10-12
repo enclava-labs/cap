@@ -103,6 +103,8 @@ For production deploys with policy-read mode enabled:
 | `ACME_DNS_LOOKUP_PREFER_SYSTEM` | Broker TXT resolver preference: exactly `true` or `false` (default). `true` tries the pod system resolver first; either order falls back only on lookup error, never on successful empty/nonmatching TXT answers. |
 | `ACME_DNS_LOOKUP_TIMEOUT_SECONDS` | Optional positive integer timeout for each complete broker TXT resolver lookup, including fallback (two attempts can consume twice this budget). Invalid/zero values fail startup. Unset preserves native resolver budgets; the historical unmerged branch's ten-second default is deliberately not introduced. No DNS egress policy changes are required. |
 | `CAP_ALLOW_PRODUCTION_ACME=true` | Required in release builds when `ACME_DIRECTORY_URL` or `TENANT_CADDY_ACME_CA` points at Let's Encrypt production. |
+| `CAP_EGRESS_ALLOW_INTERNAL_HOSTS=true` | Operator opt-out: tenant `egress_allowlist` hosts matching internal hostname patterns are accepted instead of rejected; each accepted host is audit-logged. Matched patterns include `localhost`/`*.localhost`, `*.svc`/`*.svc.cluster.local`, `*.cluster.local`, `*.internal`, `*.local`/`*.localdomain`, `metadata.*`, and rebinding helpers (`*.nip.io`, `*.sslip.io`, `*.localtest.me`, `*.lvh.me`) — see `egress_allowlist_host_audit_reasons` for the full set; this is a hostname-pattern check, not a DNS resolution check. When any allowlisted host on an app matches such a pattern, the app's generated Cilium policy shrinks its `egressDeny` CIDR list to metadata/link-local only for every allowlisted name on that app — all other non-public space (RFC1918, loopback, CGNAT, ULA) becomes reachable via any allowlisted FQDN, while metadata (169.254.0.0/16, fd00:ec2::254) and link-local stay denied. |
+| `CAP_ALLOW_PRODUCTION_INTERNAL_EGRESS=true` | Required in release builds when `CAP_EGRESS_ALLOW_INTERNAL_HOSTS` is enabled: an explicit second acknowledgment that tenant egress to internal endpoints is intended in production. Release builds without it refuse to start (and the runtime check stays disarmed even if startup gating is bypassed); debug builds ignore it. |
 | `GHCR_USERNAME` and `GHCR_TOKEN` | Optional credentials used to create tenant namespace image-pull secrets for private GHCR images. |
 | `TENANT_IMAGE_PULL_SECRET_NAME` | Tenant image-pull secret name. Defaults to `enclava-registry-auth` when GHCR credentials are configured. |
 | `TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES` | Optional comma-separated scope for the tenant pull secret. Use `registry/repository` for exact matches or `registry/repository/*` for subrepositories. |
@@ -148,6 +150,7 @@ LEGACY_BOOTSTRAP_SCRIPT
 TENANT_TEE_TLS_MODE=staging|insecure
 TENANT_CADDY_TLS_MODE=internal
 TRUSTEE_KBS_URL=http://...
+CAP_EGRESS_ALLOW_INTERNAL_HOSTS (without CAP_ALLOW_PRODUCTION_INTERNAL_EGRESS=true)
 ```
 
 Release builds also require `API_KEY_HMAC_PEPPER` or
@@ -241,6 +244,50 @@ Before using it outside local experimentation:
 - configure network policy for PostgreSQL, Trustee/KBS, policy signing,
   registry metadata, DNS, and tenant TEE callbacks;
 - decide whether CAP-managed DNS and KBS policy management are required.
+
+## Rollout Compatibility: initdata uid/gid claims
+
+`cc_init_data` uid/gid claims (`app_uid`, `app_gid`, `caddy_uid`,
+`caddy_gid`, `managed_config_gid`, `managed_config_dir_mode`) are rendered
+as quoted TOML strings, matching kata-agent's requirement that every
+`[data]` value be a string. On Kata installations enforcing that format,
+the old integer form fails pod creation with `FailedCreatePodSandBox`.
+
+Quoting changes the rendered bytes, and a signed descriptor's
+`expected_cc_init_data_hash` covers exactly those bytes. Descriptors signed
+with the old integer renderer therefore cannot be replayed against a fixed
+API: unlock and rollback validation re-render with the corrected encoder
+and reject them with HTTP 400 `signed_artifact_mismatch`
+(`expected_cc_init_data_hash`); deployment jobs fail with
+`artifact_invalid` on the same mismatch. This is deliberate fail-closed
+behavior — the API holds no deployer signing key and cannot re-sign
+stored artifacts, and preserving the old render would keep initdata that
+Kata rejects anyway. No compatibility fallback exists.
+
+Roll out and recover as follows:
+
+1. Deploy an API image built from a tree containing this change
+   (see [Images](#images)).
+2. Upgrade the `enclava` CLI to a build from the same tree. The CLI renders
+   `expected_cc_init_data_hash` locally when signing and the API re-renders
+   and compares it at deploy, so a mixed old/new CLI+API pair is rejected
+   at deploy time. Upgrade both before signing new deployments.
+3. Re-deploy each app signed before the change, from its app directory
+   (the one containing `enclava.toml`):
+
+   ```bash
+   enclava deploy --image <image>@sha256:<digest>
+   ```
+
+   The CLI signs a fresh descriptor with the deployer key and the API
+   verifies the re-rendered hash before applying a new workload rollout.
+   Use the existing app configuration, signing identity, and persistent
+   volumes; do not delete the app or reset its storage to recover.
+   Roll forward with a fresh deploy rather than rolling back — rollback to
+   a pre-change deployment artifact hits the same hash rejection.
+4. Verify the public boot, claim/unlock, HTTPS, and persistence flow before
+   treating the rollout as accepted. CI alone does not establish runtime
+   compatibility.
 
 ## Smoke Checks
 

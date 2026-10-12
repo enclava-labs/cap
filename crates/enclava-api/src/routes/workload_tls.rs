@@ -124,13 +124,8 @@ async fn dns01_certificate_inner(
                 .into_response();
         }
         Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(
-                    json!({"error": "workload_artifacts_query_failed", "detail": err.to_string()}),
-                ),
-            )
-                .into_response();
+            let (status, body) = crate::routes::workload::workload_artifacts_query_failed(&err);
+            return (status, body).into_response();
         }
     };
 
@@ -149,13 +144,7 @@ async fn dns01_certificate_inner(
         Ok(_) => {
             return (StatusCode::BAD_REQUEST, Json(json!({"error": "csr_empty"}))).into_response();
         }
-        Err(err) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": "csr_base64_invalid", "detail": err.to_string()})),
-            )
-                .into_response();
-        }
+        Err(err) => return csr_base64_invalid_response(&err).into_response(),
     };
 
     match crate::acme::issue_dns01_certificate_timed(
@@ -210,6 +199,18 @@ fn format_retry_after(deadline: DateTime<Utc>) -> String {
     deadline.to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
+/// 400 for a CSR that is not valid base64.
+///
+/// The decode error is logged server-side only; the client gets the fixed
+/// code (#122).
+fn csr_base64_invalid_response(err: &base64::DecodeError) -> (StatusCode, Json<Value>) {
+    tracing::warn!(error = %err, "certificate CSR base64 decode failed");
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error": "csr_base64_invalid"})),
+    )
+}
+
 fn attested_or_declared_init_data_hash(
     claims: &Value,
     body: &CertificateRequest,
@@ -226,7 +227,7 @@ async fn verify_attestation(
     verify_url: &str,
     token: &str,
 ) -> Result<Value, Box<axum::response::Response>> {
-    let verify_response = match crate::routes::workload::trustee_attestation_verify_request(
+    let mut verify_response = match crate::routes::workload::trustee_attestation_verify_request(
         &state.trustee_http_client,
         verify_url,
         token,
@@ -237,37 +238,22 @@ async fn verify_attestation(
     {
         Ok(response) => response,
         Err(err) => {
-            return Err((
-                StatusCode::BAD_GATEWAY,
-                Json(json!({"error": "trustee_attestation_verify_failed", "detail": err.to_string()})),
-            )
-                .into_response()
-                .into());
+            let (status, body) = crate::routes::workload::trustee_verify_unreachable(&err);
+            return Err((status, body).into_response().into());
         }
     };
 
     if !verify_response.status().is_success() {
         let status = verify_response.status().as_u16();
-        let body = verify_response.text().await.unwrap_or_default();
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "error": "attestation_denied",
-                "upstream_status": status,
-                "upstream_body": body,
-            })),
-        )
-            .into_response()
-            .into());
+        let body = crate::routes::workload::read_limited_upstream_body(&mut verify_response).await;
+        let (denied_status, denied_body) =
+            crate::routes::workload::attestation_denied(status, &body);
+        return Err((denied_status, denied_body).into_response().into());
     }
 
     verify_response.json().await.map_err(|err| {
-        (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({"error": "attestation_claims_invalid", "detail": err.to_string()})),
-        )
-            .into_response()
-            .into()
+        let (status, body) = crate::routes::workload::attestation_claims_invalid(&err);
+        (status, body).into_response().into()
     })
 }
 
@@ -318,6 +304,19 @@ mod tests {
     use super::*;
     use crate::acme::IssuanceFailureCode;
     use chrono::{DateTime, Utc};
+
+    #[test]
+    fn csr_base64_error_response_is_a_fixed_code_without_detail() {
+        // The legacy response carried the base64 decode error string in a
+        // `detail` field; pin the bounded shape (#122).
+        let err = base64::engine::general_purpose::STANDARD
+            .decode("not!base64")
+            .expect_err("invalid base64 must fail");
+        let (status, Json(body)) = csr_base64_invalid_response(&err);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, json!({"error": "csr_base64_invalid"}));
+        assert!(!serde_json::to_string(&body).unwrap().contains("detail"));
+    }
 
     #[test]
     fn certificate_hostnames_are_limited_to_attested_descriptor_domains() {

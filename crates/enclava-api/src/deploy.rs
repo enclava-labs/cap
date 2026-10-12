@@ -686,20 +686,21 @@ pub(crate) fn build_confidential_app_from_rows(
 
     let mut containers = Vec::new();
     for row in containers_rows {
-        let image_str = row
-            .image_digest
-            .as_ref()
-            .map(|d| {
-                format!(
-                    "{}@{}",
-                    row.image_ref.split('@').next().unwrap_or(&row.image_ref),
-                    d
-                )
-            })
-            .unwrap_or_else(|| row.image_ref.clone());
-
-        let image =
-            ImageRef::parse(&image_str).map_err(|e| DeployError::ImageParse(e.to_string()))?;
+        let mut image =
+            ImageRef::parse(&row.image_ref).map_err(|e| DeployError::ImageParse(e.to_string()))?;
+        if let Some(d) = row.image_digest.as_ref() {
+            // The digest is authoritative: render the digest-pinned name with
+            // any tag stripped, so the cc-init render matches the signed
+            // descriptor's registry/repository@digest even when the request
+            // carried a tag (#210 review).
+            image = ImageRef::parse(&format!(
+                "{}/{}@{}",
+                image.registry(),
+                image.repository(),
+                d
+            ))
+            .map_err(|e| DeployError::ImageParse(e.to_string()))?;
+        }
 
         let storage_paths = row.storage_paths.clone().unwrap_or_default();
 
@@ -1140,6 +1141,28 @@ mod tests {
     }
 
     #[test]
+    fn tagged_rows_render_the_digest_pinned_name() {
+        let app = queued_apply_app();
+        let snapshot = queued_apply_snapshot('c');
+        let rendered = build_confidential_app_from_rows(
+            &app,
+            uuid::Uuid::new_v4(),
+            &test_attestation_config(),
+            "api-signing-key",
+            "https://api.enclava.dev",
+            &snapshot.containers,
+            &snapshot.resources,
+        )
+        .expect("render");
+        // A stored tag must not leak into the rendered name: the signed
+        // descriptor binds registry/repository@digest (#210 review).
+        assert_eq!(
+            rendered.containers[0].image.digest_ref(),
+            format!("ghcr.io/acme/app@sha256:{}", "c".repeat(64))
+        );
+    }
+
+    #[test]
     fn password_redeploy_timeout_stays_healthy_for_manual_unlock() {
         let outcome = classify_rollout_result(
             Ok(EngineDeployStatus::timed_out(
@@ -1443,7 +1466,8 @@ mod tests {
             independent_verification: true,
             expected_firmware_measurement: [3; 32].into(),
             expected_runtime_class: "kata-qemu-snp".to_string(),
-            kbs_resource_path: "default/cap-demo-org-customer-app-owner".to_string(),
+            kbs_resource_path: "default/cap-demo-org-customer-app-customer-app-owner/seed-encrypted"
+                .to_string(),
             unlock_mode: "password".to_string(),
             policy_template_id: "enclava-kbs-policy-v1".to_string(),
             policy_template_sha256: [4; 32],
