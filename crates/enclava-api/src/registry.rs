@@ -65,7 +65,7 @@ pub async fn resolve_tag_to_digest(
                         .to_string(),
                 )
             })?;
-        let token = fetch_bearer_token(client, challenge, repository).await?;
+        let token = fetch_bearer_token(client, challenge, registry, repository).await?;
         response = client
             .inner()
             .get(&url)
@@ -113,12 +113,20 @@ pub async fn resolve_tag_to_digest(
     verify_advertised_digest(&advertised_digest, &manifest, registry, repository, tag)
 }
 
+/// Auth services that legitimately live on a different host than the
+/// registry they serve. Checked in addition to the registry allowlist so a
+/// hostile (but allowlisted) registry cannot point the challenge realm at an
+/// unrelated allowlisted host.
+const AUTH_REALM_EXCEPTION_HOSTS: &[&str] = &["auth.docker.io", "gitlab.com"];
+
 /// Complete an RFC 7235 Bearer token flow against the challenge realm and
 /// return the access token. The realm URL is registry-supplied input, so it
-/// goes through the same https + allowlist checks as the manifest request.
+/// goes through the same https + allowlist checks as the manifest request,
+/// and its host must be the registry's own host (or a known auth service).
 async fn fetch_bearer_token(
     client: &RegistryClient,
     challenge: &str,
+    registry: &str,
     repository: &str,
 ) -> Result<String, RegistryError> {
     let challenge =
@@ -135,6 +143,16 @@ async fn fetch_bearer_token(
         return Err(RegistryError::ResolveFailed(format!(
             "registry auth realm {} is not https",
             challenge.realm
+        )));
+    }
+    let registry_host = reqwest::Url::parse(&registry_base_url(registry)?)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .unwrap_or_default();
+    let realm_host = url.host_str().unwrap_or_default();
+    if realm_host != registry_host && !AUTH_REALM_EXCEPTION_HOSTS.contains(&realm_host) {
+        return Err(RegistryError::ResolveFailed(format!(
+            "registry auth realm host {realm_host} is not the registry host {registry_host} or a known registry auth service"
         )));
     }
     let scope = challenge

@@ -31,6 +31,10 @@ pub async fn resolve_image_digest(image_ref: &ImageRef) -> Result<String, String
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
+        // Registry redirects must not move a fetch off https or onto a
+        // different host unnoticed (mirror the API registry client).
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| format!("http client: {e}"))?;
 
