@@ -1056,11 +1056,15 @@ fn app_unlock_mode(mode: crate::models::UnlockMode) -> &'static str {
 /// trustee_policy_json
 /// proof-bundle field (it also carries metadata, signature, and the attached
 /// keyring envelope); 24 KiB leaves headroom for those. agent_policy_text is
-/// capped at 48 KiB: together with a 32 KiB descriptor, 16 KiB keyring, 24 KiB
-/// rego text, and envelope/metadata overhead the composed
-/// workload_artifacts_json stays under its 196_608-byte field budget;
-/// validate_proof_bundle_budget enforces the composed size exactly.
-pub(crate) const MAX_POLICY_TEXT_BYTES: usize = 48 * 1024;
+/// capped at 160 KiB: the signing service's genpolicy output measures ~116 KiB
+/// raw / ~125 KiB JSON-escaped for ordinary apps (mostly fixed agent-policy
+/// boilerplate), so the 48 KiB cap this replaced rejected every deployment at
+/// ingress. This cap bounds per-field DoS cost only; the composed
+/// workload_artifacts_json budget (196_608, enforced by
+/// validate_proof_bundle_budget at ingress and again at dispatch) is the
+/// authoritative launchability bound and rejects field combinations whose
+/// composition overflows.
+pub(crate) const MAX_POLICY_TEXT_BYTES: usize = 160 * 1024;
 pub(crate) const MAX_REGO_TEXT_BYTES: usize = 24 * 1024;
 pub(crate) const MAX_POLICY_METADATA_FIELD_BYTES: usize = 256;
 pub(crate) const MAX_POLICY_SIGNATURE_FIELD_BYTES: usize = 128;
