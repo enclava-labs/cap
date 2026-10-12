@@ -709,14 +709,14 @@ fn hold_deferral_correlates(revoked_owners: &[String], hold_apps: &[String]) -> 
 /// even while the app row still projects the preceding failed/stopped state.
 /// Failed, unsigned, or deleting latest operations contribute no authorization,
 /// except that a deleting app with confidential teardown still pending keeps
-/// authorization of the last workload known applied (the newest completed
-/// generation; supersession never rewrites completed jobs) plus the newest
-/// later generation that reached the apply phase until teardown completes.
-/// Apply failures are never reverted, and the delete flip itself supersedes
-/// leased work; a later apply supersedes older failed attempts, bounding the
-/// authority a single deleting app can force into the shared policy.
-/// The prior healthy workload remains required until a replacement is healthy,
-/// including when replacement setup fails without stopping the running workload.
+/// the last completed workload (supersession never rewrites completed jobs)
+/// plus the newest later generation that published a StatefulSet, until teardown
+/// completes. Setup acceptance is not publication. Apply failures are never
+/// reverted, and the delete flip itself supersedes leased work; a later
+/// publication supersedes older failed attempts, bounding the authority one
+/// deleting app can force into the shared policy. The prior healthy workload
+/// remains required until a replacement is healthy, including when replacement
+/// setup fails without stopping the running workload.
 async fn load_signed_policy_candidates(
     db: &PgPool,
     retention: i64,
@@ -735,8 +735,7 @@ async fn load_signed_policy_candidates(
                 app.status::text AS app_status,
                 app.workload_teardown_required,
                 app.workload_teardown_completed_at,
-                job.last_error_code,
-                deployment.spec_snapshot->>'setup_state' AS deployment_setup_state,
+                deployment.workload_spec_published_at,
                 ROW_NUMBER() OVER (
                     PARTITION BY job.app_id
                     ORDER BY job.generation DESC
@@ -766,30 +765,27 @@ async fn load_signed_policy_candidates(
                         AND job_state IN ('setup_pending', 'setting_up', 'pending', 'running', 'completed')
                     )
                     OR (
-                        -- Deleting with confidential teardown still pending:
-                        -- every workload generation the app may still be
-                        -- running under stays authorized until the teardown
-                        -- completes, so the teardown's policy-governed KBS
-                        -- deletes cannot be stranded by a reconciliation.
+                        -- Deleting with confidential teardown still pending.
+                        -- Policy-governed KBS deletes stay possible until
+                        -- teardown completes.
                         --
-                        -- Soundness does not come from a generation count:
-                        -- single-flight leases serialize concurrent
-                        -- deployments, but sequentially failed generations
-                        -- stack, so the live workload can sit at any rank.
-                        -- It comes from workload state instead:
+                        -- Failed generations stack. Two rows cover the
+                        -- workloads that can still be serving, and bound what
+                        -- one app can force into the shared policy:
                         --   * the newest completed job is the last workload
                         --     known applied (a watching generation's job
-                        --     completes, and supersession only rewrites
-                        --     queued/leased jobs, so it stays completed) —
-                        --     admitted however many later generations
-                        --     failed;
-                        --   * the newest later generation that reached the
-                        --     apply phase may have written (or still be
-                        --     rolling out) a workload spec. Older failed
-                        --     attempts are superseded by that later apply;
-                        --     retaining all of them would let one deleting
-                        --     app turn the retention setting into required
-                        --     policy bytes and exhaust the shared KBS body.
+                        --     completes; supersession does not rewrite
+                        --     completed jobs);
+                        --   * the newest later generation with
+                        --     workload_spec_published_at set has applied a
+                        --     StatefulSet. That column is written only after
+                        --     apply_statefulset returns. A later
+                        --     setup-accepted failure — preflight, resources
+                        --     before the StatefulSet, or supersession before
+                        --     that write — neither replaces the spec nor
+                        --     suppresses it. The probe below uses the same
+                        --     column.
+                        -- shortcut: intermediate publications between the last completed job and the newest publication are dropped, upgrade when teardown can name the pod that is still live
                         app_status = 'deleting'
                         AND workload_teardown_required
                         AND workload_teardown_completed_at IS NULL
@@ -806,25 +802,17 @@ async fn load_signed_policy_candidates(
                                 )
                             )
                             OR (
-                                job_state <> 'completed'
-                                AND COALESCE(
-                                       ranked_job_operations.last_error_code,
-                                       ''
-                                   ) <> 'deployment_setup_failed'
-                                AND ranked_job_operations.deployment_setup_state
-                                    = 'accepted'
+                                ranked_job_operations.workload_spec_published_at
+                                    IS NOT NULL
                                 AND NOT EXISTS (
                                     SELECT 1
-                                      FROM ranked_job_operations AS newer_apply
-                                     WHERE newer_apply.app_id
+                                      FROM ranked_job_operations AS newer_published
+                                     WHERE newer_published.app_id
                                          = ranked_job_operations.app_id
-                                       AND newer_apply.generation
+                                       AND newer_published.generation
                                            > ranked_job_operations.generation
-                                       AND newer_apply.job_state <> 'completed'
-                                       AND COALESCE(newer_apply.last_error_code, '')
-                                           <> 'deployment_setup_failed'
-                                       AND newer_apply.deployment_setup_state
-                                           = 'accepted'
+                                       AND newer_published.workload_spec_published_at
+                                           IS NOT NULL
                                 )
                                 AND ranked_job_operations.generation > COALESCE(
                                        (
@@ -890,7 +878,8 @@ async fn load_signed_policy_candidates(
                     historical.artifact_deployment_id = current.artifact_deployment_id
                     AND historical.artifact_descriptor_core_hash
                         = current.artifact_descriptor_core_hash
-                ) AS required
+                ) AS required,
+                (current.app_status = 'deleting') AS retention_exempt
             FROM eligible_current_job_operations AS current
             JOIN deployment_apply_jobs AS historical
               ON historical.app_id = current.app_id
@@ -949,13 +938,18 @@ async fn load_signed_policy_candidates(
                 operation_generation,
                 artifact_created_at,
                 descriptor_core_hash,
-                ROW_NUMBER() OVER (
-                    PARTITION BY app_id
-                    ORDER BY required DESC,
-                             operation_generation DESC,
-                             artifact_created_at DESC,
-                             descriptor_core_hash
-                ) AS app_artifact_rank
+                CASE
+                    -- Both teardown artifacts can still be serving. Retention
+                    -- must not drop either; the byte budget fail-closes.
+                    WHEN retention_exempt THEN 1
+                    ELSE ROW_NUMBER() OVER (
+                        PARTITION BY app_id
+                        ORDER BY required DESC,
+                                 operation_generation DESC,
+                                 artifact_created_at DESC,
+                                 descriptor_core_hash
+                    )
+                END AS app_artifact_rank
             FROM job_artifact_candidates
         ),
         ranked_legacy_operations AS (
@@ -3203,10 +3197,10 @@ resource_bindings := {
         .expect("insert KBS test deployment");
     }
 
-    /// Stamp the durable setup machine a deployment would carry in
-    /// spec_snapshot: 'accepted' once setup finished (the apply phase was
-    /// entered), 'dns_pending' while still queued. Supersession never
-    /// rewrites it, which is exactly why the selector can trust it.
+    /// Stamp spec_snapshot.setup_state. Supersession never rewrites it.
+    /// Setup acceptance indicates the apply phase was entered, but teardown
+    /// authority does not treat 'accepted' as a published workload spec.
+
     async fn set_test_setup_state(pool: &PgPool, deployment_id: Uuid, state: &str) {
         sqlx::query(
             "UPDATE deployments
@@ -3223,6 +3217,18 @@ resource_bindings := {
         .execute(pool)
         .await
         .expect("stamp KBS test setup state");
+    }
+
+    async fn mark_test_workload_published(pool: &PgPool, deployment_id: Uuid) {
+        sqlx::query(
+            "UPDATE deployments
+                SET workload_spec_published_at = clock_timestamp()
+              WHERE id = $1",
+        )
+        .bind(deployment_id)
+        .execute(pool)
+        .await
+        .expect("mark KBS test workload spec published");
     }
 
     async fn insert_test_artifact(
@@ -4618,10 +4624,11 @@ resource_bindings := {
         )
         .await;
 
-        // A newer upgrade that never finished applying. The three rows share
-        // one transaction: a nonterminal deployment requires its apply job at
-        // INSERT time (schema trigger), while the job's artifact binding and
-        // the artifact's deployment reference are deferred FKs.
+        // Setup accepted, still pending, then superseded before apply.
+        // No StatefulSet was written. The three rows share one transaction:
+        // a nonterminal deployment requires its apply job at INSERT time,
+        // while the job's artifact binding and the artifact's deployment
+        // reference are deferred FKs.
         let pending = Uuid::new_v4();
         let mut pending_artifact = test_signed_policy_artifact("cd", 16);
         pending_artifact.metadata.app_id = app_id.to_string();
@@ -4699,8 +4706,13 @@ resource_bindings := {
             "the still-running workload's artifact must stay authorized through teardown"
         );
         assert!(
-            hashes.contains(pending_artifact.metadata.descriptor_core_hash.as_str()),
-            "a superseded-but-maybe-applied operation's artifact must stay authorized through teardown"
+            !hashes.contains(pending_artifact.metadata.descriptor_core_hash.as_str()),
+            "a setup-accepted job superseded before publication wrote no spec"
+        );
+        assert_eq!(
+            hashes.len(),
+            1,
+            "only the last applied workload stays authorized"
         );
         assert!(
             !hashes.contains(dead_artifact.metadata.descriptor_core_hash.as_str()),
@@ -5077,9 +5089,8 @@ resource_bindings := {
         .await
         .expect("insert setup-failed apply job");
 
-        // A failed generation that reached the apply phase: apply failures
-        // are never reverted, so its workload spec may be the one the
-        // teardown hits.
+        // Published a StatefulSet, then failed. That spec may still be the
+        // one running. Setup acceptance alone is not this signal.
         let apply_failed = Uuid::new_v4();
         insert_test_deployment(
             &pool,
@@ -5091,6 +5102,7 @@ resource_bindings := {
         )
         .await;
         set_test_setup_state(&pool, apply_failed, "accepted").await;
+        mark_test_workload_published(&pool, apply_failed).await;
         let apply_failed_artifact = insert_test_artifact(&pool, app_id, apply_failed, "de").await;
         sqlx::query(
             "INSERT INTO deployment_apply_jobs (
@@ -5113,9 +5125,9 @@ resource_bindings := {
         .await
         .expect("insert apply-failed apply job");
 
-        // Only the newest apply-phase failure can supersede the previously
-        // applied workload. Keeping every older failure required would let
-        // this one deleting app exhaust the shared policy byte budget.
+        // Newer generation reached setup accepted and failed before any
+        // StatefulSet write. It must not suppress the published spec, and
+        // it must not consume required policy budget.
         let latest_apply_failed = Uuid::new_v4();
         insert_test_deployment(
             &pool,
@@ -5162,17 +5174,17 @@ resource_bindings := {
             "the live workload under two stacked failures must stay authorized"
         );
         assert!(
-            hashes.contains(
+            hashes.contains(apply_failed_artifact.metadata.descriptor_core_hash.as_str()),
+            "a published spec must stay authorized when a newer failure never wrote one"
+        );
+        assert!(
+            !hashes.contains(
                 latest_apply_failed_artifact
                     .metadata
                     .descriptor_core_hash
                     .as_str()
             ),
-            "the newest apply-phase failure must stay authorized"
-        );
-        assert!(
-            !hashes.contains(apply_failed_artifact.metadata.descriptor_core_hash.as_str()),
-            "an older failed apply must not consume required policy budget"
+            "a setup-accepted failure that never published a spec must not be authorized"
         );
         assert!(
             !hashes.contains(setup_failed_artifact.metadata.descriptor_core_hash.as_str()),
@@ -5180,11 +5192,142 @@ resource_bindings := {
         );
         assert_eq!(hashes.len(), 2, "deletion authority must stay bounded");
 
+        let retained = load_signed_policy_candidates(&pool, 1)
+            .await
+            .expect("select teardown authority at retention 1");
+        let retained_hashes: HashSet<_> = retained
+            .iter()
+            .map(|candidate| candidate.artifact.metadata.descriptor_core_hash.as_str())
+            .collect();
+        assert!(
+            retained_hashes.contains(live_artifact.metadata.descriptor_core_hash.as_str())
+                && retained_hashes
+                    .contains(apply_failed_artifact.metadata.descriptor_core_hash.as_str()),
+            "retention 1 must not drop either live teardown artifact: {retained_hashes:?}"
+        );
+        assert_eq!(retained_hashes.len(), 2);
+
         sqlx::query("DELETE FROM organizations WHERE id = $1")
             .bind(org_id)
             .execute(&pool)
             .await
             .expect("delete stacked-failures fixture organization");
+    }
+
+    #[tokio::test]
+    async fn newer_published_spec_bounds_teardown_authority() {
+        let pool = crate::test_support::database_test_pool().await;
+        let now = Utc::now();
+        let (org_id, app_id) = insert_test_app(&pool, "deleting").await;
+        sqlx::query("UPDATE apps SET workload_teardown_required = true WHERE id = $1")
+            .bind(app_id)
+            .execute(&pool)
+            .await
+            .expect("mark workload teardown pending");
+
+        let live = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, live, "healthy", now).await;
+        let live_artifact = insert_test_artifact(&pool, app_id, live, "11").await;
+        insert_test_job(
+            &pool,
+            org_id,
+            app_id,
+            live,
+            live,
+            Some((live, &live_artifact)),
+        )
+        .await;
+
+        let older = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, older, "failed", now).await;
+        set_test_setup_state(&pool, older, "accepted").await;
+        mark_test_workload_published(&pool, older).await;
+        let older_artifact = insert_test_artifact(&pool, app_id, older, "22").await;
+        insert_failed_apply_job(&pool, org_id, app_id, older, &older_artifact, 6).await;
+
+        let newer = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            org_id,
+            app_id,
+            newer,
+            "failed",
+            now + chrono::Duration::seconds(1),
+        )
+        .await;
+        set_test_setup_state(&pool, newer, "accepted").await;
+        mark_test_workload_published(&pool, newer).await;
+        let newer_artifact = insert_test_artifact(&pool, app_id, newer, "33").await;
+        insert_failed_apply_job(&pool, org_id, app_id, newer, &newer_artifact, 7).await;
+
+        // Highest generation, setup accepted, never published. Must not be
+        // the row that wins, and must not be admitted.
+        let unpublished = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            org_id,
+            app_id,
+            unpublished,
+            "failed",
+            now + chrono::Duration::seconds(2),
+        )
+        .await;
+        set_test_setup_state(&pool, unpublished, "accepted").await;
+        let unpublished_artifact = insert_test_artifact(&pool, app_id, unpublished, "44").await;
+        insert_failed_apply_job(&pool, org_id, app_id, unpublished, &unpublished_artifact, 8).await;
+
+        let candidates = load_signed_policy_candidates(&pool, 1)
+            .await
+            .expect("select bounded teardown authority");
+        let hashes: HashSet<_> = candidates
+            .iter()
+            .map(|candidate| candidate.artifact.metadata.descriptor_core_hash.as_str())
+            .collect();
+        assert!(hashes.contains(live_artifact.metadata.descriptor_core_hash.as_str()));
+        assert!(hashes.contains(newer_artifact.metadata.descriptor_core_hash.as_str()));
+        assert!(!hashes.contains(older_artifact.metadata.descriptor_core_hash.as_str()));
+        assert!(!hashes.contains(unpublished_artifact.metadata.descriptor_core_hash.as_str()));
+        assert_eq!(
+            hashes.len(),
+            2,
+            "only the last completed workload and the newest publication"
+        );
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete published-bound fixture organization");
+    }
+
+    async fn insert_failed_apply_job(
+        pool: &PgPool,
+        org_id: Uuid,
+        app_id: Uuid,
+        deployment_id: Uuid,
+        artifact: &crate::signing_service::SignedPolicyArtifact,
+        payload_byte: u8,
+    ) {
+        sqlx::query(
+            "INSERT INTO deployment_apply_jobs (
+                 deployment_id, app_id, org_id, source_deployment_id,
+                 payload_version, payload, payload_sha256,
+                 cleanup_app_on_setup_failure, signed_required,
+                 artifact_deployment_id, artifact_descriptor_core_hash,
+                 log_encryption, state, last_error_code
+             ) VALUES ($1, $2, $3, $1, 1,
+                       '{\"version\":1,\"log_encryption\":null}'::jsonb,
+                       $4, false, true, $1, $5, NULL, 'failed',
+                       'deployment_apply_failed')",
+        )
+        .bind(deployment_id)
+        .bind(app_id)
+        .bind(org_id)
+        .bind(vec![payload_byte; 32])
+        .bind(hex::decode(&artifact.metadata.descriptor_core_hash).unwrap())
+        .execute(pool)
+        .await
+        .expect("insert failed apply job");
     }
 
     #[tokio::test]

@@ -2989,6 +2989,29 @@ fn app_status_label(status: AppStatus) -> &'static str {
     }
 }
 
+async fn record_workload_spec_published(
+    pool: &PgPool,
+    deployment_id: Uuid,
+) -> Result<(), DeployError> {
+    // shortcut: crash after StatefulSet apply and before this commit, then lease expiry and supersession, looks unpublished; upgrade when supersession can tell a written spec from an applying row that never reached the StatefulSet
+    let updated = sqlx::query(
+        "UPDATE deployments
+            SET workload_spec_published_at = COALESCE(
+                    workload_spec_published_at,
+                    clock_timestamp()
+                )
+          WHERE id = $1",
+    )
+    .bind(deployment_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    if updated != 1 {
+        return Err(DeployError::Db(sqlx::Error::RowNotFound));
+    }
+    Ok(())
+}
+
 /// Apply manifests and return durable rollout-observation context.
 pub async fn apply_deployment_manifests(
     request: ApplyDeploymentManifestsRequest,
@@ -3127,6 +3150,9 @@ pub async fn apply_deployment_manifests(
         generation,
     )
     .await?;
+    // After the StatefulSet write, before edge routes. setup_state and
+    // manifest_hash are both recorded earlier and do not mean this succeeded.
+    record_workload_spec_published(&pool, deployment_id).await?;
     let edge_config = crate::edge::EdgeRouteConfig::from_env();
     let org_slug: String = sqlx::query_scalar("SELECT cust_slug FROM organizations WHERE id = $1")
         .bind(app.org_id)
