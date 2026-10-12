@@ -944,6 +944,34 @@ fn base64_artifact_form_decodes_within_the_payload_budget() {
 }
 
 #[test]
+fn base64_decoded_size_is_capped_exactly() {
+    // The rounded encoded-input allowance can decode 1-2 bytes over
+    // max_bytes; the decoded size must be checked exactly (#213 review).
+    use base64::Engine as _;
+    let max_bytes = 16 * 1024;
+    // Decodes to max_bytes + 1 while staying inside the encoded allowance.
+    let raw = serde_json::to_string(&"x".repeat(max_bytes - 1)).unwrap();
+    assert_eq!(raw.len(), max_bytes + 1);
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&raw);
+    assert!(encoded.len() <= (max_bytes / 3 + 1) * 4);
+    let err = super::keyring::decode_json_blob::<serde_json::Value>("blob", &encoded, max_bytes)
+        .unwrap_err();
+    assert!(
+        matches!(err, SigningServiceError::Blob(ref msg) if msg.contains("exceeds")),
+        "got: {err:?}"
+    );
+    // Within the cap it decodes.
+    let raw_ok = serde_json::to_string(&"x".repeat(max_bytes - 8)).unwrap();
+    let ok = super::keyring::decode_json_blob::<serde_json::Value>(
+        "blob",
+        &base64::engine::general_purpose::STANDARD.encode(&raw_ok),
+        max_bytes,
+    )
+    .unwrap();
+    assert!(ok.is_string());
+}
+
+#[test]
 // Pin canary: assertions are constant by design — they fail CI if a cap is
 // recalibrated below the measured generator output (#212).
 #[allow(clippy::assertions_on_constants)]

@@ -109,10 +109,18 @@ pub(super) fn decode_json_blob<T: for<'de> Deserialize<'de>>(
             trimmed.len()
         )));
     }
-    if let Ok(decoded) = B64.decode(trimmed.as_bytes())
-        && let Ok(parsed) = serde_json::from_slice(&decoded)
-    {
-        return Ok(parsed);
+    if let Ok(decoded) = B64.decode(trimmed.as_bytes()) {
+        // Exact bound: the rounded encoded allowance can decode 1-2 bytes
+        // over max_bytes (#213 review).
+        if decoded.len() > max_bytes {
+            return Err(SigningServiceError::Blob(format!(
+                "{name} exceeds {max_bytes} bytes (got {})",
+                decoded.len()
+            )));
+        }
+        if let Ok(parsed) = serde_json::from_slice(&decoded) {
+            return Ok(parsed);
+        }
     }
     serde_json::from_str(trimmed)
         .map_err(|err| SigningServiceError::Blob(format!("parsing {name}: {err}")))
