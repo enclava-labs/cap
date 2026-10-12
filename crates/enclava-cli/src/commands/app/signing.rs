@@ -564,12 +564,27 @@ pub(crate) async fn build_signed_deploy_blobs(
         workload_security_profile,
     } = params;
     let image_ref = enclava_common::image::ImageRef::parse(image)?;
-    if !image_ref.has_digest() {
-        return Err(
-            "deployment descriptor signing requires --image <image>@sha256:<digest>; build/sign the image first and pass the digest-pinned reference"
-                .into(),
-        );
-    }
+    let image_ref = if image_ref.has_digest() {
+        image_ref
+    } else {
+        // Tags work as documented: resolve to a content digest before the
+        // descriptor binds it. The server re-resolves body.image and refuses
+        // any digest disagreement (signing_service.rs).
+        let digest = enclava_cli::registry::resolve_image_digest(&image_ref)
+            .await
+            .map_err(|err| {
+                format!(
+                    "could not resolve image tag to a digest ({err}); \
+                     pass a digest-pinned reference --image <image>@sha256:<digest>"
+                )
+            })?;
+        enclava_common::image::ImageRef::parse(&format!(
+            "{}/{}@{}",
+            image_ref.registry(),
+            image_ref.repository(),
+            digest
+        ))?
+    };
     let deploy_unlock_mode = target_unlock_mode.unwrap_or(app.unlock_mode.as_str());
     if app_config.app.command.is_empty() {
         return Err(

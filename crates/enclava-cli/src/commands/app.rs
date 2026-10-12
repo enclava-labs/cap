@@ -401,7 +401,8 @@ pub async fn create(args: CreateArgs) -> Result<(), Box<dyn std::error::Error>> 
 
 #[derive(Args)]
 pub struct DeployArgs {
-    /// Digest-pinned container image to deploy and bind into the customer-signed descriptor.
+    /// Container image to deploy and bind into the customer-signed descriptor.
+    /// A tag is resolved to its content digest first.
     #[arg(long)]
     pub image: String,
     /// Set config key=value pairs delivered to TEE after boot

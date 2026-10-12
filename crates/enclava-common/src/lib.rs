@@ -9,6 +9,7 @@ pub mod image;
 pub mod log_encryption;
 #[cfg(feature = "runtime")]
 pub mod orgs;
+pub mod registry;
 #[cfg(feature = "runtime")]
 pub mod types;
 pub mod validate;
