@@ -47,7 +47,10 @@ fn group_challenges(value: &str) -> Vec<(String, Vec<&str>)> {
             continue;
         }
         match part.split_once(char::is_whitespace) {
-            Some((first, rest)) if !first.contains('=') => {
+            // A new challenge starts with a scheme token followed by params;
+            // a continuation param with bad whitespace around '=' (RFC 7235
+            // allows `key = value`) has its rest starting with '='.
+            Some((first, rest)) if !first.contains('=') && !rest.trim_start().starts_with('=') => {
                 groups.push((first.to_string(), vec![rest]));
             }
             None if !part.contains('=') => {
@@ -238,6 +241,17 @@ mod tests {
         assert_eq!(challenge.realm, "https://reg.example/token");
         assert_eq!(challenge.service.as_deref(), Some("reg.example"));
         assert_eq!(challenge.scope.as_deref(), Some("repository:org/app:pull"));
+    }
+
+    #[test]
+    fn spaced_auth_params_stay_in_their_challenge() {
+        // RFC 7235 allows bad whitespace around '=' (BWS): `key = value`.
+        let challenge = parse_bearer_challenge(
+            r#"Bearer service = "reg.example", realm = "https://reg.example/token""#,
+        )
+        .unwrap();
+        assert_eq!(challenge.realm, "https://reg.example/token");
+        assert_eq!(challenge.service.as_deref(), Some("reg.example"));
     }
 
     #[test]
