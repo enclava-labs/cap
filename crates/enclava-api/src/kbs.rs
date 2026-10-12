@@ -3403,7 +3403,7 @@ resource_bindings := {
 
     #[tokio::test]
     async fn legacy_authority_survives_while_the_only_durable_job_is_an_unreleased_hold() {
-        let pool = database_test_pool().await;
+        let pool = crate::test_support::database_test_pool().await;
         let now = Utc::now();
         let (org_id, app_id) = insert_test_app(&pool, "running").await;
         let legacy = Uuid::new_v4();
@@ -3558,7 +3558,7 @@ resource_bindings := {
 
     #[tokio::test]
     async fn replacement_handoff_keeps_running_authority_required_until_healthy() {
-        let pool = database_test_pool().await;
+        let pool = crate::test_support::database_test_pool().await;
         let now = Utc::now();
 
         // A signed replacement released from its hold whose apply has not
@@ -3916,7 +3916,7 @@ resource_bindings := {
 
     #[tokio::test]
     async fn failed_replacement_keeps_running_authority_until_confirmed_takeover() {
-        let pool = database_test_pool().await;
+        let pool = crate::test_support::database_test_pool().await;
         let now = Utc::now();
 
         // The released replacement of a signed workload fails mid-apply:
