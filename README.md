@@ -64,8 +64,19 @@ enclava status
 enclava key backup --out enclava-recovery.json
 ```
 
-The image must be digest-pinned. The signer subject should match the identity
-that signs the image, such as a GitHub Actions keyless cosign subject.
+Images may be digest-pinned or tagged (`enclava deploy --image
+<registry>/<image>:<tag>`). The CLI resolves tags to a content digest before
+signing; CAP independently resolves the image and checks that the digests agree.
+The signer subject should match the identity that signs the image, such as a
+GitHub Actions keyless cosign subject.
+
+CLI tag resolution uses direct HTTPS requests with TLS verification and no
+redirects or system HTTP proxies. Registry and permitted bearer-auth endpoints
+cannot resolve to loopback, private, link-local, metadata, or CGNAT addresses,
+including IPv4-mapped IPv6 addresses. `CLUSTER_POD_CIDR` and
+`CLUSTER_SERVICE_CIDR` add comma-separated IPv4/IPv6 CIDRs to the blocklist.
+Literal IP destinations are checked against the same ranges. Digest-pinned
+references skip the CLI registry lookup.
 
 The CLI also contains hosted-template commands used by Enclava-hosted API mode:
 

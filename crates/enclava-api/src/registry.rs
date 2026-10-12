@@ -246,7 +246,8 @@ pub async fn resolve_image_digest(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clients::{AllowList, BlockedNetworks, ClientConfig};
+    use crate::clients::{AllowList, ClientConfig};
+    use enclava_common::outbound_http::BlockedNetworks;
     use std::sync::Arc;
     use std::time::Duration;
 

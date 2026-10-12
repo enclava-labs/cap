@@ -8,7 +8,11 @@
 //! `body.image` and refuses any digest disagreement with the signed
 //! descriptor (signing_service.rs), so both resolutions must agree.
 
+use std::net::IpAddr;
+use std::sync::Arc;
+
 use enclava_common::image::ImageRef;
+use enclava_common::outbound_http::{BlockedNetworks, GuardedResolver};
 
 const MANIFEST_ACCEPT: &str = "application/vnd.oci.image.index.v1+json, \
      application/vnd.oci.image.manifest.v1+json, \
@@ -23,25 +27,40 @@ pub async fn resolve_image_digest(image_ref: &ImageRef) -> Result<String, String
     if image_ref.has_digest() {
         return Ok(image_ref.digest().to_string());
     }
+    let blocked = Arc::new(BlockedNetworks::from_env());
+    let client = registry_client_builder(Arc::clone(&blocked))
+        .build()
+        .map_err(|e| format!("http client: {e}"))?;
+    resolve_tag(image_ref, &client, &blocked).await
+}
+
+fn registry_client_builder(blocked: Arc<BlockedNetworks>) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .dns_resolver(Arc::new(GuardedResolver::new(blocked)))
+        // A proxy can resolve destinations remotely, bypassing the DNS guard.
+        .no_proxy()
+}
+
+async fn resolve_tag(
+    image_ref: &ImageRef,
+    client: &reqwest::Client,
+    blocked: &BlockedNetworks,
+) -> Result<String, String> {
     let tag = image_ref
         .tag()
         .ok_or_else(|| format!("image {} has no tag or digest", image_ref.full_ref()))?;
     let base_url = registry_base_url(image_ref.registry())?;
     let repository =
         enclava_common::registry::manifest_repository(image_ref.registry(), image_ref.repository());
-    let url = format!("{base_url}/v2/{repository}/manifests/{tag}");
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        // Registry redirects must not move a fetch off https or onto a
-        // different host unnoticed (mirror the API registry client).
-        .https_only(true)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|e| format!("http client: {e}"))?;
+    let url = reqwest::Url::parse(&format!("{base_url}/v2/{repository}/manifests/{tag}"))
+        .map_err(|e| format!("registry URL is not valid: {e}"))?;
+    validate_destination(&url, blocked)?;
 
     let mut response = client
-        .get(&url)
+        .get(url.as_str())
         .header("Accept", MANIFEST_ACCEPT)
         .send()
         .await
@@ -61,9 +80,9 @@ pub async fn resolve_image_digest(image_ref: &ImageRef) -> Result<String, String
             "registry demanded authentication without a usable WWW-Authenticate challenge"
                 .to_string()
         })?;
-        let token = fetch_bearer_token(&client, challenge, &base_url, &repository).await?;
+        let token = fetch_bearer_token(client, challenge, &base_url, &repository, blocked).await?;
         response = client
-            .get(&url)
+            .get(url.as_str())
             .header("Accept", MANIFEST_ACCEPT)
             .header("Authorization", format!("Bearer {token}"))
             .send()
@@ -95,6 +114,25 @@ pub async fn resolve_image_digest(image_ref: &ImageRef) -> Result<String, String
     Ok(digest)
 }
 
+fn validate_destination(url: &reqwest::Url, blocked: &BlockedNetworks) -> Result<(), String> {
+    if url.scheme() != "https" {
+        return Err(format!("registry URL {url} is not https"));
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| "registry URL has no host".to_string())?;
+    // Reqwest bypasses its DNS resolver for literal IP addresses.
+    if let Ok(addr) = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<IpAddr>()
+        && blocked.contains(addr)
+    {
+        return Err(format!("registry URL targets blocked address {addr}"));
+    }
+    Ok(())
+}
+
 /// Complete an RFC 7235 Bearer token flow against the challenge realm and
 /// return the access token. The realm is registry-supplied input: https-only,
 /// and its host must be the registry's own host (or a known auth service).
@@ -103,15 +141,11 @@ async fn fetch_bearer_token(
     challenge: enclava_common::registry::BearerChallenge,
     base_url: &str,
     repository: &str,
+    blocked: &BlockedNetworks,
 ) -> Result<String, String> {
     let mut url = reqwest::Url::parse(&challenge.realm)
         .map_err(|e| format!("registry auth realm is not a valid URL: {e}"))?;
-    if url.scheme() != "https" {
-        return Err(format!(
-            "registry auth realm {} is not https",
-            challenge.realm
-        ));
-    }
+    validate_destination(&url, blocked)?;
     let registry_host = reqwest::Url::parse(base_url)
         .ok()
         .and_then(|u| u.host_str().map(str::to_string))
@@ -216,3 +250,6 @@ mod tests {
         assert!(registry_base_url("localhost").is_err());
     }
 }
+
+#[cfg(test)]
+mod network_tests;
