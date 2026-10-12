@@ -632,6 +632,26 @@ async fn signed_policy_mode_active(db: &PgPool) -> Result<bool, KbsPolicyError> 
     .await?)
 }
 
+/// True while any unreleased customer-config hold still exists. A held
+/// signed deployment is withheld from `load_signed_policy_candidates`
+/// until its roll releases (or its hold expires failed), so on a legacy
+/// Rego install it can be the only signed authority: converging the empty
+/// candidate set would publish `{artifacts: []}` and revoke the workload
+/// the hold deliberately left running.
+async fn unreleased_customer_config_hold_pending(db: &PgPool) -> Result<bool, KbsPolicyError> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1
+               FROM deployment_apply_jobs
+              WHERE customer_config_hold
+                AND customer_config_released_at IS NULL
+         )",
+    )
+    .fetch_one(db)
+    .await?)
+}
+
+
 /// Select policy authority from the latest operation generation, not from the
 /// historical deployment that owns an artifact.  A rollback therefore makes
 /// its exact source artifact required.  The active operation is authoritative
@@ -1160,6 +1180,18 @@ async fn reconcile_pending_signed_policy_artifacts_with_client(
         let reset_bootstrap = state.configmap_generation == 0 && state.applied_generation == 0;
         let previously_applied = state.applied_generation >= generation;
         let candidates = load_signed_policy_candidates(db, config.signed_policy_retention).await?;
+        // Every signed authority is withheld behind an unreleased
+        // customer-config hold: publishing the empty body would flip a
+        // legacy Rego install into fail-closed signed mode and revoke the
+        // workload the hold deliberately left running. Defer this
+        // generation until release or hold expiry settles it.
+        if candidates.is_empty() && unreleased_customer_config_hold_pending(db).await? {
+            tracing::info!(
+                policy_generation = generation,
+                "deferring signed KBS policy convergence until held deployments release"
+            );
+            return Ok(());
+        }
         if let Some(expected) = expected_artifact
             && !candidates.iter().any(|candidate| {
                 candidate.artifact.metadata.descriptor_core_hash
@@ -3074,6 +3106,27 @@ resource_bindings := {
         .bind(status)
         .bind(created_at)
         .execute(pool)
+        .await
+        .expect("insert KBS test deployment");
+    }
+
+    async fn insert_test_deployment_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        org_id: Uuid,
+        app_id: Uuid,
+        deployment_id: Uuid,
+        status: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO deployments (
+                 id, org_id, app_id, status, spec_snapshot, created_at
+             ) VALUES ($1, $2, $3, $4::deploy_status_enum, '{}'::jsonb, now())",
+        )
+        .bind(deployment_id)
+        .bind(org_id)
+        .bind(app_id)
+        .bind(status)
+        .execute(&mut **tx)
         .await
         .expect("insert KBS test deployment");
     }
@@ -5140,5 +5193,86 @@ resource_bindings := {
             .execute(&pool)
             .await
             .expect("delete queued-supersessions fixture organization");
+    }
+
+    #[tokio::test]
+    async fn unreleased_customer_config_hold_defers_an_empty_policy() {
+        let pool = crate::test_support::database_test_pool().await;
+        let (org_id, app_id) = insert_test_app(&pool, "running").await;
+
+        assert!(
+            !unreleased_customer_config_hold_pending(&pool)
+                .await
+                .expect("probe hold before fixture"),
+            "no held deployment exists yet"
+        );
+
+        // The first signed deployment on this app is held: the schema
+        // trigger requires the job row first, then the pending deployment
+        // lands in the same transaction.
+        let held = Uuid::new_v4();
+        let mut tx = pool.begin().await.expect("begin held fixture");
+        sqlx::query(
+            "INSERT INTO deployment_apply_jobs (
+                 deployment_id, app_id, org_id, source_deployment_id,
+                 payload_version, payload, payload_sha256,
+                 cleanup_app_on_setup_failure, signed_required,
+                 artifact_deployment_id, artifact_descriptor_core_hash,
+                 log_encryption, state, next_attempt_at,
+                 customer_config_hold, customer_config_hold_until
+             ) VALUES (
+                 $1, $2, $3, $1, 1,
+                 '{\"version\":1,\"log_encryption\":null}'::jsonb,
+                 $4, false, false, NULL, NULL, NULL, 'setup_pending',
+                 'infinity'::timestamptz,
+                 true, clock_timestamp() + interval '1 hour'
+             )",
+        )
+        .bind(held)
+        .bind(app_id)
+        .bind(org_id)
+        .bind(vec![7u8; 32])
+        .execute(&mut *tx)
+        .await
+        .expect("insert held apply job");
+        insert_test_deployment_in_tx(&mut tx, org_id, app_id, held, "pending").await;
+        tx.commit().await.expect("commit held fixture");
+
+        assert!(
+            unreleased_customer_config_hold_pending(&pool)
+                .await
+                .expect("probe held deployment"),
+            "the unreleased hold must defer an empty policy publish"
+        );
+        let candidates = load_signed_policy_candidates(&pool, 8)
+            .await
+            .expect("load candidates under a held first deploy");
+        assert!(
+            candidates.is_empty(),
+            "the held artifact is withheld: converging here would publish {{artifacts: []}} and revoke the legacy workload"
+        );
+
+        // Releasing the hold ends the deferral.
+        sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET customer_config_released_at = clock_timestamp()
+              WHERE deployment_id = $1",
+        )
+        .bind(held)
+        .execute(&pool)
+        .await
+        .expect("release the hold");
+        assert!(
+            !unreleased_customer_config_hold_pending(&pool)
+                .await
+                .expect("probe after release"),
+            "a released hold no longer defers the policy"
+        );
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete held fixture organization");
     }
 }

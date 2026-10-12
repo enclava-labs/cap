@@ -379,6 +379,20 @@ async fn load_desired_edge_apps(pool: &PgPool) -> Result<Vec<DesiredEdgeApp>, sq
                     AND app.workload_teardown_required
                     AND app.workload_teardown_completed_at IS NULL
                 )
+                -- A failed app whose earlier deployment is still healthy
+                -- may have its previous workload live: apply/rollout
+                -- failures do not stop the old TEE, and a held redeploy
+                -- writes customer config to that domain. This is the same
+                -- prior-healthy evidence that arms the hold.
+                OR (
+                    app.status = 'failed'::app_status_enum
+                    AND EXISTS (
+                        SELECT 1
+                          FROM deployments AS earlier
+                         WHERE earlier.app_id = app.id
+                           AND earlier.status = 'healthy'::deploy_status_enum
+                    )
+                )
           )
           ORDER BY app.id",
     )
@@ -1782,6 +1796,89 @@ mod tests {
             .await
             .expect("reselect without a routable deployment");
         assert!(!selected.iter().any(|app| app.app_id == app_id));
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete edge selection fixture");
+    }
+
+    #[tokio::test]
+    async fn failed_app_with_prior_healthy_deployment_keeps_edge_route() {
+        let pool = edge_database_test_pool().await;
+        let org_id = Uuid::new_v4();
+        let app_id = Uuid::new_v4();
+        let suffix = app_id.simple().to_string();
+        sqlx::query("INSERT INTO organizations (id, name, cust_slug) VALUES ($1, $2, $3)")
+            .bind(org_id)
+            .bind(format!("edge-{suffix}"))
+            .bind(&suffix[..8])
+            .execute(&pool)
+            .await
+            .expect("insert edge test organization");
+        sqlx::query(
+            "INSERT INTO apps (
+                 id, org_id, name, namespace, instance_id, tenant_id,
+                 service_account, bootstrap_owner_pubkey_hash,
+                 tenant_instance_identity_hash, domain, tee_domain, status
+             ) VALUES (
+                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'failed'
+             )",
+        )
+        .bind(app_id)
+        .bind(org_id)
+        .bind(format!("edge-{}", &suffix[..12]))
+        .bind(format!("cap-edge-{}", &suffix[..12]))
+        .bind(format!("instance-{suffix}"))
+        .bind(&suffix[..8])
+        .bind(format!("cap-edge-{}-sa", &suffix[..12]))
+        .bind("11".repeat(32))
+        .bind("22".repeat(32))
+        .bind(format!("edge-{}.example.test", &suffix[..12]))
+        .bind(format!("edge-{}.tee.example.test", &suffix[..12]))
+        .execute(&pool)
+        .await
+        .expect("insert failed edge test app");
+
+        // A failed app with no healthy deployment history has no live TEE
+        // to serve; its route must not be retained.
+        insert_edge_deployment_job(
+            &pool,
+            org_id,
+            app_id,
+            Uuid::new_v4(),
+            "failed",
+            "failed",
+        )
+        .await;
+        let selected = load_desired_edge_apps(&pool)
+            .await
+            .expect("select routes for never-healthy failed app");
+        assert!(
+            !selected.iter().any(|app| app.app_id == app_id),
+            "a failed app without prior healthy evidence has no live route"
+        );
+
+        // A prior healthy deployment is the same evidence that arms the
+        // hold: the old TEE may still be live and the held redeploy writes
+        // customer config through this route.
+        insert_edge_deployment_job(
+            &pool,
+            org_id,
+            app_id,
+            Uuid::new_v4(),
+            "healthy",
+            "completed",
+        )
+        .await;
+        let selected = load_desired_edge_apps(&pool)
+            .await
+            .expect("reselect with prior healthy evidence");
+        assert!(
+            selected.iter().any(|app| app.app_id == app_id),
+            "a failed app with a prior healthy workload must keep its route"
+        );
+
         sqlx::query("DELETE FROM organizations WHERE id = $1")
             .bind(org_id)
             .execute(&pool)

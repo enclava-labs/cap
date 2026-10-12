@@ -1005,10 +1005,15 @@ fn hold_expiry(armed_at: Instant, hold_seconds: u32) -> Instant {
 /// Resolve the hold expiry as a monotonic deadline. CAP quotes
 /// `customer_config_hold_remaining_ms` from its database clock at response
 /// time, so adding it to `received_at` is skew-safe; a zero or negative
-/// remainder is already expired, never a fresh window. Older responses fall
-/// back to the absolute `customer_config_hold_until` (client wall-clock
-/// subtraction — the skew-exposed path — is no longer primary), then to the
-/// local pre-request estimate for a PaaS that predates both fields.
+/// remainder is already expired, never a fresh window. That remainder is
+/// always bounded by the conservative local estimate anchored at the
+/// request send: CAP measured the remainder before the response travelled
+/// through PaaS, so `received_at + remaining` alone can grant work beyond
+/// the stored expiry when transit exceeds the release reserve. The local
+/// estimate uses the same requested budget as a fresh arm, so it can only
+/// shorten the window, never extend a replay's authority. Older responses
+/// fall back to the absolute `customer_config_hold_until`, then to the
+/// local estimate alone for a PaaS that predates both fields.
 fn hold_expiry_instant(
     remaining_ms: Option<i64>,
     hold_until: Option<&str>,
@@ -1017,9 +1022,11 @@ fn hold_expiry_instant(
     hold_seconds: u32,
 ) -> Instant {
     if let Some(remaining_ms) = remaining_ms {
-        // Saturate absurd remainders at the documented hold maximum.
+        // Saturate absurd remainders at the documented hold maximum, then
+        // bound transit extension with the pre-request estimate.
         let bounded = remaining_ms.clamp(0, (CUSTOMER_CONFIG_ROLL_HOLD_MAX_SECONDS * 1_000) as i64);
-        return received_at + Duration::from_millis(bounded as u64);
+        return (received_at + Duration::from_millis(bounded as u64))
+            .min(hold_expiry(armed_at, hold_seconds));
     }
     if let Some(until) = hold_until
         && let Ok(expiry) = chrono::DateTime::parse_from_rfc3339(until)
@@ -5626,6 +5633,25 @@ mod tests {
                 "remaining_ms={expired} must be an expired hold"
             );
         }
+
+        // A response delayed in transit must not stretch the hold past the
+        // pre-request estimate: CAP measured the remainder before transit,
+        // so the local estimate bounds how far the quoted remainder can
+        // ride on the receipt clock.
+        let late_armed = Instant::now()
+            .checked_sub(Duration::from_secs(7_000))
+            .unwrap_or_else(Instant::now);
+        let transit = hold_expiry_instant(
+            Some(7_200_000),
+            None,
+            received_at,
+            late_armed,
+            7_200,
+        );
+        assert!(
+            transit <= Instant::now() + Duration::from_secs(201),
+            "a delayed response must not grant a fresh 2h window"
+        );
 
         // Without the integer field but with the absolute expiry, the
         // wall-clock subtraction path still applies for older responses.

@@ -5318,7 +5318,16 @@ pub async fn create_paas_generic_deployment(
     .await?
     {
         IdempotencyBegin::Execute(lease) => lease,
-        IdempotencyBegin::Replay((status, body)) => return Ok((status, Json(body))),
+        // The cached response stores a time-relative
+        // `customer_config_hold_remaining_ms` measured when the first
+        // request committed. Replaying it verbatim would anchor the stale
+        // duration at the retry's receipt and grant a fresh window after
+        // CAP's real deadline, so recompute the remainder from the stored
+        // hold before replaying.
+        IdempotencyBegin::Replay((status, body)) => {
+            let body = refresh_replayed_hold_remainder(&state, body).await;
+            return Ok((status, Json(body)));
+        }
     };
     let reclaimed = idempotency.reclaimed();
     let result: Result<IdempotencyResponse, InternalRouteError> = async {
@@ -5352,6 +5361,62 @@ pub async fn create_paas_generic_deployment(
     let (status, response) = complete_idempotent_result(idempotency, result).await?;
     Ok((status, Json(response)))
 }
+
+/// Recompute a cached idempotent response's `customer_config_hold_remaining_ms`
+/// from the stored hold before replay. The field is a duration measured at
+/// commit time; replaying the cached value verbatim would anchor that stale
+/// remainder at the retry's receipt and let the CLI spend a fresh window
+/// after CAP's real expiry. A replay whose deployment id or hold lookup
+/// cannot be refreshed keeps the cached body — losing the freshness fix is
+/// worse than serving one stale field.
+async fn refresh_replayed_hold_remainder(
+    state: &AppState,
+    mut body: serde_json::Value,
+) -> serde_json::Value {
+    let Some(deployment_id) = body
+        .get("deployment_id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())
+    else {
+        return body;
+    };
+    let open_hold =
+        crate::deployment_jobs::customer_config_open_hold(&state.db, deployment_id).await;
+    let Some(object) = body.as_object_mut() else {
+        return body;
+    };
+    match open_hold {
+        Ok(Some(hold)) => {
+            object.insert(
+                "customer_config_hold_until".to_string(),
+                serde_json::Value::String(hold.until.to_rfc3339()),
+            );
+            object.insert(
+                "customer_config_hold_remaining_ms".to_string(),
+                serde_json::Value::from(hold.remaining_ms),
+            );
+        }
+        Ok(None) => {
+            // The hold released or expired since the first response: do not
+            // keep reporting a live window.
+            object.insert(
+                "customer_config_hold".to_string(),
+                serde_json::Value::Bool(false),
+            );
+            object.insert(
+                "customer_config_hold_until".to_string(),
+                serde_json::Value::Null,
+            );
+            object.insert(
+                "customer_config_hold_remaining_ms".to_string(),
+                serde_json::Value::Null,
+            );
+        }
+        Err(_) => {}
+    }
+    body
+}
+
 
 pub async fn get_paas_generic_deployment(
     _auth: InternalAuth,
