@@ -709,11 +709,12 @@ fn hold_deferral_correlates(revoked_owners: &[String], hold_apps: &[String]) -> 
 /// even while the app row still projects the preceding failed/stopped state.
 /// Failed, unsigned, or deleting latest operations contribute no authorization,
 /// except that a deleting app with confidential teardown still pending keeps
-/// the authorization of every workload generation it may still be running
-/// under — the newest completed generation (the last workload known applied;
-/// supersession never rewrites completed jobs) plus any later generation that
-/// reached the apply phase (apply failures are never reverted, and the delete
-/// flip itself supersedes leased work) — until the teardown completes.
+/// authorization of the last workload known applied (the newest completed
+/// generation; supersession never rewrites completed jobs) plus the newest
+/// later generation that reached the apply phase until teardown completes.
+/// Apply failures are never reverted, and the delete flip itself supersedes
+/// leased work; a later apply supersedes older failed attempts, bounding the
+/// authority a single deleting app can force into the shared policy.
 /// The prior healthy workload remains required until a replacement is healthy,
 /// including when replacement setup fails without stopping the running workload.
 async fn load_signed_policy_candidates(
@@ -782,24 +783,13 @@ async fn load_signed_policy_candidates(
                         --     queued/leased jobs, so it stays completed) —
                         --     admitted however many later generations
                         --     failed;
-                        --   * any later generation that reached the apply
-                        --     phase may have written (or still be rolling
-                        --     out) a workload spec — apply failures are
-                        --     never reverted and the delete flip itself
-                        --     supersedes leased work with
-                        --     'deployment_superseded'. Two signals gate
-                        --     this arm: only provable setup failures are
-                        --     excluded by error code (setup completes
-                        --     before any workload spec is written), and
-                        --     the deployment must carry setup_state
-                        --     'accepted' (the durable setup machine in
-                        --     spec_snapshot, which supersession never
-                        --     rewrites) — a deployment superseded while
-                        --     still queued never entered the apply phase,
-                        --     wrote no spec, and admitting a pile of them
-                        --     would crowd the per-app retention slots and
-                        --     could push the live workload's artifact out
-                        --     of the published policy.
+                        --   * the newest later generation that reached the
+                        --     apply phase may have written (or still be
+                        --     rolling out) a workload spec. Older failed
+                        --     attempts are superseded by that later apply;
+                        --     retaining all of them would let one deleting
+                        --     app turn the retention setting into required
+                        --     policy bytes and exhaust the shared KBS body.
                         app_status = 'deleting'
                         AND workload_teardown_required
                         AND workload_teardown_completed_at IS NULL
@@ -823,6 +813,19 @@ async fn load_signed_policy_candidates(
                                    ) <> 'deployment_setup_failed'
                                 AND ranked_job_operations.deployment_setup_state
                                     = 'accepted'
+                                AND NOT EXISTS (
+                                    SELECT 1
+                                      FROM ranked_job_operations AS newer_apply
+                                     WHERE newer_apply.app_id
+                                         = ranked_job_operations.app_id
+                                       AND newer_apply.generation
+                                           > ranked_job_operations.generation
+                                       AND newer_apply.job_state <> 'completed'
+                                       AND COALESCE(newer_apply.last_error_code, '')
+                                           <> 'deployment_setup_failed'
+                                       AND newer_apply.deployment_setup_state
+                                           = 'accepted'
+                                )
                                 AND ranked_job_operations.generation > COALESCE(
                                        (
                                            SELECT MAX(applied.generation)
@@ -5110,7 +5113,44 @@ resource_bindings := {
         .await
         .expect("insert apply-failed apply job");
 
-        let candidates = load_signed_policy_candidates(&pool, 2)
+        // Only the newest apply-phase failure can supersede the previously
+        // applied workload. Keeping every older failure required would let
+        // this one deleting app exhaust the shared policy byte budget.
+        let latest_apply_failed = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            org_id,
+            app_id,
+            latest_apply_failed,
+            "failed",
+            now + chrono::Duration::seconds(2),
+        )
+        .await;
+        set_test_setup_state(&pool, latest_apply_failed, "accepted").await;
+        let latest_apply_failed_artifact =
+            insert_test_artifact(&pool, app_id, latest_apply_failed, "ef").await;
+        sqlx::query(
+            "INSERT INTO deployment_apply_jobs (
+                 deployment_id, app_id, org_id, source_deployment_id,
+                 payload_version, payload, payload_sha256,
+                 cleanup_app_on_setup_failure, signed_required,
+                 artifact_deployment_id, artifact_descriptor_core_hash,
+                 log_encryption, state, last_error_code
+             ) VALUES ($1, $2, $3, $1, 1,
+                       '{\"version\":1,\"log_encryption\":null}'::jsonb,
+                       $4, false, true, $1, $5, NULL, 'failed',
+                       'deployment_apply_failed')",
+        )
+        .bind(latest_apply_failed)
+        .bind(app_id)
+        .bind(org_id)
+        .bind(vec![7u8; 32])
+        .bind(hex::decode(&latest_apply_failed_artifact.metadata.descriptor_core_hash).unwrap())
+        .execute(&pool)
+        .await
+        .expect("insert latest apply-failed apply job");
+
+        let candidates = load_signed_policy_candidates(&pool, 6)
             .await
             .expect("select teardown-pending authority with stacked failures");
         let hashes: HashSet<_> = candidates
@@ -5122,13 +5162,23 @@ resource_bindings := {
             "the live workload under two stacked failures must stay authorized"
         );
         assert!(
-            hashes.contains(apply_failed_artifact.metadata.descriptor_core_hash.as_str()),
-            "an apply-phase failure newer than the last applied workload must stay authorized"
+            hashes.contains(
+                latest_apply_failed_artifact
+                    .metadata
+                    .descriptor_core_hash
+                    .as_str()
+            ),
+            "the newest apply-phase failure must stay authorized"
+        );
+        assert!(
+            !hashes.contains(apply_failed_artifact.metadata.descriptor_core_hash.as_str()),
+            "an older failed apply must not consume required policy budget"
         );
         assert!(
             !hashes.contains(setup_failed_artifact.metadata.descriptor_core_hash.as_str()),
             "a provable setup failure never wrote a workload spec and must stay excluded"
         );
+        assert_eq!(hashes.len(), 2, "deletion authority must stay bounded");
 
         sqlx::query("DELETE FROM organizations WHERE id = $1")
             .bind(org_id)
