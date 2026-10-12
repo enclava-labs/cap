@@ -865,10 +865,12 @@ fn valid_keyring() -> OrgKeyring {
 #[test]
 fn max_legal_caps_compose_under_proof_bundle_budgets() {
     // #128 (review warning 1): a max-legal combination (rego at
-    // MAX_REGO_TEXT_BYTES, agent policy at MAX_POLICY_TEXT_BYTES) must
-    // produce workload_artifacts_json and trustee_policy_json that both fit
-    // the downstream verifier field budgets, so ingress acceptance implies
-    // launchability.
+    // MAX_REGO_TEXT_BYTES, agent policy at MAX_POLICY_TEXT_BYTES) with the
+    // small fixtures here composes under the downstream verifier field
+    // budgets. At max-size descriptor/keyring siblings the composition can
+    // exceed them; validate_proof_bundle_budget (enforced at ingress in
+    // resolve_signed_policy_artifact and again at dispatch) is then the
+    // authoritative bound — the field caps only bound per-field DoS cost.
     let artifacts = signing_artifacts(descriptor());
     let mut artifact = signed_policy_artifact(&artifacts, &SigningKey::from_bytes(&[0x11; 32]));
     artifact.rego_text = "r".repeat(MAX_REGO_TEXT_BYTES);
@@ -892,6 +894,105 @@ fn max_legal_caps_compose_under_proof_bundle_budgets() {
     );
     // The exact-budget check accepts the max-legal composition.
     validate_proof_bundle_budget(&artifacts, &artifact).unwrap();
+}
+
+#[test]
+fn genpolicy_sized_agent_policy_passes_ingress_decode_caps_and_budgets() {
+    // Regression: the signing service's genpolicy output is ~116 KiB raw /
+    // ~125 KiB JSON-escaped for ordinary apps (serialized artifact ~134 KiB),
+    // which both the whole-artifact decode cap (MAX_SIGNED_POLICY_ARTIFACT_
+    // BLOB_BYTES, formerly 128 KiB) and the field cap (MAX_POLICY_TEXT_BYTES,
+    // formerly 48 KiB) rejected at ingress — no deployment could succeed.
+    // The serialized artifact must decode, pass the field caps, and compose
+    // under the budgets: the real ingress sequence.
+    let artifacts = signing_artifacts(descriptor());
+    let mut artifact = signed_policy_artifact(&artifacts, &SigningKey::from_bytes(&[0x22; 32]));
+    // "a" escapes to itself, so raw == escaped: 130 KiB covers the ~125 KiB
+    // measured escaped size of real genpolicy output with headroom.
+    artifact.agent_policy_text = "a".repeat(130 * 1024);
+    artifact.rego_text = "r".repeat(7 * 1024);
+    let blob = serde_json::to_string(&artifact).unwrap();
+    let mut artifact = decode_optional_policy_artifact(Some(blob))
+        .unwrap()
+        .unwrap();
+    artifacts.attach_customer_authority(&mut artifact).unwrap();
+    validate_signed_artifact_field_caps(&artifact).unwrap();
+    validate_proof_bundle_budget(&artifacts, &artifact).unwrap();
+}
+
+#[test]
+fn base64_artifact_form_decodes_within_the_payload_budget() {
+    // decode_json_blob accepts the base64 form and must bound the DECODED
+    // payload: the 4/3 encoded-input inflation must not reject a valid
+    // near-cap artifact (#213 review).
+    use base64::Engine as _;
+    let artifacts = signing_artifacts(descriptor());
+    let mut artifact = signed_policy_artifact(&artifacts, &SigningKey::from_bytes(&[0x23; 32]));
+    artifact.agent_policy_text = "a".repeat(MAX_POLICY_TEXT_BYTES);
+    artifact.rego_text = "r".repeat(MAX_REGO_TEXT_BYTES);
+    let raw = serde_json::to_string(&artifact).unwrap();
+    assert!(raw.len() < super::keyring::MAX_SIGNED_POLICY_ARTIFACT_BLOB_BYTES);
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&raw);
+    assert!(
+        encoded.len() > super::keyring::MAX_SIGNED_POLICY_ARTIFACT_BLOB_BYTES,
+        "test must exercise the encoded-input inflation case"
+    );
+    let decoded = decode_optional_policy_artifact(Some(encoded))
+        .unwrap()
+        .unwrap();
+    assert_eq!(decoded.agent_policy_text.len(), MAX_POLICY_TEXT_BYTES);
+}
+
+#[test]
+fn base64_decoded_size_is_capped_exactly() {
+    // The rounded encoded-input allowance can decode 1-2 bytes over
+    // max_bytes; the decoded size must be checked exactly (#213 review).
+    use base64::Engine as _;
+    let max_bytes = 16 * 1024;
+    // Decodes to max_bytes + 1 while staying inside the encoded allowance.
+    let raw = serde_json::to_string(&"x".repeat(max_bytes - 1)).unwrap();
+    assert_eq!(raw.len(), max_bytes + 1);
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&raw);
+    assert!(encoded.len() <= (max_bytes / 3 + 1) * 4);
+    let err = super::keyring::decode_json_blob::<serde_json::Value>("blob", &encoded, max_bytes)
+        .unwrap_err();
+    assert!(
+        matches!(err, SigningServiceError::Blob(ref msg) if msg.contains("exceeds")),
+        "got: {err:?}"
+    );
+    // Within the cap it decodes.
+    let raw_ok = serde_json::to_string(&"x".repeat(max_bytes - 8)).unwrap();
+    let ok = super::keyring::decode_json_blob::<serde_json::Value>(
+        "blob",
+        &base64::engine::general_purpose::STANDARD.encode(&raw_ok),
+        max_bytes,
+    )
+    .unwrap();
+    assert!(ok.is_string());
+}
+
+#[test]
+// Pin canary: assertions are constant by design — they fail CI if a cap is
+// recalibrated below the measured generator output (#212).
+#[allow(clippy::assertions_on_constants)]
+fn measured_genpolicy_size_class_fits_the_caps() {
+    // Recalibration trigger: the signing service's genpolicy output
+    // (kata-containers/genpolicy 3.28.0) measured 116,287 / 116,963 raw
+    // bytes (~125 KiB JSON-escaped) on two unrelated apps, and the
+    // serialized artifact measured 133,947 bytes. Shrinking a cap below
+    // these would reject the platform's own generator output again (#212).
+    // Generator-side growth detection belongs in the signing service's
+    // tests, where genpolicy runs.
+    assert!(
+        MAX_POLICY_TEXT_BYTES >= 125_058,
+        "agent policy cap {} is below the measured genpolicy escaped size 125058",
+        MAX_POLICY_TEXT_BYTES
+    );
+    assert!(
+        super::keyring::MAX_SIGNED_POLICY_ARTIFACT_BLOB_BYTES >= 133_947,
+        "artifact blob cap {} is below the measured serialized artifact size 133947",
+        super::keyring::MAX_SIGNED_POLICY_ARTIFACT_BLOB_BYTES
+    );
 }
 
 #[test]

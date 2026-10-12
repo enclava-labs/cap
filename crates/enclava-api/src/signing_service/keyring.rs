@@ -70,16 +70,20 @@ impl KeyringMember {
 
 /// Per-blob byte caps (#128): reject oversized payloads before any base64
 /// decoding or JSON parsing so unauthenticated blobs cannot spend unbounded
-/// CPU/memory. Caps are derived from the downstream proof-bundle field
-/// budgets (enclava-verifier bundle.rs / deploy.rs build_verification_material):
-/// trustee_policy_json is capped at 49_152 bytes and workload_artifacts_json
-/// at 196_608 bytes. A max-legal combination (32 KiB descriptor + 16 KiB
-/// keyring + 24 KiB rego + 48 KiB agent policy + 16 KiB keyring envelope +
-/// metadata/signature overhead) must compose under both budgets, and
-/// validate_proof_bundle_budget enforces the composed size exactly.
+/// CPU/memory. The signed-artifact cap is derived from the per-field caps so
+/// any artifact that passes validate_signed_artifact_field_caps also decodes:
+/// agent policy + rego at their escaped caps, the org-keyring envelope it can
+/// carry, and 8 KiB for the capped metadata/signature fields and JSON
+/// scaffolding. The composed proof-bundle budgets (workload_artifacts_json
+/// 196_608 / trustee_policy_json 49_152, enforced by
+/// validate_proof_bundle_budget at ingress and dispatch) remain the
+/// authoritative size bound.
 pub(super) const MAX_DESCRIPTOR_BLOB_BYTES: usize = 32 * 1024;
 pub(super) const MAX_ORG_KEYRING_BLOB_BYTES: usize = 16 * 1024;
-pub(super) const MAX_SIGNED_POLICY_ARTIFACT_BLOB_BYTES: usize = 128 * 1024;
+pub(super) const MAX_SIGNED_POLICY_ARTIFACT_BLOB_BYTES: usize = super::MAX_POLICY_TEXT_BYTES
+    + super::MAX_REGO_TEXT_BYTES
+    + MAX_ORG_KEYRING_BLOB_BYTES
+    + 8 * 1024;
 
 pub(super) fn decode_json_blob<T: for<'de> Deserialize<'de>>(
     name: &str,
@@ -90,16 +94,33 @@ pub(super) fn decode_json_blob<T: for<'de> Deserialize<'de>>(
     if trimmed.is_empty() {
         return Err(SigningServiceError::Blob(format!("{name} is required")));
     }
-    if trimmed.len() > max_bytes {
+    // The cap bounds the DECODED payload; the base64 form (supported below)
+    // inflates the input by up to 4/3, so the encoded form gets the
+    // proportional allowance instead of rejecting a valid decoded payload
+    // (#213 review). JSON blobs start with '{', base64 never does.
+    let input_cap = if trimmed.starts_with('{') {
+        max_bytes
+    } else {
+        (max_bytes / 3 + 1) * 4
+    };
+    if trimmed.len() > input_cap {
         return Err(SigningServiceError::Blob(format!(
             "{name} exceeds {max_bytes} bytes (got {})",
             trimmed.len()
         )));
     }
-    if let Ok(decoded) = B64.decode(trimmed.as_bytes())
-        && let Ok(parsed) = serde_json::from_slice(&decoded)
-    {
-        return Ok(parsed);
+    if let Ok(decoded) = B64.decode(trimmed.as_bytes()) {
+        // Exact bound: the rounded encoded allowance can decode 1-2 bytes
+        // over max_bytes (#213 review).
+        if decoded.len() > max_bytes {
+            return Err(SigningServiceError::Blob(format!(
+                "{name} exceeds {max_bytes} bytes (got {})",
+                decoded.len()
+            )));
+        }
+        if let Ok(parsed) = serde_json::from_slice(&decoded) {
+            return Ok(parsed);
+        }
     }
     serde_json::from_str(trimmed)
         .map_err(|err| SigningServiceError::Blob(format!("parsing {name}: {err}")))
