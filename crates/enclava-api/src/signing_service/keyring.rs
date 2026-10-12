@@ -70,16 +70,20 @@ impl KeyringMember {
 
 /// Per-blob byte caps (#128): reject oversized payloads before any base64
 /// decoding or JSON parsing so unauthenticated blobs cannot spend unbounded
-/// CPU/memory. Caps are derived from the downstream proof-bundle field
-/// budgets (enclava-verifier bundle.rs / deploy.rs build_verification_material):
-/// trustee_policy_json is capped at 49_152 bytes and workload_artifacts_json
-/// at 196_608 bytes. A max-legal combination (32 KiB descriptor + 16 KiB
-/// keyring + 24 KiB rego + 48 KiB agent policy + 16 KiB keyring envelope +
-/// metadata/signature overhead) must compose under both budgets, and
-/// validate_proof_bundle_budget enforces the composed size exactly.
+/// CPU/memory. The signed-artifact cap is derived from the per-field caps so
+/// any artifact that passes validate_signed_artifact_field_caps also decodes:
+/// agent policy + rego at their escaped caps, the org-keyring envelope it can
+/// carry, and 8 KiB for the capped metadata/signature fields and JSON
+/// scaffolding. The composed proof-bundle budgets (workload_artifacts_json
+/// 196_608 / trustee_policy_json 49_152, enforced by
+/// validate_proof_bundle_budget at ingress and dispatch) remain the
+/// authoritative size bound.
 pub(super) const MAX_DESCRIPTOR_BLOB_BYTES: usize = 32 * 1024;
 pub(super) const MAX_ORG_KEYRING_BLOB_BYTES: usize = 16 * 1024;
-pub(super) const MAX_SIGNED_POLICY_ARTIFACT_BLOB_BYTES: usize = 128 * 1024;
+pub(super) const MAX_SIGNED_POLICY_ARTIFACT_BLOB_BYTES: usize = super::MAX_POLICY_TEXT_BYTES
+    + super::MAX_REGO_TEXT_BYTES
+    + MAX_ORG_KEYRING_BLOB_BYTES
+    + 8 * 1024;
 
 pub(super) fn decode_json_blob<T: for<'de> Deserialize<'de>>(
     name: &str,

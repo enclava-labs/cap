@@ -897,18 +897,24 @@ fn max_legal_caps_compose_under_proof_bundle_budgets() {
 }
 
 #[test]
-fn genpolicy_sized_agent_policy_passes_field_caps_and_budgets() {
+fn genpolicy_sized_agent_policy_passes_ingress_decode_caps_and_budgets() {
     // Regression: the signing service's genpolicy output is ~116 KiB raw /
-    // ~125 KiB JSON-escaped for ordinary apps, which the former 48 KiB
-    // MAX_POLICY_TEXT_BYTES rejected at ingress — no deployment could
-    // succeed. A genpolicy-sized policy must pass the field caps and compose
-    // under the proof-bundle budgets.
+    // ~125 KiB JSON-escaped for ordinary apps (serialized artifact ~134 KiB),
+    // which both the whole-artifact decode cap (MAX_SIGNED_POLICY_ARTIFACT_
+    // BLOB_BYTES, formerly 128 KiB) and the field cap (MAX_POLICY_TEXT_BYTES,
+    // formerly 48 KiB) rejected at ingress — no deployment could succeed.
+    // The serialized artifact must decode, pass the field caps, and compose
+    // under the budgets: the real ingress sequence.
     let artifacts = signing_artifacts(descriptor());
     let mut artifact = signed_policy_artifact(&artifacts, &SigningKey::from_bytes(&[0x22; 32]));
     // "a" escapes to itself, so raw == escaped: 130 KiB covers the ~125 KiB
     // measured escaped size of real genpolicy output with headroom.
     artifact.agent_policy_text = "a".repeat(130 * 1024);
     artifact.rego_text = "r".repeat(7 * 1024);
+    let blob = serde_json::to_string(&artifact).unwrap();
+    let mut artifact = decode_optional_policy_artifact(Some(blob))
+        .unwrap()
+        .unwrap();
     artifacts.attach_customer_authority(&mut artifact).unwrap();
     validate_signed_artifact_field_caps(&artifact).unwrap();
     validate_proof_bundle_budget(&artifacts, &artifact).unwrap();
