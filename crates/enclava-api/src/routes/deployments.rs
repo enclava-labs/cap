@@ -609,6 +609,40 @@ async fn app_has_prior_healthy_deployment(
     .await
 }
 
+/// True while an earlier rollout is still in flight: supersession
+/// terminalizes the job and deployment rows in SQL but cannot cancel an
+/// apply already running against the cluster, so a `watching` (or
+/// `pending`/`applying`) rollout may still replace or boot the TEE a held
+/// redeploy is trying to write customer config into. An unreleased
+/// customer-config hold is excluded: its roll is deliberately frozen and
+/// must not block the next deployment's own hold decision.
+async fn app_has_rollout_in_flight(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    app_id: Uuid,
+    excluding_deployment_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1
+               FROM deployments AS deployment
+              WHERE deployment.app_id = $1
+                AND deployment.id <> $2
+                AND deployment.status IN ('pending', 'applying', 'watching')
+                AND NOT EXISTS (
+                    SELECT 1
+                      FROM deployment_apply_jobs AS job
+                     WHERE job.deployment_id = deployment.id
+                       AND job.customer_config_hold
+                       AND job.customer_config_released_at IS NULL
+                )
+         )",
+    )
+    .bind(app_id)
+    .bind(excluding_deployment_id)
+    .fetch_one(&mut **tx)
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn build_accepted_apply_payload(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -1545,10 +1579,17 @@ async fn deploy_app_candidate(
     // its authority for exactly that case. Hold only when an earlier
     // deployment still reports healthy — the same evidence — so a failed app
     // that never produced a live workload is not stranded waiting for a
-    // handshake no TEE can accept.
+    // handshake no TEE can accept. A nonterminal earlier rollout means the
+    // workload is unstable, so the hold is not armed at all: that rollout
+    // could still replace the TEE while this CLI writes config.
+    let is_update = app_mutation != AppMutation::Insert;
     let prior_healthy_workload = matches!(live_app_status, crate::models::AppStatus::Failed)
-        && app_mutation != AppMutation::Insert
+        && is_update
         && app_has_prior_healthy_deployment(&mut tx, app.id)
+            .await
+            .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+    let rollout_in_flight = is_update
+        && app_has_rollout_in_flight(&mut tx, app.id, deploy_id)
             .await
             .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
     let customer_config_hold_seconds =
@@ -1558,6 +1599,7 @@ async fn deploy_app_candidate(
                 app_mutation == AppMutation::Insert,
                 live_app_status,
                 prior_healthy_workload,
+                rollout_in_flight,
                 app.tee_domain.as_deref(),
             ),
         );
@@ -2506,6 +2548,114 @@ mod tests {
         assert!(
             has_healthy(&pool, app.id).await,
             "a prior healthy deployment means the failed app may still be live"
+        );
+
+        delete_setup_test_org(&pool, app.org_id).await;
+    }
+
+    #[tokio::test]
+    async fn rollout_in_flight_evidence_skips_frozen_holds() {
+        let pool = database_test_pool().await;
+        let app = insert_setup_test_app(&pool).await;
+
+        async fn in_flight(pool: &sqlx::PgPool, app_id: Uuid, current: Uuid) -> bool {
+            let mut tx = pool.begin().await.expect("begin in-flight probe");
+            let result = app_has_rollout_in_flight(&mut tx, app_id, current)
+                .await
+                .expect("probe in-flight rollout evidence");
+            tx.commit().await.expect("commit in-flight probe");
+            result
+        }
+        let current = Uuid::new_v4();
+
+        // A watching rollout is still replacing the workload and counts as
+        // in flight for every later deployment. The schema trigger requires
+        // the job row first; the deferred FK lets the deployment follow in
+        // the same transaction.
+        async fn insert_in_flight(
+            pool: &sqlx::PgPool,
+            app_id: Uuid,
+            org_id: Uuid,
+            status: &str,
+            hold: bool,
+        ) -> Uuid {
+            let id = Uuid::new_v4();
+            let mut tx = pool.begin().await.expect("begin in-flight fixture");
+            sqlx::query(
+                "INSERT INTO deployment_apply_jobs (
+                     deployment_id, app_id, org_id, source_deployment_id,
+                     payload_version, payload, payload_sha256,
+                     cleanup_app_on_setup_failure, signed_required,
+                     artifact_deployment_id, artifact_descriptor_core_hash,
+                     log_encryption, state, next_attempt_at,
+                     customer_config_hold, customer_config_hold_until
+                 ) VALUES (
+                     $1, $2, $3, $1, 1,
+                     '{\"version\":1,\"log_encryption\":null}'::jsonb,
+                     $4, false, false, NULL, NULL, NULL, 'setup_pending',
+                     CASE WHEN $5 THEN 'infinity'::timestamptz ELSE now() END,
+                     $5,
+                     CASE WHEN $5 THEN clock_timestamp() + interval '1 hour' END
+                 )",
+            )
+            .bind(id)
+            .bind(app_id)
+            .bind(org_id)
+            .bind(vec![5u8; 32])
+            .bind(hold)
+            .execute(&mut *tx)
+            .await
+            .expect("insert in-flight apply job");
+            sqlx::query(
+                "INSERT INTO deployments (id, org_id, app_id, trigger, status, spec_snapshot)
+                 VALUES ($1, $2, $3, 'api', $4::deploy_status_enum, '{}'::jsonb)",
+            )
+            .bind(id)
+            .bind(org_id)
+            .bind(app_id)
+            .bind(status)
+            .execute(&mut *tx)
+            .await
+            .expect("insert in-flight deployment");
+            tx.commit().await.expect("commit in-flight fixture");
+            id
+        }
+
+        let watching =
+            insert_in_flight(&pool, app.id, app.org_id, "watching", false).await;
+        assert!(
+            in_flight(&pool, app.id, current).await,
+            "a watching earlier rollout means the workload is unstable"
+        );
+
+        // An unreleased hold freezes its roll before apply: it must not
+        // block the next deployment's own hold decision.
+        sqlx::query("UPDATE deployments SET status = 'failed' WHERE id = $1")
+            .bind(watching)
+            .execute(&pool)
+            .await
+            .expect("settle watching deployment");
+        let held =
+            insert_in_flight(&pool, app.id, app.org_id, "pending", true).await;
+        assert!(
+            !in_flight(&pool, app.id, current).await,
+            "a frozen unreleased hold must not count as an in-flight rollout"
+        );
+
+        // Once the hold is released its roll resumes and counts as in
+        // flight again.
+        sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET customer_config_released_at = clock_timestamp()
+              WHERE deployment_id = $1",
+        )
+        .bind(held)
+        .execute(&pool)
+        .await
+        .expect("release hold job");
+        assert!(
+            in_flight(&pool, app.id, current).await,
+            "a released hold is rolling again and blocks a new hold"
         );
 
         delete_setup_test_org(&pool, app.org_id).await;

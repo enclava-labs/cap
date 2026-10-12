@@ -37,19 +37,30 @@ pub const MIN_CUSTOMER_CONFIG_ROLL_HOLD_SECONDS: i32 = 30;
 pub const MAX_CUSTOMER_CONFIG_ROLL_HOLD_SECONDS: i32 = 7_200;
 
 /// A hostname allocated at app creation is not a running TEE. Hold only a
-/// replacement of a workload that is live, so the CLI can write config to it
-/// before the roll. A failed app may still be running its previous workload —
-/// an apply or rollout failure does not stop the old TEE — so `Failed` arms
-/// the hold when a prior deployment still reports `healthy`, the same
-/// authority the KBS selector retains. A failed app that never had a live
-/// workload has no TEE to receive customer config and stays unheld.
+/// replacement of a workload that is live and stable, so the CLI can write
+/// config to it before the roll. A failed app may still be running its
+/// previous workload — an apply or rollout failure does not stop the old
+/// TEE — so `Failed` arms the hold when a prior deployment still reports
+/// `healthy`, the same authority the KBS selector retains. A failed app
+/// that never had a live workload has no TEE to receive customer config.
+///
+/// An earlier nonterminal rollout (`pending`/`applying`/`watching`) means
+/// the workload is still being replaced: supersession terminalizes only
+/// the job rows, not an apply already in flight, so that rollout could
+/// boot or replace the TEE while the CLI holds the new roll. The hold is
+/// not armed against an unstable workload; the earlier rollout supersedes
+/// under the ordinary rules instead.
 pub fn customer_config_roll_hold_applies(
     is_new_app: bool,
     live_app_status: AppStatus,
     prior_healthy_workload: bool,
+    rollout_in_flight: bool,
     tee_domain: Option<&str>,
 ) -> bool {
-    if is_new_app || !tee_domain.is_some_and(|domain| !domain.trim().is_empty()) {
+    if is_new_app
+        || rollout_in_flight
+        || !tee_domain.is_some_and(|domain| !domain.trim().is_empty())
+    {
         return false;
     }
     match live_app_status {
@@ -4568,27 +4579,48 @@ mod tests {
             true,
             running,
             true,
+            false,
             Some("tee.example.test")
         ));
         assert!(!customer_config_roll_hold_applies(
             false,
             creating,
             true,
+            false,
             Some("tee.example.test")
         ));
         assert!(!customer_config_roll_hold_applies(
-            false, running, true, None
+            false, running, true, false, None
         ));
         assert!(!customer_config_roll_hold_applies(
             false,
             running,
             true,
+            false,
             Some("  ")
         ));
         assert!(customer_config_roll_hold_applies(
             false,
             running,
             false,
+            false,
+            Some("tee.example.test")
+        ));
+        // An earlier rollout still in flight means the workload is unstable:
+        // its in-progress apply could replace the TEE while the CLI writes
+        // config, so the hold never arms against it.
+        assert!(!customer_config_roll_hold_applies(
+            false,
+            running,
+            false,
+            true,
+            Some("tee.example.test")
+        ));
+        assert!(!customer_config_roll_hold_applies(
+            false,
+            failed,
+            true,
+            true,
             Some("tee.example.test")
         ));
         // A failed app holds a redeploy only while a prior healthy workload
@@ -4598,16 +4630,18 @@ mod tests {
             false,
             failed,
             true,
+            false,
             Some("tee.example.test")
         ));
         assert!(!customer_config_roll_hold_applies(
             false,
             failed,
             false,
+            false,
             Some("tee.example.test")
         ));
         assert!(!customer_config_roll_hold_applies(
-            false, failed, true, None
+            false, failed, true, false, None
         ));
         assert_eq!(
             normalize_customer_config_roll_hold_seconds(Some(120), false),

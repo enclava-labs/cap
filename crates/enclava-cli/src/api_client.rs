@@ -466,6 +466,25 @@ impl ApiClient {
         read_bounded_json(resp).await
     }
 
+    pub async fn managed_config_delivery_status(
+        &self,
+        app_name: &str,
+        delivery_id: &str,
+    ) -> Result<ManagedConfigDeliveryStatusResponse, ApiError> {
+        let app_name = path_segment(app_name);
+        let delivery_id = path_segment(delivery_id);
+        let resp = self
+            .http
+            .get(self.url(&format!(
+                "/apps/{app_name}/managed-config/delivery/{delivery_id}"
+            )))
+            .headers(self.auth_headers()?)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        read_bounded_json(resp).await
+    }
+
     // --- Status ---
 
     pub async fn get_status(&self, app_name: &str) -> Result<AppStatus, ApiError> {

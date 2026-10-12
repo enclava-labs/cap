@@ -500,6 +500,18 @@ pub struct ManagedConfigDeliveryResponse {
     pub status: String,
     pub app_name: String,
     pub template_slug: String,
+    /// This call's delivery receipt on PaaS versions that expose it. Poll
+    /// `managed_config_delivery_status` until it reports `delivered` to
+    /// prove the enqueued values reached the TEE.
+    #[serde(default)]
+    pub delivery_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ManagedConfigDeliveryStatusResponse {
+    pub status: String,
+    #[serde(default)]
+    pub delivery_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

@@ -597,7 +597,7 @@ async fn deploy_with_timings(
     }
     if !template.paas_managed_config_keys.is_empty() {
         pb.set_message("Delivering platform-managed config...");
-        let (managed_key_baseline, managed_delivered_receipt) = timings
+        let (managed_key_baseline, managed_delivered_receipt, managed_delivery_id) = timings
             .run(DeployPhase::ManagedConfigEnqueue, async {
                 // Snapshot each expected key's `updated_at` before the
                 // enqueue: config metadata persists across deployments, so
@@ -635,10 +635,9 @@ async fn deploy_with_timings(
                 // satisfies the keys it covers; `queued` proves nothing
                 // reached the TEE, so the wait below needs fresh metadata.
                 let delivered_receipt = managed.status == "delivered";
-                Ok::<(HashMap<String, Option<String>>, bool), Box<dyn std::error::Error>>((
-                    baseline,
-                    delivered_receipt,
-                ))
+                Ok::<(HashMap<String, Option<String>>, bool, Option<String>), Box<dyn std::error::Error>>(
+                    (baseline, delivered_receipt, managed.delivery_id),
+                )
             })
             .await?;
         pb.set_message("Waiting for platform-managed config...");
@@ -654,6 +653,7 @@ async fn deploy_with_timings(
                     pre_release_deadline,
                     &managed_key_baseline,
                     managed_delivered_receipt,
+                    managed_delivery_id.as_deref(),
                     &pb,
                 ),
             )
@@ -2372,16 +2372,26 @@ fn managed_key_timestamp_is_newer(current: &str, previous: &str) -> bool {
 }
 
 /// Decide whether an observed managed key proves this call's delivery.
-/// `delivered_receipt` is the enqueue response's own `delivered` status —
-/// a `queued` response never satisfies a key.
+/// `delivered_receipt` is an authoritative receipt for this call — either
+/// the enqueue response's own `delivered` status or a matching polled
+/// `delivery_id` reporting `delivered`. A `queued` enqueue response never
+/// satisfies a key. When `strict_receipt` is set (the enqueue returned a
+/// `delivery_id`), only a matching receipt may release the key: an
+/// unchanged or newly bumped `updated_at` cannot, because an older
+/// in-flight delivery finishing after this call's enqueue would otherwise
+/// release the hold with stale values.
 fn managed_key_is_fresh(
     key: &str,
     baseline: &HashMap<String, Option<String>>,
     observed: &HashMap<String, String>,
     delivered_receipt: bool,
+    strict_receipt: bool,
 ) -> bool {
     if delivered_receipt {
         return true;
+    }
+    if strict_receipt {
+        return false;
     }
     match (
         baseline.get(key).and_then(Option::as_deref),
@@ -2401,11 +2411,18 @@ fn managed_key_is_fresh(
 ///
 /// `baseline` is the pre-enqueue `updated_at` snapshot and
 /// `delivered_receipt` is the enqueue response's `delivered` status; a key
-/// is ready only when that receipt covers it, it was absent before and is
-/// present now, or its `updated_at` is strictly newer than the snapshot.
-/// A pre-existing key whose timestamp did not change must not satisfy the
-/// wait — that value predates this deploy and releasing on it would roll
-/// the workload without the new config.
+/// is ready only when a receipt for this call covers it, it was absent
+/// before and is present now, or its `updated_at` is strictly newer than
+/// the snapshot. A pre-existing key whose timestamp did not change must
+/// not satisfy the wait — that value predates this deploy and releasing on
+/// it would roll the workload without the new config.
+///
+/// `delivery_id` is the enqueue response's delivery receipt. When PaaS
+/// returns one, only this call's delivery reaching `delivered` may satisfy
+/// a key: the timestamp fallback is disabled because an older in-flight
+/// delivery finishing after this enqueue would bump `updated_at` with
+/// values this call did not enqueue. `exhausted` or `cancelled` receipts
+/// fail the wait immediately.
 ///
 /// `hold_deadline` bounds each in-flight status read, the whole loop, and
 /// each retry sleep on a held redeploy: the API client's own 900 s cap would
@@ -2422,6 +2439,7 @@ async fn wait_for_paas_managed_config_keys(
     hold_deadline: Option<Instant>,
     baseline: &HashMap<String, Option<String>>,
     delivered_receipt: bool,
+    delivery_id: Option<&str>,
     progress: &ProgressBar,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let expected = expected_keys
@@ -2440,6 +2458,7 @@ async fn wait_for_paas_managed_config_keys(
     // reserve. Unheld deploys keep start + timeout.
     let deadline = hold_deadline.map_or(start + timeout, |hold| hold.min(start + timeout));
     let mut terminal_probe_at: Option<Instant> = None;
+    let mut delivered_receipt = delivered_receipt;
     progress.set_message(managed_config_progress_message(
         0,
         expected.len(),
@@ -2463,6 +2482,22 @@ async fn wait_for_paas_managed_config_keys(
             progress.abandon_with_message("TEE bootstrap failed");
             return Err(terminal_bootstrap_failure_message(instance_name, &diagnostic).into());
         }
+        // Poll this call's delivery receipt first: a matching `delivered`
+        // satisfies every expected key regardless of metadata timestamps.
+        if !delivered_receipt
+            && let Some(receipt) = delivery_id
+        {
+            match poll_managed_delivery_status(api, instance_name, receipt, hold_deadline).await? {
+                ManagedDeliveryPoll::Delivered => delivered_receipt = true,
+                ManagedDeliveryPoll::Pending => {}
+                ManagedDeliveryPoll::Failed(status) => {
+                    return Err(format!(
+                        "platform config delivery for app {instance_name} reported `{status}`; this command did not deliver customer config; redeploy to enqueue a fresh delivery"
+                    )
+                    .into());
+                }
+            }
+        }
         match bounded_request(hold_deadline, api.list_config_keys(instance_name)).await {
             Some(Ok(response)) => {
                 let observed = response
@@ -2473,7 +2508,13 @@ async fn wait_for_paas_managed_config_keys(
                 let missing = expected
                     .iter()
                     .filter(|key| {
-                        !managed_key_is_fresh(key, baseline, &observed, delivered_receipt)
+                        !managed_key_is_fresh(
+                            key,
+                            baseline,
+                            &observed,
+                            delivered_receipt,
+                            delivery_id.is_some(),
+                        )
                     })
                     .cloned()
                     .collect::<Vec<_>>();
@@ -2522,6 +2563,63 @@ async fn wait_for_paas_managed_config_keys(
         }
         progress.tick();
         template_config_sleep_until_retry(hold_deadline).await;
+    }
+}
+
+/// One poll of this call's managed-config delivery receipt.
+enum ManagedDeliveryPoll {
+    /// The enqueued delivery reached the TEE: it satisfies every key.
+    Delivered,
+    /// Still queued or processing — keep waiting.
+    Pending,
+    /// The delivery exhausted or was cancelled; carries the status name.
+    Failed(&'static str),
+}
+
+/// Read this call's delivery receipt once. Unknown or not-yet-observed
+/// receipts are treated as still pending so a replica lag cannot stall the
+/// wait, while retryable transport failures keep waiting under the normal
+/// deadline handling.
+async fn poll_managed_delivery_status(
+    api: &ApiClient,
+    instance_name: &str,
+    delivery_id: &str,
+    hold_deadline: Option<Instant>,
+) -> Result<ManagedDeliveryPoll, Box<dyn std::error::Error>> {
+    match bounded_request(
+        hold_deadline,
+        api.managed_config_delivery_status(instance_name, delivery_id),
+    )
+    .await
+    {
+        Some(Ok(status)) => {
+            if status
+                .delivery_id
+                .as_deref()
+                .is_some_and(|echoed| echoed == delivery_id)
+            {
+                match status.status.as_str() {
+                    "delivered" => Ok(ManagedDeliveryPoll::Delivered),
+                    "exhausted" => Ok(ManagedDeliveryPoll::Failed("exhausted")),
+                    "cancelled" => Ok(ManagedDeliveryPoll::Failed("cancelled")),
+                    _ => Ok(ManagedDeliveryPoll::Pending),
+                }
+            } else {
+                // A mismatched echo can never satisfy this call's receipt.
+                Ok(ManagedDeliveryPoll::Pending)
+            }
+        }
+        Some(Err(error)) if matches!(&error, ApiError::Api { status: 404, .. }) => {
+            Ok(ManagedDeliveryPoll::Pending)
+        }
+        Some(Err(error)) if should_retry_template_config_sync_error(&error) => {
+            Ok(ManagedDeliveryPoll::Pending)
+        }
+        Some(Err(error)) => Err(error.into()),
+        None => Err(
+            "customer-config roll hold deadline reached with the delivery status read still in flight"
+                .into(),
+        ),
     }
 }
 
@@ -5468,6 +5566,7 @@ mod tests {
                 Some(hold),
                 &HashMap::new(),
                 false,
+                None,
                 &progress,
             ),
         )
@@ -5618,29 +5717,33 @@ mod tests {
             );
             baseline
         };
-        assert!(managed_key_is_fresh("NEW_KEY", &baseline, &observed, false));
+        assert!(managed_key_is_fresh("NEW_KEY", &baseline, &observed, false, false));
         assert!(managed_key_is_fresh(
             "CHANGED_KEY",
             &baseline,
             &observed,
+            false,
             false
         ));
         assert!(managed_key_is_fresh(
             "UNPARSEABLE",
             &baseline,
             &observed,
+            false,
             false
         ));
         assert!(!managed_key_is_fresh(
             "STALE_KEY",
             &baseline,
             &observed,
+            false,
             false
         ));
         assert!(!managed_key_is_fresh(
             "REGRESSED",
             &baseline,
             &observed,
+            false,
             false
         ));
         // A key still absent after the enqueue is not fresh.
@@ -5648,6 +5751,7 @@ mod tests {
             "MISSING_KEY",
             &baseline,
             &observed,
+            false,
             false
         ));
         // The enqueue's `delivered` receipt satisfies every expected key.
@@ -5655,20 +5759,46 @@ mod tests {
             "STALE_KEY",
             &baseline,
             &observed,
-            true
+            true,
+            false
         ));
         assert!(managed_key_is_fresh(
             "MISSING_KEY",
             &baseline,
             &observed,
-            true
+            true,
+            false
         ));
         // `queued` is not a receipt.
         assert!(!managed_key_is_fresh(
             "STALE_KEY",
             &baseline,
             &observed,
+            false,
             false
+        ));
+        // With a delivery receipt issued, timestamps alone can never
+        // release the key — only this call's delivery may.
+        assert!(!managed_key_is_fresh(
+            "NEW_KEY",
+            &baseline,
+            &observed,
+            false,
+            true
+        ));
+        assert!(!managed_key_is_fresh(
+            "CHANGED_KEY",
+            &baseline,
+            &observed,
+            false,
+            true
+        ));
+        assert!(managed_key_is_fresh(
+            "STALE_KEY",
+            &baseline,
+            &observed,
+            true,
+            true
         ));
     }
 
@@ -5714,6 +5844,7 @@ mod tests {
             None,
             &baseline,
             false,
+            None,
             &progress,
         )
         .await
@@ -5769,6 +5900,7 @@ mod tests {
             None,
             &baseline,
             false,
+            None,
             &progress,
         )
         .await
@@ -5802,12 +5934,117 @@ mod tests {
             None,
             &baseline,
             true,
+            None,
             &progress,
         )
         .await
         .expect("the enqueue's delivered receipt satisfies the key");
     }
 
+    #[tokio::test]
+    async fn managed_config_wait_accepts_a_matching_delivery_receipt() {
+        use terminal_delivery_support::spawn_json_api_stub;
+
+        // The enqueue returned a delivery receipt. The config key stays at
+        // its pre-enqueue timestamp forever — only this call's delivery
+        // reporting `delivered` may release the wait.
+        let api_address = spawn_json_api_stub(|path| {
+            if let Some(id) = path
+                .strip_prefix("/apps/shell/managed-config/delivery/")
+            {
+                Some(serde_json::json!({
+                    "status": "delivered",
+                    "delivery_id": id,
+                }))
+            } else if path.ends_with("/config") {
+                Some(serde_json::json!({
+                    "keys": [{
+                        "key": "MANAGED_KEY",
+                        "updated_at": "2026-10-12T10:00:00Z"
+                    }]
+                }))
+            } else {
+                None
+            }
+        })
+        .await;
+        let api = ApiClient::new(
+            &format!("http://{api_address}"),
+            Some("test-token".to_string()),
+        );
+        let progress = ProgressBar::hidden();
+        let baseline = HashMap::from([(
+            "MANAGED_KEY".to_string(),
+            Some("2026-10-12T10:00:00Z".to_string()),
+        )]);
+        wait_for_paas_managed_config_keys(
+            &api,
+            "shell",
+            &["MANAGED_KEY".to_string()],
+            DeploymentWait::trusted("deploy-1", None),
+            Duration::from_secs(30),
+            None,
+            &baseline,
+            false,
+            Some("11111111-2222-3333-4444-555555555555"),
+            &progress,
+        )
+        .await
+        .expect("a matching delivered receipt satisfies the key");
+    }
+
+    #[tokio::test]
+    async fn managed_config_wait_rejects_an_exhausted_delivery_receipt() {
+        use terminal_delivery_support::spawn_json_api_stub;
+
+        // A terminal delivery failure must fail the wait fast instead of
+        // holding the roll open until the budget expires.
+        let api_address = spawn_json_api_stub(|path| {
+            if path.contains("/managed-config/delivery/") {
+                Some(serde_json::json!({
+                    "status": "exhausted",
+                    "delivery_id": "11111111-2222-3333-4444-555555555555",
+                }))
+            } else if path.ends_with("/config") {
+                Some(serde_json::json!({
+                    "keys": [{
+                        "key": "MANAGED_KEY",
+                        "updated_at": "2026-10-12T10:00:00Z"
+                    }]
+                }))
+            } else {
+                None
+            }
+        })
+        .await;
+        let api = ApiClient::new(
+            &format!("http://{api_address}"),
+            Some("test-token".to_string()),
+        );
+        let progress = ProgressBar::hidden();
+        let baseline = HashMap::from([(
+            "MANAGED_KEY".to_string(),
+            Some("2026-10-12T10:00:00Z".to_string()),
+        )]);
+        let error = wait_for_paas_managed_config_keys(
+            &api,
+            "shell",
+            &["MANAGED_KEY".to_string()],
+            DeploymentWait::trusted("deploy-1", None),
+            Duration::from_secs(30),
+            None,
+            &baseline,
+            false,
+            Some("11111111-2222-3333-4444-555555555555"),
+            &progress,
+        )
+        .await
+        .expect_err("an exhausted delivery must fail the wait");
+        assert!(
+            error.to_string().contains("exhausted"),
+            "unexpected wait outcome: {error}"
+        );
+    }
     #[tokio::test]
     async fn abandoned_release_stays_unknown_when_the_retry_is_rejected() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
