@@ -37,21 +37,47 @@ pub async fn resolve_tag_to_digest(
     // also still carries Docker-Content-Digest, so a mismatch between the
     // self-computed and advertised digests additionally proves the registry
     // is dishonest and is rejected outright (defense in depth, issue #140).
-    let url = format!("{base_url}/v2/{repository}/manifests/{tag}");
+    let manifest_repository = enclava_common::registry::manifest_repository(registry, repository);
+    let url = format!("{base_url}/v2/{manifest_repository}/manifests/{tag}");
     client.check_url(&url)?;
 
-    let response = client
-        .inner()
-        .get(&url)
-        .header(
-            "Accept",
-            "application/vnd.oci.image.index.v1+json, \
+    const MANIFEST_ACCEPT: &str = "application/vnd.oci.image.index.v1+json, \
              application/vnd.oci.image.manifest.v1+json, \
              application/vnd.docker.distribution.manifest.v2+json, \
-             application/vnd.docker.distribution.manifest.list.v2+json",
-        )
+             application/vnd.docker.distribution.manifest.list.v2+json";
+
+    let mut response = client
+        .inner()
+        .get(&url)
+        .header("Accept", MANIFEST_ACCEPT)
         .send()
         .await?;
+
+    // Registries commonly protect even public manifests with a bearer-token
+    // challenge (401 + WWW-Authenticate); complete the token flow and retry.
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        let challenge = enclava_common::registry::select_bearer_challenge(
+            response
+                .headers()
+                .get_all("WWW-Authenticate")
+                .iter()
+                .filter_map(|v| v.to_str().ok()),
+        )
+        .ok_or_else(|| {
+            RegistryError::ResolveFailed(
+                "registry demanded authentication without a usable WWW-Authenticate challenge"
+                    .to_string(),
+            )
+        })?;
+        let token = fetch_bearer_token(client, challenge, registry, &manifest_repository).await?;
+        response = client
+            .inner()
+            .get(&url)
+            .header("Accept", MANIFEST_ACCEPT)
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await?;
+    }
 
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         return Err(RegistryError::NotFound(format!(
@@ -89,6 +115,69 @@ pub async fn resolve_tag_to_digest(
         .await
         .map_err(RegistryError::Client)?;
     verify_advertised_digest(&advertised_digest, &manifest, registry, repository, tag)
+}
+
+/// Complete an RFC 7235 Bearer token flow against the challenge realm and
+/// return the access token. The realm URL is registry-supplied input, so it
+/// goes through the same https + allowlist checks as the manifest request,
+/// and its host must be the registry's own host (or a known auth service).
+async fn fetch_bearer_token(
+    client: &RegistryClient,
+    challenge: enclava_common::registry::BearerChallenge,
+    registry: &str,
+    repository: &str,
+) -> Result<String, RegistryError> {
+    let mut url = reqwest::Url::parse(&challenge.realm).map_err(|e| {
+        RegistryError::ResolveFailed(format!("registry auth realm is not a valid URL: {e}"))
+    })?;
+    if url.scheme() != "https" {
+        return Err(RegistryError::ResolveFailed(format!(
+            "registry auth realm {} is not https",
+            challenge.realm
+        )));
+    }
+    let registry_host = reqwest::Url::parse(&registry_base_url(registry)?)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .unwrap_or_default();
+    let realm_host = url.host_str().unwrap_or_default();
+    if !enclava_common::registry::realm_host_allowed(&registry_host, realm_host) {
+        return Err(RegistryError::ResolveFailed(format!(
+            "registry auth realm host {realm_host} is not the registry host {registry_host} or its known registry auth service"
+        )));
+    }
+    let scope = challenge
+        .scope
+        .unwrap_or_else(|| format!("repository:{repository}:pull"));
+    {
+        let mut query = url.query_pairs_mut();
+        if let Some(service) = &challenge.service {
+            query.append_pair("service", service);
+        }
+        query.append_pair("scope", &scope);
+    }
+    client.check_url(url.as_str())?;
+
+    let response = client.inner().get(url.as_str()).send().await?;
+    if !response.status().is_success() {
+        return Err(RegistryError::ResolveFailed(format!(
+            "registry token endpoint returned status {}",
+            response.status()
+        )));
+    }
+    let body = crate::clients::read_body_capped(response, client.body_limit()).await?;
+    let parsed: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
+        RegistryError::ResolveFailed(format!("registry token response is not parseable: {e}"))
+    })?;
+    parsed
+        .get("token")
+        .or_else(|| parsed.get("access_token"))
+        .and_then(|v| v.as_str())
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            RegistryError::ResolveFailed("registry token response carried no token".to_string())
+        })
 }
 
 /// Cross-check the registry-advertised digest against the digest computed

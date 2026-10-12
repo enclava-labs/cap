@@ -9,4 +9,5 @@ pub mod keyring;
 pub mod keys;
 pub mod platform_release;
 pub mod policy_artifact;
+pub mod registry;
 pub mod tee_client;
