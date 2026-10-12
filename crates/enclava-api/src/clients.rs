@@ -20,6 +20,8 @@ const DEFAULT_REGISTRY_ALLOWLIST: &[&str] = &[
     "registry-1.docker.io",
     // Docker Hub's bearer-token realm (challenge flow for docker.io pulls).
     "auth.docker.io",
+    // GitLab's bearer-token realm (challenge for registry.gitlab.com pulls).
+    "gitlab.com",
     "quay.io",
     "gcr.io",
     "registry.gitlab.com",
@@ -417,6 +419,7 @@ mod tests {
             "docker.io",
             "registry-1.docker.io",
             "auth.docker.io",
+            "gitlab.com",
             "quay.io",
             "gcr.io",
             "registry.gitlab.com",

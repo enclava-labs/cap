@@ -113,11 +113,16 @@ pub async fn resolve_tag_to_digest(
     verify_advertised_digest(&advertised_digest, &manifest, registry, repository, tag)
 }
 
-/// Auth services that legitimately live on a different host than the
-/// registry they serve. Checked in addition to the registry allowlist so a
-/// hostile (but allowlisted) registry cannot point the challenge realm at an
-/// unrelated allowlisted host.
-const AUTH_REALM_EXCEPTION_HOSTS: &[&str] = &["auth.docker.io", "gitlab.com"];
+/// Cross-host auth services, keyed by the registry host they serve: a
+/// challenge realm may live on the registry's own host or on that registry's
+/// known auth service — never an unrelated allowlisted host.
+fn realm_host_allowed(registry_host: &str, realm_host: &str) -> bool {
+    realm_host == registry_host
+        || matches!(
+            (registry_host, realm_host),
+            ("registry-1.docker.io", "auth.docker.io") | ("registry.gitlab.com", "gitlab.com")
+        )
+}
 
 /// Complete an RFC 7235 Bearer token flow against the challenge realm and
 /// return the access token. The realm URL is registry-supplied input, so it
@@ -150,9 +155,9 @@ async fn fetch_bearer_token(
         .and_then(|u| u.host_str().map(str::to_string))
         .unwrap_or_default();
     let realm_host = url.host_str().unwrap_or_default();
-    if realm_host != registry_host && !AUTH_REALM_EXCEPTION_HOSTS.contains(&realm_host) {
+    if !realm_host_allowed(&registry_host, realm_host) {
         return Err(RegistryError::ResolveFailed(format!(
-            "registry auth realm host {realm_host} is not the registry host {registry_host} or a known registry auth service"
+            "registry auth realm host {realm_host} is not the registry host {registry_host} or its known registry auth service"
         )));
     }
     let scope = challenge
@@ -258,6 +263,15 @@ mod tests {
     use crate::clients::{AllowList, BlockedNetworks, ClientConfig};
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn realm_host_is_bound_to_the_registry_or_its_auth_service() {
+        assert!(realm_host_allowed("ghcr.io", "ghcr.io"));
+        assert!(realm_host_allowed("registry-1.docker.io", "auth.docker.io"));
+        assert!(realm_host_allowed("registry.gitlab.com", "gitlab.com"));
+        assert!(!realm_host_allowed("ghcr.io", "auth.docker.io"));
+        assert!(!realm_host_allowed("quay.io", "gitlab.com"));
+    }
 
     fn registry_client() -> RegistryClient {
         RegistryClient::new(
