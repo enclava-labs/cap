@@ -14,16 +14,60 @@ pub struct BearerChallenge {
 /// Returns `None` for other schemes or a challenge without a realm.
 /// Quoted-string values may contain commas and backslash escapes (RFC 7235).
 pub fn parse_bearer_challenge(header: &str) -> Option<BearerChallenge> {
-    let header = header.trim();
-    let (scheme, params) = header.split_once(char::is_whitespace)?;
-    if !scheme.eq_ignore_ascii_case("bearer") {
-        return None;
-    }
+    select_bearer_challenge([header].into_iter())
+}
 
+/// Select the Bearer challenge from all `WWW-Authenticate` field values.
+/// A response may advertise several challenges (e.g. `Basic` and `Bearer` as
+/// separate field values, or joined in one value); only the Bearer one is
+/// usable for the anonymous token flow.
+pub fn select_bearer_challenge<'a, I: Iterator<Item = &'a str>>(
+    values: I,
+) -> Option<BearerChallenge> {
+    for (scheme, params) in values.flat_map(|value| group_challenges(value.trim())) {
+        if scheme.eq_ignore_ascii_case("bearer")
+            && let Some(challenge) = challenge_from_params(&params)
+        {
+            return Some(challenge);
+        }
+    }
+    None
+}
+
+/// Group auth parameters into challenges: a top-level segment whose first
+/// token is a scheme (contains no '=') starts a new challenge, and following
+/// key=value segments belong to it. Commas never split a challenge's own
+/// parameters (they may hide inside quoted values), so joined challenges are
+/// separated at scheme tokens only.
+fn group_challenges(value: &str) -> Vec<(String, Vec<&str>)> {
+    let mut groups: Vec<(String, Vec<&str>)> = Vec::new();
+    for part in split_auth_params(value) {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        match part.split_once(char::is_whitespace) {
+            Some((first, rest)) if !first.contains('=') => {
+                groups.push((first.to_string(), vec![rest]));
+            }
+            None if !part.contains('=') => {
+                groups.push((part.to_string(), Vec::new()));
+            }
+            _ => {
+                if let Some((_, params)) = groups.last_mut() {
+                    params.push(part);
+                }
+            }
+        }
+    }
+    groups
+}
+
+fn challenge_from_params(params: &[&str]) -> Option<BearerChallenge> {
     let mut realm = None;
     let mut service = None;
     let mut scope = None;
-    for pair in split_auth_params(params) {
+    for pair in params {
         let Some((key, value)) = pair.split_once('=') else {
             continue;
         };
@@ -87,28 +131,6 @@ fn unquote_auth_param(value: &str) -> String {
         }
     }
     out
-}
-
-/// Select the Bearer challenge from all `WWW-Authenticate` field values.
-/// A response may advertise several challenges (e.g. `Basic` and `Bearer` as
-/// separate field values, or joined in one value); only the Bearer one is
-/// usable for the anonymous token flow.
-pub fn select_bearer_challenge<'a, I: Iterator<Item = &'a str>>(
-    values: I,
-) -> Option<BearerChallenge> {
-    for value in values {
-        if let Some(challenge) = parse_bearer_challenge(value) {
-            return Some(challenge);
-        }
-        // Joined challenges: try each top-level comma segment on its own
-        // (quote-aware split keeps quoted commas inside their challenge).
-        for part in split_auth_params(value) {
-            if let Some(challenge) = parse_bearer_challenge(part.trim()) {
-                return Some(challenge);
-            }
-        }
-    }
-    None
 }
 
 /// Cross-host auth services, keyed by the registry host they serve: a
@@ -207,7 +229,19 @@ mod tests {
     }
 
     #[test]
-    fn selects_bearer_among_multiple_challenges() {
+    fn joined_challenges_keep_their_own_parameters() {
+        // Bearer after Basic, with Bearer's continuation params intact.
+        let challenge = parse_bearer_challenge(
+            r#"Basic realm="https://basic.example/auth", Bearer realm="https://reg.example/token",service="reg.example",scope="repository:org/app:pull""#,
+        )
+        .unwrap();
+        assert_eq!(challenge.realm, "https://reg.example/token");
+        assert_eq!(challenge.service.as_deref(), Some("reg.example"));
+        assert_eq!(challenge.scope.as_deref(), Some("repository:org/app:pull"));
+    }
+
+    #[test]
+    fn selects_bearer_among_multiple_field_values() {
         assert_eq!(
             select_bearer_challenge(
                 [
@@ -220,12 +254,6 @@ mod tests {
                 r#"Bearer realm="https://reg.example/token",service="reg.example""#
             )
         );
-        // Joined in one field value.
-        let joined = select_bearer_challenge(
-            [r#"Basic realm="reg", Bearer realm="https://reg.example/token?aud=a,b""#].into_iter(),
-        )
-        .unwrap();
-        assert_eq!(joined.realm, "https://reg.example/token?aud=a,b");
         assert_eq!(
             select_bearer_challenge([r#"Basic realm="reg""#].into_iter()),
             None
