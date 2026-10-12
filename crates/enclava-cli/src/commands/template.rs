@@ -1057,7 +1057,11 @@ fn bounded_phase(deadline: Option<Instant>, requested: Duration) -> Duration {
 fn release_outcome_is_unknown(error: &ApiError) -> bool {
     match error {
         ApiError::Http(_) => true,
-        ApiError::Api { status, .. } => *status >= 500,
+        // 408/425/429 are transient rejections, not definitive outcomes:
+        // the idempotent release may still succeed, and treating them as
+        // terminal strands a stored-config deployment until the hold
+        // expires.
+        ApiError::Api { status, .. } => *status >= 500 || matches!(*status, 408 | 425 | 429),
         ApiError::Decode(_) | ApiError::ResponseTooLarge(_) => true,
         ApiError::NotAuthenticated => false,
     }
@@ -5355,6 +5359,58 @@ mod tests {
         assert!(
             accepted.load(std::sync::atomic::Ordering::SeqCst) >= 2,
             "a short hold must still leave time for a retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn transient_release_status_retries_within_the_hold() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind transient release fixture");
+        let addr = listener
+            .local_addr()
+            .expect("transient release fixture addr");
+        let requests = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let captured = requests.clone();
+        tokio::spawn(async move {
+            let mut first = true;
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut request = [0_u8; 1024];
+                let read = stream.read(&mut request).await.unwrap_or(0);
+                captured
+                    .lock()
+                    .push(String::from_utf8_lossy(&request[..read]).to_string());
+                if first {
+                    first = false;
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\ncontent-length: 17\r\n\r\n{\"error\":\"busy\"}",
+                        )
+                        .await
+                        .expect("write transient release response");
+                } else {
+                    stream
+                        .write_all(b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n")
+                        .await
+                        .expect("write release response");
+                    break;
+                }
+            }
+        });
+        let api = ApiClient::new(&format!("http://{addr}"), Some("test-token".to_string()));
+
+        let expiry = Instant::now() + Duration::from_secs(6);
+        release_customer_config_roll_with_retry(&api, "shell", "deploy-1", expiry)
+            .await
+            .expect("a transient release status must retry inside the hold");
+
+        let requests = requests.lock();
+        assert_eq!(
+            requests.len(),
+            2,
+            "a 429 release response must be retried, saw {requests:?}"
         );
     }
 

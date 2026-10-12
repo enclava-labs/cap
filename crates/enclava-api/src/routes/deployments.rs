@@ -613,20 +613,20 @@ async fn app_has_prior_healthy_deployment(
 /// terminalizes the job and deployment rows in SQL but cannot cancel an
 /// apply already running against the cluster, so a `watching` (or
 /// `pending`/`applying`) rollout may still replace or boot the TEE a held
-/// redeploy is trying to write customer config into. An unreleased
-/// customer-config hold is excluded: its roll is deliberately frozen and
-/// must not block the next deployment's own hold decision.
+/// redeploy is trying to write customer config into. Callers must run this
+/// *before* `supersede_incomplete_deployments`, which rewrites exactly
+/// these statuses to `failed`. An unreleased customer-config hold is
+/// excluded: its roll is deliberately frozen and must not block the next
+/// deployment's own hold decision.
 async fn app_has_rollout_in_flight(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     app_id: Uuid,
-    excluding_deployment_id: Uuid,
 ) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar(
         "SELECT EXISTS(
              SELECT 1
                FROM deployments AS deployment
               WHERE deployment.app_id = $1
-                AND deployment.id <> $2
                 AND deployment.status IN ('pending', 'applying', 'watching')
                 AND NOT EXISTS (
                     SELECT 1
@@ -638,7 +638,6 @@ async fn app_has_rollout_in_flight(
          )",
     )
     .bind(app_id)
-    .bind(excluding_deployment_id)
     .fetch_one(&mut **tx)
     .await
 }
@@ -1503,6 +1502,13 @@ async fn deploy_app_candidate(
     .await
     .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
 
+    // Capture in-flight evidence before supersession: supersede rewrites
+    // those rows to `failed`, which would erase the signal this hold
+    // decision depends on.
+    let rollout_in_flight = (app_mutation != AppMutation::Insert)
+        && app_has_rollout_in_flight(&mut tx, app.id)
+            .await
+            .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
     crate::deploy::supersede_incomplete_deployments(&mut tx, app.id)
         .await
         .map_err(|error| match error {
@@ -1586,10 +1592,6 @@ async fn deploy_app_candidate(
     let prior_healthy_workload = matches!(live_app_status, crate::models::AppStatus::Failed)
         && is_update
         && app_has_prior_healthy_deployment(&mut tx, app.id)
-            .await
-            .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
-    let rollout_in_flight = is_update
-        && app_has_rollout_in_flight(&mut tx, app.id, deploy_id)
             .await
             .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
     let customer_config_hold_seconds =
@@ -2558,16 +2560,14 @@ mod tests {
         let pool = database_test_pool().await;
         let app = insert_setup_test_app(&pool).await;
 
-        async fn in_flight(pool: &sqlx::PgPool, app_id: Uuid, current: Uuid) -> bool {
+        async fn in_flight(pool: &sqlx::PgPool, app_id: Uuid) -> bool {
             let mut tx = pool.begin().await.expect("begin in-flight probe");
-            let result = app_has_rollout_in_flight(&mut tx, app_id, current)
+            let result = app_has_rollout_in_flight(&mut tx, app_id)
                 .await
                 .expect("probe in-flight rollout evidence");
             tx.commit().await.expect("commit in-flight probe");
             result
         }
-        let current = Uuid::new_v4();
-
         // A watching rollout is still replacing the workload and counts as
         // in flight for every later deployment. The schema trigger requires
         // the job row first; the deferred FK lets the deployment follow in
@@ -2624,7 +2624,7 @@ mod tests {
         let watching =
             insert_in_flight(&pool, app.id, app.org_id, "watching", false).await;
         assert!(
-            in_flight(&pool, app.id, current).await,
+            in_flight(&pool, app.id).await,
             "a watching earlier rollout means the workload is unstable"
         );
 
@@ -2638,7 +2638,7 @@ mod tests {
         let held =
             insert_in_flight(&pool, app.id, app.org_id, "pending", true).await;
         assert!(
-            !in_flight(&pool, app.id, current).await,
+            !in_flight(&pool, app.id).await,
             "a frozen unreleased hold must not count as an in-flight rollout"
         );
 
@@ -2654,7 +2654,7 @@ mod tests {
         .await
         .expect("release hold job");
         assert!(
-            in_flight(&pool, app.id, current).await,
+            in_flight(&pool, app.id).await,
             "a released hold is rolling again and blocks a new hold"
         );
 
