@@ -632,12 +632,10 @@ async fn signed_policy_mode_active(db: &PgPool) -> Result<bool, KbsPolicyError> 
     .await?)
 }
 
-/// True while any unreleased customer-config hold still exists. A held
-/// signed deployment is withheld from `load_signed_policy_candidates`
-/// until its roll releases (or its hold expires failed), so on a legacy
-/// Rego install it can be the only signed authority: converging the empty
-/// candidate set would publish `{artifacts: []}` and revoke the workload
-/// the hold deliberately left running.
+/// True while any customer-config hold is still live: the job is frozen at
+/// `setup_pending`, never released, and the expiry sweeper has not failed
+/// it yet. Only a live hold may defer policy convergence — a released or
+/// already-failed hold cannot wedge revocation for unrelated apps.
 async fn unreleased_customer_config_hold_pending(db: &PgPool) -> Result<bool, KbsPolicyError> {
     Ok(sqlx::query_scalar(
         "SELECT EXISTS(
@@ -645,6 +643,7 @@ async fn unreleased_customer_config_hold_pending(db: &PgPool) -> Result<bool, Kb
                FROM deployment_apply_jobs
               WHERE customer_config_hold
                 AND customer_config_released_at IS NULL
+                AND state = 'setup_pending'
          )",
     )
     .fetch_one(db)
@@ -5267,6 +5266,40 @@ resource_bindings := {
                 .await
                 .expect("probe after release"),
             "a released hold no longer defers the policy"
+        );
+
+        // A hold that expired and failed is equally inert: it must not
+        // wedge revocation for unrelated apps. The sweeper terminalizes the
+        // job and deployment together.
+        // Both rows terminalize in one transaction so the deferred
+        // durable-job constraint sees the canonical deployment already
+        // failed at commit.
+        let mut expiry_tx = pool.begin().await.expect("begin expiry fixture");
+        sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET customer_config_released_at = NULL,
+                    state = 'failed'
+              WHERE deployment_id = $1",
+        )
+        .bind(held)
+        .execute(&mut *expiry_tx)
+        .await
+        .expect("expire the hold job fixture");
+        sqlx::query(
+            "UPDATE deployments
+                SET status = 'failed'::deploy_status_enum
+              WHERE id = $1",
+        )
+        .bind(held)
+        .execute(&mut *expiry_tx)
+        .await
+        .expect("expire the hold deployment fixture");
+        expiry_tx.commit().await.expect("commit expiry fixture");
+        assert!(
+            !unreleased_customer_config_hold_pending(&pool)
+                .await
+                .expect("probe after hold expiry"),
+            "a terminal failed hold must not defer the policy"
         );
 
         sqlx::query("DELETE FROM organizations WHERE id = $1")

@@ -353,16 +353,23 @@ async fn load_desired_edge_apps(pool: &PgPool) -> Result<Vec<DesiredEdgeApp>, sq
            JOIN organizations AS organization ON organization.id = app.org_id
            JOIN LATERAL (
                 SELECT deployment.status
-                  FROM deployment_apply_jobs AS job
-                  JOIN deployments AS deployment
-                    ON deployment.id = job.deployment_id
-                   AND deployment.app_id = job.app_id
-                 WHERE job.app_id = app.id
+                  FROM deployments AS deployment
+                 WHERE deployment.app_id = app.id
                    AND deployment.status IN (
                         'watching'::deploy_status_enum,
                         'healthy'::deploy_status_enum
                    )
-                 ORDER BY job.generation DESC
+                   AND (
+                        EXISTS (
+                            SELECT 1
+                              FROM deployment_apply_jobs AS job
+                             WHERE job.deployment_id = deployment.id
+                        )
+                        -- Legacy deployments predate apply jobs; a healthy
+                        -- one still proves a live workload.
+                        OR deployment.status = 'healthy'::deploy_status_enum
+                   )
+                 ORDER BY deployment.created_at DESC, deployment.id DESC
                  LIMIT 1
            ) AS latest ON true
           WHERE (
@@ -1884,6 +1891,82 @@ mod tests {
             .execute(&pool)
             .await
             .expect("delete edge selection fixture");
+    }
+
+    #[tokio::test]
+    async fn failed_app_with_legacy_jobless_healthy_deployment_keeps_edge_route() {
+        let pool = edge_database_test_pool().await;
+        let org_id = Uuid::new_v4();
+        let app_id = Uuid::new_v4();
+        let suffix = app_id.simple().to_string();
+        sqlx::query("INSERT INTO organizations (id, name, cust_slug) VALUES ($1, $2, $3)")
+            .bind(org_id)
+            .bind(format!("edge-{suffix}"))
+            .bind(&suffix[..8])
+            .execute(&pool)
+            .await
+            .expect("insert edge test organization");
+        sqlx::query(
+            "INSERT INTO apps (
+                 id, org_id, name, namespace, instance_id, tenant_id,
+                 service_account, bootstrap_owner_pubkey_hash,
+                 tenant_instance_identity_hash, domain, tee_domain, status
+             ) VALUES (
+                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'failed'
+             )",
+        )
+        .bind(app_id)
+        .bind(org_id)
+        .bind(format!("edge-{}", &suffix[..12]))
+        .bind(format!("cap-edge-{}", &suffix[..12]))
+        .bind(format!("instance-{suffix}"))
+        .bind(&suffix[..8])
+        .bind(format!("cap-edge-{}-sa", &suffix[..12]))
+        .bind("11".repeat(32))
+        .bind("22".repeat(32))
+        .bind(format!("edge-{}.example.test", &suffix[..12]))
+        .bind(format!("edge-{}.tee.example.test", &suffix[..12]))
+        .execute(&pool)
+        .await
+        .expect("insert failed edge test app");
+
+        // A legacy healthy deployment predates apply jobs entirely: the
+        // route selector must not require a job row to count it as live
+        // evidence for a failed app.
+        sqlx::query(
+            "INSERT INTO deployments (id, org_id, app_id, status, spec_snapshot)
+             VALUES ($1, $2, $3, 'healthy', '{}'::jsonb)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(org_id)
+        .bind(app_id)
+        .execute(&pool)
+        .await
+        .expect("insert jobless healthy deployment");
+        sqlx::query(
+            "INSERT INTO deployments (id, org_id, app_id, status, spec_snapshot)
+             VALUES ($1, $2, $3, 'failed', '{}'::jsonb)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(org_id)
+        .bind(app_id)
+        .execute(&pool)
+        .await
+        .expect("insert jobless failed deployment");
+
+        let selected = load_desired_edge_apps(&pool)
+            .await
+            .expect("reselect with legacy healthy evidence");
+        assert!(
+            selected.iter().any(|app| app.app_id == app_id),
+            "a failed app whose only healthy deployment predates apply jobs must keep its route"
+        );
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete legacy edge selection fixture");
     }
 
     #[tokio::test]
