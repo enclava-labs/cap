@@ -586,6 +586,29 @@ async fn app_has_incomplete_deployment_setup(
     .await
 }
 
+/// True while an earlier deployment of this app still reports healthy — the
+/// same evidence the KBS selector uses to retain a failed app's workload
+/// authority. Held deployments stay `pending`, so an unreleased hold never
+/// counts as live evidence, and a lost-response retry sees the same
+/// deployments the first request saw. A failed app that never produced a
+/// healthy deployment has no TEE to receive customer config.
+async fn app_has_prior_healthy_deployment(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    app_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1
+               FROM deployments
+              WHERE app_id = $1
+                AND status = 'healthy'
+         )",
+    )
+    .bind(app_id)
+    .fetch_one(&mut **tx)
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn build_accepted_apply_payload(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -1517,12 +1540,24 @@ async fn deploy_app_candidate(
     let customer_config_roll_hold_request = honor_customer_config_roll_hold
         .then_some(body.customer_config_roll_hold_seconds)
         .flatten();
+    // A failed app can still be serving its previous workload: a failed
+    // apply or rollout does not stop the old TEE, and the KBS selector keeps
+    // its authority for exactly that case. Hold only when an earlier
+    // deployment still reports healthy — the same evidence — so a failed app
+    // that never produced a live workload is not stranded waiting for a
+    // handshake no TEE can accept.
+    let prior_healthy_workload = matches!(live_app_status, crate::models::AppStatus::Failed)
+        && app_mutation != AppMutation::Insert
+        && app_has_prior_healthy_deployment(&mut tx, app.id)
+            .await
+            .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
     let customer_config_hold_seconds =
         crate::deployment_jobs::normalize_customer_config_roll_hold_seconds(
             customer_config_roll_hold_request,
             crate::deployment_jobs::customer_config_roll_hold_applies(
                 app_mutation == AppMutation::Insert,
-                matches!(live_app_status, crate::models::AppStatus::Running),
+                live_app_status,
+                prior_healthy_workload,
                 app.tee_domain.as_deref(),
             ),
         );
@@ -2416,6 +2451,62 @@ mod tests {
             .await
             .expect("load app status after current watcher");
         assert_eq!(app_status, "running");
+
+        delete_setup_test_org(&pool, app.org_id).await;
+    }
+
+    #[tokio::test]
+    async fn prior_healthy_deployment_evidence_distinguishes_a_live_failed_app() {
+        let pool = database_test_pool().await;
+        let app = insert_setup_test_app(&pool).await;
+        async fn has_healthy(pool: &sqlx::PgPool, app_id: Uuid) -> bool {
+            let mut tx = pool.begin().await.expect("begin evidence probe");
+            let result = app_has_prior_healthy_deployment(&mut tx, app_id)
+                .await
+                .expect("probe prior healthy deployment");
+            tx.commit().await.expect("commit evidence probe");
+            result
+        }
+
+        // No deployment yet: a failed app that never had a live workload
+        // must not count as holding a live TEE.
+        assert!(
+            !has_healthy(&pool, app.id).await,
+            "an app without deployments has no prior healthy workload"
+        );
+
+        // A failed-only history still has nothing live to configure.
+        sqlx::query(
+            "INSERT INTO deployments (id, org_id, app_id, trigger, status, spec_snapshot)
+             VALUES ($1, $2, $3, 'api', 'failed', '{}'::jsonb)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(app.org_id)
+        .bind(app.id)
+        .execute(&pool)
+        .await
+        .expect("insert failed deployment");
+        assert!(
+            !has_healthy(&pool, app.id).await,
+            "failed deployments alone do not prove a live workload"
+        );
+
+        // A previously healthy deployment is exactly the evidence a failed
+        // apply leaves behind while the old TEE keeps serving.
+        sqlx::query(
+            "INSERT INTO deployments (id, org_id, app_id, trigger, status, spec_snapshot)
+             VALUES ($1, $2, $3, 'api', 'healthy', '{}'::jsonb)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(app.org_id)
+        .bind(app.id)
+        .execute(&pool)
+        .await
+        .expect("insert healthy deployment");
+        assert!(
+            has_healthy(&pool, app.id).await,
+            "a prior healthy deployment means the failed app may still be live"
+        );
 
         delete_setup_test_org(&pool, app.org_id).await;
     }

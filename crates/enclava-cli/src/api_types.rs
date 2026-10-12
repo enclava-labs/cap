@@ -398,6 +398,11 @@ pub struct TemplateInstanceResponse {
     /// The workload roll is waiting until customer config is released.
     #[serde(default)]
     pub customer_config_hold: bool,
+    /// The hold deadline CAP stored when it accepted the deployment. A
+    /// replayed create response carries the original expiry, not a fresh
+    /// window, so retry deadlines must derive from it.
+    #[serde(default)]
+    pub customer_config_hold_until: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]

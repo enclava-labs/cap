@@ -37,34 +37,48 @@ pub const MIN_CUSTOMER_CONFIG_ROLL_HOLD_SECONDS: i32 = 30;
 pub const MAX_CUSTOMER_CONFIG_ROLL_HOLD_SECONDS: i32 = 7_200;
 
 /// A hostname allocated at app creation is not a running TEE. Hold only a
-/// replacement of a workload that is already running, so the CLI can write
-/// config to it before the roll.
+/// replacement of a workload that is live, so the CLI can write config to it
+/// before the roll. A failed app may still be running its previous workload —
+/// an apply or rollout failure does not stop the old TEE — so `Failed` arms
+/// the hold when a prior deployment still reports `healthy`, the same
+/// authority the KBS selector retains. A failed app that never had a live
+/// workload has no TEE to receive customer config and stays unheld.
 pub fn customer_config_roll_hold_applies(
     is_new_app: bool,
-    app_is_running: bool,
+    live_app_status: AppStatus,
+    prior_healthy_workload: bool,
     tee_domain: Option<&str>,
 ) -> bool {
-    !is_new_app && app_is_running && tee_domain.is_some_and(|domain| !domain.trim().is_empty())
+    if is_new_app || !tee_domain.is_some_and(|domain| !domain.trim().is_empty()) {
+        return false;
+    }
+    match live_app_status {
+        AppStatus::Running => true,
+        AppStatus::Failed => prior_healthy_workload,
+        _ => false,
+    }
 }
 
-/// True while this deployment's roll is still waiting for the handshake.
-pub async fn customer_config_hold_is_open(
+/// The open hold's stored expiry while this deployment's roll is still
+/// waiting for the handshake. `None` when the roll is not held. The returned
+/// timestamp is the authority CAP set at accept time; a lost-response retry
+/// must reuse it instead of budgeting a fresh window from the retry.
+pub async fn customer_config_open_hold_until(
     pool: &PgPool,
     deployment_id: Uuid,
-) -> Result<bool, sqlx::Error> {
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, sqlx::Error> {
     sqlx::query_scalar(
-        "SELECT EXISTS(
-             SELECT 1
-               FROM deployment_apply_jobs
-              WHERE deployment_id = $1
-                AND customer_config_hold
-                AND customer_config_released_at IS NULL
-                AND state = 'setup_pending'
-         )",
+        "SELECT customer_config_hold_until
+           FROM deployment_apply_jobs
+          WHERE deployment_id = $1
+            AND customer_config_hold
+            AND customer_config_released_at IS NULL
+            AND state = 'setup_pending'",
     )
     .bind(deployment_id)
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await
+    .map(|row| row.flatten())
 }
 
 /// Clamp a caller-requested hold. `None` and zero mean the roll starts
@@ -4527,22 +4541,53 @@ mod tests {
 
     #[test]
     fn customer_config_roll_hold_requires_a_live_tee_and_stays_bounded() {
+        let running = crate::models::AppStatus::Running;
+        let failed = crate::models::AppStatus::Failed;
+        let creating = crate::models::AppStatus::Creating;
         assert!(!customer_config_roll_hold_applies(
             true,
+            running,
             true,
             Some("tee.example.test")
         ));
         assert!(!customer_config_roll_hold_applies(
             false,
-            false,
+            creating,
+            true,
             Some("tee.example.test")
         ));
-        assert!(!customer_config_roll_hold_applies(false, true, None));
-        assert!(!customer_config_roll_hold_applies(false, true, Some("  ")));
+        assert!(!customer_config_roll_hold_applies(
+            false, running, true, None
+        ));
+        assert!(!customer_config_roll_hold_applies(
+            false,
+            running,
+            true,
+            Some("  ")
+        ));
         assert!(customer_config_roll_hold_applies(
             false,
+            running,
+            false,
+            Some("tee.example.test")
+        ));
+        // A failed app holds a redeploy only while a prior healthy workload
+        // may still be live in the TEE; a never-live failed app has nothing
+        // to receive the config and must not arm the hold.
+        assert!(customer_config_roll_hold_applies(
+            false,
+            failed,
             true,
             Some("tee.example.test")
+        ));
+        assert!(!customer_config_roll_hold_applies(
+            false,
+            failed,
+            false,
+            Some("tee.example.test")
+        ));
+        assert!(!customer_config_roll_hold_applies(
+            false, failed, true, None
         ));
         assert_eq!(
             normalize_customer_config_roll_hold_seconds(Some(120), false),
@@ -4590,11 +4635,10 @@ mod tests {
             .await
             .expect("claim while held");
         assert!(claimed.is_none(), "an unreleased hold must not start setup");
-        assert!(
-            customer_config_hold_is_open(&pool, deployment_id)
-                .await
-                .expect("read open hold")
-        );
+        let open_until = customer_config_open_hold_until(&pool, deployment_id)
+            .await
+            .expect("read open hold");
+        assert!(open_until.is_some(), "an armed hold must expose its expiry");
 
         let release = release_customer_config_hold(&pool, app.org_id, deployment_id)
             .await

@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fs,
     io::Write as _,
     path::PathBuf,
@@ -485,10 +485,12 @@ async fn deploy_with_timings(
     // retry. CAP applies the hold only when a live workload is being
     // replaced and reports that in the response.
     let roll_hold_seconds = customer_config_roll_hold_seconds(args.ssh_timeout_seconds);
-    // CAP arms the hold when it accepts the request below. The deadline
+    // CAP arms the hold when it accepts the request below. The fallback
     // clock starts here, not at deploy_started, so preflight time above
     // (discovery, app creation, key preparation, signing) does not consume
-    // the hold.
+    // the hold. The response's `customer_config_hold_until` is the
+    // authoritative deadline — a replayed create returns the original
+    // expiry, never a fresh window from the retry.
     let hold_armed_at = Instant::now();
     let response = match timings
         .run(
@@ -514,6 +516,7 @@ async fn deploy_with_timings(
         explicit_stable_endpoint.as_deref(),
     )?;
     let customer_config_hold = response.customer_config_hold;
+    let customer_config_hold_until = response.customer_config_hold_until.clone();
     let deployment_id = response
         .deployment
         .cap_deployment_id
@@ -523,9 +526,18 @@ async fn deploy_with_timings(
     if customer_config_hold && deployment_id == "pending" {
         return Err("PaaS held the workload roll but did not return a deployment id".into());
     }
-    // Reserve release time within the same window armed before the create request.
-    let pre_release_deadline =
-        customer_config_hold.then(|| hold_deadline(hold_armed_at, roll_hold_seconds));
+    // The stored CAP expiry is the deadline authority. A lost-response
+    // retry replays it unchanged; only a stale PaaS without the field falls
+    // back to the locally armed estimate. Reserve release time inside the
+    // same window.
+    let hold_expires_at = customer_config_hold.then(|| {
+        hold_expiry_instant(
+            customer_config_hold_until.as_deref(),
+            hold_armed_at,
+            roll_hold_seconds,
+        )
+    });
+    let pre_release_deadline = hold_expires_at.map(hold_pre_release_deadline);
     let phase_budget =
         |requested: u64| bounded_phase(pre_release_deadline, Duration::from_secs(requested));
     if customer_config_hold
@@ -576,8 +588,18 @@ async fn deploy_with_timings(
     }
     if !template.paas_managed_config_keys.is_empty() {
         pb.set_message("Delivering platform-managed config...");
-        timings
+        let (managed_key_baseline, managed_delivered_receipt) = timings
             .run(DeployPhase::ManagedConfigEnqueue, async {
+                // Snapshot each expected key's `updated_at` before the
+                // enqueue: config metadata persists across deployments, so
+                // key presence alone can prove only that the *previous*
+                // value reached the TEE.
+                let baseline = snapshot_managed_key_updates(
+                    api,
+                    &instance_name,
+                    pre_release_deadline,
+                )
+                .await?;
                 // The enqueue is a held pre-release request: bound it by
                 // the same deadline as the waits so a stalled response
                 // cannot consume the release reserve.
@@ -600,7 +622,14 @@ async fn deploy_with_timings(
                     )
                     .into());
                 }
-                Ok::<(), Box<dyn std::error::Error>>(())
+                // A `delivered` response is this call's delivery receipt and
+                // satisfies the keys it covers; `queued` proves nothing
+                // reached the TEE, so the wait below needs fresh metadata.
+                let delivered_receipt = managed.status == "delivered";
+                Ok::<(HashMap<String, Option<String>>, bool), Box<dyn std::error::Error>>((
+                    baseline,
+                    delivered_receipt,
+                ))
             })
             .await?;
         pb.set_message("Waiting for platform-managed config...");
@@ -614,6 +643,8 @@ async fn deploy_with_timings(
                     deployment,
                     phase_budget(args.ssh_timeout_seconds),
                     pre_release_deadline,
+                    &managed_key_baseline,
+                    managed_delivered_receipt,
                     &pb,
                 ),
             )
@@ -680,7 +711,7 @@ async fn deploy_with_timings(
                 api,
                 &instance_name,
                 &deployment_id,
-                hold_expiry(hold_armed_at, roll_hold_seconds),
+                hold_expires_at.expect("a held roll always resolves an expiry"),
             )
             .await?;
             return Err(error);
@@ -699,7 +730,7 @@ async fn deploy_with_timings(
             api,
             &instance_name,
             &deployment_id,
-            hold_expiry(hold_armed_at, roll_hold_seconds),
+            hold_expires_at.expect("a held roll always resolves an expiry"),
         )
         .await?;
     }
@@ -956,14 +987,32 @@ const CUSTOMER_CONFIG_ROLL_HOLD_MAX_SECONDS: u64 = 7_200;
 /// cover managed-config delivery and the password-mode owner wait.
 const CUSTOMER_CONFIG_ROLL_HOLD_PREFIX_SECONDS: u64 = 240 + (121 * 2) + 60;
 
-/// The pre-request clock conservatively precedes CAP arming the hold.
+/// The pre-request clock conservatively precedes CAP arming the hold, so a
+/// local estimate never outlives the stored deadline.
 fn hold_expiry(armed_at: Instant, hold_seconds: u32) -> Instant {
     armed_at + Duration::from_secs(u64::from(hold_seconds))
 }
 
+/// Resolve the hold expiry from CAP's stored deadline. A replayed create
+/// response carries the original `customer_config_hold_until`, so retries
+/// never budget a fresh window; the local estimate is only the fallback for
+/// a PaaS that predates the field.
+fn hold_expiry_instant(hold_until: Option<&str>, armed_at: Instant, hold_seconds: u32) -> Instant {
+    if let Some(until) = hold_until
+        && let Ok(expiry) = chrono::DateTime::parse_from_rfc3339(until)
+    {
+        let remaining = expiry.timestamp_millis() - chrono::Utc::now().timestamp_millis();
+        return Instant::now()
+            + Duration::from_millis(u64::try_from(remaining.max(0)).unwrap_or(0));
+    }
+    hold_expiry(armed_at, hold_seconds)
+}
+
 /// Leave 30 seconds for release after config delivery.
-fn hold_deadline(armed_at: Instant, hold_seconds: u32) -> Instant {
-    hold_expiry(armed_at, hold_seconds) - Duration::from_secs(30)
+fn hold_pre_release_deadline(expires_at: Instant) -> Instant {
+    expires_at
+        .checked_sub(Duration::from_secs(30))
+        .unwrap_or_else(Instant::now)
 }
 
 /// Cap a pre-release wait at the hold deadline. Unheld deploys keep the
@@ -2248,13 +2297,99 @@ fn managed_config_progress_message(
     )
 }
 
-/// Wait for the PaaS to report every platform-managed config key ready.
+/// Snapshot each expected managed config key's stored `updated_at` before
+/// the enqueue call. The freshness check in
+/// `wait_for_paas_managed_config_keys` compares against this baseline; an
+/// absent baseline entry marks the key as previously missing, so its first
+/// appearance is fresh.
+async fn snapshot_managed_key_updates(
+    api: &ApiClient,
+    instance_name: &str,
+    hold_deadline: Option<Instant>,
+) -> Result<HashMap<String, Option<String>>, Box<dyn std::error::Error>> {
+    let mut last_error = String::new();
+    for _attempt in 0..3 {
+        match bounded_request(hold_deadline, api.list_config_keys(instance_name)).await {
+            Some(Ok(response)) => {
+                return Ok(response
+                    .keys
+                    .into_iter()
+                    .map(|entry| (entry.key, Some(entry.updated_at)))
+                    .collect());
+            }
+            Some(Err(error)) if should_retry_template_config_sync_error(&error) => {
+                last_error = error.to_string();
+                template_config_sleep_until_retry(hold_deadline).await;
+            }
+            Some(Err(error)) => return Err(error.into()),
+            None => {
+                return Err("customer-config roll hold deadline reached while snapshotting the platform-managed config keys; this command did not deliver customer config".into());
+            }
+        }
+    }
+    Err(format!(
+        "platform-managed config status did not become available for the pre-enqueue snapshot: {last_error}; this command did not deliver customer config"
+    )
+    .into())
+}
+
+/// True when the observed `updated_at` is strictly newer than the
+/// pre-enqueue snapshot. Equal timestamps cannot prove this deploy's value
+/// arrived: the previous write stays indistinguishable and does not count.
+/// Parseable timestamps compare as instants; unparseable values fall back
+/// to a byte-level difference so a changed timestamp is still recognized.
+fn managed_key_timestamp_is_newer(current: &str, previous: &str) -> bool {
+    match (
+        chrono::DateTime::parse_from_rfc3339(current),
+        chrono::DateTime::parse_from_rfc3339(previous),
+    ) {
+        (Ok(current), Ok(previous)) => current > previous,
+        _ => current != previous,
+    }
+}
+
+/// Decide whether an observed managed key proves this call's delivery.
+/// `delivered_receipt` is the enqueue response's own `delivered` status —
+/// a `queued` response never satisfies a key.
+fn managed_key_is_fresh(
+    key: &str,
+    baseline: &HashMap<String, Option<String>>,
+    observed: &HashMap<String, String>,
+    delivered_receipt: bool,
+) -> bool {
+    if delivered_receipt {
+        return true;
+    }
+    match (
+        baseline.get(key).and_then(Option::as_deref),
+        observed.get(key),
+    ) {
+        // Absent before, present after: the write this call enqueued.
+        (None, Some(_)) => true,
+        // Present before: only a strictly newer timestamp counts.
+        (Some(previous), Some(current)) => managed_key_timestamp_is_newer(current, previous),
+        // Still absent, or a vanished baseline row — not fresh.
+        _ => false,
+    }
+}
+
+/// Wait for the PaaS to report every platform-managed config key freshly
+/// delivered by this deploy's enqueue.
+///
+/// `baseline` is the pre-enqueue `updated_at` snapshot and
+/// `delivered_receipt` is the enqueue response's `delivered` status; a key
+/// is ready only when that receipt covers it, it was absent before and is
+/// present now, or its `updated_at` is strictly newer than the snapshot.
+/// A pre-existing key whose timestamp did not change must not satisfy the
+/// wait — that value predates this deploy and releasing on it would roll
+/// the workload without the new config.
 ///
 /// `hold_deadline` bounds each in-flight status read, the whole loop, and
 /// each retry sleep on a held redeploy: the API client's own 900 s cap would
 /// otherwise let one stalled read run past the roll hold. A cut read
 /// surfaces this wait's own not-available timeout. `None` on unheld deploys
 /// keeps the unbounded reads.
+#[allow(clippy::too_many_arguments)]
 async fn wait_for_paas_managed_config_keys(
     api: &ApiClient,
     instance_name: &str,
@@ -2262,6 +2397,8 @@ async fn wait_for_paas_managed_config_keys(
     deployment: DeploymentWait<'_>,
     timeout: Duration,
     hold_deadline: Option<Instant>,
+    baseline: &HashMap<String, Option<String>>,
+    delivered_receipt: bool,
     progress: &ProgressBar,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let expected = expected_keys
@@ -2305,14 +2442,16 @@ async fn wait_for_paas_managed_config_keys(
         }
         match bounded_request(hold_deadline, api.list_config_keys(instance_name)).await {
             Some(Ok(response)) => {
-                let present = response
+                let observed = response
                     .keys
                     .into_iter()
-                    .map(|entry| entry.key)
-                    .collect::<HashSet<_>>();
+                    .map(|entry| (entry.key, entry.updated_at))
+                    .collect::<HashMap<_, _>>();
                 let missing = expected
                     .iter()
-                    .filter(|key| !present.contains(*key))
+                    .filter(|key| {
+                        !managed_key_is_fresh(key, baseline, &observed, delivered_receipt)
+                    })
                     .cloned()
                     .collect::<Vec<_>>();
                 let ready = expected.len() - missing.len();
@@ -4915,6 +5054,7 @@ mod tests {
                 "app_domain": "shell.enclava.dev"
             }),
             customer_config_hold: false,
+            customer_config_hold_until: None,
         }
     }
 
@@ -5302,6 +5442,8 @@ mod tests {
                 DeploymentWait::trusted("deploy-1", None),
                 Duration::from_secs(600),
                 Some(hold),
+                &HashMap::new(),
+                false,
                 &progress,
             ),
         )
@@ -5319,6 +5461,280 @@ mod tests {
             "the stalled wait must stop at the pre-release deadline instead of the 600s budget, took {:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn replayed_hold_deadline_comes_from_the_stored_expiry() {
+        let armed_at = Instant::now();
+        // A replayed create carries the original expiry: a retry 10 minutes
+        // into a two-hour hold must see ~90 minutes left, not a fresh 120.
+        let until = chrono::DateTime::parse_from_rfc3339("2099-01-01T00:00:00Z").unwrap();
+        let expiry = hold_expiry_instant(
+            Some(&until.to_rfc3339()),
+            armed_at,
+            CUSTOMER_CONFIG_ROLL_HOLD_MAX_SECONDS as u32,
+        );
+        let expected = Instant::now()
+            + Duration::from_secs(
+                u64::try_from(until.timestamp() - chrono::Utc::now().timestamp()).unwrap_or(0),
+            );
+        let skew = expiry
+            .checked_duration_since(expected)
+            .or_else(|| expected.checked_duration_since(expiry))
+            .unwrap_or_default();
+        assert!(
+            skew < Duration::from_secs(2),
+            "the stored expiry must drive the deadline, skew {skew:?}"
+        );
+
+        // Without the field (older PaaS), the local estimate stands in.
+        let fallback = hold_expiry_instant(None, armed_at, 120);
+        assert!(
+            fallback <= armed_at + Duration::from_secs(121)
+                && fallback >= armed_at + Duration::from_secs(119),
+            "fallback must be armed_at + hold_seconds"
+        );
+
+        // An unparseable or already-past expiry never extends the hold.
+        let past = hold_expiry_instant(Some("2020-01-01T00:00:00Z"), armed_at, 7_200);
+        assert!(past <= Instant::now() + Duration::from_secs(1));
+        let garbage = hold_expiry_instant(Some("not-a-timestamp"), armed_at, 120);
+        assert_eq!(garbage, hold_expiry(armed_at, 120));
+
+        // The pre-release deadline keeps the 30s release reserve inside the
+        // stored window and never goes below now.
+        let reserve = hold_pre_release_deadline(Instant::now() + Duration::from_secs(90));
+        assert!(
+            reserve <= Instant::now() + Duration::from_secs(61)
+                && reserve >= Instant::now() + Duration::from_secs(55),
+            "pre-release deadline must be expiry - 30s"
+        );
+    }
+
+    #[test]
+    fn managed_key_freshness_requires_this_enqueues_write() {
+        let baseline = HashMap::from([
+            (
+                "STALE_KEY".to_string(),
+                Some("2026-10-12T10:00:00Z".to_string()),
+            ),
+            (
+                "CHANGED_KEY".to_string(),
+                Some("2026-10-12T10:00:00Z".to_string()),
+            ),
+            ("UNPARSEABLE".to_string(), Some("not-a-time".to_string())),
+        ]);
+        let observed = HashMap::from([
+            // Same timestamp as the snapshot: the previous value, not fresh.
+            ("STALE_KEY".to_string(), "2026-10-12T10:00:00Z".to_string()),
+            // Strictly newer timestamp: this enqueue's write landed.
+            (
+                "CHANGED_KEY".to_string(),
+                "2026-10-12T10:00:01Z".to_string(),
+            ),
+            // Absent before enqueue, present after.
+            ("NEW_KEY".to_string(), "2026-10-12T10:00:00Z".to_string()),
+            // A changed unparseable timestamp still counts as fresher.
+            ("UNPARSEABLE".to_string(), "also-not-a-time".to_string()),
+            // An older timestamp does not count.
+            ("REGRESSED".to_string(), "2026-10-12T09:00:00Z".to_string()),
+        ]);
+        let baseline = {
+            let mut baseline = baseline;
+            baseline.insert(
+                "REGRESSED".to_string(),
+                Some("2026-10-12T10:00:00Z".to_string()),
+            );
+            baseline
+        };
+        assert!(managed_key_is_fresh("NEW_KEY", &baseline, &observed, false));
+        assert!(managed_key_is_fresh(
+            "CHANGED_KEY",
+            &baseline,
+            &observed,
+            false
+        ));
+        assert!(managed_key_is_fresh(
+            "UNPARSEABLE",
+            &baseline,
+            &observed,
+            false
+        ));
+        assert!(!managed_key_is_fresh(
+            "STALE_KEY",
+            &baseline,
+            &observed,
+            false
+        ));
+        assert!(!managed_key_is_fresh(
+            "REGRESSED",
+            &baseline,
+            &observed,
+            false
+        ));
+        // A key still absent after the enqueue is not fresh.
+        assert!(!managed_key_is_fresh(
+            "MISSING_KEY",
+            &baseline,
+            &observed,
+            false
+        ));
+        // The enqueue's `delivered` receipt satisfies every expected key.
+        assert!(managed_key_is_fresh(
+            "STALE_KEY",
+            &baseline,
+            &observed,
+            true
+        ));
+        assert!(managed_key_is_fresh(
+            "MISSING_KEY",
+            &baseline,
+            &observed,
+            true
+        ));
+        // `queued` is not a receipt.
+        assert!(!managed_key_is_fresh(
+            "STALE_KEY",
+            &baseline,
+            &observed,
+            false
+        ));
+    }
+
+    #[tokio::test]
+    async fn managed_config_wait_rejects_an_unchanged_pre_enqueue_timestamp() {
+        use terminal_delivery_support::spawn_json_api_stub;
+
+        // The key persists across deployments at the same updated_at: the
+        // wait must keep polling instead of releasing on the previous value.
+        let stale_polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let polls = stale_polls.clone();
+        let api_address = spawn_json_api_stub(move |path| {
+            if path.ends_with("/config") {
+                polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some(serde_json::json!({
+                    "keys": [{
+                        "key": "MANAGED_KEY",
+                        "updated_at": "2026-10-12T10:00:00Z"
+                    }]
+                }))
+            } else {
+                None
+            }
+        })
+        .await;
+        let api = ApiClient::new(
+            &format!("http://{api_address}"),
+            Some("test-token".to_string()),
+        );
+        let progress = ProgressBar::hidden();
+        let baseline = HashMap::from([(
+            "MANAGED_KEY".to_string(),
+            Some("2026-10-12T10:00:00Z".to_string()),
+        )]);
+
+        let started = Instant::now();
+        let error = wait_for_paas_managed_config_keys(
+            &api,
+            "shell",
+            &["MANAGED_KEY".to_string()],
+            DeploymentWait::trusted("deploy-1", None),
+            Duration::from_secs(6),
+            None,
+            &baseline,
+            false,
+            &progress,
+        )
+        .await
+        .expect_err("an unchanged timestamp must never release the wait");
+        assert!(
+            error.to_string().contains("timed out"),
+            "unexpected wait outcome: {error}"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_secs(6),
+            "the stale key must keep the wait open, returned after {:?}",
+            started.elapsed()
+        );
+        assert!(
+            stale_polls.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "the wait must poll rather than trust the first stale read"
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_config_wait_accepts_a_newer_timestamp_and_delivered_receipt() {
+        use terminal_delivery_support::spawn_json_api_stub;
+
+        // Strictly newer updated_at satisfies a queued enqueue.
+        let api_address = spawn_json_api_stub(|path| {
+            if path.ends_with("/config") {
+                Some(serde_json::json!({
+                    "keys": [{
+                        "key": "MANAGED_KEY",
+                        "updated_at": "2026-10-12T10:00:01Z"
+                    }]
+                }))
+            } else {
+                None
+            }
+        })
+        .await;
+        let api = ApiClient::new(
+            &format!("http://{api_address}"),
+            Some("test-token".to_string()),
+        );
+        let progress = ProgressBar::hidden();
+        let baseline = HashMap::from([(
+            "MANAGED_KEY".to_string(),
+            Some("2026-10-12T10:00:00Z".to_string()),
+        )]);
+        wait_for_paas_managed_config_keys(
+            &api,
+            "shell",
+            &["MANAGED_KEY".to_string()],
+            DeploymentWait::trusted("deploy-1", None),
+            Duration::from_secs(30),
+            None,
+            &baseline,
+            false,
+            &progress,
+        )
+        .await
+        .expect("a strictly newer timestamp proves the enqueued write landed");
+
+        // A `delivered` receipt satisfies the key even when the follow-up
+        // read still shows the pre-enqueue timestamp.
+        let api_address = spawn_json_api_stub(|path| {
+            if path.ends_with("/config") {
+                Some(serde_json::json!({
+                    "keys": [{
+                        "key": "MANAGED_KEY",
+                        "updated_at": "2026-10-12T10:00:00Z"
+                    }]
+                }))
+            } else {
+                None
+            }
+        })
+        .await;
+        let api = ApiClient::new(
+            &format!("http://{api_address}"),
+            Some("test-token".to_string()),
+        );
+        wait_for_paas_managed_config_keys(
+            &api,
+            "shell",
+            &["MANAGED_KEY".to_string()],
+            DeploymentWait::trusted("deploy-1", None),
+            Duration::from_secs(30),
+            None,
+            &baseline,
+            true,
+            &progress,
+        )
+        .await
+        .expect("the enqueue's delivered receipt satisfies the key");
     }
 
     #[tokio::test]

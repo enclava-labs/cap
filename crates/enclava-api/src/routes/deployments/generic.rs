@@ -96,6 +96,10 @@ pub struct GenericDeploymentResponse {
     /// handshake. Absent when the roll was not held.
     #[serde(default, skip_serializing_if = "is_false")]
     pub customer_config_hold: bool,
+    /// The hold's stored expiry. A lost-response retry replays this same
+    /// deadline, so a retried create must not budget a fresh window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub customer_config_hold_until: Option<chrono::DateTime<chrono::Utc>>,
     /// Explicit live evidence. The lifecycle fields above remain database
     /// projections; consumers must use this observation to decide whether a
     /// healthy/running projection is current.
@@ -150,6 +154,7 @@ impl GenericDeploymentResponse {
             created_at: deployment.created_at,
             completed_at: deployment.completed_at,
             customer_config_hold: false,
+            customer_config_hold_until: None,
             observation: LiveObservation::not_observed(),
         }
     }
@@ -285,11 +290,11 @@ pub(crate) async fn create_generic_deployment_inner(
         && let Some((deployment, app)) =
             fetch_deployment_by_external_id(&state, auth.org_id, external_id).await?
     {
-        let customer_config_hold =
-            crate::deployment_jobs::customer_config_hold_is_open(&state.db, deployment.id)
+        let customer_config_hold_until =
+            crate::deployment_jobs::customer_config_open_hold_until(&state.db, deployment.id)
                 .await
                 .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
-        if super::deployment_setup_incomplete(&deployment) && !customer_config_hold {
+        if super::deployment_setup_incomplete(&deployment) && customer_config_hold_until.is_none() {
             return Err(json_error(
                 StatusCode::CONFLICT,
                 "external_id belongs to a deployment whose setup did not complete",
@@ -297,7 +302,10 @@ pub(crate) async fn create_generic_deployment_inner(
         }
         ensure_idempotent_retry_matches(&deployment, &app, &body)?;
         let mut response = GenericDeploymentResponse::from_deployment(deployment, &app);
-        response.customer_config_hold = customer_config_hold;
+        // Replay the stored expiry so a lost-response retry keeps the
+        // original deadline instead of a fresh hold window.
+        response.customer_config_hold = customer_config_hold_until.is_some();
+        response.customer_config_hold_until = customer_config_hold_until;
         return Ok((StatusCode::OK, Json(response)));
     }
 
@@ -374,12 +382,13 @@ pub(crate) async fn create_generic_deployment_inner(
     let (deployment, app) = fetch_deployment_with_app(&state, org_id, deployed.deployment_id)
         .await?
         .ok_or_else(|| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
-    let customer_config_hold =
-        crate::deployment_jobs::customer_config_hold_is_open(&state.db, deployment.id)
+    let customer_config_hold_until =
+        crate::deployment_jobs::customer_config_open_hold_until(&state.db, deployment.id)
             .await
             .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
     let mut response = GenericDeploymentResponse::from_deployment(deployment, &app);
-    response.customer_config_hold = customer_config_hold;
+    response.customer_config_hold = customer_config_hold_until.is_some();
+    response.customer_config_hold_until = customer_config_hold_until;
 
     Ok((status, Json(response)))
 }
@@ -408,10 +417,11 @@ pub async fn get_generic_deployment(
         response.app_status = "failed".to_string();
         response.error_message = Some(runtime_failure);
     }
-    response.customer_config_hold =
-        crate::deployment_jobs::customer_config_hold_is_open(&state.db, deployment_id)
+    response.customer_config_hold_until =
+        crate::deployment_jobs::customer_config_open_hold_until(&state.db, deployment_id)
             .await
             .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+    response.customer_config_hold = response.customer_config_hold_until.is_some();
     Ok(Json(response))
 }
 
