@@ -5366,9 +5366,9 @@ pub async fn create_paas_generic_deployment(
 /// from the stored hold before replay. The field is a duration measured at
 /// commit time; replaying the cached value verbatim would anchor that stale
 /// remainder at the retry's receipt and let the CLI spend a fresh window
-/// after CAP's real expiry. A replay whose deployment id or hold lookup
-/// cannot be refreshed keeps the cached body — losing the freshness fix is
-/// worse than serving one stale field.
+/// after CAP's real expiry. A replay that cannot refresh the hold drops the
+/// server-quoted expiry fields rather than serving a stale remainder, so
+/// the CLI falls back to its conservative pre-request estimate.
 async fn refresh_replayed_hold_remainder(
     state: &AppState,
     mut body: serde_json::Value,
@@ -5412,7 +5412,15 @@ async fn refresh_replayed_hold_remainder(
                 serde_json::Value::Null,
             );
         }
-        Err(_) => {}
+        Err(_) => {
+            // Fail closed: a replay that cannot refresh the hold must not
+            // serve the stale commit-time remainder, or an expired hold
+            // could be reported as a live window. Dropping both expiry
+            // fields leaves the CLI's pre-request estimate, which never
+            // outlives the stored deadline.
+            object.remove("customer_config_hold_until");
+            object.remove("customer_config_hold_remaining_ms");
+        }
     }
     body
 }

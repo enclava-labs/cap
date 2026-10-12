@@ -5386,7 +5386,7 @@ mod tests {
                     first = false;
                     stream
                         .write_all(
-                            b"HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\ncontent-length: 17\r\n\r\n{\"error\":\"busy\"}",
+                            b"HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\ncontent-length: 16\r\n\r\n{\"error\":\"busy\"}",
                         )
                         .await
                         .expect("write transient release response");
