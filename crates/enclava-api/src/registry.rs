@@ -37,7 +37,8 @@ pub async fn resolve_tag_to_digest(
     // also still carries Docker-Content-Digest, so a mismatch between the
     // self-computed and advertised digests additionally proves the registry
     // is dishonest and is rejected outright (defense in depth, issue #140).
-    let url = format!("{base_url}/v2/{repository}/manifests/{tag}");
+    let manifest_repository = enclava_common::registry::manifest_repository(registry, repository);
+    let url = format!("{base_url}/v2/{manifest_repository}/manifests/{tag}");
     client.check_url(&url)?;
 
     const MANIFEST_ACCEPT: &str = "application/vnd.oci.image.index.v1+json, \
@@ -55,17 +56,20 @@ pub async fn resolve_tag_to_digest(
     // Registries commonly protect even public manifests with a bearer-token
     // challenge (401 + WWW-Authenticate); complete the token flow and retry.
     if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-        let challenge = response
-            .headers()
-            .get("WWW-Authenticate")
-            .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| {
-                RegistryError::ResolveFailed(
-                    "registry demanded authentication without a usable WWW-Authenticate challenge"
-                        .to_string(),
-                )
-            })?;
-        let token = fetch_bearer_token(client, challenge, registry, repository).await?;
+        let challenge = enclava_common::registry::select_bearer_challenge(
+            response
+                .headers()
+                .get_all("WWW-Authenticate")
+                .iter()
+                .filter_map(|v| v.to_str().ok()),
+        )
+        .ok_or_else(|| {
+            RegistryError::ResolveFailed(
+                "registry demanded authentication without a usable WWW-Authenticate challenge"
+                    .to_string(),
+            )
+        })?;
+        let token = fetch_bearer_token(client, challenge, registry, &manifest_repository).await?;
         response = client
             .inner()
             .get(&url)
@@ -113,34 +117,16 @@ pub async fn resolve_tag_to_digest(
     verify_advertised_digest(&advertised_digest, &manifest, registry, repository, tag)
 }
 
-/// Cross-host auth services, keyed by the registry host they serve: a
-/// challenge realm may live on the registry's own host or on that registry's
-/// known auth service — never an unrelated allowlisted host.
-fn realm_host_allowed(registry_host: &str, realm_host: &str) -> bool {
-    realm_host == registry_host
-        || matches!(
-            (registry_host, realm_host),
-            ("registry-1.docker.io", "auth.docker.io") | ("registry.gitlab.com", "gitlab.com")
-        )
-}
-
 /// Complete an RFC 7235 Bearer token flow against the challenge realm and
 /// return the access token. The realm URL is registry-supplied input, so it
 /// goes through the same https + allowlist checks as the manifest request,
 /// and its host must be the registry's own host (or a known auth service).
 async fn fetch_bearer_token(
     client: &RegistryClient,
-    challenge: &str,
+    challenge: enclava_common::registry::BearerChallenge,
     registry: &str,
     repository: &str,
 ) -> Result<String, RegistryError> {
-    let challenge =
-        enclava_common::registry::parse_bearer_challenge(challenge).ok_or_else(|| {
-            RegistryError::ResolveFailed(
-                "unsupported WWW-Authenticate challenge from registry".to_string(),
-            )
-        })?;
-
     let mut url = reqwest::Url::parse(&challenge.realm).map_err(|e| {
         RegistryError::ResolveFailed(format!("registry auth realm is not a valid URL: {e}"))
     })?;
@@ -155,7 +141,7 @@ async fn fetch_bearer_token(
         .and_then(|u| u.host_str().map(str::to_string))
         .unwrap_or_default();
     let realm_host = url.host_str().unwrap_or_default();
-    if !realm_host_allowed(&registry_host, realm_host) {
+    if !enclava_common::registry::realm_host_allowed(&registry_host, realm_host) {
         return Err(RegistryError::ResolveFailed(format!(
             "registry auth realm host {realm_host} is not the registry host {registry_host} or its known registry auth service"
         )));
@@ -263,15 +249,6 @@ mod tests {
     use crate::clients::{AllowList, BlockedNetworks, ClientConfig};
     use std::sync::Arc;
     use std::time::Duration;
-
-    #[test]
-    fn realm_host_is_bound_to_the_registry_or_its_auth_service() {
-        assert!(realm_host_allowed("ghcr.io", "ghcr.io"));
-        assert!(realm_host_allowed("registry-1.docker.io", "auth.docker.io"));
-        assert!(realm_host_allowed("registry.gitlab.com", "gitlab.com"));
-        assert!(!realm_host_allowed("ghcr.io", "auth.docker.io"));
-        assert!(!realm_host_allowed("quay.io", "gitlab.com"));
-    }
 
     fn registry_client() -> RegistryClient {
         RegistryClient::new(

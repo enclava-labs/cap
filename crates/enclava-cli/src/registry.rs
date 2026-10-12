@@ -27,7 +27,9 @@ pub async fn resolve_image_digest(image_ref: &ImageRef) -> Result<String, String
         .tag()
         .ok_or_else(|| format!("image {} has no tag or digest", image_ref.full_ref()))?;
     let base_url = registry_base_url(image_ref.registry())?;
-    let url = format!("{base_url}/v2/{}/manifests/{tag}", image_ref.repository());
+    let repository =
+        enclava_common::registry::manifest_repository(image_ref.registry(), image_ref.repository());
+    let url = format!("{base_url}/v2/{repository}/manifests/{tag}");
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -48,16 +50,18 @@ pub async fn resolve_image_digest(image_ref: &ImageRef) -> Result<String, String
     // Public manifests are commonly behind a bearer-token challenge
     // (401 + WWW-Authenticate); complete the token flow and retry.
     if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-        let challenge = response
-            .headers()
-            .get("WWW-Authenticate")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned)
-            .ok_or_else(|| {
-                "registry demanded authentication without a usable WWW-Authenticate challenge"
-                    .to_string()
-            })?;
-        let token = fetch_bearer_token(&client, &challenge, image_ref.repository()).await?;
+        let challenge = enclava_common::registry::select_bearer_challenge(
+            response
+                .headers()
+                .get_all("WWW-Authenticate")
+                .iter()
+                .filter_map(|v| v.to_str().ok()),
+        )
+        .ok_or_else(|| {
+            "registry demanded authentication without a usable WWW-Authenticate challenge"
+                .to_string()
+        })?;
+        let token = fetch_bearer_token(&client, challenge, &base_url, &repository).await?;
         response = client
             .get(&url)
             .header("Accept", MANIFEST_ACCEPT)
@@ -92,21 +96,30 @@ pub async fn resolve_image_digest(image_ref: &ImageRef) -> Result<String, String
 }
 
 /// Complete an RFC 7235 Bearer token flow against the challenge realm and
-/// return the access token. The realm is registry-supplied input: https-only.
+/// return the access token. The realm is registry-supplied input: https-only,
+/// and its host must be the registry's own host (or a known auth service).
 async fn fetch_bearer_token(
     client: &reqwest::Client,
-    challenge: &str,
+    challenge: enclava_common::registry::BearerChallenge,
+    base_url: &str,
     repository: &str,
 ) -> Result<String, String> {
-    let challenge = enclava_common::registry::parse_bearer_challenge(challenge)
-        .ok_or_else(|| "unsupported WWW-Authenticate challenge from registry".to_string())?;
-
     let mut url = reqwest::Url::parse(&challenge.realm)
         .map_err(|e| format!("registry auth realm is not a valid URL: {e}"))?;
     if url.scheme() != "https" {
         return Err(format!(
             "registry auth realm {} is not https",
             challenge.realm
+        ));
+    }
+    let registry_host = reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .unwrap_or_default();
+    let realm_host = url.host_str().unwrap_or_default();
+    if !enclava_common::registry::realm_host_allowed(&registry_host, realm_host) {
+        return Err(format!(
+            "registry auth realm host {realm_host} is not the registry host {registry_host} or its known registry auth service"
         ));
     }
     let scope = challenge

@@ -89,6 +89,49 @@ fn unquote_auth_param(value: &str) -> String {
     out
 }
 
+/// Select the Bearer challenge from all `WWW-Authenticate` field values.
+/// A response may advertise several challenges (e.g. `Basic` and `Bearer` as
+/// separate field values, or joined in one value); only the Bearer one is
+/// usable for the anonymous token flow.
+pub fn select_bearer_challenge<'a, I: Iterator<Item = &'a str>>(
+    values: I,
+) -> Option<BearerChallenge> {
+    for value in values {
+        if let Some(challenge) = parse_bearer_challenge(value) {
+            return Some(challenge);
+        }
+        // Joined challenges: try each top-level comma segment on its own
+        // (quote-aware split keeps quoted commas inside their challenge).
+        for part in split_auth_params(value) {
+            if let Some(challenge) = parse_bearer_challenge(part.trim()) {
+                return Some(challenge);
+            }
+        }
+    }
+    None
+}
+
+/// Cross-host auth services, keyed by the registry host they serve: a
+/// challenge realm may live on the registry's own host or on that registry's
+/// known auth service — never an unrelated host.
+pub fn realm_host_allowed(registry_host: &str, realm_host: &str) -> bool {
+    realm_host == registry_host
+        || matches!(
+            (registry_host, realm_host),
+            ("registry-1.docker.io", "auth.docker.io") | ("registry.gitlab.com", "gitlab.com")
+        )
+}
+
+/// Repository path to use in registry requests: Docker Hub serves
+/// single-component official images under the `library/` namespace.
+pub fn manifest_repository(registry: &str, repository: &str) -> String {
+    if registry == "docker.io" && !repository.contains('/') {
+        format!("library/{repository}")
+    } else {
+        repository.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,5 +204,51 @@ mod tests {
         )
         .unwrap();
         assert_eq!(challenge.realm, "https://reg.example/token?q=\"x,y\"");
+    }
+
+    #[test]
+    fn selects_bearer_among_multiple_challenges() {
+        assert_eq!(
+            select_bearer_challenge(
+                [
+                    r#"Basic realm="reg""#,
+                    r#"Bearer realm="https://reg.example/token",service="reg.example""#
+                ]
+                .into_iter()
+            ),
+            parse_bearer_challenge(
+                r#"Bearer realm="https://reg.example/token",service="reg.example""#
+            )
+        );
+        // Joined in one field value.
+        let joined = select_bearer_challenge(
+            [r#"Basic realm="reg", Bearer realm="https://reg.example/token?aud=a,b""#].into_iter(),
+        )
+        .unwrap();
+        assert_eq!(joined.realm, "https://reg.example/token?aud=a,b");
+        assert_eq!(
+            select_bearer_challenge([r#"Basic realm="reg""#].into_iter()),
+            None
+        );
+    }
+
+    #[test]
+    fn realm_binding_maps_only_known_auth_services() {
+        assert!(realm_host_allowed("ghcr.io", "ghcr.io"));
+        assert!(realm_host_allowed("registry-1.docker.io", "auth.docker.io"));
+        assert!(realm_host_allowed("registry.gitlab.com", "gitlab.com"));
+        assert!(!realm_host_allowed("ghcr.io", "auth.docker.io"));
+        assert!(!realm_host_allowed("quay.io", "gitlab.com"));
+    }
+
+    #[test]
+    fn docker_hub_official_images_normalize_to_library() {
+        assert_eq!(manifest_repository("docker.io", "nginx"), "library/nginx");
+        assert_eq!(
+            manifest_repository("docker.io", "library/nginx"),
+            "library/nginx"
+        );
+        assert_eq!(manifest_repository("docker.io", "enclava/x"), "enclava/x");
+        assert_eq!(manifest_repository("ghcr.io", "org/app"), "org/app");
     }
 }
