@@ -55,7 +55,10 @@ pub async fn apply_namespace(
                 .as_ref()
                 .and_then(|annotations| annotations.get(NAMESPACE_CREATED_BY_ANNOTATION))
             {
-                Some(existing) => NamespaceProbe::AdoptedWithEvidence(existing.clone()),
+                // The evidence VALUE is no longer consumed here: the SSA
+                // path preserves whatever the live object carries directly
+                // from its own GET, so only the classification matters.
+                Some(_) => NamespaceProbe::AdoptedWithEvidence,
                 // A live namespace without the annotation predates this scheme
                 // or was never created by CAP: adopt without fabricating
                 // evidence.
@@ -105,12 +108,13 @@ pub async fn apply_namespace(
                     }
                     Err(ApplyError::Kube(kube::Error::Api(error))) if error.code == 409 => {
                         // Another creator won the race: adopt, never stamp.
+                        // apply_resource_opt strips any evidence the manifest
+                        // still carries and preserves only what the winner's
+                        // live object has, so no re-read is needed here.
                         tracing::info!(
                             namespace = %name,
                             "namespace create raced with another creator; adopting without creation evidence"
                         );
-                        let live = api.get(name).await.map_err(ApplyError::Kube)?;
-                        adopt_manifest(&mut manifest, &live);
                         let patched = match apply_resource_opt(
                             engine, &api, &manifest, generation, false, false, false,
                         )
@@ -130,27 +134,16 @@ pub async fn apply_namespace(
                     Err(error) => return Err(error),
                 }
             }
-            // Adopted namespace with earlier creation evidence: preserve it
-            // verbatim — an earlier CAP generation may legitimately have created
-            // the namespace, and that evidence must survive re-applies.
-            NamespaceProbe::AdoptedWithEvidence(existing) => {
-                manifest
-                    .metadata
-                    .annotations
-                    .get_or_insert_with(Default::default)
-                    .insert(
-                        NAMESPACE_CREATED_BY_ANNOTATION.to_string(),
-                        existing.clone(),
-                    );
-            }
-            // Adopted without evidence: never fabricate creation proof, and
-            // strip any caller-supplied stamp so a public caller cannot smuggle
-            // ownership evidence onto an adopted namespace.
-            NamespaceProbe::AdoptedWithoutEvidence => {
-                if let Some(annotations) = manifest.metadata.annotations.as_mut() {
-                    annotations.remove(NAMESPACE_CREATED_BY_ANNOTATION);
-                }
-            }
+            // Both adopted outcomes write through apply_resource_opt's
+            // existing-object path, which now strips caller-supplied
+            // creation evidence and re-adds ONLY what the live object (the
+            // one the SSA preconditions pin) carries. A pre-existing
+            // namespace's earlier evidence therefore survives verbatim
+            // without this code ever copying it — and a namespace REPLACED
+            // between the probe and the SSA GET can never inherit the
+            // predecessor's evidence, because the replacement does not
+            // carry it. The probe classification is used only for logging.
+            NamespaceProbe::AdoptedWithEvidence | NamespaceProbe::AdoptedWithoutEvidence => {}
         }
 
         let patched = match apply_resource_opt(
@@ -206,32 +199,6 @@ fn verify_creation_stamp(
     }
 }
 
-/// After a lost create race, normalize the manifest to the adoption rules:
-/// preserve the winner's creation evidence if any, otherwise strip the
-/// stamp this manifest was about to carry.
-fn adopt_manifest(manifest: &mut Namespace, live: &Namespace) {
-    let existing = live
-        .metadata
-        .annotations
-        .as_ref()
-        .and_then(|annotations| annotations.get(NAMESPACE_CREATED_BY_ANNOTATION))
-        .cloned();
-    match existing {
-        Some(evidence) => {
-            manifest
-                .metadata
-                .annotations
-                .get_or_insert_with(Default::default)
-                .insert(NAMESPACE_CREATED_BY_ANNOTATION.to_string(), evidence);
-        }
-        None => {
-            if let Some(annotations) = manifest.metadata.annotations.as_mut() {
-                annotations.remove(NAMESPACE_CREATED_BY_ANNOTATION);
-            }
-        }
-    }
-}
-
 /// Outcome of the pre-apply namespace probe in [`apply_namespace`].
 #[derive(Debug, Default)]
 enum NamespaceProbe {
@@ -239,7 +206,7 @@ enum NamespaceProbe {
     #[default]
     Absent,
     /// A live namespace carries a previous generation's creation evidence.
-    AdoptedWithEvidence(String),
+    AdoptedWithEvidence,
     /// A live namespace without creation evidence: adopted, never stamped.
     AdoptedWithoutEvidence,
 }

@@ -238,6 +238,7 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
         // replaced object of another generation is never hit.
         let mut deleted = false;
         let mut exhausted_conflicts = false;
+        let mut statefulset_uid: Option<String> = None;
         for attempt in 0..SWEEP_DELETE_RETRIES {
             let live = match bounded_sweep_read(api.get_opt(&target.name)).await {
                 Ok(live) => live,
@@ -274,15 +275,17 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
                 uid: live.metadata.uid.clone(),
                 resource_version: live.metadata.resource_version.clone(),
             };
-            match api
-                .delete(
-                    &target.name,
-                    &kube::api::DeleteParams {
-                        preconditions: Some(preconditions),
-                        ..kube::api::DeleteParams::default()
-                    },
-                )
-                .await
+            if target.kind == "StatefulSet" {
+                statefulset_uid = live.metadata.uid.clone();
+            }
+            match bounded_sweep_read(api.delete(
+                &target.name,
+                &kube::api::DeleteParams {
+                    preconditions: Some(preconditions),
+                    ..kube::api::DeleteParams::default()
+                },
+            ))
+            .await
             {
                 Ok(_) => {
                     deleted = true;
@@ -335,7 +338,14 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
             // too, or a later resized workload would silently reuse the
             // old-size volumes while the cleared manifest_hash had
             // disabled the storage-size guard.
-            failures += sweep_statefulset_pvcs(&client, &app.namespace, &target.name).await;
+            failures += sweep_statefulset_pvcs(
+                &client,
+                &app.namespace,
+                &target.name,
+                statefulset_uid.as_deref(),
+                sweep_deadline,
+            )
+            .await;
         }
     }
     failures
@@ -376,20 +386,28 @@ fn is_cap_created_generation_leftover(
 const SWEEP_DELETE_RETRIES: usize = 3;
 
 /// Delete the PVCs this failed generation's StatefulSet created in an
-/// adopted namespace. Only claims whose name matches the exact
-/// `<vct>-<statefulset>-<ordinal>` shape for a CAP-rendered VCT name are
-/// deleted, with UID/resourceVersion preconditions. PVCs created by the
-/// Kubernetes StatefulSet controller from `spec.volumeClaimTemplates`
-/// never carry CAP annotations (VCT metadata is immutable — adding the
+/// adopted namespace. A claim is deleted only when BOTH hold:
+///
+/// * its name matches the exact `<vct>-<statefulset>-<ordinal>` shape for
+///   a CAP-rendered VCT name, AND
+/// * its controller ownerReference points at the EXACT StatefulSet UID
+///   this sweep just deleted (StatefulSet-controller-created claims carry
+///   that ownerReference). A pre-existing claim the controller merely
+///   ADOPTED by name — including one from a foreign StatefulSet with the
+///   same name, or a claim that predates CAP — carries a different or
+///   absent owner UID and is never touched.
+///
+/// PVCs created by the controller from `spec.volumeClaimTemplates` never
+/// carry CAP annotations (VCT metadata is immutable — adding the
 /// annotation would break every redeploy of an existing StatefulSet with
-/// 422), so ownership is derived from the claim-name shape after the
+/// 422), so ownership is derived from the ownerReference after the
 /// StatefulSet itself was proven CAP-created and deleted by this sweep.
-/// A pre-existing unannotated claim — including one from a foreign
-/// StatefulSet with the same name — is never touched.
 pub(crate) async fn sweep_statefulset_pvcs(
     client: &kube::Client,
     namespace: &str,
     statefulset: &str,
+    statefulset_uid: Option<&str>,
+    sweep_deadline: tokio::time::Instant,
 ) -> usize {
     const CAP_VCT_NAMES: [&str; 2] = ["state", "tls-state"];
     let api: kube::Api<k8s_openapi::api::core::v1::PersistentVolumeClaim> =
@@ -414,19 +432,51 @@ pub(crate) async fn sweep_statefulset_pvcs(
         if !is_cap_claim_name(&name, statefulset, &CAP_VCT_NAMES) {
             continue;
         }
+        // The claim must be OWNED by the exact StatefulSet this sweep just
+        // deleted (controller-created claims carry the ownerReference).
+        // Without the UID pin the controller's name-based adoption of a
+        // pre-existing claim would make this sweep destroy foreign data.
+        let owned_by_deleted_statefulset = statefulset_uid.is_some_and(|expected| {
+            pvc.metadata
+                .owner_references
+                .as_ref()
+                .is_some_and(|owners| {
+                    owners.iter().any(|owner| {
+                        owner.kind == "StatefulSet"
+                            && owner.uid == expected
+                            && owner.controller == Some(true)
+                    })
+                })
+        });
+        if !owned_by_deleted_statefulset {
+            tracing::info!(
+                namespace = %namespace,
+                pvc = %name,
+                "adopted-namespace PVC sweep skips claim not owned by the deleted CAP StatefulSet"
+            );
+            continue;
+        }
         let preconditions = kube::api::Preconditions {
             uid: pvc.metadata.uid.clone(),
             resource_version: pvc.metadata.resource_version.clone(),
         };
-        if let Err(error) = api
-            .delete(
-                &name,
-                &kube::api::DeleteParams {
-                    preconditions: Some(preconditions),
-                    ..kube::api::DeleteParams::default()
-                },
-            )
-            .await
+        if tokio::time::Instant::now() >= sweep_deadline {
+            tracing::warn!(
+                namespace = %namespace,
+                pvc = %name,
+                "adopted-namespace PVC sweep hit the overall deadline; counting remaining claims as failures"
+            );
+            failures += 1;
+            continue;
+        }
+        if let Err(error) = bounded_sweep_read(api.delete(
+            &name,
+            &kube::api::DeleteParams {
+                preconditions: Some(preconditions),
+                ..kube::api::DeleteParams::default()
+            },
+        ))
+        .await
         {
             if matches!(&error, kube::Error::Api(error) if error.code == 404) {
                 // Already gone: successful cleanup, not a failure.
@@ -537,6 +587,11 @@ fn sweep_api_resource(kind: &str) -> kube::api::ApiResource {
 /// after the delete is accepted and is not nested inside a second budget.
 const NAMESPACE_CONVERGENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// Bounded retry budget for UID-conflicted namespace deletes. Each retry
+/// re-verifies the pinned UID against the live object, so the loop cannot
+/// delete a replacement and cannot spin unbounded.
+const NAMESPACE_DELETE_RETRIES: usize = 3;
+
 /// Outcome of the bounded namespace teardown.
 #[derive(Debug, PartialEq, Eq)]
 enum NamespaceTeardown {
@@ -548,10 +603,6 @@ enum NamespaceTeardown {
     /// retained CAP-created namespace fence, the retained-fence
     /// reconciler would never observe a 404 here).
     AdoptedIncomplete,
-    /// Nothing this generation owns: the live namespace carries another
-    /// generation's (or no) mutation annotation, or it could not even be
-    /// inspected. No delete was issued through this path.
-    NotOurs,
     /// A pre-existing namespace this apply adopted (mutation annotation
     /// matches but no creation evidence): never deleted. Only the routes
     /// this apply published are compensated.
@@ -641,35 +692,129 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
     // namespace does route removal make sense — `ensure_haproxy_routes` runs
     // strictly after `apply_namespace` inside the same provider phase, so a
     // generation that never owned the namespace never published routes.
-    let teardown = match mutation
-        .guard_provider(delete_failed_generation_namespace(
+    //
+    // The classification GET and the teardown run as separate guarded
+    // provider steps: a lease lost during the classification (or the
+    // adopted-namespace sweep) released nothing harmful — no namespace
+    // delete can have been issued — so the fence must NOT be retained (an
+    // adopted namespace never 404s, and the retained-fence reconciler only
+    // releases on an observed 404; retaining would wedge every later
+    // deployment of this app on permanent Busy). Only a lease lost while a
+    // CAP-created namespace delete may be in flight retains the fence.
+    let ownership = match mutation
+        .guard_provider(classify_failed_generation_namespace(
             app,
             namespace_generation,
         ))
         .await
     {
-        Ok(outcome) => outcome,
+        Ok(ownership) => ownership,
         Err(error) => {
-            // Lease heartbeat lost with the provider state uncertain: fail
-            // closed on the namespace fence.
             tracing::warn!(
                 app_id = %app.id,
                 namespace = %app.namespace,
                 error = %error,
-                "failed-apply namespace cleanup lost its mutation lease; retaining the namespace fence for reconciliation"
+                "failed-apply cleanup lost its mutation lease while classifying the namespace; releasing fences"
             );
-            return CleanupFenceOutcome::RetainNamespaceFence;
+            return CleanupFenceOutcome::ReleaseNormally;
         }
     };
-
-    if matches!(teardown, NamespaceTeardown::NotOurs) {
+    if matches!(ownership, InitialNamespaceOwnership::AbsentBeforeDelete) {
         tracing::info!(
             app_id = %app.id,
             namespace = %app.namespace,
-            "failed apply never owned the live namespace; skipping route removal"
+            "failed-apply cleanup found no live namespace before any delete; this generation never published it (or its routes)"
         );
         return CleanupFenceOutcome::ReleaseNormally;
     }
+    if matches!(ownership, InitialNamespaceOwnership::Foreign) {
+        tracing::info!(
+            app_id = %app.id,
+            namespace = %app.namespace,
+            expected_generation = namespace_generation.get(),
+            "failed-apply cleanup skips namespace: it does not carry this generation's mutation annotation"
+        );
+        return CleanupFenceOutcome::ReleaseNormally;
+    }
+    if matches!(ownership, InitialNamespaceOwnership::Uninspectable) {
+        tracing::warn!(
+            app_id = %app.id,
+            namespace = %app.namespace,
+            "failed-apply cleanup cannot inspect the namespace; skipping deletion"
+        );
+        return CleanupFenceOutcome::ReleaseNormally;
+    }
+    let teardown = match ownership {
+        InitialNamespaceOwnership::Owned { uid } => match mutation
+            .guard_provider(delete_owned_namespace(app, uid))
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                // Lease heartbeat lost with a namespace delete possibly in
+                // flight: fail closed on the namespace fence.
+                tracing::warn!(
+                    app_id = %app.id,
+                    namespace = %app.namespace,
+                    error = %error,
+                    "failed-apply namespace cleanup lost its mutation lease; retaining the namespace fence for reconciliation"
+                );
+                return CleanupFenceOutcome::RetainNamespaceFence;
+            }
+        },
+        InitialNamespaceOwnership::Adopted => {
+            // Pre-existing namespace this apply adopted: not CAP's to
+            // destroy. Delete only the objects this generation created
+            // (creation-evidence gated). A lease lost mid-sweep releases
+            // the fences — the retained-fence reconciler can never clear a
+            // retained marker for a namespace that will never 404.
+            tracing::info!(
+                app_id = %app.id,
+                namespace = %app.namespace,
+                "failed-apply cleanup sweeps published objects from adopted namespace (no creation evidence; namespace not deleted)"
+            );
+            match mutation
+                .guard_provider(sweep_published_objects_from_adopted_namespace(
+                    app,
+                    namespace_generation,
+                ))
+                .await
+            {
+                Ok(failures) if failures > 0 => {
+                    // Incomplete sweep. The namespace fence must NOT be
+                    // retained: the retained-fence reconciler releases only
+                    // on an observed namespace 404, which never happens for
+                    // an adopted namespace — retaining would reintroduce the
+                    // permanent-Busy bug this change fixes. Leftovers
+                    // converge deterministically instead: the next apply of
+                    // this app SSA-overwrites every swept name with a newer
+                    // generation, and app deletion tears down whatever
+                    // remains.
+                    tracing::warn!(
+                        app_id = %app.id,
+                        namespace = %app.namespace,
+                        failures,
+                        error_code = "adopted_namespace_sweep_incomplete",
+                        "adopted-namespace sweep left objects behind; the next apply or app deletion converges them"
+                    );
+                    NamespaceTeardown::AdoptedIncomplete
+                }
+                Ok(_) => NamespaceTeardown::Adopted,
+                Err(error) => {
+                    tracing::warn!(
+                        app_id = %app.id,
+                        namespace = %app.namespace,
+                        error = %error,
+                        error_code = "adopted_namespace_sweep_interrupted",
+                        "failed-apply cleanup lost its mutation lease during the adopted-namespace sweep; fences release and leftovers converge via the next apply or app deletion"
+                    );
+                    NamespaceTeardown::AdoptedIncomplete
+                }
+            }
+        }
+        // Handled above; the probe outcomes that skip teardown entirely.
+        _ => unreachable!("absent/foreign/uninspectable returned early"),
+    };
 
     // The namespace was this generation's, so its SNI routes are this
     // generation's publication. Remove them while still holding the
@@ -744,7 +889,6 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
             );
             CleanupFenceOutcome::RetainNamespaceFence
         }
-        NamespaceTeardown::NotOurs => unreachable!("handled above"),
     }
 }
 
@@ -853,14 +997,10 @@ enum InitialNamespaceOwnership {
     /// Live object carries this generation's annotation AND creation
     /// evidence (`enclava.dev/cap-namespace-created-by-generation`): CAP
     /// created it and this generation was the last writer — safe to delete.
-    /// Carries the exact UID/resourceVersion of the object that passed the
-    /// ownership check: the DELETE must target THAT object, never whatever
-    /// a fresh GET would return (a same-named replacement would sail
-    /// through the annotation checks as generation zero).
-    Owned {
-        uid: String,
-        resource_version: String,
-    },
+    /// Carries the exact UID of the object that passed the ownership
+    /// check: the DELETE is UID-preconditioned so it can only ever target
+    /// THAT object, never a same-named replacement.
+    Owned { uid: String },
     /// Live object carries this generation's mutation annotation but no
     /// creation evidence: a pre-existing namespace this apply adopted.
     /// Never delete it — only the resources this apply published (routes)
@@ -910,15 +1050,9 @@ fn classify_initial_namespace_get(
                 // object missing uid/resourceVersion cannot be pinned and
                 // is treated as undecidable (the API server always
                 // populates both on real reads).
-                match (
-                    namespace.metadata.uid.clone(),
-                    namespace.metadata.resource_version.clone(),
-                ) {
-                    (Some(uid), Some(resource_version)) => InitialNamespaceOwnership::Owned {
-                        uid,
-                        resource_version,
-                    },
-                    _ => InitialNamespaceOwnership::Uninspectable,
+                match namespace.metadata.uid.clone() {
+                    Some(uid) => InitialNamespaceOwnership::Owned { uid },
+                    None => InitialNamespaceOwnership::Uninspectable,
                 }
             } else {
                 InitialNamespaceOwnership::Foreign
@@ -931,28 +1065,15 @@ fn classify_initial_namespace_get(
     }
 }
 
-/// Delete the failed generation's namespace — which removes the image-pull
-/// secret, network policy, Gateway API resources, and StatefulSet with it —
-/// but only when the live namespace carries this exact generation's
-/// mutation-generation annotation. `delete_resource` alone would accept any
-/// live generation <= ours (a missing annotation counts as 0), which could
-/// destroy a namespace another generation created; the exact-annotation check
-/// closes that, and it doubles as the proof this generation itself ran
-/// `apply_namespace` (the deployment row's `manifest_hash` is written before
-/// any provider call and proves nothing).
-///
-/// A 404 before any delete is issued is [`NamespaceTeardown::NotOurs`]: the
-/// generation never published the namespace (a pre-publish failure), so it
-/// never published routes either, and the caller must not touch the shared
-/// HAProxy ConfigMap. Once a delete is issued under a proven-owning GET, the
-/// bounded convergence wait must observe 404; otherwise the outcome is
-/// `DeleteIncomplete` and the caller retains the pre-armed fence (fail
-/// closed, mirroring app delete) rather than converting it to the bounded
-/// reclaim quarantine while the namespace may still be Terminating.
-async fn delete_failed_generation_namespace(
+/// Classify the live namespace against this failed generation: the
+/// ownership probe that authorizes (or forbids) every later teardown step.
+/// Runs as its own guarded provider step so a lease lost during
+/// classification cannot retain the namespace fence (no delete could have
+/// been issued yet).
+async fn classify_failed_generation_namespace(
     app: &App,
     generation: enclava_engine::apply::generation::MutationGeneration,
-) -> NamespaceTeardown {
+) -> InitialNamespaceOwnership {
     let client = match kube::Client::try_default().await {
         Ok(client) => client,
         Err(error) => {
@@ -963,121 +1084,126 @@ async fn delete_failed_generation_namespace(
                 "failed-apply cleanup cannot reach Kubernetes; skipping namespace deletion"
             );
             // No delete was issued through this path.
-            return NamespaceTeardown::NotOurs;
+            return InitialNamespaceOwnership::Uninspectable;
         }
     };
     let api: kube::Api<k8s_openapi::api::core::v1::Namespace> = kube::Api::all(client);
+    classify_initial_namespace_get(&api.get(&app.namespace).await, generation)
+}
 
-    let (owned_uid, owned_resource_version) = match classify_initial_namespace_get(
-        &api.get(&app.namespace).await,
-        generation,
-    ) {
-        InitialNamespaceOwnership::Owned {
-            uid,
-            resource_version,
-        } => (uid, resource_version),
-        InitialNamespaceOwnership::AbsentBeforeDelete => {
-            tracing::info!(
-                app_id = %app.id,
-                namespace = %app.namespace,
-                "failed-apply cleanup found no live namespace before any delete; this generation never published it (or its routes)"
-            );
-            return NamespaceTeardown::NotOurs;
-        }
-        InitialNamespaceOwnership::Adopted => {
-            // Pre-existing namespace this apply adopted: not CAP's to
-            // destroy. Delete only the objects this generation published
-            // (generation-gated), then compensate routes; fences release
-            // normally because the namespace outlives the failed
-            // generation.
-            tracing::info!(
-                app_id = %app.id,
-                namespace = %app.namespace,
-                "failed-apply cleanup sweeps published objects from adopted namespace (no creation evidence; namespace not deleted)"
-            );
-            let failures = sweep_published_objects_from_adopted_namespace(app, generation).await;
-            if failures > 0 {
-                // Incomplete sweep. The namespace fence must NOT be
-                // retained: the retained-fence reconciler releases only on
-                // an observed namespace 404, which never happens for an
-                // adopted namespace — retaining would reintroduce the
-                // permanent-Busy bug this change fixes. Leftovers converge
-                // deterministically instead: the next apply of this app
-                // SSA-overwrites every swept name with a newer generation,
-                // and app deletion tears down whatever remains.
-                tracing::warn!(
-                    app_id = %app.id,
-                    namespace = %app.namespace,
-                    failures,
-                    error_code = "adopted_namespace_sweep_incomplete",
-                    "adopted-namespace sweep left objects behind; the next apply or app deletion converges them"
-                );
-                return NamespaceTeardown::AdoptedIncomplete;
-            }
-            return NamespaceTeardown::Adopted;
-        }
-        InitialNamespaceOwnership::Foreign => {
-            // The namespace was created or last written by another
-            // generation (or predates generation annotations): it is not
-            // this apply's partial state. Leave it alone.
-            tracing::info!(
-                app_id = %app.id,
-                namespace = %app.namespace,
-                expected_generation = generation.get(),
-                "failed-apply cleanup skips namespace: it does not carry this generation's mutation annotation"
-            );
-            return NamespaceTeardown::NotOurs;
-        }
-        InitialNamespaceOwnership::Uninspectable => {
-            tracing::warn!(
-                app_id = %app.id,
-                namespace = %app.namespace,
-                "failed-apply cleanup cannot inspect the namespace; skipping deletion"
-            );
-            // No delete issued through this path.
-            return NamespaceTeardown::NotOurs;
-        }
-    };
-
-    // The DELETE carries the UID/resourceVersion of the EXACT object that
-    // passed the ownership classification above — not whatever a fresh GET
-    // inside a generic delete helper would return. If an external actor
-    // deletes the CAP-owned namespace and recreates a foreign same-named
-    // one between our reads, the stale resourceVersion precondition fails
-    // with 409 instead of authorizing deletion of the replacement.
-    let deleted = match api
-        .delete(
-            &app.namespace,
-            &kube::api::DeleteParams {
-                preconditions: Some(kube::api::Preconditions {
-                    uid: Some(owned_uid),
-                    resource_version: Some(owned_resource_version),
-                }),
-                ..kube::api::DeleteParams::default()
-            },
-        )
-        .await
-    {
-        Ok(_) => true,
-        Err(kube::Error::Api(error)) if error.code == 404 => {
-            // Vanished between the owning GET and the delete: complete.
-            false
-        }
+/// Delete the namespace that ALREADY passed the ownership classification,
+/// carrying the exact UID/resourceVersion of that owning GET into the
+/// DELETE preconditions — a foreign same-named replacement (created after
+/// the CAP-owned namespace was externally deleted) fails the stale
+/// resourceVersion precondition with 409 instead of being deleted.
+/// Once the delete is accepted, a bounded convergence wait must observe
+/// 404; otherwise the outcome is `DeleteIncomplete` and the caller retains
+/// the pre-armed fence (fail closed, mirroring app delete) rather than
+/// converting it to the bounded reclaim quarantine while the namespace may
+/// still be Terminating.
+async fn delete_owned_namespace(app: &App, owned_uid: String) -> NamespaceTeardown {
+    let client = match kube::Client::try_default().await {
+        Ok(client) => client,
         Err(error) => {
             tracing::warn!(
                 app_id = %app.id,
                 namespace = %app.namespace,
                 error = %error,
-                "failed-apply namespace deletion failed; retaining the namespace fence for reconciliation"
+                "failed-apply cleanup cannot reach Kubernetes; skipping namespace deletion"
             );
-            // The delete request may have reached the API server
-            // before the error surfaced: treat as incomplete.
+            // No delete was issued through this path, but ownership WAS
+            // proven: treat as incomplete so the fence is retained and a
+            // later reconciliation retries.
             return NamespaceTeardown::DeleteIncomplete;
         }
     };
+    let api: kube::Api<k8s_openapi::api::core::v1::Namespace> = kube::Api::all(client);
+
+    // UID-only precondition: pinning the resourceVersion as well would 409
+    // on every same-UID status bump (finalizers, controllers), and a 409
+    // here cannot be retried by the retained-fence reconciler — permanent
+    // Busy. The UID alone blocks the replacement-namespace race the
+    // ownership check guards against; a 409 against a UID-only
+    // precondition means the pinned object itself changed identity.
+    let mut deleted = false;
+    for _attempt in 0..NAMESPACE_DELETE_RETRIES {
+        match api
+            .delete(
+                &app.namespace,
+                &kube::api::DeleteParams {
+                    preconditions: Some(kube::api::Preconditions {
+                        uid: Some(owned_uid.clone()),
+                        ..kube::api::Preconditions::default()
+                    }),
+                    ..kube::api::DeleteParams::default()
+                },
+            )
+            .await
+        {
+            Ok(_) => {
+                deleted = true;
+                break;
+            }
+            Err(kube::Error::Api(error)) if error.code == 404 => {
+                // Vanished between the owning GET and the delete: complete.
+                return NamespaceTeardown::ConfirmedAbsent;
+            }
+            Err(kube::Error::Api(error)) if error.code == 409 => {
+                // The UID-pinned object changed under us. Re-read: 404 or a
+                // DIFFERENT uid proves the owned namespace is gone (a
+                // foreign replacement must never be deleted) — complete.
+                // The same uid still live is a transient conflict: retry.
+                match api.get(&app.namespace).await {
+                    Err(kube::Error::Api(error)) if error.code == 404 => {
+                        return NamespaceTeardown::ConfirmedAbsent;
+                    }
+                    Ok(live) if live.metadata.uid.as_deref() != Some(owned_uid.as_str()) => {
+                        tracing::info!(
+                            app_id = %app.id,
+                            namespace = %app.namespace,
+                            "failed-apply cleanup: the owned namespace was replaced by a foreign object; leaving the replacement alone"
+                        );
+                        return NamespaceTeardown::ConfirmedAbsent;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            app_id = %app.id,
+                            namespace = %app.namespace,
+                            error = %error,
+                            "failed-apply namespace delete conflict could not be re-inspected; retaining the namespace fence for reconciliation"
+                        );
+                        return NamespaceTeardown::DeleteIncomplete;
+                    }
+                }
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    app_id = %app.id,
+                    namespace = %app.namespace,
+                    error = %error,
+                    "failed-apply namespace deletion failed; retaining the namespace fence for reconciliation"
+                );
+                // The delete request may have reached the API server
+                // before the error surfaced: treat as incomplete.
+                return NamespaceTeardown::DeleteIncomplete;
+            }
+        }
+    }
     if !deleted {
-        // Vanished between get and delete: complete.
-        return NamespaceTeardown::ConfirmedAbsent;
+        // The loop only leaves `deleted == false` via its 404 and
+        // replaced-UID arms (both prove the owned namespace is gone) or by
+        // exhausting the retry budget against a same-UID conflict. The
+        // 404/replaced arms return directly inside the loop; reaching here
+        // with `deleted == false` therefore means the budget burned on
+        // conflicts while the owned object stayed live: fail closed.
+        tracing::warn!(
+            app_id = %app.id,
+            namespace = %app.namespace,
+            "failed-apply namespace delete exhausted its UID-conflict retries; retaining the namespace fence for reconciliation"
+        );
+        return NamespaceTeardown::DeleteIncomplete;
     }
     // The delete was accepted. Bound the convergence wait; if it
     // elapses without a 404 the caller must retain the fence. Each

@@ -132,6 +132,53 @@ where
         );
 }
 
+/// Confirm a created object actually carries this generation's creation
+/// evidence (the API server or a mutating admission policy could have
+/// dropped or rewritten the annotation). Fail closed: an object missing
+/// its evidence can never be classified as CAP-created by compensating
+/// cleanup.
+fn verify_creation_evidence<K>(
+    created: &K,
+    generation: MutationGeneration,
+) -> Result<(), ApplyError>
+where
+    K: Resource,
+{
+    let stamped = created
+        .meta()
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(RESOURCE_CREATED_BY_ANNOTATION))
+        .and_then(|raw| raw.parse::<i64>().ok());
+    if stamped == Some(generation.get()) {
+        Ok(())
+    } else {
+        Err(ApplyError::ProviderGenerationNotApplied {
+            kind: kind::<K>(),
+            name: created
+                .meta()
+                .name
+                .clone()
+                .unwrap_or_else(|| "<unnamed>".to_string()),
+            expected: generation.get(),
+            actual: stamped.unwrap_or(0),
+        })
+    }
+}
+
+/// Remove any creation-evidence annotations from a desired write. Evidence
+/// is re-added only from the live object in `preserve_creation_evidence`;
+/// callers cannot smuggle it in.
+fn strip_creation_evidence<K>(resource: &mut K)
+where
+    K: Resource,
+{
+    if let Some(annotations) = resource.meta_mut().annotations.as_mut() {
+        annotations.remove(RESOURCE_CREATED_BY_ANNOTATION);
+        annotations.remove(NAMESPACE_CREATED_BY_ANNOTATION);
+    }
+}
+
 /// Stamp creation evidence on a resource this apply is creating via POST.
 fn annotate_created<K>(resource: &mut K, generation: MutationGeneration)
 where
@@ -151,24 +198,35 @@ where
 /// write. Re-applying an object CAP created must not silently drop the
 /// evidence: an apply omitting a map key it owns can prune it, which would
 /// make a CAP-created object look adopted forever after. Evidence is only
-/// ever copied from the live object — never fabricated for an object whose
-/// creation was not observed by this code path.
+/// ever copied from the object the write is preconditioned on — the same
+/// GET whose resourceVersion gates the patch — so a same-named replacement
+/// can never inherit the predecessor's evidence, and evidence is never
+/// fabricated for an object whose creation was not observed by this code
+/// path. Both evidence keys are covered: the generic
+/// RESOURCE_CREATED_BY stamp and the namespace-specific
+/// NAMESPACE_CREATED_BY stamp (namespaces apply through this same path).
 fn preserve_creation_evidence<K>(desired: &mut K, current: &K)
 where
     K: Resource,
 {
-    if let Some(evidence) = current
-        .meta()
-        .annotations
-        .as_ref()
-        .and_then(|annotations| annotations.get(RESOURCE_CREATED_BY_ANNOTATION))
-        .cloned()
-    {
-        desired
-            .meta_mut()
+    const EVIDENCE_KEYS: [&str; 2] = [
+        RESOURCE_CREATED_BY_ANNOTATION,
+        NAMESPACE_CREATED_BY_ANNOTATION,
+    ];
+    for key in EVIDENCE_KEYS {
+        if let Some(evidence) = current
+            .meta()
             .annotations
-            .get_or_insert_with(Default::default)
-            .insert(RESOURCE_CREATED_BY_ANNOTATION.to_string(), evidence);
+            .as_ref()
+            .and_then(|annotations| annotations.get(key))
+            .cloned()
+        {
+            desired
+                .meta_mut()
+                .annotations
+                .get_or_insert_with(Default::default)
+                .insert(key.to_string(), evidence);
+        }
     }
 }
 
@@ -375,9 +433,13 @@ where
             let mut desired = resource.clone();
             desired.meta_mut().resource_version = Some(resource_version.clone());
             annotate(&mut desired, generation);
-            // Never drop creation evidence on re-apply: a CAP-created object
-            // must stay classifiable as such, or later failed-apply cleanup
-            // would treat it as adopted and leave it behind forever.
+            // Never drop creation evidence on re-apply, and never carry
+            // caller-supplied evidence onto an object that does not already
+            // have it: a CAP-created object must stay classifiable as such,
+            // and a pre-existing (possibly replaced) object must never gain
+            // fabricated evidence. Only evidence read from THIS live object
+            // — the one the write is preconditioned on — survives.
+            strip_creation_evidence(&mut desired);
             preserve_creation_evidence(&mut desired, &current);
             let applied = if exact_when_trusted && trusted {
                 super::bounded_kube_write(api.replace(name, &post_params, &desired)).await
@@ -467,6 +529,10 @@ where
             match super::bounded_kube_write(api.create(&post_params, &desired)).await {
                 Ok(applied) => {
                     verify_applied_generation(&applied, generation)?;
+                    // An admission rewrite that drops the creation evidence
+                    // would leave the created object forever unsweepable in
+                    // an adopted namespace: fail closed instead.
+                    verify_creation_evidence(&applied, generation)?;
                     return Ok(applied);
                 }
                 Err(ApplyError::Kube(kube::Error::Api(error))) if error.code == 409 => {
@@ -666,6 +732,83 @@ mod tests {
     const COLLECTION_PATH: &str = "/api/v1/namespaces/fence-test/configmaps";
     const STATEFULSET_PATH: &str = "/apis/apps/v1/namespaces/fence-test/statefulsets/fenced";
 
+    #[test]
+    fn creation_evidence_is_stripped_then_rederived_from_live_only() {
+        // A caller smuggles creation evidence onto a desired write for an
+        // existing object: the existing-object path must strip it and re-add
+        // ONLY what the live object carries, so a replaced same-named object
+        // can never inherit the predecessor's evidence (Codex P1 round 6).
+        use k8s_openapi::api::core::v1::ConfigMap;
+
+        let mut desired: ConfigMap = serde_json::from_value(json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "fenced",
+                "annotations": {
+                    RESOURCE_CREATED_BY_ANNOTATION: "9",
+                    NAMESPACE_CREATED_BY_ANNOTATION: "9",
+                },
+            },
+            "data": {"value": "x"},
+        }))
+        .unwrap();
+        let live_with_evidence: ConfigMap = serde_json::from_value(json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "fenced",
+                "annotations": { RESOURCE_CREATED_BY_ANNOTATION: "3" },
+            },
+        }))
+        .unwrap();
+        let live_without_evidence: ConfigMap = serde_json::from_value(json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {"name": "fenced"},
+        }))
+        .unwrap();
+
+        strip_creation_evidence(&mut desired);
+        assert!(
+            desired
+                .meta()
+                .annotations
+                .as_ref()
+                .is_none_or(|a| !a.contains_key(RESOURCE_CREATED_BY_ANNOTATION)),
+            "smuggled evidence must be stripped"
+        );
+        preserve_creation_evidence(&mut desired, &live_with_evidence);
+        assert_eq!(
+            desired
+                .meta()
+                .annotations
+                .as_ref()
+                .and_then(|a| a.get(RESOURCE_CREATED_BY_ANNOTATION)),
+            Some(&"3".to_string()),
+            "evidence is re-derived from the live object only, verbatim"
+        );
+
+        let mut desired2: ConfigMap = serde_json::from_value(json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "fenced",
+                "annotations": { RESOURCE_CREATED_BY_ANNOTATION: "9" },
+            },
+        }))
+        .unwrap();
+        strip_creation_evidence(&mut desired2);
+        preserve_creation_evidence(&mut desired2, &live_without_evidence);
+        assert!(
+            desired2
+                .meta()
+                .annotations
+                .as_ref()
+                .is_none_or(|a| !a.contains_key(RESOURCE_CREATED_BY_ANNOTATION)),
+            "a live object without evidence must never gain it"
+        );
+    }
     #[test]
     fn conflict_retry_backoff_is_bounded() {
         assert_eq!(conflict_retry_delay(0), Duration::from_millis(25));
