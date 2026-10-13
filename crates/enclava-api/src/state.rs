@@ -191,6 +191,13 @@ pub struct AppState {
     pub tee_domain_suffix: String,
     /// HTTP client for outbound requests.
     pub http_client: reqwest::Client,
+    /// Cap (bytes) applied to outbound HTTP response bodies read into
+    /// memory via `crate::clients::read_body_capped` (from
+    /// `ClientConfig::body_limit_bytes`). Reads on `http_client` that use
+    /// `.text()`/`.json()`/`.bytes()` directly are NOT capped — new call
+    /// sites must read through `read_body_capped` (or a client wrapper
+    /// carrying `body_limit`, like `RegistryClient`).
+    pub outbound_body_limit: u64,
     /// Outbound client for registry tag resolution, with registry allowlist.
     pub registry_client: RegistryClient,
     /// HTTP client for fixed internal Trustee/KBS calls.
