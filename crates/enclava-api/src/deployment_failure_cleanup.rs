@@ -202,6 +202,7 @@ where
 pub(crate) async fn sweep_published_objects_from_adopted_namespace(
     app: &App,
     generation: enclava_engine::apply::generation::MutationGeneration,
+    apply_started_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> usize {
     let client = match kube::Client::try_default().await {
         Ok(client) => client,
@@ -256,6 +257,22 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
                 }
             };
             let Some(live) = live else {
+                // Absent. For the StatefulSet this may be a RETRY after a
+                // previous sweep deleted it but could not finish its PVC
+                // sweep: run the claim sweep now under the retry-time
+                // ownership rules (dangling controller ownerRef naming the
+                // StatefulSet + claim created after this apply started).
+                if target.kind == "StatefulSet" {
+                    failures += sweep_statefulset_pvcs(
+                        &client,
+                        &app.namespace,
+                        &target.name,
+                        None,
+                        sweep_deadline,
+                        apply_started_at,
+                    )
+                    .await;
+                }
                 break; // never created, or already deleted
             };
             if !is_cap_created_generation_leftover(&live.metadata, generation.get()) {
@@ -288,8 +305,41 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
             .await
             {
                 Ok(_) => {
-                    deleted = true;
-                    break;
+                    // Accepted DELETE is not absence: a finalizer can hold
+                    // the object in Terminating indefinitely. Re-read and
+                    // confirm 404 before counting the target complete.
+                    match bounded_sweep_read(api.get_opt(&target.name)).await {
+                        Ok(None) => {
+                            deleted = true;
+                            break;
+                        }
+                        Ok(Some(_)) => {
+                            // Terminating or finalizer-stuck: the sweep
+                            // must not report completion while the object
+                            // may survive.
+                            tracing::warn!(
+                                app_id = %app.id,
+                                namespace = %app.namespace,
+                                kind = target.kind,
+                                name = %target.name,
+                                "adopted-namespace sweep delete accepted but object still live (finalizer?); counting as incomplete"
+                            );
+                            failures += 1;
+                            break;
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                app_id = %app.id,
+                                namespace = %app.namespace,
+                                kind = target.kind,
+                                name = %target.name,
+                                error = %error,
+                                "adopted-namespace sweep cannot confirm absence after delete; counting as incomplete"
+                            );
+                            failures += 1;
+                            break;
+                        }
+                    }
                 }
                 Err(kube::Error::Api(error)) if error.code == 404 => {
                     // Raced deletion: the object vanished between our GET
@@ -344,6 +394,7 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
                 &target.name,
                 statefulset_uid.as_deref(),
                 sweep_deadline,
+                apply_started_at,
             )
             .await;
         }
@@ -408,6 +459,7 @@ pub(crate) async fn sweep_statefulset_pvcs(
     statefulset: &str,
     statefulset_uid: Option<&str>,
     sweep_deadline: tokio::time::Instant,
+    apply_started_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> usize {
     const CAP_VCT_NAMES: [&str; 2] = ["state", "tls-state"];
     let api: kube::Api<k8s_openapi::api::core::v1::PersistentVolumeClaim> =
@@ -436,8 +488,11 @@ pub(crate) async fn sweep_statefulset_pvcs(
         // deleted (controller-created claims carry the ownerReference).
         // Without the UID pin the controller's name-based adoption of a
         // pre-existing claim would make this sweep destroy foreign data.
-        let owned_by_deleted_statefulset = statefulset_uid.is_some_and(|expected| {
-            pvc.metadata
+        let owned_by_deleted_statefulset = match statefulset_uid {
+            // First sweep, StatefulSet just deleted by this sweep: the
+            // controller ownerReference must pin its EXACT UID.
+            Some(expected) => pvc
+                .metadata
                 .owner_references
                 .as_ref()
                 .is_some_and(|owners| {
@@ -446,8 +501,37 @@ pub(crate) async fn sweep_statefulset_pvcs(
                             && owner.uid == expected
                             && owner.controller == Some(true)
                     })
-                })
-        });
+                }),
+            // Retry sweep, StatefulSet already gone: a dangling controller
+            // ownerReference naming it proves some StatefulSet of that
+            // name created the claim; combined with the claim being
+            // created after this apply started (a CAP-created StatefulSet
+            // implies no foreign same-named one existed — the apply would
+            // have SSA-patched it instead of creating), the claim is
+            // provably this workload's.
+            None => {
+                let named_owner = pvc
+                    .metadata
+                    .owner_references
+                    .as_ref()
+                    .is_some_and(|owners| {
+                        owners.iter().any(|owner| {
+                            owner.kind == "StatefulSet"
+                                && owner.name == statefulset
+                                && owner.controller == Some(true)
+                        })
+                    });
+                let created_after_apply_start = apply_started_at.is_some_and(|threshold| {
+                    pvc.metadata.creation_timestamp.is_some_and(|created| {
+                        // Both sides render as RFC 3339 with the same
+                        // nanosecond precision, so lexicographic ordering
+                        // of the strings matches chronological ordering.
+                        created.0.to_string().as_str() > threshold.to_rfc3339().as_str()
+                    })
+                });
+                named_owner && created_after_apply_start
+            }
+        };
         if !owned_by_deleted_statefulset {
             tracing::info!(
                 namespace = %namespace,
@@ -469,7 +553,7 @@ pub(crate) async fn sweep_statefulset_pvcs(
             failures += 1;
             continue;
         }
-        if let Err(error) = bounded_sweep_read(api.delete(
+        match bounded_sweep_read(api.delete(
             &name,
             &kube::api::DeleteParams {
                 preconditions: Some(preconditions),
@@ -478,17 +562,44 @@ pub(crate) async fn sweep_statefulset_pvcs(
         ))
         .await
         {
-            if matches!(&error, kube::Error::Api(error) if error.code == 404) {
+            Err(kube::Error::Api(error)) if error.code == 404 => {
                 // Already gone: successful cleanup, not a failure.
                 continue;
             }
-            tracing::warn!(
-                namespace = %namespace,
-                pvc = %name,
-                error = %error,
-                "adopted-namespace sweep could not delete this generation's PVC; will retry via reconciliation"
-            );
-            failures += 1;
+            Err(error) => {
+                tracing::warn!(
+                    namespace = %namespace,
+                    pvc = %name,
+                    error = %error,
+                    "adopted-namespace sweep could not delete this generation's PVC; will retry via reconciliation"
+                );
+                failures += 1;
+            }
+            Ok(_) => {
+                // Accepted is not absent (Longhorn finalizers can hold a
+                // claim in Terminating): confirm 404, else the sweep is
+                // incomplete and retains provider-state evidence.
+                match bounded_sweep_read(api.get_opt(&name)).await {
+                    Ok(None) => {}
+                    Ok(Some(_)) => {
+                        tracing::warn!(
+                            namespace = %namespace,
+                            pvc = %name,
+                            "adopted-namespace sweep PVC delete accepted but claim still live (finalizer?); counting as incomplete"
+                        );
+                        failures += 1;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            namespace = %namespace,
+                            pvc = %name,
+                            error = %error,
+                            "adopted-namespace sweep cannot confirm PVC absence; counting as incomplete"
+                        );
+                        failures += 1;
+                    }
+                }
+            }
         }
     }
     failures
@@ -725,6 +836,32 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
             namespace = %app.namespace,
             "failed-apply cleanup found no live namespace before any delete; this generation never published it (or its routes)"
         );
+        // A confirmed 404 proves this generation published nothing: every
+        // object the apply creates is namespaced and died with the
+        // namespace. Clearing the row's provider-state evidence unblocks
+        // LATER failed generations whose own cleanup the stale
+        // manifest_hash (written before any provider call) would
+        // otherwise block forever. An UNINSPECTABLE namespace keeps the
+        // evidence (fail closed).
+        if let Err(error) = sqlx::query(
+            "UPDATE deployments
+             SET manifest_hash = NULL, observing_since = NULL
+             WHERE id = $1 AND app_id = $2 AND status = 'failed'",
+        )
+        .bind(failed_deployment_id)
+        .bind(app.id)
+        .execute(&state.db)
+        .await
+        {
+            // Best-effort bookkeeping: failing to clear only keeps the
+            // previous (more conservative) behavior.
+            tracing::warn!(
+                app_id = %app.id,
+                deployment_id = %failed_deployment_id,
+                error = %error,
+                "failed-apply cleanup could not clear pre-publication row's provider-state evidence"
+            );
+        }
         return CleanupFenceOutcome::ReleaseNormally;
     }
     if matches!(ownership, InitialNamespaceOwnership::Foreign) {
@@ -773,10 +910,22 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
                 namespace = %app.namespace,
                 "failed-apply cleanup sweeps published objects from adopted namespace (no creation evidence; namespace not deleted)"
             );
+            // The failed row's creation time bounds when this apply (and
+            // therefore its CAP-created StatefulSet) could have started
+            // creating claims — the retry-time PVC ownership rule.
+            let apply_started_at = sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
+                "SELECT created_at FROM deployments WHERE id = $1 AND app_id = $2",
+            )
+            .bind(failed_deployment_id)
+            .bind(app.id)
+            .fetch_one(&state.db)
+            .await
+            .ok();
             match mutation
                 .guard_provider(sweep_published_objects_from_adopted_namespace(
                     app,
                     namespace_generation,
+                    apply_started_at,
                 ))
                 .await
             {
