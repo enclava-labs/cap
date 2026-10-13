@@ -740,6 +740,18 @@ fn deploy_waits_fail_fast_on_terminal_deployment_failure() {
         );
     }
 
+    // The sibling deployment-history lookups (apply-start and health waits)
+    // use the same bounded fetch as the failure check: a stalled
+    // /deployments response must never eat any wait's budget (cap#220 review).
+    let dense_source: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    assert_eq!(
+        dense_source
+            .matches("find_deployment_entry(api,app_name,deployment_id,start+max_wait)")
+            .count(),
+        2,
+        "wait_for_deployment_apply_start and wait_for_deployment_completion must bound their history lookups by the wait's remaining budget (cap#220 review)"
+    );
+
     // The standalone ownership wait must not swallow non-retryable
     // unlock-endpoint errors until the 900s budget: it fetches the endpoint
     // lazily inside the loop and routes fetch failures through the same

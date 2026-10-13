@@ -2507,6 +2507,7 @@ async fn wait_for_paas_managed_config_keys(
         // Bounded by the wait's remaining budget (cap#220 review); the loop
         // deadline above already guarantees the budget is positive here.
         fail_if_template_deployment_failed(api, instance_name, deployment_id, read_deadline).await?;
+
         // TLS provisioning starts around the claim, so a terminal bootstrap
         // diagnostic must stop this post-claim wait promptly. The probe is
         // bound to the expected deployment via CAP before and after the

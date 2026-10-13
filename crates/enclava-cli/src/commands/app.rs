@@ -1418,6 +1418,33 @@ fn deployment_history_lookup_budget(wait_deadline: Instant) -> Duration {
     DEPLOYMENT_HISTORY_LOOKUP_BUDGET.min(wait_deadline.saturating_duration_since(Instant::now()))
 }
 
+/// Bounded deployment-history fetch shared by the wait loops (cap#220
+/// review). `Ok(None)` means no usable answer within the budget -- a passed
+/// deadline skips the request entirely, and a stalled response is cut at
+/// the budget -- so callers keep waiting and the enclosing wait's own
+/// deadline governs.
+async fn bounded_deployment_history(
+    api: &ApiClient,
+    app_name: &str,
+    wait_deadline: Instant,
+) -> Result<Option<Vec<DeploymentEntry>>, ApiError> {
+    let budget = deployment_history_lookup_budget(wait_deadline);
+    if budget.is_zero() {
+        // The wait's deadline has already passed: an observation arriving
+        // now could only land after the budget is gone, so skip the request
+        // entirely and let the wait's own deadline report the timeout.
+        return Ok(None);
+    }
+    // Bounded lookup (cap#220 review): a history response that cannot
+    // arrive within the budget is indistinguishable from "no observation"
+    // -- keep waiting and let the wait's deadline decide, instead of
+    // burning the whole wait on a stalled response.
+    match tokio::time::timeout(budget, api.list_deployments(app_name)).await {
+        Ok(result) => result.map(Some),
+        Err(_) => Ok(None),
+    }
+}
+
 /// Fail fast when CAP has already terminalized the deployment we are waiting
 /// on (#18): a manifest-apply rejection (e.g. the KBS signed-policy byte
 /// budget) otherwise surfaces only as an opaque wait timeout ~10 minutes
@@ -1448,21 +1475,8 @@ async fn template_deployment_failure(
     deployment_id: &str,
     wait_deadline: Instant,
 ) -> Result<Option<String>, ApiError> {
-    let budget = deployment_history_lookup_budget(wait_deadline);
-    if budget.is_zero() {
-        // The wait's deadline has already passed: an observation arriving
-        // now could only land after the budget is gone, so skip the request
-        // entirely and let the wait's own deadline report the timeout.
+    let Some(deployments) = bounded_deployment_history(api, app_name, wait_deadline).await? else {
         return Ok(None);
-    }
-    // Bounded lookup (cap#220 review): a history response that cannot
-    // arrive within the budget is indistinguishable from "no failure
-    // observed" -- keep waiting and let the wait's deadline decide, instead
-    // of burning the whole wait on a stalled response.
-    let lookup = tokio::time::timeout(budget, api.list_deployments(app_name)).await;
-    let deployments = match lookup {
-        Ok(result) => result?,
-        Err(_) => return Ok(None),
     };
     let deployment = deployments
         .into_iter()
@@ -1506,12 +1520,15 @@ async fn find_deployment_entry(
     api: &ApiClient,
     app_name: &str,
     deployment_id: &str,
+    wait_deadline: Instant,
 ) -> Result<Option<DeploymentEntry>, ApiError> {
-    Ok(api
-        .list_deployments(app_name)
+    Ok(bounded_deployment_history(api, app_name, wait_deadline)
         .await?
-        .into_iter()
-        .find(|deployment| deployment.id == deployment_id))
+        .and_then(|deployments| {
+            deployments
+                .into_iter()
+                .find(|deployment| deployment.id == deployment_id)
+        }))
 }
 
 async fn wait_for_deployment_apply_start(
@@ -1533,7 +1550,7 @@ async fn wait_for_deployment_apply_start(
             .into());
         }
 
-        match find_deployment_entry(api, app_name, deployment_id).await {
+        match find_deployment_entry(api, app_name, deployment_id, start + max_wait).await {
             Ok(Some(deployment)) => match deployment.status.as_str() {
                 "pending" => pb.set_message(timed_progress(
                     "Applying deployment: pending",
@@ -1602,7 +1619,7 @@ async fn wait_for_deployment_completion(
             return Err(terminal_bootstrap_failure_message(app_name, &diagnostic).into());
         }
 
-        match find_deployment_entry(api, app_name, deployment_id).await {
+        match find_deployment_entry(api, app_name, deployment_id, start + max_wait).await {
             Ok(Some(deployment)) => match deployment.status.as_str() {
                 "healthy" => return Ok(()),
                 "failed" => {
