@@ -1402,20 +1402,31 @@ fn observation_allows_direct_tee_fallback(
     })
 }
 
-/// Hard cap on one deployment-history lookup inside a wait loop (the
-/// terminal-failure check). The shared HTTP client's per-request timeout is
-/// generous (it also covers slow deploy/setup calls), so without this cap a
-/// stalled `/apps/{app}/deployments` response can hold the failure check for
-/// up to that timeout and consume the enclosing wait's entire budget -- a
-/// healthy deployment then reports a wait timeout instead of readiness
-/// (cap#220 review).
+/// Hard cap on one deployment-history lookup from the *advisory*
+/// terminal-failure check inside a wait loop. The shared HTTP client's
+/// per-request timeout is generous (it also covers slow deploy/setup calls),
+/// so without this cap a stalled `/apps/{app}/deployments` response can hold
+/// the failure check for up to that timeout and consume the enclosing wait's
+/// entire budget -- a healthy deployment then reports a wait timeout instead
+/// of readiness (cap#220 review). State lookups (`find_deployment_entry`)
+/// deliberately do NOT use this cap: cutting them would discard valid slow
+/// responses and hide deploy state (cap#220 review follow-up).
 const DEPLOYMENT_HISTORY_LOOKUP_BUDGET: Duration = Duration::from_secs(15);
 
-/// Budget for one deployment-history lookup: the hard cap, never more than
-/// the enclosing wait's remaining time -- and nothing at all once the wait's
-/// deadline has passed, so no lookup starts after the budget is gone.
+/// Budget for one advisory failure-check lookup: the hard cap, never more
+/// than the enclosing wait's remaining time -- and nothing at all once the
+/// wait's deadline has passed, so no lookup starts after the budget is gone.
 fn deployment_history_lookup_budget(wait_deadline: Instant) -> Duration {
     DEPLOYMENT_HISTORY_LOOKUP_BUDGET.min(wait_deadline.saturating_duration_since(Instant::now()))
+}
+
+/// Budget for one deployment-state lookup (apply-start, health waits): the
+/// full remaining wait budget. These lookups are how the CLI observes deploy
+/// state at all, so a response slower than the advisory cap must still be
+/// allowed to arrive (cap#220 review follow-up) -- the bound by the wait's
+/// remaining time still guarantees no lookup outlives its wait.
+fn remaining_wait_budget(wait_deadline: Instant) -> Duration {
+    wait_deadline.saturating_duration_since(Instant::now())
 }
 
 /// Bounded deployment-history fetch shared by the wait loops (cap#220
@@ -1426,9 +1437,8 @@ fn deployment_history_lookup_budget(wait_deadline: Instant) -> Duration {
 async fn bounded_deployment_history(
     api: &ApiClient,
     app_name: &str,
-    wait_deadline: Instant,
+    budget: Duration,
 ) -> Result<Option<Vec<DeploymentEntry>>, ApiError> {
-    let budget = deployment_history_lookup_budget(wait_deadline);
     if budget.is_zero() {
         // The wait's deadline has already passed: an observation arriving
         // now could only land after the budget is gone, so skip the request
@@ -1475,7 +1485,15 @@ async fn template_deployment_failure(
     deployment_id: &str,
     wait_deadline: Instant,
 ) -> Result<Option<String>, ApiError> {
-    let Some(deployments) = bounded_deployment_history(api, app_name, wait_deadline).await? else {
+    // Advisory check: the small cap keeps a stalled history endpoint from
+    // blocking the readiness polls that follow it in the wait loops.
+    let Some(deployments) = bounded_deployment_history(
+        api,
+        app_name,
+        deployment_history_lookup_budget(wait_deadline),
+    )
+    .await?
+    else {
         return Ok(None);
     };
     let deployment = deployments
@@ -1522,13 +1540,15 @@ async fn find_deployment_entry(
     deployment_id: &str,
     wait_deadline: Instant,
 ) -> Result<Option<DeploymentEntry>, ApiError> {
-    Ok(bounded_deployment_history(api, app_name, wait_deadline)
-        .await?
-        .and_then(|deployments| {
-            deployments
-                .into_iter()
-                .find(|deployment| deployment.id == deployment_id)
-        }))
+    Ok(
+        bounded_deployment_history(api, app_name, remaining_wait_budget(wait_deadline))
+            .await?
+            .and_then(|deployments| {
+                deployments
+                    .into_iter()
+                    .find(|deployment| deployment.id == deployment_id)
+            }),
+    )
 }
 
 async fn wait_for_deployment_apply_start(
