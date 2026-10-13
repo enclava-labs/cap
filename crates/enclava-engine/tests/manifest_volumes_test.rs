@@ -218,13 +218,18 @@ fn logs_emptydir_fence_survives_dm_integrity_staging_growth() {
 }
 
 #[test]
-fn logs_emptydir_fence_reproduces_observed_eviction_interval() {
-    // Pin the fence arithmetic against #223's timeline: at the observed
-    // growth rate, usage crosses the PRE-#223 fence at t≈10 s; kubelet's
-    // eviction then fires on its next housekeeping pass, producing the
-    // observed steady ~61 s eviction period. The current fence pushes the
-    // crossing far past the convergence window, so a healthy deploy never
-    // sees an eviction.
+fn logs_emptydir_fence_crossing_time_stays_outside_first_deploy_window() {
+    // Pin the fence arithmetic against #223's timeline. This test asserts
+    // the deterministic, manifest-authoritative part of the eviction
+    // mechanism: the time at which sampled usage crosses the sizeLimit at
+    // the growth rate #223 measured. Kubelet's eviction itself fires on its
+    // next housekeeping pass (default 10 s eviction monitoring interval),
+    // which only ever DELAYS an eviction relative to the crossing — it can
+    // never fire before usage crosses the fence. So a fence that is not
+    // crossed inside the first-deploy window can, a fortiori, not evict the
+    // pod inside it; the pre-#223 fence (crossed ~30 s in) is what produced
+    // the observed steady ~61 s eviction period once housekeeping delay was
+    // layered on top of the crossing.
     const RATE: u64 = 6_500_000;
     const PRE_223_LIMIT: u64 = 64 * 1024 * 1024;
     let vols = build_volumes(&memory_app());
