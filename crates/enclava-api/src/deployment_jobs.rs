@@ -1096,7 +1096,7 @@ async fn process_cleanup_job(state: &AppState, job: ClaimedJob) {
             ),
         ))
         .await;
-    let mut deleted_app_identity: Option<(String, String)> = None;
+    let mut deleted_app_identity: Option<(Uuid, String, String)> = None;
     match outcome {
         Ok(Ok(true)) => {
             if sqlx::query("SAVEPOINT cleanup_app_delete")
@@ -1115,7 +1115,7 @@ async fn process_cleanup_job(state: &AppState, job: ClaimedJob) {
             deleted_app_identity = expected_app
                 .as_ref()
                 .filter(|_| app_delete.is_ok())
-                .map(|app| (app.name.clone(), app.namespace.clone()));
+                .map(|app| (app.id, app.name.clone(), app.namespace.clone()));
             if app_delete.is_err() {
                 if sqlx::query("ROLLBACK TO SAVEPOINT cleanup_app_delete")
                     .execute(&mut *side_effect_lane)
@@ -1190,12 +1190,17 @@ async fn process_cleanup_job(state: &AppState, job: ClaimedJob) {
             error_code = "database_error",
             "failed to publish durable deployment cleanup"
         );
-    } else if let Some((app_name, app_namespace)) = deleted_app_identity {
+    } else if let Some((app_id, app_name, app_namespace)) = deleted_app_identity {
         // The cleanup transaction is committed and the app row is gone:
         // drop any TEE probe failure signature so a recreated app of the
         // same name starts from a clean rate-limit state instead of
         // inheriting (and suppressing) this incarnation's last failure.
-        crate::routes::status::clear_tee_probe_failure_state(state, &app_name, &app_namespace);
+        crate::routes::status::clear_tee_probe_failure_state(
+            state,
+            app_id,
+            &app_name,
+            &app_namespace,
+        );
     }
 }
 

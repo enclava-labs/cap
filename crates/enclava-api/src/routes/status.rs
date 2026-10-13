@@ -226,6 +226,7 @@ pub(crate) async fn observe_app_status_for_deployment(
     let domain = app.custom_domain.as_deref().unwrap_or(&app.domain);
     observe_app_status_fields_for_deployment(
         state,
+        app.id,
         &app.namespace,
         &app.name,
         domain,
@@ -237,6 +238,7 @@ pub(crate) async fn observe_app_status_for_deployment(
 
 pub(crate) async fn observe_app_status_fields_for_deployment(
     state: &AppState,
+    app_id: Uuid,
     namespace: &str,
     app_name: &str,
     domain: &str,
@@ -245,7 +247,7 @@ pub(crate) async fn observe_app_status_fields_for_deployment(
 ) -> ObservedAppStatus {
     let (kubernetes, tee) = tokio::join!(
         probe_kubernetes(namespace, app_name, expected_deployment_id),
-        probe_tee(state, namespace, app_name, domain, tee_domain)
+        probe_tee(state, app_id, namespace, app_name, domain, tee_domain)
     );
     classify_live_observation_for_deployment(kubernetes, tee, Utc::now(), expected_deployment_id)
 }
@@ -406,6 +408,7 @@ fn tee_request_timeout(deadline: tokio::time::Instant) -> Duration {
 
 async fn probe_tee(
     state: &AppState,
+    app_id: Uuid,
     namespace: &str,
     app_name: &str,
     domain: &str,
@@ -414,9 +417,12 @@ async fn probe_tee(
     let deadline = tokio::time::Instant::now() + TEE_STATUS_PROBE_TIMEOUT;
     bounded_tee_probe(
         state,
+        app_id,
         namespace,
         app_name,
-        probe_tee_unbounded(state, namespace, app_name, domain, tee_domain, deadline),
+        probe_tee_unbounded(
+            state, app_id, namespace, app_name, domain, tee_domain, deadline,
+        ),
         TEE_STATUS_PROBE_TIMEOUT,
     )
     .await
@@ -424,6 +430,7 @@ async fn probe_tee(
 
 async fn bounded_tee_probe<F>(
     state: &AppState,
+    app_id: Uuid,
     namespace: &str,
     app_name: &str,
     probe: F,
@@ -437,6 +444,7 @@ where
         Err(_) => {
             warn_tee_probe_failure(
                 state,
+                app_id,
                 app_name,
                 namespace,
                 "deadline",
@@ -457,13 +465,14 @@ where
 /// emitted; repeated identical failures and successes stay silent.
 fn warn_tee_probe_failure(
     state: &AppState,
+    app_id: Uuid,
     app_name: &str,
     namespace: &str,
     stage: &str,
     detail: &str,
 ) {
     let signature = format!("{stage}\u{1}{detail}");
-    if !tee_probe_failure_signature_changed(state, app_name, namespace, &signature) {
+    if !tee_probe_failure_signature_changed(state, app_id, app_name, namespace, &signature) {
         return;
     }
     tracing::warn!(
@@ -478,29 +487,44 @@ fn warn_tee_probe_failure(
 
 /// Clear the rate-limit signature after a successful probe so a later
 /// recurrence of the same failure is logged again rather than suppressed.
-fn note_tee_probe_success(state: &AppState, app_name: &str, namespace: &str) {
+fn note_tee_probe_success(state: &AppState, app_id: Uuid, app_name: &str, namespace: &str) {
     state
         .recent_tee_probe_failures
         .lock()
         .expect("TEE probe failure state mutex")
-        .remove(&tee_probe_failure_key(app_name, namespace));
+        .remove(&tee_probe_failure_key(app_id, app_name, namespace));
 }
 
 /// Drop the rate-limit signature when an app is fully deleted so a recreated
 /// app of the same name logs its first probe failure rather than inheriting
 /// the previous incarnation's suppressed signature.
-pub(crate) fn clear_tee_probe_failure_state(state: &AppState, app_name: &str, namespace: &str) {
-    note_tee_probe_success(state, app_name, namespace);
+///
+/// The signature is additionally keyed by the immutable app ID (#219 review):
+/// a status probe that read the old app row before deletion and finishes
+/// after the delete commits then repopulates the *old incarnation's* key,
+/// which the recreated app (new ID, deterministic same namespace) never
+/// reads — its first failure is warned regardless of in-flight probes.
+pub(crate) fn clear_tee_probe_failure_state(
+    state: &AppState,
+    app_id: Uuid,
+    app_name: &str,
+    namespace: &str,
+) {
+    note_tee_probe_success(state, app_id, app_name, namespace);
 }
 
-fn tee_probe_failure_key(app_name: &str, namespace: &str) -> String {
-    format!("{namespace}/{app_name}")
+/// Rate-limit key: namespace/name plus the immutable app ID. The name can be
+/// recreated with the same deterministic namespace; the ID cannot, so probes
+/// of different incarnations never share suppression state.
+fn tee_probe_failure_key(app_id: Uuid, app_name: &str, namespace: &str) -> String {
+    format!("{namespace}/{app_name}/{app_id}")
 }
 
 /// Record a failure signature, returning whether it differs from the
 /// previously recorded one for this app (and therefore should be logged).
 fn tee_probe_failure_signature_changed(
     state: &AppState,
+    app_id: Uuid,
     app_name: &str,
     namespace: &str,
     signature: &str,
@@ -509,7 +533,7 @@ fn tee_probe_failure_signature_changed(
         .recent_tee_probe_failures
         .lock()
         .expect("TEE probe failure state mutex");
-    let key = tee_probe_failure_key(app_name, namespace);
+    let key = tee_probe_failure_key(app_id, app_name, namespace);
     let changed = recent.get(&key).map(String::as_str) != Some(signature);
     if changed {
         recent.insert(key, signature.to_string());
@@ -519,6 +543,7 @@ fn tee_probe_failure_signature_changed(
 
 async fn probe_tee_unbounded(
     state: &AppState,
+    app_id: Uuid,
     namespace: &str,
     app_name: &str,
     domain: &str,
@@ -533,24 +558,43 @@ async fn probe_tee_unbounded(
         .is_some()
     });
     let (client, tee_status_url) = if internal_transport {
-        // Socket-resolution failures already emit a structured warn inside
-        // `resolve_internal_tee_socket`.
-        let Some(socket) =
-            crate::routes::logs::resolve_internal_tee_socket(app_name, namespace).await
-        else {
-            note_existing_tee_probe_failure(state, app_name, namespace, "resolve_socket");
-            return TeeEvidence::Unavailable;
-        };
+        // Socket-resolution failures are emitted through the probe warning
+        // limiter below (stage `resolve_socket`), sharing the per-app
+        // rate limit instead of an untagged per-request warn (#219 review).
+        let socket =
+            match crate::routes::logs::resolve_internal_tee_socket(app_name, namespace).await {
+                Ok(socket) => socket,
+                Err(detail) => {
+                    warn_tee_probe_failure(
+                        state,
+                        app_id,
+                        app_name,
+                        namespace,
+                        "resolve_socket",
+                        &detail,
+                    );
+                    return TeeEvidence::Unavailable;
+                }
+            };
         let client =
             match crate::routes::logs::build_resolved_tenant_tee_http_client(domain, socket) {
                 Ok(client) => client,
                 Err(error) => {
+                    // Render the builder error chain whole (TLS backend,
+                    // resolver, or certificate cause lives in `source()`,
+                    // not the top-level builder message) so distinct build
+                    // failures keep distinct diagnostics and signatures
+                    // (#219 review).
                     warn_tee_probe_failure(
                         state,
+                        app_id,
                         app_name,
                         namespace,
                         "build_client",
-                        &format!("failed to build the internal-transport HTTP client: {error}"),
+                        &format!(
+                            "failed to build the internal-transport HTTP client: {}",
+                            crate::routes::workload::format_error_chain(&error)
+                        ),
                     );
                     return TeeEvidence::Unavailable;
                 }
@@ -580,6 +624,7 @@ async fn probe_tee_unbounded(
             // timeout; render it whole rather than collapsing to a category.
             warn_tee_probe_failure(
                 state,
+                app_id,
                 app_name,
                 namespace,
                 "send",
@@ -594,6 +639,7 @@ async fn probe_tee_unbounded(
     if !response.status().is_success() {
         warn_tee_probe_failure(
             state,
+            app_id,
             app_name,
             namespace,
             "http_status",
@@ -603,7 +649,7 @@ async fn probe_tee_unbounded(
     }
     match response.json::<Value>().await {
         Ok(body) if body.is_object() => {
-            note_tee_probe_success(state, app_name, namespace);
+            note_tee_probe_success(state, app_id, app_name, namespace);
             TeeEvidence::Available(tee_evidence_fields(&body))
         }
         Ok(_) => {
@@ -612,6 +658,7 @@ async fn probe_tee_unbounded(
             // http_status -> body transition visible in logs.
             warn_tee_probe_failure(
                 state,
+                app_id,
                 app_name,
                 namespace,
                 "body",
@@ -626,6 +673,7 @@ async fn probe_tee_unbounded(
             // signatures, matching the send-stage handling (#219 review).
             warn_tee_probe_failure(
                 state,
+                app_id,
                 app_name,
                 namespace,
                 "body",
@@ -637,17 +685,6 @@ async fn probe_tee_unbounded(
             TeeEvidence::Malformed
         }
     }
-}
-
-/// `resolve_internal_tee_socket` logs its own detailed warn; record only the
-/// stage marker so the rate-limit state knows which stage failed.
-fn note_existing_tee_probe_failure(state: &AppState, app_name: &str, namespace: &str, stage: &str) {
-    tee_probe_failure_signature_changed(
-        state,
-        app_name,
-        namespace,
-        &format!("{stage}\u{1}(logged upstream)"),
-    );
 }
 
 fn tee_evidence_fields(body: &Value) -> TeeEvidenceFields {
@@ -1737,6 +1774,7 @@ mod tests {
         let state = probe_test_state(resolved_probe_client(closed_local_socket().await));
         let evidence = bounded_tee_probe(
             &state,
+            probe_app_id(),
             "ns-110",
             "app-110",
             std::future::pending::<TeeEvidence>(),
@@ -1858,6 +1896,12 @@ mod tests {
         state
     }
 
+    /// Distinct immutable app IDs distinguish incarnations of the same
+    /// namespace/name in the probe rate-limit cache (#219 review).
+    fn probe_app_id() -> Uuid {
+        Uuid::new_v4()
+    }
+
     /// A reqwest client that resolves `app.example.test` to the given local
     /// socket, trusts any certificate, and never consults a proxy.
     fn resolved_probe_client(socket: SocketAddr) -> reqwest::Client {
@@ -1885,7 +1929,15 @@ mod tests {
         let (logs, _guard) = captured_warn_logs();
         let socket = closed_local_socket().await;
         let state = probe_test_state(resolved_probe_client(socket));
-        let evidence = probe_tee(&state, "ns-110", "app-110", "app.example.test", None).await;
+        let evidence = probe_tee(
+            &state,
+            probe_app_id(),
+            "ns-110",
+            "app-110",
+            "app.example.test",
+            None,
+        )
+        .await;
 
         assert_eq!(evidence, TeeEvidence::Unavailable);
         let text = captured_log_text(&logs);
@@ -1914,7 +1966,15 @@ mod tests {
         .await;
         let state = probe_test_state(resolved_probe_client(address));
 
-        let evidence = probe_tee(&state, "ns-110", "app-110", "app.example.test", None).await;
+        let evidence = probe_tee(
+            &state,
+            probe_app_id(),
+            "ns-110",
+            "app-110",
+            "app.example.test",
+            None,
+        )
+        .await;
 
         assert_eq!(evidence, TeeEvidence::Unavailable);
         let text = captured_log_text(&logs);
@@ -1931,8 +1991,18 @@ mod tests {
         let socket = closed_local_socket().await;
         let state = probe_test_state(resolved_probe_client(socket));
 
+        // Use the same app_id for all iterations so the rate-limit key is stable.
+        let app_id = probe_app_id();
         for _ in 0..3 {
-            let evidence = probe_tee(&state, "ns-110", "app-110", "app.example.test", None).await;
+            let evidence = probe_tee(
+                &state,
+                app_id,
+                "ns-110",
+                "app-110",
+                "app.example.test",
+                None,
+            )
+            .await;
             assert_eq!(evidence, TeeEvidence::Unavailable);
         }
 
@@ -1951,7 +2021,15 @@ mod tests {
         let state = probe_test_state(resolved_probe_client(closed));
 
         // First failure: warned.
-        let _ = probe_tee(&state, "ns-110", "app-110", "app.example.test", None).await;
+        let _ = probe_tee(
+            &state,
+            probe_app_id(),
+            "ns-110",
+            "app-110",
+            "app.example.test",
+            None,
+        )
+        .await;
         // Success: clears the rate-limit signature (no warn, no failure).
         let address = spawn_status_server(
             StatusCode::OK,
@@ -1960,10 +2038,26 @@ mod tests {
         .await;
         let mut recovered = state.clone();
         recovered.tee_http_client = resolved_probe_client(address);
-        let evidence = probe_tee(&recovered, "ns-110", "app-110", "app.example.test", None).await;
+        let evidence = probe_tee(
+            &recovered,
+            probe_app_id(),
+            "ns-110",
+            "app-110",
+            "app.example.test",
+            None,
+        )
+        .await;
         assert!(matches!(evidence, TeeEvidence::Available(_)));
         // Same failure again after recovery: warned again.
-        let _ = probe_tee(&state, "ns-110", "app-110", "app.example.test", None).await;
+        let _ = probe_tee(
+            &state,
+            probe_app_id(),
+            "ns-110",
+            "app-110",
+            "app.example.test",
+            None,
+        )
+        .await;
 
         let text = captured_log_text(&logs);
         assert_eq!(
@@ -1978,9 +2072,18 @@ mod tests {
         let (logs, _guard) = captured_warn_logs();
         let closed = closed_local_socket().await;
         let state = probe_test_state(resolved_probe_client(closed));
+        let first_incarnation = probe_app_id();
 
         // First incarnation: exactly one warned failure.
-        let _ = probe_tee(&state, "ns-110", "app-110", "app.example.test", None).await;
+        let _ = probe_tee(
+            &state,
+            first_incarnation,
+            "ns-110",
+            "app-110",
+            "app.example.test",
+            None,
+        )
+        .await;
         assert_eq!(
             captured_log_text(&logs)
                 .matches("live TEE probe failed")
@@ -1991,10 +2094,18 @@ mod tests {
         // Completed deletion clears the signature (both delete-completion
         // paths call this): a recreated app of the same name must not
         // inherit the previous incarnation's suppression.
-        clear_tee_probe_failure_state(&state, "app-110", "ns-110");
+        clear_tee_probe_failure_state(&state, first_incarnation, "app-110", "ns-110");
 
         // Recreated app, identical failure signature: must warn again.
-        let _ = probe_tee(&state, "ns-110", "app-110", "app.example.test", None).await;
+        let _ = probe_tee(
+            &state,
+            probe_app_id(),
+            "ns-110",
+            "app-110",
+            "app.example.test",
+            None,
+        )
+        .await;
         assert_eq!(
             captured_log_text(&logs)
                 .matches("live TEE probe failed")
@@ -2005,11 +2116,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tee_probe_distinct_incarnation_keys_not_shared_after_delete() {
+        // The race the #219 review flagged: a status probe reads the old app
+        // row before the delete commits and its failure lands *after* the
+        // post-commit clear. Because the rate-limit key now includes the
+        // immutable app ID, the late old-incarnation failure cannot populate
+        // the recreated app's (new ID) state, so its first identical failure
+        // still warns.
+        let (logs, _guard) = captured_warn_logs();
+        let closed = closed_local_socket().await;
+        let state = probe_test_state(resolved_probe_client(closed));
+        let old_incarnation = probe_app_id();
+        let recreated = probe_app_id();
+
+        // Old incarnation fails once (warned), then the app is deleted and
+        // the post-commit clear runs.
+        let _ = probe_tee(
+            &state,
+            old_incarnation,
+            "ns-110",
+            "app-110",
+            "app.example.test",
+            None,
+        )
+        .await;
+        clear_tee_probe_failure_state(&state, old_incarnation, "app-110", "ns-110");
+
+        // An in-flight probe of the OLD incarnation finishes after the clear
+        // and reinserts the old incarnation's signature.
+        let _ = probe_tee(
+            &state,
+            old_incarnation,
+            "ns-110",
+            "app-110",
+            "app.example.test",
+            None,
+        )
+        .await;
+        assert_eq!(
+            captured_log_text(&logs)
+                .matches("live TEE probe failed")
+                .count(),
+            2,
+            "the late old-incarnation failure re-warns on its own key: {logs:?}"
+        );
+
+        // The recreated app (same namespace/name, new ID) fails identically:
+        // its first failure must warn, not be suppressed.
+        let _ = probe_tee(
+            &state,
+            recreated,
+            "ns-110",
+            "app-110",
+            "app.example.test",
+            None,
+        )
+        .await;
+        assert_eq!(
+            captured_log_text(&logs)
+                .matches("live TEE probe failed")
+                .count(),
+            3,
+            "recreated incarnation's first failure must not be suppressed: {logs:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn tee_probe_deadline_failure_emits_structured_warn() {
         let (logs, _guard) = captured_warn_logs();
         let state = probe_test_state(resolved_probe_client(closed_local_socket().await));
         let evidence = bounded_tee_probe(
             &state,
+            probe_app_id(),
             "ns-110",
             "app-110",
             std::future::pending::<TeeEvidence>(),

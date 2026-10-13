@@ -2175,6 +2175,7 @@ pub(crate) async fn delete_app_before(
     // back deletion keeps the surviving app's suppression intact.
     crate::routes::status::clear_tee_probe_failure_state(
         &state,
+        deleting_app.id,
         &deleting_app.name,
         &deleting_app.namespace,
     );

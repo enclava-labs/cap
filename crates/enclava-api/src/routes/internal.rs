@@ -4220,6 +4220,7 @@ async fn observed_internal_status_item(
 ) -> serde_json::Value {
     let observed = observe_app_status_fields_for_deployment(
         state,
+        cap_app_id,
         &namespace,
         &app_name,
         &domain,
