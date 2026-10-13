@@ -1058,14 +1058,39 @@ mod tests {
     /// env-reading one produces flaky conflicts).
     static POLICY_ENV_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// Restores both env vars on drop so a panic mid-test cannot leak them
-    /// into other tests in this binary.
-    struct EnvGuard;
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
+    /// Isolates the POLICY_*PUBKEY_HEX process env for one test: captures
+    /// the prior values, clears both vars, and on drop restores the exact
+    /// prior state (value or unset). A panic mid-test cannot leak mutations
+    /// into other tests in this binary, and operator-provided values in the
+    /// test environment are preserved instead of erased.
+    struct EnvGuard {
+        prior_trustee: Option<std::ffi::OsString>,
+        prior_signing: Option<std::ffi::OsString>,
+    }
+    impl EnvGuard {
+        fn new() -> Self {
+            let guard = Self {
+                prior_trustee: std::env::var_os("PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX"),
+                prior_signing: std::env::var_os("SIGNING_SERVICE_PUBKEY_HEX"),
+            };
             unsafe {
                 std::env::remove_var("PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX");
                 std::env::remove_var("SIGNING_SERVICE_PUBKEY_HEX");
+            }
+            guard
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prior_trustee {
+                    Some(value) => std::env::set_var("PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX", value),
+                    None => std::env::remove_var("PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX"),
+                }
+                match &self.prior_signing {
+                    Some(value) => std::env::set_var("SIGNING_SERVICE_PUBKEY_HEX", value),
+                    None => std::env::remove_var("SIGNING_SERVICE_PUBKEY_HEX"),
+                }
             }
         }
     }
@@ -1078,7 +1103,7 @@ mod tests {
         // same hex must fail startup instead of silently collapsing the
         // domains.
         let _env_mutex = POLICY_ENV_TEST_MUTEX.lock().unwrap();
-        let _guard = EnvGuard;
+        let _guard = EnvGuard::new();
         let key = "11".repeat(32);
         unsafe {
             std::env::set_var("PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX", &key);
@@ -1105,6 +1130,9 @@ mod tests {
         // field must supply each slot from its own field (the bundled
         // envelope's own distinct keys are proven in the lib tests).
         let _env_mutex = POLICY_ENV_TEST_MUTEX.lock().unwrap();
+        // Clear inherited env too: operator-provided POLICY_*PUBKEY_HEX
+        // values would conflict with the release fields under test.
+        let _guard = EnvGuard::new();
         let release = PlatformRelease {
             schema_version: "v1".into(),
             platform_release_version: "test".into(),
