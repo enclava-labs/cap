@@ -180,75 +180,94 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
         let ar = sweep_api_resource(target.kind);
         let api: kube::Api<kube::api::DynamicObject> =
             kube::Api::namespaced_with(client.clone(), &app.namespace, &ar);
-        let live = match api.get_opt(&target.name).await {
-            Ok(live) => live,
-            Err(error) => {
-                tracing::warn!(
+        // Bounded re-read retry: a controller can bump the resourceVersion
+        // between our GET and the delete (409). Each retry re-reads the
+        // live object and re-checks ownership before deleting, so a
+        // replaced object of another generation is never hit.
+        let mut deleted = false;
+        for _attempt in 0..SWEEP_DELETE_RETRIES {
+            let live = match api.get_opt(&target.name).await {
+                Ok(live) => live,
+                Err(error) => {
+                    tracing::warn!(
+                        app_id = %app.id,
+                        namespace = %app.namespace,
+                        kind = target.kind,
+                        name = %target.name,
+                        error = %error,
+                        "adopted-namespace sweep cannot inspect object; will retry via reconciliation"
+                    );
+                    failures += 1;
+                    break;
+                }
+            };
+            let Some(live) = live else {
+                break; // never created, or already deleted
+            };
+            let live_generation = live
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|annotations| {
+                    annotations
+                        .get(enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION)
+                })
+                .and_then(|raw| raw.parse::<i64>().ok());
+            if !is_sweepable_leftover(live_generation, generation.get()) {
+                // Foreign (unannotated) or newer-generation: never delete
+                // on name alone.
+                tracing::info!(
                     app_id = %app.id,
                     namespace = %app.namespace,
                     kind = target.kind,
                     name = %target.name,
-                    error = %error,
-                    "adopted-namespace sweep cannot inspect object; will retry via reconciliation"
+                    "adopted-namespace sweep skips object not published by a CAP failed apply"
                 );
-                failures += 1;
-                continue;
+                break;
             }
-        };
-        let Some(live) = live else {
-            continue; // never created (apply failed before reaching it)
-        };
-        let live_generation = live
-            .metadata
-            .annotations
-            .as_ref()
-            .and_then(|annotations| {
-                annotations.get(enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION)
-            })
-            .and_then(|raw| raw.parse::<i64>().ok());
-        if live_generation != Some(generation.get()) {
-            // Not this generation's publication (older, newer, or foreign):
-            // never delete on name alone.
-            tracing::info!(
-                app_id = %app.id,
-                namespace = %app.namespace,
-                kind = target.kind,
-                name = %target.name,
-                "adopted-namespace sweep skips object not published by the failed generation"
-            );
-            continue;
+            let preconditions = kube::api::Preconditions {
+                uid: live.metadata.uid.clone(),
+                resource_version: live.metadata.resource_version.clone(),
+            };
+            match api
+                .delete(
+                    &target.name,
+                    &kube::api::DeleteParams {
+                        preconditions: Some(preconditions),
+                        ..kube::api::DeleteParams::default()
+                    },
+                )
+                .await
+            {
+                Ok(_) => {
+                    deleted = true;
+                    break;
+                }
+                Err(kube::Error::Api(error)) if error.code == 409 => {
+                    // Preconditions raced with a controller write: re-read
+                    // and retry under the same ownership check.
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        app_id = %app.id,
+                        namespace = %app.namespace,
+                        kind = target.kind,
+                        name = %target.name,
+                        error = %error,
+                        "adopted-namespace sweep deletion failed; will retry via reconciliation"
+                    );
+                    failures += 1;
+                    break;
+                }
+            }
         }
-        let preconditions = kube::api::Preconditions {
-            uid: live.metadata.uid.clone(),
-            resource_version: live.metadata.resource_version.clone(),
-        };
-        if let Err(error) = api
-            .delete(
-                &target.name,
-                &kube::api::DeleteParams {
-                    preconditions: Some(preconditions),
-                    ..kube::api::DeleteParams::default()
-                },
-            )
-            .await
-        {
-            tracing::warn!(
-                app_id = %app.id,
-                namespace = %app.namespace,
-                kind = target.kind,
-                name = %target.name,
-                error = %error,
-                "adopted-namespace sweep deletion failed; will retry via reconciliation"
-            );
-            failures += 1;
-            continue;
-        }
-        // A deleted StatefulSet leaves its PVCs behind (the manifest's
-        // retention policy is Retain): sweep this generation's claims too,
-        // or a later resized workload would silently reuse the old-size
-        // volumes while the cleared manifest_hash had disabled the
-        // storage-size guard.
-        if target.kind == "StatefulSet" {
+        if deleted && target.kind == "StatefulSet" {
+            // A deleted StatefulSet leaves its PVCs behind (the manifest's
+            // retention policy is Retain): sweep the CAP-owned claims too,
+            // or a later resized workload would silently reuse the
+            // old-size volumes while the cleared manifest_hash had
+            // disabled the storage-size guard.
             failures +=
                 sweep_statefulset_pvcs(&client, &app.namespace, &target.name, generation).await;
         }
@@ -256,13 +275,29 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
     failures
 }
 
+/// A live object's generation annotation makes it a sweepable leftover of
+/// this app's failed applies: strictly positive (an annotated object is
+/// provably CAP-written; an unannotated one is foreign) and not newer than
+/// the failed generation (a newer generation's publication is not this
+/// failure's partial state). The sweep only runs after the ownership gate
+/// proved no other deployment of this app retains provider state, so an
+/// older annotated object can only be a leftover of an earlier failed
+/// apply — exactly what must not survive generation after generation.
+fn is_sweepable_leftover(live_generation: Option<i64>, failed_generation: i64) -> bool {
+    live_generation.is_some_and(|live| live > 0 && live <= failed_generation)
+}
+
+/// Bounded re-read retry budget for preconditioned sweep deletes.
+const SWEEP_DELETE_RETRIES: usize = 3;
+
 /// Delete the PVCs this failed generation's StatefulSet created in an
 /// adopted namespace. Only claims whose name matches the exact
 /// `<vct>-<statefulset>-<ordinal>` shape for a CAP-rendered VCT name AND
-/// whose live mutation-generation annotation exactly equals the failed
-/// generation are deleted (with UID/resourceVersion preconditions): a
-/// pre-existing claim — including one from a foreign StatefulSet with the
-/// same name or from an earlier generation — is never touched.
+/// which are sweepable leftovers (`is_sweepable_leftover`: annotated with
+/// a positive generation not newer than the failed one) are deleted, with
+/// UID/resourceVersion preconditions: a pre-existing unannotated claim —
+/// including one from a foreign StatefulSet with the same name — is never
+/// touched.
 pub(crate) async fn sweep_statefulset_pvcs(
     client: &kube::Client,
     namespace: &str,
@@ -300,7 +335,7 @@ pub(crate) async fn sweep_statefulset_pvcs(
                 annotations.get(enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION)
             })
             .and_then(|raw| raw.parse::<i64>().ok());
-        if live_generation != Some(generation.get()) {
+        if !is_sweepable_leftover(live_generation, generation.get()) {
             continue;
         }
         let preconditions = kube::api::Preconditions {
