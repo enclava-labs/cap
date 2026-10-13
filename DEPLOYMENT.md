@@ -44,17 +44,17 @@ Owner-rotation state spans five append-only migrations:
 
 | Migration | Purpose |
 | --- | --- |
-| `0050_org_rotation_directives.sql` | Consume-once ledger of accepted rotation-directive digests. |
-| `0051_org_keyrings_created_at_clock.sql` | `org_keyrings.created_at` defaults to `clock_timestamp()` so freshness bounds measure real insertion time, not transaction start. |
-| `0053_org_rotation_intents.sql` | Presentation record for each authenticated, signature-verified directive; proof of presentation only, never of upstream success. |
-| `0054_org_keyrings_created_at_watermark.sql` | Floors directive version-recency checks for pre-0051 rows with legacy `created_at` semantics. |
-| `0059_org_rotation_upstream_receipts.sql` | Receipts binding a validated signing-service `rotate-owner` response (owner version, `rotated_at`) to the exact directive and normalized keyring digests. |
+| `0062_org_rotation_directives.sql` | Consume-once ledger of accepted rotation-directive digests. |
+| `0063_org_keyrings_created_at_clock.sql` | `org_keyrings.created_at` defaults to `clock_timestamp()` so freshness bounds measure real insertion time, not transaction start. |
+| `0064_org_rotation_intents.sql` | Presentation record for each authenticated, signature-verified directive; proof of presentation only, never of upstream success. |
+| `0065_org_keyrings_created_at_watermark.sql` | Floors directive version-recency checks for pre-0063 rows with legacy `created_at` semantics. |
+| `0066_org_rotation_upstream_receipts.sql` | Receipts binding a validated signing-service `rotate-owner` response (owner version, `rotated_at`) to the exact directive and normalized keyring digests. |
 
-Note on `0053`'s in-file comment: the SQL comment inside
-`0053_org_rotation_intents.sql` is historical and byte-frozen (sqlx
+Note on `0064`'s in-file comment: the SQL comment inside
+`0064_org_rotation_intents.sql` is historical and byte-frozen (sqlx
 checksums applied migration bytes, and this file's checksum is already
 recorded in databases), and it describes the earlier intent-row waiver that
-`0059` superseded. Do not read it as current semantics. An intent row is
+`0066` superseded. Do not read it as current semantics. An intent row is
 proof of presentation only: it never mints, grants, or blocks recovery. The
 expired-retry waiver is granted exclusively by a matching
 `org_rotation_upstream_receipts` row (see `expired_rotation_waived_by_receipt`
@@ -85,7 +85,7 @@ restored. New keyring versions therefore depend on signing-service
 availability once owner rotation is in play; exact same-version replays and
 rotation receipt retries are unaffected.
 
-Cutover notes for `0059`:
+Cutover notes for `0066`:
 
 - Migrations run at API startup. During rollout, old API pods never mint
   receipts; drain old pods cleanly (let in-flight requests finish before

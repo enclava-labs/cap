@@ -961,9 +961,9 @@ pub async fn bootstrap_signing_service_owner(
 type RotationAuthorityRow = (i64, Vec<u8>, Vec<u8>, Vec<u8>, DateTime<Utc>);
 
 /// Latest keyring version plus the signed_at floor for the directive
-/// version-recency bound. Pre-0054 rows keep legacy transaction-start
+/// version-recency bound. Pre-0065 rows keep legacy transaction-start
 /// created_at semantics, so their stored timestamp is floored at the
-/// watermark recorded when 0054 committed.
+/// watermark recorded when 0065 committed.
 async fn read_rotation_authority(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     org_id: Uuid,
@@ -1213,7 +1213,7 @@ async fn rotate_service_owner(
 ///
 /// Presentation rows (`org_rotation_intents`) never satisfy this query: an
 /// intent is proof of presentation only, never of execution. (The historical
-/// SQL comment in migration `0053` describes the superseded intent-row
+/// SQL comment in migration `0064` describes the superseded intent-row
 /// waiver; that file is byte-frozen because sqlx checksums applied migration
 /// bytes — see `DEPLOYMENT.md` for the current semantics.)
 async fn upstream_receipt_matches_live_service(
@@ -1395,7 +1395,7 @@ pub async fn rotate_org_owner(
     // fall inside the first-use max-age window, and the directive is
     // consumed exactly once. The max-age window carries one recovery
     // exception: an expired retry is accepted only when an upstream
-    // receipt (org_rotation_upstream_receipts, migration 0059) proves this
+    // receipt (org_rotation_upstream_receipts, migration 0066) proves this
     // exact request's rotate-owner RPC succeeded and the service's current
     // owner state still matches that receipt. An already-applied rotation
     // is idempotent at any age, proven by the byte-identical stored
@@ -1441,7 +1441,7 @@ pub async fn rotate_org_owner(
         Json(serde_json::json!({"error": "platform signing service is not configured"})),
     ))?;
 
-    // Durable presentation record (migration 0053), committed on its own
+    // Durable presentation record (migration 0064), committed on its own
     // short-lived connection BEFORE the lane transaction opens: with the
     // pool capped, waiting on a second connection while holding the lane
     // transaction's connection could starve the whole cluster. The row
@@ -1741,9 +1741,9 @@ pub async fn rotate_org_owner(
     // Owner rotation can remove the signer of retained signed policy
     // artifacts still inside the KBS retention window (#130).  As with
     // put_keyring, the owed generation bump is recorded by migration
-    // 0058's org_keyrings INSERT trigger inside this transaction -- a
+    // 0061's org_keyrings INSERT trigger inside this transaction -- a
     // direct desired_generation bump here could be consumed by a
-    // pre-0058 replica's unfiltered reconciler during the rollout.
+    // pre-0061 replica's unfiltered reconciler during the rollout.
 
     let owner_status = read_live_service_owner(signing_service, org_id).await?;
     let service_owner = service_owner_pubkey(&owner_status);
@@ -3379,11 +3379,11 @@ mod tests {
 
     #[tokio::test]
     async fn owner_rotation_version_bound_floors_legacy_rows_at_migration_watermark() {
-        // Regression (PR #185 review, codex P2 on migration 0051): a
+        // Regression (PR #185 review, codex P2 on migration 0063): a
         // keyring version committed by pre-migration code keeps a
         // transaction-start created_at that can predate its real
         // insertion by the full signing-authority lane wait. Without the
-        // migration-0054 watermark floor, a directive signed while the
+        // migration-0065 watermark floor, a directive signed while the
         // legacy upload sat queued on the lane compares as "newer than
         // the version" and is accepted during the post-rollout first-use
         // window even though it predates the version's real insertion.
@@ -3500,7 +3500,7 @@ mod tests {
         );
 
         // Control: once the org has a post-watermark version (uploaded
-        // after migration 0054, created_at = clock_timestamp()), a
+        // after migration 0063, created_at = clock_timestamp()), a
         // directive signed after that insertion rotates normally -- the
         // floor does not wedge forward rotations.
         let _ = put_keyring(
@@ -5000,7 +5000,7 @@ mod tests {
         // signing-authority lane pins now() == transaction_timestamp() at
         // BEGIN; a directive captured after BEGIN but before the queued
         // version lands would then compare as "newer than the version" and be
-        // accepted, defeating the pre-creation replay bound. Migration 0051
+        // accepted, defeating the pre-creation replay bound. Migration 0063
         // switches the default to clock_timestamp() and this test fails
         // against the old transaction-start semantics.
         let pool = database_test_pool().await;
@@ -5371,7 +5371,7 @@ mod tests {
 
         // Active signed mode, seeded at a nonzero desired generation: the
         // keyring insert must owe exactly one selector bump through
-        // migration 0058's trigger (never a direct desired_generation bump),
+        // migration 0061's trigger (never a direct desired_generation bump),
         // and the route must not report success until the owed generation is
         // live in the KBS.
         sqlx::query(
@@ -5759,7 +5759,7 @@ mod tests {
     /// Review follow-up: a `\u0000` escape in an unknown field passes
     /// SignedOrgKeyring deserialization (unknown fields ignored) and would be
     /// persisted verbatim, but jsonb cannot represent it -- the INSERT would
-    /// surface as a database error (500) once migration 0058's CHECK exists.
+    /// surface as a database error (500) once migration 0061's CHECK exists.
     /// The handler must reject it as a 400 before any signature work, and
     /// must never leave a row behind.
     #[tokio::test]
@@ -5848,7 +5848,7 @@ mod tests {
 
         // Active signed mode: every committed keyring insert (the v1 put
         // and the rotation v2) must owe exactly one selector bump through
-        // migration 0058's trigger, and the route must not report success
+        // migration 0061's trigger, and the route must not report success
         // until the owed generation is live in the KBS.
         sqlx::query(
             "UPDATE kbs_signed_policy_reconciliation
@@ -6050,7 +6050,7 @@ mod tests {
                     );
                 }
 
-                // The v1 predecessor row can be pruned by migration 0058's repair
+                // The v1 predecessor row can be pruned by migration 0061's repair
                 // pass while the committed v2 rotation stays intact.  Replaying the
                 // identical request after that prune must still confirm the
                 // rotation, not fail with "previous keyring authority is
