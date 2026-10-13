@@ -470,6 +470,13 @@ fn note_tee_probe_success(state: &AppState, app_name: &str, namespace: &str) {
         .remove(&tee_probe_failure_key(app_name, namespace));
 }
 
+/// Drop the rate-limit signature when an app is fully deleted so a recreated
+/// app of the same name logs its first probe failure rather than inheriting
+/// the previous incarnation's suppressed signature.
+pub(crate) fn clear_tee_probe_failure_state(state: &AppState, app_name: &str, namespace: &str) {
+    note_tee_probe_success(state, app_name, namespace);
+}
+
 fn tee_probe_failure_key(app_name: &str, namespace: &str) -> String {
     format!("{namespace}/{app_name}")
 }
@@ -1016,8 +1023,8 @@ mod tests {
         AppState, KubernetesEvidence, LiveObservationReason, LiveObservationState, PodEvidence,
         RuntimeFailureEvidence, TeeEvidence, bounded_kubernetes_probe, bounded_tee_probe,
         classify_live_observation, classify_live_observation_for_deployment,
-        confidential_status_url, effective_app_status, pod_is_ready, probe_tee,
-        runtime_failure_evidence, select_runtime_failure, tee_evidence_fields,
+        clear_tee_probe_failure_state, confidential_status_url, effective_app_status, pod_is_ready,
+        probe_tee, runtime_failure_evidence, select_runtime_failure, tee_evidence_fields,
     };
     use axum::http::StatusCode;
     use std::net::SocketAddr;
@@ -1796,9 +1803,10 @@ mod tests {
                 let mut request = Vec::new();
                 let mut buf = [0u8; 1024];
                 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-                while let Ok(read) = stream.read(&mut buf).await
-                    && read > 0
-                {
+                while let Ok(read) = stream.read(&mut buf).await {
+                    if read == 0 {
+                        break;
+                    }
                     request.extend_from_slice(&buf[..read]);
                     if request.ends_with(b"\r\n\r\n") {
                         break;
@@ -1935,6 +1943,37 @@ mod tests {
             text.matches("live TEE probe failed").count(),
             2,
             "expected warn on first failure and re-warn after recovery: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tee_probe_recreated_app_warns_on_first_failure_after_delete_clear() {
+        let (logs, _guard) = captured_warn_logs();
+        let closed = closed_local_socket().await;
+        let state = probe_test_state(resolved_probe_client(closed));
+
+        // First incarnation: exactly one warned failure.
+        let _ = probe_tee(&state, "ns-110", "app-110", "app.example.test", None).await;
+        assert_eq!(
+            captured_log_text(&logs)
+                .matches("live TEE probe failed")
+                .count(),
+            1
+        );
+
+        // Completed deletion clears the signature (both delete-completion
+        // paths call this): a recreated app of the same name must not
+        // inherit the previous incarnation's suppression.
+        clear_tee_probe_failure_state(&state, "app-110", "ns-110");
+
+        // Recreated app, identical failure signature: must warn again.
+        let _ = probe_tee(&state, "ns-110", "app-110", "app.example.test", None).await;
+        assert_eq!(
+            captured_log_text(&logs)
+                .matches("live TEE probe failed")
+                .count(),
+            2,
+            "recreated app's first failure must be logged: {logs:?}"
         );
     }
 

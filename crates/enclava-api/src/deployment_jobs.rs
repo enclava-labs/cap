@@ -1111,6 +1111,16 @@ async fn process_cleanup_job(state: &AppState, job: ClaimedJob) {
                 .bind(job.org_id)
                 .execute(&mut *side_effect_lane)
                 .await;
+            // The app row is gone: drop any TEE probe failure signature so a
+            // recreated app of the same name starts from a clean rate-limit
+            // state instead of inheriting this incarnation's last failure.
+            if let Some(app) = expected_app.as_ref().filter(|_| app_delete.is_ok()) {
+                crate::routes::status::clear_tee_probe_failure_state(
+                    state,
+                    &app.name,
+                    &app.namespace,
+                );
+            }
             if app_delete.is_err() {
                 if sqlx::query("ROLLBACK TO SAVEPOINT cleanup_app_delete")
                     .execute(&mut *side_effect_lane)
