@@ -2772,7 +2772,7 @@ async fn validate_apply_artifacts(
             &payload.app,
             primary_image_digest,
             &payload.api_signing_pubkey,
-            &signing_service_pubkey_hex,
+            signing_service_pubkey_hex,
             &crate::signing_service::descriptor_platform_binding_for(
                 state,
                 &payload.snapshot.resources.memory_limit,

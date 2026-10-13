@@ -475,7 +475,7 @@ pub async fn rollback(
                 &app,
                 &image_digest,
                 &crate::auth::jwt::public_key_base64(&state.signing_key),
-                &signing_service_pubkey_hex,
+                signing_service_pubkey_hex,
                 &crate::signing_service::descriptor_platform_binding_for(
                     &state,
                     &target_resources.memory_limit,
