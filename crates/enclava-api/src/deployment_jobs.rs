@@ -2984,7 +2984,6 @@ async fn deployment_is_terminal(
 async fn fail_apply_job(state: &AppState, job: &ClaimedJob, error: &DeploymentJobError) {
     fail_apply_job_with_mutation(state, job, error, None, None).await;
 }
-
 async fn reconcile_pending_kbs_with_mutation(
     state: &AppState,
     mutation: &crate::mutation_leases::AppMutationLease,
@@ -3047,7 +3046,9 @@ async fn fail_apply_job_with_mutation(
     failed_app: Option<&App>,
 ) {
     let published =
-        match publish_apply_failure_with_mutation(&state.db, job, mutation.as_mut()).await {
+        match publish_apply_failure_with_mutation(&state.db, job, error.code(), mutation.as_mut())
+            .await
+        {
             Ok(()) => true,
             Err(db_error) => {
                 tracing::error!(
@@ -3337,9 +3338,15 @@ async fn publish_rollout_outcome(
     publish_rollout_outcome_with_mutation(pool, job, outcome, None).await
 }
 
+/// Terminalize a durable deployment apply failure. `failure_code` must be a
+/// bounded classification from `DeploymentJobError::code` (or one of the
+/// fixed setup/apply constants) so the stored `deployments.error_message`
+/// can cross the public projection allowlist without leaking backend
+/// plaintext (#18: users must see *why* a deploy was rejected).
 async fn publish_apply_failure_with_mutation(
     pool: &PgPool,
     job: &ClaimedJob,
+    failure_code: &str,
     mutation: Option<&mut crate::mutation_leases::AppMutationLease>,
 ) -> Result<(), DeploymentJobError> {
     let mut tx = pool.begin().await?;
@@ -3418,7 +3425,7 @@ async fn publish_apply_failure_with_mutation(
             AND org_id = $4
             AND status IN ('pending', 'applying', 'watching')",
     )
-    .bind(DEPLOYMENT_APPLY_FAILED_MESSAGE)
+    .bind(failure_code)
     .bind(job.deployment_id)
     .bind(job.app_id)
     .bind(job.org_id)
@@ -3461,7 +3468,7 @@ async fn publish_apply_failure_with_mutation(
             AND state = 'running'
             AND lock_token = $3",
     )
-    .bind(DEPLOYMENT_APPLY_FAILED_MESSAGE)
+    .bind(failure_code)
     .bind(job.deployment_id)
     .bind(job.lock_token)
     .execute(&mut *tx)
@@ -3483,7 +3490,7 @@ async fn publish_apply_failure_with_mutation(
 
 #[cfg(test)]
 async fn publish_apply_failure(pool: &PgPool, job: &ClaimedJob) -> Result<(), DeploymentJobError> {
-    publish_apply_failure_with_mutation(pool, job, None).await
+    publish_apply_failure_with_mutation(pool, job, DEPLOYMENT_APPLY_FAILED_MESSAGE, None).await
 }
 
 async fn finish_job(
@@ -8355,6 +8362,52 @@ pub(crate) mod tests {
             .execute(&pool)
             .await
             .expect("delete watching failure fixture");
+    }
+
+    #[tokio::test]
+    async fn apply_failure_publishes_the_bounded_error_code() {
+        // #18: the failure classification (e.g. `kbs_policy_error` for a
+        // signed-policy budget rejection) must be persisted on the
+        // deployments row so the public projection allowlist can surface
+        // the real reason instead of a constant `deployment_apply_failed`.
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _, _) = insert_job_fixture(&pool).await;
+        let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim code fixture setup")
+            .expect("code fixture setup exists");
+        mark_setup_accepted(&pool, deployment_id, setup.lock_token)
+            .await
+            .expect("accept code fixture setup");
+        let job = claim_job(&pool, "pending", "running", Some(deployment_id))
+            .await
+            .expect("claim code fixture apply")
+            .expect("code fixture apply exists");
+
+        publish_apply_failure_with_mutation(&pool, &job, "kbs_policy_error", None)
+            .await
+            .expect("publish classified apply failure");
+
+        let (deploy_status, error_message, job_code): (String, Option<String>, Option<String>) =
+            sqlx::query_as(
+                "SELECT d.status::text, d.error_message, j.last_error_code
+                   FROM deployments d
+                   JOIN deployment_apply_jobs j ON j.deployment_id = d.id
+                  WHERE d.id = $1",
+            )
+            .bind(deployment_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load classified failure");
+        assert_eq!(deploy_status, "failed");
+        assert_eq!(error_message.as_deref(), Some("kbs_policy_error"));
+        assert_eq!(job_code.as_deref(), Some("kbs_policy_error"));
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete classified failure fixture");
     }
 
     #[tokio::test]

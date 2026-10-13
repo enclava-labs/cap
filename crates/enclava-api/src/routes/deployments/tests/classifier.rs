@@ -167,6 +167,56 @@ fn stored_error_plaintext_is_redacted_from_public_and_generic_responses() {
 }
 
 #[test]
+fn bounded_error_codes_cross_the_public_projection() {
+    // #18: bounded classification codes (e.g. a KBS signed-policy budget
+    // rejection classified as `kbs_policy_error`) must reach the user
+    // instead of collapsing to the opaque `deployment_error`.
+    let app = idempotency_app();
+
+    for code in [
+        "kbs_policy_error",
+        "deployment_setup_failed",
+        "deployment_apply_failed",
+        "rollout_timeout",
+        "kubernetes_api_error",
+    ] {
+        let mut public_deployment = idempotency_deployment(&app);
+        public_deployment.error_message = Some(code.to_string());
+        let public = DeploymentResponse::from_deployment(public_deployment, &app);
+        assert_eq!(
+            serde_json::to_value(&public).unwrap()["error_message"],
+            code,
+            "bounded code {code} must be preserved across the public projection"
+        );
+
+        let mut generic_deployment = idempotency_deployment(&app);
+        generic_deployment.error_message = Some(code.to_string());
+        let generic = GenericDeploymentResponse::from_deployment(generic_deployment, &app);
+        assert_eq!(
+            serde_json::to_value(&generic).unwrap()["error_message"],
+            code,
+            "bounded code {code} must be preserved across the generic projection"
+        );
+    }
+}
+
+#[test]
+fn unknown_error_plaintext_still_collapses_to_deployment_error() {
+    let app = idempotency_app();
+
+    let mut public_deployment = idempotency_deployment(&app);
+    public_deployment.error_message =
+        Some("signed policy artifact set exceeds byte budget: 937481 > 921600".to_string());
+    let public = DeploymentResponse::from_deployment(public_deployment, &app);
+    let serialized = serde_json::to_string(&public).unwrap();
+    assert_eq!(
+        serde_json::to_value(&public).unwrap()["error_message"],
+        "deployment_error"
+    );
+    assert!(!serialized.contains("937481"));
+}
+
+#[test]
 fn control_plane_supersession_code_is_preserved_across_deployment_responses() {
     let app = idempotency_app();
 

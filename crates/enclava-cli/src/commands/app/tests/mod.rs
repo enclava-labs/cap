@@ -666,6 +666,60 @@ fn deploy_accepts_storage_password_file_flag() {
 }
 
 #[test]
+fn deployment_failure_message_includes_api_error_code_detail() {
+    let deployment = DeploymentEntry {
+        id: "deploy-123".to_string(),
+        status: "failed".to_string(),
+        image_digest: None,
+        // Bounded classification codes now cross the CAP projection
+        // allowlist verbatim (#18): a KBS signed-policy budget rejection
+        // surfaces as its code, not opaque plaintext.
+        error_message: Some("kbs_policy_error".to_string()),
+        template_slug: None,
+        template_version: None,
+        template_expected: Default::default(),
+        created_at: "2026-07-03T15:48:25Z".to_string(),
+        completed_at: None,
+    };
+
+    assert_eq!(
+        template_deployment_failure_message(&deployment, "deploy-123"),
+        "deployment deploy-123 failed: kbs_policy_error"
+    );
+}
+
+#[test]
+fn deploy_waits_fail_fast_on_terminal_deployment_failure() {
+    // CRLF checkouts (Windows autocrlf) must not break source matching.
+    let source = include_str!("../../app.rs").replace("\r\n", "\n");
+
+    for (fn_name, deadline_message) in [
+        (
+            "async fn wait_for_bootstrap_endpoint",
+            "TEE ownership timed out",
+        ),
+        ("async fn wait_for_deploy_runtime", "TEE boot timed out"),
+    ] {
+        let fn_start = source
+            .find(fn_name)
+            .unwrap_or_else(|| panic!("{fn_name} must exist so standalone app deploy waits exist"));
+        let body = &source[fn_start..];
+        let failure_check = body
+            .find("fail_if_template_deployment_failed")
+            .unwrap_or_else(|| {
+                panic!("{fn_name} must poll for a terminal deployment failure (#18)")
+            });
+        let deadline = body
+            .find(deadline_message)
+            .unwrap_or_else(|| panic!("{fn_name} must keep its deadline guard"));
+        assert!(
+            failure_check < deadline,
+            "{fn_name}: the terminal-failure check must run inside the wait loop before the deadline fires, so a manifest-apply rejection (e.g. KBS signed-policy budget) fails fast instead of timing out ~10 minutes later"
+        );
+    }
+}
+
+#[test]
 fn deploy_progress_does_not_redraw_during_interactive_secret_prompts() {
     // CRLF checkouts (Windows autocrlf) must not break source matching.
     let source = include_str!("../../app.rs").replace("\r\n", "\n");

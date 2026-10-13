@@ -45,7 +45,7 @@ use enclava_engine::types::{
 use std::collections::HashMap;
 use uuid::Uuid;
 
-use crate::commands::template::normalize_ngrok_tcp_url;
+use crate::commands::template::{normalize_ngrok_tcp_url, should_retry_api_transport_error};
 
 const DEPLOY_HEALTH_TIMEOUT_SECONDS: u64 = 900;
 
@@ -1051,6 +1051,7 @@ pub(crate) async fn wait_for_bootstrap_endpoint(
     let start = std::time::Instant::now();
 
     loop {
+        fail_if_template_deployment_failed(api, app_name, deployment.deployment_id).await?;
         if start.elapsed() > max_wait {
             pb.abandon_with_message("TEE ownership timed out");
             return Err(format!(
@@ -1180,6 +1181,7 @@ async fn wait_for_deploy_runtime(
     let mut terminal_probe_at: Option<Instant> = None;
 
     loop {
+        fail_if_template_deployment_failed(api, app_name, expected_deployment_id).await?;
         if start.elapsed() > max_wait {
             pb.abandon_with_message("TEE boot timed out");
             return Err(format!(
@@ -1355,6 +1357,72 @@ fn observation_allows_direct_tee_fallback(
             && !observation.drifted
             && observation.deployment_id.as_deref() == Some(expected_deployment_id)
     })
+}
+
+/// Fail fast when CAP has already terminalized the deployment we are waiting
+/// on (#18): a manifest-apply rejection (e.g. the KBS signed-policy byte
+/// budget) otherwise surfaces only as an opaque wait timeout ~10 minutes
+/// later. Shared by the standalone `app deploy` waits and the hosted
+/// template deploy flow.
+pub(crate) async fn fail_if_template_deployment_failed(
+    api: &ApiClient,
+    app_name: &str,
+    deployment_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if deployment_id == "pending" {
+        return Ok(());
+    }
+    match template_deployment_failure(api, app_name, deployment_id).await {
+        Ok(Some(message)) => Err(message.into()),
+        Ok(None) => Ok(()),
+        Err(error) if should_retry_template_deployment_status_error(&error) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn template_deployment_failure(
+    api: &ApiClient,
+    app_name: &str,
+    deployment_id: &str,
+) -> Result<Option<String>, ApiError> {
+    let deployment = api
+        .list_deployments(app_name)
+        .await?
+        .into_iter()
+        .find(|deployment| deployment.id == deployment_id);
+    Ok(deployment
+        .as_ref()
+        .filter(|deployment| deployment.status == "failed")
+        .map(|deployment| template_deployment_failure_message(deployment, deployment_id)))
+}
+
+fn template_deployment_failure_message(
+    deployment: &DeploymentEntry,
+    deployment_id: &str,
+) -> String {
+    let detail = deployment
+        .error_message
+        .as_deref()
+        .unwrap_or("deployment failed");
+    format!("deployment {deployment_id} failed: {detail}")
+}
+
+pub(crate) fn should_retry_template_deployment_status_error(error: &ApiError) -> bool {
+    match error {
+        ApiError::Http(error) => should_retry_api_transport_error(error),
+        // A malformed or oversized body will not improve on retry.
+        ApiError::Decode(_) | ApiError::ResponseTooLarge(_) => false,
+        ApiError::Api { status, code, .. } => {
+            if matches!(
+                code.as_deref(),
+                Some("cap_response_invalid" | "not_implemented_hosted")
+            ) {
+                return false;
+            }
+            matches!(*status, 404 | 408 | 409 | 425 | 429 | 500..=599)
+        }
+        ApiError::NotAuthenticated => false,
+    }
 }
 
 async fn find_deployment_entry(

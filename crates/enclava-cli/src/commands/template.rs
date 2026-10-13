@@ -15,9 +15,8 @@ use sha2::{Digest, Sha256};
 use enclava_cli::{
     api_client::{ApiClient, ApiError, read_bounded_body},
     api_types::{
-        AppResponse, CreateAppRequest, CreateTemplateInstanceRequest, DeploymentEntry,
-        HostedTemplate, HostedTemplateConfigKey, ServiceSpec, SshCommandResponse,
-        TemplateInstanceResponse,
+        AppResponse, CreateAppRequest, CreateTemplateInstanceRequest, DeploymentEntry, HostedTemplate,
+        HostedTemplateConfigKey, ServiceSpec, SshCommandResponse, TemplateInstanceResponse,
     },
     app_config::{
         AppConfig, AppSection, HealthSection, ResourcesSection, StorageSection, UnlockSection,
@@ -1754,7 +1753,7 @@ fn should_retry_template_bootstrap_endpoint_error(error: &ApiError) -> bool {
     }
 }
 
-fn should_retry_api_transport_error(error: &reqwest::Error) -> bool {
+pub(crate) fn should_retry_api_transport_error(error: &reqwest::Error) -> bool {
     error.is_timeout() || error.is_connect() || error.is_request()
 }
 
@@ -4113,6 +4112,7 @@ fn ensure_ssh_command_matches_endpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::app::should_retry_template_deployment_status_error;
     use std::io::{Read, Write};
 
     #[tokio::test]
@@ -7277,28 +7277,6 @@ mod tests {
                 "log_key_id": "shell-logs",
                 "log_private_key_file": "/tmp/shell-logs.x25519"
             })
-        );
-    }
-
-    #[test]
-    fn template_deployment_failure_message_includes_api_error_detail() {
-        let deployment = DeploymentEntry {
-            id: "deploy-123".to_string(),
-            status: "failed".to_string(),
-            image_digest: None,
-            error_message: Some(
-                "KBS policy error: signed policy artifact set exceeds byte budget".to_string(),
-            ),
-            template_slug: Some("debian-ssh-frp".to_string()),
-            template_version: Some("2026.07.03".to_string()),
-            template_expected: Default::default(),
-            created_at: "2026-07-03T15:48:25Z".to_string(),
-            completed_at: None,
-        };
-
-        assert_eq!(
-            template_deployment_failure_message(&deployment, "deploy-123"),
-            "deployment deploy-123 failed: KBS policy error: signed policy artifact set exceeds byte budget"
         );
     }
 
