@@ -986,3 +986,30 @@ async fn external_id_replay_rejects_an_unreleased_terminal_hold() {
         .await
         .unwrap();
 }
+#[tokio::test]
+async fn public_error_codes_are_persistable_job_codes() {
+    // #18: PUBLIC_DEPLOYMENT_ERROR_CODES must stay a subset of the codes the
+    // deployment_apply_jobs.last_error_code CHECK constraint accepts, or the
+    // classified failure published by publish_apply_failure_with_mutation is
+    // rejected by the database and the real reason never survives. The
+    // constraint list lives in migrations/0073 (widening 0038); this test
+    // fails if either side drifts.
+    let pool = crate::test_support::database_test_pool().await;
+    let constraint_def: String = sqlx::query_scalar(
+        "SELECT pg_get_constraintdef(oid)
+           FROM pg_constraint
+          WHERE conname = 'deployment_apply_jobs_last_error_code_check'
+            AND conrelid = 'deployment_apply_jobs'::regclass",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("load last_error_code constraint definition");
+    for code in PUBLIC_DEPLOYMENT_ERROR_CODES {
+        let needle = format!("'{code}'");
+        assert!(
+            constraint_def.contains(&needle),
+            "PUBLIC_DEPLOYMENT_ERROR_CODES entry `{code}` is rejected by the              deployment_apply_jobs_last_error_code_check constraint; widen              migrations/0058_widen_deployment_apply_jobs_last_error_code.sql",
+        );
+    }
+}
+
