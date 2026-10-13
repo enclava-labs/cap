@@ -1156,20 +1156,27 @@ pub(crate) async fn wait_for_bootstrap_endpoint(
                             );
                         }
                         // Readiness alone must not end the wait (cap#220
-                        // review follow-up): reconcile the pending
-                        // deployment-state observation with this success so
-                        // a failed deployment reports its terminal error
-                        // instead of proceeding to ownership handling.
-                        reconcile_success_with_deployment_history(
+                        // review follow-up): the success must be authorized
+                        // by a current deployment-state observation, and an
+                        // inconclusive one keeps the wait running (the
+                        // enclosing deadline governs).
+                        if let SuccessGate::Confirmed = reconcile_success_with_deployment_history(
                             api,
                             app_name,
                             deployment_id,
                             start + max_wait,
                             &mut history,
                         )
-                        .await?;
-                        pb.set_message("Ownership claim endpoint ready");
-                        return Ok(true);
+                        .await?
+                        {
+                            pb.set_message("Ownership claim endpoint ready");
+                            return Ok(true);
+                        }
+                        pb.set_message(timed_progress(
+                            "TEE ownership: confirming deployment state",
+                            start.elapsed(),
+                            max_wait,
+                        ));
                     }
                     Some(Err(_)) | None => {
                         // One safe status read decides the challenge-failure
@@ -1210,16 +1217,24 @@ pub(crate) async fn wait_for_bootstrap_endpoint(
                                     ));
                                 }
                                 BootstrapEndpointStatusDecision::AlreadyClaimed => {
-                                    reconcile_success_with_deployment_history(
-                                        api,
-                                        app_name,
-                                        deployment_id,
-                                        start + max_wait,
-                                        &mut history,
-                                    )
-                                    .await?;
-                                    pb.set_message("Ownership already claimed");
-                                    return Ok(false);
+                                    if let SuccessGate::Confirmed =
+                                        reconcile_success_with_deployment_history(
+                                            api,
+                                            app_name,
+                                            deployment_id,
+                                            start + max_wait,
+                                            &mut history,
+                                        )
+                                        .await?
+                                    {
+                                        pb.set_message("Ownership already claimed");
+                                        return Ok(false);
+                                    }
+                                    pb.set_message(timed_progress(
+                                        "TEE ownership: confirming deployment state",
+                                        start.elapsed(),
+                                        max_wait,
+                                    ));
                                 }
                                 BootstrapEndpointStatusDecision::Waiting => {
                                     pb.set_message(timed_progress(
@@ -1314,23 +1329,26 @@ async fn wait_for_deploy_runtime(
                         );
                     if observation_is_fresh && target.accepts_api_status(status.status.as_str()) {
                         // Readiness alone must not end the wait (cap#220
-                        // review follow-up): reconcile the pending
-                        // deployment-state observation with this success so
-                        // a failed deployment reports its terminal error.
-                        reconcile_success_with_deployment_history(
+                        // review follow-up): the success must be authorized
+                        // by a current deployment-state observation, and an
+                        // inconclusive one keeps the wait running (the
+                        // enclosing deadline governs).
+                        if let SuccessGate::Confirmed = reconcile_success_with_deployment_history(
                             api,
                             app_name,
                             expected_deployment_id,
                             start + max_wait,
                             &mut history,
                         )
-                        .await?;
-                        pb.set_position(3);
-                        pb.set_message(match status.status.as_str() {
-                            "locked" => "TEE running, storage locked",
-                            _ => "TEE running, attestation complete",
-                        });
-                        return Ok(());
+                        .await?
+                        {
+                            pb.set_position(3);
+                            pb.set_message(match status.status.as_str() {
+                                "locked" => "TEE running, storage locked",
+                                _ => "TEE running, attestation complete",
+                            });
+                            return Ok(());
+                        }
                     }
 
                     let pod_phase_is_verified = observation_is_fresh && status.status != "failed";
@@ -1338,17 +1356,25 @@ async fn wait_for_deploy_runtime(
                         Some("Running")
                             if pod_phase_is_verified && target.accepts_running_pod_phase() =>
                         {
-                            reconcile_success_with_deployment_history(
-                                api,
-                                app_name,
-                                expected_deployment_id,
-                                start + max_wait,
-                                &mut history,
-                            )
-                            .await?;
-                            pb.set_position(3);
-                            pb.set_message("TEE running, attestation complete");
-                            return Ok(());
+                            if let SuccessGate::Confirmed =
+                                reconcile_success_with_deployment_history(
+                                    api,
+                                    app_name,
+                                    expected_deployment_id,
+                                    start + max_wait,
+                                    &mut history,
+                                )
+                                .await?
+                            {
+                                pb.set_position(3);
+                                pb.set_message("TEE running, attestation complete");
+                                return Ok(());
+                            }
+                            pb.set_message(timed_progress(
+                                "TEE boot: confirming deployment state",
+                                start.elapsed(),
+                                max_wait,
+                            ));
                         }
                         Some(phase) => {
                             pb.set_message(timed_progress(
@@ -1424,30 +1450,44 @@ async fn wait_for_deploy_runtime(
             if tee_supplemental_fields_are_consistent(&status) {
                 match outcome {
                     DirectTeeRuntimeOutcome::Locked => {
-                        reconcile_success_with_deployment_history(
+                        if let SuccessGate::Confirmed = reconcile_success_with_deployment_history(
                             api,
                             app_name,
                             expected_deployment_id,
                             start + max_wait,
                             &mut history,
                         )
-                        .await?;
-                        pb.set_position(3);
-                        pb.set_message("TEE running, storage locked");
-                        return Ok(());
+                        .await?
+                        {
+                            pb.set_position(3);
+                            pb.set_message("TEE running, storage locked");
+                            return Ok(());
+                        }
+                        pb.set_message(timed_progress(
+                            "TEE boot: confirming deployment state",
+                            start.elapsed(),
+                            max_wait,
+                        ));
                     }
                     DirectTeeRuntimeOutcome::Unlocked if target.accepts_direct_unlocked() => {
-                        reconcile_success_with_deployment_history(
+                        if let SuccessGate::Confirmed = reconcile_success_with_deployment_history(
                             api,
                             app_name,
                             expected_deployment_id,
                             start + max_wait,
                             &mut history,
                         )
-                        .await?;
-                        pb.set_position(3);
-                        pb.set_message("TEE running, attestation complete");
-                        return Ok(());
+                        .await?
+                        {
+                            pb.set_position(3);
+                            pb.set_message("TEE running, attestation complete");
+                            return Ok(());
+                        }
+                        pb.set_message(timed_progress(
+                            "TEE boot: confirming deployment state",
+                            start.elapsed(),
+                            max_wait,
+                        ));
                     }
                     DirectTeeRuntimeOutcome::Unlocked => {
                         pb.set_message(timed_progress(
@@ -1653,8 +1693,8 @@ impl DeploymentHistoryProbe {
     }
 
     /// Keep the observation current: issue a detached request when none is
-    /// in flight or the newest one is a refresh window old. A passed wait
-    /// deadline issues nothing.
+    /// in flight or the newest one is a refresh window old, applying the
+    /// overflow supersession policy. A passed wait deadline issues nothing.
     fn ensure_request(&mut self, api: &ApiClient, app_name: &str, wait_deadline: Instant) {
         if wait_attempt_budget(wait_deadline).is_zero() {
             return;
@@ -1666,23 +1706,29 @@ impl DeploymentHistoryProbe {
         if !refresh_due {
             return;
         }
-        self.issue(api, app_name);
+        self.push_request(api, app_name);
+        self.supersede_overflow();
     }
 
     /// Issue a detached request now, ignoring the refresh cadence
     /// (cap#220 review follow-up): a successful exit needs a *current*
     /// observation, and the newest answer the probe already holds may
     /// predate the deployment's failure -- a pre-gate non-failure is not
-    /// authority. A passed wait deadline issues nothing.
+    /// authority. This never supersedes older pending lookups (cap#220
+    /// review): at a successful exit any of them may be the request about to
+    /// report the failure, so they get their full chance to land inside the
+    /// gate's settle budget; only the wait loop's next pump applies the
+    /// overflow policy, after that budget has passed. A passed wait deadline
+    /// issues nothing.
     fn force_request(&mut self, api: &ApiClient, app_name: &str, wait_deadline: Instant) {
         if wait_attempt_budget(wait_deadline).is_zero() {
             return;
         }
-        self.issue(api, app_name);
+        self.push_request(api, app_name);
     }
 
-    /// One detached lookup, with the overflow supersession policy.
-    fn issue(&mut self, api: &ApiClient, app_name: &str) {
+    /// One detached lookup.
+    fn push_request(&mut self, api: &ApiClient, app_name: &str) {
         let api = api.clone();
         let app_name = app_name.to_owned();
         self.in_flight.push_back(HistoryRequest {
@@ -1691,6 +1737,11 @@ impl DeploymentHistoryProbe {
                 api.list_deployments(&app_name).await
             })),
         });
+    }
+
+    /// The pump's overflow policy: bound sockets on a stalled endpoint while
+    /// still observing any response slower than the refresh cadence.
+    fn supersede_overflow(&mut self) {
         while self.in_flight.len() > HISTORY_MAX_IN_FLIGHT {
             // Never supersede a landed answer: its result would be dropped
             // unobserved. A finished request is picked up on the next
@@ -1713,7 +1764,7 @@ impl DeploymentHistoryProbe {
     /// request was cancelled/panicked -- indistinguishable from "no
     /// observation", so the caller keeps waiting and the wait's own deadline
     /// governs).
-    async fn take_landed(&mut self) -> Option<Result<Vec<DeploymentEntry>, ApiError>> {
+    async fn take_landed(&mut self) -> Option<(Instant, Result<Vec<DeploymentEntry>, ApiError>)> {
         let index = self
             .in_flight
             .iter()
@@ -1722,7 +1773,7 @@ impl DeploymentHistoryProbe {
         // A cancelled or panicked task surfaces as `Err` and reads as "no
         // observation", exactly like `take_landed`'s `None`.
         match request.handle.join().await {
-            Some(Ok(result)) => Some(result),
+            Some(Ok(result)) => Some((request.issued_at, result)),
             Some(Err(_)) | None => None,
         }
     }
@@ -1732,36 +1783,38 @@ impl DeploymentHistoryProbe {
     /// requests are still in flight. Two properties the exit gate needs:
     ///
     /// - a landed answer is never dropped unobserved -- `on_landed` sees it
-    ///   the moment it lands, so a failure answer is reported right away
-    ///   instead of after the rest settles;
-    /// - a newer pending request keeps the exit waiting, so a stale
-    ///   non-failure answer can never authorize success while the request
-    ///   that would show the current state is still in flight.
+    ///   the moment it lands (with the request's issue time, so the gate can
+    ///   tell a current answer from a stale one), so a failure answer is
+    ///   reported right away instead of after the rest settles;
+    /// - a pending request keeps the exit waiting, so a stale non-failure
+    ///   answer can never authorize success while the request that would
+    ///   show the current state is still in flight.
     ///
     /// `on_landed` returns `false` to stop the settle immediately (a
     /// terminal failure needs no further observation). `budget` expires
     /// with requests still pending (a stalled history endpoint): the
-    /// caller reconciles the remainder with its own outcome instead of
-    /// blocking forever, so a stall can never turn readiness into a false
-    /// timeout.
+    /// returned `bool` says whether everything settled (`true`) or the
+    /// budget ran out with answers still pending (`false`) -- the caller
+    /// must treat the latter as an inconclusive observation, never as
+    /// authority for success.
     async fn take_settled_within(
         &mut self,
         budget: Duration,
-        mut on_landed: impl FnMut(Result<Vec<DeploymentEntry>, ApiError>) -> bool,
-    ) {
+        mut on_landed: impl FnMut(Instant, Result<Vec<DeploymentEntry>, ApiError>) -> bool,
+    ) -> bool {
         let deadline = Instant::now() + budget;
         loop {
-            while let Some(result) = self.take_landed().await {
-                if !on_landed(result) {
-                    return;
+            while let Some((issued_at, result)) = self.take_landed().await {
+                if !on_landed(issued_at, result) {
+                    return false;
                 }
             }
             if self.in_flight.is_empty() {
-                return;
+                return true;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return;
+                return false;
             }
             tokio::time::sleep(remaining.min(LANDED_PICKUP_POLL_INTERVAL)).await;
         }
@@ -1833,7 +1886,7 @@ async fn template_deployment_failure(
     // observed when it lands, while a stalled endpoint costs this check
     // nothing and the readiness polls still run every iteration.
     history.ensure_request(api, app_name, wait_deadline);
-    let Some(result) = history.take_landed().await else {
+    let Some((_issued_at, result)) = history.take_landed().await else {
         return Ok(None);
     };
     deployment_history_failure(result, deployment_id)
@@ -1868,11 +1921,30 @@ pub(crate) fn should_retry_template_deployment_status_error(error: &ApiError) ->
     }
 }
 
+/// Outcome of the successful-exit gate
+/// ([`reconcile_success_with_deployment_history`]).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SuccessGate {
+    /// A *current* observation (a request issued at the gate) landed and
+    /// shows this deployment present and not failed, with every pending
+    /// lookup settled: the success is authorized.
+    Confirmed,
+    /// No conclusive current observation: the fresh request never landed
+    /// within the settle budget, or landed without this deployment's row, or
+    /// its lookup failed transiently. The caller keeps the wait running and
+    /// the enclosing deadline governs (cap#220 review follow-up): a stalled
+    /// or flaky history endpoint may delay a ready deploy to its deadline --
+    /// the safe side of the bug this gate exists for -- but success is never
+    /// claimed without the observation that rules out a failed deployment.
+    Inconclusive,
+}
+
 /// Gate a wait's successful exit on deployment history (cap#220 review
 /// follow-up). Readiness alone must not end a wait: a failed deployment can
 /// otherwise proceed to ownership handling before its history answer lands
-/// and the terminal error is never reported. The gate settles the probe's
-/// requests before returning:
+/// and the terminal error is never reported. Success is authorized only on a
+/// conclusive current observation; the gate settles the probe's requests
+/// before returning its three-way verdict:
 ///
 /// - it always asks for a *current* observation first: the newest answer
 ///   the probe already holds may predate the deployment's failure (a
@@ -1880,38 +1952,58 @@ pub(crate) fn should_retry_template_deployment_status_error(error: &ApiError) ->
 ///   the exit regardless of the refresh cadence;
 /// - every landed answer is consumed and reported the moment it lands -- a
 ///   landed failure is never dropped unobserved and never waits on the rest;
-/// - a newer pending request keeps the exit waiting, so a stale non-failure
+/// - a pending request keeps the exit waiting, so a stale non-failure
 ///   answer can never authorize success while the request that would show
 ///   the current state is still in flight;
-/// - the wait is bounded by one per-attempt budget
+/// - [`SuccessGate::Confirmed`] requires the fresh answer to land showing
+///   the deployment present and not failed, with nothing else pending.
+///   Pending, a missing row, a transient lookup error, or budget expiry is
+///   [`SuccessGate::Inconclusive`]: the caller keeps the wait and its probe
+///   running (nothing is aborted) and the enclosing deadline produces the
+///   timeout. The settle is bounded by one per-attempt budget
 ///   ([`wait_attempt_budget`], 60 seconds, min'd with the wait's remaining
-///   time) for every request to settle. On expiry the pending request is
-///   reconciled with the success instead of blocking: a stalled history
-///   endpoint delays success at most one attempt budget and can never fail
-///   a ready deployment or consume the wait.
+///   time), so an inconclusive exit never consumes more than one attempt.
 pub(crate) async fn reconcile_success_with_deployment_history(
     api: &ApiClient,
     app_name: &str,
     deployment_id: &str,
     wait_deadline: Instant,
     history: &mut DeploymentHistoryProbe,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<SuccessGate, Box<dyn std::error::Error>> {
     if deployment_id == "pending" {
-        return Ok(());
+        return Ok(SuccessGate::Confirmed);
     }
+    let entry_at = Instant::now();
     history.force_request(api, app_name, wait_deadline);
     let mut failure: Option<Box<dyn std::error::Error>> = None;
-    history
-        .take_settled_within(wait_attempt_budget(wait_deadline), |result| {
-            match deployment_history_failure(result, deployment_id) {
-                Ok(Some(message)) => {
-                    failure = Some(message.into());
-                    false
-                }
-                Ok(None) => true,
-                // A transient lookup error reads as "no observation": the same
-                // retry predicate as the per-iteration check keeps a ready
-                // endpoint's success intact.
+    let mut fresh_confirmed = false;
+    let settled = history
+        .take_settled_within(wait_attempt_budget(wait_deadline), |issued_at, result| {
+            let current = issued_at >= entry_at;
+            match result {
+                Ok(entries) => match entries.into_iter().find(|d| d.id == deployment_id) {
+                    Some(deployment) if deployment.status == "failed" => {
+                        failure = Some(
+                            template_deployment_failure_message(&deployment, deployment_id).into(),
+                        );
+                        false
+                    }
+                    Some(_) => {
+                        // Only the fresh request's non-failure is authority;
+                        // a stale one may predate the failure.
+                        fresh_confirmed |= current;
+                        true
+                    }
+                    // A missing row is never authority (cap#220 review
+                    // follow-up): without the entry we cannot rule out that
+                    // this deployment is the failed one.
+                    None => true,
+                },
+                // A transient lookup error reads as "no observation", the
+                // same retry predicate as the per-iteration check -- but it
+                // can never authorize success either (cap#220 review
+                // follow-up): a conclusive exit needs a landed non-failure
+                // for this deployment id.
                 Err(error) if should_retry_template_deployment_status_error(&error) => true,
                 Err(error) => {
                     failure = Some(error.into());
@@ -1922,7 +2014,11 @@ pub(crate) async fn reconcile_success_with_deployment_history(
         .await;
     match failure {
         Some(error) => Err(error),
-        None => Ok(()),
+        None => Ok(if fresh_confirmed && settled {
+            SuccessGate::Confirmed
+        } else {
+            SuccessGate::Inconclusive
+        }),
     }
 }
 
@@ -1940,7 +2036,7 @@ async fn find_deployment_entry(
     // when it lands instead of being cancelled and turning the wait into a
     // false timeout.
     history.ensure_request(api, app_name, wait_deadline);
-    let Some(result) = history.take_landed().await else {
+    let Some((_issued_at, result)) = history.take_landed().await else {
         return Ok(None);
     };
     Ok(result?
@@ -1985,19 +2081,28 @@ async fn wait_for_deployment_apply_start(
                     return Err(format!("deployment {deployment_id} failed: {detail}").into());
                 }
                 _ => {
-                    // A success exit must reconcile the deployment-state
-                    // observation first (cap#220 review follow-up): acting
-                    // on the oldest landed answer and returning would drop
-                    // a newer failure already landed or in flight.
-                    reconcile_success_with_deployment_history(
+                    // A success exit must be authorized by a current
+                    // deployment-state observation (cap#220 review
+                    // follow-up): acting on the oldest landed answer and
+                    // returning would drop a newer failure already landed or
+                    // in flight, and an inconclusive observation keeps the
+                    // wait running (the enclosing deadline governs).
+                    if let SuccessGate::Confirmed = reconcile_success_with_deployment_history(
                         api,
                         app_name,
                         deployment_id,
                         start + max_wait,
                         &mut history,
                     )
-                    .await?;
-                    return Ok(());
+                    .await?
+                    {
+                        return Ok(());
+                    }
+                    pb.set_message(timed_progress(
+                        "Applying deployment: confirming state",
+                        start.elapsed(),
+                        max_wait,
+                    ));
                 }
             },
             Ok(None) => pb.set_message(timed_progress(
@@ -2059,20 +2164,30 @@ async fn wait_for_deployment_completion(
         {
             Ok(Some(deployment)) => match deployment.status.as_str() {
                 "healthy" => {
-                    // The final "Deployed and healthy" exit must reconcile
-                    // the deployment-state observation first (cap#220 review
-                    // follow-up): acting on the oldest landed answer and
-                    // returning would drop a newer failure already landed or
-                    // in flight -- a false success, not just a delayed one.
-                    reconcile_success_with_deployment_history(
+                    // The final "Deployed and healthy" exit must be
+                    // authorized by a current deployment-state observation
+                    // (cap#220 review follow-up): acting on the oldest
+                    // landed answer and returning would drop a newer failure
+                    // already landed or in flight -- a false success, not
+                    // just a delayed one -- and an inconclusive observation
+                    // keeps the wait running (the enclosing deadline
+                    // governs).
+                    if let SuccessGate::Confirmed = reconcile_success_with_deployment_history(
                         api,
                         app_name,
                         deployment_id,
                         start + max_wait,
                         &mut history,
                     )
-                    .await?;
-                    return Ok(());
+                    .await?
+                    {
+                        return Ok(());
+                    }
+                    pb.set_message(timed_progress(
+                        "Workload health: confirming state",
+                        start.elapsed(),
+                        max_wait,
+                    ));
                 }
                 "failed" => {
                     let detail = deployment
