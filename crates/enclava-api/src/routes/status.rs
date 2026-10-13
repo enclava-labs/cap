@@ -620,12 +620,19 @@ async fn probe_tee_unbounded(
             TeeEvidence::Malformed
         }
         Err(error) => {
+            // Render the reqwest error chain whole (serde/transport cause
+            // lives in `source()`, not the top-level display) so different
+            // malformed-body failures keep distinct diagnostics and
+            // signatures, matching the send-stage handling (#219 review).
             warn_tee_probe_failure(
                 state,
                 app_name,
                 namespace,
                 "body",
-                &format!("{tee_status_url} returned a malformed body: {error}"),
+                &format!(
+                    "{tee_status_url} returned a malformed body: {}",
+                    crate::routes::workload::format_error_chain(&error)
+                ),
             );
             TeeEvidence::Malformed
         }
