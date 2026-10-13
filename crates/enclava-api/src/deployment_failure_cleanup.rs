@@ -82,8 +82,10 @@ fn crd_api_resource(
 fn adopted_namespace_sweep_targets(app: &App) -> Vec<AdoptedNamespaceSweep> {
     let mut targets = Vec::new();
     // Tenant image-pull secret (GHCR credentials): the most security-
-    // sensitive object; its name comes from the same env-derived default
-    // as `deploy.rs`.
+    // sensitive object. Deletion is still evidence-gated
+    // (is_cap_created_generation_leftover on the Secret), so a
+    // same-named PRE-EXISTING secret without creation evidence is
+    // skipped; the env-derived name only selects the candidate.
     targets.push(AdoptedNamespaceSweep {
         kind: "Secret",
         name: crate::deploy::default_tenant_image_pull_secret_name_for_cleanup(),
@@ -906,8 +908,33 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
             app_id = %app.id,
             namespace = %app.namespace,
             expected_generation = namespace_generation.get(),
-            "failed-apply cleanup skips namespace: it does not carry this generation's mutation annotation"
+            "failed-apply cleanup skips namespace: it does not carry this generation's mutation annotation; marking row for a later sweep to converge older leftovers"
         );
+        // The live namespace may retain an older generation's leftovers
+        // (e.g. a prior incomplete sweep that failed before reaching the
+        // namespace). This row's evidence would otherwise permanently
+        // gate every later failed generation of the app
+        // (no_other_generation_owns_provider_state). Mark THIS row
+        // incomplete instead: later failed generations stay
+        // cleanup-eligible (gate exemption) and their sweeps converge
+        // the shared-name leftovers. Evidence is retained.
+        if let Err(error) = sqlx::query(
+            "UPDATE deployments
+             SET cleanup_sweep_incomplete = true
+             WHERE id = $1 AND app_id = $2 AND status = 'failed'",
+        )
+        .bind(failed_deployment_id)
+        .bind(app.id)
+        .execute(&state.db)
+        .await
+        {
+            tracing::warn!(
+                app_id = %app.id,
+                deployment_id = %failed_deployment_id,
+                error = %error,
+                "failed-apply cleanup could not mark the foreign-namespace row's sweep incomplete"
+            );
+        }
         return CleanupFenceOutcome::ReleaseNormally;
     }
     if matches!(ownership, InitialNamespaceOwnership::Uninspectable) {
@@ -955,11 +982,16 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
                 namespace = %app.namespace,
                 "failed-apply cleanup sweeps published objects from adopted namespace (no creation evidence; namespace not deleted)"
             );
-            // The failed row's creation time bounds when this apply (and
-            // therefore its CAP-created StatefulSet) could have started
-            // creating claims — the retry-time PVC ownership rule.
+            // The PVC ownership bound is when this apply ATTEMPTED the
+            // Kubernetes writes, not the row's creation (acceptance
+            // precedes setup/signing/apply by an unbounded margin, and a
+            // tenant could create a same-named claim in between).
+            // observing_since is persisted at the first apply attempt of
+            // the failed generation (COALESCE keeps the earliest), which
+            // is exactly the start of CAP's write window; fall back to
+            // created_at only when it was never set.
             let apply_started_at = sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
-                "SELECT created_at FROM deployments WHERE id = $1 AND app_id = $2",
+                "SELECT COALESCE(observing_since, created_at) FROM deployments WHERE id = $1 AND app_id = $2",
             )
             .bind(failed_deployment_id)
             .bind(app.id)
@@ -1135,6 +1167,31 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
             CleanupFenceOutcome::ReleaseNormally
         }
         NamespaceTeardown::DeleteIncomplete => {
+            // A delete may be in flight: the fence stays retained so a
+            // retry cannot claim the name while the namespace may still be
+            // Terminating. The row keeps its evidence (storage guard) but
+            // is marked cleanup_sweep_incomplete so that once the fence
+            // resolves — the retained-fence reconciler observes the 404,
+            // or the retain falls back to the bounded quarantine — this
+            // historical row cannot veto every later failed generation's
+            // cleanup forever.
+            if let Err(error) = sqlx::query(
+                "UPDATE deployments
+                 SET cleanup_sweep_incomplete = true
+                 WHERE id = $1 AND app_id = $2 AND status = 'failed'",
+            )
+            .bind(failed_deployment_id)
+            .bind(app.id)
+            .execute(&state.db)
+            .await
+            {
+                tracing::warn!(
+                    app_id = %app.id,
+                    deployment_id = %failed_deployment_id,
+                    error = %error,
+                    "failed-apply cleanup could not mark the row's delete-incomplete outcome"
+                );
+            }
             tracing::warn!(
                 app_id = %app.id,
                 namespace = %app.namespace,
@@ -1254,7 +1311,7 @@ async fn remove_failed_generation_edge_routes(
 /// was observed under this generation's annotation and only later returned
 /// 404 (between the owning GET and the delete, or during the convergence
 /// wait).
-enum InitialNamespaceOwnership {
+pub(crate) enum InitialNamespaceOwnership {
     /// Live object carries this generation's annotation AND creation
     /// evidence (`enclava.dev/cap-namespace-created-by-generation`): CAP
     /// created it and this generation was the last writer — safe to delete.
@@ -1281,7 +1338,7 @@ enum InitialNamespaceOwnership {
     Uninspectable,
 }
 
-fn classify_initial_namespace_get(
+pub(crate) fn classify_initial_namespace_get(
     result: &Result<k8s_openapi::api::core::v1::Namespace, kube::Error>,
     generation: enclava_engine::apply::generation::MutationGeneration,
 ) -> InitialNamespaceOwnership {
@@ -1301,14 +1358,28 @@ fn classify_initial_namespace_get(
                 // pre-existing one this apply adopted and stamped. The
                 // value must parse as a positive generation — a planted
                 // empty or non-numeric key proves nothing.
-                let created_by_cap = annotations
+                // Value alone is not proof: SSA omission does not remove
+                // an annotation a tenant's field manager owns, so a
+                // pre-existing namespace carrying a tenant-authored
+                // creation marker keeps it after CAP stamps the current
+                // mutation generation. Require the marker to ALSO be
+                // managed-fields-attributed to CAP's field manager —
+                // evidence a tenant cannot forge without seizing the
+                // field-manager identity itself.
+                let value_proves_creation = annotations
                     .and_then(|annotations| {
                         annotations
                             .get(enclava_engine::apply::generation::NAMESPACE_CREATED_BY_ANNOTATION)
                     })
                     .and_then(|raw| raw.parse::<i64>().ok())
                     .is_some_and(|value| value > 0);
-                if !created_by_cap {
+                let manager_proves_authorship = value_proves_creation
+                    && enclava_engine::apply::generation::annotation_owned_by_manager(
+                        namespace,
+                        enclava_engine::apply::generation::NAMESPACE_CREATED_BY_ANNOTATION,
+                        &enclava_engine::apply::types::ApplyConfig::default().field_manager,
+                    );
+                if !manager_proves_authorship {
                     return InitialNamespaceOwnership::Adopted;
                 }
                 // The DELETE preconditions come from THIS object. A live
@@ -1359,7 +1430,16 @@ async fn classify_failed_generation_namespace(
         }
     };
     let api: kube::Api<k8s_openapi::api::core::v1::Namespace> = kube::Api::all(client);
-    classify_initial_namespace_get(&api.get(&app.namespace).await, generation)
+    // Bound the probe: a stalled API server must not hold the failed
+    // mutation's shared fences for the client's ~295 s read timeout on
+    // this pre-teardown GET (it is outside both the sweep deadline and
+    // the namespace convergence deadline). A timed-out probe is simply
+    // undecidable — same handling as any other GET error.
+    let probed = tokio::time::timeout(SWEEP_READ_TIMEOUT, api.get(&app.namespace))
+        .await
+        .map_err(|_| kube::Error::Service("namespace ownership probe timed out".into()))
+        .and_then(|inner| inner);
+    classify_initial_namespace_get(&probed, generation)
 }
 
 /// Delete the namespace that ALREADY passed the ownership classification,
@@ -1431,13 +1511,33 @@ async fn delete_owned_namespace(
             Ok(result) => result,
             Err(_elapsed) => {
                 // The DELETE exceeded its request budget: whether it was
-                // accepted is undecidable, so fail closed.
+                // accepted is undecidable. Blindly retaining the fence
+                // deadlocks when the namespace is live (the reconciler
+                // releases only on an observed 404); blindly releasing
+                // destroys the guard when a delete IS in flight.
+                // Re-probe under the same budget: absent -> retain (a
+                // delete may be converging; reconciler observes the 404);
+                // live -> nothing is in flight (mark incomplete,
+                // release — a later failed generation retries).
                 tracing::warn!(
                     app_id = %app.id,
                     namespace = %app.namespace,
-                    "failed-apply namespace delete exceeded its request budget; retaining the namespace fence for reconciliation"
+                    "failed-apply namespace delete exceeded its request budget; re-probing before deciding"
                 );
-                return NamespaceTeardown::DeleteIncomplete;
+                return match tokio::time::timeout(
+                    NAMESPACE_DELETE_REQUEST_TIMEOUT,
+                    api.get_opt(&app.namespace),
+                )
+                .await
+                {
+                    Ok(Ok(None)) => NamespaceTeardown::DeleteIncomplete,
+                    Ok(Ok(Some(_))) => NamespaceTeardown::DeleteNotIssued,
+                    Ok(Err(_)) | Err(_) => {
+                        // Undecidable absence: the conservative arm
+                        // retains; the reconciler re-probes each cycle.
+                        NamespaceTeardown::DeleteIncomplete
+                    }
+                };
             }
         };
         match delete_result {
@@ -1488,6 +1588,22 @@ async fn delete_owned_namespace(
                 };
                 pinned_resource_version = fresh_version;
                 continue;
+            }
+            Err(kube::Error::Api(error)) if (400..500).contains(&error.code) => {
+                // A definitive 4xx rejection (403, 422, 400, ... — the 404
+                // and 409 cases are handled above): Kubernetes answered
+                // with a rejection BEFORE accepting the request, so no
+                // delete is in flight. Retaining the fence would wait for a
+                // 404 that cannot occur and wedge every later deployment on
+                // permanent Busy — but the proven-owned namespace is still
+                // live, so this is not confirmed absence either.
+                tracing::warn!(
+                    app_id = %app.id,
+                    namespace = %app.namespace,
+                    error = %error,
+                    "failed-apply namespace delete was definitively rejected before acceptance; nothing is in flight"
+                );
+                return NamespaceTeardown::DeleteNotIssued;
             }
             Err(kube::Error::Api(error)) if error.code >= 500 => {
                 // Server-side rejection before acceptance is likely but not
@@ -2022,9 +2138,28 @@ mod tests {
                 generation.to_string(),
             );
         }
+        // CAP-created namespaces carry the creation annotation inside
+        // an enclava-platform managed-fields entry (the create POST's
+        // field-manager ownership); adopted ones have no such entry.
+        let managed_fields = created_by_cap.then(|| {
+            vec![k8s_openapi::apimachinery::pkg::apis::meta::v1::ManagedFieldsEntry {
+                manager: Some("enclava-platform".to_string()),
+                fields_v1: Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::FieldsV1(
+                    serde_json::json!({
+                        "f:metadata": {
+                            "f:annotations": {
+                                format!("f:{}", enclava_engine::apply::generation::NAMESPACE_CREATED_BY_ANNOTATION): {}
+                            }
+                        }
+                    }),
+                )),
+                ..Default::default()
+            }]
+        });
         k8s_openapi::api::core::v1::Namespace {
             metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
                 annotations: Some(annotations),
+                managed_fields,
                 uid: Some("00000000-0000-0000-0000-000000000001".to_string()),
                 resource_version: Some("42".to_string()),
                 ..Default::default()
@@ -2065,6 +2200,25 @@ mod tests {
         // pre-existed and was adopted — it must never be deleted.
         assert!(matches!(
             classify_initial_namespace_get(&Ok(adopted_namespace(7)), generation),
+            InitialNamespaceOwnership::Adopted
+        ));
+        // Codex e4Z: a tenant-authored creation marker (value present,
+        // but no CAP field-manager provenance) must not authenticate
+        // ownership — SSA omission cannot remove a tenant-owned
+        // annotation, so value-only checks would delete the foreign
+        // namespace after CAP stamped the mutation generation.
+        let mut forged = adopted_namespace(7);
+        forged
+            .metadata
+            .annotations
+            .as_mut()
+            .expect("annotations")
+            .insert(
+                enclava_engine::apply::generation::NAMESPACE_CREATED_BY_ANNOTATION.to_string(),
+                "7".to_string(),
+            );
+        assert!(matches!(
+            classify_initial_namespace_get(&Ok(forged), generation),
             InitialNamespaceOwnership::Adopted
         ));
         // Creation evidence written by an earlier generation (the namespace

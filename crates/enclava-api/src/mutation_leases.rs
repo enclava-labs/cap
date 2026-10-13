@@ -12,7 +12,11 @@ use sqlx::{PgPool, Postgres, Transaction};
 use tokio::sync::{OwnedSemaphorePermit, watch};
 use uuid::Uuid;
 
+use crate::deployment_failure_cleanup::{
+    InitialNamespaceOwnership, classify_initial_namespace_get,
+};
 use crate::state::AppState;
+use enclava_engine::apply::generation::MutationGeneration;
 
 const LEASE_SECONDS: i64 = 180;
 // kube-client's default read/write timeout is 295s. Keep a full minute of
@@ -1094,6 +1098,87 @@ async fn select_expired_retained_namespace_fences(
     .await?)
 }
 
+/// Retry the UID+resourceVersion-pinned namespace DELETE for a retained
+/// fence whose namespace is still live and still classifies as the failed
+/// generation's CAP-created namespace. Returns true only when absence is
+/// positively confirmed (the DELETE raced to 404, or it was accepted and a
+/// bounded re-probe observed 404); every other outcome keeps the caller's
+/// fence retained for the next cycle. The preconditions come from the same
+/// fresh GET that passed the ownership classification, so the retry can
+/// only ever target THAT object — never a same-named replacement, and
+/// never a same-UID object another writer has since modified.
+async fn retry_retained_namespace_delete(
+    api: &kube::Api<k8s_openapi::api::core::v1::Namespace>,
+    namespace: &str,
+    uid: String,
+    resource_version: String,
+) -> bool {
+    match tokio::time::timeout(
+        RETAINED_NAMESPACE_PROBE_TIMEOUT,
+        api.delete(
+            namespace,
+            &kube::api::DeleteParams {
+                preconditions: Some(kube::api::Preconditions {
+                    uid: Some(uid),
+                    resource_version: Some(resource_version),
+                }),
+                ..kube::api::DeleteParams::default()
+            },
+        ),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(kube::Error::Api(error))) if error.code == 404 => {
+            // Raced to absence: nothing of ours remains.
+            return true;
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(
+                namespace = %namespace,
+                error = %error,
+                "retained-namespace fence reconciliation delete retry failed; retaining fence"
+            );
+            return false;
+        }
+        Err(_) => {
+            tracing::warn!(
+                namespace = %namespace,
+                "retained-namespace fence reconciliation delete retry timed out; retaining fence"
+            );
+            return false;
+        }
+    }
+    // The delete was accepted. Confirm absence within the probe budget;
+    // a still-live object (Terminating under finalizers) retains the fence
+    // and converges via the deletionTimestamp path on the next cycle.
+    match tokio::time::timeout(RETAINED_NAMESPACE_PROBE_TIMEOUT, api.get_opt(namespace)).await {
+        Ok(Ok(None)) => true,
+        Ok(Ok(Some(_))) => {
+            tracing::info!(
+                namespace = %namespace,
+                "retained-namespace fence reconciliation delete accepted; awaiting observed 404"
+            );
+            false
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(
+                namespace = %namespace,
+                error = %error,
+                "retained-namespace fence reconciliation cannot confirm delete; retaining fence"
+            );
+            false
+        }
+        Err(_) => {
+            tracing::warn!(
+                namespace = %namespace,
+                "retained-namespace fence reconciliation absence probe timed out; retaining fence"
+            );
+            false
+        }
+    }
+}
+
 /// Testable core of [`release_retained_deployment_namespace_fences`]: the
 /// Kubernetes observation is made through the supplied client.
 async fn release_retained_deployment_namespace_fences_with(
@@ -1112,14 +1197,13 @@ async fn release_retained_deployment_namespace_fences_with(
         // orphan-repair loop) for the client's full 295 s read timeout. A
         // timed-out probe is treated exactly like a GET error: retain the
         // fence and revisit next cycle.
-        let absence = match tokio::time::timeout(
+        let live = match tokio::time::timeout(
             RETAINED_NAMESPACE_PROBE_TIMEOUT,
             api.get_opt(&namespace),
         )
         .await
         {
-            Ok(Ok(None)) => true,
-            Ok(Ok(Some(_))) => false,
+            Ok(Ok(live)) => live,
             Ok(Err(error)) => {
                 // Fail closed: an unobservable namespace must not release.
                 tracing::warn!(
@@ -1135,6 +1219,49 @@ async fn release_retained_deployment_namespace_fences_with(
                     "retained-namespace fence reconciliation probe timed out; retaining fence"
                 );
                 continue;
+            }
+        };
+        let absence = match live {
+            None => true,
+            Some(live_namespace) => {
+                if live_namespace.metadata.deletion_timestamp.is_some() {
+                    // A deletion is already converging (the original
+                    // attempt's or an earlier retry's): the fence releases
+                    // only on the observed 404.
+                    continue;
+                }
+                // Still live and NOT deleting: the retained fence's own
+                // delete was lost or never landed, so waiting for a 404
+                // that cannot occur would wedge every later deployment and
+                // app deletion on permanent Busy. Retry the pinned
+                // deletion — but only when the object still classifies as
+                // THIS generation's CAP-created namespace (exact mutation
+                // annotation equal to the retained fence's generation AND
+                // creation evidence): a rewritten or replaced namespace is
+                // never touched.
+                let Ok(generation_value) = MutationGeneration::new(generation) else {
+                    continue;
+                };
+                match classify_initial_namespace_get(&Ok(live_namespace), generation_value) {
+                    InitialNamespaceOwnership::Owned {
+                        uid,
+                        resource_version,
+                    } => {
+                        if !retry_retained_namespace_delete(&api, &namespace, uid, resource_version)
+                            .await
+                        {
+                            continue;
+                        }
+                        true
+                    }
+                    _ => {
+                        // Live but no longer provably ours (external
+                        // rewrite or same-named replacement): keep the
+                        // conservative contract — only positive evidence of
+                        // absence releases the fence.
+                        continue;
+                    }
+                }
             }
         };
         if !absence {
@@ -1190,6 +1317,33 @@ async fn release_retained_deployment_namespace_fences_with(
         .execute(&mut *tx)
         .await?;
         let released_row = result.rows_affected() == 1;
+        if released_row {
+            // The release only happens on CONFIRMED absence, so the failed
+            // deployment's provider-state evidence is provably stale: clear
+            // it exactly like the cleanup path does on `ConfirmedAbsent`.
+            // Leaving it set would keep the storage-size guard armed (and
+            // the row's cleanup marker lingering) for state that no longer
+            // exists. Best-effort bookkeeping: failing to clear only keeps
+            // the previous (more conservative) behavior.
+            if let Err(error) = sqlx::query(
+                "UPDATE deployments
+                    SET manifest_hash = NULL,
+                        observing_since = NULL,
+                        cleanup_sweep_incomplete = false
+                  WHERE id = $1 AND status = 'failed'",
+            )
+            .bind(operation_id)
+            .execute(&mut *tx)
+            .await
+            {
+                tracing::warn!(
+                    namespace = %namespace,
+                    operation_id = %operation_id,
+                    error = %error,
+                    "retained-namespace fence reconciliation could not clear the converged row's provider-state evidence"
+                );
+            }
+        }
         // Clear the retained app owner only under the same guards the
         // documented operator path uses: the app row must still be this
         // exact operation's (token + operation id), expired, and hold no
@@ -2456,14 +2610,23 @@ mod tests {
     const MOCK_NS_LIVE: u8 = 0;
     const MOCK_NS_ABSENT: u8 = 1;
     const MOCK_NS_ERROR: u8 = 2;
+    /// A live namespace still carrying the exact mutation-generation and
+    /// creation-evidence annotations of a given generation: the reconciler's
+    /// ownership re-classification must accept it and retry the pinned
+    /// delete. Any DELETE flips the mock to [`MOCK_NS_ABSENT`] and answers
+    /// success, so a bounded re-probe observes the 404.
+    const MOCK_NS_OURS: u8 = 3;
 
     /// A mock Kubernetes API server reporting namespaces live (200), gone
     /// (404), or unobservable (500), switchable at runtime. When a race
     /// target is configured, a GET of that namespace first bumps the fence's
     /// generation in the database — injecting the SELECT-then-UPDATE race the
-    /// release compare-and-swap must survive.
+    /// release compare-and-swap must survive. When `ours_generation` is set,
+    /// [`MOCK_NS_OURS`] serves a namespace carrying that generation's
+    /// ownership annotations.
     async fn mock_namespace_api_server(
         race: Option<(PgPool, String)>,
+        ours_generation: Arc<std::sync::atomic::AtomicI64>,
     ) -> (
         String,
         Arc<std::sync::atomic::AtomicU8>,
@@ -2473,9 +2636,11 @@ mod tests {
         use axum::response::IntoResponse;
         let mode = Arc::new(std::sync::atomic::AtomicU8::new(MOCK_NS_LIVE));
         let state = mode.clone();
+        let ours = ours_generation;
         let app = Router::new().fallback(move |request: axum::extract::Request| {
             let absent = state.clone();
             let race = race.clone();
+            let ours = ours.clone();
             async move {
                 let name = request
                     .uri()
@@ -2499,6 +2664,19 @@ mod tests {
                     .await
                     .expect("race mutation bumps retained fence generation");
                 }
+                if request.method() == axum::http::Method::DELETE {
+                    // Accept the delete and converge: subsequent probes
+                    // observe the 404.
+                    absent.store(MOCK_NS_ABSENT, std::sync::atomic::Ordering::SeqCst);
+                    return (
+                        StatusCode::OK,
+                        axum::Json(serde_json::json!({
+                            "apiVersion": "v1", "kind": "Status",
+                            "status": "Success", "code": 200
+                        })),
+                    )
+                        .into_response();
+                }
                 match absent.load(std::sync::atomic::Ordering::SeqCst) {
                     MOCK_NS_ABSENT => (
                         StatusCode::NOT_FOUND,
@@ -2518,6 +2696,32 @@ mod tests {
                         })),
                     )
                         .into_response(),
+                    MOCK_NS_OURS => {
+                        let generation = ours.load(std::sync::atomic::Ordering::SeqCst);
+                        let annotations = std::collections::BTreeMap::from([
+                            (
+                                enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION
+                                    .to_string(),
+                                generation.to_string(),
+                            ),
+                            (
+                                enclava_engine::apply::generation::NAMESPACE_CREATED_BY_ANNOTATION
+                                    .to_string(),
+                                generation.to_string(),
+                            ),
+                        ]);
+                        (
+                            StatusCode::OK,
+                            axum::Json(serde_json::json!({
+                                "apiVersion": "v1", "kind": "Namespace",
+                                "metadata": {
+                                    "name": name, "uid": "fixture", "resourceVersion": "1",
+                                    "annotations": annotations
+                                }
+                            })),
+                        )
+                            .into_response()
+                    }
                     _ => (
                         StatusCode::OK,
                         axum::Json(serde_json::json!({
@@ -2632,8 +2836,11 @@ mod tests {
             .await
             .expect("hard-delete vanished-app fixture app row");
 
-        let (server_url, mode, server) =
-            mock_namespace_api_server(Some((pool.clone(), namespace_two.clone()))).await;
+        let (server_url, mode, server) = mock_namespace_api_server(
+            Some((pool.clone(), namespace_two.clone())),
+            Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        )
+        .await;
         let client = mock_kube_client(&server_url);
 
         // An unobservable namespace (GET error) must retain the fence.

@@ -252,7 +252,11 @@ where
 /// FieldsV1 flattener refuses to attribute — rejecting the whole entry
 /// there would drop creation evidence on every StatefulSet reapply. Fails
 /// closed when managed fields are absent entirely.
-fn annotation_owned_by_manager<K>(resource: &K, annotation_key: &str, field_manager: &str) -> bool
+pub fn annotation_owned_by_manager<K>(
+    resource: &K,
+    annotation_key: &str,
+    field_manager: &str,
+) -> bool
 where
     K: Resource,
 {
