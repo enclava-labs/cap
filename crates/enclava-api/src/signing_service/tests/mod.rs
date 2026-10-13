@@ -1362,8 +1362,11 @@ fn sign_response_verifies_against_signing_service_pin_and_not_a_trustee_pin() {
     let err = artifacts
         .validate_signed_artifact(&artifact, &trustee_pubkey_hex)
         .unwrap_err();
+    // The ed25519 check runs first (#128), so a wrong pin surfaces
+    // InvalidSignature — the artifact does not verify against the trustee
+    // pin, which is the cap#118 producer contract.
     assert!(
-        matches!(err, SigningServiceError::Mismatch(ref field) if field == "artifact.verify_pubkey_b64"),
+        matches!(err, SigningServiceError::InvalidSignature),
         "/sign output must not verify against a different pin, got: {err:?}"
     );
 }
