@@ -30,6 +30,22 @@ DEV_FIXTURE_TRUSTEE_POLICY_SEED_HEX = "c1" * 32
 # Public key of the dev-fixture trustee seed (Ed25519 seed -> pubkey, derived
 # once and pinned so the fixture envelope stays byte-stable).
 DEV_FIXTURE_TRUSTEE_POLICY_KEY_HEX = "acdcc8494d458f44a7aaac1d6a84ec624daee88436db2ae26e67ba645a106228"
+
+
+def dev_fixture_signing_root_pubkey() -> bytes:
+    """Public half of DEV_FIXTURE_SIGNING_KEY_HEX (the dev-fixture release
+    root). Signing with the fixture seed is the fixture root regardless of
+    flags, so fixture-root privileges key off this value, not --dev-fixture-key."""
+    return (
+        Ed25519PrivateKey.from_private_bytes(bytes.fromhex(DEV_FIXTURE_SIGNING_KEY_HEX))
+        .public_key()
+        .public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+    )
+
+
 DEFAULT_RELEASE_PATH = Path(__file__).resolve().parents[1] / "platform-release.json"
 GHCR_DIGEST_RE = re.compile(
     r"^ghcr\.io/enclava-labs/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$"
@@ -440,6 +456,23 @@ def generate(args: argparse.Namespace) -> str:
         encoding=serialization.Encoding.Raw,
         format=serialization.PublicFormat.Raw,
     )
+    # Mirror of the Rust release validators (verify_envelope): the dev-fixture
+    # trustee policy key's seed is public, so a non-fixture root must never
+    # sign a release pinning it — anyone with the repo could then forge policy
+    # envelopes the TEE accepts. Refuse at signing time instead of emitting an
+    # envelope every verifier rejects under a production root.
+    if (
+        hex32_bytes(
+            "platform_trustee_policy_pubkey_hex",
+            payload["platform_trustee_policy_pubkey_hex"],
+        )
+        == bytes.fromhex(DEV_FIXTURE_TRUSTEE_POLICY_KEY_HEX)
+        and public_key != dev_fixture_signing_root_pubkey()
+    ):
+        raise SystemExit(
+            "platform_trustee_policy_pubkey_hex pins the dev-fixture trustee policy key; "
+            "a production root must not sign it (fixture releases need --dev-fixture-key)"
+        )
     signature = private_key.sign(canonical_platform_release_bytes(payload))
     envelope = {
         "payload": payload,
