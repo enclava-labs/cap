@@ -2458,6 +2458,42 @@ async fn fail_apply_job_with_mutation(
     {
         retain_namespace_fence = true;
     }
+    // Persist the retained-namespace marker IMMEDIATELY after the teardown
+    // outcome, before the unrelated KBS reconciliation below: the namespace
+    // DELETE may already be in flight or stuck on finalizers, and a process
+    // exit during that reconciliation window would otherwise leave the row
+    // labeled `deployment_apply`, letting
+    // `reconcile_orphaned_deployment_apply_leases` convert the intentional
+    // infinite retention into the ordinary finite quarantine and permit
+    // namespace reuse while the old deletion is still unresolved. The
+    // marker method keeps the heartbeat running so the lease stays
+    // renewable (and guard_provider stays armed) for the KBS work; renewal
+    // never extends a `reclaim_after = infinity` row, and the reconciler's
+    // release CAS simply waits for the last `locked_until` to elapse.
+    let mut retain_marker_persisted = false;
+    if published
+        && retain_namespace_fence
+        && let Some(mutation) = mutation.as_mut()
+    {
+        match mutation
+            .retain_resource_scope_under_marker(
+                "kubernetes_namespace",
+                crate::mutation_leases::RETAINED_DEPLOYMENT_NAMESPACE_OPERATION,
+            )
+            .await
+        {
+            Ok(()) => {
+                retain_marker_persisted = true;
+            }
+            Err(retain_error) => {
+                tracing::error!(
+                    deployment_id = %job.deployment_id,
+                    error_code = DeploymentJobError::from(retain_error).code(),
+                    "failed to retain the namespace fence after incomplete teardown; falling back to bounded quarantine"
+                );
+            }
+        }
+    }
     if published && let Some(mutation) = mutation.as_mut() {
         if reconcile_pending_kbs_with_mutation(state, mutation)
             .await
@@ -2478,38 +2514,14 @@ async fn fail_apply_job_with_mutation(
             );
         }
     }
-    if published && let Some(mut mutation) = mutation {
-        if retain_namespace_fence {
-            // The namespace may still be Terminating (e.g. under Longhorn PVC
-            // finalizers). Convert every other scope to the bounded reclaim
-            // quarantine but leave the kubernetes_namespace scope armed under
-            // the retained-namespace marker operation until reconciliation
-            // confirms the namespace is gone — mirroring the app-delete
-            // fail-closed teardown contract. The marker relabel is what keeps
-            // `reconcile_orphaned_deployment_apply_leases` (which joins on
-            // `operation_kind = 'deployment_apply'`) from re-bounding this
-            // intentionally retained fence to the 360s quarantine while a
-            // crashed worker's pre-arm stays repairable.
-            if let Err(retain_error) = mutation
-                .retain_resource_scope_under_marker(
-                    "kubernetes_namespace",
-                    crate::mutation_leases::RETAINED_DEPLOYMENT_NAMESPACE_OPERATION,
-                )
-                .await
-            {
-                tracing::error!(
-                    deployment_id = %job.deployment_id,
-                    error_code = DeploymentJobError::from(retain_error).code(),
-                    "failed to retain the namespace fence after incomplete teardown; falling back to bounded quarantine"
-                );
-                if let Err(release_error) = mutation.release_after_provider_quarantine().await {
-                    tracing::error!(
-                        deployment_id = %job.deployment_id,
-                        error_code = DeploymentJobError::from(release_error).code(),
-                        "failed to bound failed deployment mutation leases"
-                    );
-                }
-            }
+    if published && let Some(mutation) = mutation {
+        if retain_marker_persisted {
+            // The namespace scope stays armed under the retained-namespace
+            // marker operation until reconciliation confirms the namespace
+            // is gone — mirroring the app-delete fail-closed teardown
+            // contract. Every other scope already carries its bounded
+            // claim-time quarantine, and dropping the lease stops renewal
+            // so the reconciler's expiry CAS becomes eligible.
         } else if let Err(release_error) = mutation.release_after_provider_quarantine().await {
             tracing::error!(
                 deployment_id = %job.deployment_id,

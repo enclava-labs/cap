@@ -1004,10 +1004,13 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
             // Kubernetes writes, not the row's creation (acceptance
             // precedes setup/signing/apply by an unbounded margin, and a
             // tenant could create a same-named claim in between).
-            // observing_since is persisted at the first apply attempt of
-            // the failed generation (COALESCE keeps the earliest), which
-            // is exactly the start of CAP's write window; fall back to
-            // created_at only when it was never set.
+            // apply_started_at is stamped at the 'applying' transition —
+            // immediately before the first Kubernetes write — so it is
+            // set for exactly the partial applies this cleanup
+            // compensates (observing_since only appears AFTER a fully
+            // successful apply). Legacy rows fall back to observing_since
+            // (a failed apply that had completed its writes) and finally
+            // created_at.
             // The bound is the EARLIEST write-window start across this
             // row AND every still-incomplete sibling row: a completed
             // sweep clears those siblings' evidence (their shared-name
@@ -1016,7 +1019,7 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
             // pre-sibling claim is skipped here and then forgotten when
             // the marker clears.
             let apply_started_at = sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
-                "SELECT MIN(COALESCE(observing_since, created_at)) FROM deployments WHERE app_id = $1 AND (id = $2 OR cleanup_sweep_incomplete)",
+                "SELECT MIN(COALESCE(apply_started_at, observing_since, created_at)) FROM deployments WHERE app_id = $1 AND (id = $2 OR cleanup_sweep_incomplete)",
             )
             .bind(app.id)
             .bind(failed_deployment_id)
@@ -1536,33 +1539,33 @@ async fn delete_owned_namespace(
             Ok(result) => result,
             Err(_elapsed) => {
                 // The DELETE exceeded its request budget: whether it was
-                // accepted is undecidable. Blindly retaining the fence
-                // deadlocks when the namespace is live (the reconciler
-                // releases only on an observed 404); blindly releasing
-                // destroys the guard when a delete IS in flight.
-                // Re-probe under the same budget: absent -> retain (a
-                // delete may be converging; reconciler observes the 404);
-                // live -> nothing is in flight (mark incomplete,
-                // release — a later failed generation retries).
+                // accepted is undecidable. Releasing the fence would let a
+                // later deployment claim the name while Kubernetes may
+                // still be processing the original DELETE (or the object
+                // sits Terminating under finalizers); the retained-fence
+                // reconciler now converges BOTH cases — it observes the
+                // eventual 404 for a converging delete, and retries the
+                // UID+resourceVersion-pinned delete after full
+                // re-classification when the namespace is live and not
+                // deleting. Retain on every ambiguous outcome.
                 tracing::warn!(
                     app_id = %app.id,
                     namespace = %app.namespace,
-                    "failed-apply namespace delete exceeded its request budget; re-probing before deciding"
+                    "failed-apply namespace delete exceeded its request budget; retaining the namespace fence for reconciliation"
                 );
-                return match tokio::time::timeout(
+                // The re-probe itself is not decisive: absence may mean the
+                // delete is converging (the reconciler observes the 404),
+                // and a live object may be Terminating with the delete in
+                // flight. The reconciler converges both — it observes the
+                // eventual 404, or retries the UID+resourceVersion-pinned
+                // delete after full re-classification when live and not
+                // deleting. Retain on every outcome.
+                let _ = tokio::time::timeout(
                     NAMESPACE_DELETE_REQUEST_TIMEOUT,
                     api.get_opt(&app.namespace),
                 )
-                .await
-                {
-                    Ok(Ok(None)) => NamespaceTeardown::DeleteIncomplete,
-                    Ok(Ok(Some(_))) => NamespaceTeardown::DeleteNotIssued,
-                    Ok(Err(_)) | Err(_) => {
-                        // Undecidable absence: the conservative arm
-                        // retains; the reconciler re-probes each cycle.
-                        NamespaceTeardown::DeleteIncomplete
-                    }
-                };
+                .await;
+                return NamespaceTeardown::DeleteIncomplete;
             }
         };
         match delete_result {

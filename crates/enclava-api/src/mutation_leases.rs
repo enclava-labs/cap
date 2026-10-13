@@ -351,12 +351,20 @@ impl AppMutationLease {
     /// PVC finalizers — stays fenced until explicitly cleared after the
     /// namespace is observed gone, while a crashed worker's pre-arm (still
     /// labeled `deployment_apply`) remains repairable by the loop.
+    ///
+    /// The heartbeat keeps running: unlike the terminal retain paths, this
+    /// marker is persisted EARLY — before unrelated follow-up provider work
+    /// (KBS reconciliation) that may itself take unbounded time — so the
+    /// lease must stay renewable while that work runs. A crash during that
+    /// window still leaves the durable marker armed exactly as intended;
+    /// renewal only extends `locked_until`/`reclaim_after` for rows whose
+    /// `reclaim_after` is not already `'infinity'`, so the poisoned scope
+    /// stays retained regardless.
     pub async fn retain_resource_scope_under_marker(
         &mut self,
         resource_scope: &str,
         marker_operation_kind: &str,
     ) -> Result<(), MutationLeaseError> {
-        self.stop_heartbeat();
         let mut tx = self.pool.begin().await?;
         crate::deploy::lock_app_deployment_lane(&mut tx, self.app_id).await?;
         let retained =
@@ -1321,16 +1329,29 @@ async fn release_retained_deployment_namespace_fences_with(
             // The release only happens on CONFIRMED absence, so the failed
             // deployment's provider-state evidence is provably stale: clear
             // it exactly like the cleanup path does on `ConfirmedAbsent`.
-            // Leaving it set would keep the storage-size guard armed (and
-            // the row's cleanup marker lingering) for state that no longer
-            // exists. Best-effort bookkeeping: failing to clear only keeps
-            // the previous (more conservative) behavior.
+            // Sibling incomplete rows of the same app clear too: the
+            // namespace deletion cascaded over every object their sweeps
+            // targeted (shared names across generations), so their
+            // retained evidence is equally stale — leaving it would keep
+            // the storage-size guard in routes/deployments.rs permanently
+            // armed for an app with no remaining workload. Best-effort
+            // bookkeeping: failing to clear only keeps the previous (more
+            // conservative) behavior.
             if let Err(error) = sqlx::query(
                 "UPDATE deployments
                     SET manifest_hash = NULL,
                         observing_since = NULL,
                         cleanup_sweep_incomplete = false
-                  WHERE id = $1 AND status = 'failed'",
+                  WHERE status = 'failed'
+                    AND (
+                        id = $1
+                        OR (
+                            cleanup_sweep_incomplete
+                            AND app_id = (
+                                SELECT app_id FROM deployments WHERE id = $1
+                            )
+                        )
+                    )",
             )
             .bind(operation_id)
             .execute(&mut *tx)
@@ -2716,7 +2737,23 @@ mod tests {
                                 "apiVersion": "v1", "kind": "Namespace",
                                 "metadata": {
                                     "name": name, "uid": "fixture", "resourceVersion": "1",
-                                    "annotations": annotations
+                                    "annotations": annotations,
+                                    "managedFields": [{
+                                        "manager": "enclava-platform",
+                                        "apiVersion": "v1",
+                                        "time": "2026-01-01T00:00:00Z",
+                                        "fieldsType": "FieldsV1",
+                                        "fieldsV1": {
+                                            "f:metadata": {
+                                                "f:annotations": {
+                                                    format!(
+                                                        "f:{}",
+                                                        enclava_engine::apply::generation::NAMESPACE_CREATED_BY_ANNOTATION
+                                                    ): {}
+                                                }
+                                            }
+                                        }
+                                    }]
                                 }
                             })),
                         )
@@ -2987,6 +3024,125 @@ mod tests {
                 .execute(&pool)
                 .await
                 .expect("remove retained-fence organization fixture");
+        }
+    }
+
+    /// A retained fence whose namespace is still LIVE but still classifies
+    /// as the failed generation's CAP-created namespace (exact mutation
+    /// annotation + manager-attributed creation evidence + fresh UID/RV)
+    /// must have its pinned DELETE retried by the reconciler — the "delete
+    /// was lost or never landed" arm of
+    /// [`release_retained_deployment_namespace_fences`]. A same-shaped
+    /// namespace whose annotation generation no longer matches the fence is
+    /// never deleted.
+    #[tokio::test]
+    async fn retained_namespace_fence_retries_pinned_delete_for_live_owned_namespace() {
+        let pool = database_test_pool(2).await;
+
+        // Cycle one: exactly one retained fence, served as a live namespace
+        // carrying that fence generation's ownership annotations with CAP
+        // managed-fields provenance. The reconciler must re-classify it as
+        // Owned, retry the UID+resourceVersion-pinned DELETE (the mock
+        // accepts it and converges to 404), and release the fence on the
+        // confirmed absence of the same cycle.
+        let (org_one, _app_one, _owner_one, namespace_one) =
+            stage_retained_namespace_fixture(&pool, Vec::new()).await;
+        let fence_generation: i64 = sqlx::query_scalar(
+            "SELECT generation FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1",
+        )
+        .bind(&namespace_one)
+        .fetch_one(&pool)
+        .await
+        .expect("load retained fence generation");
+
+        let (server_url, mode, server) = mock_namespace_api_server(
+            None,
+            Arc::new(std::sync::atomic::AtomicI64::new(fence_generation)),
+        )
+        .await;
+        let client = mock_kube_client(&server_url);
+
+        mode.store(MOCK_NS_OURS, std::sync::atomic::Ordering::SeqCst);
+        let released = release_retained_deployment_namespace_fences_with(&pool, client.clone())
+            .await
+            .expect("reconcile retained fence against a live owned namespace");
+        assert_eq!(
+            released, 1,
+            "the pinned delete retry releases the fence after confirmed absence"
+        );
+        let one_owner: Option<Uuid> =
+            sqlx::query_scalar("SELECT owner_token FROM external_resource_mutation_leases WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1")
+                .bind(&namespace_one)
+                .fetch_one(&pool)
+                .await
+                .expect("verify retried fence owner");
+        assert_eq!(
+            one_owner, None,
+            "the live owned namespace's retried delete released the exact fence"
+        );
+        assert_eq!(
+            mode.load(std::sync::atomic::Ordering::SeqCst),
+            MOCK_NS_ABSENT,
+            "the reconciler issued the pinned DELETE (mock converged)"
+        );
+
+        // Cycle two: a fresh retained fence whose namespace is served with
+        // the SAME annotations but whose fence generation was bumped — the
+        // live object no longer classifies as this fence's generation, so
+        // no delete may be issued and the fence stays retained.
+        let (org_two, _app_two, _owner_two, namespace_two) =
+            stage_retained_namespace_fixture(&pool, Vec::new()).await;
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET generation = generation + 1
+              WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1",
+        )
+        .bind(&namespace_two)
+        .execute(&pool)
+        .await
+        .expect("advance the second fixture's fence generation");
+        mode.store(MOCK_NS_OURS, std::sync::atomic::Ordering::SeqCst);
+        let released = release_retained_deployment_namespace_fences_with(&pool, client.clone())
+            .await
+            .expect("reconcile retained fence against a replaced-generation namespace");
+        assert_eq!(
+            released, 0,
+            "a namespace that no longer classifies as the fence's generation is never deleted"
+        );
+        let two_owner: Option<Uuid> =
+            sqlx::query_scalar("SELECT owner_token FROM external_resource_mutation_leases WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1")
+                .bind(&namespace_two)
+                .fetch_one(&pool)
+                .await
+                .expect("verify non-matching fence owner");
+        assert!(
+            two_owner.is_some(),
+            "the non-matching retained fence stays retained"
+        );
+        assert_eq!(
+            mode.load(std::sync::atomic::Ordering::SeqCst),
+            MOCK_NS_OURS,
+            "no DELETE was issued against the non-matching namespace"
+        );
+
+        server.abort();
+        for namespace in [&namespace_one, &namespace_two] {
+            sqlx::query(
+                "DELETE FROM external_resource_mutation_leases
+                  WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1",
+            )
+            .bind(namespace)
+            .execute(&pool)
+            .await
+            .expect("remove retry-fixture fence");
+        }
+        for org in [org_one, org_two] {
+            sqlx::query("DELETE FROM organizations WHERE id = $1")
+                .bind(org)
+                .execute(&pool)
+                .await
+                .expect("remove retry-fixture organization");
         }
     }
 }

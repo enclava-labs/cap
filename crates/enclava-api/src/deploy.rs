@@ -1871,6 +1871,10 @@ pub async fn set_deployment_status(
              observing_since = CASE
                  WHEN $1 = 'watching' THEN COALESCE(observing_since, clock_timestamp())
                  ELSE observing_since
+             END,
+             apply_started_at = CASE
+                 WHEN $1 = 'applying' THEN COALESCE(apply_started_at, clock_timestamp())
+                 ELSE apply_started_at
              END
          WHERE id = $5",
     )
