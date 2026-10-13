@@ -366,7 +366,7 @@ fn bad_request(message: &str) -> (StatusCode, Json<serde_json::Value>) {
 }
 
 /// keyring payloads are persisted as UTF-8 JSON that PostgreSQL must be able
-/// to re-parse as jsonb (migration 0058's shape CHECK, and the candidate
+/// to re-parse as jsonb (migration 0061's shape CHECK, and the candidate
 /// selector's cast).  serde_json is stricter than jsonb in exactly one
 /// practical way: it accepts `\u0000` escapes that jsonb cannot represent.
 /// The writers persist the client-supplied payload verbatim while
@@ -687,7 +687,7 @@ pub async fn put_keyring(
         .map_err(|_| db_error())?;
         // A new keyring generation can revoke the signer of retained signed
         // policy artifacts; the owed generation bump is deferred to
-        // migration 0058's INSERT trigger (durable selector debt) and
+        // migration 0061's INSERT trigger (durable selector debt) and
         // consumed only after the filtered policy body is published, never
         // bumped directly here.
     }
@@ -7052,6 +7052,23 @@ mod tests {
     #[tokio::test]
     async fn owner_rotation_recovery_allows_remaining_owner_with_foreign_replacement_key() {
         let pool = database_test_pool().await;
+        // Run as an unsigned install: this test asserts keyring authority,
+        // not KBS publication, and the shared database's singleton row must
+        // stay out of active signed mode for the whole flow.
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 0,
+                    selector_bumps_owed = 0,
+                    configmap_generation = 0,
+                    applied_generation = 0,
+                    configmap_policy_sha256 = NULL,
+                    applied_policy_sha256 = NULL,
+                    configmap_resource_version = NULL
+              WHERE singleton",
+        )
+        .execute(&pool)
+        .await
+        .expect("reset shared signed-policy singleton to unsigned mode");
         let org_id = Uuid::new_v4();
         let removed_user_id = Uuid::new_v4();
         let remaining_user_id = Uuid::new_v4();
