@@ -186,10 +186,12 @@ impl PlatformRelease {
     }
 
     pub fn signing_service_pubkey_bytes(&self) -> Result<[u8; 32], PlatformReleaseError> {
-        hex32(
+        let bytes = hex32(
             "signing_service_pubkey_hex",
             &self.signing_service_pubkey_hex,
-        )
+        )?;
+        require_ed25519_point("signing_service_pubkey_hex", &bytes)?;
+        Ok(bytes)
     }
 
     /// Dedicated in-TEE policy authority key. Must differ from
@@ -197,10 +199,12 @@ impl PlatformRelease {
     /// (in-TEE policy authority vs off-cluster signing service) and a
     /// release that collapses them is rejected at validation time.
     pub fn platform_trustee_policy_pubkey_bytes(&self) -> Result<[u8; 32], PlatformReleaseError> {
-        hex32(
+        let bytes = hex32(
             "platform_trustee_policy_pubkey_hex",
             &self.platform_trustee_policy_pubkey_hex,
-        )
+        )?;
+        require_ed25519_point("platform_trustee_policy_pubkey_hex", &bytes)?;
+        Ok(bytes)
     }
 }
 
@@ -426,6 +430,24 @@ fn hex32(field: &'static str, value: &str) -> Result<[u8; 32], PlatformReleaseEr
         .map_err(|bytes: Vec<u8>| PlatformReleaseError::InvalidField {
             field,
             message: format!("expected 32 bytes, got {}", bytes.len()),
+        })
+}
+
+/// A pin that the consumers cannot parse must fail release ingestion (and
+/// ceremony signing), not tenant boots: enclava-init's `parse_pubkey` calls
+/// `VerifyingKey::from_bytes` and aborts verification on failure, so one
+/// malformed key in a signed release would prevent every workload from
+/// starting. Verify the exact Ed25519 point encoding the consumers enforce
+/// (codex cap#218 P2).
+fn require_ed25519_point(
+    field: &'static str,
+    bytes: &[u8; 32],
+) -> Result<(), PlatformReleaseError> {
+    ed25519_dalek::VerifyingKey::from_bytes(bytes)
+        .map(|_| ())
+        .map_err(|err| PlatformReleaseError::InvalidField {
+            field,
+            message: format!("not a valid Ed25519 public key: {err}"),
         })
 }
 
@@ -1067,6 +1089,36 @@ mod tests {
         let err = validate_release_payload(&payload).unwrap_err();
         assert!(
             matches!(err, PlatformReleaseError::InvalidField { field, .. } if field == "platform_trustee_policy_pubkey_hex")
+        );
+    }
+
+    #[test]
+    fn release_payload_rejects_non_point_policy_keys() {
+        // codex cap#218 P2: both pins are parsed with
+        // VerifyingKey::from_bytes by the consumers (enclava-init
+        // parse_pubkey) and abort verification on failure, so a pin that is
+        // not a valid Ed25519 point would brick every workload at boot.
+        // Ingestion (and ceremony signing, which validates first) must
+        // reject it instead. The compressed encoding of a y with no Edwards
+        // point on the curve (e.g. y = 2 for edwards25519) is the canonical
+        // rejection case.
+        let raw: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
+        let non_point = format!("02{}", "00".repeat(31));
+        let mut payload = raw.payload.clone();
+        payload.platform_trustee_policy_pubkey_hex = non_point.clone();
+        let err = validate_release_payload(&payload).unwrap_err();
+        assert!(
+            matches!(err, PlatformReleaseError::InvalidField { field, message }
+                if field == "platform_trustee_policy_pubkey_hex"
+                    && message.contains("not a valid Ed25519 public key"))
+        );
+        let mut payload = raw.payload;
+        payload.signing_service_pubkey_hex = non_point;
+        let err = validate_release_payload(&payload).unwrap_err();
+        assert!(
+            matches!(err, PlatformReleaseError::InvalidField { field, message }
+                if field == "signing_service_pubkey_hex"
+                    && message.contains("not a valid Ed25519 public key"))
         );
     }
 

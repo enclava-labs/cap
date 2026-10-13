@@ -482,6 +482,12 @@ impl ConfidentialApp {
             .as_ref()
             .is_some_and(|binding| binding.legacy_collapsed_trustee_key)
         {
+            // The pin is only set once a render that included the
+            // signing-service key matched the artifact's signed hash, so the
+            // signing key is always present here. The `.or(...)` fallback is
+            // unreachable in practice; it only keeps the helper total — it
+            // cannot reproduce a signed value that never contained the
+            // trustee key.
             return self
                 .attestation
                 .signing_service_pubkey_hex

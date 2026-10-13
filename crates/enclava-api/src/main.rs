@@ -355,6 +355,12 @@ fn load_pubkey_hex_value(
     if raw.len() != 32 {
         anyhow::bail!("invalid {name}: expected 32-byte Ed25519 public key hex");
     }
+    // Same parse enclava-init applies (VerifyingKey::from_bytes): a pin that
+    // is not a valid Ed25519 point would abort in-TEE verification and brick
+    // every workload, so fail startup instead (codex cap#218 P2).
+    let arr: [u8; 32] = raw.try_into().expect("length checked above");
+    ed25519_dalek::VerifyingKey::from_bytes(&arr)
+        .map_err(|e| anyhow::anyhow!("invalid {name}: not a valid Ed25519 public key: {e}"))?;
     Ok(Some(value.to_ascii_lowercase()))
 }
 
@@ -1121,6 +1127,27 @@ mod tests {
         }
         let err = load_policy_authority_pubkeys(None).unwrap_err();
         assert!(err.to_string().contains("must be distinct keys"));
+    }
+
+    #[test]
+    fn policy_authority_pubkeys_reject_non_point_encoding() {
+        // codex cap#218 P2: enclava-init parses both pins with
+        // VerifyingKey::from_bytes and aborts verification on failure, so a
+        // pin that is not a valid Ed25519 point would brick every workload.
+        // Startup must reject it instead. The compressed encoding of a y
+        // with no Edwards point on the curve (e.g. y = 2 for edwards25519)
+        // is the canonical rejection case.
+        let _env_mutex = POLICY_ENV_TEST_MUTEX.lock().unwrap();
+        let _guard = EnvGuard::new();
+        let non_point = format!("02{}", "00".repeat(31));
+        unsafe {
+            std::env::set_var("PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX", &non_point);
+        }
+        let err = load_policy_authority_pubkeys(None).unwrap_err();
+        assert!(
+            err.to_string().contains("not a valid Ed25519 public key"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
