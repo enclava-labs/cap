@@ -1420,13 +1420,19 @@ fn deployment_history_lookup_budget(wait_deadline: Instant) -> Duration {
     DEPLOYMENT_HISTORY_LOOKUP_BUDGET.min(wait_deadline.saturating_duration_since(Instant::now()))
 }
 
-/// Budget for one deployment-state lookup (apply-start, health waits): the
-/// full remaining wait budget. These lookups are how the CLI observes deploy
-/// state at all, so a response slower than the advisory cap must still be
-/// allowed to arrive (cap#220 review follow-up) -- the bound by the wait's
-/// remaining time still guarantees no lookup outlives its wait.
-fn remaining_wait_budget(wait_deadline: Instant) -> Duration {
-    wait_deadline.saturating_duration_since(Instant::now())
+/// Per-attempt budget for one deployment-state lookup (apply-start, health
+/// waits). These lookups are how the CLI observes deploy state at all, so the
+/// budget must comfortably exceed the advisory cap -- a response slower than
+/// 15s must still be observed (cap#220 review follow-up) -- but stay finite:
+/// a single stalled request must not block the loop from retrying once the
+/// endpoint recovers (cap#220 review follow-up #2). Always bounded by the
+/// wait's remaining time; a passed deadline yields zero budget and skips the
+/// request, so no lookup outlives its wait and no state is ever observed too
+/// late to matter.
+const STATE_HISTORY_ATTEMPT_BUDGET: Duration = Duration::from_secs(60);
+
+fn state_history_attempt_budget(wait_deadline: Instant) -> Duration {
+    STATE_HISTORY_ATTEMPT_BUDGET.min(wait_deadline.saturating_duration_since(Instant::now()))
 }
 
 /// Bounded deployment-history fetch shared by the wait loops (cap#220
@@ -1541,7 +1547,7 @@ async fn find_deployment_entry(
     wait_deadline: Instant,
 ) -> Result<Option<DeploymentEntry>, ApiError> {
     Ok(
-        bounded_deployment_history(api, app_name, remaining_wait_budget(wait_deadline))
+        bounded_deployment_history(api, app_name, state_history_attempt_budget(wait_deadline))
             .await?
             .and_then(|deployments| {
                 deployments

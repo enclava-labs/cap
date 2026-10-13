@@ -741,11 +741,12 @@ fn deploy_waits_fail_fast_on_terminal_deployment_failure() {
     }
 
     // The sibling deployment-history lookups (apply-start and health waits)
-    // receive the wait's deadline and may use its FULL remaining budget on
-    // purpose: they are how deploy state is observed at all, so cutting them
-    // at the advisory cap would discard valid slow responses (cap#220 review
-    // follow-up). A stalled response can consume the rest of that one wait,
-    // but never outlive it -- and the 15s cap stays on the advisory failure
+    // receive the wait's deadline and use a FINITE per-attempt budget longer
+    // than the advisory cap: they are how deploy state is observed at all, so
+    // the budget must fit slow-but-valid responses, while staying short enough
+    // that one stalled request is cut and the loop retries once the endpoint
+    // recovers (cap#220 review follow-ups). The wait's own deadline still
+    // bounds every attempt, and the 15s cap stays on the advisory failure
     // check asserted above.
     let dense_source: String = source.chars().filter(|c| !c.is_whitespace()).collect();
     assert_eq!(
@@ -792,14 +793,16 @@ fn deployment_history_lookup_budget_is_capped_by_the_wait_deadline() {
 }
 
 #[test]
-fn state_history_lookups_use_the_full_wait_budget_not_the_advisory_cap() {
-    // cap#220 review follow-up: the deployment-state lookup (apply-start and
-    // health waits) is how the CLI observes deploy state at all. A response
-    // slower than the advisory cap (e.g. 16s with 600s of wait left) must
-    // still be allowed to arrive, so its budget is the full remaining wait --
-    // while the advisory failure check keeps the small cap so a stalled
-    // endpoint cannot block the readiness polls behind it. Both bounds still
-    // guarantee no lookup outlives its wait.
+fn state_history_lookups_use_a_finite_attempt_budget_not_the_advisory_cap() {
+    // cap#220 review follow-ups: the deployment-state lookup (apply-start and
+    // health waits) is how the CLI observes deploy state at all. Its per-attempt
+    // budget must exceed the advisory cap -- a response slower than 15s (e.g.
+    // 16s with 600s of wait left) must still be allowed to arrive -- but stay
+    // finite and shorter than the wait -- one stalled request must not block
+    // the loop from retrying once the endpoint recovers. The advisory failure
+    // check keeps the small cap so a stalled endpoint cannot block the
+    // readiness polls behind it. Every bound is capped by the remaining wait,
+    // so no lookup ever outlives its wait.
     let source = include_str!("../../app.rs").replace("\r\n", "\n");
     // Whitespace- and comma-insensitive: rustfmt may wrap call arguments
     // one-per-line (adding a trailing comma) without changing the wiring.
@@ -838,26 +841,35 @@ fn state_history_lookups_use_the_full_wait_budget_not_the_advisory_cap() {
     };
     assert!(
         dense(state_lookup).contains(
-            "bounded_deployment_history(apiapp_nameremaining_wait_budget(wait_deadline))"
+            "bounded_deployment_history(apiapp_namestate_history_attempt_budget(wait_deadline))"
         ),
-        "the deployment-state lookup must pass the full remaining wait budget (cap#220 review follow-up): cutting it at the advisory cap discards valid slow responses and hides deploy state"
+        "the deployment-state lookup must pass the finite per-attempt budget (cap#220 review follow-ups): the advisory cap discards valid slow responses, while the full remaining wait lets one stalled request block retries"
     );
 }
 
 #[test]
-fn remaining_wait_budget_is_the_full_wait_not_the_advisory_cap() {
-    // Far deadline: the state lookup may use the entire remaining wait --
-    // well beyond the advisory cap -- but never more than the wait itself.
+fn state_history_attempt_budget_exceeds_the_advisory_cap_but_stays_finite() {
+    // Far deadline: the per-attempt budget is finite (so a stalled attempt is
+    // cut and the loop retries) but comfortably exceeds the advisory cap (so
+    // slow-but-valid responses are observed).
     let far = std::time::Instant::now() + std::time::Duration::from_secs(600);
-    let remaining = remaining_wait_budget(far);
-    assert!(remaining > DEPLOYMENT_HISTORY_LOOKUP_BUDGET);
-    assert!(remaining <= std::time::Duration::from_secs(600));
+    assert_eq!(
+        state_history_attempt_budget(far),
+        STATE_HISTORY_ATTEMPT_BUDGET
+    );
+    assert!(STATE_HISTORY_ATTEMPT_BUDGET > DEPLOYMENT_HISTORY_LOOKUP_BUDGET);
+    assert!(STATE_HISTORY_ATTEMPT_BUDGET < std::time::Duration::from_secs(600));
+    // Nearly exhausted wait: only the remaining time may be used.
+    let nearly_exhausted = std::time::Instant::now() + std::time::Duration::from_millis(300);
+    let budget = state_history_attempt_budget(nearly_exhausted);
+    assert!(budget > std::time::Duration::ZERO);
+    assert!(budget <= std::time::Duration::from_millis(300));
     // Exhausted wait: no lookup may start at all.
-    assert!(remaining_wait_budget(std::time::Instant::now()).is_zero());
+    assert!(state_history_attempt_budget(std::time::Instant::now()).is_zero());
     let past = std::time::Instant::now()
         .checked_sub(std::time::Duration::from_secs(1))
         .unwrap_or_else(std::time::Instant::now);
-    assert!(remaining_wait_budget(past).is_zero());
+    assert!(state_history_attempt_budget(past).is_zero());
 }
 
 #[test]
@@ -2902,9 +2914,10 @@ mod terminal_diagnostics {
         );
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
 
-        // But the deployment-state lookup may use the full remaining wait
-        // budget, so the same slow-but-valid response is observed and the
-        // apply-start/health waits can complete instead of timing out.
+        // But the deployment-state lookup uses the finite per-attempt budget
+        // (longer than the advisory cap), so the same slow-but-valid response
+        // is observed and the apply-start/health waits can complete instead of
+        // timing out.
         let entry = find_deployment_entry(
             &api,
             "demo",
@@ -2915,6 +2928,82 @@ mod terminal_diagnostics {
         .expect("a slow-but-valid history response must not error");
         let entry =
             entry.expect("the state lookup must observe the slow response within its budget");
+        assert_eq!(entry.id, "deploy-1");
+        assert_eq!(entry.status, "healthy");
+    }
+
+    #[tokio::test]
+    async fn stalled_state_lookup_is_cut_and_a_retry_observes_the_recovered_endpoint() {
+        // cap#220 review follow-up #2: one stalled history request must not
+        // consume the whole wait and prevent retries. The attempt is cut at
+        // its budget, and the next attempt observes the recovered endpoint --
+        // exactly the apply-start/health loop behavior with a finite
+        // per-attempt budget.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let connections = std::sync::Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let connections_by_server = connections.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let nth = connections_by_server.fetch_add(1, Ordering::SeqCst) + 1;
+                tokio::spawn(async move {
+                    let mut sink = [0_u8; 4096];
+                    let _ = stream.read(&mut sink).await;
+                    if nth == 1 {
+                        // First request stalls: accept and never answer.
+                        std::future::pending::<()>().await;
+                    }
+                    // The endpoint has recovered: answer promptly.
+                    let body = serde_json::json!([{
+                        "deployment_id": "deploy-1",
+                        "status": "healthy",
+                        "image_digest": null,
+                        "created_at": "2026-10-13T00:00:00Z",
+                        "completed_at": "2026-10-13T00:01:00Z",
+                    }])
+                    .to_string();
+                    let _ = stream
+                            .write_all(
+                                format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                    body.len(),
+                                    body
+                                )
+                                .as_bytes(),
+                            )
+                            .await;
+                });
+            }
+        });
+        let api = ApiClient::new(&format!("http://{address}"), Some("test".to_string()));
+
+        // Attempt 1: the stalled request is cut at the attempt budget and
+        // reads as "no observation" instead of holding the wait open.
+        let started = std::time::Instant::now();
+        let cut = bounded_deployment_history(&api, "demo", std::time::Duration::from_millis(150))
+            .await
+            .expect("a budget cut must not be an error");
+        assert!(
+            cut.is_none(),
+            "the stalled attempt must read as no observation"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+
+        // Attempt 2 (as the wait loop would issue it): the recovered endpoint
+        // answers and the deployment state is observed.
+        let entry = find_deployment_entry(
+            &api,
+            "demo",
+            "deploy-1",
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("the retry must not error");
+        let entry = entry.expect("the retry must observe the recovered endpoint");
         assert_eq!(entry.id, "deploy-1");
         assert_eq!(entry.status, "healthy");
     }
