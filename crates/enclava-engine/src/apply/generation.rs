@@ -245,8 +245,13 @@ where
 }
 
 /// True when a managed-fields entry authored by `field_manager` (non-status)
-/// owns `metadata.annotations.<key>` on the live object. Fails closed when
-/// managed fields are absent or cannot be attributed.
+/// owns `metadata.annotations.<key>` on the live object. The walk follows
+/// ONLY the f:metadata -> f:annotations -> f:<key> chain and ignores
+/// sibling branches: a real control-plane entry mixes annotation ownership
+/// with associative-list paths (`k:` container keys) that the general
+/// FieldsV1 flattener refuses to attribute — rejecting the whole entry
+/// there would drop creation evidence on every StatefulSet reapply. Fails
+/// closed when managed fields are absent entirely.
 fn annotation_owned_by_manager<K>(resource: &K, annotation_key: &str, field_manager: &str) -> bool
 where
     K: Resource,
@@ -257,7 +262,6 @@ where
     if entries.is_empty() {
         return false;
     }
-    let owned_path = format!("metadata.annotations.{annotation_key}");
     entries.iter().any(|entry| {
         if entry.subresource.as_deref() == Some("status") {
             return false;
@@ -268,9 +272,17 @@ where
         entry
             .fields_v1
             .as_ref()
-            .and_then(|fields| flatten_owned_paths(&fields.0))
-            .is_some_and(|paths| paths.iter().any(|path| path == &owned_path))
+            .is_some_and(|fields| owns_annotation_path(&fields.0, annotation_key))
     })
+}
+
+/// Walk f:metadata -> f:annotations -> f:<key> within one FieldsV1
+/// document, ignoring every other branch.
+fn owns_annotation_path(fields_v1: &serde_json::Value, annotation_key: &str) -> bool {
+    fields_v1
+        .pointer("/f:metadata/f:annotations")
+        .and_then(|annotations| annotations.get(format!("f:{annotation_key}")))
+        .is_some()
 }
 
 fn only_trusted_field_managers<K>(resource: &K, field_manager: &str) -> bool

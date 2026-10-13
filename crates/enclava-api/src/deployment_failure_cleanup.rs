@@ -730,6 +730,15 @@ enum NamespaceTeardown {
     /// it, so a retry cannot claim the fence while the namespace may still be
     /// Terminating.
     DeleteIncomplete,
+    /// Ownership WAS proven but no delete could be issued (client
+    /// construction or request building failed before anything was sent,
+    /// or the conflict budget burned with the namespace still live). The
+    /// namespace is still live, so provider-state evidence must be
+    /// retained — but no delete is in flight, so the fence must NOT be
+    /// retained (that would wedge every later deployment on permanent
+    /// Busy). The row is marked cleanup_sweep_incomplete so later failed
+    /// generations stay cleanup-eligible and their sweeps converge.
+    DeleteNotIssued,
 }
 
 /// How the caller should release the mutation fences after cleanup.
@@ -1098,11 +1107,31 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
             }
             CleanupFenceOutcome::ReleaseNormally
         }
-        NamespaceTeardown::AdoptedIncomplete => {
+        NamespaceTeardown::AdoptedIncomplete | NamespaceTeardown::DeleteNotIssued => {
             // Evidence kept (storage guard + ownership gates), fences
-            // release: the namespace was never CAP's, so the
-            // retained-fence reconciler (which requires a namespace 404)
-            // would never release a retained fence here.
+            // release: the retained-fence reconciler requires a namespace
+            // 404 — which never happens for an adopted namespace, nor for
+            // a proven-owned one no delete was issued against. Marking the
+            // row cleanup_sweep_incomplete keeps later failed generations
+            // cleanup-eligible so their sweeps converge the leftovers.
+            if matches!(teardown, NamespaceTeardown::DeleteNotIssued)
+                && let Err(error) = sqlx::query(
+                    "UPDATE deployments
+                     SET cleanup_sweep_incomplete = true
+                     WHERE id = $1 AND app_id = $2 AND status = 'failed'",
+                )
+                .bind(failed_deployment_id)
+                .bind(app.id)
+                .execute(&state.db)
+                .await
+            {
+                tracing::warn!(
+                    app_id = %app.id,
+                    deployment_id = %failed_deployment_id,
+                    error = %error,
+                    "failed-apply cleanup could not mark the row's delete-not-issued outcome"
+                );
+            }
             CleanupFenceOutcome::ReleaseNormally
         }
         NamespaceTeardown::DeleteIncomplete => {
@@ -1371,10 +1400,9 @@ async fn delete_owned_namespace(
                 "failed-apply cleanup cannot reach Kubernetes before issuing the namespace delete; no delete was sent"
             );
             // Pre-acceptance: no DELETE reached the API server, so there
-            // is nothing in flight to converge — retaining the fence
-            // would wedge the app on permanent Busy for a delete that
-            // never happened.
-            return NamespaceTeardown::ConfirmedAbsent;
+            // is nothing in flight to converge — but the namespace IS
+            // still live, so this is not confirmed absence either.
+            return NamespaceTeardown::DeleteNotIssued;
         }
     };
     let api: kube::Api<k8s_openapi::api::core::v1::Namespace> = kube::Api::all(client);
@@ -1413,7 +1441,10 @@ async fn delete_owned_namespace(
             }
         };
         match delete_result {
-            Ok(_) => break, // accepted; converge below
+            Ok(_) => {
+                // Accepted: converge on observed absence.
+                return wait_for_namespace_absence(app, &api).await;
+            }
             Err(kube::Error::Api(error)) if error.code == 404 => {
                 // Vanished between the owning GET and the delete: complete.
                 return NamespaceTeardown::ConfirmedAbsent;
@@ -1471,15 +1502,14 @@ async fn delete_owned_namespace(
             }
             Err(kube::Error::BuildRequest(_)) => {
                 // Request construction failed BEFORE anything was sent: no
-                // delete is in flight, so retaining the fence would wedge
-                // the app on permanent Busy for a delete that never
-                // happened.
+                // delete is in flight, but the proven-owned namespace is
+                // still live — evidence stays, fence releases.
                 tracing::warn!(
                     app_id = %app.id,
                     namespace = %app.namespace,
                     "failed-apply namespace delete could not build its request; nothing is in flight"
                 );
-                return NamespaceTeardown::ConfirmedAbsent;
+                return NamespaceTeardown::DeleteNotIssued;
             }
             Err(error) => {
                 tracing::warn!(
@@ -1495,6 +1525,23 @@ async fn delete_owned_namespace(
         }
     }
 
+    // The retry budget burned entirely on conflicts while the owned
+    // namespace stayed live: no delete was accepted, so entering the
+    // convergence wait would be waiting for a 404 that cannot happen.
+    // Mark not-issued (evidence retained, later generations unblocked)
+    // and release the fence — nothing is in flight.
+    tracing::warn!(
+        app_id = %app.id,
+        namespace = %app.namespace,
+        "failed-apply namespace delete exhausted its conflict retries; leaving the live namespace for the next reconciliation"
+    );
+    NamespaceTeardown::DeleteNotIssued
+}
+
+async fn wait_for_namespace_absence(
+    app: &App,
+    api: &kube::Api<k8s_openapi::api::core::v1::Namespace>,
+) -> NamespaceTeardown {
     // The delete was accepted. Bound the convergence wait; if it elapses
     // without a 404 the caller must retain the fence. Each GET is itself
     // bounded by the remaining deadline: a stalled API server must not
