@@ -22,6 +22,20 @@ const RECLAIM_QUARANTINE_SECONDS: i64 = 360;
 const HEARTBEAT_SECONDS: u64 = 30;
 const RENEW_TIMEOUT_SECONDS: u64 = 10;
 
+/// Marker written to `external_resource_mutation_leases.operation_kind` when a
+/// failed deployment apply intentionally retains its `kubernetes_namespace`
+/// fence until reconciliation confirms the namespace is gone. The orphaned
+/// deployment-apply repair loop
+/// ([`reconcile_orphaned_deployment_apply_leases`]) matches
+/// `operation_kind = 'deployment_apply'`, so this relabel keeps an
+/// intentionally retained fence — whose namespace may still be Terminating
+/// under Longhorn PVC finalizers — indistinguishable from a crash only to
+/// operators, never to the repair loop: the loop keeps bounding crashed
+/// pre-arms (still labeled `deployment_apply`) while a retained fence stays
+/// infinite until an operator or reconciler clears it after observing
+/// namespace 404.
+pub const RETAINED_DEPLOYMENT_NAMESPACE_OPERATION: &str = "deployment_apply_retained_namespace";
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ResourceFence {
     pub scope: String,
@@ -311,6 +325,59 @@ impl AppMutationLease {
         crate::deploy::lock_app_deployment_lane(&mut tx, self.app_id).await?;
         self.retain_resource_scope_until_reconciled_in_tx(&mut tx, resource_scope)
             .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Retain `resource_scope` under a marker `operation_kind` the orphaned
+    /// deployment-apply repair loop does not match. Unlike
+    /// [`Self::retain_resource_scope_until_reconciled`], the retained rows are
+    /// relabeled so that [`reconcile_orphaned_deployment_apply_leases`] (which
+    /// joins on `operation_kind = 'deployment_apply'`) can never re-bound the
+    /// fence to the 360s reclaim quarantine: an intentionally retained
+    /// incomplete namespace delete — possibly still Terminating under Longhorn
+    /// PVC finalizers — stays fenced until explicitly cleared after the
+    /// namespace is observed gone, while a crashed worker's pre-arm (still
+    /// labeled `deployment_apply`) remains repairable by the loop.
+    pub async fn retain_resource_scope_under_marker(
+        &mut self,
+        resource_scope: &str,
+        marker_operation_kind: &str,
+    ) -> Result<(), MutationLeaseError> {
+        self.stop_heartbeat();
+        let mut tx = self.pool.begin().await?;
+        crate::deploy::lock_app_deployment_lane(&mut tx, self.app_id).await?;
+        let retained =
+            poison_resource_scope(&mut tx, self.token, &self.resources, resource_scope).await?;
+        if retained == 0 {
+            return Err(MutationLeaseError::Lost);
+        }
+        for resource in self
+            .resources
+            .iter()
+            .filter(|resource| resource.fence.scope == resource_scope)
+        {
+            let result = sqlx::query(
+                "UPDATE external_resource_mutation_leases
+                    SET operation_kind = $5,
+                        updated_at = clock_timestamp()
+                  WHERE resource_scope = $1
+                    AND resource_key = $2
+                    AND owner_token = $3
+                    AND generation = $4
+                    AND reclaim_after = 'infinity'::timestamptz",
+            )
+            .bind(&resource.fence.scope)
+            .bind(&resource.fence.key)
+            .bind(self.token)
+            .bind(resource.generation)
+            .bind(marker_operation_kind)
+            .execute(&mut *tx)
+            .await?;
+            if result.rows_affected() != 1 {
+                return Err(MutationLeaseError::Lost);
+            }
+        }
         tx.commit().await?;
         Ok(())
     }

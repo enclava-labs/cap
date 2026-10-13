@@ -309,6 +309,58 @@ async fn remove_failed_generation_edge_routes(
     }
 }
 
+/// The pre-delete namespace GET, classified. Only a live object carrying
+/// this exact generation's mutation-generation annotation authorizes a
+/// delete; every other outcome — including an initial 404 — is
+/// [`NamespaceTeardown::NotOurs`]. A generation that never owned the live
+/// namespace never published routes (`ensure_haproxy_routes` runs strictly
+/// after `apply_namespace`), so route removal must be skipped for these
+/// outcomes rather than run against the shared HAProxy ConfigMap.
+/// [`NamespaceTeardown::ConfirmedAbsent`] is reserved for a namespace that
+/// was observed under this generation's annotation and only later returned
+/// 404 (between the owning GET and the delete, or during the convergence
+/// wait).
+enum InitialNamespaceOwnership {
+    /// Live object carries this generation's annotation: safe to delete.
+    Owned,
+    /// GET returned 404 before any delete was issued. This generation never
+    /// published the namespace, so it never published routes either.
+    AbsentBeforeDelete,
+    /// Live object carries another generation's annotation (or none).
+    Foreign,
+    /// GET failed for a non-404 reason: ownership is undecidable, so no
+    /// provider state may be touched.
+    Uninspectable,
+}
+
+fn classify_initial_namespace_get(
+    result: &Result<k8s_openapi::api::core::v1::Namespace, kube::Error>,
+    generation: enclava_engine::apply::generation::MutationGeneration,
+) -> InitialNamespaceOwnership {
+    match result {
+        Ok(namespace) => {
+            let live = namespace
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|annotations| {
+                    annotations
+                        .get(enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION)
+                })
+                .and_then(|raw| raw.parse::<i64>().ok());
+            if live == Some(generation.get()) {
+                InitialNamespaceOwnership::Owned
+            } else {
+                InitialNamespaceOwnership::Foreign
+            }
+        }
+        Err(kube::Error::Api(error)) if error.code == 404 => {
+            InitialNamespaceOwnership::AbsentBeforeDelete
+        }
+        Err(_) => InitialNamespaceOwnership::Uninspectable,
+    }
+}
+
 /// Delete the failed generation's namespace — which removes the image-pull
 /// secret, network policy, Gateway API resources, and StatefulSet with it —
 /// but only when the live namespace carries this exact generation's
@@ -319,11 +371,14 @@ async fn remove_failed_generation_edge_routes(
 /// `apply_namespace` (the deployment row's `manifest_hash` is written before
 /// any provider call and proves nothing).
 ///
-/// Absence (404) is success. Once a delete is issued, the bounded convergence
-/// wait must observe 404; otherwise the outcome is `DeleteIncomplete` and the
-/// caller retains the pre-armed fence (fail closed, mirroring app delete)
-/// rather than converting it to the bounded reclaim quarantine while the
-/// namespace may still be Terminating.
+/// A 404 before any delete is issued is [`NamespaceTeardown::NotOurs`]: the
+/// generation never published the namespace (a pre-publish failure), so it
+/// never published routes either, and the caller must not touch the shared
+/// HAProxy ConfigMap. Once a delete is issued under a proven-owning GET, the
+/// bounded convergence wait must observe 404; otherwise the outcome is
+/// `DeleteIncomplete` and the caller retains the pre-armed fence (fail
+/// closed, mirroring app delete) rather than converting it to the bounded
+/// reclaim quarantine while the namespace may still be Terminating.
 async fn delete_failed_generation_namespace(
     app: &App,
     generation: enclava_engine::apply::generation::MutationGeneration,
@@ -343,99 +398,91 @@ async fn delete_failed_generation_namespace(
     };
     let api: kube::Api<k8s_openapi::api::core::v1::Namespace> = kube::Api::all(client);
 
-    match api.get(&app.namespace).await {
-        Ok(namespace) => {
-            let live = namespace
-                .metadata
-                .annotations
-                .as_ref()
-                .and_then(|annotations| {
-                    annotations
-                        .get(enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION)
-                })
-                .and_then(|raw| raw.parse::<i64>().ok());
-            if live != Some(generation.get()) {
-                // The namespace was created or last written by another
-                // generation (or predates generation annotations): it is not
-                // this apply's partial state. Leave it alone.
-                tracing::info!(
-                    app_id = %app.id,
-                    namespace = %app.namespace,
-                    expected_generation = generation.get(),
-                    live_generation = ?live,
-                    "failed-apply cleanup skips namespace: it does not carry this generation's mutation annotation"
-                );
-                return NamespaceTeardown::NotOurs;
-            }
-            let deleted = match enclava_engine::apply::generation::delete_resource(
-                &api,
-                &app.namespace,
-                generation,
-                kube::api::DeleteParams::default(),
-            )
-            .await
-            {
-                Ok(deleted) => deleted,
-                Err(error) => {
-                    tracing::warn!(
-                        app_id = %app.id,
-                        namespace = %app.namespace,
-                        error = %error,
-                        "failed-apply namespace deletion failed; retaining the namespace fence for reconciliation"
-                    );
-                    // The delete request may have reached the API server
-                    // before the error surfaced: treat as incomplete.
-                    return NamespaceTeardown::DeleteIncomplete;
-                }
-            };
-            if !deleted {
-                // Vanished between get and delete: complete.
-                return NamespaceTeardown::ConfirmedAbsent;
-            }
-            // The delete was accepted. Bound the convergence wait; if it
-            // elapses without a 404 the caller must retain the fence.
-            let deadline = tokio::time::Instant::now() + NAMESPACE_CONVERGENCE_TIMEOUT;
-            loop {
-                match api.get(&app.namespace).await {
-                    Err(kube::Error::Api(error)) if error.code == 404 => {
-                        return NamespaceTeardown::ConfirmedAbsent;
-                    }
-                    Ok(_) if tokio::time::Instant::now() < deadline => {
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    }
-                    Ok(_) => {
-                        tracing::warn!(
-                            app_id = %app.id,
-                            namespace = %app.namespace,
-                            "failed-apply namespace deletion did not converge within the bounded wait; retaining the namespace fence for reconciliation"
-                        );
-                        return NamespaceTeardown::DeleteIncomplete;
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            app_id = %app.id,
-                            namespace = %app.namespace,
-                            error = %error,
-                            "failed-apply namespace deletion wait failed; retaining the namespace fence for reconciliation"
-                        );
-                        return NamespaceTeardown::DeleteIncomplete;
-                    }
-                }
-            }
+    match classify_initial_namespace_get(&api.get(&app.namespace).await, generation) {
+        InitialNamespaceOwnership::Owned => {}
+        InitialNamespaceOwnership::AbsentBeforeDelete => {
+            tracing::info!(
+                app_id = %app.id,
+                namespace = %app.namespace,
+                "failed-apply cleanup found no live namespace before any delete; this generation never published it (or its routes)"
+            );
+            return NamespaceTeardown::NotOurs;
         }
-        Err(kube::Error::Api(error)) if error.code == 404 => {
-            // Already absent: nothing this apply left behind.
-            NamespaceTeardown::ConfirmedAbsent
+        InitialNamespaceOwnership::Foreign => {
+            // The namespace was created or last written by another
+            // generation (or predates generation annotations): it is not
+            // this apply's partial state. Leave it alone.
+            tracing::info!(
+                app_id = %app.id,
+                namespace = %app.namespace,
+                expected_generation = generation.get(),
+                "failed-apply cleanup skips namespace: it does not carry this generation's mutation annotation"
+            );
+            return NamespaceTeardown::NotOurs;
         }
+        InitialNamespaceOwnership::Uninspectable => {
+            tracing::warn!(
+                app_id = %app.id,
+                namespace = %app.namespace,
+                "failed-apply cleanup cannot inspect the namespace; skipping deletion"
+            );
+            // No delete issued through this path.
+            return NamespaceTeardown::NotOurs;
+        }
+    }
+    let deleted = match enclava_engine::apply::generation::delete_resource(
+        &api,
+        &app.namespace,
+        generation,
+        kube::api::DeleteParams::default(),
+    )
+    .await
+    {
+        Ok(deleted) => deleted,
         Err(error) => {
             tracing::warn!(
                 app_id = %app.id,
                 namespace = %app.namespace,
                 error = %error,
-                "failed-apply cleanup cannot inspect the namespace; skipping deletion"
+                "failed-apply namespace deletion failed; retaining the namespace fence for reconciliation"
             );
-            // No delete issued through this path.
-            NamespaceTeardown::NotOurs
+            // The delete request may have reached the API server
+            // before the error surfaced: treat as incomplete.
+            return NamespaceTeardown::DeleteIncomplete;
+        }
+    };
+    if !deleted {
+        // Vanished between get and delete: complete.
+        return NamespaceTeardown::ConfirmedAbsent;
+    }
+    // The delete was accepted. Bound the convergence wait; if it
+    // elapses without a 404 the caller must retain the fence.
+    let deadline = tokio::time::Instant::now() + NAMESPACE_CONVERGENCE_TIMEOUT;
+    loop {
+        match api.get(&app.namespace).await {
+            Err(kube::Error::Api(error)) if error.code == 404 => {
+                return NamespaceTeardown::ConfirmedAbsent;
+            }
+            Ok(_) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            Ok(_) => {
+                tracing::warn!(
+                    app_id = %app.id,
+                    namespace = %app.namespace,
+                    "failed-apply namespace deletion did not converge within the bounded wait; retaining the namespace fence for reconciliation"
+                );
+                return NamespaceTeardown::DeleteIncomplete;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    app_id = %app.id,
+                    namespace = %app.namespace,
+                    error = %error,
+                    "failed-apply namespace deletion wait failed; retaining the namespace fence for reconciliation"
+                );
+                return NamespaceTeardown::DeleteIncomplete;
+            }
         }
     }
 }
@@ -766,5 +813,73 @@ mod tests {
             ],
             "TEE host must mirror the apply fallback to the platform domain, and an empty custom domain must be skipped"
         );
+    }
+
+    fn annotated_namespace(generation: i64) -> k8s_openapi::api::core::v1::Namespace {
+        k8s_openapi::api::core::v1::Namespace {
+            metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+                annotations: Some(std::collections::BTreeMap::from([(
+                    enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION.to_string(),
+                    generation.to_string(),
+                )])),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn api_error(code: u16) -> kube::Error {
+        kube::Error::Api(Box::new(
+            kube::core::Status::failure("classified", "Probe").with_code(code),
+        ))
+    }
+
+    #[test]
+    fn initial_ownership_classifies_live_annotation_outcomes() {
+        let generation = enclava_engine::apply::generation::MutationGeneration::new(7)
+            .expect("valid generation");
+        assert!(matches!(
+            classify_initial_namespace_get(&Ok(annotated_namespace(7)), generation),
+            InitialNamespaceOwnership::Owned
+        ));
+        assert!(matches!(
+            classify_initial_namespace_get(&Ok(annotated_namespace(6)), generation),
+            InitialNamespaceOwnership::Foreign
+        ));
+        // A missing annotation (or an unparseable one) is foreign, not owned:
+        // `delete_resource` would otherwise treat it as generation 0.
+        assert!(matches!(
+            classify_initial_namespace_get(
+                &Ok(k8s_openapi::api::core::v1::Namespace::default()),
+                generation
+            ),
+            InitialNamespaceOwnership::Foreign
+        ));
+    }
+
+    #[test]
+    fn initial_ownership_treats_pre_delete_absence_and_errors_as_not_ours() {
+        let generation = enclava_engine::apply::generation::MutationGeneration::new(7)
+            .expect("valid generation");
+        // The round-3 regression: an initial 404 must NOT read as
+        // ConfirmedAbsent — this generation never published the namespace or
+        // its routes, so route removal against the shared HAProxy ConfigMap
+        // must be skipped (NotOurs), not run.
+        assert!(matches!(
+            classify_initial_namespace_get(&Err(api_error(404)), generation),
+            InitialNamespaceOwnership::AbsentBeforeDelete
+        ));
+        // Any non-404 inspect failure is equally undecided ownership.
+        assert!(matches!(
+            classify_initial_namespace_get(&Err(api_error(500)), generation),
+            InitialNamespaceOwnership::Uninspectable
+        ));
+        assert!(matches!(
+            classify_initial_namespace_get(
+                &Err(kube::Error::Service("transport unavailable".into())),
+                generation
+            ),
+            InitialNamespaceOwnership::Uninspectable
+        ));
     }
 }

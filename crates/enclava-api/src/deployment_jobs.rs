@@ -2453,13 +2453,21 @@ async fn fail_apply_job_with_mutation(
     }
     if published && let Some(mut mutation) = mutation {
         if retain_namespace_fence {
-            // The namespace may still be Terminating. Convert every other
-            // scope to the bounded reclaim quarantine but leave the
-            // kubernetes_namespace scope armed until reconciliation confirms
-            // the namespace is gone — mirroring the app-delete fail-closed
-            // teardown contract.
+            // The namespace may still be Terminating (e.g. under Longhorn PVC
+            // finalizers). Convert every other scope to the bounded reclaim
+            // quarantine but leave the kubernetes_namespace scope armed under
+            // the retained-namespace marker operation until reconciliation
+            // confirms the namespace is gone — mirroring the app-delete
+            // fail-closed teardown contract. The marker relabel is what keeps
+            // `reconcile_orphaned_deployment_apply_leases` (which joins on
+            // `operation_kind = 'deployment_apply'`) from re-bounding this
+            // intentionally retained fence to the 360s quarantine while a
+            // crashed worker's pre-arm stays repairable.
             if let Err(retain_error) = mutation
-                .retain_resource_scope_until_reconciled("kubernetes_namespace")
+                .retain_resource_scope_under_marker(
+                    "kubernetes_namespace",
+                    crate::mutation_leases::RETAINED_DEPLOYMENT_NAMESPACE_OPERATION,
+                )
                 .await
             {
                 tracing::error!(
@@ -5745,6 +5753,208 @@ mod tests {
             .execute(&pool)
             .await
             .expect("clean inactive repair fixture");
+    }
+
+    #[tokio::test]
+    async fn retained_namespace_fence_is_exempt_from_orphan_repair_until_reconciled() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _, _) = insert_job_fixture(&pool).await;
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.side_effect_admission = Arc::new(tokio::sync::Semaphore::new(2));
+        let resources = vec![
+            crate::mutation_leases::ResourceFence::new("kubernetes_namespace", &app.namespace),
+            crate::mutation_leases::ResourceFence::edge_config(),
+        ];
+        // Stage exactly what fail_apply_job_with_mutation leaves behind after
+        // an incomplete teardown retain: a failed apply job, a failed
+        // deployment, and a mutation whose namespace fence was retained under
+        // the marker operation kind.
+        let mut retained = crate::mutation_leases::claim(
+            &state,
+            app.id,
+            "deployment_apply",
+            deployment_id,
+            false,
+            resources.clone(),
+        )
+        .await
+        .expect("claim failed apply resources");
+        retained
+            .arm_resource_scope_until_reconciled("kubernetes_namespace")
+            .await
+            .expect("pre-arm namespace before retain");
+        retained
+            .retain_resource_scope_under_marker(
+                "kubernetes_namespace",
+                crate::mutation_leases::RETAINED_DEPLOYMENT_NAMESPACE_OPERATION,
+            )
+            .await
+            .expect("retain namespace fence under marker");
+        sqlx::query(
+            "UPDATE deployments
+                SET status = 'failed'::deploy_status_enum
+              WHERE id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("stage failed deployment");
+        sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET state = 'failed'
+              WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("stage failed apply job");
+        let owner_token: Uuid =
+            sqlx::query_scalar("SELECT owner_token FROM app_mutation_leases WHERE app_id = $1")
+                .bind(app.id)
+                .fetch_one(&pool)
+                .await
+                .expect("load retained owner");
+        // Expire both leases past every reclaim boundary: the repair loop
+        // must still not bound the retained namespace fence.
+        sqlx::query(
+            "UPDATE app_mutation_leases
+                SET locked_until = clock_timestamp() - interval '2 seconds',
+                    reclaim_after = clock_timestamp() - interval '1 second'
+              WHERE app_id = $1 AND owner_token = $2",
+        )
+        .bind(app.id)
+        .bind(owner_token)
+        .execute(&pool)
+        .await
+        .expect("expire retained app owner");
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET locked_until = clock_timestamp() - interval '2 seconds',
+                    reclaim_after = CASE
+                        WHEN resource_scope = 'kubernetes_namespace'
+                            THEN 'infinity'::timestamptz
+                        ELSE clock_timestamp() - interval '1 second'
+                    END
+              WHERE owner_token = $1",
+        )
+        .bind(owner_token)
+        .execute(&pool)
+        .await
+        .expect("expire retained provider owners");
+
+        let repaired = crate::mutation_leases::reconcile_orphaned_deployment_apply_leases(&pool)
+            .await
+            .expect("run orphan repair over retained fence");
+        assert_eq!(
+            repaired, 0,
+            "an intentionally retained namespace fence must not be re-bounded by the orphan repair loop"
+        );
+        let (namespace_operation, namespace_infinite): (String, bool) = sqlx::query_as(
+            "SELECT operation_kind, reclaim_after = 'infinity'::timestamptz
+               FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1",
+        )
+        .bind(&app.namespace)
+        .fetch_one(&pool)
+        .await
+        .expect("verify retained fence");
+        assert_eq!(
+            namespace_operation,
+            crate::mutation_leases::RETAINED_DEPLOYMENT_NAMESPACE_OPERATION
+        );
+        assert!(
+            namespace_infinite,
+            "the retained fence stays infinite while the delete is unconfirmed"
+        );
+        // And the fence genuinely blocks a retry claiming the namespace name
+        // while the namespace may still be Terminating.
+        let blocked = crate::mutation_leases::claim(
+            &state,
+            app.id,
+            "deployment_apply",
+            Uuid::new_v4(),
+            false,
+            resources.clone(),
+        )
+        .await
+        .expect_err("retained fence rejects a new deployment apply");
+        assert!(matches!(
+            blocked,
+            crate::mutation_leases::MutationLeaseError::Busy
+        ));
+
+        // Once reconciliation observes the namespace gone, the marker rows are
+        // cleared exactly like the documented operator path, and a retry may
+        // claim the name again.
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET owner_token = NULL,
+                    operation_kind = NULL,
+                    operation_id = NULL,
+                    locked_until = NULL,
+                    reclaim_after = NULL,
+                    updated_at = clock_timestamp()
+              WHERE resource_scope = 'kubernetes_namespace'
+                AND resource_key = $1
+                AND owner_token = $2
+                AND reclaim_after = 'infinity'::timestamptz",
+        )
+        .bind(&app.namespace)
+        .bind(owner_token)
+        .execute(&pool)
+        .await
+        .expect("reconciler clears the retained fence after namespace 404");
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET locked_until = clock_timestamp() - interval '2 seconds',
+                    reclaim_after = clock_timestamp() - interval '1 second'
+              WHERE owner_token = $1 AND resource_scope <> 'kubernetes_namespace'",
+        )
+        .bind(owner_token)
+        .execute(&pool)
+        .await
+        .expect("expire remaining provider quarantine");
+        sqlx::query(
+            "UPDATE app_mutation_leases
+                SET owner_token = NULL,
+                    operation_kind = NULL,
+                    operation_id = NULL,
+                    locked_until = NULL,
+                    reclaim_after = NULL
+              WHERE app_id = $1 AND owner_token = $2",
+        )
+        .bind(app.id)
+        .bind(owner_token)
+        .execute(&pool)
+        .await
+        .expect("clear retained app owner");
+        let retry = crate::mutation_leases::claim(
+            &state,
+            app.id,
+            "deployment_apply",
+            Uuid::new_v4(),
+            false,
+            resources,
+        )
+        .await
+        .expect("retry claims the name after reconciliation");
+        retry.finish().await.expect("finish retry generation");
+
+        sqlx::query(
+            "DELETE FROM external_resource_mutation_leases
+              WHERE resource_scope IN ('kubernetes_namespace', 'edge_config')
+                AND resource_key IN ($1, 'global')",
+        )
+        .bind(&app.namespace)
+        .execute(&pool)
+        .await
+        .expect("remove retained-fence fixtures");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("clean retained-fence fixture");
     }
 
     #[tokio::test]
