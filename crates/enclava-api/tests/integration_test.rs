@@ -192,6 +192,7 @@ async fn setup_test_state_with_mode(management_mode: CapManagementMode) -> (AppS
         .unwrap(),
         trustee_http_client: reqwest::Client::new(),
         tee_http_client: reqwest::Client::new(),
+        recent_tee_probe_failures: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         attestation: Some(AttestationConfig {
             proxy_image: ImageRef::parse(
                 "ghcr.io/enclava-labs/attestation-proxy@sha256:1111111111111111111111111111111111111111111111111111111111111111",

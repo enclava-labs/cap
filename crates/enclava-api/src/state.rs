@@ -198,6 +198,12 @@ pub struct AppState {
     /// HTTP client for tenant TEE endpoints. Test environments may use staging
     /// ACME certificates that are not trusted by the public WebPKI roots.
     pub tee_http_client: reqwest::Client,
+    /// Rate-limit state for live TEE probe failure warns: the last failure
+    /// signature per `namespace/app`, so a persistently failing probe logs on
+    /// the first failure and on change of error class instead of per request.
+    /// Shared through the `AppState` clones handed to concurrent handlers.
+    pub recent_tee_probe_failures:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
     /// Sidecar/runtime settings used when generating Kubernetes manifests.
     pub attestation: Option<AttestationConfig>,
     /// Signed public platform release envelope used to derive

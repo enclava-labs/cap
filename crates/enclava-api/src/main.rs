@@ -894,6 +894,9 @@ async fn main() {
         registry_client,
         trustee_http_client,
         tee_http_client,
+        recent_tee_probe_failures: std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
         attestation,
         platform_release_envelope,
         dns,
