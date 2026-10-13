@@ -817,8 +817,12 @@ fn success_exit_settles_requests_with_the_per_attempt_budget() {
         + gate_start;
     let gate = &source[gate_start..gate_end];
     assert!(
-        gate.contains("take_settled_within(wait_attempt_budget(wait_deadline))"),
+        gate.contains("take_settled_within(wait_attempt_budget(wait_deadline)"),
         "the gate must settle its requests within the per-attempt budget (cap#220 review follow-up)"
+    );
+    assert!(
+        gate.contains("history.force_request(api, app_name, wait_deadline)"),
+        "the gate must ask for a current observation at the exit (cap#220 review follow-up): a pre-gate non-failure may predate the failure"
     );
     assert!(
         !gate.contains("SUCCESS_RECONCILE_BUDGET") && !gate.contains("success_reconcile_budget"),
@@ -977,6 +981,18 @@ fn deploy_wait_success_exits_reconcile_deployment_state_first() {
             source.as_str(),
             "async fn wait_for_deploy_runtime",
             "fn observation_is_fresh_for_deployment",
+        ),
+        (
+            "wait_for_deployment_apply_start",
+            source.as_str(),
+            "async fn wait_for_deployment_apply_start",
+            "async fn wait_for_deployment_completion",
+        ),
+        (
+            "wait_for_deployment_completion",
+            source.as_str(),
+            "async fn wait_for_deployment_completion",
+            "async fn ensure_password_storage_unlocked_for_config",
         ),
         (
             "wait_for_template_bootstrap_endpoint",
@@ -3350,9 +3366,10 @@ mod terminal_diagnostics {
     #[tokio::test]
     async fn success_exit_accepts_a_non_failed_observation() {
         // The reconciliation is not a failure trap: an observation showing
-        // the deployment is fine passes the exit, both when it lands during
-        // the pickup and when it has already landed before the exit (drained
-        // without blocking).
+        // the deployment is fine passes the exit -- both when it lands
+        // during the pickup and when the exit finds one already landed (the
+        // gate still asks for a current observation first and consumes its
+        // answer as soon as it lands, without waiting out the budget).
         let address = spawn_history_stub(std::time::Duration::from_millis(100), |_| {
             serde_json::json!([deployment_entry_json("deploy-1", "healthy")])
         })
@@ -3365,7 +3382,8 @@ mod terminal_diagnostics {
             .await
             .expect("a non-failed observation must pass the exit gate");
 
-        // The answer lands before the exit: drained at once, no waiting.
+        // An answer has already landed before the exit: drained at once,
+        // and the gate's fresh answer is consumed as soon as it lands.
         history.ensure_request(&api, "demo", deadline);
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
         let started = std::time::Instant::now();
@@ -3374,7 +3392,7 @@ mod terminal_diagnostics {
             .expect("a landed non-failed observation must pass the exit gate");
         assert!(
             started.elapsed() < std::time::Duration::from_millis(300),
-            "a landed observation must be drained without blocking the exit"
+            "the exit must consume the fresh answer as soon as it lands, not wait out the budget"
         );
     }
 
@@ -3418,6 +3436,55 @@ mod terminal_diagnostics {
         )
         .await
         .expect_err("a stale non-failure must not mask a fresh request showing the failure");
+        assert!(
+            error
+                .to_string()
+                .contains("deployment deploy-1 failed: signed_policy_budget_exceeded"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn success_exit_reasks_instead_of_authorizing_on_a_young_landed_answer() {
+        // cap#220 self-check: a landed non-failure is not a current
+        // observation -- the deployment may have failed after that answer
+        // was served. Even when the newest answer is younger than the
+        // refresh window (the common case: the failure check ran at the top
+        // of the loop, then readiness arrived while the answer aged), the
+        // exit must ask again and report the fresh answer's failure instead
+        // of letting the pre-gate answer authorize success.
+        let address = spawn_history_stub(std::time::Duration::from_millis(100), |nth| match nth {
+            1 => serde_json::json!([deployment_entry_json("deploy-1", "healthy")]),
+            _ => serde_json::json!([{
+                "id": "deploy-1",
+                "status": "failed",
+                "error_message": "signed_policy_budget_exceeded",
+                "image_digest": null,
+                "created_at": "2026-10-13T00:00:00Z",
+                "completed_at": "2026-10-13T00:01:00Z",
+            }]),
+        })
+        .await;
+        let api = ApiClient::new(&format!("http://{address}"), Some("test".to_string()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+
+        // The pre-gate answer lands and stays well within the refresh
+        // window (the default one is a full attempt budget).
+        let mut history = DeploymentHistoryProbe::new();
+        history.ensure_request(&api, "demo", deadline);
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+        let error = reconcile_success_with_deployment_history(
+            &api,
+            "demo",
+            "deploy-1",
+            deadline,
+            &mut history,
+        )
+        .await
+        .expect_err(
+            "a pre-gate non-failure must not authorize success without a fresh observation",
+        );
         assert!(
             error
                 .to_string()
@@ -3711,4 +3778,183 @@ mod terminal_diagnostics {
             "unexpected error: {error}"
         );
     }
+
+
+    #[tokio::test]
+    async fn healthy_exit_reasks_history_instead_of_dropping_a_newer_failure() {
+        // cap#220 self-check: the health wait's "healthy" answer may be
+        // stale -- the deployment can fail after that answer was served, and
+        // the exit used to return success on it at once (a false "Deployed
+        // and healthy"). The success exit must reconcile the
+        // deployment-state observation first: the fresh request shows the
+        // failure and it is reported instead of masked.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let deployments = std::sync::Arc::new(AtomicUsize::new(0));
+        let seen = deployments.clone();
+        let api_address = spawn_json_api_stub(move |path| {
+            if !path.ends_with("/deployments") {
+                return None;
+            }
+            let nth = seen.fetch_add(1, Ordering::SeqCst) + 1;
+            Some(match nth {
+                1 => serde_json::json!([deployment_entry_json("expected-1", "healthy")]),
+                _ => serde_json::json!([{
+                    "id": "expected-1",
+                    "status": "failed",
+                    "error_message": "signed_policy_budget_exceeded",
+                    "image_digest": null,
+                    "created_at": "2026-10-13T00:00:00Z",
+                    "completed_at": "2026-10-13T00:01:00Z",
+                }]),
+            })
+        })
+        .await;
+        let api = ApiClient::new(&format!("http://{api_address}"), Some("test".to_string()));
+        let error = wait_for_deployment_completion(
+            &api,
+            "demo",
+            crate::commands::app::DeploymentWait::new("expected-1"),
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(50),
+            &ProgressBar::hidden(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("deployment expected-1 failed: signed_policy_budget_exceeded"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_start_exit_reasks_history_instead_of_dropping_a_newer_failure() {
+        // cap#220 self-check: the same staleness at the apply-start wait's
+        // success exit -- acting on the oldest landed answer and returning
+        // dropped a newer failure (already landed or in flight). The exit
+        // must reconcile the deployment-state observation first.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let deployments = std::sync::Arc::new(AtomicUsize::new(0));
+        let seen = deployments.clone();
+        let api_address = spawn_json_api_stub(move |path| {
+            if !path.ends_with("/deployments") {
+                return None;
+            }
+            let nth = seen.fetch_add(1, Ordering::SeqCst) + 1;
+            Some(match nth {
+                1 => serde_json::json!([deployment_entry_json("expected-1", "applying")]),
+                _ => serde_json::json!([{
+                    "id": "expected-1",
+                    "status": "failed",
+                    "error_message": "signed_policy_budget_exceeded",
+                    "image_digest": null,
+                    "created_at": "2026-10-13T00:00:00Z",
+                    "completed_at": "2026-10-13T00:01:00Z",
+                }]),
+            })
+        })
+        .await;
+        let api = ApiClient::new(&format!("http://{api_address}"), Some("test".to_string()));
+        let error = wait_for_deployment_apply_start(
+            &api,
+            "demo",
+            "expected-1",
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(50),
+            &ProgressBar::hidden(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("deployment expected-1 failed: signed_policy_budget_exceeded"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn terminal_diagnostic_wiring_covers_every_post_claim_wait() {
+        // Fail-if-bypassed wiring check (behavior is covered by the live
+        // tests above): the runtime direct fallback classifies before
+        // returning Ok, config retries probe, and the health wait uses the
+        // deployment-bound probe.
+        let source = include_str!("../../app.rs").replace("\r\n", "\n");
+
+        let runtime_start = source.find("async fn wait_for_deploy_runtime").unwrap();
+        let runtime_end = source[runtime_start..]
+            .find("async fn find_deployment_entry")
+            .unwrap()
+            + runtime_start;
+        let runtime = &source[runtime_start..runtime_end];
+        let classify = runtime.find("direct_tee_runtime_outcome").unwrap();
+        let ready = runtime[classify..]
+            .find("return Ok(())")
+            .map(|offset| offset + classify)
+            .unwrap();
+        assert!(
+            classify < ready,
+            "the direct TEE fallback must classify terminal diagnostics before reporting readiness"
+        );
+        assert!(runtime.contains("bounded_status_json"));
+
+        let config_start = source.find("async fn set_deploy_config").unwrap();
+        let config_end = source[config_start..]
+            .find("fn should_retry_deploy_config")
+            .unwrap()
+            + config_start;
+        let config = &source[config_start..config_end];
+        assert!(
+            config.contains("deployment_bound_terminal_bootstrap_error_on_channel"),
+            "config write retries must stop on a deployment-bound terminal diagnostic from the attested channel"
+        );
+
+        let health_start = source
+            .find("async fn wait_for_deployment_completion")
+            .unwrap();
+        let health_end = source[health_start..]
+            .find("async fn ensure_password_storage_unlocked_for_config")
+            .unwrap()
+            + health_start;
+        let health = &source[health_start..health_end];
+        assert!(
+            health.contains("deployment_bound_terminal_bootstrap_error"),
+            "the health wait must use the deployment-bound terminal probe"
+        );
+
+        // Production ordering inside the post-auth reader is
+        // verification -> predicate -> reader: the launch-identity predicate
+        // must gate the bounded status read.
+        let reader_start = source
+            .find("async fn bound_tee_status_on_attested")
+            .unwrap();
+        let reader_end = source[reader_start..].find("\nasync fn ").unwrap() + reader_start;
+        let reader = &source[reader_start..reader_end];
+        let predicate = reader.find("launch_identity_binds_deployment").unwrap();
+        let read = reader.find("bounded_status_json").unwrap();
+        assert!(
+            predicate < read,
+            "the launch-identity predicate must gate the status read"
+        );
+
+        // No terminal-classifying status read may escape a complete budget:
+        // the unlock wait, the runtime direct fallback, and the bootstrap
+        // fallback arms all use the deadline-capped reads.
+        let unlock_start = source
+            .find("async fn wait_for_deploy_unlock_completion")
+            .unwrap();
+        let unlock_end = source[unlock_start..]
+            .find("pub(crate) async fn claim_initial_ownership")
+            .unwrap()
+            + unlock_start;
+        assert!(
+            source[unlock_start..unlock_end]
+                .contains("bounded_status_json_within(terminal_diagnostic_budget"),
+            "the unlock wait's status read must be budget-capped to its deadline"
+        );
+        assert!(runtime.contains("bounded_status_json_within"));
+        assert!(source.contains("bootstrap_status_within(terminal_diagnostic_budget"));
+    }
+
 }

@@ -1666,6 +1666,23 @@ impl DeploymentHistoryProbe {
         if !refresh_due {
             return;
         }
+        self.issue(api, app_name);
+    }
+
+    /// Issue a detached request now, ignoring the refresh cadence
+    /// (cap#220 review follow-up): a successful exit needs a *current*
+    /// observation, and the newest answer the probe already holds may
+    /// predate the deployment's failure -- a pre-gate non-failure is not
+    /// authority. A passed wait deadline issues nothing.
+    fn force_request(&mut self, api: &ApiClient, app_name: &str, wait_deadline: Instant) {
+        if wait_attempt_budget(wait_deadline).is_zero() {
+            return;
+        }
+        self.issue(api, app_name);
+    }
+
+    /// One detached lookup, with the overflow supersession policy.
+    fn issue(&mut self, api: &ApiClient, app_name: &str) {
         let api = api.clone();
         let app_name = app_name.to_owned();
         self.in_flight.push_back(HistoryRequest {
@@ -1714,32 +1731,37 @@ impl DeploymentHistoryProbe {
     /// follow-up): every answer that lands within `budget`, waiting while
     /// requests are still in flight. Two properties the exit gate needs:
     ///
-    /// - a landed answer is never dropped unobserved -- a failure answer
-    ///   that landed before the exit is returned and reported;
+    /// - a landed answer is never dropped unobserved -- `on_landed` sees it
+    ///   the moment it lands, so a failure answer is reported right away
+    ///   instead of after the rest settles;
     /// - a newer pending request keeps the exit waiting, so a stale
     ///   non-failure answer can never authorize success while the request
     ///   that would show the current state is still in flight.
     ///
-    /// `budget` expires with requests still pending (a stalled history
-    /// endpoint): whatever landed is returned and the caller reconciles the
-    /// remainder with its own outcome instead of blocking forever, so a
-    /// stall can never turn readiness into a false timeout.
+    /// `on_landed` returns `false` to stop the settle immediately (a
+    /// terminal failure needs no further observation). `budget` expires
+    /// with requests still pending (a stalled history endpoint): the
+    /// caller reconciles the remainder with its own outcome instead of
+    /// blocking forever, so a stall can never turn readiness into a false
+    /// timeout.
     async fn take_settled_within(
         &mut self,
         budget: Duration,
-    ) -> Vec<Result<Vec<DeploymentEntry>, ApiError>> {
+        mut on_landed: impl FnMut(Result<Vec<DeploymentEntry>, ApiError>) -> bool,
+    ) {
         let deadline = Instant::now() + budget;
-        let mut landed = Vec::new();
         loop {
             while let Some(result) = self.take_landed().await {
-                landed.push(result);
+                if !on_landed(result) {
+                    return;
+                }
             }
             if self.in_flight.is_empty() {
-                return landed;
+                return;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return landed;
+                return;
             }
             tokio::time::sleep(remaining.min(LANDED_PICKUP_POLL_INTERVAL)).await;
         }
@@ -1852,8 +1874,12 @@ pub(crate) fn should_retry_template_deployment_status_error(error: &ApiError) ->
 /// and the terminal error is never reported. The gate settles the probe's
 /// requests before returning:
 ///
-/// - every landed answer is consumed and reported -- a landed failure is
-///   never dropped unobserved;
+/// - it always asks for a *current* observation first: the newest answer
+///   the probe already holds may predate the deployment's failure (a
+///   pre-gate non-failure is not authority), so a fresh request goes out at
+///   the exit regardless of the refresh cadence;
+/// - every landed answer is consumed and reported the moment it lands -- a
+///   landed failure is never dropped unobserved and never waits on the rest;
 /// - a newer pending request keeps the exit waiting, so a stale non-failure
 ///   answer can never authorize success while the request that would show
 ///   the current state is still in flight;
@@ -1873,22 +1899,31 @@ pub(crate) async fn reconcile_success_with_deployment_history(
     if deployment_id == "pending" {
         return Ok(());
     }
-    history.ensure_request(api, app_name, wait_deadline);
-    for result in history
-        .take_settled_within(wait_attempt_budget(wait_deadline))
-        .await
-    {
-        match deployment_history_failure(result, deployment_id) {
-            Ok(Some(message)) => return Err(message.into()),
-            Ok(None) => {}
-            // A transient lookup error reads as "no observation": the same
-            // retry predicate as the per-iteration check keeps a ready
-            // endpoint's success intact.
-            Err(error) if should_retry_template_deployment_status_error(&error) => {}
-            Err(error) => return Err(error.into()),
-        }
+    history.force_request(api, app_name, wait_deadline);
+    let mut failure: Option<Box<dyn std::error::Error>> = None;
+    history
+        .take_settled_within(wait_attempt_budget(wait_deadline), |result| {
+            match deployment_history_failure(result, deployment_id) {
+                Ok(Some(message)) => {
+                    failure = Some(message.into());
+                    false
+                }
+                Ok(None) => true,
+                // A transient lookup error reads as "no observation": the same
+                // retry predicate as the per-iteration check keeps a ready
+                // endpoint's success intact.
+                Err(error) if should_retry_template_deployment_status_error(&error) => true,
+                Err(error) => {
+                    failure = Some(error.into());
+                    false
+                }
+            }
+        })
+        .await;
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 async fn find_deployment_entry(
@@ -1949,7 +1984,21 @@ async fn wait_for_deployment_apply_start(
                         .unwrap_or("deployment failed before apply");
                     return Err(format!("deployment {deployment_id} failed: {detail}").into());
                 }
-                _ => return Ok(()),
+                _ => {
+                    // A success exit must reconcile the deployment-state
+                    // observation first (cap#220 review follow-up): acting
+                    // on the oldest landed answer and returning would drop
+                    // a newer failure already landed or in flight.
+                    reconcile_success_with_deployment_history(
+                        api,
+                        app_name,
+                        deployment_id,
+                        start + max_wait,
+                        &mut history,
+                    )
+                    .await?;
+                    return Ok(());
+                }
             },
             Ok(None) => pb.set_message(timed_progress(
                 "Applying deployment: waiting for record",
@@ -2009,7 +2058,22 @@ async fn wait_for_deployment_completion(
             .await
         {
             Ok(Some(deployment)) => match deployment.status.as_str() {
-                "healthy" => return Ok(()),
+                "healthy" => {
+                    // The final "Deployed and healthy" exit must reconcile
+                    // the deployment-state observation first (cap#220 review
+                    // follow-up): acting on the oldest landed answer and
+                    // returning would drop a newer failure already landed or
+                    // in flight -- a false success, not just a delayed one.
+                    reconcile_success_with_deployment_history(
+                        api,
+                        app_name,
+                        deployment_id,
+                        start + max_wait,
+                        &mut history,
+                    )
+                    .await?;
+                    return Ok(());
+                }
                 "failed" => {
                     let detail = deployment
                         .error_message
