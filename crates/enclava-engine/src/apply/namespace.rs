@@ -2,7 +2,10 @@ use k8s_openapi::api::core::v1::Namespace;
 use kube::api::{Api, PostParams};
 
 use super::engine::{ApplyEngine, ApplyError};
-use super::generation::{MutationGeneration, NAMESPACE_CREATED_BY_ANNOTATION, apply_resource};
+use super::generation::{
+    MUTATION_GENERATION_ANNOTATION, MutationGeneration, NAMESPACE_CREATED_BY_ANNOTATION,
+    apply_resource_opt,
+};
 
 /// Apply a Namespace via server-side apply.
 ///
@@ -35,108 +38,144 @@ pub async fn apply_namespace(
 
     let api: Api<Namespace> = Api::all(engine.client().clone());
 
-    // Creation-evidence probe: only an observed absence authorizes the
-    // creation stamp. Any probe error aborts the step so evidence can never
-    // be fabricated for a namespace that might pre-exist.
-    let probe = match api.get_opt(name).await {
-        Ok(None) => NamespaceProbe::Absent,
-        Ok(Some(live)) => match live
-            .metadata
-            .annotations
-            .as_ref()
-            .and_then(|annotations| annotations.get(NAMESPACE_CREATED_BY_ANNOTATION))
-        {
-            Some(existing) => NamespaceProbe::AdoptedWithEvidence(existing.clone()),
-            // A live namespace without the annotation predates this scheme
-            // or was never created by CAP: adopt without fabricating
-            // evidence.
-            None => NamespaceProbe::AdoptedWithoutEvidence,
-        },
-        Err(error) => {
-            tracing::warn!(
-                namespace = %name,
-                error = %error,
-                "namespace pre-apply probe failed; failing closed without applying"
-            );
-            return Err(ApplyError::Kube(error));
-        }
-    };
-
-    let mut manifest = namespace.clone();
-    match &probe {
-        // Observed absence: this apply creates the namespace with a direct
-        // POST. The stamp is bound to the POST body: a 409 loser of the
-        // create race must never carry it into the follow-up SSA.
-        NamespaceProbe::Absent => {
-            manifest
+    // The ownership probe and the apply are retried as a unit when the
+    // namespace vanishes between them: only the direct stamped POST may
+    // create a namespace, so a mid-flight deletion must re-enter the
+    // probe→(POST|adopt) flow instead of letting SSA create an unstamped
+    // replacement.
+    for _vanish_attempt in 0..3 {
+        // Creation-evidence probe: only an observed absence authorizes the
+        // creation stamp. Any probe error aborts the step so evidence can never
+        // be fabricated for a namespace that might pre-exist.
+        let probe = match api.get_opt(name).await {
+            Ok(None) => NamespaceProbe::Absent,
+            Ok(Some(live)) => match live
                 .metadata
                 .annotations
-                .get_or_insert_with(Default::default)
-                .insert(
+                .as_ref()
+                .and_then(|annotations| annotations.get(NAMESPACE_CREATED_BY_ANNOTATION))
+            {
+                Some(existing) => NamespaceProbe::AdoptedWithEvidence(existing.clone()),
+                // A live namespace without the annotation predates this scheme
+                // or was never created by CAP: adopt without fabricating
+                // evidence.
+                None => NamespaceProbe::AdoptedWithoutEvidence,
+            },
+            Err(error) => {
+                tracing::warn!(
+                    namespace = %name,
+                    error = %error,
+                    "namespace pre-apply probe failed; failing closed without applying"
+                );
+                return Err(ApplyError::Kube(error));
+            }
+        };
+
+        let mut manifest = namespace.clone();
+        match &probe {
+            // Observed absence: this apply creates the namespace with a direct
+            // POST. The stamp is bound to the POST body: a 409 loser of the
+            // create race must never carry it into the follow-up SSA.
+            NamespaceProbe::Absent => {
+                // The POST carries BOTH annotations: the mutation-generation
+                // stamp (so the created namespace is classifiable by failed-
+                // apply cleanup exactly like an SSA-patched one) and the
+                // creation evidence bound to this POST.
+                let annotations = manifest
+                    .metadata
+                    .annotations
+                    .get_or_insert_with(Default::default);
+                annotations.insert(
                     NAMESPACE_CREATED_BY_ANNOTATION.to_string(),
                     generation.get().to_string(),
                 );
-            let post_params = PostParams {
-                field_manager: Some(engine.config().field_manager.clone()),
-                ..PostParams::default()
-            };
-            match super::bounded_kube_write(api.create(&post_params, &manifest)).await {
-                Ok(created) => {
-                    verify_creation_stamp(&created, generation)?;
-                    tracing::info!(namespace = %name, created = true, "namespace created via POST");
-                    return Ok(created);
-                }
-                Err(ApplyError::Kube(kube::Error::Api(error))) if error.code == 409 => {
-                    // Another creator won the race: adopt, never stamp.
-                    tracing::info!(
-                        namespace = %name,
-                        "namespace create raced with another creator; adopting without creation evidence"
-                    );
-                    let live = api.get(name).await.map_err(ApplyError::Kube)?;
-                    adopt_manifest(&mut manifest, &live);
-                    let patched =
-                        apply_resource(engine, &api, &manifest, generation, false, false).await?;
-                    tracing::info!(
-                        namespace = %name,
-                        created = false,
-                        "namespace applied via SSA after create race"
-                    );
-                    return Ok(patched);
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        // Adopted namespace with earlier creation evidence: preserve it
-        // verbatim — an earlier CAP generation may legitimately have created
-        // the namespace, and that evidence must survive re-applies.
-        NamespaceProbe::AdoptedWithEvidence(existing) => {
-            manifest
-                .metadata
-                .annotations
-                .get_or_insert_with(Default::default)
-                .insert(
-                    NAMESPACE_CREATED_BY_ANNOTATION.to_string(),
-                    existing.clone(),
+                annotations.insert(
+                    MUTATION_GENERATION_ANNOTATION.to_string(),
+                    generation.get().to_string(),
                 );
-        }
-        // Adopted without evidence: never fabricate creation proof, and
-        // strip any caller-supplied stamp so a public caller cannot smuggle
-        // ownership evidence onto an adopted namespace.
-        NamespaceProbe::AdoptedWithoutEvidence => {
-            if let Some(annotations) = manifest.metadata.annotations.as_mut() {
-                annotations.remove(NAMESPACE_CREATED_BY_ANNOTATION);
+                let post_params = PostParams {
+                    field_manager: Some(engine.config().field_manager.clone()),
+                    ..PostParams::default()
+                };
+                match super::bounded_kube_write(api.create(&post_params, &manifest)).await {
+                    Ok(created) => {
+                        verify_creation_stamp(&created, generation)?;
+                        tracing::info!(namespace = %name, created = true, "namespace created via POST");
+                        return Ok(created);
+                    }
+                    Err(ApplyError::Kube(kube::Error::Api(error))) if error.code == 409 => {
+                        // Another creator won the race: adopt, never stamp.
+                        tracing::info!(
+                            namespace = %name,
+                            "namespace create raced with another creator; adopting without creation evidence"
+                        );
+                        let live = api.get(name).await.map_err(ApplyError::Kube)?;
+                        adopt_manifest(&mut manifest, &live);
+                        let patched = match apply_resource_opt(
+                            engine, &api, &manifest, generation, false, false, false,
+                        )
+                        .await
+                        {
+                            Ok(patched) => patched,
+                            Err(ApplyError::VanishedResource { .. }) => continue,
+                            Err(error) => return Err(error),
+                        };
+                        tracing::info!(
+                            namespace = %name,
+                            created = false,
+                            "namespace applied via SSA after create race"
+                        );
+                        return Ok(patched);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            // Adopted namespace with earlier creation evidence: preserve it
+            // verbatim — an earlier CAP generation may legitimately have created
+            // the namespace, and that evidence must survive re-applies.
+            NamespaceProbe::AdoptedWithEvidence(existing) => {
+                manifest
+                    .metadata
+                    .annotations
+                    .get_or_insert_with(Default::default)
+                    .insert(
+                        NAMESPACE_CREATED_BY_ANNOTATION.to_string(),
+                        existing.clone(),
+                    );
+            }
+            // Adopted without evidence: never fabricate creation proof, and
+            // strip any caller-supplied stamp so a public caller cannot smuggle
+            // ownership evidence onto an adopted namespace.
+            NamespaceProbe::AdoptedWithoutEvidence => {
+                if let Some(annotations) = manifest.metadata.annotations.as_mut() {
+                    annotations.remove(NAMESPACE_CREATED_BY_ANNOTATION);
+                }
             }
         }
-    }
 
-    let patched = apply_resource(engine, &api, &manifest, generation, false, false).await?;
+        let patched = match apply_resource_opt(
+            engine, &api, &manifest, generation, false, false, false,
+        )
+        .await
+        {
+            Ok(patched) => patched,
+            Err(ApplyError::VanishedResource { .. }) => continue,
+            Err(error) => return Err(error),
+        };
 
-    tracing::info!(
-        namespace = %name,
-        created = matches!(probe, NamespaceProbe::Absent),
-        "namespace applied via SSA"
-    );
-    Ok(patched)
+        tracing::info!(
+            namespace = %name,
+            created = matches!(probe, NamespaceProbe::Absent),
+            "namespace applied via SSA"
+        );
+        return Ok(patched);
+    } // vanish-race retry loop
+
+    // The namespace kept vanishing between probe and apply across all
+    // attempts: fail closed rather than create without evidence.
+    Err(ApplyError::NamespaceNotReady(format!(
+        "namespace '{name}' repeatedly vanished between probe and apply"
+    )))
 }
 
 /// Confirm the created object actually carries this generation's creation
@@ -223,6 +262,11 @@ mod tests {
         /// Annotations the race winner's namespace carries when it appears
         /// after a rejected create.
         winner_annotations: std::collections::BTreeMap<String, String>,
+        /// 404 the SSA-time GET inside `apply_resource_opt` (the namespace
+        /// vanished between the ownership probe and the apply): the apply
+        /// must re-probe and create via the stamped POST, never let SSA
+        /// create an unstamped replacement.
+        vanish_before_patch: bool,
     }
 
     #[derive(Default)]
@@ -264,7 +308,16 @@ mod tests {
                 };
 
                 if method == axum::http::Method::GET && path == "/api/v1/namespaces/tenants" {
-                    recorded.lock().expect("poisoned").gets += 1;
+                    let mut locked = recorded.lock().expect("poisoned");
+                    locked.gets += 1;
+                    let gets = locked.gets;
+                    drop(locked);
+                    let live_annotations = if config.vanish_before_patch && gets > 1 {
+                        // The namespace vanished after the ownership probe.
+                        None
+                    } else {
+                        live_annotations
+                    };
                     let response = match live_annotations {
                         Some(annotations) => {
                             let namespace = json!({
@@ -405,6 +458,11 @@ mod tests {
             Some(&json!("7")),
             "the POST body carries this generation's creation evidence"
         );
+        assert_eq!(
+            annotations.get(MUTATION_GENERATION_ANNOTATION),
+            Some(&json!("7")),
+            "the POST body also carries the mutation-generation annotation so cleanup can classify the created namespace"
+        );
         assert!(
             locked.patch.is_none(),
             "no SSA patch is needed when the POST succeeds"
@@ -510,6 +568,7 @@ mod tests {
                 live: None,
                 reject_create: true,
                 winner_annotations: Default::default(),
+                vanish_before_patch: false,
             },
             Arc::clone(&recorded),
         )
@@ -539,6 +598,7 @@ mod tests {
             FakeServer {
                 live: None,
                 reject_create: true,
+                vanish_before_patch: false,
                 winner_annotations: std::collections::BTreeMap::from([(
                     NAMESPACE_CREATED_BY_ANNOTATION.to_string(),
                     "5".to_string(),
@@ -559,6 +619,44 @@ mod tests {
             annotations.get(NAMESPACE_CREATED_BY_ANNOTATION),
             Some(&json!("5")),
             "the race winner's creation evidence is preserved, not overwritten"
+        );
+    }
+
+    #[tokio::test]
+    async fn vanished_namespace_reenters_stamped_create_flow() {
+        let recorded = Arc::new(Mutex::new(Recorded::default()));
+        let client = fake_namespace_server(
+            FakeServer {
+                live: Some(Default::default()),
+                vanish_before_patch: true,
+                ..Default::default()
+            },
+            Arc::clone(&recorded),
+        )
+        .await;
+        let engine = ApplyEngine::new(client, Default::default());
+
+        apply_namespace(&engine, &test_namespace(), generation(7))
+            .await
+            .expect("apply succeeds after vanish-race retry");
+
+        let locked = recorded.lock().expect("poisoned");
+        assert!(
+            locked.create.is_some(),
+            "the apply must re-enter the stamped-POST create flow after the namespace vanishes"
+        );
+        let create = locked.create.clone().expect("POST carried a body");
+        let create_body = Some(create);
+        let annotations = annotations_of(&create_body).expect("POST carried annotations");
+        assert_eq!(
+            annotations.get(NAMESPACE_CREATED_BY_ANNOTATION),
+            Some(&json!("7")),
+            "the replacement namespace is created WITH creation evidence"
+        );
+        assert_eq!(
+            annotations.get(MUTATION_GENERATION_ANNOTATION),
+            Some(&json!("7")),
+            "the replacement namespace carries the mutation-generation annotation"
         );
     }
 

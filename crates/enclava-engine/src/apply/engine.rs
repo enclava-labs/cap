@@ -28,6 +28,11 @@ pub enum ApplyError {
     },
 
     #[error(
+        "{kind} '{name}' vanished between the ownership probe and the apply; the caller must re-probe"
+    )]
+    VanishedResource { kind: String, name: String },
+
+    #[error(
         "Kubernetes accepted {kind} '{name}' without provider mutation generation {expected} (found {actual})"
     )]
     ProviderGenerationNotApplied {
@@ -81,6 +86,7 @@ impl ApplyError {
             Self::MissingResourceIdentity(_) => "missing_resource_identity",
             Self::ResourceNotFound { .. } => "resource_not_found",
             Self::MutationConflictExhausted { .. } => "mutation_conflict_exhausted",
+            Self::VanishedResource { .. } => "resource_vanished",
             Self::NamespaceNotReady(_) => "namespace_not_ready",
             Self::RolloutTimeout(_, _) => "rollout_timeout",
             Self::RolloutFailed(_) => "rollout_failed",

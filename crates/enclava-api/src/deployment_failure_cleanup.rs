@@ -150,15 +150,19 @@ fn adopted_namespace_sweep_targets(app: &App) -> Vec<AdoptedNamespaceSweep> {
 }
 
 /// Delete exactly the objects this failed generation published into an
-/// adopted namespace. Deletion is generation-gated via `delete_resource`'s
-/// mutation-annotation check, so objects another generation owns (or that
-/// pre-date CAP entirely) are left untouched. Failures are logged and
-/// skipped: the fences still release normally because the retained
-/// objects converge through later successful applies.
-async fn sweep_published_objects_from_adopted_namespace(
+/// adopted namespace. Each target is first GET'd: an object is deleted only
+/// when its live mutation-generation annotation EXACTLY equals the failed
+/// generation (proving this generation published it) and the delete carries
+/// UID + resourceVersion preconditions (so a replaced object cannot be
+/// deleted by a stale decision). Objects that are absent, carry another
+/// generation, or pre-date CAP entirely (no annotation) are skipped.
+/// Returns the number of objects whose deletion was attempted and failed:
+/// non-zero means the sweep is incomplete and must be retried (the caller
+/// retains the namespace fence so the periodic reconciler converges it).
+pub(crate) async fn sweep_published_objects_from_adopted_namespace(
     app: &App,
     generation: enclava_engine::apply::generation::MutationGeneration,
-) {
+) -> usize {
     let client = match kube::Client::try_default().await {
         Ok(client) => client,
         Err(error) => {
@@ -166,121 +170,18 @@ async fn sweep_published_objects_from_adopted_namespace(
                 app_id = %app.id,
                 namespace = %app.namespace,
                 error = %error,
-                "adopted-namespace sweep cannot reach Kubernetes; leaving published objects for the next apply to reconcile"
+                "adopted-namespace sweep cannot reach Kubernetes; leaving published objects for reconciliation"
             );
-            return;
+            return usize::MAX;
         }
     };
-    let mut deleted = 0usize;
+    let mut failures = 0usize;
     for target in adopted_namespace_sweep_targets(app) {
-        // Each kind needs its typed API; `delete_resource` is generic over
-        // the resource type and re-uses the generation gate.
-        let outcome: Result<bool, enclava_engine::apply::engine::ApplyError> = match target.kind {
-            "StatefulSet" => {
-                let api: kube::Api<k8s_openapi::api::apps::v1::StatefulSet> =
-                    kube::Api::namespaced(client.clone(), &app.namespace);
-                enclava_engine::apply::generation::delete_resource(
-                    &api,
-                    &target.name,
-                    generation,
-                    kube::api::DeleteParams::default(),
-                )
-                .await
-            }
-            "Secret" => {
-                let api: kube::Api<k8s_openapi::api::core::v1::Secret> =
-                    kube::Api::namespaced(client.clone(), &app.namespace);
-                enclava_engine::apply::generation::delete_resource(
-                    &api,
-                    &target.name,
-                    generation,
-                    kube::api::DeleteParams::default(),
-                )
-                .await
-            }
-            "ServiceAccount" => {
-                let api: kube::Api<k8s_openapi::api::core::v1::ServiceAccount> =
-                    kube::Api::namespaced(client.clone(), &app.namespace);
-                enclava_engine::apply::generation::delete_resource(
-                    &api,
-                    &target.name,
-                    generation,
-                    kube::api::DeleteParams::default(),
-                )
-                .await
-            }
-            "ResourceQuota" => {
-                let api: kube::Api<k8s_openapi::api::core::v1::ResourceQuota> =
-                    kube::Api::namespaced(client.clone(), &app.namespace);
-                enclava_engine::apply::generation::delete_resource(
-                    &api,
-                    &target.name,
-                    generation,
-                    kube::api::DeleteParams::default(),
-                )
-                .await
-            }
-            "Service" => {
-                let api: kube::Api<k8s_openapi::api::core::v1::Service> =
-                    kube::Api::namespaced(client.clone(), &app.namespace);
-                enclava_engine::apply::generation::delete_resource(
-                    &api,
-                    &target.name,
-                    generation,
-                    kube::api::DeleteParams::default(),
-                )
-                .await
-            }
-            "CiliumNetworkPolicy" | "EnvoyProxy" | "Gateway" | "TLSRoute" => {
-                let ar = match target.kind {
-                    "CiliumNetworkPolicy" => crd_api_resource(
-                        "cilium.io",
-                        "v2",
-                        "CiliumNetworkPolicy",
-                        "ciliumnetworkpolicies",
-                    ),
-                    "EnvoyProxy" => crd_api_resource(
-                        "gateway.envoyproxy.io",
-                        "v1alpha1",
-                        "EnvoyProxy",
-                        "envoyproxies",
-                    ),
-                    "Gateway" => {
-                        crd_api_resource("gateway.networking.k8s.io", "v1", "Gateway", "gateways")
-                    }
-                    _ => crd_api_resource(
-                        "gateway.networking.k8s.io",
-                        "v1alpha3",
-                        "TLSRoute",
-                        "tlsroutes",
-                    ),
-                };
-                let api: kube::Api<kube::api::DynamicObject> =
-                    kube::Api::namespaced_with(client.clone(), &app.namespace, &ar);
-                enclava_engine::apply::generation::delete_resource(
-                    &api,
-                    &target.name,
-                    generation,
-                    kube::api::DeleteParams::default(),
-                )
-                .await
-            }
-            "ConfigMap" => {
-                let api: kube::Api<k8s_openapi::api::core::v1::ConfigMap> =
-                    kube::Api::namespaced(client.clone(), &app.namespace);
-                enclava_engine::apply::generation::delete_resource(
-                    &api,
-                    &target.name,
-                    generation,
-                    kube::api::DeleteParams::default(),
-                )
-                .await
-            }
-            _ => unreachable!("statically enumerated kinds"),
-        };
-        match outcome {
-            Ok(true) => deleted += 1,
-            Ok(false) => {}
+        let ar = sweep_api_resource(target.kind);
+        let api: kube::Api<kube::api::DynamicObject> =
+            kube::Api::namespaced_with(client.clone(), &app.namespace, &ar);
+        let live = match api.get_opt(&target.name).await {
+            Ok(live) => live,
             Err(error) => {
                 tracing::warn!(
                     app_id = %app.id,
@@ -288,17 +189,131 @@ async fn sweep_published_objects_from_adopted_namespace(
                     kind = target.kind,
                     name = %target.name,
                     error = %error,
-                    "adopted-namespace sweep could not delete a published object; the next apply reconciles it"
+                    "adopted-namespace sweep cannot inspect object; will retry via reconciliation"
                 );
+                failures += 1;
+                continue;
             }
+        };
+        let Some(live) = live else {
+            continue; // never created (apply failed before reaching it)
+        };
+        let live_generation = live
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|annotations| {
+                annotations.get(enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION)
+            })
+            .and_then(|raw| raw.parse::<i64>().ok());
+        if live_generation != Some(generation.get()) {
+            // Not this generation's publication (older, newer, or foreign):
+            // never delete on name alone.
+            tracing::info!(
+                app_id = %app.id,
+                namespace = %app.namespace,
+                kind = target.kind,
+                name = %target.name,
+                "adopted-namespace sweep skips object not published by the failed generation"
+            );
+            continue;
+        }
+        let preconditions = kube::api::Preconditions {
+            uid: live.metadata.uid.clone(),
+            resource_version: live.metadata.resource_version.clone(),
+        };
+        if let Err(error) = api
+            .delete(
+                &target.name,
+                &kube::api::DeleteParams {
+                    preconditions: Some(preconditions),
+                    ..kube::api::DeleteParams::default()
+                },
+            )
+            .await
+        {
+            tracing::warn!(
+                app_id = %app.id,
+                namespace = %app.namespace,
+                kind = target.kind,
+                name = %target.name,
+                error = %error,
+                "adopted-namespace sweep deletion failed; will retry via reconciliation"
+            );
+            failures += 1;
         }
     }
-    tracing::info!(
-        app_id = %app.id,
-        namespace = %app.namespace,
-        deleted,
-        "swept failed generation's objects from adopted namespace"
-    );
+    failures
+}
+
+/// ApiResource descriptors for every kind the sweep targets (core, apps,
+/// and the Gateway/Cilium CRDs), mirroring the constructors in
+/// `enclava-engine`'s apply modules.
+fn sweep_api_resource(kind: &str) -> kube::api::ApiResource {
+    match kind {
+        "Secret" => kube::api::ApiResource {
+            group: String::new(),
+            version: "v1".to_string(),
+            api_version: "v1".to_string(),
+            kind: "Secret".to_string(),
+            plural: "secrets".to_string(),
+        },
+        "StatefulSet" => kube::api::ApiResource {
+            group: "apps".to_string(),
+            version: "v1".to_string(),
+            api_version: "apps/v1".to_string(),
+            kind: "StatefulSet".to_string(),
+            plural: "statefulsets".to_string(),
+        },
+        "ServiceAccount" => kube::api::ApiResource {
+            group: String::new(),
+            version: "v1".to_string(),
+            api_version: "v1".to_string(),
+            kind: "ServiceAccount".to_string(),
+            plural: "serviceaccounts".to_string(),
+        },
+        "ResourceQuota" => kube::api::ApiResource {
+            group: String::new(),
+            version: "v1".to_string(),
+            api_version: "v1".to_string(),
+            kind: "ResourceQuota".to_string(),
+            plural: "resourcequotas".to_string(),
+        },
+        "Service" => kube::api::ApiResource {
+            group: String::new(),
+            version: "v1".to_string(),
+            api_version: "v1".to_string(),
+            kind: "Service".to_string(),
+            plural: "services".to_string(),
+        },
+        "ConfigMap" => kube::api::ApiResource {
+            group: String::new(),
+            version: "v1".to_string(),
+            api_version: "v1".to_string(),
+            kind: "ConfigMap".to_string(),
+            plural: "configmaps".to_string(),
+        },
+        "CiliumNetworkPolicy" => crd_api_resource(
+            "cilium.io",
+            "v2",
+            "CiliumNetworkPolicy",
+            "ciliumnetworkpolicies",
+        ),
+        "EnvoyProxy" => crd_api_resource(
+            "gateway.envoyproxy.io",
+            "v1alpha1",
+            "EnvoyProxy",
+            "envoyproxies",
+        ),
+        "Gateway" => crd_api_resource("gateway.networking.k8s.io", "v1", "Gateway", "gateways"),
+        "TLSRoute" => crd_api_resource(
+            "gateway.networking.k8s.io",
+            "v1alpha3",
+            "TLSRoute",
+            "tlsroutes",
+        ),
+        _ => unreachable!("statically enumerated kinds"),
+    }
 }
 
 /// Mirrors the app-delete namespace teardown envelope: bounded convergence
@@ -726,7 +741,24 @@ async fn delete_failed_generation_namespace(
                 namespace = %app.namespace,
                 "failed-apply cleanup sweeps published objects from adopted namespace (no creation evidence; namespace not deleted)"
             );
-            sweep_published_objects_from_adopted_namespace(app, generation).await;
+            let failures = sweep_published_objects_from_adopted_namespace(app, generation).await;
+            if failures > 0 {
+                // Incomplete sweep. The namespace fence must NOT be
+                // retained: the retained-fence reconciler releases only on
+                // an observed namespace 404, which never happens for an
+                // adopted namespace — retaining would reintroduce the
+                // permanent-Busy bug this change fixes. Leftovers converge
+                // deterministically instead: the next apply of this app
+                // SSA-overwrites every swept name with a newer generation,
+                // and app deletion tears down whatever remains.
+                tracing::warn!(
+                    app_id = %app.id,
+                    namespace = %app.namespace,
+                    failures,
+                    error_code = "adopted_namespace_sweep_incomplete",
+                    "adopted-namespace sweep left objects behind; the next apply or app deletion converges them"
+                );
+            }
             return NamespaceTeardown::Adopted;
         }
         InitialNamespaceOwnership::Foreign => {

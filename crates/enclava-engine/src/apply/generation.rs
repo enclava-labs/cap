@@ -253,6 +253,36 @@ pub async fn apply_resource<K>(
 where
     K: Resource + Clone + Debug + Serialize + DeserializeOwned,
 {
+    apply_resource_opt(
+        engine,
+        api,
+        resource,
+        generation,
+        force,
+        exact_when_trusted,
+        true,
+    )
+    .await
+}
+
+/// Like [`apply_resource`] but with an explicit `allow_create` flag. When
+/// false, an object that vanishes between the ownership probe and the SSA
+/// attempt returns [`ApplyError::VanishedResource`] instead of creating a
+/// replacement — used by the namespace adoption flow, where only the
+/// direct stamped POST may create.
+#[allow(clippy::too_many_arguments)]
+pub async fn apply_resource_opt<K>(
+    engine: &ApplyEngine,
+    api: &Api<K>,
+    resource: &K,
+    generation: MutationGeneration,
+    force: bool,
+    exact_when_trusted: bool,
+    allow_create: bool,
+) -> Result<K, ApplyError>
+where
+    K: Resource + Clone + Debug + Serialize + DeserializeOwned,
+{
     let name = resource
         .meta()
         .name
@@ -370,7 +400,7 @@ where
                 }
                 Err(error) => return Err(error),
             }
-        } else {
+        } else if allow_create {
             let mut desired = resource.clone();
             desired.meta_mut().resource_version = None;
             desired.meta_mut().uid = None;
@@ -386,6 +416,15 @@ where
                 }
                 Err(error) => return Err(error),
             }
+        } else {
+            // Creation is disallowed for this caller: the object was
+            // observed live at the ownership probe but is gone now. Signal
+            // the vanish so the caller re-probes instead of silently
+            // creating an unstamped replacement (namespace adoption flow).
+            return Err(ApplyError::VanishedResource {
+                kind: kind::<K>(),
+                name: name.to_string(),
+            });
         }
     }
 
