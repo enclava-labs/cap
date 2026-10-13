@@ -5,9 +5,9 @@
 //! boundaries. This module is the safe replacement for the `kubectl
 //! describe` / controller-log diagnosis an operator would otherwise
 //! perform: it projects what the platform already knows durably (the
-//! deployment, its apply job, and the app mutation lease) into a stable,
-//! redacted phase / condition / reason contract that the CLI and hosted
-//! console can render identically.
+//! deployment, its apply job, the app mutation lease, and the namespace
+//! resource fence) into a stable, redacted phase / condition / reason
+//! contract that the CLI and hosted console can render identically.
 //!
 //! Contract rules:
 //! - Every string is a fixed, redacted token — no provider, Kubernetes,
@@ -27,12 +27,28 @@
 //!   stays `watching` (observing_since anchors the cumulative deadline).
 //!   `pending` + deployment `watching` is therefore steady-state watch
 //!   progress, NOT a lease-expiry retry.
+//! - A job is CLAIMABLE when it is `pending`/`setup_pending`/
+//!   `cleanup_pending` with `next_attempt_at <= now`, or `running`/
+//!   `setting_up`/`cleaning_up` with an expired lock (claim predicate in
+//!   deployment_jobs.rs). Claimable means the dispatcher will pick it up
+//!   as soon as an apply slot is free — with `CAP_MAX_CONCURRENT_APPLIES`
+//!   default 1 that wait is the normal multi-app steady state, so a
+//!   claimable job is ALWAYS progressing, never stalled.
 //! - A terminal rollout outcome publishes job `completed` (last_error_code
 //!   cleared) with deployment status `healthy` OR `failed` — the
-//!   deployment row, not the job row, distinguishes success.
-//! - Setup failure leaves job `cleanup_pending`/`cleaning_up` (rollback)
-//!   with `last_error_code = deployment_setup_failed` and deployment
-//!   `failed`.
+//!   deployment row, not the job row, distinguishes success; the durable
+//!   `deployments.error_message` token carries the public error code.
+//! - Setup failure leaves job `cleanup_pending`/`cleaning_up` (rollback,
+//!   retried on a 30s schedule) with `last_error_code =
+//!   deployment_setup_failed` and deployment `failed`: the failure is
+//!   durable but cleanup may still be running, so the condition is NOT
+//!   terminal while a cleanup job is scheduled or held.
+//! - The deployment's own mutation-lease kinds (`deployment`,
+//!   `deployment_apply`, `deployment_setup`, `deployment_cleanup`) are
+//!   this deployment's lane, not a foreign blocker. Foreign kinds
+//!   (`app_delete`, `app_desired_state`, `custom_domain_*`,
+//!   `app_create_dns`) and a poisoned/armed `kubernetes_namespace`
+//!   resource fence DO block: a redeploy would 409 on them.
 
 use axum::Json;
 use axum::extract::State;
@@ -55,16 +71,19 @@ pub enum DeploymentPhase {
     Watching,
     Healthy,
     Failed,
-    /// The deployment was ended by app deletion or supersession, not by
-    /// its own outcome.
+    /// The deployment was ended by supersession, not by its own outcome.
     Cancelled,
+    /// The app is being destroyed; the deployment underneath is being torn
+    /// down and no deployment action is available until deletion finishes.
+    Destroying,
     /// Durable rows missing or not classifiable.
     Unknown,
 }
 
 /// Whether the phase is advancing, deliberately waiting on the platform
 /// dispatcher or an external dependency, blocked by another operation's
-/// mutation lease, stalled with nothing scheduled, or terminal.
+/// mutation lease or an external resource fence, stalled with nothing
+/// scheduled, or terminal.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeploymentCondition {
@@ -86,8 +105,9 @@ pub enum DeploymentReason {
     DeploymentApplyFailed,
     DeploymentRolloutFailed,
     DeploymentSuperseded,
-    /// The app mutation lease is held by another operation, including the
-    /// post-expiry reclaim quarantine window.
+    /// A foreign operation holds the app mutation lease (including the
+    /// post-expiry reclaim quarantine window) or the namespace resource
+    /// fence is armed.
     MutationLeaseHeldByOperation,
     AppDeleting,
     NoApplyJobRecorded,
@@ -123,10 +143,12 @@ pub struct DeploymentDiagnostics {
     pub next_retry_at: Option<DateTime<Utc>>,
     /// Deadline after which the app mutation lane admits a new claim
     /// (holder lock expiry, or the lost-owner reclaim quarantine after it).
+    /// Absent while only this deployment's own lease kinds are held, and
+    /// for a poisoned fence with no automatic release time.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blocked_until: Option<DateTime<Utc>>,
-    /// The operation that owns the app mutation lease, when one does.
-    /// Allowlisted fixed token.
+    /// The operation that owns the app mutation lane, when a FOREIGN
+    /// operation or fence does. Allowlisted fixed token.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blocking_operation: Option<String>,
     /// Cumulative rollout-observation anchor (`watching` deployments).
@@ -142,6 +164,9 @@ struct DiagnosticsRow {
     created_at: Option<DateTime<Utc>>,
     completed_at: Option<DateTime<Utc>>,
     observing_since: Option<DateTime<Utc>>,
+    /// Fixed public error token persisted on the publish path
+    /// (`deployments.error_message`); never provider text.
+    deployment_error_message: Option<String>,
     job_state: Option<String>,
     job_updated_at: Option<DateTime<Utc>>,
     next_attempt_at: Option<DateTime<Utc>>,
@@ -152,6 +177,11 @@ struct DiagnosticsRow {
     lease_locked_until: Option<DateTime<Utc>>,
     lease_reclaim_after: Option<DateTime<Utc>>,
     lease_operation_kind: Option<String>,
+    fence_locked_until: Option<DateTime<Utc>>,
+    /// `reclaim_after` of the namespace fence with `infinity` already
+    /// NULLed in SQL: a poisoned fence carries no automatic release time.
+    fence_reclaim_after: Option<DateTime<Utc>>,
+    fence_operation_kind: Option<String>,
     app_deleting: bool,
 }
 
@@ -170,6 +200,17 @@ const KNOWN_OPERATION_KINDS: &[&str] = &[
     "deployment_cleanup",
 ];
 
+/// Operation kinds on the app mutation lease that belong to THIS
+/// deployment's own lane. They are held by this deployment's worker, so
+/// they are never a foreign blocker and never populate the blocked/
+/// holder fields while the deployment progresses.
+const OWN_OPERATION_KINDS: &[&str] = &[
+    "deployment",
+    "deployment_apply",
+    "deployment_setup",
+    "deployment_cleanup",
+];
+
 fn public_operation_kind(kind: Option<&str>) -> Option<&'static str> {
     match kind {
         Some(kind) => KNOWN_OPERATION_KINDS
@@ -179,6 +220,10 @@ fn public_operation_kind(kind: Option<&str>) -> Option<&'static str> {
             .or(Some("other_operation")),
         None => None,
     }
+}
+
+fn is_own_operation(kind: Option<&str>) -> bool {
+    kind.is_some_and(|kind| OWN_OPERATION_KINDS.contains(&kind))
 }
 
 /// Load the durable facts for the app's newest deployment and project them.
@@ -198,6 +243,7 @@ pub(crate) async fn deployment_diagnostics(
                 deployment.created_at,
                 deployment.completed_at,
                 deployment.observing_since,
+                deployment.error_message AS deployment_error_message,
                 job.state AS job_state,
                 job.updated_at AS job_updated_at,
                 job.next_attempt_at,
@@ -208,6 +254,9 @@ pub(crate) async fn deployment_diagnostics(
                 lease.locked_until AS lease_locked_until,
                 lease.reclaim_after AS lease_reclaim_after,
                 lease.operation_kind AS lease_operation_kind,
+                fence.locked_until AS fence_locked_until,
+                fence.reclaim_after AS fence_reclaim_after,
+                fence.operation_kind AS fence_operation_kind,
                 app_row.status = 'deleting'::app_status_enum AS app_deleting
            FROM apps AS app_row
            LEFT JOIN LATERAL (
@@ -226,6 +275,17 @@ pub(crate) async fn deployment_diagnostics(
                   AND reclaim_after > clock_timestamp()
                 LIMIT 1
            ) AS lease ON true
+           LEFT JOIN LATERAL (
+               SELECT locked_until,
+                      NULLIF(reclaim_after, 'infinity'::timestamptz)
+                          AS reclaim_after,
+                      operation_kind
+                 FROM external_resource_mutation_leases
+                WHERE resource_scope = 'kubernetes_namespace'
+                  AND resource_key = app_row.namespace
+                  AND owner_token IS NOT NULL
+                LIMIT 1
+           ) AS fence ON true
           WHERE app_row.id = $1",
     )
     .bind(app.id)
@@ -237,7 +297,9 @@ pub(crate) async fn deployment_diagnostics(
 /// Effective app-mutation-lane admission deadline, mirroring the 409
 /// `retry_after` semantics (apps.rs `lease_retry_after_seconds`): a live
 /// holder blocks until its renewable lock expiry; once the lock has lapsed
-/// the row blocks until `reclaim_after` (lost-owner quarantine).
+/// the row blocks until `reclaim_after` (lost-owner quarantine). A fence
+/// (or lease) with `reclaim_after = infinity` is NULLed in SQL and yields
+/// no deadline — blocked with no automatic release time.
 fn lease_admission_deadline(
     locked_until: Option<DateTime<Utc>>,
     reclaim_after: Option<DateTime<Utc>>,
@@ -266,18 +328,46 @@ fn unknown_diagnostics() -> DeploymentDiagnostics {
     }
 }
 
+/// Which foreign holder (if any) blocks the app mutation lane for this
+/// deployment, and until when. Own-lane lease kinds never block. A held
+/// namespace fence always blocks — a redeploy would 409 on it regardless
+/// of which operation armed it — including poisoned fences that carry no
+/// automatic release time.
+struct ForeignBlock {
+    operation: Option<&'static str>,
+    until: Option<DateTime<Utc>>,
+}
+
+fn foreign_block(row: &DiagnosticsRow, now: DateTime<Utc>) -> ForeignBlock {
+    if !is_own_operation(row.lease_operation_kind.as_deref()) {
+        let deadline =
+            lease_admission_deadline(row.lease_locked_until, row.lease_reclaim_after, now);
+        if deadline.is_some() {
+            return ForeignBlock {
+                operation: public_operation_kind(row.lease_operation_kind.as_deref()),
+                until: deadline,
+            };
+        }
+    }
+    if row.fence_operation_kind.is_some() {
+        return ForeignBlock {
+            operation: public_operation_kind(row.fence_operation_kind.as_deref()),
+            until: lease_admission_deadline(row.fence_locked_until, row.fence_reclaim_after, now),
+        };
+    }
+    ForeignBlock {
+        operation: None,
+        until: None,
+    }
+}
+
 fn project_diagnostics(row: Option<DiagnosticsRow>) -> DeploymentDiagnostics {
     let Some(row) = row else {
         return unknown_diagnostics();
     };
     let now = Utc::now();
-
-    // A foreign mutation lease blocks the app lane regardless of deployment
-    // state. Quantify it the same way the 409 conflict body does.
-    let blocking_operation = public_operation_kind(row.lease_operation_kind.as_deref());
-    let blocked_until =
-        lease_admission_deadline(row.lease_locked_until, row.lease_reclaim_after, now)
-            .filter(|_| blocking_operation.is_some());
+    let blocked = foreign_block(&row, now);
+    let foreign_blocked = blocked.operation.is_some();
 
     let base = DeploymentDiagnostics {
         deployment_id: row.deployment_id,
@@ -287,17 +377,26 @@ fn project_diagnostics(row: Option<DiagnosticsRow>) -> DeploymentDiagnostics {
         observing_since: row
             .observing_since
             .filter(|_| row.deployment_status.as_deref() == Some("watching")),
-        blocked_until,
-        blocking_operation: blocking_operation.map(str::to_string),
+        blocked_until: if foreign_blocked { blocked.until } else { None },
+        blocking_operation: blocked
+            .operation
+            .filter(|_| foreign_blocked)
+            .map(str::to_string),
         ..unknown_diagnostics()
     };
 
     // An app being destroyed owns the lifecycle; the deployment underneath
-    // is being torn down, not advanced.
+    // is being torn down, not advanced. This is NOT terminal: teardown is
+    // an in-progress platform operation the owner must wait out.
     if row.app_deleting {
+        let condition = if row.lease_locked_until.is_some_and(|until| until > now) {
+            DeploymentCondition::Progressing
+        } else {
+            DeploymentCondition::WaitingExternal
+        };
         return DeploymentDiagnostics {
-            phase: DeploymentPhase::Cancelled,
-            condition: DeploymentCondition::Terminal,
+            phase: DeploymentPhase::Destroying,
+            condition,
             reason: Some(DeploymentReason::AppDeleting),
             next_retry_at: None,
             ..base
@@ -313,9 +412,10 @@ fn project_diagnostics(row: Option<DiagnosticsRow>) -> DeploymentDiagnostics {
         };
     };
 
-    let phase = classify_phase(deployment_status, row.job_state.as_deref(), &row);
+    let phase = classify_phase(deployment_status, row.job_state.as_deref());
     let reason = classify_reason(deployment_status, row.job_state.as_deref(), &row);
-    let (condition, next_retry_at) = classify_condition_and_retry(phase, &row, now);
+    let (condition, next_retry_at) =
+        classify_condition_and_retry(phase, &row, foreign_blocked, now);
     let reason = match condition {
         DeploymentCondition::BlockedByOperation => {
             Some(DeploymentReason::MutationLeaseHeldByOperation)
@@ -337,28 +437,22 @@ fn project_diagnostics(row: Option<DiagnosticsRow>) -> DeploymentDiagnostics {
 /// `watching` is a watch slice gap, while `pending` + `applying` is a
 /// queued apply; `completed` + deployment `failed` is a terminal rollout
 /// failure, not health.
-fn classify_phase(
-    deployment_status: &str,
-    job_state: Option<&str>,
-    row: &DiagnosticsRow,
-) -> DeploymentPhase {
+fn classify_phase(deployment_status: &str, job_state: Option<&str>) -> DeploymentPhase {
     match (deployment_status, job_state) {
         // Terminal rollout publishes clear the job error code; the
         // deployment row alone distinguishes success from failure.
-        ("failed", _) => match row.setup_state.as_deref() {
-            Some("cancel") => DeploymentPhase::Cancelled,
-            _ => DeploymentPhase::Failed,
-        },
+        ("failed", _) => DeploymentPhase::Failed,
         ("healthy", _) => DeploymentPhase::Healthy,
-        // Watch slices release the job to `pending` between observations;
-        // a setup-state job under a watching deployment is still in setup.
-        ("watching", Some("setup_pending" | "setting_up")) | ("watching", None) => {
+        // A deployment is inserted at status `pending` and only moves to
+        // `applying` after setup finished, so live setup work rides on a
+        // `pending` deployment with a setup job (the `applying` arm is
+        // defensive for any future writer).
+        ("pending" | "applying", Some("setup_pending" | "setting_up")) => {
             DeploymentPhase::SettingUp
         }
-        ("watching", _) => DeploymentPhase::Watching,
-        ("applying", Some("setup_pending" | "setting_up")) => DeploymentPhase::SettingUp,
-        ("applying", _) => DeploymentPhase::Applying,
         ("pending", _) => DeploymentPhase::Queued,
+        ("applying", _) => DeploymentPhase::Applying,
+        ("watching", _) => DeploymentPhase::Watching,
         _ => DeploymentPhase::Unknown,
     }
 }
@@ -371,33 +465,35 @@ fn classify_reason(
 ) -> Option<DeploymentReason> {
     // Terminal classifications win: they are the durable outcome. A
     // terminal rollout failure publishes job `completed` with the error
-    // code cleared, so `deployment_rollout_failed` is the fallback.
+    // code cleared, so the durable `deployments.error_message` public
+    // token (and finally the rollout-failed fallback) carries the reason.
     if deployment_status == "failed" {
-        return match row.setup_state.as_deref() {
-            Some("cancel") => Some(DeploymentReason::DeploymentSuperseded),
-            _ => row
-                .last_error_code
-                .as_deref()
-                .and_then(error_code_reason)
-                .or(Some(DeploymentReason::DeploymentRolloutFailed)),
-        };
+        return row
+            .last_error_code
+            .as_deref()
+            .and_then(error_code_reason)
+            .or_else(|| {
+                row.deployment_error_message
+                    .as_deref()
+                    .and_then(error_code_reason)
+            })
+            .or(Some(DeploymentReason::DeploymentRolloutFailed));
     }
     if deployment_status == "healthy" {
         return None;
     }
     match job_state {
-        // No job row: the deployment's setup marker still classifies it.
-        None => match row.setup_state.as_deref() {
-            Some("dns_pending") | Some("cleanup_pending") => {
-                Some(DeploymentReason::DnsSetupPending)
-            }
-            Some("failed") => Some(DeploymentReason::DeploymentSetupFailed),
-            _ => None,
-        },
-        Some("setup_pending") => match row.setup_state.as_deref() {
-            Some("dns_pending") => Some(DeploymentReason::DnsSetupPending),
-            _ => None,
-        },
+        // A committed non-terminal deployment must have an active job
+        // (deferred constraint, migration 0038); none is a durability
+        // anomaly surfaced as a stall, not a setup classification.
+        None => Some(DeploymentReason::NoApplyJobRecorded),
+        // DNS setup spans setup_pending AND setting_up: the setup_state
+        // marker stays `dns_pending` while the worker runs setup.
+        Some("setup_pending" | "setting_up")
+            if row.setup_state.as_deref() == Some("dns_pending") =>
+        {
+            Some(DeploymentReason::DnsSetupPending)
+        }
         // Cleanup rollback after a first-deploy setup failure.
         Some("cleanup_pending") | Some("cleaning_up") => {
             Some(DeploymentReason::DeploymentSetupFailed)
@@ -411,49 +507,81 @@ fn classify_reason(
 }
 
 /// Condition and retry timing from the worker/dispatcher state.
+///
+/// Precedence, per the durable state machine:
+/// 1. A live worker lease is durable progress evidence, always.
+/// 2. A foreign lease or an armed namespace fence blocks the lane — even
+///    when a retry is scheduled, because the admission deadline outlives
+///    it and any immediate claim would 409.
+/// 3. A future `next_attempt_at` is deliberate dispatch pacing.
+/// 4. Otherwise the job is claimable (due now, or a running state with an
+///    expired lock): the dispatcher picks it up as soon as an apply slot
+///    frees, which is normal queueing — progressing, never stalled.
 fn classify_condition_and_retry(
     phase: DeploymentPhase,
     row: &DiagnosticsRow,
+    foreign_blocked: bool,
     now: DateTime<Utc>,
 ) -> (DeploymentCondition, Option<DateTime<Utc>>) {
     match phase {
-        DeploymentPhase::Healthy | DeploymentPhase::Failed | DeploymentPhase::Cancelled => {
-            (DeploymentCondition::Terminal, None)
+        DeploymentPhase::Healthy => (DeploymentCondition::Terminal, None),
+        DeploymentPhase::Failed => {
+            // A failed deployment with a cleanup job still rolling back
+            // is not finished: cleanup holds the lane (redeploy 409s on
+            // it) and retries on its own schedule.
+            if matches!(
+                row.job_state.as_deref(),
+                Some("cleanup_pending" | "cleaning_up")
+            ) {
+                worker_or_schedule_condition(row, foreign_blocked, now)
+            } else {
+                (DeploymentCondition::Terminal, None)
+            }
         }
         DeploymentPhase::Unknown => (DeploymentCondition::Unknown, None),
-        DeploymentPhase::Queued => match row.next_attempt_at.filter(|a| a > &now) {
-            // Submitted but not yet due (backoff after a lost worker).
-            Some(attempt_at) => (DeploymentCondition::WaitingExternal, Some(attempt_at)),
-            // Due now: waits only for the dispatcher's idle poll, which is
-            // normal dispatch latency, not a stall.
-            None => (DeploymentCondition::Progressing, None),
-        },
-        DeploymentPhase::SettingUp | DeploymentPhase::Applying | DeploymentPhase::Watching => {
-            let worker_live = row.job_lock_token.is_some()
-                && row.job_locked_until.is_some_and(|until| until > now);
-            if worker_live {
-                // A worker holds the job: lease renewals are durable
-                // progress evidence even when the phase looks static.
-                (DeploymentCondition::Progressing, None)
-            } else if let Some(attempt_at) = row.next_attempt_at.filter(|a| a > &now) {
-                // Dispatch scheduled but not yet due. For a `watching`
-                // deployment this is the steady state between observation
-                // slices — deliberate pacing, not a fault.
-                (DeploymentCondition::WaitingExternal, Some(attempt_at))
-            } else if blocked_by_lease(row, now) {
-                (DeploymentCondition::BlockedByOperation, None)
-            } else {
-                // Eligible now or overdue with no worker and no schedule:
-                // the reconciler bounds this, do not invent timing.
-                (DeploymentCondition::Stalled, None)
+        DeploymentPhase::Queued
+        | DeploymentPhase::SettingUp
+        | DeploymentPhase::Applying
+        | DeploymentPhase::Watching => {
+            if row.job_state.is_none() {
+                // Non-terminal deployment without a job row violates the
+                // schema invariant: nothing can advance it.
+                return (DeploymentCondition::Stalled, None);
             }
+            worker_or_schedule_condition(row, foreign_blocked, now)
+        }
+        // Destroying/Cancelled compute their condition at the short-circuit
+        // in project_diagnostics; unreachable here.
+        DeploymentPhase::Destroying | DeploymentPhase::Cancelled => {
+            (DeploymentCondition::Unknown, None)
         }
     }
 }
 
-fn blocked_by_lease(row: &DiagnosticsRow, now: DateTime<Utc>) -> bool {
-    row.lease_operation_kind.is_some()
-        && lease_admission_deadline(row.lease_locked_until, row.lease_reclaim_after, now).is_some()
+fn worker_or_schedule_condition(
+    row: &DiagnosticsRow,
+    foreign_blocked: bool,
+    now: DateTime<Utc>,
+) -> (DeploymentCondition, Option<DateTime<Utc>>) {
+    let worker_live =
+        row.job_lock_token.is_some() && row.job_locked_until.is_some_and(|until| until > now);
+    if worker_live {
+        // A worker holds the job: lease renewals are durable progress
+        // evidence even when the phase looks static.
+        (DeploymentCondition::Progressing, None)
+    } else if foreign_blocked {
+        (DeploymentCondition::BlockedByOperation, None)
+    } else if let Some(attempt_at) = row.next_attempt_at.filter(|a| a > &now) {
+        // Dispatch scheduled but not yet due. For a `watching`
+        // deployment this is the steady state between observation
+        // slices — deliberate pacing, not a fault.
+        (DeploymentCondition::WaitingExternal, Some(attempt_at))
+    } else {
+        // Claimable now (due retry, or a running state whose lock
+        // expired): waits only for a free apply slot. Normal
+        // dispatcher queueing, not a stall.
+        (DeploymentCondition::Progressing, None)
+    }
 }
 
 fn error_code_reason(code: &str) -> Option<DeploymentReason> {
@@ -519,6 +647,7 @@ mod tests {
             created_at: Some(Utc::now() - chrono::Duration::minutes(14)),
             completed_at: None,
             observing_since: None,
+            deployment_error_message: None,
             job_state: job_state.map(str::to_string),
             job_updated_at: Some(Utc::now() - chrono::Duration::minutes(13)),
             next_attempt_at: None,
@@ -529,6 +658,9 @@ mod tests {
             lease_locked_until: None,
             lease_reclaim_after: None,
             lease_operation_kind: None,
+            fence_locked_until: None,
+            fence_reclaim_after: None,
+            fence_operation_kind: None,
             app_deleting: false,
         }
     }
@@ -568,6 +700,34 @@ mod tests {
     }
 
     #[test]
+    fn due_watch_retry_is_progressing_not_stalled() {
+        // The due tail of a watch-slice gap: claimable the moment an apply
+        // slot frees. With CAP_MAX_CONCURRENT_APPLIES=1 that wait is the
+        // normal multi-app steady state — never a stall, never
+        // "contact support".
+        let mut input = row("watching", Some("pending"), None);
+        input.job_lock_token = None;
+        input.job_locked_until = None;
+        input.next_attempt_at = Some(Utc::now() - chrono::Duration::seconds(20));
+        let diagnostics = project_diagnostics(Some(input));
+        assert_eq!(diagnostics.phase, DeploymentPhase::Watching);
+        assert_eq!(diagnostics.condition, DeploymentCondition::Progressing);
+        assert_eq!(diagnostics.reason, None);
+    }
+
+    #[test]
+    fn expired_worker_lock_is_progressing_not_stalled() {
+        // A running job whose lock expired is claimable by the claim
+        // predicate: the dispatcher reclaims it, this is not a stall.
+        let mut input = row("applying", Some("running"), None);
+        input.job_locked_until = Some(Utc::now() - chrono::Duration::seconds(30));
+        input.next_attempt_at = None;
+        let diagnostics = project_diagnostics(Some(input));
+        assert_eq!(diagnostics.phase, DeploymentPhase::Applying);
+        assert_eq!(diagnostics.condition, DeploymentCondition::Progressing);
+    }
+
+    #[test]
     fn terminal_rollout_failure_is_failed_even_when_job_completed() {
         // publish_rollout_outcome clears last_error_code and completes the
         // job on a terminal watch outcome; the deployment row is `failed`.
@@ -583,20 +743,39 @@ mod tests {
     }
 
     #[test]
-    fn terminal_setup_failure_keeps_its_reason_over_completed_job() {
+    fn terminal_failure_reason_survives_via_durable_error_token() {
+        // The publish path also persists the public error token on the
+        // deployment row; it must classify even with the job code cleared.
         let mut input = row("failed", Some("completed"), None);
-        input.last_error_code = Some("deployment_setup_failed".to_string());
+        input.last_error_code = None;
+        input.deployment_error_message = Some("deployment_rollout_failed".to_string());
         let diagnostics = project_diagnostics(Some(input));
         assert_eq!(diagnostics.phase, DeploymentPhase::Failed);
         assert_eq!(
             diagnostics.reason,
-            Some(DeploymentReason::DeploymentSetupFailed)
+            Some(DeploymentReason::DeploymentRolloutFailed)
         );
     }
 
     #[test]
-    fn setup_cleanup_states_are_failed_setup_not_setting_up() {
-        // First-deploy rollback: job cleanup_pending with deployment failed.
+    fn superseded_deployment_is_failed_with_superseded_reason() {
+        // Supersession sets job last_error_code = deployment_superseded
+        // and deployment status failed (deploy.rs).
+        let mut input = row("failed", Some("failed"), None);
+        input.last_error_code = Some("deployment_superseded".to_string());
+        let diagnostics = project_diagnostics(Some(input));
+        assert_eq!(diagnostics.phase, DeploymentPhase::Failed);
+        assert_eq!(
+            diagnostics.reason,
+            Some(DeploymentReason::DeploymentSuperseded)
+        );
+    }
+
+    #[test]
+    fn failed_setup_cleanup_retry_is_waiting_external_not_terminal() {
+        // release_cleanup_for_retry_in_tx requeues the cleanup job with a
+        // 30s retry while the deployment stays failed: the failure is
+        // durable but rollback still runs (and blocks redeploy).
         let mut input = row("failed", Some("cleanup_pending"), Some("cleanup_pending"));
         input.last_error_code = Some("deployment_setup_failed".to_string());
         input.job_lock_token = None;
@@ -608,11 +787,21 @@ mod tests {
             diagnostics.reason,
             Some(DeploymentReason::DeploymentSetupFailed)
         );
-        assert_eq!(diagnostics.condition, DeploymentCondition::Terminal);
+        assert_eq!(diagnostics.condition, DeploymentCondition::WaitingExternal);
+        assert!(diagnostics.next_retry_at.is_some());
     }
 
     #[test]
-    fn failed_job_is_terminal_with_redacted_reason() {
+    fn failed_setup_cleanup_in_flight_is_progressing() {
+        let mut input = row("failed", Some("cleaning_up"), Some("cleanup_pending"));
+        input.last_error_code = Some("deployment_setup_failed".to_string());
+        let diagnostics = project_diagnostics(Some(input));
+        assert_eq!(diagnostics.phase, DeploymentPhase::Failed);
+        assert_eq!(diagnostics.condition, DeploymentCondition::Progressing);
+    }
+
+    #[test]
+    fn failed_deployment_without_cleanup_job_is_terminal() {
         let mut input = row("failed", Some("failed"), None);
         input.last_error_code = Some("deployment_apply_failed".to_string());
         let diagnostics = project_diagnostics(Some(input));
@@ -626,13 +815,29 @@ mod tests {
     }
 
     #[test]
-    fn deleting_app_cancels_the_active_deployment() {
+    fn deleting_app_is_destroying_not_terminal() {
+        // Delete holds the app_delete lease across external teardown;
+        // teardown is an in-progress operation the owner waits out, not a
+        // finished lifecycle.
         let mut input = row("applying", Some("running"), None);
         input.app_deleting = true;
+        input.lease_locked_until = Some(Utc::now() + chrono::Duration::minutes(2));
+        input.lease_operation_kind = Some("app_delete".to_string());
         let diagnostics = project_diagnostics(Some(input));
-        assert_eq!(diagnostics.phase, DeploymentPhase::Cancelled);
-        assert_eq!(diagnostics.condition, DeploymentCondition::Terminal);
+        assert_eq!(diagnostics.phase, DeploymentPhase::Destroying);
+        assert_eq!(diagnostics.condition, DeploymentCondition::Progressing);
         assert_eq!(diagnostics.reason, Some(DeploymentReason::AppDeleting));
+    }
+
+    #[test]
+    fn deleting_app_with_lapsed_lease_still_waits() {
+        let mut input = row("applying", Some("running"), None);
+        input.app_deleting = true;
+        input.lease_locked_until = Some(Utc::now() - chrono::Duration::seconds(5));
+        input.lease_operation_kind = Some("app_delete".to_string());
+        let diagnostics = project_diagnostics(Some(input));
+        assert_eq!(diagnostics.phase, DeploymentPhase::Destroying);
+        assert_eq!(diagnostics.condition, DeploymentCondition::WaitingExternal);
     }
 
     #[test]
@@ -659,6 +864,21 @@ mod tests {
         assert!(diagnostics.deployment_id.is_none());
         assert!(diagnostics.started_at.is_none());
         assert_eq!(diagnostics.attempts, 0);
+    }
+
+    #[test]
+    fn nonterminal_deployment_without_job_row_is_stalled() {
+        // The schema guarantees a committed non-terminal deployment has an
+        // active job; a missing row is a durability anomaly nothing can
+        // advance — the one true stall.
+        let input = row("watching", None, None);
+        let diagnostics = project_diagnostics(Some(input));
+        assert_eq!(diagnostics.phase, DeploymentPhase::Watching);
+        assert_eq!(diagnostics.condition, DeploymentCondition::Stalled);
+        assert_eq!(
+            diagnostics.reason,
+            Some(DeploymentReason::NoApplyJobRecorded)
+        );
     }
 
     #[test]
@@ -689,13 +909,55 @@ mod tests {
     }
 
     #[test]
-    fn live_foreign_lease_is_blocked_by_operation() {
+    fn live_setup_on_pending_deployment_is_setting_up_with_dns_reason() {
+        // Deployments are inserted at status `pending`; setup work rides a
+        // setup job under it, and the DNS reason spans setup_pending AND
+        // setting_up (setup_state stays dns_pending while claimed).
+        let mut pending = row("pending", Some("setup_pending"), Some("dns_pending"));
+        pending.job_lock_token = None;
+        pending.job_locked_until = None;
+        let diagnostics = project_diagnostics(Some(pending));
+        assert_eq!(diagnostics.phase, DeploymentPhase::SettingUp);
+        assert_eq!(diagnostics.reason, Some(DeploymentReason::DnsSetupPending));
+
+        let mut claimed = row("pending", Some("setting_up"), Some("dns_pending"));
+        claimed.job_lock_token = None;
+        claimed.job_locked_until = None;
+        let diagnostics = project_diagnostics(Some(claimed));
+        assert_eq!(diagnostics.phase, DeploymentPhase::SettingUp);
+        assert_eq!(diagnostics.reason, Some(DeploymentReason::DnsSetupPending));
+    }
+
+    #[test]
+    fn own_lane_lease_never_blocks_or_populates_holder() {
+        // The deployment's own worker holds deployment_apply while it
+        // works: a healthy apply must not look blocked by itself, even
+        // after its job lock lapses (claimable => progressing).
         let mut input = row("applying", Some("pending"), None);
         input.job_lock_token = None;
         input.job_locked_until = None;
         input.next_attempt_at = None;
         input.lease_locked_until = Some(Utc::now() + chrono::Duration::minutes(2));
-        input.lease_reclaim_after = Some(Utc::now() + chrono::Duration::minutes(3));
+        input.lease_reclaim_after = Some(Utc::now() + chrono::Duration::minutes(5));
+        input.lease_operation_kind = Some("deployment_apply".to_string());
+        let diagnostics = project_diagnostics(Some(input));
+        assert_eq!(diagnostics.condition, DeploymentCondition::Progressing);
+        assert_eq!(diagnostics.reason, None);
+        assert!(diagnostics.blocking_operation.is_none());
+        assert!(diagnostics.blocked_until.is_none());
+    }
+
+    #[test]
+    fn foreign_lease_beats_a_scheduled_retry() {
+        // A foreign holder wins the condition over a future retry: the
+        // admission deadline outlives the schedule and an immediate claim
+        // would 409. The action must not promise the earlier retry time.
+        let mut input = row("applying", Some("pending"), None);
+        input.job_lock_token = None;
+        input.job_locked_until = None;
+        input.next_attempt_at = Some(Utc::now() + chrono::Duration::seconds(30));
+        input.lease_locked_until = Some(Utc::now() + chrono::Duration::minutes(3));
+        input.lease_reclaim_after = Some(Utc::now() + chrono::Duration::minutes(6));
         input.lease_operation_kind = Some("app_delete".to_string());
         let diagnostics = project_diagnostics(Some(input));
         assert_eq!(
@@ -711,6 +973,7 @@ mod tests {
             Some("app_delete")
         );
         assert!(diagnostics.blocked_until.is_some());
+        assert!(diagnostics.next_retry_at.is_none());
     }
 
     #[test]
@@ -737,6 +1000,57 @@ mod tests {
     }
 
     #[test]
+    fn armed_namespace_fence_is_visible_as_the_blocker() {
+        // Kubernetes-namespace ambiguity is fenced on
+        // external_resource_mutation_leases; after the app-row lease
+        // lapses this is the thing a redeploy would 409 on.
+        let mut input = row("watching", Some("pending"), None);
+        input.job_lock_token = None;
+        input.job_locked_until = None;
+        input.next_attempt_at = Some(Utc::now() - chrono::Duration::seconds(10));
+        input.fence_locked_until = Some(Utc::now() - chrono::Duration::minutes(1));
+        input.fence_reclaim_after = Some(Utc::now() + chrono::Duration::minutes(10));
+        input.fence_operation_kind = Some("deployment_apply".to_string());
+        let diagnostics = project_diagnostics(Some(input));
+        assert_eq!(
+            diagnostics.condition,
+            DeploymentCondition::BlockedByOperation
+        );
+        assert_eq!(
+            diagnostics.reason,
+            Some(DeploymentReason::MutationLeaseHeldByOperation)
+        );
+        assert_eq!(
+            diagnostics.blocking_operation.as_deref(),
+            Some("deployment_apply")
+        );
+        assert!(diagnostics.blocked_until.is_some());
+    }
+
+    #[test]
+    fn poisoned_fence_blocks_without_a_deadline() {
+        // reclaim_after = infinity is NULLed in SQL: blocked with no
+        // automatic release time. Still blocked, still named.
+        let mut input = row("applying", Some("pending"), None);
+        input.job_lock_token = None;
+        input.job_locked_until = None;
+        input.next_attempt_at = None;
+        input.fence_locked_until = Some(Utc::now() - chrono::Duration::minutes(5));
+        input.fence_reclaim_after = None;
+        input.fence_operation_kind = Some("custom_domain_set".to_string());
+        let diagnostics = project_diagnostics(Some(input));
+        assert_eq!(
+            diagnostics.condition,
+            DeploymentCondition::BlockedByOperation
+        );
+        assert_eq!(
+            diagnostics.blocking_operation.as_deref(),
+            Some("custom_domain_set")
+        );
+        assert!(diagnostics.blocked_until.is_none());
+    }
+
+    #[test]
     fn unknown_operation_kind_degrades_to_fixed_token() {
         let mut input = row("applying", Some("pending"), None);
         input.job_lock_token = None;
@@ -753,26 +1067,12 @@ mod tests {
     }
 
     #[test]
-    fn expired_lease_without_retry_or_lease_blocker_is_stalled() {
-        let mut input = row("watching", Some("pending"), None);
-        input.job_lock_token = None;
-        input.job_locked_until = None;
-        input.next_attempt_at = None;
-        let diagnostics = project_diagnostics(Some(input));
-        assert_eq!(diagnostics.condition, DeploymentCondition::Stalled);
-        assert_eq!(diagnostics.reason, None);
-    }
-
-    #[test]
-    fn cancel_setup_state_is_cancelled() {
-        let diagnostics = project_diagnostics(Some(row("failed", None, Some("cancel"))));
-        assert_eq!(diagnostics.phase, DeploymentPhase::Cancelled);
-    }
-
-    #[test]
-    fn missing_job_classifies_by_deployment_status() {
+    fn missing_job_with_dns_marker_keeps_setup_reason() {
         let diagnostics = project_diagnostics(Some(row("pending", None, Some("dns_pending"))));
-        assert_eq!(diagnostics.phase, DeploymentPhase::Queued);
-        assert_eq!(diagnostics.reason, Some(DeploymentReason::DnsSetupPending));
+        assert_eq!(diagnostics.condition, DeploymentCondition::Stalled);
+        assert_eq!(
+            diagnostics.reason,
+            Some(DeploymentReason::NoApplyJobRecorded)
+        );
     }
 }

@@ -1849,18 +1849,24 @@ pub async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> 
 /// strings are fixed tokens from the API contract; only timing context is
 /// appended, never provider or workload text.
 fn deployment_condition_action(condition: &str, phase: Option<&str>) -> &'static str {
+    if phase == Some("destroying") {
+        return "the app is being deleted; wait for teardown to complete before creating it again";
+    }
     match condition {
         "progressing" => "wait; the deployment is making progress",
         "waiting_external" => {
             "wait; the platform will pick this deployment up automatically at the scheduled time"
         }
         "blocked_by_operation" => {
-            "another operation owns this app's mutation lease; wait for it to finish or retry after it completes"
+            "another operation owns this app's mutation lane; wait for it to finish or retry after it completes"
         }
-        "stalled" => "no retry is scheduled; contact support or redeploy if this persists",
+        "stalled" => "no worker or retry schedule is recorded; contact support if this persists",
         "terminal" => match phase {
             Some("healthy") => "the deployment completed successfully",
-            Some("cancelled") => "the deployment was ended by app deletion or supersession",
+            Some("cancelled") => "the deployment was superseded by a newer deployment",
+            Some("failed") => {
+                "the deployment failed; wait for any rollback to finish, then redeploy to try again"
+            }
             _ => "the deployment failed; redeploy to try again",
         },
         _ => "lifecycle details are unavailable from this API instance",
