@@ -592,9 +592,9 @@ mod app_status_contract_tests {
             "domain": "demo.example.test",
             "last_deployed": null,
             "deployment": {
-                "phase": "queued",
+                "phase": "watching",
                 "condition": "waiting_external",
-                "reason": "lease_expired_retry_scheduled",
+                "reason": null,
                 "deployment_id": "00000000-0000-0000-0000-00000000090",
                 "started_at": "2026-10-13T08:00:00Z",
                 "last_progress_at": "2026-10-13T08:01:02Z",
@@ -602,21 +602,83 @@ mod app_status_contract_tests {
                 "next_retry_at": "2026-10-13T08:01:07Z",
                 "blocked_until": "2026-10-13T08:03:00Z",
                 "blocking_operation": "app_delete",
-                "observing_since": null
+                "observing_since": "2026-10-13T07:44:00Z"
             }
         }))
         .expect("parse deployment diagnostics block");
 
         let deployment = status.deployment.expect("deployment diagnostics");
-        assert_eq!(deployment.phase, "queued");
+        assert_eq!(deployment.phase, "watching");
         assert_eq!(deployment.condition, "waiting_external");
-        assert_eq!(
-            deployment.reason.as_deref(),
-            Some("lease_expired_retry_scheduled")
-        );
+        // Deliberate watch pacing carries no fault reason.
+        assert_eq!(deployment.reason, None);
         assert_eq!(deployment.attempts, Some(4));
         assert!(deployment.next_retry_at.is_some());
         assert_eq!(deployment.blocking_operation.as_deref(), Some("app_delete"));
+    }
+
+    #[test]
+    fn app_status_parses_terminal_rollout_failure_shape() {
+        // Terminal rollout publish: job completed, deployment failed — the
+        // deployment row is what distinguishes failure from health.
+        let status: AppStatus = serde_json::from_value(serde_json::json!({
+            "app_name": "demo",
+            "status": "failed",
+            "pod_phase": null,
+            "tee_status": null,
+            "unlock_status": null,
+            "domain": "demo.example.test",
+            "last_deployed": null,
+            "deployment": {
+                "phase": "failed",
+                "condition": "terminal",
+                "reason": "deployment_rollout_failed",
+                "deployment_id": "00000000-0000-0000-0000-00000000090",
+                "started_at": "2026-10-13T08:00:00Z",
+                "last_progress_at": "2026-10-13T08:11:02Z",
+                "attempts": 3,
+                "next_retry_at": null,
+                "observing_since": null
+            }
+        }))
+        .expect("parse failed-rollout diagnostics");
+
+        let deployment = status.deployment.expect("deployment diagnostics");
+        assert_eq!(deployment.phase, "failed");
+        assert_eq!(deployment.condition, "terminal");
+        assert_eq!(
+            deployment.reason.as_deref(),
+            Some("deployment_rollout_failed")
+        );
+        assert_eq!(deployment.next_retry_at, None);
+    }
+
+    #[test]
+    fn app_status_parses_blocked_by_operation_shape() {
+        let status: AppStatus = serde_json::from_value(serde_json::json!({
+            "app_name": "demo",
+            "status": "deploying",
+            "pod_phase": null,
+            "tee_status": null,
+            "unlock_status": null,
+            "domain": "demo.example.test",
+            "last_deployed": null,
+            "deployment": {
+                "phase": "queued",
+                "condition": "blocked_by_operation",
+                "reason": "mutation_lease_held_by_operation",
+                "deployment_id": "00000000-0000-0000-0000-00000000090",
+                "attempts": 2,
+                "blocked_until": "2026-10-13T08:03:00Z",
+                "blocking_operation": "app_delete"
+            }
+        }))
+        .expect("parse blocked diagnostics");
+
+        let deployment = status.deployment.expect("deployment diagnostics");
+        assert_eq!(deployment.condition, "blocked_by_operation");
+        assert_eq!(deployment.blocking_operation.as_deref(), Some("app_delete"));
+        assert!(deployment.blocked_until.is_some());
     }
 
     #[test]

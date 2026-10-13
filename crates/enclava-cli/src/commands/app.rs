@@ -1848,23 +1848,54 @@ pub async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> 
 /// One owner-facing sentence for the common lifecycle states (#90). The
 /// strings are fixed tokens from the API contract; only timing context is
 /// appended, never provider or workload text.
-fn deployment_condition_action(condition: &str, reason: Option<&str>) -> &'static str {
+fn deployment_condition_action(condition: &str, phase: Option<&str>) -> &'static str {
     match condition {
         "progressing" => "wait; the deployment is making progress",
-        "waiting_external" => match reason {
-            Some("lease_expired_retry_scheduled") => {
-                "wait; the platform will retry this deployment automatically"
-            }
-            _ => "wait; a platform dependency is being retried",
+        "waiting_external" => {
+            "wait; the platform will pick this deployment up automatically at the scheduled time"
+        }
+        "blocked_by_operation" => {
+            "another operation owns this app's mutation lease; wait for it to finish or retry after it completes"
+        }
+        "stalled" => "no retry is scheduled; contact support or redeploy if this persists",
+        "terminal" => match phase {
+            Some("healthy") => "the deployment completed successfully",
+            Some("cancelled") => "the deployment was ended by app deletion or supersession",
+            _ => "the deployment failed; redeploy to try again",
         },
-        "stalled" => match reason {
-            Some("mutation_lease_held_by_operation") => {
-                "another operation owns this app's mutation lease; wait for it to finish or retry after it completes"
-            }
-            _ => "no retry is scheduled; contact support or redeploy if this persists",
-        },
-        "terminal" => "the deployment is complete (check phase for outcome); redeploy to try again",
         _ => "lifecycle details are unavailable from this API instance",
+    }
+}
+
+/// "3m ago" / "in 25s" style relative age for owner-facing timestamps.
+/// Falls back to the raw timestamp when it cannot be parsed.
+fn relative_time(timestamp: &str) -> String {
+    let parsed = chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|parsed| parsed.with_timezone(&chrono::Utc));
+    match parsed {
+        Ok(parsed) => {
+            let delta = chrono::Utc::now().signed_duration_since(parsed);
+            let seconds = delta.num_seconds();
+            if seconds >= 0 {
+                if seconds < 60 {
+                    format!("{timestamp} ({seconds}s ago)")
+                } else if seconds < 3600 {
+                    format!("{timestamp} ({}m ago)", seconds / 60)
+                } else {
+                    format!("{timestamp} ({}h ago)", seconds / 3600)
+                }
+            } else {
+                let seconds = -seconds;
+                if seconds < 60 {
+                    format!("{timestamp} (in {seconds}s)")
+                } else if seconds < 3600 {
+                    format!("{timestamp} (in {}m)", seconds / 60)
+                } else {
+                    format!("{timestamp} (in {}h)", seconds / 3600)
+                }
+            }
+        }
+        Err(_) => timestamp.to_string(),
     }
 }
 
@@ -1873,8 +1904,8 @@ fn print_deployment_diagnostics(deployment: &DeploymentDiagnostics) {
     let phase_colored = match deployment.condition.as_str() {
         "terminal" if deployment.phase == "failed" => deployment.phase.red().to_string(),
         "terminal" if deployment.phase == "healthy" => deployment.phase.green().to_string(),
-        "progressing" => deployment.phase.yellow().to_string(),
-        "stalled" => deployment.phase.red().to_string(),
+        "progressing" | "waiting_external" => deployment.phase.yellow().to_string(),
+        "stalled" | "blocked_by_operation" => deployment.phase.red().to_string(),
         _ => deployment.phase.yellow().to_string(),
     };
     println!("Deploy:   {phase_colored} ({})", deployment.condition);
@@ -1882,26 +1913,32 @@ fn print_deployment_diagnostics(deployment: &DeploymentDiagnostics) {
         println!("Reason:   {reason}");
     }
     if let Some(last_progress_at) = &deployment.last_progress_at {
-        println!("Progress: {last_progress_at}");
+        println!("Progress: {}", relative_time(last_progress_at));
     }
     if let Some(attempts) = deployment.attempts {
         println!("Attempts: {attempts}");
     }
     if let Some(next_retry_at) = &deployment.next_retry_at {
-        println!("Retry:    {next_retry_at}");
+        println!("Retry:    {}", relative_time(next_retry_at));
     }
     if let Some(blocked_until) = &deployment.blocked_until {
-        println!("Blocked:  lease held until {blocked_until}");
+        println!(
+            "Blocked:  mutation lane admits retries after {}",
+            relative_time(blocked_until)
+        );
     }
     if let Some(blocking_operation) = &deployment.blocking_operation {
         println!("Holder:   {blocking_operation}");
     }
     if let Some(observing_since) = &deployment.observing_since {
-        println!("Watching: observing since {observing_since}");
+        println!(
+            "Watching: observing since {}",
+            relative_time(observing_since)
+        );
     }
     println!(
         "Action:   {}",
-        deployment_condition_action(&deployment.condition, deployment.reason.as_deref())
+        deployment_condition_action(&deployment.condition, Some(&deployment.phase))
     );
 }
 

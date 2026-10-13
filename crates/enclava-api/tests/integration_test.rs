@@ -4161,6 +4161,7 @@ async fn seed_diagnostics_fixture(
     org_id: Uuid,
     app_id: Uuid,
     deployment_id: Uuid,
+    deployment_status: &str,
     job_state: &str,
     job_lock_token: Option<Uuid>,
     next_attempt_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -4176,7 +4177,7 @@ async fn seed_diagnostics_fixture(
              id, org_id, app_id, trigger, status, spec_snapshot,
              image_digest, cosign_verified
          ) VALUES (
-             $1, $2, $3, 'api', 'applying', $4,
+             $1, $2, $3, 'api', $5::deploy_status_enum, $4,
              'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', true
          )",
     )
@@ -4184,6 +4185,7 @@ async fn seed_diagnostics_fixture(
     .bind(org_id)
     .bind(app_id)
     .bind(serde_json::json!({"setup_state": "applied"}))
+    .bind(deployment_status)
     .execute(&mut *tx)
     .await
     .expect("seed deployment row");
@@ -4254,6 +4256,7 @@ async fn deployment_diagnostics_projects_live_apply_job_over_http() {
         org_id,
         persisted_app.id,
         deployment_id,
+        "applying",
         "running",
         Some(Uuid::new_v4()),
         None,
@@ -4309,6 +4312,7 @@ async fn deployment_diagnostics_projects_live_apply_job_over_http() {
         org_id,
         persisted_app.id,
         retry_deployment_id,
+        "applying",
         "pending",
         None,
         Some(chrono::Utc::now() + chrono::Duration::seconds(30)),
@@ -4323,14 +4327,169 @@ async fn deployment_diagnostics_projects_live_apply_job_over_http() {
         .await;
     retry_response.assert_status(StatusCode::OK);
     let retry_body: Value = retry_response.json();
-    assert_eq!(retry_body["phase"], "queued");
+    assert_eq!(retry_body["phase"], "applying");
     assert_eq!(retry_body["condition"], "waiting_external");
     assert_eq!(
-        retry_body["reason"], "lease_expired_retry_scheduled",
-        "retry diagnostics body: {retry_body}"
+        retry_body["reason"],
+        Value::Null,
+        "deliberate dispatch pacing carries no fault reason: {retry_body}"
     );
     assert_eq!(retry_body["attempts"], 7);
     assert!(retry_body["next_retry_at"].is_string());
+}
+
+#[tokio::test]
+async fn deployment_diagnostics_no_deployment_app_is_unknown_not_500() {
+    let (state, _pool) = setup_test_state().await;
+    let app = test_router(state);
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+    let suffix = Uuid::new_v4().simple().to_string();
+    let app_name = format!("diagnd-{}", &suffix[..12]);
+    let (session_token, _org_id) = signup_owner(&server, "diagnd").await;
+
+    server
+        .post("/apps")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .authorization_bearer(&session_token)
+        .json(&serde_json::json!({
+            "name": app_name,
+            "unlock_mode": "auto",
+        }))
+        .await
+        .assert_status(StatusCode::CREATED);
+
+    // Fresh app, no deployment rows at all: the endpoint must degrade to
+    // unknown with a null deployment id, never a 500.
+    let response = server
+        .get(&format!("/apps/{app_name}/deployment/diagnostics"))
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .authorization_bearer(&session_token)
+        .await;
+    response.assert_status(StatusCode::OK);
+    let body: Value = response.json();
+    assert_eq!(body["phase"], "unknown", "no-deployment body: {body}");
+    assert_eq!(body["deployment_id"], Value::Null);
+    assert_eq!(body["reason"], "no_apply_job_recorded");
+    assert_eq!(body["attempts"], 0);
+}
+
+#[tokio::test]
+async fn deployment_diagnostics_terminal_rollout_failure_is_failed_not_healthy() {
+    let (state, pool) = setup_test_state().await;
+    let app = test_router(state);
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+    let suffix = Uuid::new_v4().simple().to_string();
+    let app_name = format!("diagrf-{}", &suffix[..12]);
+    let (session_token, org_id) = signup_owner(&server, "diagrf").await;
+
+    server
+        .post("/apps")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .authorization_bearer(&session_token)
+        .json(&serde_json::json!({
+            "name": app_name,
+            "unlock_mode": "auto",
+        }))
+        .await
+        .assert_status(StatusCode::CREATED);
+
+    let persisted_app: enclava_api::models::App =
+        sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
+            .bind(org_id)
+            .bind(&app_name)
+            .fetch_one(&pool)
+            .await
+            .expect("created diagnostics app");
+
+    // Terminal rollout-failure publish shape: job `completed` with the
+    // error code cleared, deployment `failed`.
+    let deployment_id = Uuid::new_v4();
+    seed_diagnostics_fixture(
+        &pool,
+        org_id,
+        persisted_app.id,
+        deployment_id,
+        "failed",
+        "completed",
+        None,
+        None,
+        3,
+    )
+    .await;
+
+    let response = server
+        .get(&format!("/apps/{app_name}/deployment/diagnostics"))
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .authorization_bearer(&session_token)
+        .await;
+    response.assert_status(StatusCode::OK);
+    let body: Value = response.json();
+    assert_eq!(body["phase"], "failed", "rollout-failure body: {body}");
+    assert_eq!(body["condition"], "terminal");
+    assert_eq!(body["reason"], "deployment_rollout_failed");
+}
+
+#[tokio::test]
+async fn deployment_diagnostics_watch_slice_gap_is_watching_not_queued() {
+    let (state, pool) = setup_test_state().await;
+    let app = test_router(state);
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+    let suffix = Uuid::new_v4().simple().to_string();
+    let app_name = format!("diagws-{}", &suffix[..12]);
+    let (session_token, org_id) = signup_owner(&server, "diagws").await;
+
+    server
+        .post("/apps")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .authorization_bearer(&session_token)
+        .json(&serde_json::json!({
+            "name": app_name,
+            "unlock_mode": "auto",
+        }))
+        .await
+        .assert_status(StatusCode::CREATED);
+
+    let persisted_app: enclava_api::models::App =
+        sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
+            .bind(org_id)
+            .bind(&app_name)
+            .fetch_one(&pool)
+            .await
+            .expect("created diagnostics app");
+
+    // Between 90s observation slices: job released to `pending` with a 30s
+    // retry, deployment stays `watching`.
+    let deployment_id = Uuid::new_v4();
+    seed_diagnostics_fixture(
+        &pool,
+        org_id,
+        persisted_app.id,
+        deployment_id,
+        "watching",
+        "pending",
+        None,
+        Some(chrono::Utc::now() + chrono::Duration::seconds(25)),
+        5,
+    )
+    .await;
+    sqlx::query("UPDATE deployments SET observing_since = clock_timestamp() - interval '3 minutes' WHERE id = $1")
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("anchor watch observation");
+
+    let response = server
+        .get(&format!("/apps/{app_name}/deployment/diagnostics"))
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .authorization_bearer(&session_token)
+        .await;
+    response.assert_status(StatusCode::OK);
+    let body: Value = response.json();
+    assert_eq!(body["phase"], "watching", "watch-slice body: {body}");
+    assert_eq!(body["condition"], "waiting_external");
+    assert_eq!(body["reason"], Value::Null);
+    assert!(body["next_retry_at"].is_string());
+    assert!(body["observing_since"].is_string());
 }
 
 #[tokio::test]
@@ -4367,6 +4526,7 @@ async fn deployment_diagnostics_reports_foreign_lease_blocker() {
         org_id,
         persisted_app.id,
         deployment_id,
+        "applying",
         "pending",
         None,
         None,
@@ -4402,8 +4562,8 @@ async fn deployment_diagnostics_reports_foreign_lease_blocker() {
         .await;
     response.assert_status(StatusCode::OK);
     let body: Value = response.json();
-    assert_eq!(body["phase"], "queued");
-    assert_eq!(body["condition"], "stalled");
+    assert_eq!(body["phase"], "applying");
+    assert_eq!(body["condition"], "blocked_by_operation");
     assert_eq!(
         body["reason"], "mutation_lease_held_by_operation",
         "blocked diagnostics body: {body}"
