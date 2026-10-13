@@ -9,10 +9,33 @@
 //! key on 200, 401 if attestation rejected, 403 if Rego denied, 404 if no
 //! such resource (first-write-wins enrollment hasn't happened yet).
 
+use std::io::Read;
 use std::time::Duration;
 
 use crate::errors::{InitError, Result};
 use crate::secrets::WrapKey;
+
+/// Hard cap on the wrap-key response body: the legitimate payload is 32
+/// bytes, so anything larger is a hostile/compromised endpoint and must be
+/// rejected without buffering it.
+const KBS_FETCH_BODY_LIMIT_BYTES: usize = 64 * 1024;
+
+fn read_capped(resp: &mut reqwest::blocking::Response, limit: usize) -> std::io::Result<Vec<u8>> {
+    let mut body = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let read = resp.read(&mut chunk)?;
+        if read == 0 {
+            return Ok(body);
+        }
+        if body.len().saturating_add(read) > limit {
+            return Err(std::io::Error::other(format!(
+                "body exceeds {limit} byte limit"
+            )));
+        }
+        body.extend_from_slice(&chunk[..read]);
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct KbsClient {
@@ -40,15 +63,14 @@ impl KbsClient {
             .timeout(self.timeout)
             .build()
             .map_err(|e| InitError::Kbs(format!("client build: {e}")))?;
-        let resp = client
+        let mut resp = client
             .get(&url)
             .send()
             .map_err(|e| InitError::Kbs(format!("GET {url}: {e}")))?;
         let status = resp.status();
         match status.as_u16() {
             200 => {
-                let bytes = resp
-                    .bytes()
+                let bytes = read_capped(&mut resp, KBS_FETCH_BODY_LIMIT_BYTES)
                     .map_err(|e| InitError::Kbs(format!("read body: {e}")))?;
                 if bytes.len() != 32 {
                     return Err(InitError::Kbs(format!(
@@ -155,5 +177,38 @@ mod tests {
             Err(e) => e,
         };
         assert!(matches!(err, InitError::Kbs(s) if s.contains("wrong length")));
+    }
+}
+
+#[cfg(test)]
+mod body_cap_tests {
+    use super::*;
+
+    #[test]
+    fn fetch_wrap_key_rejects_oversized_body() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let body = vec![0xABu8; KBS_FETCH_BODY_LIMIT_BYTES + 1];
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).unwrap();
+            stream.write_all(&body).unwrap();
+        });
+        let client = KbsClient::new(format!("http://127.0.0.1:{port}"), "wrap".into());
+        let err = match client.fetch_wrap_key() {
+            Err(err) => err,
+            Ok(_) => panic!("oversized wrap-key body must be rejected"),
+        };
+        assert!(
+            matches!(&err, InitError::Kbs(msg) if msg.contains("byte limit")),
+            "expected body-limit error, got: {err:?}"
+        );
     }
 }

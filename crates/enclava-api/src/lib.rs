@@ -2155,6 +2155,7 @@ pub(crate) mod test_support {
             platform_domain: "enclava.dev".to_string(),
             tee_domain_suffix: "tee.enclava.dev".to_string(),
             http_client: reqwest::Client::new(),
+            outbound_body_limit: crate::clients::ClientConfig::from_env().body_limit_bytes,
             registry_client: RegistryClient::new(
                 ClientConfig::from_env(),
                 AllowList::from_env_or_default(None),
@@ -2162,6 +2163,9 @@ pub(crate) mod test_support {
             .unwrap(),
             trustee_http_client: reqwest::Client::new(),
             tee_http_client: reqwest::Client::new(),
+            recent_tee_probe_failures: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::state::TeeProbeFailureCache::default(),
+            )),
             attestation: Some(AttestationConfig {
                 proxy_image: ImageRef::parse(
                     "ghcr.io/enclava-labs/attestation-proxy@sha256:1111111111111111111111111111111111111111111111111111111111111111",

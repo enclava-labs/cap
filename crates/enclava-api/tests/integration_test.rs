@@ -185,6 +185,7 @@ async fn setup_test_state_with_mode(management_mode: CapManagementMode) -> (AppS
         platform_domain: "enclava.dev".to_string(),
         tee_domain_suffix: "tee.enclava.dev".to_string(),
         http_client: reqwest::Client::new(),
+        outbound_body_limit: enclava_api::clients::ClientConfig::from_env().body_limit_bytes,
         registry_client: enclava_api::clients::RegistryClient::new(
             enclava_api::clients::ClientConfig::from_env(),
             enclava_api::clients::AllowList::from_env_or_default(None),
@@ -192,6 +193,9 @@ async fn setup_test_state_with_mode(management_mode: CapManagementMode) -> (AppS
         .unwrap(),
         trustee_http_client: reqwest::Client::new(),
         tee_http_client: reqwest::Client::new(),
+        recent_tee_probe_failures: Arc::new(std::sync::Mutex::new(
+            enclava_api::state::TeeProbeFailureCache::default(),
+        )),
         attestation: Some(AttestationConfig {
             proxy_image: ImageRef::parse(
                 "ghcr.io/enclava-labs/attestation-proxy@sha256:1111111111111111111111111111111111111111111111111111111111111111",

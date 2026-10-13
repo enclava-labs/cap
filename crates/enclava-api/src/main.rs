@@ -198,7 +198,13 @@ fn build_tenant_tee_http_client_with_env(
 fn build_trustee_http_client() -> anyhow::Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(15));
+        .timeout(std::time::Duration::from_secs(15))
+        // TRUSTEE_ATTESTATION_VERIFY_BEARER_TOKEN must never transit
+        // cleartext: the trustee client only talks to
+        // TRUSTEE_ATTESTATION_VERIFY_URL, which is HTTPS-gated in
+        // env_gates for release builds. https_only is the belt to that
+        // suspenders, and also covers debug builds where the gate is off.
+        .https_only(true);
 
     if let Some(cert_pem) = env_nonempty("TRUSTEE_KBS_CA_CERT_PEM") {
         let cert_pem = cert_pem.replace("\\n", "\n");
@@ -873,6 +879,7 @@ async fn main() {
     let outbound_config = enclava_api::clients::ClientConfig::from_env();
     let http_client = enclava_api::clients::build_guarded_client(&outbound_config)
         .expect("failed to build SSRF-defended outbound HTTP client");
+    let outbound_body_limit = outbound_config.body_limit_bytes;
     let registry_client =
         enclava_api::clients::RegistryClient::from_env().expect("failed to build registry client");
     let trustee_http_client =
@@ -891,9 +898,13 @@ async fn main() {
         platform_domain,
         tee_domain_suffix,
         http_client,
+        outbound_body_limit,
         registry_client,
         trustee_http_client,
         tee_http_client,
+        recent_tee_probe_failures: std::sync::Arc::new(std::sync::Mutex::new(
+            enclava_api::state::TeeProbeFailureCache::default(),
+        )),
         attestation,
         platform_release_envelope,
         dns,
@@ -1145,6 +1156,30 @@ mod tests {
         assert!(
             err.to_string().contains("TENANT_TEE_CA_CERT_PEM"),
             "error should name the invalid tenant TEE CA env var: {err}"
+        );
+    }
+
+    #[test]
+    fn trustee_http_client_is_https_only() {
+        // Regression for cap#117: the trustee client carries
+        // TRUSTEE_ATTESTATION_VERIFY_BEARER_TOKEN, so it must refuse to
+        // send over cleartext http even in debug builds where the env
+        // gate is relaxed.
+        let client = build_trustee_http_client().expect("trustee client should build");
+
+        let http_err = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(
+                client
+                    .get("http://kbs.example.test:8080/kbs/v0/attestation/verify")
+                    .send(),
+            )
+            .expect_err("https_only client must refuse http:// requests");
+        assert!(
+            http_err.is_builder(),
+            "expected a builder-stage rejection, got: {http_err}"
         );
     }
 

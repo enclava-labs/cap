@@ -400,17 +400,30 @@ fn extract_signer_metadata(
 }
 
 /// Fetch provenance attestation and SBOM from OCI registry attestation tags.
+///
+/// `body_limit` caps how many manifest bytes a registry response may carry
+/// before the read is aborted (see `clients::read_body_capped`); callers
+/// should pass the outbound client's `ClientConfig::body_limit_bytes`.
 pub async fn fetch_attestations(
     client: &reqwest::Client,
     image_ref: &str,
     digest: &str,
+    body_limit: u64,
 ) -> Result<(Option<serde_json::Value>, Option<serde_json::Value>), CosignError> {
     let (registry, repository) = parse_image_parts(image_ref)?;
     let base_url = registry_base_url(&registry)
         .map_err(|e| CosignError::VerificationFailed(format!("unsupported registry: {e}")))?;
 
-    let provenance = fetch_attestation_tag(client, &base_url, &repository, digest, "att").await?;
-    let sbom = fetch_attestation_tag(client, &base_url, &repository, digest, "sbom").await?;
+    // Attestation manifests are provenance material: bound the read by the
+    // same cap the portable-material checks enforce, so a malicious registry
+    // cannot force multi-megabyte JSON (and serde_json Value amplification
+    // beyond it) past this fetch even when the generic outbound limit is
+    // higher.
+    let body_limit = body_limit.min(MAX_PROVENANCE_MATERIAL_BYTES as u64);
+    let provenance =
+        fetch_attestation_tag(client, &base_url, &repository, digest, "att", body_limit).await?;
+    let sbom =
+        fetch_attestation_tag(client, &base_url, &repository, digest, "sbom", body_limit).await?;
 
     Ok((provenance, sbom))
 }
@@ -727,6 +740,7 @@ async fn fetch_attestation_tag(
     repository: &str,
     digest: &str,
     suffix: &str,
+    body_limit: u64,
 ) -> Result<Option<serde_json::Value>, CosignError> {
     let tag = digest_to_cosign_tag(digest, suffix);
     let url = format!("{base_url}/v2/{repository}/manifests/{tag}");
@@ -755,13 +769,49 @@ async fn fetch_attestation_tag(
         return Ok(None);
     }
 
-    let body = response.text().await?;
+    // Cap the manifest read: a malicious registry must not be able to
+    // exhaust API memory before the provenance size checks apply.
+    let Some(body) = read_attestation_body(response, body_limit, suffix).await? else {
+        return Ok(None);
+    };
     match serde_json::from_str(&body) {
         Ok(value) => Ok(Some(value)),
         Err(e) => {
             tracing::warn!("failed to parse {} attestation as JSON: {}", suffix, e);
             Ok(None)
         }
+    }
+}
+
+/// Capped read of an attestation manifest body. Returns `Ok(None)`
+/// (treated as "attestation absent") when the body exceeds `body_limit`
+/// or is not valid UTF-8; transport errors propagate as `Err`.
+async fn read_attestation_body(
+    response: reqwest::Response,
+    body_limit: u64,
+    suffix: &str,
+) -> Result<Option<String>, CosignError> {
+    match crate::clients::read_body_capped(response, body_limit).await {
+        Ok(bytes) => match std::str::from_utf8(&bytes) {
+            Ok(text) => Ok(Some(text.to_string())),
+            Err(e) => {
+                tracing::warn!("failed to decode {} attestation as UTF-8: {}", suffix, e);
+                Ok(None)
+            }
+        },
+        Err(crate::clients::ClientError::BodyTooLarge { limit }) => {
+            tracing::warn!(
+                "{} attestation manifest exceeded {} byte body limit",
+                suffix,
+                limit
+            );
+            // Degrade to "absent": an oversized or undecodable manifest is
+            // not usable evidence, and the fetch path treats missing
+            // attestations as non-fatal.
+            Ok(None)
+        }
+        Err(crate::clients::ClientError::Http(e)) => Err(CosignError::Http(e)),
+        Err(e) => Err(CosignError::VerificationFailed(e.to_string())),
     }
 }
 
@@ -1183,5 +1233,86 @@ mod tests {
             auth,
             Auth::Basic(username, password) if username == "cap-bot" && password == "ghp_example"
         ));
+    }
+
+    /// Regression test for issue #125: a malicious registry must not be able
+    /// to make the attestation fetch buffer an unbounded manifest body. Both
+    /// the declared-content-length path and the streamed-chunk path (no
+    /// content-length) must degrade to `None` once the body exceeds the
+    /// limit, and a small valid manifest must still parse.
+    #[tokio::test]
+    async fn fetch_attestation_tag_caps_oversized_registry_bodies() {
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn spawn_registry(body: Vec<u8>, declare_content_length: bool) -> String {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("loopback bind");
+            let addr = listener.local_addr().expect("loopback address");
+            let body = Arc::new(body);
+            tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut chunk = [0u8; 1024];
+                let mut head = Vec::new();
+                loop {
+                    let read = stream.read(&mut chunk).await.expect("read head");
+                    if read == 0 {
+                        return;
+                    }
+                    head.extend_from_slice(&chunk[..read]);
+                    if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let headers = if declare_content_length {
+                    format!("Content-Length: {}\r\n", body.len())
+                } else {
+                    "Transfer-Encoding: chunked\r\n".to_string()
+                };
+                let head = format!("HTTP/1.1 200 OK\r\n{headers}Connection: close\r\n\r\n");
+                stream.write_all(head.as_bytes()).await.expect("head");
+                if declare_content_length {
+                    stream.write_all(&body).await.expect("body");
+                } else {
+                    // chunked encoding: one chunk holding the whole body
+                    stream
+                        .write_all(format!("{:x}\r\n", body.len()).as_bytes())
+                        .await
+                        .expect("chunk head");
+                    stream.write_all(&body).await.expect("chunk body");
+                    stream.write_all(b"\r\n0\r\n\r\n").await.expect("chunk end");
+                }
+            });
+            format!("http://{addr}")
+        }
+
+        let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let client = reqwest::Client::builder().build().unwrap();
+
+        // Small valid manifest still parses.
+        let base = spawn_registry(b"{\"schemaVersion\":2}".to_vec(), true).await;
+        let tag = fetch_attestation_tag(&client, &base, "team/app", digest, "att", 1024)
+            .await
+            .unwrap();
+        assert!(tag.is_some(), "small manifest should parse");
+
+        // Oversized declared body is rejected via the content-length check.
+        let big: Vec<u8> = serde_json::json!({ "pad": "x".repeat(4096) })
+            .to_string()
+            .into_bytes();
+        let base = spawn_registry(big.clone(), true).await;
+        let tag = fetch_attestation_tag(&client, &base, "team/app", digest, "att", 1024)
+            .await
+            .unwrap();
+        assert!(tag.is_none(), "oversized att must degrade to None");
+
+        // Oversized streamed body (chunked, no content-length) is rejected
+        // while streaming, before the whole body is buffered.
+        let base = spawn_registry(big, false).await;
+        let tag = fetch_attestation_tag(&client, &base, "team/app", digest, "att", 1024)
+            .await
+            .unwrap();
+        assert!(tag.is_none(), "oversized streamed att must degrade to None");
     }
 }

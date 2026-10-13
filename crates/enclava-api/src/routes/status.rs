@@ -23,6 +23,13 @@ use crate::state::AppState;
 const DEPLOYMENT_ID_LABEL: &str = "enclava.dev/deployment-id";
 const KUBERNETES_STATUS_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const TEE_STATUS_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// The per-request timeout gets the remaining probe budget minus this
+/// margin. A stalled connect/TLS/body exchange then surfaces as a reqwest
+/// timeout error at the send/body stage — with its full error chain —
+/// slightly before the outer deadline (established earlier, so it would
+/// otherwise always win) cancels the probe, while valid responses keep
+/// almost the whole outer allowance (#219 review).
+const TEE_STATUS_REQUEST_TIMEOUT_MARGIN: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -219,6 +226,7 @@ pub(crate) async fn observe_app_status_for_deployment(
     let domain = app.custom_domain.as_deref().unwrap_or(&app.domain);
     observe_app_status_fields_for_deployment(
         state,
+        app.id,
         &app.namespace,
         &app.name,
         domain,
@@ -230,6 +238,7 @@ pub(crate) async fn observe_app_status_for_deployment(
 
 pub(crate) async fn observe_app_status_fields_for_deployment(
     state: &AppState,
+    app_id: Uuid,
     namespace: &str,
     app_name: &str,
     domain: &str,
@@ -238,7 +247,7 @@ pub(crate) async fn observe_app_status_fields_for_deployment(
 ) -> ObservedAppStatus {
     let (kubernetes, tee) = tokio::join!(
         probe_kubernetes(namespace, app_name, expected_deployment_id),
-        probe_tee(state, namespace, app_name, domain, tee_domain)
+        probe_tee(state, app_id, namespace, app_name, domain, tee_domain)
     );
     classify_live_observation_for_deployment(kubernetes, tee, Utc::now(), expected_deployment_id)
 }
@@ -389,35 +398,157 @@ fn select_runtime_failure(
     selected.and_then(|index| failures.into_iter().nth(index))
 }
 
+/// Per-request timeout derived from the probe deadline: the remaining budget
+/// minus [`TEE_STATUS_REQUEST_TIMEOUT_MARGIN`], saturating at zero.
+fn tee_request_timeout(deadline: tokio::time::Instant) -> Duration {
+    deadline
+        .saturating_duration_since(tokio::time::Instant::now())
+        .saturating_sub(TEE_STATUS_REQUEST_TIMEOUT_MARGIN)
+}
+
 async fn probe_tee(
     state: &AppState,
+    app_id: Uuid,
     namespace: &str,
     app_name: &str,
     domain: &str,
     tee_domain: Option<&str>,
 ) -> TeeEvidence {
+    let deadline = tokio::time::Instant::now() + TEE_STATUS_PROBE_TIMEOUT;
     bounded_tee_probe(
-        probe_tee_unbounded(state, namespace, app_name, domain, tee_domain),
+        state,
+        app_id,
+        namespace,
+        app_name,
+        probe_tee_unbounded(
+            state, app_id, namespace, app_name, domain, tee_domain, deadline,
+        ),
         TEE_STATUS_PROBE_TIMEOUT,
     )
     .await
 }
 
-async fn bounded_tee_probe<F>(probe: F, deadline: Duration) -> TeeEvidence
+async fn bounded_tee_probe<F>(
+    state: &AppState,
+    app_id: Uuid,
+    namespace: &str,
+    app_name: &str,
+    probe: F,
+    deadline: Duration,
+) -> TeeEvidence
 where
     F: Future<Output = TeeEvidence>,
 {
-    tokio::time::timeout(deadline, probe)
-        .await
-        .unwrap_or(TeeEvidence::Unavailable)
+    match tokio::time::timeout(deadline, probe).await {
+        Ok(evidence) => evidence,
+        Err(_) => {
+            warn_tee_probe_failure(
+                state,
+                app_id,
+                app_name,
+                namespace,
+                "deadline",
+                &format!("TEE status probe exceeded the {deadline:?} bound"),
+            );
+            TeeEvidence::Unavailable
+        }
+    }
+}
+
+/// One structured warn per failed probe attempt, naming the failed stage and
+/// its underlying error so the remediation domain (service wiring, network
+/// policy, TLS material, proxy/ingress health) is readable from the log
+/// instead of being collapsed into `evidence: tee_unavailable`.
+///
+/// The probe runs per status/observation request, so warns are rate-limited
+/// per app: the first failure and every change of failure signature are
+/// emitted; repeated identical failures and successes stay silent.
+fn warn_tee_probe_failure(
+    state: &AppState,
+    app_id: Uuid,
+    app_name: &str,
+    namespace: &str,
+    stage: &str,
+    detail: &str,
+) {
+    let signature = format!("{stage}\u{1}{detail}");
+    if !tee_probe_failure_signature_changed(state, app_id, app_name, namespace, &signature) {
+        return;
+    }
+    tracing::warn!(
+        app = %app_name,
+        namespace = %namespace,
+        probe = "tee_status",
+        stage,
+        detail,
+        "live TEE probe failed"
+    );
+}
+
+/// Clear the rate-limit signature after a successful probe so a later
+/// recurrence of the same failure is logged again rather than suppressed.
+fn note_tee_probe_success(state: &AppState, app_id: Uuid, app_name: &str, namespace: &str) {
+    state
+        .recent_tee_probe_failures
+        .lock()
+        .expect("TEE probe failure state mutex")
+        .remove(&tee_probe_failure_key(app_id, app_name, namespace));
+}
+
+/// Drop the rate-limit signature when an app is fully deleted so a recreated
+/// app of the same name logs its first probe failure rather than inheriting
+/// the previous incarnation's suppressed signature.
+///
+/// The signature is additionally keyed by the immutable app ID (#219 review):
+/// a status probe that read the old app row before deletion and finishes
+/// after the delete commits then repopulates the *old incarnation's* key,
+/// which the recreated app (new ID, deterministic same namespace) never
+/// reads — its first failure is warned regardless of in-flight probes.
+pub(crate) fn clear_tee_probe_failure_state(
+    state: &AppState,
+    app_id: Uuid,
+    app_name: &str,
+    namespace: &str,
+) {
+    note_tee_probe_success(state, app_id, app_name, namespace);
+}
+
+/// Rate-limit key: namespace/name plus the immutable app ID. The name can be
+/// recreated with the same deterministic namespace; the ID cannot, so probes
+/// of different incarnations never share suppression state.
+fn tee_probe_failure_key(app_id: Uuid, app_name: &str, namespace: &str) -> String {
+    format!("{namespace}/{app_name}/{app_id}")
+}
+
+/// Record a failure signature, returning whether it differs from the
+/// previously recorded one for this app (and therefore should be logged).
+fn tee_probe_failure_signature_changed(
+    state: &AppState,
+    app_id: Uuid,
+    app_name: &str,
+    namespace: &str,
+    signature: &str,
+) -> bool {
+    let mut recent = state
+        .recent_tee_probe_failures
+        .lock()
+        .expect("TEE probe failure state mutex");
+    let key = tee_probe_failure_key(app_id, app_name, namespace);
+    let changed = recent.get(&key).map(String::as_str) != Some(signature);
+    if changed {
+        recent.insert(key, signature.to_string());
+    }
+    changed
 }
 
 async fn probe_tee_unbounded(
     state: &AppState,
+    app_id: Uuid,
     namespace: &str,
     app_name: &str,
     domain: &str,
     tee_domain: Option<&str>,
+    probe_deadline: tokio::time::Instant,
 ) -> TeeEvidence {
     let internal_transport = state.attestation.as_ref().is_some_and(|attestation| {
         enclava_engine::manifest::network_policy::cap_api_namespace_for_attestation(
@@ -427,15 +558,47 @@ async fn probe_tee_unbounded(
         .is_some()
     });
     let (client, tee_status_url) = if internal_transport {
-        let Some(socket) =
-            crate::routes::logs::resolve_internal_tee_socket(app_name, namespace).await
-        else {
-            return TeeEvidence::Unavailable;
-        };
-        let Ok(client) = crate::routes::logs::build_resolved_tenant_tee_http_client(domain, socket)
-        else {
-            return TeeEvidence::Unavailable;
-        };
+        // Socket-resolution failures are emitted through the probe warning
+        // limiter below (stage `resolve_socket`), sharing the per-app
+        // rate limit instead of an untagged per-request warn (#219 review).
+        let socket =
+            match crate::routes::logs::resolve_internal_tee_socket(app_name, namespace).await {
+                Ok(socket) => socket,
+                Err(detail) => {
+                    warn_tee_probe_failure(
+                        state,
+                        app_id,
+                        app_name,
+                        namespace,
+                        "resolve_socket",
+                        &detail,
+                    );
+                    return TeeEvidence::Unavailable;
+                }
+            };
+        let client =
+            match crate::routes::logs::build_resolved_tenant_tee_http_client(domain, socket) {
+                Ok(client) => client,
+                Err(error) => {
+                    // Render the builder error chain whole (TLS backend,
+                    // resolver, or certificate cause lives in `source()`,
+                    // not the top-level builder message) so distinct build
+                    // failures keep distinct diagnostics and signatures
+                    // (#219 review).
+                    warn_tee_probe_failure(
+                        state,
+                        app_id,
+                        app_name,
+                        namespace,
+                        "build_client",
+                        &format!(
+                            "failed to build the internal-transport HTTP client: {}",
+                            crate::routes::workload::format_error_chain(&error)
+                        ),
+                    );
+                    return TeeEvidence::Unavailable;
+                }
+            };
         (
             client,
             confidential_status_url(domain, tee_domain, Some(socket)),
@@ -446,20 +609,81 @@ async fn probe_tee_unbounded(
             confidential_status_url(domain, tee_domain, None),
         )
     };
-    let Ok(response) = client
-        .get(tee_status_url)
-        .timeout(TEE_STATUS_PROBE_TIMEOUT)
+    // Computed here, after socket resolution and client construction, so the
+    // request allowance reflects the remaining probe budget rather than a
+    // snapshot taken before those steps (#219 review).
+    let response = match client
+        .get(&tee_status_url)
+        .timeout(tee_request_timeout(probe_deadline))
         .send()
         .await
-    else {
-        return TeeEvidence::Unavailable;
+    {
+        Ok(response) => response,
+        Err(error) => {
+            // The reqwest error chain distinguishes connect vs TLS vs
+            // timeout; render it whole rather than collapsing to a category.
+            warn_tee_probe_failure(
+                state,
+                app_id,
+                app_name,
+                namespace,
+                "send",
+                &format!(
+                    "request to {tee_status_url} failed: {}",
+                    crate::routes::workload::format_error_chain(&error)
+                ),
+            );
+            return TeeEvidence::Unavailable;
+        }
     };
     if !response.status().is_success() {
+        warn_tee_probe_failure(
+            state,
+            app_id,
+            app_name,
+            namespace,
+            "http_status",
+            &format!("{tee_status_url} returned {}", response.status()),
+        );
         return TeeEvidence::Unavailable;
     }
     match response.json::<Value>().await {
-        Ok(body) if body.is_object() => TeeEvidence::Available(tee_evidence_fields(&body)),
-        Ok(_) | Err(_) => TeeEvidence::Malformed,
+        Ok(body) if body.is_object() => {
+            note_tee_probe_success(state, app_id, app_name, namespace);
+            TeeEvidence::Available(tee_evidence_fields(&body))
+        }
+        Ok(_) => {
+            // A 2xx body that is not a JSON object already surfaces as the
+            // distinct `TeeEvidence::Malformed` reason; keep the warn for the
+            // http_status -> body transition visible in logs.
+            warn_tee_probe_failure(
+                state,
+                app_id,
+                app_name,
+                namespace,
+                "body",
+                &format!("{tee_status_url} returned a non-object JSON body"),
+            );
+            TeeEvidence::Malformed
+        }
+        Err(error) => {
+            // Render the reqwest error chain whole (serde/transport cause
+            // lives in `source()`, not the top-level display) so different
+            // malformed-body failures keep distinct diagnostics and
+            // signatures, matching the send-stage handling (#219 review).
+            warn_tee_probe_failure(
+                state,
+                app_id,
+                app_name,
+                namespace,
+                "body",
+                &format!(
+                    "{tee_status_url} returned a malformed body: {}",
+                    crate::routes::workload::format_error_chain(&error)
+                ),
+            );
+            TeeEvidence::Malformed
+        }
     }
 }
 
@@ -860,12 +1084,14 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        KubernetesEvidence, LiveObservationReason, LiveObservationState, PodEvidence,
+        AppState, KubernetesEvidence, LiveObservationReason, LiveObservationState, PodEvidence,
         RuntimeFailureEvidence, TeeEvidence, bounded_kubernetes_probe, bounded_tee_probe,
         classify_live_observation, classify_live_observation_for_deployment,
-        confidential_status_url, effective_app_status, pod_is_ready, runtime_failure_evidence,
-        select_runtime_failure, tee_evidence_fields,
+        clear_tee_probe_failure_state, confidential_status_url, effective_app_status, pod_is_ready,
+        probe_tee, runtime_failure_evidence, select_runtime_failure, tee_evidence_fields,
     };
+    use axum::http::StatusCode;
+    use std::net::SocketAddr;
 
     const WAITING_SECRET: &str = "waiting-message-secret=tenant-api-key";
     const TERMINATED_SECRET: &str = "terminated-message-secret=tenant-private-key";
@@ -1545,12 +1771,438 @@ mod tests {
 
     #[tokio::test]
     async fn tee_probe_deadline_covers_internal_service_resolution() {
+        let state = probe_test_state(resolved_probe_client(closed_local_socket().await));
         let evidence = bounded_tee_probe(
+            &state,
+            probe_app_id(),
+            "ns-110",
+            "app-110",
             std::future::pending::<TeeEvidence>(),
             Duration::from_millis(1),
         )
         .await;
 
         assert_eq!(evidence, TeeEvidence::Unavailable);
+    }
+
+    // --- Regression tests for #110: silent TEE probe failures -------------
+
+    use std::sync::{Arc, Mutex};
+
+    struct CapturedProbeLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedProbeLogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("captured log mutex").extend(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn captured_warn_logs() -> (Arc<Mutex<Vec<u8>>>, tracing::subscriber::DefaultGuard) {
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer({
+                let logs = Arc::clone(&logs);
+                move || CapturedProbeLogWriter(Arc::clone(&logs))
+            })
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (logs, guard)
+    }
+
+    fn captured_log_text(logs: &Arc<Mutex<Vec<u8>>>) -> String {
+        String::from_utf8(logs.lock().expect("captured log mutex").clone())
+            .expect("captured logs are UTF-8")
+    }
+
+    /// rustls cannot infer a process-level CryptoProvider when both aws-lc-rs
+    /// and ring are in the dependency graph; select aws-lc-rs (the provider
+    /// the workspace pins for kube/reqwest) once per test binary.
+    fn install_test_crypto_provider() {
+        use std::sync::Once;
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(|| {
+            let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+        });
+    }
+
+    /// Serve a TEE status endpoint over real TLS with a self-signed cert so
+    /// `probe_tee`'s public-transport path exercises the full HTTP client.
+    async fn spawn_status_server(status_code: StatusCode, body: &'static str) -> SocketAddr {
+        use tokio_rustls::TlsAcceptor;
+
+        install_test_crypto_provider();
+        let cert = rcgen::generate_simple_self_signed(vec!["app.example.test".to_string()])
+            .expect("self-signed certificate");
+        let config = tokio_rustls::rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![tokio_rustls::rustls::pki_types::CertificateDer::from(
+                    cert.cert.der().to_vec(),
+                )],
+                tokio_rustls::rustls::pki_types::PrivateKeyDer::Pkcs8(
+                    cert.signing_key.serialize_der().into(),
+                ),
+            )
+            .expect("TLS server config");
+        let acceptor = TlsAcceptor::from(std::sync::Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    continue;
+                };
+                let Ok(mut stream) = acceptor.accept(stream).await else {
+                    continue;
+                };
+                // Read the client request before responding so reqwest sees a
+                // complete exchange; connection is closed afterwards.
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+                while let Ok(read) = stream.read(&mut buf).await {
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..read]);
+                    if request.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 {} {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    status_code.as_u16(),
+                    status_code.canonical_reason().unwrap_or("Unknown"),
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        address
+    }
+
+    fn probe_test_state(tee_http_client: reqwest::Client) -> AppState {
+        let mut state = crate::test_support::lazy_state();
+        state.tee_http_client = tee_http_client;
+        state
+    }
+
+    /// Distinct immutable app IDs distinguish incarnations of the same
+    /// namespace/name in the probe rate-limit cache (#219 review).
+    fn probe_app_id() -> Uuid {
+        Uuid::new_v4()
+    }
+
+    /// A reqwest client that resolves `app.example.test` to the given local
+    /// socket, trusts any certificate, and never consults a proxy.
+    fn resolved_probe_client(socket: SocketAddr) -> reqwest::Client {
+        install_test_crypto_provider();
+        reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .resolve("app.example.test", socket)
+            .https_only(true)
+            .no_proxy()
+            .build()
+            .unwrap()
+    }
+
+    /// Bind an ephemeral port and drop the listener so the port is closed:
+    /// probing it deterministically fails at the connect stage.
+    async fn closed_local_socket() -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        address
+    }
+
+    #[tokio::test]
+    async fn tee_probe_send_failure_emits_structured_warn() {
+        let (logs, _guard) = captured_warn_logs();
+        let socket = closed_local_socket().await;
+        let state = probe_test_state(resolved_probe_client(socket));
+        let evidence = probe_tee(
+            &state,
+            probe_app_id(),
+            "ns-110",
+            "app-110",
+            "app.example.test",
+            None,
+        )
+        .await;
+
+        assert_eq!(evidence, TeeEvidence::Unavailable);
+        let text = captured_log_text(&logs);
+        assert!(
+            text.contains(r#"stage="send""#),
+            "expected a send-stage warn, got: {text}"
+        );
+        assert!(text.contains("app=app-110"));
+        assert!(text.contains("namespace=ns-110"));
+        // The full reqwest source chain must surface: a connect-stage failure
+        // carries a hyper source whose display names the connect error rather
+        // than the top-level "error sending request" summary alone.
+        assert!(
+            text.to_lowercase().contains("error") && text.to_lowercase().contains("connect"),
+            "expected underlying error-chain detail (error + connect), got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tee_probe_http_status_failure_emits_structured_warn() {
+        let (logs, _guard) = captured_warn_logs();
+        let address = spawn_status_server(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{\"error\": \"unavailable\"}",
+        )
+        .await;
+        let state = probe_test_state(resolved_probe_client(address));
+
+        let evidence = probe_tee(
+            &state,
+            probe_app_id(),
+            "ns-110",
+            "app-110",
+            "app.example.test",
+            None,
+        )
+        .await;
+
+        assert_eq!(evidence, TeeEvidence::Unavailable);
+        let text = captured_log_text(&logs);
+        assert!(
+            text.contains(r#"stage="http_status""#),
+            "expected an http_status-stage warn, got: {text}"
+        );
+        assert!(text.contains("503"), "expected the upstream status code");
+    }
+
+    #[tokio::test]
+    async fn tee_probe_repeated_identical_failures_are_rate_limited() {
+        let (logs, _guard) = captured_warn_logs();
+        let socket = closed_local_socket().await;
+        let state = probe_test_state(resolved_probe_client(socket));
+
+        // Use the same app_id for all iterations so the rate-limit key is stable.
+        let app_id = probe_app_id();
+        for _ in 0..3 {
+            let evidence = probe_tee(
+                &state,
+                app_id,
+                "ns-110",
+                "app-110",
+                "app.example.test",
+                None,
+            )
+            .await;
+            assert_eq!(evidence, TeeEvidence::Unavailable);
+        }
+
+        let text = captured_log_text(&logs);
+        assert_eq!(
+            text.matches("live TEE probe failed").count(),
+            1,
+            "identical consecutive failures must warn exactly once: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tee_probe_warns_again_after_signature_change_and_recovery() {
+        let (logs, _guard) = captured_warn_logs();
+        let closed = closed_local_socket().await;
+        let state = probe_test_state(resolved_probe_client(closed));
+        // Reuse one app ID across all three probes so the test protects the
+        // recovery-clears-signature behavior (#219 Codex review).
+        let app_id = probe_app_id();
+
+        // First failure: warned.
+        let _ = probe_tee(
+            &state,
+            app_id,
+            "ns-110",
+            "app-110",
+            "app.example.test",
+            None,
+        )
+        .await;
+        // Success: clears the rate-limit signature (no warn, no failure).
+        let address = spawn_status_server(
+            StatusCode::OK,
+            "{\"pod_status\": \"Running\", \"tee_status\": \"ready\", \"storage_status\": \"unlocked\", \"state\": \"unlocked\"}",
+        )
+        .await;
+        let mut recovered = state.clone();
+        recovered.tee_http_client = resolved_probe_client(address);
+        let evidence = probe_tee(
+            &recovered,
+            app_id,
+            "ns-110",
+            "app-110",
+            "app.example.test",
+            None,
+        )
+        .await;
+        assert!(matches!(evidence, TeeEvidence::Available(_)));
+        // Same failure again after recovery: warned again.
+        let _ = probe_tee(
+            &state,
+            app_id,
+            "ns-110",
+            "app-110",
+            "app.example.test",
+            None,
+        )
+        .await;
+
+        let text = captured_log_text(&logs);
+        assert_eq!(
+            text.matches("live TEE probe failed").count(),
+            2,
+            "expected warn on first failure and re-warn after recovery: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tee_probe_recreated_app_warns_on_first_failure_after_delete_clear() {
+        let (logs, _guard) = captured_warn_logs();
+        let closed = closed_local_socket().await;
+        let state = probe_test_state(resolved_probe_client(closed));
+        let first_incarnation = probe_app_id();
+
+        // First incarnation: exactly one warned failure.
+        let _ = probe_tee(
+            &state,
+            first_incarnation,
+            "ns-110",
+            "app-110",
+            "app.example.test",
+            None,
+        )
+        .await;
+        assert_eq!(
+            captured_log_text(&logs)
+                .matches("live TEE probe failed")
+                .count(),
+            1
+        );
+
+        // Completed deletion clears the signature (both delete-completion
+        // paths call this): a recreated app of the same name must not
+        // inherit the previous incarnation's suppression.
+        clear_tee_probe_failure_state(&state, first_incarnation, "app-110", "ns-110");
+
+        // Recreated app, identical failure signature: must warn again.
+        let _ = probe_tee(
+            &state,
+            probe_app_id(),
+            "ns-110",
+            "app-110",
+            "app.example.test",
+            None,
+        )
+        .await;
+        assert_eq!(
+            captured_log_text(&logs)
+                .matches("live TEE probe failed")
+                .count(),
+            2,
+            "recreated app's first failure must be logged: {logs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tee_probe_distinct_incarnation_keys_not_shared_after_delete() {
+        // The race the #219 review flagged: a status probe reads the old app
+        // row before the delete commits and its failure lands *after* the
+        // post-commit clear. Because the rate-limit key now includes the
+        // immutable app ID, the late old-incarnation failure cannot populate
+        // the recreated app's (new ID) state, so its first identical failure
+        // still warns.
+        let (logs, _guard) = captured_warn_logs();
+        let closed = closed_local_socket().await;
+        let state = probe_test_state(resolved_probe_client(closed));
+        let old_incarnation = probe_app_id();
+        let recreated = probe_app_id();
+
+        // Old incarnation fails once (warned), then the app is deleted and
+        // the post-commit clear runs.
+        let _ = probe_tee(
+            &state,
+            old_incarnation,
+            "ns-110",
+            "app-110",
+            "app.example.test",
+            None,
+        )
+        .await;
+        clear_tee_probe_failure_state(&state, old_incarnation, "app-110", "ns-110");
+
+        // An in-flight probe of the OLD incarnation finishes after the clear
+        // and reinserts the old incarnation's signature.
+        let _ = probe_tee(
+            &state,
+            old_incarnation,
+            "ns-110",
+            "app-110",
+            "app.example.test",
+            None,
+        )
+        .await;
+        assert_eq!(
+            captured_log_text(&logs)
+                .matches("live TEE probe failed")
+                .count(),
+            2,
+            "the late old-incarnation failure re-warns on its own key: {logs:?}"
+        );
+
+        // The recreated app (same namespace/name, new ID) fails identically:
+        // its first failure must warn, not be suppressed.
+        let _ = probe_tee(
+            &state,
+            recreated,
+            "ns-110",
+            "app-110",
+            "app.example.test",
+            None,
+        )
+        .await;
+        assert_eq!(
+            captured_log_text(&logs)
+                .matches("live TEE probe failed")
+                .count(),
+            3,
+            "recreated incarnation's first failure must not be suppressed: {logs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tee_probe_deadline_failure_emits_structured_warn() {
+        let (logs, _guard) = captured_warn_logs();
+        let state = probe_test_state(resolved_probe_client(closed_local_socket().await));
+        let evidence = bounded_tee_probe(
+            &state,
+            probe_app_id(),
+            "ns-110",
+            "app-110",
+            std::future::pending::<TeeEvidence>(),
+            Duration::from_millis(10),
+        )
+        .await;
+
+        assert_eq!(evidence, TeeEvidence::Unavailable);
+        let text = captured_log_text(&logs);
+        assert!(
+            text.contains(r#"stage="deadline""#),
+            "expected a deadline-stage warn, got: {text}"
+        );
     }
 }
