@@ -301,36 +301,46 @@ pub fn verify_envelope(
     if actual_template_hash != envelope.payload.policy_template_sha256 {
         return Err(PlatformReleaseError::TemplateHashMismatch);
     }
-    // cap#118: the dev-fixture trustee policy key's seed is public
-    // (c1*32, committed with the generator). A non-fixture root must never
-    // sign a release that pins it in either key slot: while both keys are
-    // pinned, policy signatures verify against the signing-service key
-    // (#217), and once the trustee key becomes the policy authority its
-    // slot matters directly — a public-seed key in either slot would let
-    // anyone with the repo forge policy envelopes the TEE accepts.
-    if signing != fixture_root_pubkey() {
-        for (field, value) in [
-            (
-                "platform_trustee_policy_pubkey_hex",
-                &envelope.payload.platform_trustee_policy_pubkey_hex,
-            ),
-            (
-                "signing_service_pubkey_hex",
-                &envelope.payload.signing_service_pubkey_hex,
-            ),
-        ] {
-            if hex::decode(value)? == fixture_trustee_policy_pubkey() {
-                return Err(PlatformReleaseError::InvalidField {
-                    field,
-                    message:
-                        "dev-fixture trustee policy key is only allowed under the dev fixture root"
-                            .to_string(),
-                });
-            }
-        }
-    }
+    refuse_fixture_keys_outside_fixture_root(&envelope.payload, &signing)?;
     validate_release_payload(&envelope.payload)?;
     Ok(envelope.payload)
+}
+
+/// cap#118: the dev-fixture trustee policy key's seed is public (c1*32,
+/// committed with the generator). A non-fixture root must never sign a
+/// release that pins it in either key slot: while both keys are pinned,
+/// policy signatures verify against the signing-service key (#217), and
+/// once the trustee key becomes the policy authority its slot matters
+/// directly — a public-seed key in either slot would let anyone with the
+/// repo forge policy envelopes the TEE accepts. Mirrored verbatim in
+/// enclava-cli (keep both in sync).
+pub fn refuse_fixture_keys_outside_fixture_root(
+    release: &PlatformRelease,
+    signing_pubkey: &[u8; 32],
+) -> Result<(), PlatformReleaseError> {
+    if *signing_pubkey == fixture_root_pubkey() {
+        return Ok(());
+    }
+    for (field, value) in [
+        (
+            "platform_trustee_policy_pubkey_hex",
+            &release.platform_trustee_policy_pubkey_hex,
+        ),
+        (
+            "signing_service_pubkey_hex",
+            &release.signing_service_pubkey_hex,
+        ),
+    ] {
+        if hex::decode(value)? == fixture_trustee_policy_pubkey() {
+            return Err(PlatformReleaseError::InvalidField {
+                field,
+                message:
+                    "dev-fixture trustee policy key is only allowed under the dev fixture root"
+                        .to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 pub fn canonical_platform_release_bytes(
@@ -625,6 +635,26 @@ mod tests {
         // The gate condition itself: non-fixture root + fixture trustee key.
         let trustee = fixture_trustee_policy_pubkey();
         assert_ne!(fixture_root_pubkey().to_vec(), trustee);
+        // Real negatives through the same gate verify_envelope calls (the
+        // full re-sign path lives in the CLI crate's twin tests): a
+        // non-fixture root must be refused in EITHER slot, while the
+        // fixture root may pin the fixture trustee key.
+        let raw: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
+        let prod_root = [0x42u8; 32];
+        let err = refuse_fixture_keys_outside_fixture_root(&raw.payload, &prod_root).unwrap_err();
+        assert!(
+            matches!(err, PlatformReleaseError::InvalidField { field, .. } if field == "platform_trustee_policy_pubkey_hex"),
+            "expected trustee-slot fixture rejection, got: {err:?}"
+        );
+        let mut payload = raw.payload.clone();
+        payload.signing_service_pubkey_hex = DEV_FIXTURE_TRUSTEE_POLICY_PUBKEY_HEX.to_string();
+        payload.platform_trustee_policy_pubkey_hex = "bb".repeat(32);
+        let err = refuse_fixture_keys_outside_fixture_root(&payload, &prod_root).unwrap_err();
+        assert!(
+            matches!(err, PlatformReleaseError::InvalidField { field, .. } if field == "signing_service_pubkey_hex"),
+            "expected signing-slot fixture rejection, got: {err:?}"
+        );
+        refuse_fixture_keys_outside_fixture_root(&raw.payload, &fixture_root_pubkey()).unwrap();
     }
 
     #[test]

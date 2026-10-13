@@ -478,6 +478,50 @@ def test_generate_rejects_fixture_key_in_signing_slot_under_production_root(
         generate_platform_release.generate(args)
 
 
+def test_release_generator_rejects_unforgeable_key_pins():
+    # cap#218 follow-up: mirror of the Rust require_ed25519_point + is_weak
+    # checks. verify() accepts zero-signature forgeries against small-order
+    # keys, and non-decompressible pins are rejected by every Rust consumer —
+    # the ceremony must not sign either.
+    with pytest.raises(ValueError, match="not a valid Ed25519 public key"):
+        generate_platform_release.require_unforgeable_pubkey(
+            "signing_service_pubkey_hex", "02" + "00" * 31
+        )
+    with pytest.raises(ValueError, match="small order"):
+        generate_platform_release.require_unforgeable_pubkey(
+            "platform_trustee_policy_pubkey_hex", "00" * 32
+        )
+    # Non-canonical y = p reduces to 0 in dalek's from_bytes -> small order.
+    with pytest.raises(ValueError, match="small order"):
+        generate_platform_release.require_unforgeable_pubkey(
+            "signing_service_pubkey_hex", "ed" + "ff" * 30 + "7f"
+        )
+    # The fixture and test keys are valid non-weak points.
+    generate_platform_release.require_unforgeable_pubkey(
+        "platform_trustee_policy_pubkey_hex",
+        generate_platform_release.DEV_FIXTURE_TRUSTEE_POLICY_KEY_HEX,
+    )
+    for key in ["11" * 32, "33" * 32, "01" * 32, "bb" * 32]:
+        generate_platform_release.require_unforgeable_pubkey("k", key)
+
+
+def test_generate_rejects_small_order_signing_pin(tmp_path, monkeypatch):
+    # End-to-end: validate_payload runs the unforgeability gate before any
+    # envelope is produced.
+    import argparse
+    import json
+
+    input_path = tmp_path / "platform-release.json"
+    payload = base_payload()
+    payload["signing_service_pubkey_hex"] = "00" * 32
+    input_path.write_text(json.dumps({"payload": payload}, indent=2) + "\n")
+    monkeypatch.setenv("ENCLAVA_PLATFORM_RELEASE_SIGNING_KEY_HEX", "ab" * 32)
+    args = argparse.Namespace(input=input_path, dev_fixture_key=False)
+
+    with pytest.raises(ValueError, match="small order"):
+        generate_platform_release.generate(args)
+
+
 def test_generate_allows_fixture_trustee_key_with_dev_fixture_key(tmp_path):
     import argparse
     import json

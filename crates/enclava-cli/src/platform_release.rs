@@ -339,36 +339,47 @@ pub fn verify_envelope_with_root(
     if actual_template_hash != envelope.payload.policy_template_sha256 {
         return Err(PlatformReleaseError::TemplateHashMismatch);
     }
-    // cap#118: the dev-fixture trustee policy key's seed is public (c1*32,
-    // committed with the generator). A non-fixture root must never sign a
-    // release that pins it in either key slot: while both keys are pinned,
-    // policy signatures verify against the signing-service key (#217), and
-    // once the trustee key becomes the policy authority its slot matters
-    // directly — a public-seed key in either slot would let anyone with the
-    // repo forge policy envelopes the TEE accepts.
-    if signing != fixture_root_pubkey() {
-        for (field, value) in [
-            (
-                "platform_trustee_policy_pubkey_hex",
-                &envelope.payload.platform_trustee_policy_pubkey_hex,
-            ),
-            (
-                "signing_service_pubkey_hex",
-                &envelope.payload.signing_service_pubkey_hex,
-            ),
-        ] {
-            if hex::decode(value)? == fixture_trustee_policy_pubkey() {
-                return Err(PlatformReleaseError::InvalidField {
-                    field,
-                    message:
-                        "dev-fixture trustee policy key is only allowed under the dev fixture root"
-                            .to_string(),
-                });
-            }
-        }
-    }
+    refuse_fixture_keys_outside_fixture_root(&envelope.payload, &signing)?;
     validate_release_payload(&envelope.payload)?;
     Ok(envelope.payload)
+}
+
+/// cap#118: the dev-fixture trustee policy key's seed is public (c1*32,
+/// committed with the generator). A non-fixture root must never sign a
+/// release that pins it in either key slot: while both keys are pinned,
+/// policy signatures verify against the signing-service key (#217), and
+/// once the trustee key becomes the policy authority its slot matters
+/// directly — a public-seed key in either slot would let anyone with the
+/// repo forge policy envelopes the TEE accepts. Shared by
+/// `verify_envelope_with_root` and the offline signing example so every
+/// signer and verifier enforces one gate.
+pub fn refuse_fixture_keys_outside_fixture_root(
+    release: &PlatformRelease,
+    signing_pubkey: &[u8; 32],
+) -> Result<(), PlatformReleaseError> {
+    if *signing_pubkey == fixture_root_pubkey() {
+        return Ok(());
+    }
+    for (field, value) in [
+        (
+            "platform_trustee_policy_pubkey_hex",
+            &release.platform_trustee_policy_pubkey_hex,
+        ),
+        (
+            "signing_service_pubkey_hex",
+            &release.signing_service_pubkey_hex,
+        ),
+    ] {
+        if hex::decode(value)? == fixture_trustee_policy_pubkey() {
+            return Err(PlatformReleaseError::InvalidField {
+                field,
+                message:
+                    "dev-fixture trustee policy key is only allowed under the dev fixture root"
+                        .to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 pub fn canonical_platform_release_bytes(

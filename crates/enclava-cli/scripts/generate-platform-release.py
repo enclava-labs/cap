@@ -71,6 +71,50 @@ def hex32_bytes(field: str, value: str) -> bytes:
     return bytes.fromhex(value)
 
 
+_EDWARDS_P = 2**255 - 19
+# edwards25519 d = -121665/121666 (RFC 8032).
+_EDWARDS_D = (-121665 * pow(121666, _EDWARDS_P - 2, _EDWARDS_P)) % _EDWARDS_P
+
+
+def _edwards_add(p1: tuple[int, int], p2: tuple[int, int]) -> tuple[int, int]:
+    (x1, y1), (x2, y2) = p1, p2
+    t = _EDWARDS_D * x1 * x2 * y1 * y2 % _EDWARDS_P
+    x3 = (x1 * y2 + y1 * x2) * pow(1 + t, _EDWARDS_P - 2, _EDWARDS_P) % _EDWARDS_P
+    y3 = (y1 * y2 + x1 * x2) * pow(1 - t, _EDWARDS_P - 2, _EDWARDS_P) % _EDWARDS_P
+    return (x3, y3)
+
+
+def require_unforgeable_pubkey(field: str, value: str) -> None:
+    """Mirror of the Rust ingestion checks (require_ed25519_point +
+    VerifyingKey::is_weak): the pin must decompress to an Edwards point that
+    is not small-order. Policy acceptance uses verify(), not verify_strict(),
+    and a zero signature verifies against a small-order key for a large
+    share of messages — signing such a pin would produce an envelope that
+    accepts forged policies (or that no Rust consumer will load)."""
+    raw = hex32_bytes(field, value)
+    # dalek's VerifyingKey::from_bytes reduces non-canonical y mod p.
+    y = (int.from_bytes(raw, "little") & ((1 << 255) - 1)) % _EDWARDS_P
+    num = (y * y - 1) % _EDWARDS_P
+    den = (_EDWARDS_D * y * y + 1) % _EDWARDS_P
+    if den == 0:
+        raise ValueError(f"{field} is not a valid Ed25519 public key")
+    x2 = num * pow(den, _EDWARDS_P - 2, _EDWARDS_P) % _EDWARDS_P
+    if x2 == 0:
+        x = 0
+    else:
+        if pow(x2, (_EDWARDS_P - 1) // 2, _EDWARDS_P) != 1:
+            raise ValueError(f"{field} is not a valid Ed25519 public key")
+        x = pow(x2, (_EDWARDS_P + 3) // 8, _EDWARDS_P)
+        if x * x % _EDWARDS_P != x2:
+            x = x * pow(2, (_EDWARDS_P - 1) // 4, _EDWARDS_P) % _EDWARDS_P
+    point = (x, y)
+    p2 = _edwards_add(point, point)
+    p4 = _edwards_add(p2, p2)
+    p8 = _edwards_add(p4, p4)
+    if p8 == (0, 1):
+        raise ValueError(f"{field} has small order and provides no unforgeability")
+
+
 def canonical_platform_release_bytes(payload: dict[str, str]) -> bytes:
     return ce_v1_bytes(
         [
@@ -409,6 +453,7 @@ def validate_payload(payload: dict[str, str], *, allow_dev_internal_tls: bool = 
     for field in ["platform_trustee_policy_pubkey_hex", "signing_service_pubkey_hex"]:
         if field not in payload:
             raise ValueError(f"{field} is required (two trust domains, cap#118)")
+        require_unforgeable_pubkey(field, payload[field])
     trustee_key = hex32_bytes(
         "platform_trustee_policy_pubkey_hex", payload["platform_trustee_policy_pubkey_hex"]
     )

@@ -1340,6 +1340,11 @@ fn verify_signed_policy_artifact_with_pubkey(
     // also disagrees — no semantic signal before the crypto check.
     let verifying_key = VerifyingKey::from_bytes(expected_pubkey)
         .map_err(|_| SigningServiceError::Mismatch(pubkey_field.into()))?;
+    // A weak (small-order) key verifies zero-signature forgeries under
+    // verify(); reject before the crypto check (cap#218 follow-up).
+    if verifying_key.is_weak() {
+        return Err(SigningServiceError::Mismatch(pubkey_field.into()));
+    }
     let signature = Signature::from_bytes(&decode_signature(&artifact.signature)?);
     // #128: building the signing input parses attacker-controlled metadata
     // (UUID/hex fields). A malformed field must surface the same error as a

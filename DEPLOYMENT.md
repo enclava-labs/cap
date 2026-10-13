@@ -226,9 +226,12 @@ together:
    fields you are rotating. It MUST include a `platform_trustee_policy_pubkey_hex`
    distinct from `signing_service_pubkey_hex` — releases that omit the field or
    collapse the two keys onto one key are rejected (the in-TEE policy authority
-   and the signing service are separate trust domains). Generate the trustee
-   policy keypair with its own offline seed, never reused as the signing-service
-   or root key.
+   and the signing service are separate trust domains). The committed payload
+   pins the public dev-fixture trustee key: REPLACE that pin with a freshly
+   generated trustee key — keeping the committed value is rejected at signing
+   and verification time (its seed is public, so anyone with the repo could
+   forge policy envelopes). Generate the trustee policy keypair with its own
+   offline seed, never reused as the signing-service or root key.
 3. Sign the payload with the repository's canonical encoding. Keep the seed
    in a protected file and redirect it into the helper — it never appears in
    argv or shell history:

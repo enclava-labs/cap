@@ -79,6 +79,15 @@ fn sign(payload_path: Option<&String>) -> Result<(), String> {
     // failure to whoever verifies it first.
     enclava_cli::platform_release::validate_release_payload(&payload)
         .map_err(|err| format!("payload: {err}"))?;
+    // Same root-aware fixture-key gate verify_envelope enforces (cap#218):
+    // refuse to sign an envelope every verifier would reject under a
+    // production root.
+    let verifying_key = key.verifying_key();
+    enclava_cli::platform_release::refuse_fixture_keys_outside_fixture_root(
+        &payload,
+        verifying_key.as_bytes(),
+    )
+    .map_err(|err| format!("payload: {err}"))?;
     let canonical =
         canonical_platform_release_bytes(&payload).map_err(|err| format!("payload: {err}"))?;
     let signature = key.sign(&canonical);
