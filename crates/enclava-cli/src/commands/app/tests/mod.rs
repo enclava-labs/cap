@@ -3320,6 +3320,108 @@ mod terminal_diagnostics {
     }
 
     #[tokio::test]
+    async fn success_gate_recovers_when_an_older_request_stalls_and_the_endpoint_recovers() {
+        // cap#220 review follow-up: a request issued before the gate stalls,
+        // then the history endpoint recovers. The gate consumes its own
+        // fresh healthy answers, which keeps the queue below the depth
+        // limit, so the stalled request can only be retired by age: without
+        // the age bound every later gate stays `Inconclusive` (a pending
+        // request blocks the settle) and the ready deployment runs out its
+        // whole wait -- the review's reported bug.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let connections = std::sync::Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let connections_by_server = connections.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let nth = connections_by_server.fetch_add(1, Ordering::SeqCst) + 1;
+                tokio::spawn(async move {
+                    let mut sink = [0_u8; 4096];
+                    let _ = stream.read(&mut sink).await;
+                    if nth == 1 {
+                        // The pre-gate request stalls: accept, never answer.
+                        std::future::pending::<()>().await;
+                    }
+                    // Every later request sees the deployment healthy.
+                    let body = serde_json::json!([{
+                        "id": "deploy-1",
+                        "status": "healthy",
+                        "image_digest": null,
+                        "created_at": "2026-10-13T00:00:00Z",
+                        "completed_at": "2026-10-13T00:01:00Z",
+                    }])
+                    .to_string();
+                    let _ = stream
+                            .write_all(
+                                format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                    body.len(),
+                                    body
+                                )
+                                .as_bytes(),
+                            )
+                            .await;
+                });
+            }
+        });
+        let api = ApiClient::new(&format!("http://{address}"), Some("test".to_string()));
+        // A short refresh window stands in for WAIT_ATTEMPT_BUDGET so the
+        // age bound (refresh_age * HISTORY_MAX_IN_FLIGHT) is exercised
+        // without waiting out the real ~3 minutes.
+        let refresh_age = std::time::Duration::from_millis(40);
+        let mut history = DeploymentHistoryProbe::with_refresh_age(refresh_age);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+
+        // Issue the request that stalls (it is the probe's only one, so the
+        // depth policy can never retire it).
+        history.ensure_request(&api, "demo", deadline);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
+
+        // A gate immediately after: its own fresh request answers healthy,
+        // but the stalled one is still inside the age bound, so the settle
+        // must expire inconclusive -- the safe side of the gate.
+        let settled_budget = std::time::Duration::from_millis(200);
+        let entry_at = std::time::Instant::now();
+        history.force_request(&api, "demo", deadline);
+        let settled = history
+            .take_settled_within(settled_budget, |_, _| true)
+            .await;
+        assert!(
+            !settled,
+            "a pending request inside the age bound keeps the gate inconclusive"
+        );
+
+        // The age bound passes and the next pump retires the stalled request
+        // (below the depth limit): the gate then settles on its fresh
+        // answer and confirms the ready deployment.
+        let age_bound = refresh_age * 3;
+        let waited = entry_at + age_bound - std::time::Instant::now();
+        if waited > std::time::Duration::ZERO {
+            tokio::time::sleep(waited).await;
+        }
+        history.ensure_request(&api, "demo", deadline); // applies the age bound
+        let gate = reconcile_success_with_deployment_history(
+            &api,
+            "demo",
+            "deploy-1",
+            deadline,
+            &mut history,
+        )
+        .await
+        .expect("the gate must not error on a healthy recovered endpoint");
+        assert_eq!(
+            gate,
+            SuccessGate::Confirmed,
+            "the retired stalled request must no longer block the gate: the review's ready-deployment timeout"
+        );
+    }
+
+    #[tokio::test]
     async fn success_exit_surfaces_a_failed_deployment_landing_after_readiness() {
         // cap#220 review follow-up: readiness answered long before history.
         // The exit must consume the failure when its response lands and

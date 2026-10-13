@@ -3586,8 +3586,7 @@ async fn wait_for_paas_ssh_command(
             }
         } else if let Some(response) =
             fetch_direct_ssh_command_response(&response, stable_endpoint, expected_app_url).await?
-        {
-            if let SuccessGate::Confirmed = reconcile_success_with_deployment_history(
+            && let SuccessGate::Confirmed = reconcile_success_with_deployment_history(
                 api,
                 app_name,
                 deployment_id,
@@ -3595,9 +3594,8 @@ async fn wait_for_paas_ssh_command(
                 &mut history,
             )
             .await?
-            {
-                return Ok(response);
-            }
+        {
+            return Ok(response);
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
     }

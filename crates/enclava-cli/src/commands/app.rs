@@ -1695,10 +1695,18 @@ impl DeploymentHistoryProbe {
     /// Keep the observation current: issue a detached request when none is
     /// in flight or the newest one is a refresh window old, applying the
     /// overflow supersession policy. A passed wait deadline issues nothing.
+    ///
+    /// The supersession check runs on *every* pump, not only when a refresh
+    /// is due (cap#220 review follow-up): the successful-exit gate issues
+    /// and consumes a fresh request per iteration, which keeps the newest
+    /// request younger than the refresh window -- so a pump that only
+    /// retired stale requests when issuing new ones would never retire a
+    /// request that stalled before the gate.
     fn ensure_request(&mut self, api: &ApiClient, app_name: &str, wait_deadline: Instant) {
         if wait_attempt_budget(wait_deadline).is_zero() {
             return;
         }
+        self.supersede_overflow();
         let refresh_due = self
             .in_flight
             .back()
@@ -1741,16 +1749,40 @@ impl DeploymentHistoryProbe {
 
     /// The pump's overflow policy: bound sockets on a stalled endpoint while
     /// still observing any response slower than the refresh cadence.
+    ///
+    /// Requests are superseded by *age*, not just by count (cap#220 review
+    /// follow-up): a stalled request only ever hits the depth limit when the
+    /// endpoint stays silent, but the successful-exit gate consumes every
+    /// fresh answer it issues, so a healthy endpoint keeps the queue below
+    /// the depth limit indefinitely -- and a request that stalled *before*
+    /// the gate would then survive forever, blocking every later gate with
+    /// `Inconclusive` until the wait's deadline (the exact bug the review
+    /// reported). Aging out at [`HISTORY_MAX_IN_FLIGHT`] refresh windows
+    /// gives every request the same bounded lifetime (~3 minutes) the depth
+    /// policy intended, independently of how often answers land, while the
+    /// landed-answer guard still applies: a finished request is never
+    /// superseded (its answer is picked up unobserved-dropping-free by the
+    /// next `take_landed`), and aborting a task that already finished is a
+    /// no-op anyway.
     fn supersede_overflow(&mut self) {
-        while self.in_flight.len() > HISTORY_MAX_IN_FLIGHT {
+        let max_age = self.refresh_age * (HISTORY_MAX_IN_FLIGHT as u32);
+        while let Some(front) = self.in_flight.front() {
             // Never supersede a landed answer: its result would be dropped
             // unobserved. A finished request is picked up on the next
             // `take_landed`, one per call, before any further supersession.
-            if self
-                .in_flight
-                .front()
-                .is_some_and(|request| request.handle.is_finished())
-            {
+            if front.handle.is_finished() {
+                break;
+            }
+            // Age bound (cap#220 review follow-up): a request older than
+            // `HISTORY_MAX_IN_FLIGHT` refresh windows is retired even below
+            // the depth limit. The depth check alone never fires while the
+            // successful-exit gate keeps consuming the fresh answers it
+            // issues, so a request that stalled before the gate would
+            // otherwise stay pending forever and hold every later gate at
+            // `Inconclusive` until the wait's deadline.
+            let over_depth = self.in_flight.len() > HISTORY_MAX_IN_FLIGHT;
+            let expired = front.issued_at.elapsed() >= max_age;
+            if !over_depth && !expired {
                 break;
             }
             if let Some(superseded) = self.in_flight.pop_front() {
