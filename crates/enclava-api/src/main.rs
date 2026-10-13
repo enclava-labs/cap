@@ -359,8 +359,16 @@ fn load_pubkey_hex_value(
     // is not a valid Ed25519 point would abort in-TEE verification and brick
     // every workload, so fail startup instead (codex cap#218 P2).
     let arr: [u8; 32] = raw.try_into().expect("length checked above");
-    ed25519_dalek::VerifyingKey::from_bytes(&arr)
+    let key = ed25519_dalek::VerifyingKey::from_bytes(&arr)
         .map_err(|e| anyhow::anyhow!("invalid {name}: not a valid Ed25519 public key: {e}"))?;
+    // Small-order keys provide no unforgeability: policy acceptance uses
+    // verify(), not verify_strict(), and a zero signature verifies against a
+    // small-order key for a large share of messages.
+    if key.is_weak() {
+        anyhow::bail!(
+            "invalid {name}: Ed25519 public key has small order and provides no unforgeability"
+        );
+    }
     Ok(Some(value.to_ascii_lowercase()))
 }
 
@@ -1146,6 +1154,26 @@ mod tests {
         let err = load_policy_authority_pubkeys(None).unwrap_err();
         assert!(
             err.to_string().contains("not a valid Ed25519 public key"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn policy_authority_pubkeys_reject_small_order_encoding() {
+        // cap#218 follow-up: policy acceptance uses verify(), not
+        // verify_strict(), and a zero signature verifies against a
+        // small-order key (e.g. 00*32) for a large share of messages — a
+        // small-order pin would accept forged policy artifacts. Fail
+        // startup instead.
+        let _env_mutex = POLICY_ENV_TEST_MUTEX.lock().unwrap();
+        let _guard = EnvGuard::new();
+        unsafe {
+            std::env::set_var("PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX", "00".repeat(32));
+            std::env::set_var("SIGNING_SERVICE_PUBKEY_HEX", "11".repeat(32));
+        }
+        let err = load_policy_authority_pubkeys(None).unwrap_err();
+        assert!(
+            err.to_string().contains("small order"),
             "unexpected error: {err}"
         );
     }

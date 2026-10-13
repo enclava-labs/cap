@@ -457,12 +457,26 @@ fn require_ed25519_point(
     field: &'static str,
     bytes: &[u8; 32],
 ) -> Result<(), PlatformReleaseError> {
-    ed25519_dalek::VerifyingKey::from_bytes(bytes)
-        .map(|_| ())
-        .map_err(|err| PlatformReleaseError::InvalidField {
+    let key = ed25519_dalek::VerifyingKey::from_bytes(bytes).map_err(|err| {
+        PlatformReleaseError::InvalidField {
             field,
             message: format!("not a valid Ed25519 public key: {err}"),
-        })
+        }
+    })?;
+    // Small-order keys (identity, 00*32, torsion points) provide no
+    // unforgeability: policy acceptance uses verify(), not verify_strict(),
+    // and a zero signature verifies against a small-order key for a large
+    // share of messages. Reject at ingestion so a placeholder pin cannot
+    // accept forged policy artifacts (mirror check in enclava-init
+    // parse_pubkey).
+    if key.is_weak() {
+        return Err(PlatformReleaseError::InvalidField {
+            field,
+            message: "Ed25519 public key has small order and provides no unforgeability"
+                .to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// Validates a release payload's semantic invariants (key shape, key
@@ -1160,6 +1174,31 @@ mod tests {
             matches!(err, PlatformReleaseError::InvalidField { field, message }
                 if field == "signing_service_pubkey_hex"
                     && message.contains("not a valid Ed25519 public key"))
+        );
+    }
+
+    #[test]
+    fn release_payload_rejects_small_order_policy_keys() {
+        // cap#218 follow-up: policy acceptance uses verify(), not
+        // verify_strict(), and a zero signature verifies against a
+        // small-order key (e.g. 00*32) for a large share of messages —
+        // such a pin accepts forged policy artifacts.
+        let raw: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
+        let mut payload = raw.payload.clone();
+        payload.signing_service_pubkey_hex = "00".repeat(32);
+        let err = validate_release_payload(&payload).unwrap_err();
+        assert!(
+            matches!(&err, PlatformReleaseError::InvalidField { field, message }
+                if *field == "signing_service_pubkey_hex" && message.contains("small order")),
+            "unexpected error: {err:?}"
+        );
+        let mut payload = raw.payload;
+        payload.platform_trustee_policy_pubkey_hex = "00".repeat(32);
+        let err = validate_release_payload(&payload).unwrap_err();
+        assert!(
+            matches!(&err, PlatformReleaseError::InvalidField { field, message }
+                if *field == "platform_trustee_policy_pubkey_hex" && message.contains("small order")),
+            "unexpected error: {err:?}"
         );
     }
 

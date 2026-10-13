@@ -202,10 +202,14 @@ replays — still validate after the upgrade: when only the collapsed render
 matches the signed hash, the API pins the artifact to that layout and every
 consumer (statefulset, enclava-init ConfigMap, KBS policy/TLS bindings)
 renders the exact signed bytes, so the workload boots exactly as it did
-before the upgrade. No re-signing is required before rollout; re-deploying
-(re-signing) an app moves it to the split layout. The same render-pin
-mechanism covers artifacts signed before the `log_encryption_json` claim
-existed (`omit_log_encryption_claim`).
+before the upgrade. No workload-artifact re-signing is required before
+rollout; re-deploying (re-signing) an app moves it to the split layout. The
+same render-pin mechanism covers artifacts signed before the
+`log_encryption_json` claim existed (`omit_log_encryption_claim`). The
+production platform-release envelope is the exception: the new
+`platform_trustee_policy_pubkey_hex` field is required with no default, so
+re-sign the production envelope with a distinct trustee key before
+deploying this binary — an old envelope will not load.
 
 ### Rotating the production root
 
