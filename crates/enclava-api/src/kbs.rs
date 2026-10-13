@@ -5244,6 +5244,13 @@ resource_bindings := {
         let now = Utc::now();
 
         let (pending_org, pending_app) = insert_test_app(&pool, "deleting").await;
+
+        // The candidates query filters artifacts by current keyring
+        // membership (issue #130), so the fixture org needs a keyring whose
+        // member set still contains the fixture signer pubkey (test_signed_
+        // policy_artifact signs with bb repeated 32 times) for its artifacts
+        // to stay authorized.
+        insert_test_keyring_version(&pool, pending_org, 1, &["bb".repeat(32).as_str()]).await;
         sqlx::query("UPDATE apps SET workload_teardown_required = true WHERE id = $1")
             .bind(pending_app)
             .execute(&pool)
@@ -5272,6 +5279,13 @@ resource_bindings := {
         .await;
 
         let (completed_org, completed_app) = insert_test_app(&pool, "deleting").await;
+
+        // The candidates query filters artifacts by current keyring
+        // membership (issue #130), so the fixture org needs a keyring whose
+        // member set still contains the fixture signer pubkey (test_signed_
+        // policy_artifact signs with bb repeated 32 times) for its artifacts
+        // to stay authorized.
+        insert_test_keyring_version(&pool, completed_org, 1, &["bb".repeat(32).as_str()]).await;
         sqlx::query(
             "UPDATE apps
                 SET workload_teardown_required = true,
@@ -5334,6 +5348,13 @@ resource_bindings := {
         let pool = crate::test_support::database_test_pool().await;
         let now = Utc::now();
         let (org_id, app_id) = insert_test_app(&pool, "deleting").await;
+
+        // The candidates query filters artifacts by current keyring
+        // membership (issue #130), so the fixture org needs a keyring whose
+        // member set still contains the fixture signer pubkey (test_signed_
+        // policy_artifact signs with bb repeated 32 times) for its artifacts
+        // to stay authorized.
+        insert_test_keyring_version(&pool, org_id, 1, &["bb".repeat(32).as_str()]).await;
         sqlx::query("UPDATE apps SET workload_teardown_required = true WHERE id = $1")
             .bind(app_id)
             .execute(&pool)
@@ -5781,6 +5802,13 @@ resource_bindings := {
         let pool = crate::test_support::database_test_pool().await;
         let now = Utc::now();
         let (org_id, app_id) = insert_test_app(&pool, "deleting").await;
+
+        // The candidates query filters artifacts by current keyring
+        // membership (issue #130), so the fixture org needs a keyring whose
+        // member set still contains the fixture signer pubkey (test_signed_
+        // policy_artifact signs with bb repeated 32 times) for its artifacts
+        // to stay authorized.
+        insert_test_keyring_version(&pool, org_id, 1, &["bb".repeat(32).as_str()]).await;
         sqlx::query("UPDATE apps SET workload_teardown_required = true WHERE id = $1")
             .bind(app_id)
             .execute(&pool)
@@ -5899,6 +5927,13 @@ resource_bindings := {
         let pool = crate::test_support::database_test_pool().await;
         let now = Utc::now();
         let (org_id, app_id) = insert_test_app(&pool, "deleting").await;
+
+        // The candidates query filters artifacts by current keyring
+        // membership (issue #130), so the fixture org needs a keyring whose
+        // member set still contains the fixture signer pubkey (test_signed_
+        // policy_artifact signs with bb repeated 32 times) for its artifacts
+        // to stay authorized.
+        insert_test_keyring_version(&pool, org_id, 1, &["bb".repeat(32).as_str()]).await;
         sqlx::query("UPDATE apps SET workload_teardown_required = true WHERE id = $1")
             .bind(app_id)
             .execute(&pool)
