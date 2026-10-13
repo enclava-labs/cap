@@ -545,7 +545,8 @@ mod tests {
         assert!(matches!(error, PlatformReleaseError::RootMismatch { .. }));
         let message = error.to_string();
         assert!(message.contains(&pinned.to_ascii_lowercase()));
-        assert!(message.contains(&declared));    }
+        assert!(message.contains(&declared));
+    }
 
     #[test]
     fn fixture_trustee_policy_key_is_rejected_under_a_non_fixture_root() {
