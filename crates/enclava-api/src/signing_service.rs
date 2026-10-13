@@ -153,7 +153,7 @@ pub async fn lock_org_signing_authority_lane(
 /// the caller's own checks run. This reads clock_timestamp() from the
 /// already-locked transaction so freshness bounds use the post-acquisition
 /// instant on the same clock that witnesses org_keyrings.created_at
-/// (migration 0051).
+/// (migration 0063).
 pub async fn lock_org_signing_authority_lane_now(
     tx: &mut Transaction<'_, Postgres>,
     org_id: Uuid,
