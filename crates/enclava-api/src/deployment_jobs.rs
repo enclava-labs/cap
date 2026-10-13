@@ -571,7 +571,7 @@ impl DeploymentJobError {
             Self::LeaseLost => "lease_lost",
             Self::Authority => "deployment_authority_changed",
             Self::Apply(error) => error.public_code(),
-            Self::Kbs(_) => "kbs_policy_error",
+            Self::Kbs(error) => error.public_code(),
             Self::PreflightVolumeEvidenceUnavailable => "volume_evidence_unavailable",
             Self::ApplyLimiterClosed => "apply_limiter_closed",
             Self::SideEffectAdmissionClosed => "side_effect_admission_closed",

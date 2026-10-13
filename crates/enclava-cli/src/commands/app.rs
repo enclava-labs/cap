@@ -1043,15 +1043,15 @@ pub(crate) async fn wait_for_bootstrap_endpoint(
     poll_interval: Duration,
     pb: &ProgressBar,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    let endpoint = api.get_unlock_endpoint(app_name).await?;
-    let tee = TeeClient::new_for_ownership_probe_with_resolve_ip(
-        &endpoint.tee_url,
-        endpoint.tee_resolve_ip,
-    );
+    let deployment_id = deployment.deployment_id;
+    let mut tee = None;
     let start = std::time::Instant::now();
 
     loop {
-        fail_if_template_deployment_failed(api, app_name, deployment.deployment_id).await?;
+        // Poll the terminal-failure check before any endpoint fetch: a
+        // rejected deployment must fail fast rather than block on a
+        // request whose response would never satisfy it (#18).
+        fail_if_template_deployment_failed(api, app_name, deployment_id).await?;
         if start.elapsed() > max_wait {
             pb.abandon_with_message("TEE ownership timed out");
             return Err(format!(
@@ -1066,6 +1066,26 @@ pub(crate) async fn wait_for_bootstrap_endpoint(
             start.elapsed(),
             max_wait,
         ));
+        if tee.is_none() {
+            match api.get_unlock_endpoint(app_name).await {
+                Ok(endpoint) => {
+                    tee = Some(TeeClient::new_for_ownership_probe_with_resolve_ip(
+                        &endpoint.tee_url,
+                        endpoint.tee_resolve_ip,
+                    ));
+                }
+                Err(_) => {
+                    pb.set_message(timed_progress(
+                        "TEE ownership: waiting for endpoint",
+                        start.elapsed(),
+                        max_wait,
+                    ));
+                    tokio::time::sleep(poll_interval).await;
+                    continue;
+                }
+            }
+        }
+        let tee = tee.as_ref().expect("tee client was just acquired");
         match tee.attest_receipt_key().await {
             Ok((_attestation, attested_tee)) => {
                 match attested_tee.bootstrap_challenge().await {

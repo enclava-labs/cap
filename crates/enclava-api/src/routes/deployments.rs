@@ -595,6 +595,8 @@ const PUBLIC_DEPLOYMENT_ERROR_CODES: &[&str] = &[
     "image_digest_required",
     "deploy_runtime_not_configured",
     "kbs_policy_error",
+    "signed_policy_budget_exceeded",
+    "app_not_deployed",
     "edge_route_error",
     "mutation_fence_error",
     // job-level codes (DeploymentJobError::code)

@@ -1008,7 +1008,97 @@ async fn public_error_codes_are_persistable_job_codes() {
         let needle = format!("'{code}'");
         assert!(
             constraint_def.contains(&needle),
-            "PUBLIC_DEPLOYMENT_ERROR_CODES entry `{code}` is rejected by the              deployment_apply_jobs_last_error_code_check constraint; widen              migrations/0058_widen_deployment_apply_jobs_last_error_code.sql",
+            "PUBLIC_DEPLOYMENT_ERROR_CODES entry `{code}` is rejected by the \
+             deployment_apply_jobs_last_error_code_check constraint; widen \
+             migrations/0058_widen_deployment_apply_jobs_last_error_code.sql",
+        );
+    }
+}
+
+/// Extract every bounded classification code the emitter functions can
+/// return. Each emitter body (`DeploymentJobError::code`, `dns_error_code`,
+/// `DeployError::public_code`, `ApplyError::public_code`,
+/// `KbsPolicyError::public_code`) consists solely of `&'static str` code
+/// literals, so scanning the body for quoted snake_case literals enumerates
+/// the full emitter range — including variants that cannot be constructed in
+/// a unit test (sqlx/kube/reqwest sources).
+fn emitter_error_codes() -> Vec<&'static str> {
+    fn body_after<'a>(source: &'a str, anchor: &str) -> &'a str {
+        let start = source
+            .find(anchor)
+            .unwrap_or_else(|| panic!("anchor `{anchor}` not found in emitter source"));
+        let rest = &source[start..];
+        let end = rest.find("\n}\n").map(|i| i + 2).unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    let mut codes = Vec::new();
+    let deployment_jobs = include_str!("../../../deployment_jobs.rs");
+    let deploy = include_str!("../../../deploy.rs");
+    let kbs = include_str!("../../../kbs.rs");
+    let apply_engine = include_str!("../../../../../enclava-engine/src/apply/engine.rs");
+
+    for (source, anchor) in [
+        (deployment_jobs, "impl DeploymentJobError {"),
+        (deployment_jobs, "fn dns_error_code("),
+        (deploy, "impl DeployError {"),
+        (kbs, "impl KbsPolicyError {"),
+        (apply_engine, "impl ApplyError {"),
+    ] {
+        let body = body_after(source, anchor);
+        let found: Vec<&str> = body
+            .split('"')
+            .skip(1)
+            .step_by(2)
+            .filter(|literal| {
+                !literal.is_empty()
+                    && literal
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+            })
+            .collect();
+        assert!(
+            !found.is_empty(),
+            "no classification codes found after anchor `{anchor}` — parser drift"
+        );
+        codes.extend(found);
+    }
+    codes.sort_unstable();
+    codes.dedup();
+    codes
+}
+
+#[tokio::test]
+async fn every_emitter_error_code_is_persistable_and_public() {
+    // #18: `fail_apply_job_with_mutation` persists `error.code()` verbatim
+    // into `deployment_apply_jobs.last_error_code`. Any code an emitter can
+    // return that the CHECK constraint rejects would roll back the whole
+    // terminalization transaction and strand the job in `running`. Every
+    // emitter code must therefore satisfy the constraint, and — so users see
+    // the real classification — appear in PUBLIC_DEPLOYMENT_ERROR_CODES.
+    let pool = crate::test_support::database_test_pool().await;
+    let constraint_def: String = sqlx::query_scalar(
+        "SELECT pg_get_constraintdef(oid)
+           FROM pg_constraint
+          WHERE conname = 'deployment_apply_jobs_last_error_code_check'
+            AND conrelid = 'deployment_apply_jobs'::regclass",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("load last_error_code constraint definition");
+
+    for code in emitter_error_codes() {
+        let needle = format!("'{code}'");
+        assert!(
+            constraint_def.contains(&needle),
+            "emitter code `{code}` is rejected by the \
+             deployment_apply_jobs_last_error_code_check constraint; widen \
+             migrations/0058_widen_deployment_apply_jobs_last_error_code.sql",
+        );
+        assert!(
+            PUBLIC_DEPLOYMENT_ERROR_CODES.contains(&code),
+            "emitter code `{code}` is missing from PUBLIC_DEPLOYMENT_ERROR_CODES \
+             and would redact to deployment_error",
         );
     }
 }
