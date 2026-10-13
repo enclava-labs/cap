@@ -209,12 +209,12 @@ impl TeeProbeFailureCache {
         previous
     }
 
-    /// Returns the recorded signature for `key`, refreshing its recency.
-    pub fn get(&mut self, key: &str) -> Option<&String> {
-        let signature = self.entries.get(key)?;
-        self.order.retain(|k| k != key);
-        self.order.push_back(key.to_string());
-        Some(signature)
+    /// Returns the recorded signature for `key` without mutating recency:
+    /// lookups stay O(1) so high-volume suppressed failures never scan the
+    /// order queue under the mutex (#219 review). Recency advances only when
+    /// a signature is (re-)recorded via `insert`.
+    pub fn get(&self, key: &str) -> Option<&String> {
+        self.entries.get(key)
     }
 
     /// Removes `key` (e.g. after a successful probe for the app).
@@ -367,11 +367,9 @@ mod tests {
         }
         assert_eq!(cache.entries.len(), TEE_PROBE_FAILURE_CACHE_CAPACITY);
 
-        // Refresh an old key so it is the most recently used.
-        assert_eq!(
-            cache.get("ns-0/app-0").map(String::as_str),
-            Some("failure-0")
-        );
+        // Recency advances on insert: re-recording an old key's signature
+        // makes it the most recently used (get is O(1) and does not reorder).
+        cache.insert("ns-0/app-0".to_string(), "failure-0".to_string());
 
         // Inserting one more key evicts ns-1/app-1, the least recently used,
         // but keeps the refreshed ns-0/app-0 entry.

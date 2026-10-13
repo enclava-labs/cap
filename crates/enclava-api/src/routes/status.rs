@@ -23,6 +23,12 @@ use crate::state::AppState;
 const DEPLOYMENT_ID_LABEL: &str = "enclava.dev/deployment-id";
 const KUBERNETES_STATUS_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const TEE_STATUS_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Per-request timeout, strictly shorter than the outer probe deadline so a
+/// stalled connect/TLS/body exchange surfaces as a reqwest timeout error at
+/// the send/body stage (with its full error chain) instead of being cancelled
+/// by the outer deadline, which is established earlier and would otherwise
+/// always win (#219 review).
+const TEE_STATUS_REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -550,7 +556,7 @@ async fn probe_tee_unbounded(
     };
     let response = match client
         .get(&tee_status_url)
-        .timeout(TEE_STATUS_PROBE_TIMEOUT)
+        .timeout(TEE_STATUS_REQUEST_TIMEOUT)
         .send()
         .await
     {
