@@ -5,7 +5,7 @@
 -- of presentation only: it grants nothing. In particular the expired
 -- first-use signed_at max-age waiver is NOT granted by an intent row (an
 -- earlier design did that and let a captured, never-actioned presentation
--- mint a version); since 0059_org_rotation_upstream_receipts that waiver
+-- mint a version); since 0066_org_rotation_upstream_receipts that waiver
 -- requires a receipt minted from a response-validated rotate-owner call and
 -- matched against the live upstream owner. Rows are never purged.
 CREATE TABLE org_rotation_intents (
