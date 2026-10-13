@@ -556,6 +556,12 @@ mod tests {
         // The gate sits in verify_envelope: with a fixture root it passes
         // (the bundled envelope proves that), so exercise it by hand with a
         // non-fixture signing root.
+        // NOTE: this API-side twin only asserts the gate's constants; the
+        // full negative coverage (re-signing the envelope under a production
+        // root and asserting verify_envelope rejects) lives in the CLI
+        // crate's twin test — fixture_trustee_policy_key_is_rejected_...
+        // in crates/enclava-cli/src/platform_release.rs. Keep both in sync
+        // (the gate logic and constants are deliberately duplicated).
         let raw: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
         assert_eq!(
             raw.payload.platform_trustee_policy_pubkey_hex,
