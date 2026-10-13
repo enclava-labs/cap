@@ -149,16 +149,56 @@ fn adopted_namespace_sweep_targets(app: &App) -> Vec<AdoptedNamespaceSweep> {
     targets
 }
 
-/// Delete exactly the objects this failed generation published into an
-/// adopted namespace. Each target is first GET'd: an object is deleted only
-/// when its live mutation-generation annotation EXACTLY equals the failed
-/// generation (proving this generation published it) and the delete carries
-/// UID + resourceVersion preconditions (so a replaced object cannot be
+/// Per-request cap for adopted-namespace sweep reads (GET/list). A stalled
+/// Kubernetes API server must not hold the failed mutation's shared
+/// `edge_config`/`kbs_policy` fences and side-effect admission permit for
+/// the client's default (~295 s) read timeout per target: across the ~17
+/// enumerated targets that aggregates to well over an hour of fence
+/// retention blocking unrelated deployments platform-wide.
+const SWEEP_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Overall deadline for the whole adopted-namespace sweep. Bounding each
+/// request alone still allows ~17 targets x (bounded GET + up to 3 bounded
+/// delete attempts + conflict backoff) to stretch into many minutes under
+/// sustained API-server degradation, so the sweep as a whole is bounded
+/// too: once the deadline passes, remaining targets count as failures and
+/// the caller reports `AdoptedIncomplete` (evidence kept, fences release,
+/// the next apply or app deletion converges the leftovers).
+const SWEEP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Bound a single sweep read. Returns Err on both transport failure and
+/// deadline expiry: both mean the target's state is undecidable within the
+/// sweep's budget.
+async fn bounded_sweep_read<F, T>(future: F) -> Result<T, kube::Error>
+where
+    F: std::future::Future<Output = Result<T, kube::Error>>,
+{
+    match tokio::time::timeout(SWEEP_READ_TIMEOUT, future).await {
+        Ok(result) => result,
+        Err(_) => Err(kube::Error::Service(
+            "adopted-namespace sweep read exceeded its 30s per-request budget".into(),
+        )),
+    }
+}
+
+/// Delete exactly the objects this failed generation created in an adopted
+/// namespace. Each target is first GET'd: an object is deleted only when
+/// its live mutation-generation annotation is positive and not newer than
+/// the failed generation (proving the last writer was a CAP apply of this
+/// app) AND it carries
+/// CAP creation evidence (`RESOURCE_CREATED_BY_ANNOTATION`, stamped only by
+/// the create POST in `apply_resource` — never by an SSA patch of a
+/// pre-existing object). The delete carries UID + resourceVersion
+/// preconditions from that same GET (so a replaced object cannot be
 /// deleted by a stale decision). Objects that are absent, carry another
-/// generation, or pre-date CAP entirely (no annotation) are skipped.
+/// generation, or were merely patched by CAP (no creation evidence) are
+/// skipped: a pre-existing same-named Secret, Service, or ConfigMap in an
+/// adopted namespace may retain fields and consumers owned by the
+/// namespace owner, and last-writer proof is not deletion authority.
 /// Returns the number of objects whose deletion was attempted and failed:
 /// non-zero means the sweep is incomplete and must be retried (the caller
-/// retains the namespace fence so the periodic reconciler converges it).
+/// retains provider-state evidence so later failed generations stay
+/// cleanup-eligible).
 pub(crate) async fn sweep_published_objects_from_adopted_namespace(
     app: &App,
     generation: enclava_engine::apply::generation::MutationGeneration,
@@ -175,8 +215,20 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
             return usize::MAX;
         }
     };
+    let sweep_deadline = tokio::time::Instant::now() + SWEEP_DEADLINE;
     let mut failures = 0usize;
     for target in adopted_namespace_sweep_targets(app) {
+        if tokio::time::Instant::now() >= sweep_deadline {
+            tracing::warn!(
+                app_id = %app.id,
+                namespace = %app.namespace,
+                kind = target.kind,
+                name = %target.name,
+                "adopted-namespace sweep hit its overall deadline; counting remaining targets as failures"
+            );
+            failures += 1;
+            continue;
+        }
         let ar = sweep_api_resource(target.kind);
         let api: kube::Api<kube::api::DynamicObject> =
             kube::Api::namespaced_with(client.clone(), &app.namespace, &ar);
@@ -185,8 +237,9 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
         // live object and re-checks ownership before deleting, so a
         // replaced object of another generation is never hit.
         let mut deleted = false;
-        for _attempt in 0..SWEEP_DELETE_RETRIES {
-            let live = match api.get_opt(&target.name).await {
+        let mut exhausted_conflicts = false;
+        for attempt in 0..SWEEP_DELETE_RETRIES {
+            let live = match bounded_sweep_read(api.get_opt(&target.name)).await {
                 Ok(live) => live,
                 Err(error) => {
                     tracing::warn!(
@@ -204,24 +257,16 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
             let Some(live) = live else {
                 break; // never created, or already deleted
             };
-            let live_generation = live
-                .metadata
-                .annotations
-                .as_ref()
-                .and_then(|annotations| {
-                    annotations
-                        .get(enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION)
-                })
-                .and_then(|raw| raw.parse::<i64>().ok());
-            if !is_sweepable_leftover(live_generation, generation.get()) {
-                // Foreign (unannotated) or newer-generation: never delete
-                // on name alone.
+            if !is_cap_created_generation_leftover(&live.metadata, generation.get()) {
+                // Foreign (no creation evidence — includes objects CAP
+                // merely SSA-patched), or a newer generation's publication:
+                // never delete on name alone.
                 tracing::info!(
                     app_id = %app.id,
                     namespace = %app.namespace,
                     kind = target.kind,
                     name = %target.name,
-                    "adopted-namespace sweep skips object not published by a CAP failed apply"
+                    "adopted-namespace sweep skips object not created by a CAP failed apply"
                 );
                 break;
             }
@@ -243,9 +288,21 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
                     deleted = true;
                     break;
                 }
+                Err(kube::Error::Api(error)) if error.code == 404 => {
+                    // Raced deletion: the object vanished between our GET
+                    // and this DELETE. It is already absent — that IS
+                    // successful cleanup, not a failure.
+                    deleted = true;
+                    break;
+                }
                 Err(kube::Error::Api(error)) if error.code == 409 => {
                     // Preconditions raced with a controller write: re-read
-                    // and retry under the same ownership check.
+                    // and retry under the same ownership check. Burning the
+                    // whole budget on conflicts leaves a live object — an
+                    // incomplete sweep, not a completed one.
+                    if attempt + 1 == SWEEP_DELETE_RETRIES {
+                        exhausted_conflicts = true;
+                    }
                     continue;
                 }
                 Err(error) => {
@@ -262,29 +319,57 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
                 }
             }
         }
+        if !deleted && exhausted_conflicts {
+            tracing::warn!(
+                app_id = %app.id,
+                namespace = %app.namespace,
+                kind = target.kind,
+                name = %target.name,
+                "adopted-namespace sweep exhausted its delete retries on conflicts; counting as failure"
+            );
+            failures += 1;
+        }
         if deleted && target.kind == "StatefulSet" {
             // A deleted StatefulSet leaves its PVCs behind (the manifest's
-            // retention policy is Retain): sweep the CAP-owned claims too,
-            // or a later resized workload would silently reuse the
+            // retention policy is Retain): sweep the CAP-created claims
+            // too, or a later resized workload would silently reuse the
             // old-size volumes while the cleared manifest_hash had
             // disabled the storage-size guard.
-            failures +=
-                sweep_statefulset_pvcs(&client, &app.namespace, &target.name, generation).await;
+            failures += sweep_statefulset_pvcs(&client, &app.namespace, &target.name).await;
         }
     }
     failures
 }
 
-/// A live object's generation annotation makes it a sweepable leftover of
-/// this app's failed applies: strictly positive (an annotated object is
-/// provably CAP-written; an unannotated one is foreign) and not newer than
-/// the failed generation (a newer generation's publication is not this
+/// A live object's metadata makes it a leftover of this app's failed
+/// applies that CAP itself CREATED: it carries creation evidence
+/// (`RESOURCE_CREATED_BY_ANNOTATION` > 0 — stamped only by the create POST
+/// in `apply_resource`, so a pre-existing object CAP merely SSA-patched can
+/// never acquire it) whose last-writer generation is positive and not
+/// newer than the failed one (a newer generation's publication is not this
 /// failure's partial state). The sweep only runs after the ownership gate
 /// proved no other deployment of this app retains provider state, so an
-/// older annotated object can only be a leftover of an earlier failed
+/// older created object can only be a leftover of an earlier failed
 /// apply — exactly what must not survive generation after generation.
-fn is_sweepable_leftover(live_generation: Option<i64>, failed_generation: i64) -> bool {
-    live_generation.is_some_and(|live| live > 0 && live <= failed_generation)
+fn is_cap_created_generation_leftover(
+    metadata: &k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta,
+    failed_generation: i64,
+) -> bool {
+    let annotation = |key: &str| {
+        metadata
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get(key))
+            .and_then(|raw| raw.parse::<i64>().ok())
+    };
+    let Some(created_by) =
+        annotation(enclava_engine::apply::generation::RESOURCE_CREATED_BY_ANNOTATION)
+    else {
+        return false;
+    };
+    let live_generation =
+        annotation(enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION);
+    created_by > 0 && live_generation.is_some_and(|live| live > 0 && live <= failed_generation)
 }
 
 /// Bounded re-read retry budget for preconditioned sweep deletes.
@@ -292,22 +377,24 @@ const SWEEP_DELETE_RETRIES: usize = 3;
 
 /// Delete the PVCs this failed generation's StatefulSet created in an
 /// adopted namespace. Only claims whose name matches the exact
-/// `<vct>-<statefulset>-<ordinal>` shape for a CAP-rendered VCT name AND
-/// which are sweepable leftovers (`is_sweepable_leftover`: annotated with
-/// a positive generation not newer than the failed one) are deleted, with
-/// UID/resourceVersion preconditions: a pre-existing unannotated claim —
-/// including one from a foreign StatefulSet with the same name — is never
-/// touched.
+/// `<vct>-<statefulset>-<ordinal>` shape for a CAP-rendered VCT name are
+/// deleted, with UID/resourceVersion preconditions. PVCs created by the
+/// Kubernetes StatefulSet controller from `spec.volumeClaimTemplates`
+/// never carry CAP annotations (VCT metadata is immutable — adding the
+/// annotation would break every redeploy of an existing StatefulSet with
+/// 422), so ownership is derived from the claim-name shape after the
+/// StatefulSet itself was proven CAP-created and deleted by this sweep.
+/// A pre-existing unannotated claim — including one from a foreign
+/// StatefulSet with the same name — is never touched.
 pub(crate) async fn sweep_statefulset_pvcs(
     client: &kube::Client,
     namespace: &str,
     statefulset: &str,
-    generation: enclava_engine::apply::generation::MutationGeneration,
 ) -> usize {
     const CAP_VCT_NAMES: [&str; 2] = ["state", "tls-state"];
     let api: kube::Api<k8s_openapi::api::core::v1::PersistentVolumeClaim> =
         kube::Api::namespaced(client.clone(), namespace);
-    let list = match api.list(&kube::api::ListParams::default()).await {
+    let list = match bounded_sweep_read(api.list(&kube::api::ListParams::default())).await {
         Ok(list) => list,
         Err(error) => {
             tracing::warn!(
@@ -327,17 +414,6 @@ pub(crate) async fn sweep_statefulset_pvcs(
         if !is_cap_claim_name(&name, statefulset, &CAP_VCT_NAMES) {
             continue;
         }
-        let live_generation = pvc
-            .metadata
-            .annotations
-            .as_ref()
-            .and_then(|annotations| {
-                annotations.get(enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION)
-            })
-            .and_then(|raw| raw.parse::<i64>().ok());
-        if !is_sweepable_leftover(live_generation, generation.get()) {
-            continue;
-        }
         let preconditions = kube::api::Preconditions {
             uid: pvc.metadata.uid.clone(),
             resource_version: pvc.metadata.resource_version.clone(),
@@ -352,6 +428,10 @@ pub(crate) async fn sweep_statefulset_pvcs(
             )
             .await
         {
+            if matches!(&error, kube::Error::Api(error) if error.code == 404) {
+                // Already gone: successful cleanup, not a failure.
+                continue;
+            }
             tracing::warn!(
                 namespace = %namespace,
                 pvc = %name,
@@ -773,7 +853,14 @@ enum InitialNamespaceOwnership {
     /// Live object carries this generation's annotation AND creation
     /// evidence (`enclava.dev/cap-namespace-created-by-generation`): CAP
     /// created it and this generation was the last writer — safe to delete.
-    Owned,
+    /// Carries the exact UID/resourceVersion of the object that passed the
+    /// ownership check: the DELETE must target THAT object, never whatever
+    /// a fresh GET would return (a same-named replacement would sail
+    /// through the annotation checks as generation zero).
+    Owned {
+        uid: String,
+        resource_version: String,
+    },
     /// Live object carries this generation's mutation annotation but no
     /// creation evidence: a pre-existing namespace this apply adopted.
     /// Never delete it — only the resources this apply published (routes)
@@ -819,7 +906,20 @@ fn classify_initial_namespace_get(
                 if !created_by_cap {
                     return InitialNamespaceOwnership::Adopted;
                 }
-                InitialNamespaceOwnership::Owned
+                // The DELETE preconditions come from THIS object. A live
+                // object missing uid/resourceVersion cannot be pinned and
+                // is treated as undecidable (the API server always
+                // populates both on real reads).
+                match (
+                    namespace.metadata.uid.clone(),
+                    namespace.metadata.resource_version.clone(),
+                ) {
+                    (Some(uid), Some(resource_version)) => InitialNamespaceOwnership::Owned {
+                        uid,
+                        resource_version,
+                    },
+                    _ => InitialNamespaceOwnership::Uninspectable,
+                }
             } else {
                 InitialNamespaceOwnership::Foreign
             }
@@ -868,8 +968,14 @@ async fn delete_failed_generation_namespace(
     };
     let api: kube::Api<k8s_openapi::api::core::v1::Namespace> = kube::Api::all(client);
 
-    match classify_initial_namespace_get(&api.get(&app.namespace).await, generation) {
-        InitialNamespaceOwnership::Owned => {}
+    let (owned_uid, owned_resource_version) = match classify_initial_namespace_get(
+        &api.get(&app.namespace).await,
+        generation,
+    ) {
+        InitialNamespaceOwnership::Owned {
+            uid,
+            resource_version,
+        } => (uid, resource_version),
         InitialNamespaceOwnership::AbsentBeforeDelete => {
             tracing::info!(
                 app_id = %app.id,
@@ -931,16 +1037,32 @@ async fn delete_failed_generation_namespace(
             // No delete issued through this path.
             return NamespaceTeardown::NotOurs;
         }
-    }
-    let deleted = match enclava_engine::apply::generation::delete_resource(
-        &api,
-        &app.namespace,
-        generation,
-        kube::api::DeleteParams::default(),
-    )
-    .await
+    };
+
+    // The DELETE carries the UID/resourceVersion of the EXACT object that
+    // passed the ownership classification above — not whatever a fresh GET
+    // inside a generic delete helper would return. If an external actor
+    // deletes the CAP-owned namespace and recreates a foreign same-named
+    // one between our reads, the stale resourceVersion precondition fails
+    // with 409 instead of authorizing deletion of the replacement.
+    let deleted = match api
+        .delete(
+            &app.namespace,
+            &kube::api::DeleteParams {
+                preconditions: Some(kube::api::Preconditions {
+                    uid: Some(owned_uid),
+                    resource_version: Some(owned_resource_version),
+                }),
+                ..kube::api::DeleteParams::default()
+            },
+        )
+        .await
     {
-        Ok(deleted) => deleted,
+        Ok(_) => true,
+        Err(kube::Error::Api(error)) if error.code == 404 => {
+            // Vanished between the owning GET and the delete: complete.
+            false
+        }
         Err(error) => {
             tracing::warn!(
                 app_id = %app.id,
@@ -1400,6 +1522,8 @@ mod tests {
         k8s_openapi::api::core::v1::Namespace {
             metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
                 annotations: Some(annotations),
+                uid: Some("00000000-0000-0000-0000-000000000001".to_string()),
+                resource_version: Some("42".to_string()),
                 ..Default::default()
             },
             ..Default::default()
@@ -1418,7 +1542,7 @@ mod tests {
             .expect("valid generation");
         assert!(matches!(
             classify_initial_namespace_get(&Ok(annotated_namespace(7)), generation),
-            InitialNamespaceOwnership::Owned
+            InitialNamespaceOwnership::Owned { .. }
         ));
         assert!(matches!(
             classify_initial_namespace_get(&Ok(annotated_namespace(6)), generation),
@@ -1457,7 +1581,82 @@ mod tests {
             );
         assert!(matches!(
             classify_initial_namespace_get(&Ok(recreated), generation),
-            InitialNamespaceOwnership::Owned
+            InitialNamespaceOwnership::Owned { .. }
+        ));
+    }
+
+    fn object_meta_with_annotations(
+        pairs: &[(&str, i64)],
+    ) -> k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+        let annotations = pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+            annotations: Some(annotations),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn sweep_requires_creation_evidence_not_last_writer_proof() {
+        use enclava_engine::apply::generation as generation_annotations;
+        // A CAP-created object of this failed generation: both annotations.
+        assert!(is_cap_created_generation_leftover(
+            &object_meta_with_annotations(&[
+                (generation_annotations::RESOURCE_CREATED_BY_ANNOTATION, 7),
+                (generation_annotations::MUTATION_GENERATION_ANNOTATION, 7),
+            ]),
+            7
+        ));
+        // An older CAP-created leftover (an earlier failed apply's object)
+        // whose last writer is still an older generation: sweep it.
+        assert!(is_cap_created_generation_leftover(
+            &object_meta_with_annotations(&[
+                (generation_annotations::RESOURCE_CREATED_BY_ANNOTATION, 3),
+                (generation_annotations::MUTATION_GENERATION_ANNOTATION, 3),
+            ]),
+            7
+        ));
+        // Codex P1: SSA-patched pre-existing object — mutation annotation
+        // from this apply, but NO creation evidence. Must never be deleted.
+        assert!(!is_cap_created_generation_leftover(
+            &object_meta_with_annotations(&[(
+                generation_annotations::MUTATION_GENERATION_ANNOTATION,
+                7
+            )]),
+            7
+        ));
+        // A newer generation's publication: not this failure's partial state.
+        assert!(!is_cap_created_generation_leftover(
+            &object_meta_with_annotations(&[
+                (generation_annotations::RESOURCE_CREATED_BY_ANNOTATION, 9),
+                (generation_annotations::MUTATION_GENERATION_ANNOTATION, 9),
+            ]),
+            7
+        ));
+        // Foreign object: no annotations at all.
+        assert!(!is_cap_created_generation_leftover(
+            &k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta::default(),
+            7
+        ));
+        // Creation evidence alone with an unparseable mutation annotation:
+        // undecidable last-writer, skip.
+        assert!(!is_cap_created_generation_leftover(
+            &k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+                annotations: Some(std::collections::BTreeMap::from([
+                    (
+                        generation_annotations::RESOURCE_CREATED_BY_ANNOTATION.to_string(),
+                        "7".to_string()
+                    ),
+                    (
+                        generation_annotations::MUTATION_GENERATION_ANNOTATION.to_string(),
+                        "junk".to_string()
+                    ),
+                ])),
+                ..Default::default()
+            },
+            7
         ));
     }
 

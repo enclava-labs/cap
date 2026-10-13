@@ -178,23 +178,30 @@ pub async fn apply_namespace(
     )))
 }
 
-/// Confirm the created object actually carries this generation's creation
-/// stamp (the API server could have dropped the annotation).
+/// Confirm the created object actually carries BOTH ownership annotations:
+/// the creation stamp AND this generation's mutation-generation annotation
+/// (the API server or a mutating admission policy could have dropped or
+/// rewritten either). A created namespace missing its mutation annotation
+/// would later be classified foreign/adopted by failed-apply cleanup and
+/// left uncompensated, so creation must fail closed instead.
 fn verify_creation_stamp(
     created: &Namespace,
     generation: MutationGeneration,
 ) -> Result<(), ApplyError> {
-    let stamped = created
-        .metadata
-        .annotations
-        .as_ref()
-        .and_then(|annotations| annotations.get(NAMESPACE_CREATED_BY_ANNOTATION))
-        .and_then(|raw| raw.parse::<i64>().ok());
-    if stamped == Some(generation.get()) {
+    let annotations = created.metadata.annotations.as_ref();
+    let parse = |key: &str| {
+        annotations
+            .and_then(|annotations| annotations.get(key))
+            .and_then(|raw| raw.parse::<i64>().ok())
+    };
+    if parse(NAMESPACE_CREATED_BY_ANNOTATION) == Some(generation.get())
+        && parse(MUTATION_GENERATION_ANNOTATION) == Some(generation.get())
+    {
         Ok(())
     } else {
         Err(ApplyError::NamespaceNotReady(
-            "created namespace lost its creation-evidence annotation".to_string(),
+            "created namespace lost its creation-evidence or mutation-generation annotation"
+                .to_string(),
         ))
     }
 }
@@ -267,6 +274,10 @@ mod tests {
         /// must re-probe and create via the stamped POST, never let SSA
         /// create an unstamped replacement.
         vanish_before_patch: bool,
+        /// Strip the mutation-generation annotation from the create
+        /// response (a mutating admission policy rewrote it): the apply
+        /// must fail closed instead of accepting the namespace.
+        strip_mutation_from_create_response: bool,
     }
 
     #[derive(Default)]
@@ -347,7 +358,15 @@ mod tests {
                     return response.map_err(|_| io::Error::other("build response"));
                 }
                 if method == axum::http::Method::POST && path == "/api/v1/namespaces" {
-                    let value: Value = serde_json::from_slice(&body).map_err(io::Error::other)?;
+                    let mut value: Value =
+                        serde_json::from_slice(&body).map_err(io::Error::other)?;
+                    if config.strip_mutation_from_create_response
+                        && let Some(annotations) = value
+                            .pointer_mut("/metadata/annotations")
+                            .and_then(Value::as_object_mut)
+                    {
+                        annotations.remove(MUTATION_GENERATION_ANNOTATION);
+                    }
                     recorded.lock().expect("poisoned").create = Some(value.clone());
                     if config.reject_create {
                         *winner_appeared.lock().expect("poisoned") = true;
@@ -393,15 +412,14 @@ mod tests {
         if metadata.get("name").is_none() {
             metadata["name"] = json!("tenants");
         }
-        let mut annotations = metadata
+        // The annotation is echoed verbatim from the request body (both the
+        // stamped POST and apply_resource_opt's annotated writes carry it);
+        // the fake must NOT inject it, or a response that legitimately lost
+        // it (admission rewrite) could not be modeled.
+        let annotations = metadata
             .get_mut("annotations")
             .map(std::mem::take)
             .unwrap_or_else(|| json!({}));
-        if let Some(object) = annotations.as_object_mut() {
-            object
-                .entry(MUTATION_GENERATION_ANNOTATION.to_string())
-                .or_insert_with(|| json!("7"));
-        }
         metadata["annotations"] = annotations;
         metadata["resourceVersion"] = json!("2");
         metadata["uid"] = json!("00000000-0000-0000-0000-000000000001");
@@ -466,6 +484,32 @@ mod tests {
         assert!(
             locked.patch.is_none(),
             "no SSA patch is needed when the POST succeeds"
+        );
+    }
+
+    #[tokio::test]
+    async fn created_namespace_missing_mutation_annotation_fails_closed() {
+        let recorded = Arc::new(Mutex::new(Recorded::default()));
+        // A mutating admission policy strips only the mutation-generation
+        // annotation from the created object: without verification the
+        // created namespace would later be classified foreign/adopted by
+        // failed-apply cleanup and never compensated. Creation must fail.
+        let client = fake_namespace_server(
+            FakeServer {
+                strip_mutation_from_create_response: true,
+                ..Default::default()
+            },
+            Arc::clone(&recorded),
+        )
+        .await;
+        let engine = ApplyEngine::new(client, Default::default());
+
+        let error = apply_namespace(&engine, &test_namespace(), generation(7))
+            .await
+            .expect_err("missing mutation annotation must fail creation");
+        assert!(
+            matches!(error, ApplyError::NamespaceNotReady(_)),
+            "expected NamespaceNotReady, got {error:?}"
         );
     }
 
@@ -569,6 +613,7 @@ mod tests {
                 reject_create: true,
                 winner_annotations: Default::default(),
                 vanish_before_patch: false,
+                strip_mutation_from_create_response: false,
             },
             Arc::clone(&recorded),
         )
@@ -599,6 +644,7 @@ mod tests {
                 live: None,
                 reject_create: true,
                 vanish_before_patch: false,
+                strip_mutation_from_create_response: false,
                 winner_annotations: std::collections::BTreeMap::from([(
                     NAMESPACE_CREATED_BY_ANNOTATION.to_string(),
                     "5".to_string(),

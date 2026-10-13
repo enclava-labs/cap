@@ -26,6 +26,17 @@ pub const MUTATION_GENERATION_ANNOTATION: &str = "enclava.dev/cap-provider-mutat
 /// whole namespace require this evidence so a pre-existing namespace that
 /// CAP merely adopted (non-force SSA tolerates it) is never destroyed.
 pub const NAMESPACE_CREATED_BY_ANNOTATION: &str = "enclava.dev/cap-namespace-created-by-generation";
+
+/// Annotation stamped by `apply_resource` only on the initial-create POST
+/// path. Proves CREATION by a CAP apply, as opposed to
+/// [`MUTATION_GENERATION_ANNOTATION`], which is also stamped when an
+/// existing (possibly foreign, pre-existing) object is SSA-patched.
+/// Compensating cleanup in adopted namespaces requires this evidence before
+/// deleting a namespaced object: last-writer proof alone would authorize
+/// deleting a pre-existing object CAP merely patched. Later applies copy
+/// the live evidence forward (`preserve_creation_evidence`) so it survives
+/// re-applies verbatim and is never fabricated for adopted objects.
+pub const RESOURCE_CREATED_BY_ANNOTATION: &str = "enclava.dev/cap-resource-created-by-generation";
 // ponytail: bounded but patient — total worst-case conflict wait ≈ 60 s, well
 // inside the 180 s mutation lease and job deadlines. Controllers routinely
 // rewrite status for minutes; the old 12×≤200 ms (~1.9 s) budget terminally
@@ -119,6 +130,46 @@ where
             MUTATION_GENERATION_ANNOTATION.to_string(),
             generation.get().to_string(),
         );
+}
+
+/// Stamp creation evidence on a resource this apply is creating via POST.
+fn annotate_created<K>(resource: &mut K, generation: MutationGeneration)
+where
+    K: Resource,
+{
+    resource
+        .meta_mut()
+        .annotations
+        .get_or_insert_with(Default::default)
+        .insert(
+            RESOURCE_CREATED_BY_ANNOTATION.to_string(),
+            generation.get().to_string(),
+        );
+}
+
+/// Copy the live object's creation evidence (if any) onto the desired
+/// write. Re-applying an object CAP created must not silently drop the
+/// evidence: an apply omitting a map key it owns can prune it, which would
+/// make a CAP-created object look adopted forever after. Evidence is only
+/// ever copied from the live object — never fabricated for an object whose
+/// creation was not observed by this code path.
+fn preserve_creation_evidence<K>(desired: &mut K, current: &K)
+where
+    K: Resource,
+{
+    if let Some(evidence) = current
+        .meta()
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(RESOURCE_CREATED_BY_ANNOTATION))
+        .cloned()
+    {
+        desired
+            .meta_mut()
+            .annotations
+            .get_or_insert_with(Default::default)
+            .insert(RESOURCE_CREATED_BY_ANNOTATION.to_string(), evidence);
+    }
 }
 
 fn only_trusted_field_managers<K>(resource: &K, field_manager: &str) -> bool
@@ -324,6 +375,10 @@ where
             let mut desired = resource.clone();
             desired.meta_mut().resource_version = Some(resource_version.clone());
             annotate(&mut desired, generation);
+            // Never drop creation evidence on re-apply: a CAP-created object
+            // must stay classifiable as such, or later failed-apply cleanup
+            // would treat it as adopted and leave it behind forever.
+            preserve_creation_evidence(&mut desired, &current);
             let applied = if exact_when_trusted && trusted {
                 super::bounded_kube_write(api.replace(name, &post_params, &desired)).await
             } else {
@@ -405,6 +460,10 @@ where
             desired.meta_mut().resource_version = None;
             desired.meta_mut().uid = None;
             annotate(&mut desired, generation);
+            // This POST is the creation: stamp creation-specific evidence so
+            // failed-apply cleanup can distinguish a CAP-created object from
+            // a pre-existing one this apply merely SSA-patched.
+            annotate_created(&mut desired, generation);
             match super::bounded_kube_write(api.create(&post_params, &desired)).await {
                 Ok(applied) => {
                     verify_applied_generation(&applied, generation)?;
