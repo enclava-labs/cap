@@ -2140,14 +2140,6 @@ pub(crate) async fn delete_app_before(
         .execute(&mut *delete_lane)
         .await
         .map_err(|_| internal_server_error())?;
-    // The app row is gone: drop any TEE probe failure signature so a recreated
-    // app of the same name starts from a clean rate-limit state instead of
-    // inheriting (and suppressing) this incarnation's last failure.
-    crate::routes::status::clear_tee_probe_failure_state(
-        &state,
-        &deleting_app.name,
-        &deleting_app.namespace,
-    );
     // The signed-policy candidate selectors ran against the pre-delete
     // world. An abandoned destroy keeps the completion marker NULL, so the
     // pre-delete reconciliation deliberately retained the app's artifact
@@ -2176,6 +2168,16 @@ pub(crate) async fn delete_app_before(
         .commit()
         .await
         .map_err(|_| internal_server_error())?;
+    // The delete transaction is committed and the app row is gone: drop any
+    // TEE probe failure signature so a recreated app of the same name starts
+    // from a clean rate-limit state instead of inheriting (and suppressing)
+    // this incarnation's last failure. Cleared only after commit so a rolled
+    // back deletion keeps the surviving app's suppression intact.
+    crate::routes::status::clear_tee_probe_failure_state(
+        &state,
+        &deleting_app.name,
+        &deleting_app.namespace,
+    );
     if post_delete_reconcile.is_some()
         && let Err(_error) = crate::kbs::reconcile_pending_signed_policy_artifacts(
             &state.db,
