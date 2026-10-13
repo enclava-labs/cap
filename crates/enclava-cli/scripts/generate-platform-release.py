@@ -458,21 +458,25 @@ def generate(args: argparse.Namespace) -> str:
     )
     # Mirror of the Rust release validators (verify_envelope): the dev-fixture
     # trustee policy key's seed is public, so a non-fixture root must never
-    # sign a release pinning it — anyone with the repo could then forge policy
-    # envelopes the TEE accepts. Refuse at signing time instead of emitting an
-    # envelope every verifier rejects under a production root.
-    if (
-        hex32_bytes(
+    # sign a release pinning it in EITHER key slot — while both keys are
+    # pinned, policy signatures verify against the signing-service key
+    # (#217), so a public-seed key in either slot lets anyone with the repo
+    # forge policy envelopes the TEE accepts. Refuse at signing time instead
+    # of emitting an envelope every verifier rejects under a production root.
+    if public_key != dev_fixture_signing_root_pubkey():
+        for field in (
             "platform_trustee_policy_pubkey_hex",
-            payload["platform_trustee_policy_pubkey_hex"],
-        )
-        == bytes.fromhex(DEV_FIXTURE_TRUSTEE_POLICY_KEY_HEX)
-        and public_key != dev_fixture_signing_root_pubkey()
-    ):
-        raise SystemExit(
-            "platform_trustee_policy_pubkey_hex pins the dev-fixture trustee policy key; "
-            "a production root must not sign it (fixture releases need --dev-fixture-key)"
-        )
+            "signing_service_pubkey_hex",
+        ):
+            if (
+                hex32_bytes(field, payload[field])
+                == bytes.fromhex(DEV_FIXTURE_TRUSTEE_POLICY_KEY_HEX)
+            ):
+                raise SystemExit(
+                    f"{field} pins the dev-fixture trustee policy key; "
+                    "a production root must not sign it "
+                    "(fixture releases need --dev-fixture-key)"
+                )
     signature = private_key.sign(canonical_platform_release_bytes(payload))
     envelope = {
         "payload": payload,

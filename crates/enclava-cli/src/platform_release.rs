@@ -341,17 +341,31 @@ pub fn verify_envelope_with_root(
     }
     // cap#118: the dev-fixture trustee policy key's seed is public (c1*32,
     // committed with the generator). A non-fixture root must never sign a
-    // release that pins it: anyone with the repo could then forge policy
-    // envelopes the TEE accepts.
-    if signing != fixture_root_pubkey()
-        && hex::decode(&envelope.payload.platform_trustee_policy_pubkey_hex)?
-            == fixture_trustee_policy_pubkey()
-    {
-        return Err(PlatformReleaseError::InvalidField {
-            field: "platform_trustee_policy_pubkey_hex",
-            message: "dev-fixture trustee policy key is only allowed under the dev fixture root"
-                .to_string(),
-        });
+    // release that pins it in either key slot: while both keys are pinned,
+    // policy signatures verify against the signing-service key (#217), and
+    // once the trustee key becomes the policy authority its slot matters
+    // directly — a public-seed key in either slot would let anyone with the
+    // repo forge policy envelopes the TEE accepts.
+    if signing != fixture_root_pubkey() {
+        for (field, value) in [
+            (
+                "platform_trustee_policy_pubkey_hex",
+                &envelope.payload.platform_trustee_policy_pubkey_hex,
+            ),
+            (
+                "signing_service_pubkey_hex",
+                &envelope.payload.signing_service_pubkey_hex,
+            ),
+        ] {
+            if hex::decode(value)? == fixture_trustee_policy_pubkey() {
+                return Err(PlatformReleaseError::InvalidField {
+                    field,
+                    message:
+                        "dev-fixture trustee policy key is only allowed under the dev fixture root"
+                            .to_string(),
+                });
+            }
+        }
     }
     validate_release_payload(&envelope.payload)?;
     Ok(envelope.payload)
@@ -936,6 +950,33 @@ mod tests {
         assert!(
             matches!(err, PlatformReleaseError::InvalidField { field, .. } if field == "platform_trustee_policy_pubkey_hex"),
             "expected fixture-trustee rejection, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn fixture_trustee_policy_key_is_rejected_in_the_signing_slot() {
+        // cap#218 self-check: while both keys are pinned, policy signatures
+        // verify against the signing-service key (#217), so the public
+        // fixture seed must not be pinnable in signing_service_pubkey_hex
+        // either — anyone with the repo could then forge policy envelopes
+        // the TEE accepts.
+        use ed25519_dalek::Signer;
+        let mut envelope: PlatformReleaseEnvelope =
+            serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
+        let prod_root = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
+        envelope.payload.signing_service_pubkey_hex =
+            DEV_FIXTURE_TRUSTEE_POLICY_PUBKEY_HEX.to_string();
+        envelope.payload.platform_trustee_policy_pubkey_hex =
+            hex::encode(prod_root.verifying_key().as_bytes());
+        let canonical =
+            canonical_platform_release_bytes(&envelope.payload).expect("canonical bytes");
+        envelope.signature = hex::encode(prod_root.sign(&canonical).to_bytes());
+        envelope.signing_pubkey = hex::encode(prod_root.verifying_key().as_bytes());
+        let root_hex = hex::encode(prod_root.verifying_key().as_bytes());
+        let err = verify_envelope_with_root(envelope, &root_hex).unwrap_err();
+        assert!(
+            matches!(err, PlatformReleaseError::InvalidField { field, .. } if field == "signing_service_pubkey_hex"),
+            "expected signing-slot fixture rejection, got: {err:?}"
         );
     }
 

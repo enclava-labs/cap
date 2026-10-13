@@ -453,6 +453,31 @@ def test_generate_rejects_fixture_trustee_key_under_production_root(tmp_path, mo
         generate_platform_release.generate(args)
 
 
+def test_generate_rejects_fixture_key_in_signing_slot_under_production_root(
+    tmp_path, monkeypatch
+):
+    # cap#218 self-check: while both keys are pinned, policy signatures
+    # verify against the signing-service key (#217), so the public fixture
+    # key must be refused in EITHER slot — a production root pinning it in
+    # signing_service_pubkey_hex would let anyone with the repo forge
+    # policy envelopes the TEE accepts.
+    import argparse
+    import json
+
+    input_path = tmp_path / "platform-release.json"
+    payload = base_payload()
+    payload["signing_service_pubkey_hex"] = (
+        generate_platform_release.DEV_FIXTURE_TRUSTEE_POLICY_KEY_HEX
+    )
+    payload["platform_trustee_policy_pubkey_hex"] = "bb" * 32
+    input_path.write_text(json.dumps({"payload": payload}, indent=2) + "\n")
+    monkeypatch.setenv("ENCLAVA_PLATFORM_RELEASE_SIGNING_KEY_HEX", "ab" * 32)
+    args = argparse.Namespace(input=input_path, dev_fixture_key=False)
+
+    with pytest.raises(SystemExit, match="signing_service_pubkey_hex"):
+        generate_platform_release.generate(args)
+
+
 def test_generate_allows_fixture_trustee_key_with_dev_fixture_key(tmp_path):
     import argparse
     import json
