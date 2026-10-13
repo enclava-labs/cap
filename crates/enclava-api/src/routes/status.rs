@@ -2019,11 +2019,14 @@ mod tests {
         let (logs, _guard) = captured_warn_logs();
         let closed = closed_local_socket().await;
         let state = probe_test_state(resolved_probe_client(closed));
+        // Reuse one app ID across all three probes so the test protects the
+        // recovery-clears-signature behavior (#219 Codex review).
+        let app_id = probe_app_id();
 
         // First failure: warned.
         let _ = probe_tee(
             &state,
-            probe_app_id(),
+            app_id,
             "ns-110",
             "app-110",
             "app.example.test",
@@ -2040,7 +2043,7 @@ mod tests {
         recovered.tee_http_client = resolved_probe_client(address);
         let evidence = probe_tee(
             &recovered,
-            probe_app_id(),
+            app_id,
             "ns-110",
             "app-110",
             "app.example.test",
@@ -2051,7 +2054,7 @@ mod tests {
         // Same failure again after recovery: warned again.
         let _ = probe_tee(
             &state,
-            probe_app_id(),
+            app_id,
             "ns-110",
             "app-110",
             "app.example.test",
