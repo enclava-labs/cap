@@ -541,11 +541,110 @@ pub struct AppStatus {
     pub tee_error: Option<String>,
     #[serde(default)]
     pub observation: Option<AppStatusObservation>,
+    /// Durable lifecycle diagnosis for the active deployment (#90).
+    /// Additive; older API instances do not send it.
+    #[serde(default)]
+    pub deployment: Option<DeploymentDiagnostics>,
+}
+
+/// Owner-facing lifecycle projection of the active deployment (#90):
+/// normalized phase, condition, redacted reason code, and retry/lease
+/// timing. Rendered by `enclava status` as one actionable block.
+#[derive(Debug, Deserialize)]
+pub struct DeploymentDiagnostics {
+    pub phase: String,
+    pub condition: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub deployment_id: Option<String>,
+    #[serde(default)]
+    pub started_at: Option<String>,
+    #[serde(default)]
+    pub last_progress_at: Option<String>,
+    #[serde(default)]
+    pub attempts: Option<i64>,
+    #[serde(default)]
+    pub next_retry_at: Option<String>,
+    #[serde(default)]
+    pub blocked_until: Option<String>,
+    #[serde(default)]
+    pub blocking_operation: Option<String>,
+    #[serde(default)]
+    pub observing_since: Option<String>,
 }
 
 #[cfg(test)]
 mod app_status_contract_tests {
-    use super::AppStatus;
+    use super::{AppStatus, DeploymentDiagnostics};
+
+    #[test]
+    fn app_status_accepts_deployment_lifecycle_diagnostics() {
+        // The #90 first-slice contract: a normalized phase, a condition, a
+        // redacted reason code, and retry/lease timing. Older API instances
+        // omit the block entirely and must keep parsing.
+        let status: AppStatus = serde_json::from_value(serde_json::json!({
+            "app_name": "demo",
+            "status": "deploying",
+            "pod_phase": null,
+            "tee_status": null,
+            "unlock_status": null,
+            "domain": "demo.example.test",
+            "last_deployed": null,
+            "deployment": {
+                "phase": "queued",
+                "condition": "waiting_external",
+                "reason": "lease_expired_retry_scheduled",
+                "deployment_id": "00000000-0000-0000-0000-00000000090",
+                "started_at": "2026-10-13T08:00:00Z",
+                "last_progress_at": "2026-10-13T08:01:02Z",
+                "attempts": 4,
+                "next_retry_at": "2026-10-13T08:01:07Z",
+                "blocked_until": "2026-10-13T08:03:00Z",
+                "blocking_operation": "app_delete",
+                "observing_since": null
+            }
+        }))
+        .expect("parse deployment diagnostics block");
+
+        let deployment = status.deployment.expect("deployment diagnostics");
+        assert_eq!(deployment.phase, "queued");
+        assert_eq!(deployment.condition, "waiting_external");
+        assert_eq!(
+            deployment.reason.as_deref(),
+            Some("lease_expired_retry_scheduled")
+        );
+        assert_eq!(deployment.attempts, Some(4));
+        assert!(deployment.next_retry_at.is_some());
+        assert_eq!(deployment.blocking_operation.as_deref(), Some("app_delete"));
+    }
+
+    #[test]
+    fn app_status_still_parses_without_deployment_diagnostics() {
+        let status: AppStatus = serde_json::from_value(serde_json::json!({
+            "app_name": "demo",
+            "status": "running",
+            "pod_phase": null,
+            "tee_status": null,
+            "unlock_status": null,
+            "domain": "demo.example.test",
+            "last_deployed": null
+        }))
+        .expect("parse legacy status without deployment block");
+        assert!(status.deployment.is_none());
+    }
+
+    #[test]
+    fn deployment_diagnostics_minimal_block_parses() {
+        let deployment: DeploymentDiagnostics = serde_json::from_value(serde_json::json!({
+            "phase": "unknown",
+            "condition": "unknown"
+        }))
+        .expect("parse minimal diagnostics");
+        assert_eq!(deployment.phase, "unknown");
+        assert!(deployment.reason.is_none());
+        assert!(deployment.attempts.is_none());
+    }
 
     #[test]
     fn app_status_accepts_explicit_freshness_and_drift_contract() {

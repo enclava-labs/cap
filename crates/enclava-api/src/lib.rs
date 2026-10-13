@@ -709,6 +709,10 @@ fn status_routes() -> Router<AppState> {
             axum::routing::get(routes::status::app_status),
         )
         .route(
+            "/apps/{name}/deployment/diagnostics",
+            axum::routing::get(routes::diagnostics::get_deployment_diagnostics),
+        )
+        .route(
             "/apps/{name}/logs",
             axum::routing::get(routes::status::app_logs),
         )
@@ -1091,6 +1095,7 @@ mod runtime_gate_tests {
             ("/apps/{name}/domains/{domain}", &[("DELETE", MUTATION)]),
             // status
             ("/apps/{name}/status", &[("GET", ALLOW)]),
+            ("/apps/{name}/deployment/diagnostics", &[("GET", ALLOW)]),
             ("/apps/{name}/logs", &[("GET", ALLOW)]),
             // unlock
             ("/apps/{name}/unlock/status", &[("GET", ALLOW)]),

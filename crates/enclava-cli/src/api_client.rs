@@ -459,6 +459,20 @@ impl ApiClient {
         read_bounded_json(resp).await
     }
 
+    pub async fn get_deployment_diagnostics(
+        &self,
+        app_name: &str,
+    ) -> Result<DeploymentDiagnostics, ApiError> {
+        let resp = self
+            .http
+            .get(self.url(&format!("/apps/{app_name}/deployment/diagnostics")))
+            .headers(self.auth_headers()?)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        read_bounded_json(resp).await
+    }
+
     pub async fn get_logs(
         &self,
         app_name: &str,

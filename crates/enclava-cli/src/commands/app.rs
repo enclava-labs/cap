@@ -1838,8 +1838,71 @@ pub async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> 
             println!("Evidence: {reason}");
         }
     }
+    if let Some(deployment) = &status.deployment {
+        print_deployment_diagnostics(deployment);
+    }
 
     Ok(())
+}
+
+/// One owner-facing sentence for the common lifecycle states (#90). The
+/// strings are fixed tokens from the API contract; only timing context is
+/// appended, never provider or workload text.
+fn deployment_condition_action(condition: &str, reason: Option<&str>) -> &'static str {
+    match condition {
+        "progressing" => "wait; the deployment is making progress",
+        "waiting_external" => match reason {
+            Some("lease_expired_retry_scheduled") => {
+                "wait; the platform will retry this deployment automatically"
+            }
+            _ => "wait; a platform dependency is being retried",
+        },
+        "stalled" => match reason {
+            Some("mutation_lease_held_by_operation") => {
+                "another operation owns this app's mutation lease; wait for it to finish or retry after it completes"
+            }
+            _ => "no retry is scheduled; contact support or redeploy if this persists",
+        },
+        "terminal" => "the deployment is complete (check phase for outcome); redeploy to try again",
+        _ => "lifecycle details are unavailable from this API instance",
+    }
+}
+
+fn print_deployment_diagnostics(deployment: &DeploymentDiagnostics) {
+    use colored::Colorize;
+    let phase_colored = match deployment.condition.as_str() {
+        "terminal" if deployment.phase == "failed" => deployment.phase.red().to_string(),
+        "terminal" if deployment.phase == "healthy" => deployment.phase.green().to_string(),
+        "progressing" => deployment.phase.yellow().to_string(),
+        "stalled" => deployment.phase.red().to_string(),
+        _ => deployment.phase.yellow().to_string(),
+    };
+    println!("Deploy:   {phase_colored} ({})", deployment.condition);
+    if let Some(reason) = &deployment.reason {
+        println!("Reason:   {reason}");
+    }
+    if let Some(last_progress_at) = &deployment.last_progress_at {
+        println!("Progress: {last_progress_at}");
+    }
+    if let Some(attempts) = deployment.attempts {
+        println!("Attempts: {attempts}");
+    }
+    if let Some(next_retry_at) = &deployment.next_retry_at {
+        println!("Retry:    {next_retry_at}");
+    }
+    if let Some(blocked_until) = &deployment.blocked_until {
+        println!("Blocked:  lease held until {blocked_until}");
+    }
+    if let Some(blocking_operation) = &deployment.blocking_operation {
+        println!("Holder:   {blocking_operation}");
+    }
+    if let Some(observing_since) = &deployment.observing_since {
+        println!("Watching: observing since {observing_since}");
+    }
+    println!(
+        "Action:   {}",
+        deployment_condition_action(&deployment.condition, deployment.reason.as_deref())
+    );
 }
 
 #[derive(Debug, PartialEq, Eq)]
