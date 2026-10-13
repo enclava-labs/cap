@@ -1328,7 +1328,8 @@ async fn wait_for_deploy_runtime(
                 &endpoint.tee_url,
                 endpoint.tee_resolve_ip,
             )
-            && let Ok((_attestation, attested_tee)) = tee.attest_receipt_key().await
+            && let Some(Ok((_attestation, attested_tee))) =
+                bounded_wait_attempt(start + max_wait, tee.attest_receipt_key()).await
             && let Ok(status) = attested_tee
                 .bounded_status_json_within(terminal_diagnostic_budget(Some(start + max_wait)))
                 .await

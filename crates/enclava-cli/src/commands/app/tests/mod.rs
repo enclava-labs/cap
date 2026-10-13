@@ -863,6 +863,22 @@ fn wait_loop_requests_use_the_finite_per_attempt_budget() {
         ),
         "wait_for_template_bootstrap_endpoint must bound its endpoint fetch per attempt (cap#220 review follow-up)"
     );
+    // And the remaining wait-loop requests from the self-check warning:
+    // the direct-TEE attest in the runtime wait, plus the managed-config and
+    // SSH polls in the hosted template waits.
+    assert!(
+        app.contains("bounded_wait_attempt(start+max_waittee.attest_receipt_key())"),
+        "wait_for_deploy_runtime must bound its direct-TEE attest per attempt (cap#220 review follow-up #2)"
+    );
+    assert!(
+        template.contains("bounded_wait_attempt(deadlineapi.list_config_keys(instance_name))"),
+        "wait_for_paas_managed_config_keys must bound its status poll per attempt (cap#220 review follow-up #2)"
+    );
+    assert!(
+        template
+            .contains("bounded_wait_attempt(start+timeoutapi.get_template_ssh_command(app_name))"),
+        "wait_for_paas_ssh_command must bound its status poll per attempt (cap#220 review follow-up #2)"
+    );
 }
 
 #[test]

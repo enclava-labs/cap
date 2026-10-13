@@ -29,7 +29,7 @@ use enclava_engine::types::WorkloadSecurityProfile;
 
 use crate::commands::app::{
     BootstrapEndpointStatusDecision, DeploymentWait, SignedDeployBlobParams, StoragePasswordInput,
-    bootstrap_endpoint_status_decision, bounded_request, build_signed_deploy_blobs,
+    bootstrap_endpoint_status_decision, bounded_request, bounded_wait_attempt, build_signed_deploy_blobs,
     claim_initial_ownership, deploy_preflight_needs_claim, deployment_bound_tee_status,
     deployment_bound_terminal_bootstrap_error,
     deployment_bound_terminal_bootstrap_error_on_channel, ensure_manual_deploy_keyring,
@@ -2509,6 +2509,7 @@ async fn wait_for_paas_managed_config_keys(
         // deadline above already guarantees the budget is positive here.
         fail_if_template_deployment_failed(api, instance_name, deployment_id, read_deadline).await?;
 
+
         // TLS provisioning starts around the claim, so a terminal bootstrap
         // diagnostic must stop this post-claim wait promptly. The probe is
         // bound to the expected deployment via CAP before and after the
@@ -2540,6 +2541,7 @@ async fn wait_for_paas_managed_config_keys(
         match bounded_request(read_deadline, api.list_config_keys(instance_name)).await {
             Some(Ok(response)) => {
                 let observed = response
+
                     .keys
                     .into_iter()
                     .map(|entry| (entry.key, entry.updated_at))
@@ -2601,6 +2603,7 @@ async fn wait_for_paas_managed_config_keys(
                 )
                 .into());
             }
+
         }
         progress.tick();
         template_config_sleep_until_retry(read_deadline).await;
@@ -3454,19 +3457,33 @@ async fn wait_for_paas_ssh_command(
                 .into());
             }
         }
-        let response = match api.get_template_ssh_command(app_name).await {
-            Ok(response) => response,
-            Err(error) if should_retry_paas_ssh_command_error(&error) => {
-                progress.set_message(timed_progress(
-                    "Stable SSH endpoint: status check retrying",
-                    start.elapsed(),
-                    timeout,
-                ));
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                continue;
-            }
-            Err(error) => return Err(paas_ssh_command_api_error(error)),
-        };
+        let response =
+            match bounded_wait_attempt(start + timeout, api.get_template_ssh_command(app_name))
+                .await
+            {
+                Some(Ok(response)) => response,
+                Some(Err(error)) if should_retry_paas_ssh_command_error(&error) => {
+                    progress.set_message(timed_progress(
+                        "Stable SSH endpoint: status check retrying",
+                        start.elapsed(),
+                        timeout,
+                    ));
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+                // The attempt outlived its per-attempt budget (cap#220 review):
+                // retry instead of letting a stalled endpoint consume the wait.
+                None => {
+                    progress.set_message(timed_progress(
+                        "Stable SSH endpoint: status check retrying",
+                        start.elapsed(),
+                        timeout,
+                    ));
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+                Some(Err(error)) => return Err(paas_ssh_command_api_error(error)),
+            };
         validate_ssh_command_response(&response, stable_endpoint, expected_app_url)?;
         if response.status == "ready" {
             return Ok(response);
