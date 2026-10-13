@@ -110,6 +110,19 @@ pub struct WorkloadArtifactBinding {
     /// modern layout (`false`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub omit_log_encryption_claim: bool,
+    /// Render-compatibility pin for artifacts signed before the cap#118
+    /// policy-key split. Pre-split renders filled the platform trustee
+    /// policy slot with the signing-service key (the collapsed default), so
+    /// a descriptor signed back then carries an `expected_cc_init_data_hash`
+    /// over that collapsed layout. When artifact validation detects that
+    /// only the collapsed render matches, it sets this flag so every
+    /// downstream consumer (statefulset, enclava-init ConfigMap, KBS
+    /// policy/TLS binding) renders the exact bytes the artifact was signed
+    /// over — the artifact boots exactly as it did pre-split until it is
+    /// re-signed. Freshly signed artifacts always render the split layout
+    /// (`false`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub legacy_collapsed_trustee_key: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -452,5 +465,34 @@ impl ConfidentialApp {
     /// KBS TLS resource type for generic `resource_bindings`.
     pub fn tls_resource_type(&self) -> String {
         format!("{}-tls", self.owner_instance_id())
+    }
+
+    /// Platform trustee policy key as it must appear in rendered manifests
+    /// (cc_init_data TOML and the enclava-init ConfigMap, which enclava-init
+    /// cross-checks against each other).
+    ///
+    /// Artifacts pinned to [`WorkloadArtifactBinding::legacy_collapsed_trustee_key`]
+    /// were signed over a pre-cap#118 render whose trustee slot held the
+    /// signing-service key, so their renders reproduce that collapsed value
+    /// — the exact bytes the artifact was signed over. Unpinned (fresh)
+    /// renders use the dedicated trustee policy key.
+    pub fn rendered_platform_trustee_policy_pubkey_hex(&self) -> Option<&str> {
+        if self
+            .workload_artifact_binding
+            .as_ref()
+            .is_some_and(|binding| binding.legacy_collapsed_trustee_key)
+        {
+            return self
+                .attestation
+                .signing_service_pubkey_hex
+                .as_deref()
+                .or(self
+                    .attestation
+                    .platform_trustee_policy_pubkey_hex
+                    .as_deref());
+        }
+        self.attestation
+            .platform_trustee_policy_pubkey_hex
+            .as_deref()
     }
 }

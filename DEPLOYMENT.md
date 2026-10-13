@@ -191,6 +191,22 @@ accept a rollback.
 When the signed release supplies a value, an explicit environment override must
 match it exactly or startup fails.
 
+### Upgrading across the policy-key split (cap#118)
+
+Signed deployment artifacts pin the exact hash of their rendered
+`cc_init_data`, which includes the policy-key claims. Artifacts signed
+before the platform trustee policy key was split from the signing-service
+key were rendered with the collapsed layout (trustee slot = signing-service
+key). Such artifacts — rollback targets, unlock transitions, queued-job
+replays — still validate after the upgrade: when only the collapsed render
+matches the signed hash, the API pins the artifact to that layout and every
+consumer (statefulset, enclava-init ConfigMap, KBS policy/TLS bindings)
+renders the exact signed bytes, so the workload boots exactly as it did
+before the upgrade. No re-signing is required before rollout; re-deploying
+(re-signing) an app moves it to the split layout. The same render-pin
+mechanism covers artifacts signed before the `log_encryption_json` claim
+existed (`omit_log_encryption_claim`).
+
 ### Rotating the production root
 
 The committed `platform-release.json` is signed by a well-known dev fixture
