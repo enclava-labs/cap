@@ -466,6 +466,31 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
 
     match teardown {
         NamespaceTeardown::ConfirmedAbsent | NamespaceTeardown::Adopted => {
+            // The provider state this generation published is now gone (or
+            // was never this generation's). Clear the row's provider-state
+            // evidence so a LATER failed apply of the same app is not
+            // forever blocked from its own compensating cleanup by this
+            // historical row's stale `manifest_hash`/`observing_since`.
+            if let Err(error) = sqlx::query(
+                "UPDATE deployments
+                 SET manifest_hash = NULL, observing_since = NULL
+                 WHERE id = $1 AND app_id = $2 AND status = 'failed'",
+            )
+            .bind(failed_deployment_id)
+            .bind(app.id)
+            .execute(&state.db)
+            .await
+            {
+                // Best-effort bookkeeping: failing to clear only keeps the
+                // previous (more conservative) behavior for future
+                // failures of this app.
+                tracing::warn!(
+                    app_id = %app.id,
+                    deployment_id = %failed_deployment_id,
+                    error = %error,
+                    "failed-apply cleanup could not clear compensated row's provider-state evidence"
+                );
+            }
             CleanupFenceOutcome::ReleaseNormally
         }
         NamespaceTeardown::DeleteIncomplete => {
@@ -752,30 +777,43 @@ async fn delete_failed_generation_namespace(
         return NamespaceTeardown::ConfirmedAbsent;
     }
     // The delete was accepted. Bound the convergence wait; if it
-    // elapses without a 404 the caller must retain the fence.
+    // elapses without a 404 the caller must retain the fence. Each
+    // GET is itself bounded by the remaining deadline: a stalled
+    // API server must not hold this apply's shared fences past the
+    // advertised convergence budget via the client's ~295s read
+    // timeout.
     let deadline = tokio::time::Instant::now() + NAMESPACE_CONVERGENCE_TIMEOUT;
     loop {
-        match api.get(&app.namespace).await {
-            Err(kube::Error::Api(error)) if error.code == 404 => {
+        match tokio::time::timeout_at(deadline, api.get(&app.namespace)).await {
+            Ok(Err(kube::Error::Api(error))) if error.code == 404 => {
                 return NamespaceTeardown::ConfirmedAbsent;
             }
-            Ok(_) if tokio::time::Instant::now() < deadline => {
+            Ok(Ok(_)) => {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    tracing::warn!(
+                        app_id = %app.id,
+                        namespace = %app.namespace,
+                        "failed-apply namespace deletion did not converge within the bounded wait; retaining the namespace fence for reconciliation"
+                    );
+                    return NamespaceTeardown::DeleteIncomplete;
+                }
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
-            Ok(_) => {
-                tracing::warn!(
-                    app_id = %app.id,
-                    namespace = %app.namespace,
-                    "failed-apply namespace deletion did not converge within the bounded wait; retaining the namespace fence for reconciliation"
-                );
-                return NamespaceTeardown::DeleteIncomplete;
-            }
-            Err(error) => {
+            Ok(Err(error)) => {
                 tracing::warn!(
                     app_id = %app.id,
                     namespace = %app.namespace,
                     error = %error,
                     "failed-apply namespace deletion wait failed; retaining the namespace fence for reconciliation"
+                );
+                return NamespaceTeardown::DeleteIncomplete;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    app_id = %app.id,
+                    namespace = %app.namespace,
+                    "failed-apply namespace convergence wait hit its deadline mid-GET; retaining the namespace fence for reconciliation"
                 );
                 return NamespaceTeardown::DeleteIncomplete;
             }
@@ -914,6 +952,48 @@ mod tests {
             .execute(pool)
             .await
             .expect("delete cleanup fixture");
+    }
+
+    #[tokio::test]
+    async fn compensated_failed_row_no_longer_blocks_later_cleanup() {
+        let pool = cleanup_test_pool().await;
+        let app_id = insert_cleanup_app_fixture(&pool).await;
+
+        // A historical failed apply whose compensation completed: its
+        // provider-state evidence is cleared, so a LATER failed apply of
+        // the same app must not be blocked from its own cleanup.
+        let compensated = Uuid::new_v4();
+        insert_cleanup_deployment(&pool, app_id, compensated, "failed", Some("old-gen"), false)
+            .await;
+        sqlx::query(
+            "UPDATE deployments
+             SET manifest_hash = NULL, observing_since = NULL
+             WHERE id = $1 AND app_id = $2 AND status = 'failed'",
+        )
+        .bind(compensated)
+        .bind(app_id)
+        .execute(&pool)
+        .await
+        .expect("clear compensated row evidence");
+
+        let later_failed = Uuid::new_v4();
+        insert_cleanup_deployment(
+            &pool,
+            app_id,
+            later_failed,
+            "failed",
+            Some("new-gen"),
+            false,
+        )
+        .await;
+        assert!(
+            no_other_generation_owns_provider_state(&pool, app_id, later_failed)
+                .await
+                .expect("check compensated predecessor"),
+            "a compensated failed row (evidence cleared) must not block a later failed apply's cleanup"
+        );
+
+        delete_cleanup_fixture(&pool, app_id).await;
     }
 
     #[tokio::test]
