@@ -12377,10 +12377,16 @@ mod tests {
         )
         .await
         .expect_err("a live deferred lease must keep deferring same-key retries");
-        assert_eq!(
-            (busy.0, busy.1.0),
-            (StatusCode::CONFLICT, idempotency_in_progress_error().1.0)
-        );
+        assert_eq!(busy.0, StatusCode::CONFLICT);
+        assert_eq!(busy.1.0["error"], "idempotency_request_in_progress");
+        assert_eq!(busy.1.0["idempotency_disposition"], "deferred");
+        // The live deferral lease stamps an exact retry_after hint; assert it
+        // is present and sane rather than comparing the whole body against the
+        // bare (hint-less) contract helper.
+        let retry_after = busy.1.0["retry_after"]
+            .as_i64()
+            .unwrap_or_else(|| panic!("live deferral must carry a retry_after hint: {}", busy.1.0));
+        assert!((1..=IDEMPOTENCY_RETRY_DEFER_SECONDS).contains(&retry_after));
         let mut hijack = request.clone();
         hijack["version"] = serde_json::json!(2);
         let rejected = put_paas_keyring(
