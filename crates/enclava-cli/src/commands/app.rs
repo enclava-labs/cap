@@ -1062,9 +1062,11 @@ pub(crate) async fn wait_for_bootstrap_endpoint(
         }
         // Poll the terminal-failure check before any endpoint fetch: a
         // rejected deployment must fail fast rather than block on a
-        // request whose response would never satisfy it (#18). Every request
-        // in this loop is cut at the finite per-attempt budget, so a stalled
-        // response can never consume the wait (cap#220 review).
+        // request whose response would never satisfy it (#18). Every
+        // synchronous request in this loop is cut at the finite per-attempt
+        // budget, so a stalled response can never consume the wait
+        // (cap#220 review); the history lookups themselves run detached on
+        // the probe and never block the poll.
         fail_if_template_deployment_failed(
             api,
             app_name,
@@ -1278,9 +1280,11 @@ async fn wait_for_deploy_runtime(
             .into());
         }
         // Fail fast on a terminalized deployment before any readiness poll
-        // (#18). Every request in this loop is cut at the finite per-attempt
-        // budget, so a stalled response can never consume the wait and make
-        // a healthy deployment report a boot timeout (cap#220 review).
+        // (#18). Every synchronous request in this loop is cut at the finite
+        // per-attempt budget, so a stalled response can never consume the
+        // wait and make a healthy deployment report a boot timeout
+        // (cap#220 review); the history lookups themselves run detached on
+        // the probe and never block the poll.
         fail_if_template_deployment_failed(
             api,
             app_name,
@@ -1706,38 +1710,36 @@ impl DeploymentHistoryProbe {
         }
     }
 
-    /// Every observation that has already landed, without blocking. A
-    /// successful wait exit drains the probe first (cap#220 review
-    /// follow-up): a failure answer that landed before the exit must be
-    /// consumed and reported, never dropped unobserved behind an earlier
-    /// non-failed answer.
-    async fn drain_landed(&mut self) -> Vec<Result<Vec<DeploymentEntry>, ApiError>> {
-        let mut landed = Vec::new();
-        while let Some(result) = self.take_landed().await {
-            landed.push(result);
-        }
-        landed
-    }
-
-    /// One landed observation, waiting up to `budget` for an answer to land
-    /// first (cap#220 review follow-up): a successful exit must consume the
-    /// deployment-state observation whose response arrives just after
-    /// readiness, instead of returning before it lands. `None` means nothing
-    /// landed within the budget -- the caller reconciles its pending request
-    /// with its own outcome instead of blocking, so a stalled history
-    /// endpoint can never turn readiness into a false timeout.
-    async fn take_landed_within(
+    /// Consume observations for a successful wait exit (cap#220 review
+    /// follow-up): every answer that lands within `budget`, waiting while
+    /// requests are still in flight. Two properties the exit gate needs:
+    ///
+    /// - a landed answer is never dropped unobserved -- a failure answer
+    ///   that landed before the exit is returned and reported;
+    /// - a newer pending request keeps the exit waiting, so a stale
+    ///   non-failure answer can never authorize success while the request
+    ///   that would show the current state is still in flight.
+    ///
+    /// `budget` expires with requests still pending (a stalled history
+    /// endpoint): whatever landed is returned and the caller reconciles the
+    /// remainder with its own outcome instead of blocking forever, so a
+    /// stall can never turn readiness into a false timeout.
+    async fn take_settled_within(
         &mut self,
         budget: Duration,
-    ) -> Option<Result<Vec<DeploymentEntry>, ApiError>> {
+    ) -> Vec<Result<Vec<DeploymentEntry>, ApiError>> {
         let deadline = Instant::now() + budget;
+        let mut landed = Vec::new();
         loop {
-            if let Some(result) = self.take_landed().await {
-                return Some(result);
+            while let Some(result) = self.take_landed().await {
+                landed.push(result);
+            }
+            if self.in_flight.is_empty() {
+                return landed;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return None;
+                return landed;
             }
             tokio::time::sleep(remaining.min(LANDED_PICKUP_POLL_INTERVAL)).await;
         }
@@ -1844,31 +1846,23 @@ pub(crate) fn should_retry_template_deployment_status_error(error: &ApiError) ->
     }
 }
 
-/// Hard cap on the successful-exit reconciliation with deployment history
-/// (cap#220 review follow-up). A ready endpoint must not mask a terminal
-/// deployment failure whose history answer lands just after readiness, so a
-/// successful exit gives one pending observation a bounded window to land --
-/// the same window the original synchronous failure lookup allowed before
-/// the detached probe. The window never exceeds the wait's remaining time,
-/// so a stalled history endpoint delays success at most this long instead of
-/// consuming the wait or turning readiness into a false timeout.
-const SUCCESS_RECONCILE_BUDGET: Duration = Duration::from_secs(15);
-
-fn success_reconcile_budget(wait_deadline: Instant) -> Duration {
-    SUCCESS_RECONCILE_BUDGET.min(wait_deadline.saturating_duration_since(Instant::now()))
-}
-
 /// Gate a wait's successful exit on deployment history (cap#220 review
 /// follow-up). Readiness alone must not end a wait: a failed deployment can
 /// otherwise proceed to ownership handling before its history answer lands
-/// and the terminal error is never reported. The gate consumes every
-/// observation that has already landed -- a landed failure is reported,
-/// never dropped -- and, when nothing has landed yet, gives one pending
-/// request a bounded window to arrive (the review's case: the failure
-/// response arrives seconds after the ready endpoint did). When nothing
-/// lands within the budget the pending request is reconciled with the
-/// success instead of blocking: the exit is bounded, never the whole wait,
-/// and a stalled history endpoint can never fail a ready deployment.
+/// and the terminal error is never reported. The gate settles the probe's
+/// requests before returning:
+///
+/// - every landed answer is consumed and reported -- a landed failure is
+///   never dropped unobserved;
+/// - a newer pending request keeps the exit waiting, so a stale non-failure
+///   answer can never authorize success while the request that would show
+///   the current state is still in flight;
+/// - the wait is bounded by one per-attempt budget
+///   ([`wait_attempt_budget`], 60 seconds, min'd with the wait's remaining
+///   time) for every request to settle. On expiry the pending request is
+///   reconciled with the success instead of blocking: a stalled history
+///   endpoint delays success at most one attempt budget and can never fail
+///   a ready deployment or consume the wait.
 pub(crate) async fn reconcile_success_with_deployment_history(
     api: &ApiClient,
     app_name: &str,
@@ -1880,15 +1874,10 @@ pub(crate) async fn reconcile_success_with_deployment_history(
         return Ok(());
     }
     history.ensure_request(api, app_name, wait_deadline);
-    let mut observations = history.drain_landed().await;
-    if observations.is_empty()
-        && let Some(result) = history
-            .take_landed_within(success_reconcile_budget(wait_deadline))
-            .await
+    for result in history
+        .take_settled_within(wait_attempt_budget(wait_deadline))
+        .await
     {
-        observations.push(result);
-    }
-    for result in observations {
         match deployment_history_failure(result, deployment_id) {
             Ok(Some(message)) => return Err(message.into()),
             Ok(None) => {}

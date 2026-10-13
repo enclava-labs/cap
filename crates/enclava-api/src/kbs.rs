@@ -2985,6 +2985,24 @@ resource_bindings := {
     }
 
     #[test]
+    fn signed_policy_budget_exceeded_maps_to_its_own_public_code() {
+        // cap#220: the bounded code that migration 0058, the public-code
+        // allowlist, and the error emitter all pin must stay mapped through
+        // the type -- the tests writing the string literal themselves would
+        // not notice this arm collapsing back to `kbs_policy_error`.
+        let err = KbsPolicyError::SignedPolicyBudgetExceeded {
+            required_artifacts: 2,
+            policy_bytes: 2048,
+            max_policy_bytes: 1024,
+        };
+        assert_eq!(err.public_code(), "signed_policy_budget_exceeded");
+        assert_eq!(
+            KbsPolicyError::NotConfigured.public_code(),
+            "kbs_policy_error"
+        );
+    }
+
+    #[test]
     fn empty_v2_policy_set_is_a_signed_fail_closed_body() {
         let body = signed_policy_artifact_policy_body(&[]).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();

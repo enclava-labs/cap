@@ -799,20 +799,31 @@ fn wait_attempt_budget_is_finite_and_bounded_by_the_wait() {
 }
 
 #[test]
-fn success_reconcile_budget_is_finite_and_bounded_by_the_wait() {
-    // cap#220 review follow-up: the successful-exit reconciliation with
-    // deployment history is bounded -- shorter than any wait (a stalled
-    // history endpoint delays success at most this long, never the whole
-    // wait) and never past the wait's deadline (a passed deadline reconciles
-    // without issuing anything).
-    let far = std::time::Instant::now() + std::time::Duration::from_secs(600);
-    assert_eq!(success_reconcile_budget(far), SUCCESS_RECONCILE_BUDGET);
-    assert_eq!(SUCCESS_RECONCILE_BUDGET, std::time::Duration::from_secs(15));
-    let nearly_exhausted = std::time::Instant::now() + std::time::Duration::from_millis(300);
-    let budget = success_reconcile_budget(nearly_exhausted);
-    assert!(budget > std::time::Duration::ZERO);
-    assert!(budget <= std::time::Duration::from_millis(300));
-    assert!(success_reconcile_budget(std::time::Instant::now()).is_zero());
+fn success_exit_settles_requests_with_the_per_attempt_budget() {
+    // cap#220 review follow-up: the exit gate's wait for pending history
+    // requests is bounded by the same finite per-attempt budget as the
+    // readiness polls (60s, min'd with the wait's remaining time by
+    // wait_attempt_budget), never a separate advisory cap: earlier reviews
+    // rejected a short cap because a slow-but-valid failure answer at 16s+
+    // is an observation, not a stall. On expiry the request is reconciled
+    // with the success instead of failing a ready deployment.
+    let source = include_str!("../../app.rs");
+    let gate_start = source
+        .find("pub(crate) async fn reconcile_success_with_deployment_history")
+        .expect("the gate must exist");
+    let gate_end = source[gate_start..]
+        .find("\nasync fn find_deployment_entry")
+        .expect("find_deployment_entry must follow the gate")
+        + gate_start;
+    let gate = &source[gate_start..gate_end];
+    assert!(
+        gate.contains("take_settled_within(wait_attempt_budget(wait_deadline))"),
+        "the gate must settle its requests within the per-attempt budget (cap#220 review follow-up)"
+    );
+    assert!(
+        !gate.contains("SUCCESS_RECONCILE_BUDGET") && !gate.contains("success_reconcile_budget"),
+        "the gate must not carry a separate advisory budget cap (rejected in earlier reviews)"
+    );
 }
 
 #[test]
@@ -3364,6 +3375,54 @@ mod terminal_diagnostics {
         assert!(
             started.elapsed() < std::time::Duration::from_millis(300),
             "a landed observation must be drained without blocking the exit"
+        );
+    }
+
+    #[tokio::test]
+    async fn success_exit_waits_for_the_fresh_request_when_a_stale_answer_already_landed() {
+        // cap#220 review self-check: a stale non-failure answer must not
+        // authorize success while a newer request is still in flight -- that
+        // request supersedes the stale answer and its failure must be
+        // observed before the exit. (The scenario: a slow iteration ages the
+        // newest lookup past the refresh window; the gate issues a fresh
+        // request whose response would show the failure.)
+        let address = spawn_history_stub(std::time::Duration::from_millis(100), |nth| match nth {
+            1 => serde_json::json!([deployment_entry_json("deploy-1", "applying")]),
+            _ => serde_json::json!([{
+                "id": "deploy-1",
+                "status": "failed",
+                "error_message": "signed_policy_budget_exceeded",
+                "image_digest": null,
+                "created_at": "2026-10-13T00:00:00Z",
+                "completed_at": "2026-10-13T00:01:00Z",
+            }]),
+        })
+        .await;
+        let api = ApiClient::new(&format!("http://{address}"), Some("test".to_string()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+
+        // The stale answer lands first ("applying" before the failure).
+        let mut history =
+            DeploymentHistoryProbe::with_refresh_age(std::time::Duration::from_millis(50));
+        history.ensure_request(&api, "demo", deadline);
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+        // The gate's refresh issues the fresh request showing the failure
+        // and must wait for it instead of letting the stale answer decide.
+        let error = reconcile_success_with_deployment_history(
+            &api,
+            "demo",
+            "deploy-1",
+            deadline,
+            &mut history,
+        )
+        .await
+        .expect_err("a stale non-failure must not mask a fresh request showing the failure");
+        assert!(
+            error
+                .to_string()
+                .contains("deployment deploy-1 failed: signed_policy_budget_exceeded"),
+            "unexpected error: {error}"
         );
     }
 
