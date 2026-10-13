@@ -19,14 +19,14 @@
 -- Repair pass first (review finding on this PR): the CHECK below evaluates
 -- every EXISTING row, and a row whose payload PostgreSQL cannot even parse
 -- as jsonb aborts the whole migration.  Such rows are producible by the
--- pre-0058 writers: put_keyring / rotate_org_owner deserialize into
+-- pre-0061 writers: put_keyring / rotate_org_owner deserialize into
 -- SignedOrgKeyring (which ignores unknown fields) but persist the
 -- client-supplied payload verbatim, so an extra field carrying a `\u0000`
 -- escape -- accepted by serde_json, unrepresentable in jsonb -- could be
 -- stored by any binary running before the handler guard added in this PR.
 --
 -- Take ACCESS EXCLUSIVE on org_keyrings BEFORE inspecting/deleting (review
--- finding): this migration runs in the rollout step while a pre-0058 replica
+-- finding): this migration runs in the rollout step while a pre-0061 replica
 -- may still be live, and its unguarded writer can INSERT a NUL payload that
 -- races this transaction -- a row committed between the DELETE below and
 -- ADD CONSTRAINT's scan would abort the migration and stall the rollout.
@@ -113,10 +113,10 @@ BEGIN
          GROUP BY org_id
     LOOP
         IF affected.quarantined THEN
-            RAISE NOTICE 'migration 0058: malformed CURRENT keyring for org % (versions % present); dropping ALL of this org''s keyring rows -- no older generation may be promoted; the org must upload a fresh owner-signed keyring (originals archived in org_keyring_repairs)',
+            RAISE NOTICE 'migration 0061: malformed CURRENT keyring for org % (versions % present); dropping ALL of this org''s keyring rows -- no older generation may be promoted; the org must upload a fresh owner-signed keyring (originals archived in org_keyring_repairs)',
                 affected.org_id, affected.versions;
         ELSE
-            RAISE NOTICE 'migration 0058: dropping malformed historical keyring rows for org % (versions %); the clean current version is untouched (dropped originals archived in org_keyring_repairs)',
+            RAISE NOTICE 'migration 0061: dropping malformed historical keyring rows for org % (versions %); the clean current version is untouched (dropped originals archived in org_keyring_repairs)',
                 affected.org_id, affected.versions;
         END IF;
     END LOOP;
