@@ -241,9 +241,109 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
                 "adopted-namespace sweep deletion failed; will retry via reconciliation"
             );
             failures += 1;
+            continue;
+        }
+        // A deleted StatefulSet leaves its PVCs behind (the manifest's
+        // retention policy is Retain): sweep this generation's claims too,
+        // or a later resized workload would silently reuse the old-size
+        // volumes while the cleared manifest_hash had disabled the
+        // storage-size guard.
+        if target.kind == "StatefulSet" {
+            failures +=
+                sweep_statefulset_pvcs(&client, &app.namespace, &target.name, generation).await;
         }
     }
     failures
+}
+
+/// Delete the PVCs this failed generation's StatefulSet created in an
+/// adopted namespace. Only claims whose name matches the exact
+/// `<vct>-<statefulset>-<ordinal>` shape for a CAP-rendered VCT name AND
+/// whose live mutation-generation annotation exactly equals the failed
+/// generation are deleted (with UID/resourceVersion preconditions): a
+/// pre-existing claim — including one from a foreign StatefulSet with the
+/// same name or from an earlier generation — is never touched.
+pub(crate) async fn sweep_statefulset_pvcs(
+    client: &kube::Client,
+    namespace: &str,
+    statefulset: &str,
+    generation: enclava_engine::apply::generation::MutationGeneration,
+) -> usize {
+    const CAP_VCT_NAMES: [&str; 2] = ["state", "tls-state"];
+    let api: kube::Api<k8s_openapi::api::core::v1::PersistentVolumeClaim> =
+        kube::Api::namespaced(client.clone(), namespace);
+    let list = match api.list(&kube::api::ListParams::default()).await {
+        Ok(list) => list,
+        Err(error) => {
+            tracing::warn!(
+                namespace = %namespace,
+                statefulset = %statefulset,
+                error = %error,
+                "adopted-namespace sweep cannot list PVCs; will retry via reconciliation"
+            );
+            return 1;
+        }
+    };
+    let mut failures = 0usize;
+    for pvc in list.items {
+        let Some(name) = pvc.metadata.name.clone() else {
+            continue;
+        };
+        if !is_cap_claim_name(&name, statefulset, &CAP_VCT_NAMES) {
+            continue;
+        }
+        let live_generation = pvc
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|annotations| {
+                annotations.get(enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION)
+            })
+            .and_then(|raw| raw.parse::<i64>().ok());
+        if live_generation != Some(generation.get()) {
+            continue;
+        }
+        let preconditions = kube::api::Preconditions {
+            uid: pvc.metadata.uid.clone(),
+            resource_version: pvc.metadata.resource_version.clone(),
+        };
+        if let Err(error) = api
+            .delete(
+                &name,
+                &kube::api::DeleteParams {
+                    preconditions: Some(preconditions),
+                    ..kube::api::DeleteParams::default()
+                },
+            )
+            .await
+        {
+            tracing::warn!(
+                namespace = %namespace,
+                pvc = %name,
+                error = %error,
+                "adopted-namespace sweep could not delete this generation's PVC; will retry via reconciliation"
+            );
+            failures += 1;
+        }
+    }
+    failures
+}
+
+/// `<vct>-<statefulset>-<ordinal>` with a canonical ordinal, mirroring the
+/// engine's `is_cap_owned_pvc_name`.
+fn is_cap_claim_name(name: &str, statefulset: &str, vct_names: &[&str]) -> bool {
+    let Some((stem, ordinal)) = name.rsplit_once('-') else {
+        return false;
+    };
+    if ordinal.is_empty() || !ordinal.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    if ordinal.len() > 1 && ordinal.starts_with('0') {
+        return false;
+    }
+    vct_names
+        .iter()
+        .any(|vct| stem == format!("{vct}-{statefulset}"))
 }
 
 /// ApiResource descriptors for every kind the sweep targets (core, apps,
@@ -327,6 +427,12 @@ const NAMESPACE_CONVERGENCE_TIMEOUT: std::time::Duration = std::time::Duration::
 enum NamespaceTeardown {
     /// The namespace is confirmed gone (404 observed, or absent throughout).
     ConfirmedAbsent,
+    /// An adopted namespace whose object sweep did not fully complete:
+    /// provider-state evidence stays intact so the storage guard and
+    /// ownership gates keep working; fences still release (unlike a
+    /// retained CAP-created namespace fence, the retained-fence
+    /// reconciler would never observe a 404 here).
+    AdoptedIncomplete,
     /// Nothing this generation owns: the live namespace carries another
     /// generation's (or no) mutation annotation, or it could not even be
     /// inspected. No delete was issued through this path.
@@ -506,6 +612,13 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
                     "failed-apply cleanup could not clear compensated row's provider-state evidence"
                 );
             }
+            CleanupFenceOutcome::ReleaseNormally
+        }
+        NamespaceTeardown::AdoptedIncomplete => {
+            // Evidence kept (storage guard + ownership gates), fences
+            // release: the namespace was never CAP's, so the
+            // retained-fence reconciler (which requires a namespace 404)
+            // would never release a retained fence here.
             CleanupFenceOutcome::ReleaseNormally
         }
         NamespaceTeardown::DeleteIncomplete => {
@@ -758,6 +871,7 @@ async fn delete_failed_generation_namespace(
                     error_code = "adopted_namespace_sweep_incomplete",
                     "adopted-namespace sweep left objects behind; the next apply or app deletion converges them"
                 );
+                return NamespaceTeardown::AdoptedIncomplete;
             }
             return NamespaceTeardown::Adopted;
         }
