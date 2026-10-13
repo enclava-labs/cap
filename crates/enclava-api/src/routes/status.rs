@@ -23,12 +23,13 @@ use crate::state::AppState;
 const DEPLOYMENT_ID_LABEL: &str = "enclava.dev/deployment-id";
 const KUBERNETES_STATUS_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const TEE_STATUS_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-/// Per-request timeout, strictly shorter than the outer probe deadline so a
-/// stalled connect/TLS/body exchange surfaces as a reqwest timeout error at
-/// the send/body stage (with its full error chain) instead of being cancelled
-/// by the outer deadline, which is established earlier and would otherwise
-/// always win (#219 review).
-const TEE_STATUS_REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
+/// The per-request timeout gets the remaining probe budget minus this
+/// margin. A stalled connect/TLS/body exchange then surfaces as a reqwest
+/// timeout error at the send/body stage — with its full error chain —
+/// slightly before the outer deadline (established earlier, so it would
+/// otherwise always win) cancels the probe, while valid responses keep
+/// almost the whole outer allowance (#219 review).
+const TEE_STATUS_REQUEST_TIMEOUT_MARGIN: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -395,6 +396,14 @@ fn select_runtime_failure(
     selected.and_then(|index| failures.into_iter().nth(index))
 }
 
+/// Per-request timeout derived from the probe deadline: the remaining budget
+/// minus [`TEE_STATUS_REQUEST_TIMEOUT_MARGIN`], saturating at zero.
+fn tee_request_timeout(deadline: tokio::time::Instant) -> Duration {
+    deadline
+        .saturating_duration_since(tokio::time::Instant::now())
+        .saturating_sub(TEE_STATUS_REQUEST_TIMEOUT_MARGIN)
+}
+
 async fn probe_tee(
     state: &AppState,
     namespace: &str,
@@ -402,11 +411,19 @@ async fn probe_tee(
     domain: &str,
     tee_domain: Option<&str>,
 ) -> TeeEvidence {
+    let deadline = tokio::time::Instant::now() + TEE_STATUS_PROBE_TIMEOUT;
     bounded_tee_probe(
         state,
         namespace,
         app_name,
-        probe_tee_unbounded(state, namespace, app_name, domain, tee_domain),
+        probe_tee_unbounded(
+            state,
+            namespace,
+            app_name,
+            domain,
+            tee_domain,
+            tee_request_timeout(deadline),
+        ),
         TEE_STATUS_PROBE_TIMEOUT,
     )
     .await
@@ -513,6 +530,7 @@ async fn probe_tee_unbounded(
     app_name: &str,
     domain: &str,
     tee_domain: Option<&str>,
+    request_timeout: Duration,
 ) -> TeeEvidence {
     let internal_transport = state.attestation.as_ref().is_some_and(|attestation| {
         enclava_engine::manifest::network_policy::cap_api_namespace_for_attestation(
@@ -556,7 +574,7 @@ async fn probe_tee_unbounded(
     };
     let response = match client
         .get(&tee_status_url)
-        .timeout(TEE_STATUS_REQUEST_TIMEOUT)
+        .timeout(request_timeout)
         .send()
         .await
     {
