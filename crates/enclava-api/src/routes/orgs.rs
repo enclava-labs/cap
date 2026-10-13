@@ -309,26 +309,6 @@ fn canonical_members_hash(members: &[SignedOrgKeyringMember]) -> [u8; 32] {
     ce_v1_hash(&records)
 }
 
-// Legacy rows can differ in unsigned fields while carrying identical signed
-// content (registration stored raw request bytes before #182 normalized the
-// encoding). Replay equality therefore compares the canonical signed bytes,
-// not the stored encoding.
-fn keyring_replay_conflicts(
-    stored_payload: &[u8],
-    stored_signature: &[u8],
-    stored_signing_pubkey: &[u8],
-    canonical_bytes: &[u8],
-    signature: &[u8],
-    signing_pubkey: &[u8],
-) -> bool {
-    let Ok(stored_keyring) = serde_json::from_slice::<SignedOrgKeyring>(stored_payload) else {
-        return true;
-    };
-    canonical_keyring_bytes(&stored_keyring).as_slice() != canonical_bytes
-        || stored_signature != signature
-        || stored_signing_pubkey != signing_pubkey
-}
-
 fn canonical_keyring_bytes(keyring: &SignedOrgKeyring) -> Vec<u8> {
     let members_hash = canonical_members_hash(&keyring.members);
     let version_be = keyring.version.to_be_bytes();
@@ -1006,11 +986,8 @@ async fn read_rotation_authority(
     Ok((latest, version_created_at_floor))
 }
 
-/// Derive the rotation path against the given latest version: the request
-/// either replays the latest version byte-identically (already applied) or
-/// increments it by one. Returns the base payload to validate the
-/// successor against, the pinned owner that must have signed the
-/// directive for that path, and whether a new version is inserted.
+/// A matching committed version may outlive its pruned predecessor.
+/// None permits only read-only replay after confirming the live replacement owner.
 async fn derive_rotation_path(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     org_id: Uuid,
@@ -1043,9 +1020,9 @@ async fn derive_rotation_path(
         let previous: Option<(Vec<u8>, Vec<u8>)> = match body_version.checked_sub(1) {
             Some(previous_version) => sqlx::query_as(
                 "SELECT ok.keyring_payload, usk.pubkey
-               FROM org_keyrings ok
-               JOIN user_signing_keys usk ON usk.id = ok.signing_key_id
-              WHERE ok.org_id = $1 AND ok.version = $2",
+                   FROM org_keyrings ok
+                   JOIN user_signing_keys usk ON usk.id = ok.signing_key_id
+                  WHERE ok.org_id = $1 AND ok.version = $2",
             )
             .bind(org_id)
             .bind(previous_version)
@@ -1088,6 +1065,7 @@ async fn read_live_service_owner(
         .owner_status(org_id)
         .await
         .map_err(crate::routes::deployments::signing_error_response)?;
+
     if owner_status.org_id != org_id || owner_status.state != "ready" {
         return Err(crate::routes::deployments::signing_error_response(
             crate::signing_service::SigningServiceError::AuthorityStatus(
@@ -1124,10 +1102,18 @@ async fn fence_successor_keyring_version(
         }
         return Ok(());
     };
-    let owner_status = signing_service
-        .owner_status(org_id)
-        .await
-        .map_err(crate::routes::deployments::signing_error_response)?;
+    let owner_status = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        signing_service.owner_status(org_id),
+    )
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "signing_service_unavailable"})),
+        )
+    })?
+    .map_err(crate::routes::deployments::signing_error_response)?;
     let state_consistent = matches!(
         (
             owner_status.state.as_str(),
@@ -1260,25 +1246,17 @@ async fn upstream_receipt_matches_live_service(
         && service_owner_pubkey(owner_status).as_deref() == Some(replacement_owner.as_slice()))
 }
 
-/// Validate the rotation successor against the base version's keyring and
-/// locate the registered signing key row for the replacement owner;
-/// registration is re-checked in the final phase because revocation can
-/// happen between phases. `registration_user` is `Some(caller)` for first
-/// presentations -- the replacement key must be registered to the
-/// requesting user (anti-spoofing: a caller cannot pin the org to a key
-/// they do not own) -- and `None` when the signing service already holds
-/// the replacement owner (recovery of an already-executed rotation), where
-/// the key needs only be registered to some user: upstream ownership is
-/// the stronger fact, and binding to the retry's caller is what left
-/// drifted orgs unrecoverable by a remaining owner (PR #185 review, Codex
-/// "keep caller authorization stable").
+/// Fresh rotations require the caller's active replacement-key registration.
+/// Exact receipt-bound recovery may reuse another active registration of that
+/// same key, so removing the initiator does not strand the completed RPC.
 async fn validate_rotation_successor(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     base_payload: &[u8],
     replacement_keyring: &SignedOrgKeyring,
     current_owner: &[u8; 32],
     replacement_owner: &[u8; 32],
-    registration_user: Option<Uuid>,
+    user_id: Uuid,
+    receipt_bound_recovery: bool,
 ) -> Result<Uuid, (StatusCode, Json<serde_json::Value>)> {
     let current_keyring: SignedOrgKeyring =
         serde_json::from_slice(base_payload).map_err(|_| db_error())?;
@@ -1298,26 +1276,30 @@ async fn validate_rotation_successor(
         replacement_owner,
     )
     .map_err(bad_request)?;
-    let key_id: Option<Uuid> = match registration_user {
-        Some(user_id) => sqlx::query_scalar(
+    let mut registration: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM user_signing_keys
+          WHERE user_id = $1 AND pubkey = $2 AND revoked_at IS NULL",
+    )
+    .bind(user_id)
+    .bind(replacement_owner.as_slice())
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|_| db_error())?;
+    if registration.is_none() && receipt_bound_recovery {
+        // Execution provenance comes from the receipt, not registration ownership.
+        // Select a deterministic active registration of the already-executed key.
+        registration = sqlx::query_scalar(
             "SELECT id FROM user_signing_keys
-                  WHERE user_id = $1 AND pubkey = $2 AND revoked_at IS NULL",
+              WHERE pubkey = $1 AND revoked_at IS NULL
+              ORDER BY id
+              LIMIT 1",
         )
-        .bind(user_id)
         .bind(replacement_owner.as_slice())
         .fetch_optional(&mut **tx)
         .await
-        .map_err(|_| db_error())?,
-        None => sqlx::query_scalar(
-            "SELECT id FROM user_signing_keys
-                  WHERE pubkey = $1 AND revoked_at IS NULL",
-        )
-        .bind(replacement_owner.as_slice())
-        .fetch_optional(&mut **tx)
-        .await
-        .map_err(|_| db_error())?,
-    };
-    key_id.ok_or_else(|| bad_request("replacement owner key is not registered for this user"))
+        .map_err(|_| db_error())?;
+    }
+    registration.ok_or_else(|| bad_request("replacement owner key is not registered for this user"))
 }
 
 // Release the org lane before calling: publication takes the global KBS fence.
@@ -1429,20 +1411,13 @@ pub async fn rotate_org_owner(
         .verify(&directive, &Signature::from_bytes(&rotation_signature))
         .map_err(|_| bad_request("owner rotation signature verification failed"))?;
 
-    // Cross-PR integration contract (#185 review): the durable
-    // `org_rotation_intents.keyring_sha256` digest, the keyring-version
-    // insert, and the stored replay-equality bytes must all use the same
-    // normalized JSON-value encoding registration (put_keyring after #182)
-    // uses -- the typed struct re-serialized as a JSON value, dropping
-    // unsigned extra fields -- never the raw request bytes. The encoding is
-    // fixed at first recording and is never switched afterwards; existing
-    // intent/consumption ledger rows are never rewritten.
-    // Keep normalization compatible with the persisted JSON-value encoding.
-    let normalized_payload = serde_json::to_value(&body.keyring_payload).map_err(|_| db_error())?;
+    // The intent digest, the keyring-version insert, and the stored
+    // replay-equality bytes all use the normalized JSON-value encoding
+    // registration uses (the typed struct re-serialized, dropping unsigned
+    // extra fields), never the raw request bytes; the encoding is fixed at
+    // first recording and existing ledger rows are never rewritten.
+    let normalized_payload = serde_json::to_value(&replacement_keyring).map_err(|_| db_error())?;
     let payload_bytes = serde_json::to_vec(&normalized_payload).map_err(|_| db_error())?;
-    // #128 review follow-up (P1): the registered keyring must stay inside the
-    // deploy-time org_keyring_blob envelope budget, or every later signed
-    // deployment would fail decode_optional_blobs.
     crate::signing_service::validate_org_keyring_registration_budget(
         payload_bytes.len(),
         &keyring_signature,
@@ -1491,7 +1466,7 @@ pub async fn rotate_org_owner(
         scopes::lock_and_read_active_membership_role_in_tx(&mut tx, org_id, auth.user_id).await?;
     scopes::require_owner_role(current_role)?;
     let (latest, version_created_at_floor) = read_rotation_authority(&mut tx, org_id).await?;
-    let Some((base_payload, expected_current_owner, insert_new_version)) = derive_rotation_path(
+    let rotation_path = derive_rotation_path(
         &mut tx,
         org_id,
         body.version,
@@ -1500,29 +1475,32 @@ pub async fn rotate_org_owner(
         &keyring_signature,
         &replacement_owner,
     )
-    .await?
-    else {
-        // Predecessor-less replay of an intact committed rotation: the
-        // content equality checks inside derive_rotation_path already
-        // proved this request matches the committed row byte-for-byte.
-        return Ok(Json(RotateOrgOwnerResponse {
+    .await?;
+
+    let owner_status = read_live_service_owner(signing_service, org_id).await?;
+    let service_owner = service_owner_pubkey(&owner_status);
+    let Some((base_payload, expected_current_owner, insert_new_version)) = rotation_path else {
+        if service_owner.as_deref() != Some(replacement_owner.as_slice()) {
+            return Err(crate::routes::deployments::signing_error_response(
+                crate::signing_service::SigningServiceError::AuthorityStatus(
+                    "signing service owner does not hold the replacement owner".to_string(),
+                ),
+            ));
+        }
+        tx.rollback().await.map_err(|_| db_error())?;
+        return confirm_owner_rotation_publication(
+            &state,
             org_id,
-            state: "ready",
-            keyring_version: body.version,
-            owner_fingerprint: hex::encode(Sha256::digest(replacement_owner)),
-        }));
+            body.version,
+            &replacement_owner,
+        )
+        .await;
     };
     if expected_current_owner.as_slice() != current_owner.as_slice() {
         return Err(bad_request(
             "rotation signer does not match the current pinned owner",
         ));
     }
-
-    // Live service owner, read only after the lane is held: every
-    // owner-based decision below (the expiry waiver, whether to issue the
-    // RPC at all) must use a snapshot that cannot predate the lane wait.
-    let owner_status = read_live_service_owner(signing_service, org_id).await?;
-    let service_owner = service_owner_pubkey(&owner_status);
 
     if insert_new_version {
         if body.signed_at > lane_now {
@@ -1586,10 +1564,8 @@ pub async fn rotate_org_owner(
         &replacement_keyring,
         &current_owner,
         &replacement_owner,
-        // Strict caller-key binding for first presentations; relaxed once
-        // the signing service already holds the replacement owner
-        // (recovery of an already-executed rotation -- see the fn doc).
-        (service_owner.as_deref() != Some(replacement_owner.as_slice())).then_some(auth.user_id),
+        auth.user_id,
+        receipt_bound_recovery,
     )
     .await?;
 
@@ -1622,12 +1598,13 @@ pub async fn rotate_org_owner(
             ));
         }
         tx.commit().await.map_err(|_| db_error())?;
-        return Ok(Json(RotateOrgOwnerResponse {
+        return confirm_owner_rotation_publication(
+            &state,
             org_id,
-            state: "ready",
-            keyring_version: body.version,
-            owner_fingerprint: hex::encode(Sha256::digest(replacement_owner)),
-        }));
+            body.version,
+            &replacement_owner,
+        )
+        .await;
     }
 
     if service_owner.as_deref() == Some(current_owner.as_slice()) {
@@ -1706,28 +1683,21 @@ pub async fn rotate_org_owner(
 
     // Phase 2: final lane transaction. The lane was released after the
     // receipt-only commit, so competing keyring changes may have landed;
-    // authorization was consumed in phase 1; keyring, service owner,
-    // and freshness are re-read and re-derived here. This phase never
-    // issues an upstream RPC (at most one per request, spent or deliberately
-    // skipped in phase 1): the service must already hold the replacement
-    // owner before any CAP write, so the stored keyring authority and the
-    // service stay pinned to the same owner.
-    //
-    // The caller's membership role is deliberately NOT re-checked here
-    // (PR #185 review, Codex "keep caller authorization stable"): phase 1
-    // checked it under the membership row lock, and a role change or
-    // membership removal landing between the phases must not abort the
-    // final CAP write after the upstream owner already switched -- that
-    // abort is exactly the half-executed, drifted state the two-phase
-    // design exists to avoid, and the retry it forces would fail the
-    // caller-key binding below. First presentations still require an
-    // active owner at request start (see rotate_org_owner).
+    // membership, keyring, service owner, and freshness are re-read and
+    // re-derived here. This phase never issues an upstream RPC (at most
+    // one per request, spent or deliberately skipped in phase 1): the
+    // service must already hold the replacement owner before any CAP
+    // write, so the stored keyring authority and the service stay pinned
+    // to the same owner.
     let mut tx = state.db.begin().await.map_err(|_| db_error())?;
     let lane_now = crate::signing_service::lock_org_signing_authority_lane_now(&mut tx, org_id)
         .await
         .map_err(|_| db_error())?;
+    let current_role =
+        scopes::lock_and_read_active_membership_role_in_tx(&mut tx, org_id, auth.user_id).await?;
+    scopes::require_owner_role(current_role)?;
     let (latest, version_created_at_floor) = read_rotation_authority(&mut tx, org_id).await?;
-    let Some((base_payload, expected_current_owner, insert_new_version)) = derive_rotation_path(
+    let rotation_path = derive_rotation_path(
         &mut tx,
         org_id,
         body.version,
@@ -1736,30 +1706,7 @@ pub async fn rotate_org_owner(
         &keyring_signature,
         &replacement_owner,
     )
-    .await?
-    else {
-        // Predecessor-less replay of an intact committed rotation (see
-        // phase 1): the byte-for-byte equality checks already confirmed
-        // this request against the committed row.
-        tx.commit().await.map_err(|_| db_error())?;
-        return Ok(Json(RotateOrgOwnerResponse {
-            org_id,
-            state: "ready",
-            keyring_version: body.version,
-            owner_fingerprint: hex::encode(Sha256::digest(replacement_owner)),
-        }));
-    };
-    if expected_current_owner.as_slice() != current_owner.as_slice() {
-        return Err(bad_request(
-            "rotation signer does not match the current pinned owner",
-        ));
-    }
-    // Owner rotation can remove the signer of retained signed policy
-    // artifacts still inside the KBS retention window (#130).  As with
-    // put_keyring, the owed generation bump is recorded by migration
-    // 0061's org_keyrings INSERT trigger inside this transaction -- a
-    // direct desired_generation bump here could be consumed by a
-    // pre-0061 replica's unfiltered reconciler during the rollout.
+    .await?;
 
     let owner_status = read_live_service_owner(signing_service, org_id).await?;
     let service_owner = service_owner_pubkey(&owner_status);
@@ -1770,17 +1717,33 @@ pub async fn rotate_org_owner(
             ),
         ));
     }
+    let Some((base_payload, expected_current_owner, insert_new_version)) = rotation_path else {
+        tx.rollback().await.map_err(|_| db_error())?;
+        return confirm_owner_rotation_publication(
+            &state,
+            org_id,
+            body.version,
+            &replacement_owner,
+        )
+        .await;
+    };
+    if expected_current_owner.as_slice() != current_owner.as_slice() {
+        return Err(bad_request(
+            "rotation signer does not match the current pinned owner",
+        ));
+    }
     if !insert_new_version {
         // A concurrent retry of this exact rotation completed the write
         // between the phases; the byte-identical stored version proves
         // it. Idempotent success, nothing consumed or written here.
         tx.commit().await.map_err(|_| db_error())?;
-        return Ok(Json(RotateOrgOwnerResponse {
+        return confirm_owner_rotation_publication(
+            &state,
             org_id,
-            state: "ready",
-            keyring_version: body.version,
-            owner_fingerprint: hex::encode(Sha256::digest(replacement_owner)),
-        }));
+            body.version,
+            &replacement_owner,
+        )
+        .await;
     }
 
     if body.signed_at > lane_now {
@@ -1825,16 +1788,27 @@ pub async fn rotate_org_owner(
             })),
         ));
     }
-    // Phase 2 already required the signing service to hold the replacement
-    // owner, which is exactly the recovery condition for the relaxed
-    // registration binding (see the fn doc).
+    // Revalidate recovery provenance after the lane gap. Fresh requests keep
+    // caller-bound registration checks even if their RPC just minted a receipt.
+    let receipt_bound_recovery = receipt_bound_recovery
+        && upstream_receipt_matches_live_service(
+            &mut tx,
+            org_id,
+            directive_digest.as_slice(),
+            intent_digest.as_slice(),
+            &owner_status,
+            &replacement_owner,
+        )
+        .await?;
+
     let replacement_signing_key_id = validate_rotation_successor(
         &mut tx,
         &base_payload,
         &replacement_keyring,
         &current_owner,
         &replacement_owner,
-        None,
+        auth.user_id,
+        receipt_bound_recovery,
     )
     .await?;
 
@@ -1862,14 +1836,7 @@ pub async fn rotate_org_owner(
     .await
     .map_err(|_| db_error())?;
     tx.commit().await.map_err(|_| db_error())?;
-    confirm_keyring_kbs_publication(&state).await?;
-
-    Ok(Json(RotateOrgOwnerResponse {
-        org_id,
-        state: "ready",
-        keyring_version: body.version,
-        owner_fingerprint: hex::encode(Sha256::digest(replacement_owner)),
-    }))
+    confirm_owner_rotation_publication(&state, org_id, body.version, &replacement_owner).await
 }
 
 /// POST /orgs/{name}/invite -- invite a member (must be owner or admin).
@@ -2677,7 +2644,7 @@ mod tests {
         // the insert-new-version path there is no skew allowance, because
         // signed_at is attacker-chosen at signing time and a future-dated
         // directive could otherwise compare as newer than a keyring version
-        // that already existed when it was captured (PR #185 review).
+        // that already existed when it was captured.
         let future = rotation_request(
             org_id,
             user_id,
@@ -2863,12 +2830,7 @@ mod tests {
             .expect("delete directive replay user");
     }
 
-    // Cross-PR integration regression (#185 review / #182): the durable
-    // rotation-intent digest and the stored keyring bytes must use the same
-    // normalized JSON-value encoding registration uses after #182 -- the
-    // typed struct re-serialized, dropping unsigned extra fields -- and a
-    // legacy row stored under the pre-#182 raw encoding must still replay
-    // idempotently.
+    // Unsigned fields must not change recovery identity or break legacy replay.
     #[tokio::test]
     async fn owner_rotation_intent_digest_uses_registration_normalized_encoding() {
         let pool = database_test_pool().await;
@@ -3107,7 +3069,7 @@ mod tests {
 
     #[tokio::test]
     async fn owner_rotation_rejects_future_dated_directive_despite_version_recency() {
-        // Regression (PR #185 review): the old +300s clock-skew allowance
+        // A +300s clock-skew allowance
         // made the version-recency bound bypassable. signed_at is chosen by
         // the signer, not the server: a directive captured at 12:00 with
         // signed_at = 12:04 compares as newer than a v2 uploaded at 12:01
@@ -3360,8 +3322,7 @@ mod tests {
 
     #[tokio::test]
     async fn owner_rotation_version_bound_floors_legacy_rows_at_migration_watermark() {
-        // Regression (PR #185 review, codex P2 on migration 0063): a
-        // keyring version committed by pre-migration code keeps a
+        // A keyring version committed before the migration can retain a
         // transaction-start created_at that can predate its real
         // insertion by the full signing-authority lane wait. Without the
         // migration-0065 watermark floor, a directive signed while the
@@ -3515,19 +3476,8 @@ mod tests {
 
     #[tokio::test]
     async fn owner_rotation_expired_recovery_requires_matching_upstream_receipt() {
-        // PR #185 review: an expired NEW-version directive can recover only
-        // through a durable upstream receipt, never through presentation
-        // records. The drift scenario models a lost first attempt: the
-        // upstream rotate-owner succeeded (the service is pinned to the
-        // replacement owner, upstream version 2, last_changed_at =
-        // drift_at) but the CAP transaction never committed. The exact
-        // expired retry must find a receipt binding THIS directive and
-        // keyring plus a live signing service still holding that exact
-        // rotation (matching owner, version, and last_changed_at). A
-        // merely presented intent -- even one presented while fresh and
-        // before the drift -- can never borrow another presentation's
-        // receipt, and unactioned presentations recorded afterwards must
-        // not block a valid receipt.
+        // Presentation order differs from execution order. Unrelated intents must not
+        // block the exact receipt; a changed upstream snapshot must reject it.
         let (_db_cleanup, pool) =
             crate::test_support::isolated_database_test_pool("cap185_receipt_recovery").await;
         let org_id = Uuid::new_v4();
@@ -3719,10 +3669,7 @@ mod tests {
         .expect_err("a different directive cannot borrow the upstream receipt");
         assert_eq!(rejected.0, StatusCode::BAD_REQUEST);
 
-        // The earlier failed directive D1 was presented while fresh and
-        // before the drift, but its own upstream rotate never succeeded:
-        // a presentation record alone is not a receipt and must not confer
-        // a waiver.
+        // D1 was presented while fresh, but never completed upstream.
         let rejected_d1 = rotate_org_owner(
             auth.clone(),
             State(state.clone()),
@@ -3809,16 +3756,8 @@ mod tests {
 
     #[tokio::test]
     async fn owner_rotation_receipt_survives_failed_final_commit_and_replays_once() {
-        // Producer proof for the upstream-receipt checkpoint (PR #185): a
-        // real fresh rotation performs exactly one upstream rotate-owner and
-        // commits only the receipt in its first lane transaction; the final
-        // CAP transaction (directive consumption, keyring insert, audit)
-        // runs afterwards. Forcing that final commit to fail must leave
-        // the receipt durable, and the exact retry must complete CAP
-        // without a second upstream rotation, audit row, or keyring
-        // version. The handler pool is deliberately a single connection:
-        // the receipt checkpoint and the final transaction must never need
-        // a second pool connection while a lane connection is held.
+        // The receipt must survive a failed final transaction without another RPC.
+        // One pool connection exposes any nested-acquisition deadlock.
         let (_db_cleanup, pool) =
             crate::test_support::isolated_database_test_pool("cap185_receipt_checkpoint").await;
         let org_id = Uuid::new_v4();
@@ -4648,16 +4587,8 @@ mod tests {
 
     #[tokio::test]
     async fn owner_rotation_lane_waiter_rereads_owner_before_remote_rotation() {
-        // PR #185 review: a rotation queued behind another committing
-        // rotation must decide on owner status read AFTER it acquires the
-        // signing-authority lane. The duplicate below snapshots the
-        // upstream owner while the winner is still queued (the owner is
-        // still the pre-rotation key there); acting on that stale snapshot
-        // would re-send an already-completed rotation to the signing
-        // service, which rejects it as signed by a non-owner. A correct
-        // implementation re-reads the live owner under the lane and
-        // completes the duplicate submission idempotently, with no second
-        // upstream rotation.
+        // Both requests queue while the upstream owner is still the original key.
+        // A pre-lane snapshot would send the duplicate RPC with the revoked signer.
         let pool = database_test_pool().await;
         let org_id = Uuid::new_v4();
         let user_id = Uuid::new_v4();
@@ -4821,7 +4752,7 @@ mod tests {
 
     #[tokio::test]
     async fn owner_rotation_expired_exact_retry_stays_idempotent() {
-        // Regression (PR #185 review): the signed_at max-age is a first-use
+        // The signed_at max-age is a first-use
         // bound. If a rotation commits but its response is lost, a caller
         // retrying the byte-identical request after the 15-minute window
         // must still get the documented idempotent success: the consume-once
@@ -4975,7 +4906,7 @@ mod tests {
 
     #[tokio::test]
     async fn owner_rotation_version_bound_uses_actual_keyring_insertion_time() {
-        // Regression (PR #185 review): org_keyrings.created_at must witness
+        // org_keyrings.created_at must witness
         // the moment a version row is actually inserted, not the start of the
         // inserting transaction. A keyring upload that queues on the shared
         // signing-authority lane pins now() == transaction_timestamp() at
@@ -7270,7 +7201,7 @@ mod tests {
 
         // Fail closed (self-check P1): an unreadable owner status is not
         // evidence of agreement. With a signing service configured but
-        // unreachable, the successor insert must be refused with 503 and
+        // unreachable, the successor insert must be refused with 502 and
         // still write nothing -- this is the exact inter-phase window where
         // the race re-opened in the fail-open variant of this fence.
         state.signing_service = Some(
@@ -7288,7 +7219,7 @@ mod tests {
         )
         .await
         .expect_err("an unreadable owner status must not clear the successor insert");
-        assert_eq!(closed.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(closed.0, StatusCode::BAD_GATEWAY);
         let counts_after_closed: (i64, i64) = sqlx::query_as(
             "SELECT
                  (SELECT count(*) FROM org_keyrings WHERE org_id = $1),
