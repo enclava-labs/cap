@@ -46,13 +46,19 @@ pub enum DeploymentPhase {
 }
 
 impl DeploymentPhase {
-    fn from_job_state(job_state: &str, setup_state: Option<&str>) -> Self {
+    fn from_job_state(job_state: &str, deployment_status: &str, setup_state: Option<&str>) -> Self {
         match job_state {
             "setup_pending" => Self::Queued,
             "setting_up" => Self::SettingUp,
             "cleanup_pending" | "cleaning_up" => Self::SettingUp,
             "pending" => Self::Queued,
-            "running" => Self::Watching,
+            // A `running` job spans manifest apply AND rollout watch; the
+            // deployment row carries the exact sub-phase.
+            "running" => match deployment_status {
+                "watching" => Self::Watching,
+                "applying" | "pending" => Self::Applying,
+                _ => Self::Unknown,
+            },
             "completed" => Self::Healthy,
             "failed" => Self::Failed,
             _ => {
@@ -243,7 +249,11 @@ fn project_diagnostics(row: DiagnosticsRow) -> DeploymentDiagnostics {
     // generation for the owner.
     let (phase, reason) = match (&row.job_state, row.setup_state.as_deref()) {
         (Some(job_state), _) => (
-            DeploymentPhase::from_job_state(job_state, row.setup_state.as_deref()),
+            DeploymentPhase::from_job_state(
+                job_state,
+                &row.deployment_status,
+                row.setup_state.as_deref(),
+            ),
             reason_for_job_state(job_state, &row),
         ),
         (None, Some(setup_state)) => {
@@ -439,10 +449,17 @@ mod tests {
     #[test]
     fn running_job_with_live_lease_is_progressing() {
         let diagnostics = project_diagnostics(row("applying", Some("running"), None));
-        assert_eq!(diagnostics.phase, DeploymentPhase::Watching);
+        assert_eq!(diagnostics.phase, DeploymentPhase::Applying);
         assert_eq!(diagnostics.condition, DeploymentCondition::Progressing);
         assert_eq!(diagnostics.reason, None);
         assert_eq!(diagnostics.attempts, 4);
+    }
+
+    #[test]
+    fn running_job_on_watching_deployment_is_watching() {
+        let diagnostics = project_diagnostics(row("watching", Some("running"), None));
+        assert_eq!(diagnostics.phase, DeploymentPhase::Watching);
+        assert_eq!(diagnostics.condition, DeploymentCondition::Progressing);
     }
 
     #[test]

@@ -4268,7 +4268,7 @@ async fn deployment_diagnostics_projects_live_apply_job_over_http() {
         .await;
     response.assert_status(StatusCode::OK);
     let body: Value = response.json();
-    assert_eq!(body["phase"], "watching", "diagnostics body: {body}");
+    assert_eq!(body["phase"], "applying", "diagnostics body: {body}");
     assert_eq!(body["condition"], "progressing", "diagnostics body: {body}");
     assert_eq!(
         body["attempts"], 3,
@@ -4285,7 +4285,7 @@ async fn deployment_diagnostics_projects_live_apply_job_over_http() {
     status.assert_status(StatusCode::OK);
     let status_body: Value = status.json();
     assert_eq!(
-        status_body["deployment"]["phase"], "watching",
+        status_body["deployment"]["phase"], "applying",
         "status deployment block: {status_body}"
     );
     assert_eq!(status_body["deployment"]["attempts"], 3);
