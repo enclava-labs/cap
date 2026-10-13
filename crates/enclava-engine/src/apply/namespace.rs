@@ -298,6 +298,17 @@ mod tests {
                     };
                     let response = match live_annotations {
                         Some(annotations) => {
+                            // The real API server records the control
+                            // plane's ownership of the creation-evidence
+                            // annotation it stamped; mirror that so the
+                            // provenance check in preserve_creation_evidence
+                            // can attribute it.
+                            let annotation_keys: Vec<String> =
+                                annotations.keys().cloned().collect();
+                            let mut owned_annotations = serde_json::Map::new();
+                            for key in annotation_keys {
+                                owned_annotations.insert(format!("f:{key}"), json!({}));
+                            }
                             let namespace = json!({
                                 "apiVersion": "v1",
                                 "kind": "Namespace",
@@ -306,6 +317,15 @@ mod tests {
                                     "annotations": annotations,
                                     "resourceVersion": "1",
                                     "uid": "00000000-0000-0000-0000-000000000001",
+                                    "managedFields": [{
+                                        "manager": "enclava-platform",
+                                        "operation": "Update",
+                                        "apiVersion": "v1",
+                                        "fieldsType": "FieldsV1",
+                                        "fieldsV1": {
+                                            "f:metadata": {"f:annotations": owned_annotations},
+                                        },
+                                    }],
                                 }
                             });
                             axum::http::Response::builder()

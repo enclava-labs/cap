@@ -488,55 +488,52 @@ pub(crate) async fn sweep_statefulset_pvcs(
         // deleted (controller-created claims carry the ownerReference).
         // Without the UID pin the controller's name-based adoption of a
         // pre-existing claim would make this sweep destroy foreign data.
-        let owned_by_deleted_statefulset = match statefulset_uid {
-            // First sweep, StatefulSet just deleted by this sweep: the
-            // controller ownerReference must pin its EXACT UID.
-            Some(expected) => pvc
-                .metadata
-                .owner_references
-                .as_ref()
-                .is_some_and(|owners| {
-                    owners.iter().any(|owner| {
-                        owner.kind == "StatefulSet"
-                            && owner.uid == expected
-                            && owner.controller == Some(true)
-                    })
-                }),
-            // Retry sweep, StatefulSet already gone: a dangling controller
-            // ownerReference naming it proves some StatefulSet of that
-            // name created the claim; combined with the claim being
-            // created after this apply started (a CAP-created StatefulSet
-            // implies no foreign same-named one existed — the apply would
-            // have SSA-patched it instead of creating), the claim is
-            // provably this workload's.
-            None => {
-                let named_owner = pvc
-                    .metadata
-                    .owner_references
-                    .as_ref()
-                    .is_some_and(|owners| {
-                        owners.iter().any(|owner| {
-                            owner.kind == "StatefulSet"
-                                && owner.name == statefulset
-                                && owner.controller == Some(true)
-                        })
-                    });
-                let created_after_apply_start = apply_started_at.is_some_and(|threshold| {
-                    pvc.metadata.creation_timestamp.is_some_and(|created| {
-                        // Both sides render as RFC 3339 with the same
-                        // nanosecond precision, so lexicographic ordering
-                        // of the strings matches chronological ordering.
-                        created.0.to_string().as_str() > threshold.to_rfc3339().as_str()
-                    })
-                });
-                named_owner && created_after_apply_start
-            }
+        // Ownership without a controller ownerReference: the generated
+        // StatefulSet uses when_deleted/when_scaled Retain, under which the
+        // controller attaches no PVC ownerReferences at all — so retained
+        // claims carry NO creation evidence of their own. The sound bound
+        // is temporal: the CAP-created StatefulSet existed only from this
+        // apply's start, so a same-named `<vct>-<sts>-<ordinal>` claim
+        // CREATED after that point can only be this workload's (a foreign
+        // same-named StatefulSet would have made the apply SSA-patch
+        // instead of create, failing the StatefulSet's own
+        // creation-evidence gate). Claims predating the apply — including
+        // ones a tenant created by that name — are never touched. When
+        // ownerReferences ARE present they must not contradict: a
+        // controller ownerRef must pin the deleted StatefulSet's UID
+        // (first sweep) or name it (retry sweep after it is gone).
+        let created_after_apply_start = apply_started_at.is_some_and(|threshold| {
+            pvc.metadata.creation_timestamp.is_some_and(|created| {
+                // Both sides render as RFC 3339 with the same nanosecond
+                // precision, so lexicographic ordering of the strings
+                // matches chronological ordering.
+                created.0.to_string().as_str() > threshold.to_rfc3339().as_str()
+            })
+        });
+        if !created_after_apply_start {
+            continue;
+        }
+        let owner_refs_not_foreign = match statefulset_uid {
+            Some(expected) => pvc.metadata.owner_references.as_ref().is_none_or(|owners| {
+                owners.iter().all(|owner| {
+                    owner.kind != "StatefulSet"
+                        || owner.controller != Some(true)
+                        || owner.uid == expected
+                })
+            }),
+            None => pvc.metadata.owner_references.as_ref().is_none_or(|owners| {
+                owners.iter().all(|owner| {
+                    owner.kind != "StatefulSet"
+                        || owner.controller != Some(true)
+                        || owner.name == statefulset
+                })
+            }),
         };
-        if !owned_by_deleted_statefulset {
+        if !owner_refs_not_foreign {
             tracing::info!(
                 namespace = %namespace,
                 pvc = %name,
-                "adopted-namespace PVC sweep skips claim not owned by the deleted CAP StatefulSet"
+                "adopted-namespace PVC sweep skips claim owned by a foreign StatefulSet"
             );
             continue;
         }
@@ -882,8 +879,16 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
         return CleanupFenceOutcome::ReleaseNormally;
     }
     let teardown = match ownership {
-        InitialNamespaceOwnership::Owned { uid } => match mutation
-            .guard_provider(delete_owned_namespace(app, uid))
+        InitialNamespaceOwnership::Owned {
+            uid,
+            resource_version,
+        } => match mutation
+            .guard_provider(delete_owned_namespace(
+                app,
+                namespace_generation,
+                uid,
+                resource_version,
+            ))
             .await
         {
             Ok(outcome) => outcome,
@@ -934,22 +939,56 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
                     // retained: the retained-fence reconciler releases only
                     // on an observed namespace 404, which never happens for
                     // an adopted namespace — retaining would reintroduce the
-                    // permanent-Busy bug this change fixes. Leftovers
-                    // converge deterministically instead: the next apply of
-                    // this app SSA-overwrites every swept name with a newer
-                    // generation, and app deletion tears down whatever
-                    // remains.
+                    // permanent-Busy bug this change fixes. The evidence
+                    // stays (storage guard), but the row is MARKED so the
+                    // ownership gate exempts it: a LATER failed generation
+                    // of this app can still run its own sweep, which
+                    // converges the same shared object names.
+                    if let Err(error) = sqlx::query(
+                        "UPDATE deployments
+                         SET cleanup_sweep_incomplete = true
+                         WHERE id = $1 AND app_id = $2 AND status = 'failed'",
+                    )
+                    .bind(failed_deployment_id)
+                    .bind(app.id)
+                    .execute(&state.db)
+                    .await
+                    {
+                        tracing::warn!(
+                            app_id = %app.id,
+                            deployment_id = %failed_deployment_id,
+                            error = %error,
+                            "failed-apply cleanup could not mark the row's sweep incomplete"
+                        );
+                    }
                     tracing::warn!(
                         app_id = %app.id,
                         namespace = %app.namespace,
                         failures,
                         error_code = "adopted_namespace_sweep_incomplete",
-                        "adopted-namespace sweep left objects behind; the next apply or app deletion converges them"
+                        "adopted-namespace sweep left objects behind; the next apply, later failed generation, or app deletion converges them"
                     );
                     NamespaceTeardown::AdoptedIncomplete
                 }
                 Ok(_) => NamespaceTeardown::Adopted,
                 Err(error) => {
+                    if let Err(error) = sqlx::query(
+                        "UPDATE deployments
+                         SET cleanup_sweep_incomplete = true
+                         WHERE id = $1 AND app_id = $2 AND status = 'failed'",
+                    )
+                    .bind(failed_deployment_id)
+                    .bind(app.id)
+                    .execute(&state.db)
+                    .await
+                    {
+                        tracing::warn!(
+                            app_id = %app.id,
+                            deployment_id = %failed_deployment_id,
+                            error = %error,
+                            "failed-apply cleanup could not mark the row's sweep incomplete"
+                        );
+                    }
                     tracing::warn!(
                         app_id = %app.id,
                         namespace = %app.namespace,
@@ -1001,10 +1040,15 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
             // evidence so a LATER failed apply of the same app is not
             // forever blocked from its own compensating cleanup by this
             // historical row's stale `manifest_hash`/`observing_since`.
+            // Earlier incomplete-sweep rows of the same app clear too:
+            // every swept object name is shared across the app's
+            // generations, so this completed sweep converged their
+            // leftovers as well.
             if let Err(error) = sqlx::query(
                 "UPDATE deployments
-                 SET manifest_hash = NULL, observing_since = NULL
-                 WHERE id = $1 AND app_id = $2 AND status = 'failed'",
+                 SET manifest_hash = NULL, observing_since = NULL, cleanup_sweep_incomplete = false
+                 WHERE app_id = $2 AND status = 'failed'
+                   AND (id = $1 OR cleanup_sweep_incomplete)",
             )
             .bind(failed_deployment_id)
             .bind(app.id)
@@ -1052,13 +1096,21 @@ async fn no_other_generation_owns_provider_state(
     failed_deployment_id: Uuid,
 ) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar::<_, bool>(
+        // A row whose compensating sweep already ran but could not finish
+        // (cleanup_sweep_incomplete) keeps its evidence for the storage
+        // guard, yet must not veto LATER failed generations' own cleanup:
+        // every swept object NAME is shared across the app's generations,
+        // so the later generation's sweep converges the same leftovers.
+        // Its marker and evidence clear when any sweep completes.
         "SELECT NOT EXISTS (
              SELECT 1 FROM deployments
               WHERE app_id = $1
                 AND id <> $2
                 AND (
-                    manifest_hash IS NOT NULL
-                    OR observing_since IS NOT NULL
+                    (
+                        (manifest_hash IS NOT NULL OR observing_since IS NOT NULL)
+                        AND NOT cleanup_sweep_incomplete
+                    )
                     OR status::text IN ('pending', 'applying', 'watching', 'healthy', 'rolled_back')
                 )
          ) AND NOT EXISTS (
@@ -1146,10 +1198,14 @@ enum InitialNamespaceOwnership {
     /// Live object carries this generation's annotation AND creation
     /// evidence (`enclava.dev/cap-namespace-created-by-generation`): CAP
     /// created it and this generation was the last writer — safe to delete.
-    /// Carries the exact UID of the object that passed the ownership
-    /// check: the DELETE is UID-preconditioned so it can only ever target
-    /// THAT object, never a same-named replacement.
-    Owned { uid: String },
+    /// Carries the exact UID AND resourceVersion of the object that
+    /// passed the ownership check: the DELETE is preconditioned on both,
+    /// so it can neither hit a same-named replacement nor a same-UID
+    /// object a newer deployment has since written.
+    Owned {
+        uid: String,
+        resource_version: String,
+    },
     /// Live object carries this generation's mutation annotation but no
     /// creation evidence: a pre-existing namespace this apply adopted.
     /// Never delete it — only the resources this apply published (routes)
@@ -1199,9 +1255,15 @@ fn classify_initial_namespace_get(
                 // object missing uid/resourceVersion cannot be pinned and
                 // is treated as undecidable (the API server always
                 // populates both on real reads).
-                match namespace.metadata.uid.clone() {
-                    Some(uid) => InitialNamespaceOwnership::Owned { uid },
-                    None => InitialNamespaceOwnership::Uninspectable,
+                match (
+                    namespace.metadata.uid.clone(),
+                    namespace.metadata.resource_version.clone(),
+                ) {
+                    (Some(uid), Some(resource_version)) => InitialNamespaceOwnership::Owned {
+                        uid,
+                        resource_version,
+                    },
+                    _ => InitialNamespaceOwnership::Uninspectable,
                 }
             } else {
                 InitialNamespaceOwnership::Foreign
@@ -1241,16 +1303,33 @@ async fn classify_failed_generation_namespace(
 }
 
 /// Delete the namespace that ALREADY passed the ownership classification,
-/// carrying the exact UID/resourceVersion of that owning GET into the
-/// DELETE preconditions — a foreign same-named replacement (created after
-/// the CAP-owned namespace was externally deleted) fails the stale
-/// resourceVersion precondition with 409 instead of being deleted.
-/// Once the delete is accepted, a bounded convergence wait must observe
-/// 404; otherwise the outcome is `DeleteIncomplete` and the caller retains
-/// the pre-armed fence (fail closed, mirroring app delete) rather than
-/// converting it to the bounded reclaim quarantine while the namespace may
-/// still be Terminating.
-async fn delete_owned_namespace(app: &App, owned_uid: String) -> NamespaceTeardown {
+/// carrying BOTH the UID and the resourceVersion of that owning GET into
+/// the DELETE preconditions. The UID blocks a same-named replacement; the
+/// resourceVersion blocks a STALE delete against the same object after a
+/// newer deployment has written it (generation advance, controller status
+/// bump, any write): the delayed delete 409s instead of destroying the
+/// newer deployment's namespace.
+///
+/// On 409 the live object is re-read and FULLY re-classified (exact
+/// mutation-generation annotation + creation evidence + same UID): the
+/// retry proceeds only when every check still holds against the fresh
+/// object, using its new resourceVersion. A replaced or foreign object
+/// completes as ConfirmedAbsent (nothing of ours remains); a same-UID
+/// object that no longer classifies as ours also completes — the newer
+/// deployment now owns it.
+///
+/// Failures BEFORE the delete could have been accepted (client creation,
+/// transport rejection) return `ReleaseNormally` via [`NamespaceTeardown::ConfirmedAbsent`]
+/// semantics handled by the caller only when absence is proven; here they
+/// map to a distinct pre-acceptance outcome so the caller need not retain
+/// the fence for a delete that was never issued. Failures after issuance
+/// (or ambiguous ones) are `DeleteIncomplete` and retain the fence.
+async fn delete_owned_namespace(
+    app: &App,
+    generation: enclava_engine::apply::generation::MutationGeneration,
+    owned_uid: String,
+    owned_resource_version: String,
+) -> NamespaceTeardown {
     let client = match kube::Client::try_default().await {
         Ok(client) => client,
         Err(error) => {
@@ -1258,63 +1337,48 @@ async fn delete_owned_namespace(app: &App, owned_uid: String) -> NamespaceTeardo
                 app_id = %app.id,
                 namespace = %app.namespace,
                 error = %error,
-                "failed-apply cleanup cannot reach Kubernetes; skipping namespace deletion"
+                "failed-apply cleanup cannot reach Kubernetes before issuing the namespace delete; no delete was sent"
             );
-            // No delete was issued through this path, but ownership WAS
-            // proven: treat as incomplete so the fence is retained and a
-            // later reconciliation retries.
-            return NamespaceTeardown::DeleteIncomplete;
+            // Pre-acceptance: no DELETE reached the API server, so there
+            // is nothing in flight to converge — retaining the fence
+            // would wedge the app on permanent Busy for a delete that
+            // never happened.
+            return NamespaceTeardown::ConfirmedAbsent;
         }
     };
     let api: kube::Api<k8s_openapi::api::core::v1::Namespace> = kube::Api::all(client);
 
-    // UID-only precondition: pinning the resourceVersion as well would 409
-    // on every same-UID status bump (finalizers, controllers), and a 409
-    // here cannot be retried by the retained-fence reconciler — permanent
-    // Busy. The UID alone blocks the replacement-namespace race the
-    // ownership check guards against; a 409 against a UID-only
-    // precondition means the pinned object itself changed identity.
-    let mut deleted = false;
+    let pinned_uid = owned_uid;
+    let mut pinned_resource_version = owned_resource_version;
     for _attempt in 0..NAMESPACE_DELETE_RETRIES {
         match api
             .delete(
                 &app.namespace,
                 &kube::api::DeleteParams {
                     preconditions: Some(kube::api::Preconditions {
-                        uid: Some(owned_uid.clone()),
-                        ..kube::api::Preconditions::default()
+                        uid: Some(pinned_uid.clone()),
+                        resource_version: Some(pinned_resource_version.clone()),
                     }),
                     ..kube::api::DeleteParams::default()
                 },
             )
             .await
         {
-            Ok(_) => {
-                deleted = true;
-                break;
-            }
+            Ok(_) => break, // accepted; converge below
             Err(kube::Error::Api(error)) if error.code == 404 => {
                 // Vanished between the owning GET and the delete: complete.
                 return NamespaceTeardown::ConfirmedAbsent;
             }
             Err(kube::Error::Api(error)) if error.code == 409 => {
-                // The UID-pinned object changed under us. Re-read: 404 or a
-                // DIFFERENT uid proves the owned namespace is gone (a
-                // foreign replacement must never be deleted) — complete.
-                // The same uid still live is a transient conflict: retry.
-                match api.get(&app.namespace).await {
+                // The pinned write raced. Re-read and FULLY re-classify:
+                // only an object that still carries this generation's
+                // exact annotation, creation evidence, AND the same UID
+                // may be deleted (with its fresh resourceVersion).
+                let live = match api.get(&app.namespace).await {
+                    Ok(live) => live,
                     Err(kube::Error::Api(error)) if error.code == 404 => {
                         return NamespaceTeardown::ConfirmedAbsent;
                     }
-                    Ok(live) if live.metadata.uid.as_deref() != Some(owned_uid.as_str()) => {
-                        tracing::info!(
-                            app_id = %app.id,
-                            namespace = %app.namespace,
-                            "failed-apply cleanup: the owned namespace was replaced by a foreign object; leaving the replacement alone"
-                        );
-                        return NamespaceTeardown::ConfirmedAbsent;
-                    }
-                    Ok(_) => {}
                     Err(error) => {
                         tracing::warn!(
                             app_id = %app.id,
@@ -1324,15 +1388,56 @@ async fn delete_owned_namespace(app: &App, owned_uid: String) -> NamespaceTeardo
                         );
                         return NamespaceTeardown::DeleteIncomplete;
                     }
+                };
+                let still_ours = live.metadata.uid.as_deref() == Some(pinned_uid.as_str())
+                    && matches!(
+                        classify_initial_namespace_get(&Ok(live.clone()), generation),
+                        InitialNamespaceOwnership::Owned { .. }
+                    )
+                    && live.metadata.resource_version.is_some();
+                if !still_ours {
+                    tracing::info!(
+                        app_id = %app.id,
+                        namespace = %app.namespace,
+                        "failed-apply cleanup: the namespace no longer classifies as this generation's (replaced or advanced); leaving it to its current owner"
+                    );
+                    return NamespaceTeardown::ConfirmedAbsent;
                 }
+                let Some(fresh_version) = live.metadata.resource_version.clone() else {
+                    return NamespaceTeardown::DeleteIncomplete;
+                };
+                pinned_resource_version = fresh_version;
                 continue;
+            }
+            Err(kube::Error::Api(error)) if error.code >= 500 => {
+                // Server-side rejection before acceptance is likely but not
+                // provable: treat as issued (fail closed).
+                tracing::warn!(
+                    app_id = %app.id,
+                    namespace = %app.namespace,
+                    error = %error,
+                    "failed-apply namespace deletion was server-rejected; retaining the namespace fence for reconciliation"
+                );
+                return NamespaceTeardown::DeleteIncomplete;
+            }
+            Err(kube::Error::BuildRequest(_)) => {
+                // Request construction failed BEFORE anything was sent: no
+                // delete is in flight, so retaining the fence would wedge
+                // the app on permanent Busy for a delete that never
+                // happened.
+                tracing::warn!(
+                    app_id = %app.id,
+                    namespace = %app.namespace,
+                    "failed-apply namespace delete could not build its request; nothing is in flight"
+                );
+                return NamespaceTeardown::ConfirmedAbsent;
             }
             Err(error) => {
                 tracing::warn!(
                     app_id = %app.id,
                     namespace = %app.namespace,
                     error = %error,
-                    "failed-apply namespace deletion failed; retaining the namespace fence for reconciliation"
+                    "failed-apply namespace deletion failed ambiguously; retaining the namespace fence for reconciliation"
                 );
                 // The delete request may have reached the API server
                 // before the error surfaced: treat as incomplete.
@@ -1340,26 +1445,12 @@ async fn delete_owned_namespace(app: &App, owned_uid: String) -> NamespaceTeardo
             }
         }
     }
-    if !deleted {
-        // The loop only leaves `deleted == false` via its 404 and
-        // replaced-UID arms (both prove the owned namespace is gone) or by
-        // exhausting the retry budget against a same-UID conflict. The
-        // 404/replaced arms return directly inside the loop; reaching here
-        // with `deleted == false` therefore means the budget burned on
-        // conflicts while the owned object stayed live: fail closed.
-        tracing::warn!(
-            app_id = %app.id,
-            namespace = %app.namespace,
-            "failed-apply namespace delete exhausted its UID-conflict retries; retaining the namespace fence for reconciliation"
-        );
-        return NamespaceTeardown::DeleteIncomplete;
-    }
-    // The delete was accepted. Bound the convergence wait; if it
-    // elapses without a 404 the caller must retain the fence. Each
-    // GET is itself bounded by the remaining deadline: a stalled
-    // API server must not hold this apply's shared fences past the
-    // advertised convergence budget via the client's ~295s read
-    // timeout.
+
+    // The delete was accepted. Bound the convergence wait; if it elapses
+    // without a 404 the caller must retain the fence. Each GET is itself
+    // bounded by the remaining deadline: a stalled API server must not
+    // hold this apply's shared fences past the advertised convergence
+    // budget via the client's ~295s read timeout.
     let deadline = tokio::time::Instant::now() + NAMESPACE_CONVERGENCE_TIMEOUT;
     loop {
         match tokio::time::timeout_at(deadline, api.get(&app.namespace)).await {
@@ -1569,6 +1660,47 @@ mod tests {
                 .await
                 .expect("check compensated predecessor"),
             "a compensated failed row (evidence cleared) must not block a later failed apply's cleanup"
+        );
+
+        delete_cleanup_fixture(&pool, app_id).await;
+    }
+
+    #[tokio::test]
+    async fn cleanup_incomplete_row_no_longer_blocks_later_cleanup() {
+        let pool = cleanup_test_pool().await;
+        let app_id = insert_cleanup_app_fixture(&pool).await;
+
+        // An earlier failed apply whose sweep could not finish: evidence
+        // retained (storage guard) but marked cleanup_sweep_incomplete, so
+        // a LATER failed apply must still be allowed its own cleanup.
+        let incomplete = Uuid::new_v4();
+        insert_cleanup_deployment(&pool, app_id, incomplete, "failed", Some("old-gen"), false)
+            .await;
+        sqlx::query(
+            "UPDATE deployments SET cleanup_sweep_incomplete = true
+             WHERE id = $1 AND app_id = $2 AND status = 'failed'",
+        )
+        .bind(incomplete)
+        .bind(app_id)
+        .execute(&pool)
+        .await
+        .expect("mark sweep incomplete");
+
+        let later_failed = Uuid::new_v4();
+        insert_cleanup_deployment(
+            &pool,
+            app_id,
+            later_failed,
+            "failed",
+            Some("new-gen"),
+            false,
+        )
+        .await;
+        assert!(
+            no_other_generation_owns_provider_state(&pool, app_id, later_failed)
+                .await
+                .expect("check incomplete predecessor"),
+            "an evidence-retaining but sweep-incomplete row must not block a later failed apply's cleanup"
         );
 
         delete_cleanup_fixture(&pool, app_id).await;

@@ -205,7 +205,7 @@ where
 /// path. Both evidence keys are covered: the generic
 /// RESOURCE_CREATED_BY stamp and the namespace-specific
 /// NAMESPACE_CREATED_BY stamp (namespaces apply through this same path).
-fn preserve_creation_evidence<K>(desired: &mut K, current: &K)
+fn preserve_creation_evidence<K>(desired: &mut K, current: &K, field_manager: &str)
 where
     K: Resource,
 {
@@ -214,20 +214,63 @@ where
         NAMESPACE_CREATED_BY_ANNOTATION,
     ];
     for key in EVIDENCE_KEYS {
-        if let Some(evidence) = current
+        let Some(evidence) = current
             .meta()
             .annotations
             .as_ref()
             .and_then(|annotations| annotations.get(key))
             .cloned()
-        {
-            desired
-                .meta_mut()
-                .annotations
-                .get_or_insert_with(Default::default)
-                .insert(key.to_string(), evidence);
+        else {
+            continue;
+        };
+        // Provenance: only evidence whose annotation key is OWNED by this
+        // control plane's field manager is preserved. Tenant manifests can
+        // set arbitrary annotations on pre-existing objects; without this
+        // check a forged stamp would be preserved, stamped with the
+        // current mutation generation, and later deleted by compensating
+        // cleanup as though CAP had created the object.
+        if !annotation_owned_by_manager(current, key, field_manager) {
+            tracing::warn!(
+                key,
+                "live creation evidence lacks CAP field-manager provenance; refusing to preserve it"
+            );
+            continue;
         }
+        desired
+            .meta_mut()
+            .annotations
+            .get_or_insert_with(Default::default)
+            .insert(key.to_string(), evidence);
     }
+}
+
+/// True when a managed-fields entry authored by `field_manager` (non-status)
+/// owns `metadata.annotations.<key>` on the live object. Fails closed when
+/// managed fields are absent or cannot be attributed.
+fn annotation_owned_by_manager<K>(resource: &K, annotation_key: &str, field_manager: &str) -> bool
+where
+    K: Resource,
+{
+    let Some(entries) = resource.meta().managed_fields.as_ref() else {
+        return false;
+    };
+    if entries.is_empty() {
+        return false;
+    }
+    let owned_path = format!("metadata.annotations.{annotation_key}");
+    entries.iter().any(|entry| {
+        if entry.subresource.as_deref() == Some("status") {
+            return false;
+        }
+        if entry.manager.as_deref() != Some(field_manager) {
+            return false;
+        }
+        entry
+            .fields_v1
+            .as_ref()
+            .and_then(|fields| flatten_owned_paths(&fields.0))
+            .is_some_and(|paths| paths.iter().any(|path| path == &owned_path))
+    })
 }
 
 fn only_trusted_field_managers<K>(resource: &K, field_manager: &str) -> bool
@@ -440,7 +483,7 @@ where
             // fabricated evidence. Only evidence read from THIS live object
             // — the one the write is preconditioned on — survives.
             strip_creation_evidence(&mut desired);
-            preserve_creation_evidence(&mut desired, &current);
+            preserve_creation_evidence(&mut desired, &current, &engine.config().field_manager);
             let applied = if exact_when_trusted && trusted {
                 super::bounded_kube_write(api.replace(name, &post_params, &desired)).await
             } else {
@@ -778,7 +821,23 @@ mod tests {
                 .is_none_or(|a| !a.contains_key(RESOURCE_CREATED_BY_ANNOTATION)),
             "smuggled evidence must be stripped"
         );
-        preserve_creation_evidence(&mut desired, &live_with_evidence);
+        // Give the live object trusted-manager provenance for its evidence.
+        let mut trusted_live = live_with_evidence;
+        trusted_live.metadata.managed_fields = Some(vec![
+            serde_json::from_value(json!({
+                "manager": "enclava-platform",
+                "operation": "Update",
+                "apiVersion": "v1",
+                "fieldsType": "FieldsV1",
+                "fieldsV1": {
+                    "f:metadata": {"f:annotations": {
+                        ("f:".to_string() + RESOURCE_CREATED_BY_ANNOTATION): {},
+                    }},
+                },
+            }))
+            .unwrap(),
+        ]);
+        preserve_creation_evidence(&mut desired, &trusted_live, "enclava-platform");
         assert_eq!(
             desired
                 .meta()
@@ -799,7 +858,24 @@ mod tests {
         }))
         .unwrap();
         strip_creation_evidence(&mut desired2);
-        preserve_creation_evidence(&mut desired2, &live_without_evidence);
+        // A live object without provenance entries at all: nothing is
+        // preserved (fail closed).
+        let mut trusted_live2 = live_without_evidence;
+        trusted_live2.metadata.managed_fields = Some(vec![
+            serde_json::from_value(json!({
+                "manager": "enclava-platform",
+                "operation": "Update",
+                "apiVersion": "v1",
+                "fieldsType": "FieldsV1",
+                "fieldsV1": {
+                    "f:metadata": {"f:annotations": {
+                        ("f:".to_string() + RESOURCE_CREATED_BY_ANNOTATION): {},
+                    }},
+                },
+            }))
+            .unwrap(),
+        ]);
+        preserve_creation_evidence(&mut desired2, &trusted_live2, "enclava-platform");
         assert!(
             desired2
                 .meta()
@@ -807,6 +883,33 @@ mod tests {
                 .as_ref()
                 .is_none_or(|a| !a.contains_key(RESOURCE_CREATED_BY_ANNOTATION)),
             "a live object without evidence must never gain it"
+        );
+
+        // Forged evidence (annotation present) WITHOUT CAP field-manager
+        // provenance: must NOT be preserved — the tenant set it manually.
+        let mut desired3: ConfigMap = serde_json::from_value(json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {"name": "fenced"},
+        }))
+        .unwrap();
+        let forged: ConfigMap = serde_json::from_value(json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "fenced",
+                "annotations": { RESOURCE_CREATED_BY_ANNOTATION: "2" },
+            },
+        }))
+        .unwrap();
+        preserve_creation_evidence(&mut desired3, &forged, "enclava-platform");
+        assert!(
+            desired3
+                .meta()
+                .annotations
+                .as_ref()
+                .is_none_or(|a| !a.contains_key(RESOURCE_CREATED_BY_ANNOTATION)),
+            "forged evidence without CAP provenance must not be preserved"
         );
     }
     #[test]
