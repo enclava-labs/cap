@@ -517,11 +517,21 @@ async fn deploy_with_timings(
     )?;
     let customer_config_hold = response.customer_config_hold;
     let customer_config_hold_remaining_ms = response.customer_config_hold_remaining_ms;
+    // cap#220 review: a missing `cap_deployment_id` must not become a
+    // permanent "pending" exemption -- that silently disables every
+    // terminal-failure check (including the #18 signed-policy rejection)
+    // for the rest of the flow. CAP records the signed descriptor's
+    // `deploy_id` as the deployment id for a fresh deploy (the PaaS
+    // forwards the descriptor unchanged), so the signed id is the
+    // authoritative fallback; if CAP substituted a different id, lookups
+    // for the signed id simply observe nothing -- exactly the pre-fix
+    // behavior -- and can never misattribute another rollout's failure.
     let deployment_id = response
         .deployment
         .cap_deployment_id
         .as_deref()
-        .unwrap_or("pending")
+        .filter(|id| !id.is_empty() && *id != "pending")
+        .unwrap_or(&trusted_deployment.deploy_id)
         .to_string();
     if customer_config_hold && deployment_id == "pending" {
         return Err("PaaS held the workload roll but did not return a deployment id".into());
@@ -6554,6 +6564,37 @@ mod tests {
 
         assert!(body.contains("Stable SSH endpoint: waiting for readiness"));
         assert!(!body.contains("waiting for relay registration"));
+    }
+
+    #[test]
+    fn missing_cap_deployment_id_falls_back_to_the_signed_descriptors_id() {
+        // cap#220 review: a hosted template response that omits
+        // `cap_deployment_id` must not freeze the literal "pending" for the
+        // whole flow -- that permanently disables every terminal-failure
+        // check (including the #18 signed-policy rejection) and the
+        // success-exit reconciliation. The signed descriptor's `deploy_id`
+        // is the authoritative fallback: CAP records it as the deployment id
+        // for a fresh signed deploy, and if CAP substituted a different id,
+        // lookups for the signed id simply observe nothing (the pre-fix
+        // behavior) instead of misattributing another rollout's failure.
+        let source = include_str!("template.rs");
+        let fn_start = source
+            .find("async fn deploy_with_timings")
+            .expect("deploy flow exists");
+        let fn_end = source[fn_start..]
+            .find("async fn prepare_template_log_key")
+            .expect("log key helper follows the deploy flow")
+            + fn_start;
+        let body = &source[fn_start..fn_end];
+
+        assert!(
+            body.contains(".filter(|id| !id.is_empty() && *id != \"pending\")"),
+            "the missing-id fallback must not accept empty or \"pending\" ids: {body}"
+        );
+        assert!(
+            body.contains(".unwrap_or(&trusted_deployment.deploy_id)"),
+            "the signed descriptor's deploy_id must be the fallback: {body}"
+        );
     }
 
     #[test]
