@@ -1735,7 +1735,7 @@ async fn wait_for_template_bootstrap_endpoint(
     }
 }
 
-fn should_retry_template_bootstrap_endpoint_error(error: &ApiError) -> bool {
+pub(crate) fn should_retry_template_bootstrap_endpoint_error(error: &ApiError) -> bool {
     match error {
         ApiError::Http(error) => should_retry_api_transport_error(error),
         // A body that fails to decode or breaches the size cap will not

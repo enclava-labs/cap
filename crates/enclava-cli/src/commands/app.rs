@@ -1074,7 +1074,17 @@ pub(crate) async fn wait_for_bootstrap_endpoint(
                         endpoint.tee_resolve_ip,
                     ));
                 }
-                Err(_) => {
+                Err(error) => {
+                    // Same retry predicate as the template wait: transient
+                    // transport/5xx/rate-limit conditions retry; auth,
+                    // decode, and 404-class failures surface immediately
+                    // instead of burning the whole wait budget.
+                    let error: ApiError = error;
+                    if !crate::commands::template::should_retry_template_bootstrap_endpoint_error(
+                        &error,
+                    ) {
+                        return Err(error.into());
+                    }
                     pb.set_message(timed_progress(
                         "TEE ownership: waiting for endpoint",
                         start.elapsed(),

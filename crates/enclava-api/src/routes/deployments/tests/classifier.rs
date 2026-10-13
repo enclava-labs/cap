@@ -169,11 +169,12 @@ fn stored_error_plaintext_is_redacted_from_public_and_generic_responses() {
 #[test]
 fn bounded_error_codes_cross_the_public_projection() {
     // #18: bounded classification codes (e.g. a KBS signed-policy budget
-    // rejection classified as `kbs_policy_error`) must reach the user
-    // instead of collapsing to the opaque `deployment_error`.
+    // rejection classified as `signed_policy_budget_exceeded`) must reach
+    // the user instead of collapsing to the opaque `deployment_error`.
     let app = idempotency_app();
 
     for code in [
+        "signed_policy_budget_exceeded",
         "kbs_policy_error",
         "deployment_setup_failed",
         "deployment_apply_failed",

@@ -673,8 +673,8 @@ fn deployment_failure_message_includes_api_error_code_detail() {
         image_digest: None,
         // Bounded classification codes now cross the CAP projection
         // allowlist verbatim (#18): a KBS signed-policy budget rejection
-        // surfaces as its code, not opaque plaintext.
-        error_message: Some("kbs_policy_error".to_string()),
+        // surfaces as its own code, not opaque plaintext.
+        error_message: Some("signed_policy_budget_exceeded".to_string()),
         template_slug: None,
         template_version: None,
         template_expected: Default::default(),
@@ -684,7 +684,7 @@ fn deployment_failure_message_includes_api_error_code_detail() {
 
     assert_eq!(
         template_deployment_failure_message(&deployment, "deploy-123"),
-        "deployment deploy-123 failed: kbs_policy_error"
+        "deployment deploy-123 failed: signed_policy_budget_exceeded"
     );
 }
 
@@ -717,6 +717,34 @@ fn deploy_waits_fail_fast_on_terminal_deployment_failure() {
             "{fn_name}: the terminal-failure check must run inside the wait loop before the deadline fires, so a manifest-apply rejection (e.g. KBS signed-policy budget) fails fast instead of timing out ~10 minutes later"
         );
     }
+
+    // The standalone ownership wait must not swallow non-retryable
+    // unlock-endpoint errors until the 900s budget: it fetches the endpoint
+    // lazily inside the loop and routes fetch failures through the same
+    // retry predicate as the template wait (auth/decode/404 fail fast).
+    let fn_start = source
+        .find("async fn wait_for_bootstrap_endpoint")
+        .expect("standalone ownership wait exists");
+    let body = &source[fn_start..];
+    let wait_loop = body.find("loop {").expect("wait loop exists");
+    let check_pos = body
+        .find("fail_if_template_deployment_failed")
+        .expect("wait_for_bootstrap_endpoint must poll the terminal-failure check inside its loop");
+    let fetch_pos = body
+        .find("api.get_unlock_endpoint(app_name).await")
+        .expect("wait_for_bootstrap_endpoint must fetch the unlock endpoint");
+    assert!(
+        wait_loop < check_pos,
+        "the failure check must be inside the loop"
+    );
+    assert!(
+        check_pos < fetch_pos,
+        "the failure check must run before the (potentially blocking) endpoint fetch (#18)"
+    );
+    assert!(
+        body.contains("should_retry_template_bootstrap_endpoint_error"),
+        "endpoint fetch errors must go through the template retry predicate, not an unconditional retry"
+    );
 }
 
 #[test]

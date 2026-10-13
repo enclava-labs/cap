@@ -8399,43 +8399,47 @@ pub(crate) mod tests {
         // deployments row so the public projection allowlist can surface
         // the real reason instead of a constant `deployment_apply_failed`.
         let pool = database_test_pool().await;
-        let (app, deployment_id, _, _) = insert_job_fixture(&pool).await;
-        let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
-            .await
-            .expect("claim code fixture setup")
-            .expect("code fixture setup exists");
-        mark_setup_accepted(&pool, deployment_id, setup.lock_token)
-            .await
-            .expect("accept code fixture setup");
-        let job = claim_job(&pool, "pending", "running", Some(deployment_id))
-            .await
-            .expect("claim code fixture apply")
-            .expect("code fixture apply exists");
+        // Each publication terminalizes its job and deployment, so use a
+        // fresh fixture per code.
+        for failure_code in ["kbs_policy_error", "signed_policy_budget_exceeded"] {
+            let (app, deployment_id, _, _) = insert_job_fixture(&pool).await;
+            let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+                .await
+                .expect("claim code fixture setup")
+                .expect("code fixture setup exists");
+            mark_setup_accepted(&pool, deployment_id, setup.lock_token)
+                .await
+                .expect("accept code fixture setup");
+            let job = claim_job(&pool, "pending", "running", Some(deployment_id))
+                .await
+                .expect("claim code fixture apply")
+                .expect("code fixture apply exists");
 
-        publish_apply_failure_with_mutation(&pool, &job, "kbs_policy_error", None)
-            .await
-            .expect("publish classified apply failure");
+            publish_apply_failure_with_mutation(&pool, &job, failure_code, None)
+                .await
+                .expect("publish classified apply failure");
 
-        let (deploy_status, error_message, job_code): (String, Option<String>, Option<String>) =
-            sqlx::query_as(
-                "SELECT d.status::text, d.error_message, j.last_error_code
+            let (deploy_status, error_message, job_code): (String, Option<String>, Option<String>) =
+                sqlx::query_as(
+                    "SELECT d.status::text, d.error_message, j.last_error_code
                    FROM deployments d
                    JOIN deployment_apply_jobs j ON j.deployment_id = d.id
                   WHERE d.id = $1",
-            )
-            .bind(deployment_id)
-            .fetch_one(&pool)
-            .await
-            .expect("load classified failure");
-        assert_eq!(deploy_status, "failed");
-        assert_eq!(error_message.as_deref(), Some("kbs_policy_error"));
-        assert_eq!(job_code.as_deref(), Some("kbs_policy_error"));
+                )
+                .bind(deployment_id)
+                .fetch_one(&pool)
+                .await
+                .expect("load classified failure");
+            assert_eq!(deploy_status, "failed");
+            assert_eq!(error_message.as_deref(), Some(failure_code));
+            assert_eq!(job_code.as_deref(), Some(failure_code));
 
-        sqlx::query("DELETE FROM organizations WHERE id = $1")
-            .bind(app.org_id)
-            .execute(&pool)
-            .await
-            .expect("delete classified failure fixture");
+            sqlx::query("DELETE FROM organizations WHERE id = $1")
+                .bind(app.org_id)
+                .execute(&pool)
+                .await
+                .expect("delete classified failure fixture");
+        }
     }
 
     #[tokio::test]
