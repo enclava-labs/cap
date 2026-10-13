@@ -259,14 +259,22 @@ impl ArtifactFetcher {
             &self.workload_artifacts_url,
             &self.kbs_attestation_token,
             "fetch artifacts",
+            WORKLOAD_ARTIFACTS_BODY_LIMIT_BYTES,
         )?;
-        let policy_body: serde_json::Value = fetch_json(
+        // The policy body is parsed straight from the capped bytes into the
+        // typed envelope/set shapes — it must never be materialized as a
+        // generic `serde_json::Value` first: a hostile compact array body
+        // (e.g. `[0,0,...]`) expands to ~16x its byte size in `Value` nodes,
+        // which is exactly the amplification this endpoint's byte cap cannot
+        // see (#216 review).
+        let policy_bytes = fetch_body_capped(
             &client,
             &self.trustee_policy_url,
             &self.kbs_attestation_token,
             "fetch policy",
+            TRUSTEE_POLICY_BODY_LIMIT_BYTES,
         )?;
-        let active_policy = parse_trustee_policy_body(policy_body, &bundle)?;
+        let active_policy = parse_trustee_policy_body(&policy_bytes, &bundle)?;
         verify_active_policy_matches_artifact(&active_policy, &bundle.signed_policy_artifact)?;
         let policy = bundle.signed_policy_artifact.clone();
         Ok((bundle, policy))
@@ -274,13 +282,16 @@ impl ArtifactFetcher {
 }
 
 fn parse_trustee_policy_body(
-    policy_body: serde_json::Value,
+    bytes: &[u8],
     bundle: &ArtifactsBundle,
 ) -> Result<ActivePolicyEnvelope> {
-    if let Ok(policy) = serde_json::from_value::<ActivePolicyEnvelope>(policy_body.clone()) {
+    // Typed-first parse: a map-shaped body lands in `ActivePolicyEnvelope`
+    // without any intermediate `Value` tree; array/scalar bodies fail fast
+    // here (map expected) instead of expanding into millions of `Value`s.
+    if let Ok(policy) = serde_json::from_slice::<ActivePolicyEnvelope>(bytes) {
         return Ok(policy);
     }
-    let policy_set: SignedPolicyArtifactSet = serde_json::from_value(policy_body).map_err(|e| {
+    let policy_set: SignedPolicyArtifactSet = serde_json::from_slice(bytes).map_err(|e| {
         InitError::Kbs(format!("fetch policy: unsupported policy body format: {e}"))
     })?;
     if !matches!(
@@ -311,8 +322,9 @@ fn fetch_json<T: DeserializeOwned>(
     url: &str,
     attestation_token: &str,
     context: &str,
+    limit: usize,
 ) -> Result<T> {
-    let bytes = fetch_body_capped(client, url, attestation_token, context)?;
+    let bytes = fetch_body_capped(client, url, attestation_token, context, limit)?;
     serde_json::from_slice(&bytes).map_err(|e| InitError::Kbs(format!("{context} {url} json: {e}")))
 }
 
@@ -321,21 +333,37 @@ fn fetch_json<T: DeserializeOwned>(
 /// Applies to both the `file://` dev/test transport and real HTTP fetches
 /// (declared `content-length` is checked before reading; streamed chunks
 /// are re-checked as they arrive).
-const TRUSTEE_FETCH_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+///
+/// Caps are endpoint-specific and sit near the producer limits (#216
+/// review): a byte cap alone does not bound decoded memory, because
+/// `serde_json::Value` expansion runs ~16x the serialized size (a compact
+/// `[0,0,...]` array spends ~32 bytes of `Value` per 2 input bytes). Keeping
+/// each endpoint's cap close to what its legitimate producer can emit
+/// bounds the worst-case decoded tree well under the sidecar ceiling.
+/// - Policy body: the signed policy set ConfigMap body is capped at
+///   `DEFAULT_SIGNED_POLICY_MAX_BYTES` = 900 KiB on the producer side
+///   (enclava-api `kbs.rs`); allow generous headroom for v1/v2 envelopes.
+/// - Workload artifacts bundle: descriptor + org keyring + one signed
+///   policy artifact; the same producer-side field caps
+///   (`MAX_POLICY_TEXT_BYTES` = 160 KiB agent policy, `MAX_REGO_TEXT_BYTES`
+///   = 24 KiB rego, per-field metadata caps) bound its legitimate size.
+const TRUSTEE_POLICY_BODY_LIMIT_BYTES: usize = 4 * 1024 * 1024;
+const WORKLOAD_ARTIFACTS_BODY_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 
 fn fetch_body_capped(
     client: &reqwest::blocking::Client,
     url: &str,
     attestation_token: &str,
     context: &str,
+    limit: usize,
 ) -> Result<Vec<u8>> {
     if let Some(path) = url.strip_prefix("file://") {
         let metadata = std::fs::metadata(path)
             .map_err(|e| InitError::Kbs(format!("{context} file {path}: {e}")))?;
         let len = metadata.len() as usize;
-        if len > TRUSTEE_FETCH_BODY_LIMIT_BYTES {
+        if len > limit {
             return Err(InitError::Kbs(format!(
-                "{context} file {path}: body exceeds {TRUSTEE_FETCH_BODY_LIMIT_BYTES} byte limit"
+                "{context} file {path}: body exceeds {limit} byte limit"
             )));
         }
         let mut file = std::fs::File::open(path)
@@ -345,12 +373,12 @@ fn fetch_body_capped(
         // so the file cannot grow (or be swapped for a fifo) between the
         // metadata check and the read.
         (&mut file)
-            .take(TRUSTEE_FETCH_BODY_LIMIT_BYTES as u64 + 1)
+            .take(limit as u64 + 1)
             .read_to_end(&mut bytes)
             .map_err(|e| InitError::Kbs(format!("{context} file {path}: {e}")))?;
-        if bytes.len() > TRUSTEE_FETCH_BODY_LIMIT_BYTES {
+        if bytes.len() > limit {
             return Err(InitError::Kbs(format!(
-                "{context} file {path}: body exceeds {TRUSTEE_FETCH_BODY_LIMIT_BYTES} byte limit"
+                "{context} file {path}: body exceeds {limit} byte limit"
             )));
         }
         return Ok(bytes);
@@ -364,10 +392,10 @@ fn fetch_body_capped(
         .error_for_status()
         .map_err(|e| request_error(&format!("{context} status"), url, e))?;
     if let Some(len) = response.content_length()
-        && len as usize > TRUSTEE_FETCH_BODY_LIMIT_BYTES
+        && len as usize > limit
     {
         return Err(InitError::Kbs(format!(
-            "{context} {url}: body exceeds {TRUSTEE_FETCH_BODY_LIMIT_BYTES} byte limit"
+            "{context} {url}: body exceeds {limit} byte limit"
         )));
     }
     let mut body = Vec::new();
@@ -379,9 +407,9 @@ fn fetch_body_capped(
         if read == 0 {
             break;
         }
-        if body.len() + read > TRUSTEE_FETCH_BODY_LIMIT_BYTES {
+        if body.len() + read > limit {
             return Err(InitError::Kbs(format!(
-                "{context} {url}: body exceeds {TRUSTEE_FETCH_BODY_LIMIT_BYTES} byte limit"
+                "{context} {url}: body exceeds {limit} byte limit"
             )));
         }
         body.extend_from_slice(&chunk[..read]);
@@ -391,6 +419,18 @@ fn fetch_body_capped(
 
 fn request_error(context: &str, url: &str, err: reqwest::Error) -> InitError {
     InitError::Kbs(format!("{context} {url}: {err}; debug={err:?}"))
+}
+
+/// Hard cap for the KBS attestation-token response: the legitimate payload
+/// is a small JWT (a few KiB); anything larger is hostile. Kept tiny so the
+/// subsequent JSON decode cannot amplify a hostile body past the sidecar
+/// ceiling (#216 review: byte caps alone do not bound decoded memory).
+const KBS_ATTESTATION_TOKEN_BODY_LIMIT_BYTES: usize = 64 * 1024;
+
+#[derive(Deserialize)]
+struct KbsAttestationTokenPayload {
+    #[serde(default)]
+    token: Option<String>,
 }
 
 pub fn resolve_kbs_attestation_token(
@@ -412,10 +452,10 @@ pub fn resolve_kbs_attestation_token(
         .and_then(|r| r.error_for_status())
         .map_err(|e| InitError::Kbs(format!("fetch KBS attestation token: {e}")))?;
     if let Some(len) = response.content_length()
-        && len as usize > TRUSTEE_FETCH_BODY_LIMIT_BYTES
+        && len as usize > KBS_ATTESTATION_TOKEN_BODY_LIMIT_BYTES
     {
         return Err(InitError::Kbs(format!(
-            "KBS attestation token response exceeds {TRUSTEE_FETCH_BODY_LIMIT_BYTES} byte limit"
+            "KBS attestation token response exceeds {KBS_ATTESTATION_TOKEN_BODY_LIMIT_BYTES} byte limit"
         )));
     }
     let mut body = Vec::new();
@@ -427,22 +467,26 @@ pub fn resolve_kbs_attestation_token(
         if read == 0 {
             break;
         }
-        if body.len() + read > TRUSTEE_FETCH_BODY_LIMIT_BYTES {
+        if body.len() + read > KBS_ATTESTATION_TOKEN_BODY_LIMIT_BYTES {
             return Err(InitError::Kbs(format!(
-                "KBS attestation token response exceeds {TRUSTEE_FETCH_BODY_LIMIT_BYTES} byte limit"
+                "KBS attestation token response exceeds {KBS_ATTESTATION_TOKEN_BODY_LIMIT_BYTES} byte limit"
             )));
         }
         body.extend_from_slice(&chunk[..read]);
     }
-    let payload: serde_json::Value = serde_json::from_slice(&body)
-        .map_err(|e| InitError::Kbs(format!("parse KBS attestation token response: {e}")))?;
-    parse_kbs_attestation_token_payload(&payload)
+    parse_kbs_attestation_token_payload(&body)
 }
 
-fn parse_kbs_attestation_token_payload(payload: &serde_json::Value) -> Result<String> {
+fn parse_kbs_attestation_token_payload(payload: &[u8]) -> Result<String> {
+    // Typed parse: never materialize the token response as a generic
+    // `serde_json::Value` tree (#216 review).
+    let payload: KbsAttestationTokenPayload = serde_json::from_slice(payload)
+        .map_err(|e| InitError::Kbs(format!("parse KBS attestation token response: {e}")))?;
+    // Treat a missing/empty token uniformly as "missing" rather than
+    // surfacing serde's per-field wording.
     let token = payload
-        .get("token")
-        .and_then(|value| value.as_str())
+        .token
+        .as_deref()
         .map(str::trim)
         .filter(|token| !token.is_empty())
         .ok_or_else(|| InitError::Kbs("KBS attestation token response missing token".into()))?;
@@ -629,7 +673,11 @@ fn ce_v1_descriptor_full_message(descriptor: &serde_json::Value) -> Result<Vec<u
 }
 
 fn parse_descriptor(descriptor: &serde_json::Value) -> Result<DeploymentDescriptor> {
-    serde_json::from_value(descriptor.clone())
+    // Zero-copy: deserialize from the borrowed Value instead of
+    // `from_value(descriptor.clone())`, which would re-materialize the
+    // whole (possibly hostile, amplification-carrying) subtree (#216
+    // review follow-up).
+    DeploymentDescriptor::deserialize(descriptor)
         .map_err(|e| InitError::TrusteePolicy(format!("descriptor schema: {e}")))
 }
 
@@ -644,7 +692,9 @@ fn ce_v1_policy_envelope_message(env: &PolicyEnvelope) -> Result<Vec<u8>> {
 }
 
 fn ce_v1_keyring_bytes(keyring: &serde_json::Value) -> Result<Vec<u8>> {
-    let keyring: InitOrgKeyring = serde_json::from_value(keyring.clone())
+    // Zero-copy for the same reason as parse_descriptor (#216 review
+    // follow-up): no from_value(keyring.clone()) re-materialization.
+    let keyring: InitOrgKeyring = InitOrgKeyring::deserialize(keyring)
         .map_err(|e| InitError::TrusteePolicy(format!("keyring schema: {e}")))?;
     canonical_keyring_bytes(&keyring)
 }
