@@ -1048,10 +1048,9 @@ pub(crate) async fn wait_for_bootstrap_endpoint(
     let start = std::time::Instant::now();
 
     loop {
-        // Poll the terminal-failure check before any endpoint fetch: a
-        // rejected deployment must fail fast rather than block on a
-        // request whose response would never satisfy it (#18).
-        fail_if_template_deployment_failed(api, app_name, deployment_id).await?;
+        // Check the wait deadline before polling deployment history: once
+        // the budget is gone the wait must return instead of issuing one
+        // more request that could outlive it (cap#220 review).
         if start.elapsed() > max_wait {
             pb.abandon_with_message("TEE ownership timed out");
             return Err(format!(
@@ -1060,6 +1059,12 @@ pub(crate) async fn wait_for_bootstrap_endpoint(
             )
             .into());
         }
+        // Poll the terminal-failure check before any endpoint fetch: a
+        // rejected deployment must fail fast rather than block on a
+        // request whose response would never satisfy it (#18). The history
+        // lookup is bounded by the wait's remaining budget, so a stalled
+        // response can never consume the wait (cap#220 review).
+        fail_if_template_deployment_failed(api, app_name, deployment_id, start + max_wait).await?;
 
         pb.set_message(timed_progress(
             "TEE ownership: waiting for attested endpoint",
@@ -1211,7 +1216,9 @@ async fn wait_for_deploy_runtime(
     let mut terminal_probe_at: Option<Instant> = None;
 
     loop {
-        fail_if_template_deployment_failed(api, app_name, expected_deployment_id).await?;
+        // Check the wait deadline before polling deployment history: once
+        // the budget is gone the wait must return instead of issuing one
+        // more request that could outlive it (cap#220 review).
         if start.elapsed() > max_wait {
             pb.abandon_with_message("TEE boot timed out");
             return Err(format!(
@@ -1220,6 +1227,12 @@ async fn wait_for_deploy_runtime(
             )
             .into());
         }
+        // Fail fast on a terminalized deployment before any readiness poll
+        // (#18). The history lookup is bounded by the wait's remaining
+        // budget, so a stalled response can never consume the wait and make
+        // a healthy deployment report a boot timeout (cap#220 review).
+        fail_if_template_deployment_failed(api, app_name, expected_deployment_id, start + max_wait)
+            .await?;
 
         pb.set_message(timed_progress(
             "TEE boot: waiting for runtime",
@@ -1389,20 +1402,39 @@ fn observation_allows_direct_tee_fallback(
     })
 }
 
+/// Hard cap on one deployment-history lookup inside a wait loop (the
+/// terminal-failure check). The shared HTTP client's per-request timeout is
+/// generous (it also covers slow deploy/setup calls), so without this cap a
+/// stalled `/apps/{app}/deployments` response can hold the failure check for
+/// up to that timeout and consume the enclosing wait's entire budget -- a
+/// healthy deployment then reports a wait timeout instead of readiness
+/// (cap#220 review).
+const DEPLOYMENT_HISTORY_LOOKUP_BUDGET: Duration = Duration::from_secs(15);
+
+/// Budget for one deployment-history lookup: the hard cap, never more than
+/// the enclosing wait's remaining time -- and nothing at all once the wait's
+/// deadline has passed, so no lookup starts after the budget is gone.
+fn deployment_history_lookup_budget(wait_deadline: Instant) -> Duration {
+    DEPLOYMENT_HISTORY_LOOKUP_BUDGET.min(wait_deadline.saturating_duration_since(Instant::now()))
+}
+
 /// Fail fast when CAP has already terminalized the deployment we are waiting
 /// on (#18): a manifest-apply rejection (e.g. the KBS signed-policy byte
 /// budget) otherwise surfaces only as an opaque wait timeout ~10 minutes
 /// later. Shared by the standalone `app deploy` waits and the hosted
-/// template deploy flow.
+/// template deploy flow. The history lookup is bounded by the enclosing
+/// wait's remaining budget so a stalled response can never consume it
+/// (cap#220 review).
 pub(crate) async fn fail_if_template_deployment_failed(
     api: &ApiClient,
     app_name: &str,
     deployment_id: &str,
+    wait_deadline: Instant,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if deployment_id == "pending" {
         return Ok(());
     }
-    match template_deployment_failure(api, app_name, deployment_id).await {
+    match template_deployment_failure(api, app_name, deployment_id, wait_deadline).await {
         Ok(Some(message)) => Err(message.into()),
         Ok(None) => Ok(()),
         Err(error) if should_retry_template_deployment_status_error(&error) => Ok(()),
@@ -1414,10 +1446,25 @@ async fn template_deployment_failure(
     api: &ApiClient,
     app_name: &str,
     deployment_id: &str,
+    wait_deadline: Instant,
 ) -> Result<Option<String>, ApiError> {
-    let deployment = api
-        .list_deployments(app_name)
-        .await?
+    let budget = deployment_history_lookup_budget(wait_deadline);
+    if budget.is_zero() {
+        // The wait's deadline has already passed: an observation arriving
+        // now could only land after the budget is gone, so skip the request
+        // entirely and let the wait's own deadline report the timeout.
+        return Ok(None);
+    }
+    // Bounded lookup (cap#220 review): a history response that cannot
+    // arrive within the budget is indistinguishable from "no failure
+    // observed" -- keep waiting and let the wait's deadline decide, instead
+    // of burning the whole wait on a stalled response.
+    let lookup = tokio::time::timeout(budget, api.list_deployments(app_name)).await;
+    let deployments = match lookup {
+        Ok(result) => result?,
+        Err(_) => return Ok(None),
+    };
+    let deployment = deployments
         .into_iter()
         .find(|deployment| deployment.id == deployment_id);
     Ok(deployment

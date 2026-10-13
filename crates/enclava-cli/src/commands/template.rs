@@ -1544,9 +1544,10 @@ async fn wait_for_template_bootstrap_endpoint(
     let mut tee = None;
 
     loop {
-        fail_if_template_deployment_failed(api, app_name, deployment_id, Some(wait_deadline))
-            .await?;
-        if Instant::now() > wait_deadline {
+        // Check the wait deadline before polling deployment history: once
+        // the budget is gone the wait must return instead of issuing one
+        // more request that could outlive it (cap#220 review).
+        if Instant::now() >= wait_deadline {
             pb.abandon_with_message("TEE ownership timed out");
             return Err(format!(
                 "TEE ownership for app {app_name} did not become ready within {}; run `enclava status --app {app_name}` for the latest state",
@@ -1554,6 +1555,11 @@ async fn wait_for_template_bootstrap_endpoint(
             )
             .into());
         }
+        // Fail fast on a terminalized deployment before any endpoint fetch
+        // (#18). The history lookup is bounded by the wait's remaining
+        // budget, so a stalled response can never consume the wait (cap#220
+        // review).
+        fail_if_template_deployment_failed(api, app_name, deployment_id, Some(wait_deadline)).await?;
 
         pb.set_message(timed_progress(
             "TEE ownership: waiting for attested endpoint",
@@ -2483,8 +2489,6 @@ async fn wait_for_paas_managed_config_keys(
         delivery_id.is_some() && !delivered_receipt,
     ));
     loop {
-        fail_if_template_deployment_failed(api, instance_name, deployment_id, read_deadline)
-            .await?;
         // Enforce the phase deadline before each read: once reads are bounded
         // by `deadline`, a cut at the deadline is indistinguishable from an
         // expiry, so the expiry is reported here — with the last
@@ -2500,6 +2504,9 @@ async fn wait_for_paas_managed_config_keys(
             )
             .into());
         }
+        // Bounded by the wait's remaining budget (cap#220 review); the loop
+        // deadline above already guarantees the budget is positive here.
+        fail_if_template_deployment_failed(api, instance_name, deployment_id, read_deadline).await?;
         // TLS provisioning starts around the claim, so a terminal bootstrap
         // diagnostic must stop this post-claim wait promptly. The probe is
         // bound to the expected deployment via CAP before and after the
@@ -3416,8 +3423,8 @@ async fn wait_for_paas_ssh_command(
             timeout,
         ));
         // Post-release on the deploy flow and unheld on the standalone
-        // resumption: no pre-release deadline applies to this wait.
-        fail_if_template_deployment_failed(api, app_name, deployment_id, None).await?;
+        // resumption: the wait budget still bounds the history request.
+        fail_if_template_deployment_failed(api, app_name, deployment_id, Some(start + timeout)).await?;
         // Post-claim wait: one deployment-bound attested status read covers
         // both stop conditions -- a terminal bootstrap diagnostic, and a
         // password-mode relock (the pod rolled, the TEE came back locked, and

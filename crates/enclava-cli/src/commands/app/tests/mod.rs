@@ -693,28 +693,50 @@ fn deploy_waits_fail_fast_on_terminal_deployment_failure() {
     // CRLF checkouts (Windows autocrlf) must not break source matching.
     let source = include_str!("../../app.rs").replace("\r\n", "\n");
 
-    for (fn_name, deadline_message) in [
+    for (fn_name, deadline_message, blocking_call, bounded_check) in [
         (
             "async fn wait_for_bootstrap_endpoint",
             "TEE ownership timed out",
+            "api.get_unlock_endpoint(app_name).await",
+            "fail_if_template_deployment_failed(api,app_name,deployment_id,start+max_wait)",
         ),
-        ("async fn wait_for_deploy_runtime", "TEE boot timed out"),
+        (
+            "async fn wait_for_deploy_runtime",
+            "TEE boot timed out",
+            "api.get_status(app_name).await",
+            "fail_if_template_deployment_failed(api,app_name,expected_deployment_id,start+max_wait)",
+        ),
     ] {
         let fn_start = source
             .find(fn_name)
             .unwrap_or_else(|| panic!("{fn_name} must exist so standalone app deploy waits exist"));
         let body = &source[fn_start..];
+        let wait_loop = body.find("loop {").expect("wait loop exists");
+        let deadline = body
+            .find(deadline_message)
+            .unwrap_or_else(|| panic!("{fn_name} must keep its deadline guard"));
         let failure_check = body
             .find("fail_if_template_deployment_failed")
             .unwrap_or_else(|| {
                 panic!("{fn_name} must poll for a terminal deployment failure (#18)")
             });
-        let deadline = body
-            .find(deadline_message)
-            .unwrap_or_else(|| panic!("{fn_name} must keep its deadline guard"));
+        let blocking = body
+            .find(blocking_call)
+            .unwrap_or_else(|| panic!("{fn_name} must keep its readiness poll"));
         assert!(
-            failure_check < deadline,
-            "{fn_name}: the terminal-failure check must run inside the wait loop before the deadline fires, so a manifest-apply rejection (e.g. KBS signed-policy budget) fails fast instead of timing out ~10 minutes later"
+            wait_loop < deadline && deadline < failure_check,
+            "{fn_name}: check the wait deadline before polling deployment history (cap#220 review), so an unresponsive API cannot extend the wait past its budget"
+        );
+        assert!(
+            failure_check < blocking,
+            "{fn_name}: the terminal-failure check must run inside the wait loop before the (potentially blocking) readiness request, so a manifest-apply rejection (e.g. KBS signed-policy budget) fails fast instead of timing out ~10 minutes later (#18)"
+        );
+        // Whitespace-insensitive so rustfmt line wrapping cannot break the
+        // wiring check: the failure check must receive the wait's deadline.
+        let dense: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            dense.contains(bounded_check),
+            "{fn_name}: the history lookup must be bounded by the wait's remaining budget (cap#220 review)"
         );
     }
 
@@ -726,25 +748,31 @@ fn deploy_waits_fail_fast_on_terminal_deployment_failure() {
         .find("async fn wait_for_bootstrap_endpoint")
         .expect("standalone ownership wait exists");
     let body = &source[fn_start..];
-    let wait_loop = body.find("loop {").expect("wait loop exists");
-    let check_pos = body
-        .find("fail_if_template_deployment_failed")
-        .expect("wait_for_bootstrap_endpoint must poll the terminal-failure check inside its loop");
-    let fetch_pos = body
-        .find("api.get_unlock_endpoint(app_name).await")
-        .expect("wait_for_bootstrap_endpoint must fetch the unlock endpoint");
-    assert!(
-        wait_loop < check_pos,
-        "the failure check must be inside the loop"
-    );
-    assert!(
-        check_pos < fetch_pos,
-        "the failure check must run before the (potentially blocking) endpoint fetch (#18)"
-    );
     assert!(
         body.contains("should_retry_template_bootstrap_endpoint_error"),
         "endpoint fetch errors must go through the template retry predicate, not an unconditional retry"
     );
+}
+
+#[test]
+fn deployment_history_lookup_budget_is_capped_by_the_wait_deadline() {
+    // Far deadline: the hard cap applies, never the client's request timeout.
+    let far = std::time::Instant::now() + std::time::Duration::from_secs(600);
+    assert_eq!(
+        deployment_history_lookup_budget(far),
+        DEPLOYMENT_HISTORY_LOOKUP_BUDGET
+    );
+    // Nearly exhausted wait: only the remaining time may be used.
+    let nearly_exhausted = std::time::Instant::now() + std::time::Duration::from_millis(200);
+    let budget = deployment_history_lookup_budget(nearly_exhausted);
+    assert!(budget > std::time::Duration::ZERO);
+    assert!(budget <= std::time::Duration::from_millis(200));
+    // Exhausted wait: no lookup may start at all.
+    assert!(deployment_history_lookup_budget(std::time::Instant::now()).is_zero());
+    let past = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(1))
+        .unwrap_or_else(std::time::Instant::now);
+    assert!(deployment_history_lookup_budget(past).is_zero());
 }
 
 #[test]
@@ -2670,6 +2698,65 @@ mod terminal_diagnostics {
             .await
             .is_none()
         );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn terminal_failure_check_bounds_a_stalled_history_lookup() {
+        // The terminal-failure check's history lookup must never consume the
+        // enclosing wait's budget (cap#220 review): a `/deployments` endpoint
+        // that accepts TCP but never responds is cut at the wait's remaining
+        // budget and reads as "no failure observed", and once the wait's
+        // deadline has passed no lookup is issued at all.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let accepted = std::sync::Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accepted_by_server = accepted.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                accepted_by_server.fetch_add(1, Ordering::SeqCst);
+                // Accept and stall: read nothing, write nothing.
+                let mut sink = [0_u8; 1024];
+                loop {
+                    match stream.read(&mut sink).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => std::future::pending::<()>().await,
+                    }
+                }
+            }
+        });
+        let api = ApiClient::new(&format!("http://{address}"), Some("test".to_string()));
+
+        // Deadline already passed: no request may be issued at all.
+        fail_if_template_deployment_failed(&api, "demo", "deploy-1", std::time::Instant::now())
+            .await
+            .expect("an exhausted wait budget must not turn a stalled lookup into an error");
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            0,
+            "a passed wait deadline must skip the history lookup entirely"
+        );
+
+        // Bounded by the remaining wait budget instead of the client's
+        // request timeout: the wait returns and a healthy deployment's
+        // readiness poll can still proceed.
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            fail_if_template_deployment_failed(
+                &api,
+                "demo",
+                "deploy-1",
+                std::time::Instant::now() + std::time::Duration::from_millis(250),
+            ),
+        )
+        .await
+        .expect("the failure check must return within the wait budget, not the client timeout");
+        outcome.expect("a stalled history lookup must read as no failure observed");
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
