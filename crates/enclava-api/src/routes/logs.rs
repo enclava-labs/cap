@@ -247,7 +247,7 @@ async fn tenant_tee_logs_client(
     confidential_domain: &str,
 ) -> (reqwest::Client, String) {
     match resolve_internal_tee_socket(app_name, namespace).await {
-        Some(socket) => match build_resolved_tenant_tee_http_client(confidential_domain, socket) {
+        Ok(socket) => match build_resolved_tenant_tee_http_client(confidential_domain, socket) {
             Ok(client) => (
                 client,
                 format!(
@@ -268,37 +268,40 @@ async fn tenant_tee_logs_client(
                 )
             }
         },
-        None => (
-            state.tee_http_client.clone(),
-            format!("https://{confidential_domain}/.well-known/confidential/logs"),
-        ),
-    }
-}
-
-pub(crate) async fn resolve_internal_tee_socket(
-    app_name: &str,
-    namespace: &str,
-) -> Option<SocketAddr> {
-    let target = match crate::edge::resolve_backend_target(app_name, namespace, 443).await {
-        Ok(target) => target,
-        Err(err) => {
+        Err(detail) => {
             tracing::warn!(
                 app = %app_name,
                 namespace = %namespace,
-                error = %err,
-                "failed to resolve internal tenant TEE endpoint"
+                detail = %detail,
+                "failed to resolve internal tenant TEE endpoint for logs; falling back to public TEE DNS"
             );
-            return None;
+            (
+                state.tee_http_client.clone(),
+                format!("https://{confidential_domain}/.well-known/confidential/logs"),
+            )
+        }
+    }
+}
+
+/// Resolve the internal tenant TEE socket for a probe. Returns the resolution
+/// failure detail on error; callers decide how to log it (the status probe
+/// routes it through its per-app rate-limited warn limiter with
+/// `stage="resolve_socket"`).
+pub(crate) async fn resolve_internal_tee_socket(
+    app_name: &str,
+    namespace: &str,
+) -> Result<SocketAddr, String> {
+    let target = match crate::edge::resolve_backend_target(app_name, namespace, 443).await {
+        Ok(target) => target,
+        Err(err) => {
+            return Err(format!(
+                "failed to resolve the internal tenant TEE endpoint: {}",
+                crate::routes::workload::format_error_chain(&err)
+            ));
         }
     };
-    parse_socket_addr(&target).or_else(|| {
-        tracing::warn!(
-            app = %app_name,
-            namespace = %namespace,
-            target = %target,
-            "internal tenant TEE endpoint did not resolve to an IP socket"
-        );
-        None
+    parse_socket_addr(&target).ok_or_else(|| {
+        format!("internal tenant TEE endpoint did not resolve to an IP socket: {target}")
     })
 }
 

@@ -2065,6 +2065,9 @@ pub(crate) mod test_support {
             .unwrap(),
             trustee_http_client: reqwest::Client::new(),
             tee_http_client: reqwest::Client::new(),
+            recent_tee_probe_failures: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::state::TeeProbeFailureCache::default(),
+            )),
             attestation: Some(AttestationConfig {
                 proxy_image: ImageRef::parse(
                     "ghcr.io/enclava-labs/attestation-proxy@sha256:1111111111111111111111111111111111111111111111111111111111111111",
