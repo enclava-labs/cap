@@ -277,7 +277,7 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
                 }
                 break; // never created, or already deleted
             };
-            if !is_cap_created_generation_leftover(&live.metadata, generation.get()) {
+            if !is_cap_created_generation_leftover(&live, generation.get()) {
                 // Foreign (no creation evidence — includes objects CAP
                 // merely SSA-patched), or a newer generation's publication:
                 // never delete on name alone.
@@ -414,10 +414,11 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
 /// proved no other deployment of this app retains provider state, so an
 /// older created object can only be a leftover of an earlier failed
 /// apply — exactly what must not survive generation after generation.
-fn is_cap_created_generation_leftover(
-    metadata: &k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta,
-    failed_generation: i64,
-) -> bool {
+fn is_cap_created_generation_leftover<K>(resource: &K, failed_generation: i64) -> bool
+where
+    K: kube::Resource,
+{
+    let metadata = resource.meta();
     let annotation = |key: &str| {
         metadata
             .annotations
@@ -430,9 +431,26 @@ fn is_cap_created_generation_leftover(
     else {
         return false;
     };
+    if !(created_by > 0) {
+        return false;
+    }
+    // Value alone is not proof: SSA omission cannot remove a marker a
+    // tenant's field manager owns, so a pre-existing object carrying a
+    // tenant-authored creation annotation keeps it after CAP stamps the
+    // mutation generation. Require CAP field-manager provenance over
+    // that annotation on the LIVE object (the create POST attributes
+    // its fields to the enclava-platform manager). Fails closed when
+    // managed fields are absent.
+    if !enclava_engine::apply::generation::annotation_owned_by_manager(
+        resource,
+        enclava_engine::apply::generation::RESOURCE_CREATED_BY_ANNOTATION,
+        &enclava_engine::apply::types::ApplyConfig::default().field_manager,
+    ) {
+        return false;
+    }
     let live_generation =
         annotation(enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION);
-    created_by > 0 && live_generation.is_some_and(|live| live > 0 && live <= failed_generation)
+    live_generation.is_some_and(|live| live > 0 && live <= failed_generation)
 }
 
 /// Bounded re-read retry budget for preconditioned sweep deletes.
@@ -990,11 +1008,18 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
             // the failed generation (COALESCE keeps the earliest), which
             // is exactly the start of CAP's write window; fall back to
             // created_at only when it was never set.
+            // The bound is the EARLIEST write-window start across this
+            // row AND every still-incomplete sibling row: a completed
+            // sweep clears those siblings' evidence (their shared-name
+            // objects were converged), so their older retained claims
+            // must be within this sweep's deletion window — otherwise a
+            // pre-sibling claim is skipped here and then forgotten when
+            // the marker clears.
             let apply_started_at = sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
-                "SELECT COALESCE(observing_since, created_at) FROM deployments WHERE id = $1 AND app_id = $2",
+                "SELECT MIN(COALESCE(observing_since, created_at)) FROM deployments WHERE app_id = $1 AND (id = $2 OR cleanup_sweep_incomplete)",
             )
-            .bind(failed_deployment_id)
             .bind(app.id)
+            .bind(failed_deployment_id)
             .fetch_one(&state.db)
             .await
             .ok();
@@ -1554,17 +1579,38 @@ async fn delete_owned_namespace(
                 // only an object that still carries this generation's
                 // exact annotation, creation evidence, AND the same UID
                 // may be deleted (with its fresh resourceVersion).
-                let live = match api.get(&app.namespace).await {
-                    Ok(live) => live,
-                    Err(kube::Error::Api(error)) if error.code == 404 => {
-                        return NamespaceTeardown::ConfirmedAbsent;
-                    }
-                    Err(error) => {
+                // Bound the conflict re-read: it sits outside both the
+                // delete request budget and the convergence deadline, so
+                // a stalled GET here could otherwise hold the shared
+                // fences for the client's ~295 s default.
+                let live = match tokio::time::timeout(
+                    NAMESPACE_DELETE_REQUEST_TIMEOUT,
+                    api.get(&app.namespace),
+                )
+                .await
+                {
+                    Ok(result) => match result {
+                        Ok(live) => live,
+                        Err(kube::Error::Api(error)) if error.code == 404 => {
+                            // Vanished during the conflict handling:
+                            // nothing of ours remains.
+                            return NamespaceTeardown::ConfirmedAbsent;
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                app_id = %app.id,
+                                namespace = %app.namespace,
+                                error = %error,
+                                "failed-apply namespace delete conflict re-read failed; retaining the namespace fence for reconciliation"
+                            );
+                            return NamespaceTeardown::DeleteIncomplete;
+                        }
+                    },
+                    Err(_) => {
                         tracing::warn!(
                             app_id = %app.id,
                             namespace = %app.namespace,
-                            error = %error,
-                            "failed-apply namespace delete conflict could not be re-inspected; retaining the namespace fence for reconciliation"
+                            "failed-apply namespace delete conflict re-read timed out; retaining the namespace fence for reconciliation"
                         );
                         return NamespaceTeardown::DeleteIncomplete;
                     }
@@ -2242,17 +2288,64 @@ mod tests {
         ));
     }
 
-    fn object_meta_with_annotations(
+    fn object_meta_with_annotations(pairs: &[(&str, i64)]) -> kube::api::DynamicObject {
+        sweep_leftover_object(pairs, true)
+    }
+
+    /// A sweep target object with the given annotations; when
+    /// `cap_provenance` is set, the creation annotation is owned by an
+    /// enclava-platform managed-fields entry (as the create POST leaves
+    /// it). Without it, the marker is tenant-authored.
+    fn sweep_leftover_object(
         pairs: &[(&str, i64)],
-    ) -> k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+        cap_provenance: bool,
+    ) -> kube::api::DynamicObject {
         let annotations = pairs
             .iter()
             .map(|(key, value)| (key.to_string(), value.to_string()))
             .collect();
-        k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
-            annotations: Some(annotations),
-            ..Default::default()
+        let has_creation = pairs.iter().any(|(key, _)| {
+            *key == enclava_engine::apply::generation::RESOURCE_CREATED_BY_ANNOTATION
+        });
+        let managed_fields = (cap_provenance && has_creation).then(|| {
+            vec![k8s_openapi::apimachinery::pkg::apis::meta::v1::ManagedFieldsEntry {
+                manager: Some("enclava-platform".to_string()),
+                fields_v1: Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::FieldsV1(
+                    serde_json::json!({
+                        "f:metadata": {
+                            "f:annotations": {
+                                format!("f:{}", enclava_engine::apply::generation::RESOURCE_CREATED_BY_ANNOTATION): {}
+                            }
+                        }
+                    }),
+                )),
+                ..Default::default()
+            }]
+        });
+        kube::api::DynamicObject {
+            metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+                annotations: Some(annotations),
+                managed_fields,
+                ..Default::default()
+            },
+            types: None,
+            data: serde_json::Value::Null,
         }
+    }
+
+    fn unparseable_mutation_object() -> kube::api::DynamicObject {
+        let mut object = sweep_leftover_object(&[], true);
+        object.metadata.annotations = Some(std::collections::BTreeMap::from([
+            (
+                enclava_engine::apply::generation::RESOURCE_CREATED_BY_ANNOTATION.to_string(),
+                "7".to_string(),
+            ),
+            (
+                enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION.to_string(),
+                "junk".to_string(),
+            ),
+        ]));
+        object
     }
 
     #[test]
@@ -2294,25 +2387,25 @@ mod tests {
         ));
         // Foreign object: no annotations at all.
         assert!(!is_cap_created_generation_leftover(
-            &k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta::default(),
+            &sweep_leftover_object(&[], false),
+            7
+        ));
+        // Codex tGA: tenant-authored creation marker (value present, no
+        // CAP managed-fields provenance) must not authorize deletion.
+        assert!(!is_cap_created_generation_leftover(
+            &sweep_leftover_object(
+                &[
+                    (generation_annotations::RESOURCE_CREATED_BY_ANNOTATION, 7),
+                    (generation_annotations::MUTATION_GENERATION_ANNOTATION, 7),
+                ],
+                false
+            ),
             7
         ));
         // Creation evidence alone with an unparseable mutation annotation:
         // undecidable last-writer, skip.
         assert!(!is_cap_created_generation_leftover(
-            &k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
-                annotations: Some(std::collections::BTreeMap::from([
-                    (
-                        generation_annotations::RESOURCE_CREATED_BY_ANNOTATION.to_string(),
-                        "7".to_string()
-                    ),
-                    (
-                        generation_annotations::MUTATION_GENERATION_ANNOTATION.to_string(),
-                        "junk".to_string()
-                    ),
-                ])),
-                ..Default::default()
-            },
+            &unparseable_mutation_object(),
             7
         ));
     }
