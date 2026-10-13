@@ -4152,3 +4152,262 @@ async fn existing_app_storage_resize_is_refused_before_persistence() {
         "initial size selection was refused as a resize: {first_deploy_body}"
     );
 }
+
+// --- #90 owner-facing deployment lifecycle diagnostics ---
+
+#[allow(clippy::too_many_arguments)]
+async fn seed_diagnostics_fixture(
+    pool: &sqlx::PgPool,
+    org_id: Uuid,
+    app_id: Uuid,
+    deployment_id: Uuid,
+    job_state: &str,
+    job_lock_token: Option<Uuid>,
+    next_attempt_at: Option<chrono::DateTime<chrono::Utc>>,
+    attempts: i32,
+) {
+    // The schema requires a non-terminal deployment to carry its durable
+    // apply job atomically (require_nonterminal_deployment_apply_job), so
+    // both rows are seeded in one transaction.
+    let mut tx = pool.begin().await.expect("begin diagnostics fixture tx");
+
+    sqlx::query(
+        "INSERT INTO deployments (
+             id, org_id, app_id, trigger, status, spec_snapshot,
+             image_digest, cosign_verified
+         ) VALUES (
+             $1, $2, $3, 'api', 'applying', $4,
+             'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', true
+         )",
+    )
+    .bind(deployment_id)
+    .bind(org_id)
+    .bind(app_id)
+    .bind(serde_json::json!({"setup_state": "applied"}))
+    .execute(&mut *tx)
+    .await
+    .expect("seed deployment row");
+
+    sqlx::query(
+        "INSERT INTO deployment_apply_jobs (
+             deployment_id, app_id, org_id, source_deployment_id,
+             payload_version, payload, payload_sha256,
+             cleanup_app_on_setup_failure, signed_required,
+             state, lock_token, locked_until, attempts, next_attempt_at
+         ) VALUES (
+             $1, $2, $3, $1,
+             1, $4, $5,
+             false, false,
+             $6, $7, $8, $9, $10
+         )",
+    )
+    .bind(deployment_id)
+    .bind(app_id)
+    .bind(org_id)
+    .bind(serde_json::json!({"version": 1, "log_encryption": null}))
+    .bind(vec![0u8; 32])
+    .bind(job_state)
+    .bind(job_lock_token)
+    .bind(job_lock_token.map(|_| chrono::Utc::now() + chrono::Duration::minutes(5)))
+    .bind(attempts)
+    .bind(next_attempt_at.unwrap_or_else(chrono::Utc::now))
+    .execute(&mut *tx)
+    .await
+    .expect("seed apply job row");
+    tx.commit().await.expect("commit diagnostics fixture");
+}
+
+#[tokio::test]
+async fn deployment_diagnostics_projects_live_apply_job_over_http() {
+    let (state, pool) = setup_test_state().await;
+    let app = test_router(state);
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+    let suffix = Uuid::new_v4().simple().to_string();
+    let app_name = format!("diag-{}", &suffix[..12]);
+    let (session_token, org_id) = signup_owner(&server, "diag").await;
+
+    server
+        .post("/apps")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .authorization_bearer(&session_token)
+        .json(&serde_json::json!({
+            "name": app_name,
+            "unlock_mode": "auto",
+        }))
+        .await
+        .assert_status(StatusCode::CREATED);
+
+    let persisted_app: enclava_api::models::App =
+        sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
+            .bind(org_id)
+            .bind(&app_name)
+            .fetch_one(&pool)
+            .await
+            .expect("created diagnostics app");
+
+    // A worker holds the job lease and is mid-apply (schema: `running`
+    // requires a live lock token): the owner must see progressing, not a
+    // bare `deploying`.
+    let deployment_id = Uuid::new_v4();
+    seed_diagnostics_fixture(
+        &pool,
+        org_id,
+        persisted_app.id,
+        deployment_id,
+        "running",
+        Some(Uuid::new_v4()),
+        None,
+        3,
+    )
+    .await;
+
+    let response = server
+        .get(&format!("/apps/{app_name}/deployment/diagnostics"))
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .authorization_bearer(&session_token)
+        .await;
+    response.assert_status(StatusCode::OK);
+    let body: Value = response.json();
+    assert_eq!(body["phase"], "watching", "diagnostics body: {body}");
+    assert_eq!(body["condition"], "progressing", "diagnostics body: {body}");
+    assert_eq!(
+        body["attempts"], 3,
+        "attempts must decode from int4: {body}"
+    );
+    assert_eq!(body["deployment_id"], deployment_id.to_string());
+
+    // The additive status block carries the same projection.
+    let status = server
+        .get(&format!("/apps/{app_name}/status"))
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .authorization_bearer(&session_token)
+        .await;
+    status.assert_status(StatusCode::OK);
+    let status_body: Value = status.json();
+    assert_eq!(
+        status_body["deployment"]["phase"], "watching",
+        "status deployment block: {status_body}"
+    );
+    assert_eq!(status_body["deployment"]["attempts"], 3);
+
+    // Lease-expired retry: worker gone, dispatcher rescheduled the job.
+    let retry_deployment_id = Uuid::new_v4();
+    // ... but only one deployment per app is active; supersede by updating rows.
+    sqlx::query("UPDATE deployments SET status = 'failed'::deploy_status_enum WHERE id = $1")
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("terminalize first deployment");
+    sqlx::query("DELETE FROM deployment_apply_jobs WHERE deployment_id = $1")
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("remove first job");
+
+    seed_diagnostics_fixture(
+        &pool,
+        org_id,
+        persisted_app.id,
+        retry_deployment_id,
+        "pending",
+        None,
+        Some(chrono::Utc::now() + chrono::Duration::seconds(30)),
+        7,
+    )
+    .await;
+
+    let retry_response = server
+        .get(&format!("/apps/{app_name}/deployment/diagnostics"))
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .authorization_bearer(&session_token)
+        .await;
+    retry_response.assert_status(StatusCode::OK);
+    let retry_body: Value = retry_response.json();
+    assert_eq!(retry_body["phase"], "queued");
+    assert_eq!(retry_body["condition"], "waiting_external");
+    assert_eq!(
+        retry_body["reason"], "lease_expired_retry_scheduled",
+        "retry diagnostics body: {retry_body}"
+    );
+    assert_eq!(retry_body["attempts"], 7);
+    assert!(retry_body["next_retry_at"].is_string());
+}
+
+#[tokio::test]
+async fn deployment_diagnostics_reports_foreign_lease_blocker() {
+    let (state, pool) = setup_test_state().await;
+    let app = test_router(state);
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+    let suffix = Uuid::new_v4().simple().to_string();
+    let app_name = format!("diagblk-{}", &suffix[..12]);
+    let (session_token, org_id) = signup_owner(&server, "diagblk").await;
+
+    server
+        .post("/apps")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .authorization_bearer(&session_token)
+        .json(&serde_json::json!({
+            "name": app_name,
+            "unlock_mode": "auto",
+        }))
+        .await
+        .assert_status(StatusCode::CREATED);
+
+    let persisted_app: enclava_api::models::App =
+        sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
+            .bind(org_id)
+            .bind(&app_name)
+            .fetch_one(&pool)
+            .await
+            .expect("created diagnostics app");
+
+    let deployment_id = Uuid::new_v4();
+    seed_diagnostics_fixture(
+        &pool,
+        org_id,
+        persisted_app.id,
+        deployment_id,
+        "pending",
+        None,
+        None,
+        2,
+    )
+    .await;
+
+    // A foreign operation (e.g. an in-flight destroy) owns the app mutation
+    // lease: the owner must see who is blocking and until when.
+    sqlx::query(
+        "INSERT INTO app_mutation_leases (app_id) VALUES ($1)
+         ON CONFLICT (app_id) DO UPDATE
+            SET generation = app_mutation_leases.generation + 1,
+                owner_token = $2,
+                operation_kind = 'app_delete',
+                operation_id = $3,
+                locked_until = $4,
+                reclaim_after = $5",
+    )
+    .bind(persisted_app.id)
+    .bind(Uuid::new_v4())
+    .bind(Uuid::new_v4())
+    .bind(chrono::Utc::now() + chrono::Duration::minutes(2))
+    .bind(chrono::Utc::now() + chrono::Duration::minutes(3))
+    .execute(&pool)
+    .await
+    .expect("seed foreign mutation lease");
+
+    let response = server
+        .get(&format!("/apps/{app_name}/deployment/diagnostics"))
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .authorization_bearer(&session_token)
+        .await;
+    response.assert_status(StatusCode::OK);
+    let body: Value = response.json();
+    assert_eq!(body["phase"], "queued");
+    assert_eq!(body["condition"], "stalled");
+    assert_eq!(
+        body["reason"], "mutation_lease_held_by_operation",
+        "blocked diagnostics body: {body}"
+    );
+    assert_eq!(body["blocking_operation"], "app_delete");
+    assert!(body["blocked_until"].is_string());
+}

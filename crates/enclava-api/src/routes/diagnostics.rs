@@ -115,7 +115,7 @@ pub struct DeploymentDiagnostics {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_progress_at: Option<DateTime<Utc>>,
     /// Apply-attempt count for this job, including failed ones.
-    pub attempts: i64,
+    pub attempts: i32,
     /// When the dispatcher will next pick the job up. Absent while a worker
     /// holds the lease or after a terminal state.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -144,7 +144,7 @@ struct DiagnosticsRow {
     job_state: Option<String>,
     job_updated_at: Option<DateTime<Utc>>,
     next_attempt_at: Option<DateTime<Utc>>,
-    attempts: Option<i64>,
+    attempts: Option<i32>,
     job_locked_until: Option<DateTime<Utc>>,
     job_lock_token: Option<Uuid>,
     last_error_code: Option<String>,
@@ -161,22 +161,24 @@ pub(crate) async fn deployment_diagnostics(
     app: &App,
 ) -> Result<DeploymentDiagnostics, sqlx::Error> {
     let row = sqlx::query_as::<_, DiagnosticsRow>(
-        "SELECT deployment.id,
-                deployment.status::text,
-                deployment.spec_snapshot->>'setup_state',
+        // sqlx::FromRow matches by column name: every qualified or computed
+        // column MUST carry an explicit alias equal to the struct field.
+        "SELECT deployment.id AS deployment_id,
+                deployment.status::text AS deployment_status,
+                deployment.spec_snapshot->>'setup_state' AS setup_state,
                 deployment.created_at,
                 deployment.completed_at,
                 deployment.observing_since,
-                job.state,
-                job.updated_at,
+                job.state AS job_state,
+                job.updated_at AS job_updated_at,
                 job.next_attempt_at,
                 job.attempts,
-                job.locked_until,
-                job.lock_token,
+                job.locked_until AS job_locked_until,
+                job.lock_token AS job_lock_token,
                 job.last_error_code,
-                lease.locked_until,
-                lease.operation_kind,
-                app_row.status = 'deleting'::app_status_enum
+                lease.locked_until AS lease_locked_until,
+                lease.operation_kind AS lease_operation_kind,
+                app_row.status = 'deleting'::app_status_enum AS app_deleting
            FROM apps AS app_row
            LEFT JOIN LATERAL (
                SELECT * FROM deployments
