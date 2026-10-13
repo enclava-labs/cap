@@ -2495,9 +2495,7 @@ async fn wait_for_paas_managed_config_keys(
         }
         // Poll this call's delivery receipt first: a matching `delivered`
         // satisfies every expected key regardless of metadata timestamps.
-        if !delivered_receipt
-            && let Some(receipt) = delivery_id
-        {
+        if !delivered_receipt && let Some(receipt) = delivery_id {
             match poll_managed_delivery_status(api, instance_name, receipt, hold_deadline).await? {
                 ManagedDeliveryPoll::Delivered => delivered_receipt = true,
                 ManagedDeliveryPoll::Pending => {}
@@ -5697,13 +5695,7 @@ mod tests {
         let late_armed = Instant::now()
             .checked_sub(Duration::from_secs(7_000))
             .unwrap_or_else(Instant::now);
-        let transit = hold_expiry_instant(
-            Some(7_200_000),
-            None,
-            received_at,
-            late_armed,
-            7_200,
-        );
+        let transit = hold_expiry_instant(Some(7_200_000), None, received_at, late_armed, 7_200);
         assert!(
             transit <= Instant::now() + Duration::from_secs(201),
             "a delayed response must not grant a fresh 2h window"
@@ -5799,7 +5791,9 @@ mod tests {
             );
             baseline
         };
-        assert!(managed_key_is_fresh("NEW_KEY", &baseline, &observed, false, false));
+        assert!(managed_key_is_fresh(
+            "NEW_KEY", &baseline, &observed, false, false
+        ));
         assert!(managed_key_is_fresh(
             "CHANGED_KEY",
             &baseline,
@@ -5862,11 +5856,7 @@ mod tests {
         // With a delivery receipt issued, timestamps alone can never
         // release the key — only this call's delivery may.
         assert!(!managed_key_is_fresh(
-            "NEW_KEY",
-            &baseline,
-            &observed,
-            false,
-            true
+            "NEW_KEY", &baseline, &observed, false, true
         ));
         assert!(!managed_key_is_fresh(
             "CHANGED_KEY",
@@ -6031,9 +6021,7 @@ mod tests {
         // its pre-enqueue timestamp forever — only this call's delivery
         // reporting `delivered` may release the wait.
         let api_address = spawn_json_api_stub(|path| {
-            if let Some(id) = path
-                .strip_prefix("/apps/shell/managed-config/delivery/")
-            {
+            if let Some(id) = path.strip_prefix("/apps/shell/managed-config/delivery/") {
                 Some(serde_json::json!({
                     "status": "delivered",
                     "delivery_id": id,

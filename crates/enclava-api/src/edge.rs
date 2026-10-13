@@ -1849,15 +1849,7 @@ mod tests {
 
         // A failed app with no healthy deployment history has no live TEE
         // to serve; its route must not be retained.
-        insert_edge_deployment_job(
-            &pool,
-            org_id,
-            app_id,
-            Uuid::new_v4(),
-            "failed",
-            "failed",
-        )
-        .await;
+        insert_edge_deployment_job(&pool, org_id, app_id, Uuid::new_v4(), "failed", "failed").await;
         let selected = load_desired_edge_apps(&pool)
             .await
             .expect("select routes for never-healthy failed app");

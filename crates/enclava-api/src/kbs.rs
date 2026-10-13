@@ -650,7 +650,6 @@ async fn unreleased_customer_config_hold_pending(db: &PgPool) -> Result<bool, Kb
     .await?)
 }
 
-
 /// Select policy authority from the latest operation generation, not from the
 /// historical deployment that owns an artifact.  A rollback therefore makes
 /// its exact source artifact required.  The active operation is authoritative

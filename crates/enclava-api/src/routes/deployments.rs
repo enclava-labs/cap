@@ -2625,8 +2625,7 @@ mod tests {
             id
         }
 
-        let watching =
-            insert_in_flight(&pool, app.id, app.org_id, "watching", false).await;
+        let watching = insert_in_flight(&pool, app.id, app.org_id, "watching", false).await;
         assert!(
             in_flight(&pool, app.id).await,
             "a watching earlier rollout means the workload is unstable"
@@ -2639,8 +2638,7 @@ mod tests {
             .execute(&pool)
             .await
             .expect("settle watching deployment");
-        let held =
-            insert_in_flight(&pool, app.id, app.org_id, "pending", true).await;
+        let held = insert_in_flight(&pool, app.id, app.org_id, "pending", true).await;
         assert!(
             !in_flight(&pool, app.id).await,
             "a frozen unreleased hold must not count as an in-flight rollout"
