@@ -989,7 +989,7 @@ async fn load_signed_policy_candidates(
         ),
         -- The cast is safe at two levels: org_keyrings rows are written only
         -- by the put/rotate handlers, which serialize validated JSON, and the
-        -- org_keyrings_payload_wellformed CHECK constraint (migration 0058)
+        -- org_keyrings_payload_wellformed CHECK constraint (migration 0061)
         -- rejects any non-JSON or non-object payload or a non-array members
         -- entry at INSERT time, so a malformed row from a backfill script or
         -- manual psql fix can never take down candidate loading for every
@@ -4144,9 +4144,9 @@ resource_bindings := {
     }
 
     /// Regression coverage for the #130 keyring-rotation generation bump.
-    /// Migration 0058's `org_keyrings` INSERT trigger owes one selector bump
+    /// Migration 0061's `org_keyrings` INSERT trigger owes one selector bump
     /// per keyring write while signed-policy mode is active -- including
-    /// writes committed by a PRE-0058 replica during a rolling upgrade,
+    /// writes committed by a PRE-0061 replica during a rolling upgrade,
     /// which is the whole point of the trigger (the old binary enqueues
     /// nothing itself).  Runs against its own uniquely named per-process
     /// database (see [`crate::test_support::isolated_database_test_pool`]):
@@ -4156,9 +4156,71 @@ resource_bindings := {
     /// owe bumps between this test's insert and its exact assertion, or have
     /// its own state clobbered by this test's final reset.  The process-local
     /// `SIGNED_POLICY_SINGLETON_LOCK` cannot fence across processes.
+    #[tokio::test]
+    async fn keyring_rotation_owes_selector_bump_only_when_active() {
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap130_rotation_enqueue").await;
+        let (org_id, _app_id) = insert_test_app(&pool, "running").await;
 
-    /// Migration 0058 owes selector generation bumps in a counter instead of
-    /// performing them, so a pre-0058 replica still reconciling during the
+        // Unsigned-only installs must not enter signed-policy mode.
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 0,
+                    configmap_generation = 0,
+                    applied_generation = 0,
+                    configmap_policy_sha256 = NULL,
+                    applied_policy_sha256 = NULL,
+                    configmap_resource_version = NULL
+              WHERE singleton",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        insert_test_keyring_version(&pool, org_id, 1, &["aa".repeat(32).as_str()]).await;
+        let owed: i64 = sqlx::query_scalar(
+            "SELECT selector_bumps_owed
+               FROM kbs_signed_policy_reconciliation
+              WHERE singleton",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            owed, 0,
+            "keyring write on an idle installation must owe no selector bump"
+        );
+
+        // Once signed mode is active, every keyring write owes one bump so
+        // the reconciler withdraws rotated-out artifacts (#130): the changed
+        // candidate set at an unchanged generation would otherwise be
+        // rejected as a content conflict.  desired_generation itself must
+        // stay put -- a pre-0061 replica must never see a raw bump.
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 1
+              WHERE singleton",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        insert_test_keyring_version(&pool, org_id, 2, &["bb".repeat(32).as_str()]).await;
+        insert_test_keyring_version(&pool, org_id, 3, &["cc".repeat(32).as_str()]).await;
+        let (desired, owed): (i64, i64) = sqlx::query_as(
+            "SELECT desired_generation, selector_bumps_owed
+               FROM kbs_signed_policy_reconciliation
+              WHERE singleton",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(owed, 2, "each active-mode keyring insert owes one bump");
+        assert_eq!(desired, 1, "the debt must not move desired_generation");
+
+        crate::test_support::drop_isolated_database("cap130_rotation_enqueue", pool).await;
+    }
+
+    /// Migration 0061 owes selector generation bumps in a counter instead of
+    /// performing them, so a pre-0061 replica still reconciling during the
     /// rollout cannot consume the bump with its unfiltered candidate query.
     /// Only the post-0050 reconciler interprets the marker, exactly once, and
     /// never on behalf of an unsigned-only install -- what this test pins
