@@ -8364,6 +8364,34 @@ pub(crate) mod tests {
             .expect("delete watching failure fixture");
     }
 
+    #[test]
+    fn apply_failures_publish_the_job_error_classification() {
+        // #18: fail_apply_job_with_mutation must forward
+        // `error.code()` — not the constant DEPLOYMENT_APPLY_FAILED_MESSAGE —
+        // so the bounded classification reaches the deployments row and the
+        // public projection can surface the real reason.
+        let source = include_str!("deployment_jobs.rs");
+        let body = source
+            .split("async fn fail_apply_job_with_mutation")
+            .nth(1)
+            .and_then(|rest| rest.split("\nasync fn ").next())
+            .unwrap_or("");
+        assert!(
+            body.contains("job, error.code()")
+                || body.contains(
+                    "job,
+            error.code()"
+                ),
+            "fail_apply_job_with_mutation must forward error.code() to \
+             publish_apply_failure_with_mutation"
+        );
+        assert!(
+            !body.contains("DEPLOYMENT_APPLY_FAILED_MESSAGE"),
+            "fail_apply_job_with_mutation must not collapse every apply \
+             failure to the constant DEPLOYMENT_APPLY_FAILED_MESSAGE"
+        );
+    }
+
     #[tokio::test]
     async fn apply_failure_publishes_the_bounded_error_code() {
         // #18: the failure classification (e.g. `kbs_policy_error` for a
