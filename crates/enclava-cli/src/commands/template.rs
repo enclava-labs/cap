@@ -1556,7 +1556,7 @@ async fn wait_for_template_bootstrap_endpoint(
             .into());
         }
         // Fail fast on a terminalized deployment before any endpoint fetch
-        // (#18). The history lookup is bounded by the wait's remaining
+        // (#18). Every request in this loop is cut at the finite per-attempt
         // budget, so a stalled response can never consume the wait (cap#220
         // review).
         fail_if_template_deployment_failed(api, app_name, deployment_id, Some(wait_deadline)).await?;
@@ -1605,6 +1605,7 @@ async fn wait_for_template_bootstrap_endpoint(
                         .await;
                     continue;
                 }
+
             }
         }
 

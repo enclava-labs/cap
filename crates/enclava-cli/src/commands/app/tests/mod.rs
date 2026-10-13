@@ -697,13 +697,13 @@ fn deploy_waits_fail_fast_on_terminal_deployment_failure() {
         (
             "async fn wait_for_bootstrap_endpoint",
             "TEE ownership timed out",
-            "api.get_unlock_endpoint(app_name).await",
+            "api.get_unlock_endpoint(app_name)",
             "fail_if_template_deployment_failed(api,app_name,deployment_id,start+max_wait)",
         ),
         (
             "async fn wait_for_deploy_runtime",
             "TEE boot timed out",
-            "api.get_status(app_name).await",
+            "api.get_status(app_name)",
             "fail_if_template_deployment_failed(api,app_name,expected_deployment_id,start+max_wait)",
         ),
     ] {
@@ -741,20 +741,18 @@ fn deploy_waits_fail_fast_on_terminal_deployment_failure() {
     }
 
     // The sibling deployment-history lookups (apply-start and health waits)
-    // receive the wait's deadline and use a FINITE per-attempt budget longer
-    // than the advisory cap: they are how deploy state is observed at all, so
-    // the budget must fit slow-but-valid responses, while staying short enough
-    // that one stalled request is cut and the loop retries once the endpoint
-    // recovers (cap#220 review follow-ups). The wait's own deadline still
-    // bounds every attempt, and the 15s cap stays on the advisory failure
-    // check asserted above.
+    // receive the wait's deadline and use the same finite per-attempt budget:
+    // they are how deploy state is observed at all, so the budget must fit
+    // slow-but-valid responses, while staying short enough that one stalled
+    // request is cut and the loop retries once the endpoint recovers (cap#220
+    // review follow-ups). The wait's own deadline still bounds every attempt.
     let dense_source: String = source.chars().filter(|c| !c.is_whitespace()).collect();
     assert_eq!(
         dense_source
             .matches("find_deployment_entry(api,app_name,deployment_id,start+max_wait)")
             .count(),
         2,
-        "wait_for_deployment_apply_start and wait_for_deployment_completion must bound their history lookups by the wait's remaining budget (cap#220 review)"
+        "wait_for_deployment_apply_start and wait_for_deployment_completion must bound their history lookups per attempt (cap#220 review)"
     );
 
     // The standalone ownership wait must not swallow non-retryable
@@ -772,38 +770,40 @@ fn deploy_waits_fail_fast_on_terminal_deployment_failure() {
 }
 
 #[test]
-fn deployment_history_lookup_budget_is_capped_by_the_wait_deadline() {
-    // Far deadline: the hard cap applies, never the client's request timeout.
+fn wait_attempt_budget_is_finite_and_bounded_by_the_wait() {
+    // Far deadline: the per-attempt budget is finite (so a stalled attempt is
+    // cut and the loop retries) and comfortably long (so slow-but-valid
+    // responses are observed).
     let far = std::time::Instant::now() + std::time::Duration::from_secs(600);
-    assert_eq!(
-        deployment_history_lookup_budget(far),
-        DEPLOYMENT_HISTORY_LOOKUP_BUDGET
-    );
+    assert_eq!(wait_attempt_budget(far), WAIT_ATTEMPT_BUDGET);
+    assert_eq!(WAIT_ATTEMPT_BUDGET, std::time::Duration::from_secs(60));
     // Nearly exhausted wait: only the remaining time may be used.
-    let nearly_exhausted = std::time::Instant::now() + std::time::Duration::from_millis(200);
-    let budget = deployment_history_lookup_budget(nearly_exhausted);
+    let nearly_exhausted = std::time::Instant::now() + std::time::Duration::from_millis(300);
+    let budget = wait_attempt_budget(nearly_exhausted);
     assert!(budget > std::time::Duration::ZERO);
-    assert!(budget <= std::time::Duration::from_millis(200));
-    // Exhausted wait: no lookup may start at all.
-    assert!(deployment_history_lookup_budget(std::time::Instant::now()).is_zero());
+    assert!(budget <= std::time::Duration::from_millis(300));
+    // Exhausted wait: no request may start at all.
+    assert!(wait_attempt_budget(std::time::Instant::now()).is_zero());
     let past = std::time::Instant::now()
         .checked_sub(std::time::Duration::from_secs(1))
         .unwrap_or_else(std::time::Instant::now);
-    assert!(deployment_history_lookup_budget(past).is_zero());
+    assert!(wait_attempt_budget(past).is_zero());
 }
 
 #[test]
-fn state_history_lookups_use_a_finite_attempt_budget_not_the_advisory_cap() {
-    // cap#220 review follow-ups: the deployment-state lookup (apply-start and
-    // health waits) is how the CLI observes deploy state at all. Its per-attempt
-    // budget must exceed the advisory cap -- a response slower than 15s (e.g.
-    // 16s with 600s of wait left) must still be allowed to arrive -- but stay
-    // finite and shorter than the wait -- one stalled request must not block
-    // the loop from retrying once the endpoint recovers. The advisory failure
-    // check keeps the small cap so a stalled endpoint cannot block the
-    // readiness polls behind it. Every bound is capped by the remaining wait,
-    // so no lookup ever outlives its wait.
+fn wait_loop_requests_use_the_finite_per_attempt_budget() {
+    // cap#220 review follow-ups: every request a wait loop makes -- the
+    // terminal-failure history lookup (which surfaces the issue #18
+    // rejection, so it must observe slow-but-valid answers), the
+    // deployment-state lookups (apply-start and health waits), and the
+    // readiness polls (unlock endpoint, runtime status) -- is cut at one
+    // finite per-attempt budget, bounded by the wait's remaining time. The
+    // budget must be long enough for slow responses (the earlier 15s
+    // advisory cap discarded them and hid deploy state) but finite and
+    // shorter than the wait (the earlier full-remaining-wait bound let one
+    // stalled request block retries after the endpoint recovered).
     let source = include_str!("../../app.rs").replace("\r\n", "\n");
+    let template_source = include_str!("../../template.rs").replace("\r\n", "\n");
     // Whitespace- and comma-insensitive: rustfmt may wrap call arguments
     // one-per-line (adding a trailing comma) without changing the wiring.
     let dense = |text: &str| -> String {
@@ -811,11 +811,13 @@ fn state_history_lookups_use_a_finite_attempt_budget_not_the_advisory_cap() {
             .filter(|c| !c.is_whitespace() && *c != ',')
             .collect()
     };
+    let app = dense(&source);
+    let template = dense(&template_source);
 
     let failure_check = {
         let start = source
             .find("async fn template_deployment_failure(")
-            .expect("advisory failure check exists");
+            .expect("terminal-failure check exists");
         let end = start
             + source[start..]
                 .find("fn template_deployment_failure_message(")
@@ -823,10 +825,8 @@ fn state_history_lookups_use_a_finite_attempt_budget_not_the_advisory_cap() {
         &source[start..end]
     };
     assert!(
-        dense(failure_check).contains(
-            "bounded_deployment_history(apiapp_namedeployment_history_lookup_budget(wait_deadline))"
-        ),
-        "the advisory failure check must pass the capped budget (cap#220 review): a stalled history endpoint must not block the readiness polls behind it"
+        dense(failure_check).contains("bounded_deployment_history(apiapp_namewait_deadline)"),
+        "the terminal-failure check must take the per-attempt budget from the wait deadline (cap#220 review): the shared client's 900s request timeout must never consume the wait"
     );
 
     let state_lookup = {
@@ -840,36 +840,29 @@ fn state_history_lookups_use_a_finite_attempt_budget_not_the_advisory_cap() {
         &source[start..end]
     };
     assert!(
-        dense(state_lookup).contains(
-            "bounded_deployment_history(apiapp_namestate_history_attempt_budget(wait_deadline))"
-        ),
-        "the deployment-state lookup must pass the finite per-attempt budget (cap#220 review follow-ups): the advisory cap discards valid slow responses, while the full remaining wait lets one stalled request block retries"
+        dense(state_lookup).contains("bounded_deployment_history(apiapp_namewait_deadline)"),
+        "the deployment-state lookup must take the per-attempt budget from the wait deadline (cap#220 review follow-ups): slow responses must stay observable while a stall only costs one attempt"
     );
-}
 
-#[test]
-fn state_history_attempt_budget_exceeds_the_advisory_cap_but_stays_finite() {
-    // Far deadline: the per-attempt budget is finite (so a stalled attempt is
-    // cut and the loop retries) but comfortably exceeds the advisory cap (so
-    // slow-but-valid responses are observed).
-    let far = std::time::Instant::now() + std::time::Duration::from_secs(600);
-    assert_eq!(
-        state_history_attempt_budget(far),
-        STATE_HISTORY_ATTEMPT_BUDGET
+    // Readiness polls are bounded the same way (cap#220 review follow-up):
+    // a stalled status/endpoint call must not eat the wait or hide the
+    // failure check's observations behind it.
+    assert!(
+        app.contains("bounded_wait_attempt(start+max_waitapi.get_status(app_name))"),
+        "wait_for_deploy_runtime must bound its status poll per attempt (cap#220 review follow-up)"
     );
-    assert!(STATE_HISTORY_ATTEMPT_BUDGET > DEPLOYMENT_HISTORY_LOOKUP_BUDGET);
-    assert!(STATE_HISTORY_ATTEMPT_BUDGET < std::time::Duration::from_secs(600));
-    // Nearly exhausted wait: only the remaining time may be used.
-    let nearly_exhausted = std::time::Instant::now() + std::time::Duration::from_millis(300);
-    let budget = state_history_attempt_budget(nearly_exhausted);
-    assert!(budget > std::time::Duration::ZERO);
-    assert!(budget <= std::time::Duration::from_millis(300));
-    // Exhausted wait: no lookup may start at all.
-    assert!(state_history_attempt_budget(std::time::Instant::now()).is_zero());
-    let past = std::time::Instant::now()
-        .checked_sub(std::time::Duration::from_secs(1))
-        .unwrap_or_else(std::time::Instant::now);
-    assert!(state_history_attempt_budget(past).is_zero());
+    assert!(
+        app.matches("bounded_wait_attempt(start+max_waitapi.get_unlock_endpoint(app_name))")
+            .count()
+            >= 2,
+        "wait_for_bootstrap_endpoint and the runtime diagnostic chain must bound their endpoint fetches per attempt (cap#220 review follow-up)"
+    );
+    assert!(
+        template.contains(
+            "bounded_wait_attempt(start+max_waittimings.run(DeployPhase::BootstrapEndpointAcquisitionapi.get_unlock_endpoint(app_name)))"
+        ),
+        "wait_for_template_bootstrap_endpoint must bound its endpoint fetch per attempt (cap#220 review follow-up)"
+    );
 }
 
 #[test]
@@ -2905,9 +2898,13 @@ mod terminal_diagnostics {
         // A budget too small for this response must still cut it (no lookup
         // may outlive its budget) and read as "no observation".
         let started = std::time::Instant::now();
-        let cut = bounded_deployment_history(&api, "demo", std::time::Duration::from_millis(100))
-            .await
-            .expect("a budget cut must not be an error");
+        let cut = bounded_deployment_history(
+            &api,
+            "demo",
+            std::time::Instant::now() + std::time::Duration::from_millis(100),
+        )
+        .await
+        .expect("a budget cut must not be an error");
         assert!(
             cut.is_none(),
             "a response slower than the given budget must read as no observation"
@@ -2984,9 +2981,13 @@ mod terminal_diagnostics {
         // Attempt 1: the stalled request is cut at the attempt budget and
         // reads as "no observation" instead of holding the wait open.
         let started = std::time::Instant::now();
-        let cut = bounded_deployment_history(&api, "demo", std::time::Duration::from_millis(150))
-            .await
-            .expect("a budget cut must not be an error");
+        let cut = bounded_deployment_history(
+            &api,
+            "demo",
+            std::time::Instant::now() + std::time::Duration::from_millis(150),
+        )
+        .await
+        .expect("a budget cut must not be an error");
         assert!(
             cut.is_none(),
             "the stalled attempt must read as no observation"
