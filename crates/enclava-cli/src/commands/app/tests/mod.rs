@@ -799,6 +799,23 @@ fn wait_attempt_budget_is_finite_and_bounded_by_the_wait() {
 }
 
 #[test]
+fn success_reconcile_budget_is_finite_and_bounded_by_the_wait() {
+    // cap#220 review follow-up: the successful-exit reconciliation with
+    // deployment history is bounded -- shorter than any wait (a stalled
+    // history endpoint delays success at most this long, never the whole
+    // wait) and never past the wait's deadline (a passed deadline reconciles
+    // without issuing anything).
+    let far = std::time::Instant::now() + std::time::Duration::from_secs(600);
+    assert_eq!(success_reconcile_budget(far), SUCCESS_RECONCILE_BUDGET);
+    assert_eq!(SUCCESS_RECONCILE_BUDGET, std::time::Duration::from_secs(15));
+    let nearly_exhausted = std::time::Instant::now() + std::time::Duration::from_millis(300);
+    let budget = success_reconcile_budget(nearly_exhausted);
+    assert!(budget > std::time::Duration::ZERO);
+    assert!(budget <= std::time::Duration::from_millis(300));
+    assert!(success_reconcile_budget(std::time::Instant::now()).is_zero());
+}
+
+#[test]
 fn wait_loop_requests_use_the_finite_per_attempt_budget() {
     // cap#220 review follow-ups: every synchronous request a wait loop makes
     // -- the readiness polls (unlock endpoint, runtime status, config keys,
@@ -915,6 +932,71 @@ fn wait_loop_requests_use_the_finite_per_attempt_budget() {
             .contains("bounded_wait_attempt(start+timeoutapi.get_template_ssh_command(app_name))"),
         "wait_for_paas_ssh_command must bound its status poll per attempt (cap#220 review follow-up #2)"
     );
+}
+
+#[test]
+fn deploy_wait_success_exits_reconcile_deployment_state_first() {
+    // cap#220 review follow-up: readiness alone must not end a wait that
+    // polls deployment history -- a failed deployment would proceed to
+    // ownership handling before its history answer lands. Every successful
+    // exit of those waits therefore carries exactly one reconciliation with
+    // the detached probe (one per `return Ok(`), so a new success exit
+    // cannot silently skip it.
+    let source = include_str!("../../app.rs").replace("\r\n", "\n");
+    let template_source = include_str!("../../template.rs").replace("\r\n", "\n");
+    let body_between = |text: &str, start: &str, end: &str| -> String {
+        let start_index = text
+            .find(start)
+            .unwrap_or_else(|| panic!("{start} must exist"));
+        let end_index = text[start_index..]
+            .find(end)
+            .unwrap_or_else(|| panic!("{end} must follow {start}"))
+            + start_index;
+        text[start_index..end_index].to_string()
+    };
+    for (fn_name, text, start, end) in [
+        (
+            "wait_for_bootstrap_endpoint",
+            source.as_str(),
+            "async fn wait_for_bootstrap_endpoint",
+            "async fn wait_for_deploy_runtime",
+        ),
+        (
+            "wait_for_deploy_runtime",
+            source.as_str(),
+            "async fn wait_for_deploy_runtime",
+            "fn observation_is_fresh_for_deployment",
+        ),
+        (
+            "wait_for_template_bootstrap_endpoint",
+            template_source.as_str(),
+            "async fn wait_for_template_bootstrap_endpoint",
+            "pub(crate) fn should_retry_template_bootstrap_endpoint_error",
+        ),
+        (
+            "wait_for_paas_managed_config_keys",
+            template_source.as_str(),
+            "async fn wait_for_paas_managed_config_keys",
+            "async fn refresh_template_config_token_with_retry",
+        ),
+        (
+            "wait_for_paas_ssh_command",
+            template_source.as_str(),
+            "async fn wait_for_paas_ssh_command",
+            "async fn latest_deployment_id",
+        ),
+    ] {
+        let body = body_between(text, start, end);
+        let exits = body.matches("return Ok(").count();
+        let reconciliations = body
+            .matches("reconcile_success_with_deployment_history(")
+            .count();
+        assert!(exits > 0, "{fn_name} must have successful exits to gate");
+        assert_eq!(
+            exits, reconciliations,
+            "{fn_name}: every successful exit must reconcile the pending deployment-state observation first (cap#220 review follow-up); {exits} `return Ok(` vs {reconciliations} reconciliations"
+        );
+    }
 }
 
 #[test]
@@ -2017,6 +2099,86 @@ mod terminal_diagnostics {
                 );
                 let _ = stream.write_all(response.as_bytes()).await;
                 let _ = stream.shutdown().await;
+            }
+        });
+        address
+    }
+
+    /// Plain-HTTP `/deployments` stub for the detached history probe: each
+    /// connection answers after `delay` with `answer_by_connection(nth)`
+    /// (1-based connection number).
+    async fn spawn_history_stub(
+        delay: std::time::Duration,
+        answer_by_connection: impl Fn(usize) -> serde_json::Value + Send + Sync + 'static,
+    ) -> SocketAddr {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let answer_by_connection = std::sync::Arc::new(answer_by_connection);
+        let connections = std::sync::Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let nth = connections.fetch_add(1, Ordering::SeqCst) + 1;
+                let answer_by_connection = answer_by_connection.clone();
+                tokio::spawn(async move {
+                    let mut sink = [0_u8; 4096];
+                    let _ = stream.read(&mut sink).await;
+                    tokio::time::sleep(delay).await;
+                    let body = answer_by_connection(nth).to_string();
+                    let _ = stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                });
+            }
+        });
+        address
+    }
+
+    /// Plain-HTTP `/deployments` stub that reads requests and never answers,
+    /// counting requests seen (`accepted`) and connections the client closed
+    /// again (`closed`).
+    async fn spawn_stalled_history_stub(
+        accepted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        closed: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> SocketAddr {
+        use std::sync::atomic::Ordering;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let accepted = accepted.clone();
+                let closed = closed.clone();
+                tokio::spawn(async move {
+                    let mut sink = [0_u8; 4096];
+                    let mut seen = false;
+                    loop {
+                        match stream.read(&mut sink).await {
+                            Ok(0) | Err(_) => {
+                                closed.fetch_add(1, Ordering::SeqCst);
+                                break;
+                            }
+                            Ok(_) => {
+                                if !seen {
+                                    seen = true;
+                                    accepted.fetch_add(1, Ordering::SeqCst);
+                                }
+                            }
+                        }
+                    }
+                });
             }
         });
         address
@@ -3128,6 +3290,255 @@ mod terminal_diagnostics {
             connections.load(Ordering::SeqCst) >= 2,
             "the probe must refresh alongside the stalled request instead of waiting it out"
         );
+    }
+
+    #[tokio::test]
+    async fn success_exit_surfaces_a_failed_deployment_landing_after_readiness() {
+        // cap#220 review follow-up: readiness answered long before history.
+        // The exit must consume the failure when its response lands and
+        // report the terminal error instead of letting the ready endpoint
+        // mask a failed deployment (the review's example: history records
+        // `failed`, its response arrives seconds after the ready endpoint).
+        let address = spawn_history_stub(std::time::Duration::from_millis(300), |_| {
+            serde_json::json!([{
+                "id": "deploy-1",
+                "status": "failed",
+                "error_message": "signed_policy_budget_exceeded",
+                "image_digest": null,
+                "created_at": "2026-10-13T00:00:00Z",
+                "completed_at": "2026-10-13T00:01:00Z",
+            }])
+        })
+        .await;
+        let api = ApiClient::new(&format!("http://{address}"), Some("test".to_string()));
+        let mut history = DeploymentHistoryProbe::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+
+        let started = std::time::Instant::now();
+        let error = reconcile_success_with_deployment_history(
+            &api,
+            "demo",
+            "deploy-1",
+            deadline,
+            &mut history,
+        )
+        .await
+        .expect_err("a ready endpoint must not mask a failed deployment");
+        assert!(
+            error
+                .to_string()
+                .contains("deployment deploy-1 failed: signed_policy_budget_exceeded"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the exit must consume the answer when it lands, not wait out the budget first"
+        );
+    }
+
+    #[tokio::test]
+    async fn success_exit_accepts_a_non_failed_observation() {
+        // The reconciliation is not a failure trap: an observation showing
+        // the deployment is fine passes the exit, both when it lands during
+        // the pickup and when it has already landed before the exit (drained
+        // without blocking).
+        let address = spawn_history_stub(std::time::Duration::from_millis(100), |_| {
+            serde_json::json!([deployment_entry_json("deploy-1", "healthy")])
+        })
+        .await;
+        let api = ApiClient::new(&format!("http://{address}"), Some("test".to_string()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+
+        let mut history = DeploymentHistoryProbe::new();
+        reconcile_success_with_deployment_history(&api, "demo", "deploy-1", deadline, &mut history)
+            .await
+            .expect("a non-failed observation must pass the exit gate");
+
+        // The answer lands before the exit: drained at once, no waiting.
+        history.ensure_request(&api, "demo", deadline);
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let started = std::time::Instant::now();
+        reconcile_success_with_deployment_history(&api, "demo", "deploy-1", deadline, &mut history)
+            .await
+            .expect("a landed non-failed observation must pass the exit gate");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(300),
+            "a landed observation must be drained without blocking the exit"
+        );
+    }
+
+    #[tokio::test]
+    async fn success_exit_consumes_a_landed_failure_behind_an_earlier_answer() {
+        // A failure answer that landed before the exit must be consumed even
+        // when an earlier answer landed first: taking only one answer would
+        // drop the error unobserved.
+        let address = spawn_history_stub(std::time::Duration::from_millis(100), |nth| match nth {
+            1 => serde_json::json!([deployment_entry_json("deploy-1", "applying")]),
+            _ => serde_json::json!([{
+                "id": "deploy-1",
+                "status": "failed",
+                "error_message": "signed_policy_budget_exceeded",
+                "image_digest": null,
+                "created_at": "2026-10-13T00:00:00Z",
+                "completed_at": "2026-10-13T00:01:00Z",
+            }]),
+        })
+        .await;
+        let api = ApiClient::new(&format!("http://{address}"), Some("test".to_string()));
+        // A short refresh window stands in for WAIT_ATTEMPT_BUDGET so two
+        // requests land before the exit without waiting out the real one.
+        let mut history =
+            DeploymentHistoryProbe::with_refresh_age(std::time::Duration::from_millis(50));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        history.ensure_request(&api, "demo", deadline);
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        history.ensure_request(&api, "demo", deadline);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let error = reconcile_success_with_deployment_history(
+            &api,
+            "demo",
+            "deploy-1",
+            deadline,
+            &mut history,
+        )
+        .await
+        .expect_err("a landed failure must be consumed even behind an earlier answer");
+        assert!(
+            error
+                .to_string()
+                .contains("deployment deploy-1 failed: signed_policy_budget_exceeded"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn success_exit_reconciles_pending_with_success_and_stays_bounded() {
+        // cap#220 review follow-up: a stalled history endpoint must neither
+        // block the exit (let alone the whole wait) nor turn readiness into
+        // a failure -- the pending request is reconciled with the success
+        // once the bounded pickup budget is gone, and a passed deadline
+        // issues no request at all.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let accepted = std::sync::Arc::new(AtomicUsize::new(0));
+        let closed = std::sync::Arc::new(AtomicUsize::new(0));
+        let address = spawn_stalled_history_stub(accepted.clone(), closed.clone()).await;
+        let api = ApiClient::new(&format!("http://{address}"), Some("test".to_string()));
+        let mut history = DeploymentHistoryProbe::new();
+
+        // Deadline already passed: no request may be issued at all.
+        reconcile_success_with_deployment_history(
+            &api,
+            "demo",
+            "deploy-1",
+            std::time::Instant::now(),
+            &mut history,
+        )
+        .await
+        .expect("an exhausted wait budget must not turn a stalled lookup into an error");
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            0,
+            "a passed wait deadline must skip the history lookup entirely"
+        );
+
+        // Live deadline: the exit waits at most its (clamped) budget for the
+        // pending answer, then reconciles it with the success.
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reconcile_success_with_deployment_history(
+                &api,
+                "demo",
+                "deploy-1",
+                std::time::Instant::now() + std::time::Duration::from_millis(500),
+                &mut history,
+            ),
+        )
+        .await
+        .expect("the exit gate must stay within its bounded pickup budget");
+        outcome.expect("a stalled history endpoint must not fail a ready deployment");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the exit must be bounded by the reconcile budget, never the stalled endpoint"
+        );
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "the gate must probe once while budget remains"
+        );
+    }
+
+    #[tokio::test]
+    async fn abort_on_drop_handle_cancels_its_task_instead_of_detaching() {
+        // cap#220 review follow-up: a dropped JoinHandle DETACHES its task.
+        // The wrapper must abort instead, so no request outlives its owner.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct CancelFlag(std::sync::Arc<AtomicBool>);
+        impl Drop for CancelFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let cancelled = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = cancelled.clone();
+        let handle = AbortOnDropHandle::new(tokio::spawn(async move {
+            let _flag = CancelFlag(flag);
+            std::future::pending::<()>().await;
+        }));
+        // Let the task start and park on its pending future first: a guard
+        // inside a never-polled task could not observe its own cancellation.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !cancelled.load(Ordering::SeqCst),
+            "the task must still be running before the handle drops"
+        );
+        drop(handle);
+        for _ in 0..200 {
+            if cancelled.load(Ordering::SeqCst) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("dropping the handle must abort its task, not detach it");
+    }
+
+    #[tokio::test]
+    async fn dropping_the_probe_cancels_pending_history_requests() {
+        // cap#220 review follow-up: a wait that returns (success, error, or
+        // timeout) drops its probe with requests still in flight. Those
+        // requests must be cancelled -- a detached one would keep its
+        // connection open until the client's 900-second request timeout
+        // after the CLI has moved on or returned.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let accepted = std::sync::Arc::new(AtomicUsize::new(0));
+        let closed = std::sync::Arc::new(AtomicUsize::new(0));
+        let address = spawn_stalled_history_stub(accepted.clone(), closed.clone()).await;
+        let api = ApiClient::new(&format!("http://{address}"), Some("test".to_string()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+
+        let mut history = DeploymentHistoryProbe::new();
+        history.ensure_request(&api, "demo", deadline);
+        for _ in 0..200 {
+            if accepted.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "the request must reach the stalled endpoint"
+        );
+
+        drop(history);
+        for _ in 0..200 {
+            if closed.load(Ordering::SeqCst) >= 1 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("dropping the probe must cancel the pending request's connection");
     }
 
     #[tokio::test]

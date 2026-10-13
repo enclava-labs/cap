@@ -1153,6 +1153,19 @@ pub(crate) async fn wait_for_bootstrap_endpoint(
                                 terminal_bootstrap_failure_message(app_name, &diagnostic).into()
                             );
                         }
+                        // Readiness alone must not end the wait (cap#220
+                        // review follow-up): reconcile the pending
+                        // deployment-state observation with this success so
+                        // a failed deployment reports its terminal error
+                        // instead of proceeding to ownership handling.
+                        reconcile_success_with_deployment_history(
+                            api,
+                            app_name,
+                            deployment_id,
+                            start + max_wait,
+                            &mut history,
+                        )
+                        .await?;
                         pb.set_message("Ownership claim endpoint ready");
                         return Ok(true);
                     }
@@ -1195,6 +1208,14 @@ pub(crate) async fn wait_for_bootstrap_endpoint(
                                     ));
                                 }
                                 BootstrapEndpointStatusDecision::AlreadyClaimed => {
+                                    reconcile_success_with_deployment_history(
+                                        api,
+                                        app_name,
+                                        deployment_id,
+                                        start + max_wait,
+                                        &mut history,
+                                    )
+                                    .await?;
                                     pb.set_message("Ownership already claimed");
                                     return Ok(false);
                                 }
@@ -1288,6 +1309,18 @@ async fn wait_for_deploy_runtime(
                             expected_deployment_id,
                         );
                     if observation_is_fresh && target.accepts_api_status(status.status.as_str()) {
+                        // Readiness alone must not end the wait (cap#220
+                        // review follow-up): reconcile the pending
+                        // deployment-state observation with this success so
+                        // a failed deployment reports its terminal error.
+                        reconcile_success_with_deployment_history(
+                            api,
+                            app_name,
+                            expected_deployment_id,
+                            start + max_wait,
+                            &mut history,
+                        )
+                        .await?;
                         pb.set_position(3);
                         pb.set_message(match status.status.as_str() {
                             "locked" => "TEE running, storage locked",
@@ -1301,6 +1334,14 @@ async fn wait_for_deploy_runtime(
                         Some("Running")
                             if pod_phase_is_verified && target.accepts_running_pod_phase() =>
                         {
+                            reconcile_success_with_deployment_history(
+                                api,
+                                app_name,
+                                expected_deployment_id,
+                                start + max_wait,
+                                &mut history,
+                            )
+                            .await?;
                             pb.set_position(3);
                             pb.set_message("TEE running, attestation complete");
                             return Ok(());
@@ -1379,11 +1420,27 @@ async fn wait_for_deploy_runtime(
             if tee_supplemental_fields_are_consistent(&status) {
                 match outcome {
                     DirectTeeRuntimeOutcome::Locked => {
+                        reconcile_success_with_deployment_history(
+                            api,
+                            app_name,
+                            expected_deployment_id,
+                            start + max_wait,
+                            &mut history,
+                        )
+                        .await?;
                         pb.set_position(3);
                         pb.set_message("TEE running, storage locked");
                         return Ok(());
                     }
                     DirectTeeRuntimeOutcome::Unlocked if target.accepts_direct_unlocked() => {
+                        reconcile_success_with_deployment_history(
+                            api,
+                            app_name,
+                            expected_deployment_id,
+                            start + max_wait,
+                            &mut history,
+                        )
+                        .await?;
                         pb.set_position(3);
                         pb.set_message("TEE running, attestation complete");
                         return Ok(());
@@ -1483,12 +1540,54 @@ pub(crate) async fn bounded_wait_attempt<T>(
     tokio::time::timeout(budget, request).await.ok()
 }
 
+/// A [`tokio::task::JoinHandle`] that aborts its task when dropped
+/// (cap#220 review follow-up): a dropped `JoinHandle` detaches its task, so
+/// a plain handle would let a stalled history lookup hold its connection
+/// until the API client's 900-second request timeout after the enclosing
+/// wait has already returned. Every exit from a request -- supersession,
+/// a dropped `take_landed` join, or the probe dropping with its wait --
+/// therefore cancels the lookup instead of orphaning it.
+struct AbortOnDropHandle<T>(Option<tokio::task::JoinHandle<T>>);
+
+impl<T> AbortOnDropHandle<T> {
+    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self(Some(handle))
+    }
+
+    fn is_finished(&self) -> bool {
+        self.0
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+    }
+
+    fn abort(&self) {
+        if let Some(handle) = &self.0 {
+            handle.abort();
+        }
+    }
+
+    /// Await the task's outcome. The handle stays inside the wrapper while
+    /// joining, so a dropped or cancelled join still aborts the task through
+    /// [`Drop`] instead of detaching it.
+    async fn join(&mut self) -> Option<Result<T, tokio::task::JoinError>> {
+        Some(self.0.as_mut()?.await)
+    }
+}
+
+impl<T> Drop for AbortOnDropHandle<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
 /// One detached deployment-history request ([`DeploymentHistoryProbe`]): the
 /// handle stays in flight across wait-loop iterations, so a slow answer is
 /// still observed when it lands instead of being cancelled at a budget.
 struct HistoryRequest {
     issued_at: Instant,
-    handle: tokio::task::JoinHandle<Result<Vec<DeploymentEntry>, ApiError>>,
+    handle: AbortOnDropHandle<Result<Vec<DeploymentEntry>, ApiError>>,
 }
 
 /// Supersession depth for detached history requests: a request stays in
@@ -1497,6 +1596,11 @@ struct HistoryRequest {
 /// endpoint while still observing any response slower than the attempt
 /// budget (see [`DeploymentHistoryProbe`]).
 const HISTORY_MAX_IN_FLIGHT: usize = 3;
+
+/// Polling granularity for the successful-exit pickup
+/// ([`DeploymentHistoryProbe::take_landed_within`]): how often a pending
+/// handle is checked while the exit waits, bounded by the pickup budget.
+const LANDED_PICKUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Detached deployment-history observation for the wait loops (cap#220
 /// review follow-ups).
@@ -1562,7 +1666,9 @@ impl DeploymentHistoryProbe {
         let app_name = app_name.to_owned();
         self.in_flight.push_back(HistoryRequest {
             issued_at: Instant::now(),
-            handle: tokio::spawn(async move { api.list_deployments(&app_name).await }),
+            handle: AbortOnDropHandle::new(tokio::spawn(async move {
+                api.list_deployments(&app_name).await
+            })),
         });
         while self.in_flight.len() > HISTORY_MAX_IN_FLIGHT {
             // Never supersede a landed answer: its result would be dropped
@@ -1591,10 +1697,50 @@ impl DeploymentHistoryProbe {
             .in_flight
             .iter()
             .position(|request| request.handle.is_finished())?;
-        let request = self.in_flight.remove(index)?;
+        let mut request = self.in_flight.remove(index)?;
         // A cancelled or panicked task surfaces as `Err` and reads as "no
         // observation", exactly like `take_landed`'s `None`.
-        request.handle.await.ok()
+        match request.handle.join().await {
+            Some(Ok(result)) => Some(result),
+            Some(Err(_)) | None => None,
+        }
+    }
+
+    /// Every observation that has already landed, without blocking. A
+    /// successful wait exit drains the probe first (cap#220 review
+    /// follow-up): a failure answer that landed before the exit must be
+    /// consumed and reported, never dropped unobserved behind an earlier
+    /// non-failed answer.
+    async fn drain_landed(&mut self) -> Vec<Result<Vec<DeploymentEntry>, ApiError>> {
+        let mut landed = Vec::new();
+        while let Some(result) = self.take_landed().await {
+            landed.push(result);
+        }
+        landed
+    }
+
+    /// One landed observation, waiting up to `budget` for an answer to land
+    /// first (cap#220 review follow-up): a successful exit must consume the
+    /// deployment-state observation whose response arrives just after
+    /// readiness, instead of returning before it lands. `None` means nothing
+    /// landed within the budget -- the caller reconciles its pending request
+    /// with its own outcome instead of blocking, so a stalled history
+    /// endpoint can never turn readiness into a false timeout.
+    async fn take_landed_within(
+        &mut self,
+        budget: Duration,
+    ) -> Option<Result<Vec<DeploymentEntry>, ApiError>> {
+        let deadline = Instant::now() + budget;
+        loop {
+            if let Some(result) = self.take_landed().await {
+                return Some(result);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            tokio::time::sleep(remaining.min(LANDED_PICKUP_POLL_INTERVAL)).await;
+        }
     }
 }
 
@@ -1632,6 +1778,24 @@ pub(crate) async fn fail_if_template_deployment_failed(
     }
 }
 
+/// Classify one deployment-history answer for `deployment_id`: `Ok(Some)` is
+/// the terminal-failure message when the answer records the deployment as
+/// `failed`. Shared by the per-iteration failure check and the
+/// successful-exit reconciliation (cap#220 review follow-up) so both report
+/// exactly the same terminal error.
+fn deployment_history_failure(
+    result: Result<Vec<DeploymentEntry>, ApiError>,
+    deployment_id: &str,
+) -> Result<Option<String>, ApiError> {
+    let deployment = result?
+        .into_iter()
+        .find(|deployment| deployment.id == deployment_id);
+    Ok(deployment
+        .as_ref()
+        .filter(|deployment| deployment.status == "failed")
+        .map(|deployment| template_deployment_failure_message(deployment, deployment_id)))
+}
+
 async fn template_deployment_failure(
     api: &ApiClient,
     app_name: &str,
@@ -1648,13 +1812,7 @@ async fn template_deployment_failure(
     let Some(result) = history.take_landed().await else {
         return Ok(None);
     };
-    let deployment = result?
-        .into_iter()
-        .find(|deployment| deployment.id == deployment_id);
-    Ok(deployment
-        .as_ref()
-        .filter(|deployment| deployment.status == "failed")
-        .map(|deployment| template_deployment_failure_message(deployment, deployment_id)))
+    deployment_history_failure(result, deployment_id)
 }
 
 fn template_deployment_failure_message(
@@ -1684,6 +1842,64 @@ pub(crate) fn should_retry_template_deployment_status_error(error: &ApiError) ->
         }
         ApiError::NotAuthenticated => false,
     }
+}
+
+/// Hard cap on the successful-exit reconciliation with deployment history
+/// (cap#220 review follow-up). A ready endpoint must not mask a terminal
+/// deployment failure whose history answer lands just after readiness, so a
+/// successful exit gives one pending observation a bounded window to land --
+/// the same window the original synchronous failure lookup allowed before
+/// the detached probe. The window never exceeds the wait's remaining time,
+/// so a stalled history endpoint delays success at most this long instead of
+/// consuming the wait or turning readiness into a false timeout.
+const SUCCESS_RECONCILE_BUDGET: Duration = Duration::from_secs(15);
+
+fn success_reconcile_budget(wait_deadline: Instant) -> Duration {
+    SUCCESS_RECONCILE_BUDGET.min(wait_deadline.saturating_duration_since(Instant::now()))
+}
+
+/// Gate a wait's successful exit on deployment history (cap#220 review
+/// follow-up). Readiness alone must not end a wait: a failed deployment can
+/// otherwise proceed to ownership handling before its history answer lands
+/// and the terminal error is never reported. The gate consumes every
+/// observation that has already landed -- a landed failure is reported,
+/// never dropped -- and, when nothing has landed yet, gives one pending
+/// request a bounded window to arrive (the review's case: the failure
+/// response arrives seconds after the ready endpoint did). When nothing
+/// lands within the budget the pending request is reconciled with the
+/// success instead of blocking: the exit is bounded, never the whole wait,
+/// and a stalled history endpoint can never fail a ready deployment.
+pub(crate) async fn reconcile_success_with_deployment_history(
+    api: &ApiClient,
+    app_name: &str,
+    deployment_id: &str,
+    wait_deadline: Instant,
+    history: &mut DeploymentHistoryProbe,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if deployment_id == "pending" {
+        return Ok(());
+    }
+    history.ensure_request(api, app_name, wait_deadline);
+    let mut observations = history.drain_landed().await;
+    if observations.is_empty()
+        && let Some(result) = history
+            .take_landed_within(success_reconcile_budget(wait_deadline))
+            .await
+    {
+        observations.push(result);
+    }
+    for result in observations {
+        match deployment_history_failure(result, deployment_id) {
+            Ok(Some(message)) => return Err(message.into()),
+            Ok(None) => {}
+            // A transient lookup error reads as "no observation": the same
+            // retry predicate as the per-iteration check keeps a ready
+            // endpoint's success intact.
+            Err(error) if should_retry_template_deployment_status_error(&error) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
 }
 
 async fn find_deployment_entry(

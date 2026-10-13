@@ -28,12 +28,13 @@ use enclava_cli::{
 use enclava_engine::types::WorkloadSecurityProfile;
 
 use crate::commands::app::{
-    BootstrapEndpointStatusDecision, DeploymentWait, SignedDeployBlobParams, StoragePasswordInput,
+    BootstrapEndpointStatusDecision, DeploymentHistoryProbe, DeploymentWait, SignedDeployBlobParams, StoragePasswordInput,
     bootstrap_endpoint_status_decision, bounded_request, bounded_wait_attempt, build_signed_deploy_blobs,
     claim_initial_ownership, deploy_preflight_needs_claim, deployment_bound_tee_status,
     deployment_bound_terminal_bootstrap_error,
     deployment_bound_terminal_bootstrap_error_on_channel, ensure_manual_deploy_keyring,
     fetch_verified_platform_release, generate_log_key_for_app,
+    reconcile_success_with_deployment_history,
     tee_supplemental_fields_are_consistent, tee_terminal_diagnostic_probe_due, tee_unlock_state,
     terminal_bootstrap_failure_message, terminal_diagnostic_budget,
     terminal_diagnostic_probe_with_budget,
@@ -1542,6 +1543,7 @@ async fn wait_for_template_bootstrap_endpoint(
     // so the release reserve survives; unheld deploys keep start + max_wait.
     let wait_deadline = hold_deadline.map_or(start + max_wait, |hold| hold.min(start + max_wait));
     let mut tee = None;
+    let mut history = DeploymentHistoryProbe::new();
 
     loop {
         // Check the wait deadline before polling deployment history: once
@@ -1649,6 +1651,19 @@ async fn wait_for_template_bootstrap_endpoint(
                                 terminal_bootstrap_failure_message(app_name, &diagnostic).into()
                             );
                         }
+                        // Readiness alone must not end the wait (cap#220
+                        // review follow-up): reconcile the pending
+                        // deployment-state observation with this success so
+                        // a failed deployment reports its terminal error
+                        // instead of proceeding to ownership handling.
+                        reconcile_success_with_deployment_history(
+                            api,
+                            app_name,
+                            deployment_id,
+                            start + max_wait,
+                            &mut history,
+                        )
+                        .await?;
                         pb.set_message("Ownership claim endpoint ready");
                         return Ok(true);
                     }
@@ -1693,6 +1708,14 @@ async fn wait_for_template_bootstrap_endpoint(
                                     ));
                                 }
                                 BootstrapEndpointStatusDecision::AlreadyClaimed => {
+                                    reconcile_success_with_deployment_history(
+                                        api,
+                                        app_name,
+                                        deployment_id,
+                                        start + max_wait,
+                                        &mut history,
+                                    )
+                                    .await?;
                                     pb.set_message("Ownership already claimed");
                                     return Ok(false);
                                 }
@@ -2482,6 +2505,8 @@ async fn wait_for_paas_managed_config_keys(
     // `deadline`, so at the deadline the loop can no longer poll for fresh
     // counts before it must answer.
     let mut last_missing = expected.clone();
+    let mut history = DeploymentHistoryProbe::new();
+
     progress.set_message(managed_config_progress_message(
         0,
         expected.len(),
@@ -2569,6 +2594,17 @@ async fn wait_for_paas_managed_config_keys(
                     delivery_id.is_some() && !delivered_receipt,
                 ));
                 if missing.is_empty() {
+                    // Readiness alone must not end the wait (cap#220 review
+                    // follow-up): reconcile the pending deployment-state
+                    // observation with this success.
+                    reconcile_success_with_deployment_history(
+                        api,
+                        instance_name,
+                        deployment_id,
+                        deadline,
+                        &mut history,
+                    )
+                    .await?;
                     return Ok(());
                 }
                 if Instant::now() >= deadline {
@@ -3420,6 +3456,7 @@ async fn wait_for_paas_ssh_command(
 ) -> Result<SshCommandResponse, Box<dyn std::error::Error>> {
     let deployment_id = deployment.deployment_id;
     let start = Instant::now();
+    let mut history = DeploymentHistoryProbe::new();
     let mut terminal_probe_at: Option<Instant> = None;
     while start.elapsed() < timeout {
         progress.set_message(timed_progress(
@@ -3486,11 +3523,30 @@ async fn wait_for_paas_ssh_command(
             };
         validate_ssh_command_response(&response, stable_endpoint, expected_app_url)?;
         if response.status == "ready" {
+            // Readiness alone must not end the wait (cap#220 review
+            // follow-up): reconcile the pending deployment-state observation
+            // with this success.
+            reconcile_success_with_deployment_history(
+                api,
+                app_name,
+                deployment_id,
+                start + timeout,
+                &mut history,
+            )
+            .await?;
             return Ok(response);
         }
         if let Some(response) =
             fetch_direct_ssh_command_response(&response, stable_endpoint, expected_app_url).await?
         {
+            reconcile_success_with_deployment_history(
+                api,
+                app_name,
+                deployment_id,
+                start + timeout,
+                &mut history,
+            )
+            .await?;
             return Ok(response);
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
