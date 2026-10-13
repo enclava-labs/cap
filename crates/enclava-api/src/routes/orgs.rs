@@ -961,9 +961,9 @@ pub async fn bootstrap_signing_service_owner(
 type RotationAuthorityRow = (i64, Vec<u8>, Vec<u8>, Vec<u8>, DateTime<Utc>);
 
 /// Latest keyring version plus the signed_at floor for the directive
-/// version-recency bound. Pre-0054 rows keep legacy transaction-start
+/// version-recency bound. Pre-0065 rows keep legacy transaction-start
 /// created_at semantics, so their stored timestamp is floored at the
-/// watermark recorded when 0054 committed.
+/// watermark recorded when 0065 committed.
 async fn read_rotation_authority(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     org_id: Uuid,
@@ -1213,7 +1213,7 @@ async fn rotate_service_owner(
 ///
 /// Presentation rows (`org_rotation_intents`) never satisfy this query: an
 /// intent is proof of presentation only, never of execution. (The historical
-/// SQL comment in migration `0053` describes the superseded intent-row
+/// SQL comment in migration `0064` describes the superseded intent-row
 /// waiver; that file is byte-frozen because sqlx checksums applied migration
 /// bytes — see `DEPLOYMENT.md` for the current semantics.)
 async fn upstream_receipt_matches_live_service(
@@ -1395,7 +1395,7 @@ pub async fn rotate_org_owner(
     // fall inside the first-use max-age window, and the directive is
     // consumed exactly once. The max-age window carries one recovery
     // exception: an expired retry is accepted only when an upstream
-    // receipt (org_rotation_upstream_receipts, migration 0059) proves this
+    // receipt (org_rotation_upstream_receipts, migration 0066) proves this
     // exact request's rotate-owner RPC succeeded and the service's current
     // owner state still matches that receipt. An already-applied rotation
     // is idempotent at any age, proven by the byte-identical stored
@@ -1441,7 +1441,7 @@ pub async fn rotate_org_owner(
         Json(serde_json::json!({"error": "platform signing service is not configured"})),
     ))?;
 
-    // Durable presentation record (migration 0053), committed on its own
+    // Durable presentation record (migration 0064), committed on its own
     // short-lived connection BEFORE the lane transaction opens: with the
     // pool capped, waiting on a second connection while holding the lane
     // transaction's connection could starve the whole cluster. The row
@@ -3379,11 +3379,11 @@ mod tests {
 
     #[tokio::test]
     async fn owner_rotation_version_bound_floors_legacy_rows_at_migration_watermark() {
-        // Regression (PR #185 review, codex P2 on migration 0051): a
+        // Regression (PR #185 review, codex P2 on migration 0063): a
         // keyring version committed by pre-migration code keeps a
         // transaction-start created_at that can predate its real
         // insertion by the full signing-authority lane wait. Without the
-        // migration-0054 watermark floor, a directive signed while the
+        // migration-0065 watermark floor, a directive signed while the
         // legacy upload sat queued on the lane compares as "newer than
         // the version" and is accepted during the post-rollout first-use
         // window even though it predates the version's real insertion.
@@ -3500,7 +3500,7 @@ mod tests {
         );
 
         // Control: once the org has a post-watermark version (uploaded
-        // after migration 0054, created_at = clock_timestamp()), a
+        // after migration 0063, created_at = clock_timestamp()), a
         // directive signed after that insertion rotates normally -- the
         // floor does not wedge forward rotations.
         let _ = put_keyring(
@@ -5000,7 +5000,7 @@ mod tests {
         // signing-authority lane pins now() == transaction_timestamp() at
         // BEGIN; a directive captured after BEGIN but before the queued
         // version lands would then compare as "newer than the version" and be
-        // accepted, defeating the pre-creation replay bound. Migration 0051
+        // accepted, defeating the pre-creation replay bound. Migration 0063
         // switches the default to clock_timestamp() and this test fails
         // against the old transaction-start semantics.
         let pool = database_test_pool().await;
