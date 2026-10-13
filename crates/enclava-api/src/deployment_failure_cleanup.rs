@@ -504,10 +504,14 @@ pub(crate) async fn sweep_statefulset_pvcs(
         // (first sweep) or name it (retry sweep after it is gone).
         let created_after_apply_start = apply_started_at.is_some_and(|threshold| {
             pvc.metadata.creation_timestamp.is_some_and(|created| {
-                // Both sides render as RFC 3339 with the same nanosecond
-                // precision, so lexicographic ordering of the strings
-                // matches chronological ordering.
-                created.0.to_string().as_str() > threshold.to_rfc3339().as_str()
+                // Compare as the SAME type: the chrono threshold is parsed
+                // into a jiff Timestamp (both render/parse RFC 3339), so
+                // the ordering is truly chronological — string forms of
+                // the two libraries differ and misorder near-equal times.
+                threshold
+                    .to_rfc3339()
+                    .parse::<k8s_openapi::jiff::Timestamp>()
+                    .is_ok_and(|threshold| created.0 > threshold)
             })
         });
         if !created_after_apply_start {
@@ -700,6 +704,11 @@ const NAMESPACE_CONVERGENCE_TIMEOUT: std::time::Duration = std::time::Duration::
 /// delete a replacement and cannot spin unbounded.
 const NAMESPACE_DELETE_RETRIES: usize = 3;
 
+/// Per-request budget for the preconditioned namespace DELETE itself, so a
+/// stalled API server cannot stretch the teardown phase past its advertised
+/// budget while the shared fences are held.
+const NAMESPACE_DELETE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Outcome of the bounded namespace teardown.
 #[derive(Debug, PartialEq, Eq)]
 enum NamespaceTeardown {
@@ -831,8 +840,30 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
         tracing::info!(
             app_id = %app.id,
             namespace = %app.namespace,
-            "failed-apply cleanup found no live namespace before any delete; this generation never published it (or its routes)"
+            "failed-apply cleanup found no live namespace before any delete; clearing this generation's routes and evidence"
         );
+        // An initial 404 does not prove this generation never published:
+        // the apply may have finished ensure_haproxy_routes, failed
+        // afterward, and had its namespace deleted externally before this
+        // probe. The row-level gate above already proved no OTHER
+        // generation owns provider state, so removing this app's routes
+        // here is exactly as safe as in the confirmed-absence path below.
+        if let Some(edge_config_generation) =
+            mutation.resource_generation(&ResourceFence::edge_config())
+            && let Err(error) = mutation
+                .guard_provider(remove_failed_generation_edge_routes(
+                    state,
+                    app,
+                    edge_config_generation,
+                ))
+                .await
+        {
+            tracing::warn!(
+                app_id = %app.id,
+                error = %error,
+                "failed-apply HAProxy route cleanup did not complete under the mutation lease; periodic edge reconciliation will converge"
+            );
+        }
         // A confirmed 404 proves this generation published nothing: every
         // object the apply creates is namespaced and died with the
         // namespace. Clearing the row's provider-state evidence unblocks
@@ -1351,8 +1382,12 @@ async fn delete_owned_namespace(
     let pinned_uid = owned_uid;
     let mut pinned_resource_version = owned_resource_version;
     for _attempt in 0..NAMESPACE_DELETE_RETRIES {
-        match api
-            .delete(
+        // Bound the mutation itself: a stalled API server must not hold
+        // the failed mutation's shared fences for the client's ~295 s
+        // request timeout before the convergence wait even starts.
+        let delete_result = match tokio::time::timeout(
+            NAMESPACE_DELETE_REQUEST_TIMEOUT,
+            api.delete(
                 &app.namespace,
                 &kube::api::DeleteParams {
                     preconditions: Some(kube::api::Preconditions {
@@ -1361,9 +1396,23 @@ async fn delete_owned_namespace(
                     }),
                     ..kube::api::DeleteParams::default()
                 },
-            )
-            .await
+            ),
+        )
+        .await
         {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                // The DELETE exceeded its request budget: whether it was
+                // accepted is undecidable, so fail closed.
+                tracing::warn!(
+                    app_id = %app.id,
+                    namespace = %app.namespace,
+                    "failed-apply namespace delete exceeded its request budget; retaining the namespace fence for reconciliation"
+                );
+                return NamespaceTeardown::DeleteIncomplete;
+            }
+        };
+        match delete_result {
             Ok(_) => break, // accepted; converge below
             Err(kube::Error::Api(error)) if error.code == 404 => {
                 // Vanished between the owning GET and the delete: complete.
