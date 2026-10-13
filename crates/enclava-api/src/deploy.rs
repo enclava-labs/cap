@@ -28,6 +28,14 @@ use uuid::Uuid;
 use crate::models::{App, AppContainer, AppResources, AppStatus};
 
 const DEFAULT_TENANT_IMAGE_PULL_SECRET_NAME: &str = "enclava-registry-auth";
+
+/// The tenant image-pull secret name the cleanup sweep must delete from
+/// adopted namespaces. Re-uses `configured_tenant_image_pull_secret_name`'s
+/// env-derived value so the sweep always matches what apply published.
+pub(crate) fn default_tenant_image_pull_secret_name_for_cleanup() -> String {
+    configured_tenant_image_pull_secret_name()
+        .unwrap_or_else(|| DEFAULT_TENANT_IMAGE_PULL_SECRET_NAME.to_string())
+}
 const TENANT_IMAGE_PULL_SECRET_NAME_ENV: &str = "TENANT_IMAGE_PULL_SECRET_NAME";
 const TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES_ENV: &str = "TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES";
 const PUBLIC_INTERNET_EGRESS_EXCLUDED_CIDRS_ENV: &str = "CAP_PUBLIC_INTERNET_EGRESS_EXCLUDED_CIDRS";

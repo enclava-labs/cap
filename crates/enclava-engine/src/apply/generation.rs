@@ -18,6 +18,14 @@ use super::engine::{ApplyEngine, ApplyError};
 use super::fields_v1::flatten_owned_paths;
 
 pub const MUTATION_GENERATION_ANNOTATION: &str = "enclava.dev/cap-provider-mutation-generation";
+
+/// Annotation stamped by `apply_namespace` only when it observed the
+/// namespace absent immediately before creating it. Proves CREATION by a
+/// CAP apply, as opposed to the mutation-generation annotation which only
+/// proves this apply last wrote the object. Teardown paths that delete a
+/// whole namespace require this evidence so a pre-existing namespace that
+/// CAP merely adopted (non-force SSA tolerates it) is never destroyed.
+pub const NAMESPACE_CREATED_BY_ANNOTATION: &str = "enclava.dev/cap-namespace-created-by-generation";
 // ponytail: bounded but patient — total worst-case conflict wait ≈ 60 s, well
 // inside the 180 s mutation lease and job deadlines. Controllers routinely
 // rewrite status for minutes; the old 12×≤200 ms (~1.9 s) budget terminally

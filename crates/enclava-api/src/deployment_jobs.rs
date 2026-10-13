@@ -1266,11 +1266,21 @@ pub fn spawn_deployment_dispatcher(state: AppState) {
                     "failed to repair orphaned deployment namespace mutation leases"
                 ),
             }
+            tokio::time::sleep(TERMINAL_LEASE_REPAIR_INTERVAL).await;
+        }
+    });
+
+    // Retained-namespace fence reconciliation probes Kubernetes and can be
+    // held up by slow/unreachable API servers, so it runs on its own task:
+    // orphaned-apply repair must never wait behind a stalled namespace GET.
+    let retained_state = state.clone();
+    tokio::spawn(async move {
+        loop {
             // Retained-namespace fences from incomplete failed-apply teardowns
             // are released only after reconciliation observes the namespace
             // gone; fail closed on any uncertainty.
             match crate::mutation_leases::release_retained_deployment_namespace_fences(
-                &repair_state.db,
+                &retained_state.db,
             )
             .await
             {
@@ -1287,7 +1297,6 @@ pub fn spawn_deployment_dispatcher(state: AppState) {
             tokio::time::sleep(TERMINAL_LEASE_REPAIR_INTERVAL).await;
         }
     });
-
     let setup_worker_slots = Arc::new(tokio::sync::Semaphore::new(MAX_SETUP_WORKERS));
     let configured_apply_workers =
         apply_worker_limit(state.deployment_apply_permits.available_permits());

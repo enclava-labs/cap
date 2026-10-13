@@ -8,15 +8,21 @@
 //!   will never become healthy.
 //! * Kubernetes objects created by `apply_all_with_tenant_image_pull_secret`
 //!   (namespace, image-pull secret, network policy, Gateway API resources,
-//!   StatefulSet). Deleting the namespace is sufficient cleanup: every object
-//!   the apply creates is namespaced and dies with it.
+//!   StatefulSet). When the namespace was CAP-created (creation-evidence
+//!   annotation), deleting the namespace is sufficient cleanup: every object
+//!   the apply creates is namespaced and dies with it. When the namespace
+//!   pre-existed and was merely adopted, the namespace is NOT deleted — the
+//!   objects this generation published are swept individually instead.
 //!
 //! Cleanup is strictly conservative and gated on live provider evidence, not
 //! on deployment-row status alone:
 //!
 //! * the live namespace must carry this exact generation's mutation-generation
-//!   annotation — proof this generation itself ran `apply_namespace` and
-//!   currently owns the namespace (the deployment row's `manifest_hash` is
+//!   annotation AND CAP creation evidence to authorize a namespace delete —
+//!   the mutation annotation alone proves only last-writer (an adopted
+//!   namespace carries it too), so without creation evidence the namespace
+//!   is treated as adopted and never destroyed
+//!   (the deployment row's `manifest_hash` is
 //!   written at `applying`, before any provider call, so it is not evidence
 //!   of publication);
 //! * no OTHER deployment of the app may carry any provider-state evidence
@@ -46,6 +52,255 @@ use crate::models::App;
 use crate::mutation_leases::{AppMutationLease, ResourceFence};
 use crate::state::AppState;
 
+/// Objects a failed generation published into an ADOPTED namespace and must
+/// delete individually (the namespace itself is not CAP's to destroy).
+/// Mirrors the deterministic names in `enclava-engine`'s manifest
+/// generators and the tenant image-pull secret in `deploy.rs`.
+struct AdoptedNamespaceSweep {
+    kind: &'static str,
+    name: String,
+}
+
+/// The four Gateway-API / Cilium CRDs apply publishes, as (group, version,
+/// kind, plural) — mirroring the private constructors in
+/// `enclava-engine/src/apply/gateway.rs` and `network_policy.rs`.
+fn crd_api_resource(
+    group: &str,
+    version: &str,
+    kind: &str,
+    plural: &str,
+) -> kube::api::ApiResource {
+    kube::api::ApiResource {
+        group: group.to_string(),
+        version: version.to_string(),
+        api_version: format!("{group}/{version}"),
+        kind: kind.to_string(),
+        plural: plural.to_string(),
+    }
+}
+
+fn adopted_namespace_sweep_targets(app: &App) -> Vec<AdoptedNamespaceSweep> {
+    let mut targets = Vec::new();
+    // Tenant image-pull secret (GHCR credentials): the most security-
+    // sensitive object; its name comes from the same env-derived default
+    // as `deploy.rs`.
+    targets.push(AdoptedNamespaceSweep {
+        kind: "Secret",
+        name: crate::deploy::default_tenant_image_pull_secret_name_for_cleanup(),
+    });
+    // StatefulSet (app name) — deleting it stops any partially rolled-out
+    // workload CAP started in the adopted namespace.
+    targets.push(AdoptedNamespaceSweep {
+        kind: "StatefulSet",
+        name: app.name.clone(),
+    });
+    // CiliumNetworkPolicy ("tenant-isolation")
+    targets.push(AdoptedNamespaceSweep {
+        kind: "CiliumNetworkPolicy",
+        name: "tenant-isolation".to_string(),
+    });
+    // Gateway API resources (names mirror gateway.rs's generators).
+    targets.push(AdoptedNamespaceSweep {
+        kind: "EnvoyProxy",
+        name: format!("tenant-gateway-proxy-{}", app.name),
+    });
+    targets.push(AdoptedNamespaceSweep {
+        kind: "Gateway",
+        name: format!("tenant-gateway-{}", app.name),
+    });
+    targets.push(AdoptedNamespaceSweep {
+        kind: "TLSRoute",
+        name: format!("tenant-passthrough-{}", app.name),
+    });
+    targets.push(AdoptedNamespaceSweep {
+        kind: "TLSRoute",
+        name: format!("tenant-tee-passthrough-{}", app.name),
+    });
+    // service_account
+    targets.push(AdoptedNamespaceSweep {
+        kind: "ServiceAccount",
+        name: app.service_account.clone(),
+    });
+    // resource_quota ("tenant-quota")
+    targets.push(AdoptedNamespaceSweep {
+        kind: "ResourceQuota",
+        name: "tenant-quota".to_string(),
+    });
+    // service (app name)
+    targets.push(AdoptedNamespaceSweep {
+        kind: "Service",
+        name: app.name.clone(),
+    });
+    // ConfigMaps: bootstrap, startup, ingress, enclava-init, verification,
+    // sni-route
+    for name in [
+        "secure-pv-bootstrap-script".to_string(),
+        format!("{}-startup", app.name),
+        format!("{}-tenant-ingress", app.name),
+        enclava_engine::manifest::enclava_init_config::configmap_name(&app.name),
+        enclava_engine::manifest::verification_material::configmap_name(&app.name),
+        format!("{}-sni-route", app.name),
+    ] {
+        targets.push(AdoptedNamespaceSweep {
+            kind: "ConfigMap",
+            name,
+        });
+    }
+    targets
+}
+
+/// Delete exactly the objects this failed generation published into an
+/// adopted namespace. Deletion is generation-gated via `delete_resource`'s
+/// mutation-annotation check, so objects another generation owns (or that
+/// pre-date CAP entirely) are left untouched. Failures are logged and
+/// skipped: the fences still release normally because the retained
+/// objects converge through later successful applies.
+async fn sweep_published_objects_from_adopted_namespace(
+    app: &App,
+    generation: enclava_engine::apply::generation::MutationGeneration,
+) {
+    let client = match kube::Client::try_default().await {
+        Ok(client) => client,
+        Err(error) => {
+            tracing::warn!(
+                app_id = %app.id,
+                namespace = %app.namespace,
+                error = %error,
+                "adopted-namespace sweep cannot reach Kubernetes; leaving published objects for the next apply to reconcile"
+            );
+            return;
+        }
+    };
+    let mut deleted = 0usize;
+    for target in adopted_namespace_sweep_targets(app) {
+        // Each kind needs its typed API; `delete_resource` is generic over
+        // the resource type and re-uses the generation gate.
+        let outcome: Result<bool, enclava_engine::apply::engine::ApplyError> = match target.kind {
+            "StatefulSet" => {
+                let api: kube::Api<k8s_openapi::api::apps::v1::StatefulSet> =
+                    kube::Api::namespaced(client.clone(), &app.namespace);
+                enclava_engine::apply::generation::delete_resource(
+                    &api,
+                    &target.name,
+                    generation,
+                    kube::api::DeleteParams::default(),
+                )
+                .await
+            }
+            "Secret" => {
+                let api: kube::Api<k8s_openapi::api::core::v1::Secret> =
+                    kube::Api::namespaced(client.clone(), &app.namespace);
+                enclava_engine::apply::generation::delete_resource(
+                    &api,
+                    &target.name,
+                    generation,
+                    kube::api::DeleteParams::default(),
+                )
+                .await
+            }
+            "ServiceAccount" => {
+                let api: kube::Api<k8s_openapi::api::core::v1::ServiceAccount> =
+                    kube::Api::namespaced(client.clone(), &app.namespace);
+                enclava_engine::apply::generation::delete_resource(
+                    &api,
+                    &target.name,
+                    generation,
+                    kube::api::DeleteParams::default(),
+                )
+                .await
+            }
+            "ResourceQuota" => {
+                let api: kube::Api<k8s_openapi::api::core::v1::ResourceQuota> =
+                    kube::Api::namespaced(client.clone(), &app.namespace);
+                enclava_engine::apply::generation::delete_resource(
+                    &api,
+                    &target.name,
+                    generation,
+                    kube::api::DeleteParams::default(),
+                )
+                .await
+            }
+            "Service" => {
+                let api: kube::Api<k8s_openapi::api::core::v1::Service> =
+                    kube::Api::namespaced(client.clone(), &app.namespace);
+                enclava_engine::apply::generation::delete_resource(
+                    &api,
+                    &target.name,
+                    generation,
+                    kube::api::DeleteParams::default(),
+                )
+                .await
+            }
+            "CiliumNetworkPolicy" | "EnvoyProxy" | "Gateway" | "TLSRoute" => {
+                let ar = match target.kind {
+                    "CiliumNetworkPolicy" => crd_api_resource(
+                        "cilium.io",
+                        "v2",
+                        "CiliumNetworkPolicy",
+                        "ciliumnetworkpolicies",
+                    ),
+                    "EnvoyProxy" => crd_api_resource(
+                        "gateway.envoyproxy.io",
+                        "v1alpha1",
+                        "EnvoyProxy",
+                        "envoyproxies",
+                    ),
+                    "Gateway" => {
+                        crd_api_resource("gateway.networking.k8s.io", "v1", "Gateway", "gateways")
+                    }
+                    _ => crd_api_resource(
+                        "gateway.networking.k8s.io",
+                        "v1alpha3",
+                        "TLSRoute",
+                        "tlsroutes",
+                    ),
+                };
+                let api: kube::Api<kube::api::DynamicObject> =
+                    kube::Api::namespaced_with(client.clone(), &app.namespace, &ar);
+                enclava_engine::apply::generation::delete_resource(
+                    &api,
+                    &target.name,
+                    generation,
+                    kube::api::DeleteParams::default(),
+                )
+                .await
+            }
+            "ConfigMap" => {
+                let api: kube::Api<k8s_openapi::api::core::v1::ConfigMap> =
+                    kube::Api::namespaced(client.clone(), &app.namespace);
+                enclava_engine::apply::generation::delete_resource(
+                    &api,
+                    &target.name,
+                    generation,
+                    kube::api::DeleteParams::default(),
+                )
+                .await
+            }
+            _ => unreachable!("statically enumerated kinds"),
+        };
+        match outcome {
+            Ok(true) => deleted += 1,
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(
+                    app_id = %app.id,
+                    namespace = %app.namespace,
+                    kind = target.kind,
+                    name = %target.name,
+                    error = %error,
+                    "adopted-namespace sweep could not delete a published object; the next apply reconciles it"
+                );
+            }
+        }
+    }
+    tracing::info!(
+        app_id = %app.id,
+        namespace = %app.namespace,
+        deleted,
+        "swept failed generation's objects from adopted namespace"
+    );
+}
+
 /// Mirrors the app-delete namespace teardown envelope: bounded convergence
 /// wait once the delete has been accepted. `delete_resource`'s internal
 /// conflict retries are short-lived (409 backoff only), so this wait starts
@@ -61,6 +316,10 @@ enum NamespaceTeardown {
     /// generation's (or no) mutation annotation, or it could not even be
     /// inspected. No delete was issued through this path.
     NotOurs,
+    /// A pre-existing namespace this apply adopted (mutation annotation
+    /// matches but no creation evidence): never deleted. Only the routes
+    /// this apply published are compensated.
+    Adopted,
     /// A delete was issued but 404 was not confirmed, or the step failed or
     /// lost its lease after deciding to delete. The caller must retain the
     /// pre-armed namespace fence for reconciliation instead of quarantining
@@ -167,7 +426,7 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
         }
     };
 
-    if teardown == NamespaceTeardown::NotOurs {
+    if matches!(teardown, NamespaceTeardown::NotOurs) {
         tracing::info!(
             app_id = %app.id,
             namespace = %app.namespace,
@@ -206,7 +465,9 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
     }
 
     match teardown {
-        NamespaceTeardown::ConfirmedAbsent => CleanupFenceOutcome::ReleaseNormally,
+        NamespaceTeardown::ConfirmedAbsent | NamespaceTeardown::Adopted => {
+            CleanupFenceOutcome::ReleaseNormally
+        }
         NamespaceTeardown::DeleteIncomplete => {
             tracing::warn!(
                 app_id = %app.id,
@@ -321,8 +582,15 @@ async fn remove_failed_generation_edge_routes(
 /// 404 (between the owning GET and the delete, or during the convergence
 /// wait).
 enum InitialNamespaceOwnership {
-    /// Live object carries this generation's annotation: safe to delete.
+    /// Live object carries this generation's annotation AND creation
+    /// evidence (`enclava.dev/cap-namespace-created-by-generation`): CAP
+    /// created it and this generation was the last writer — safe to delete.
     Owned,
+    /// Live object carries this generation's mutation annotation but no
+    /// creation evidence: a pre-existing namespace this apply adopted.
+    /// Never delete it — only the resources this apply published (routes)
+    /// are compensated.
+    Adopted,
     /// GET returned 404 before any delete was issued. This generation never
     /// published the namespace, so it never published routes either.
     AbsentBeforeDelete,
@@ -339,16 +607,30 @@ fn classify_initial_namespace_get(
 ) -> InitialNamespaceOwnership {
     match result {
         Ok(namespace) => {
-            let live = namespace
-                .metadata
-                .annotations
-                .as_ref()
+            let annotations = namespace.metadata.annotations.as_ref();
+            let live = annotations
                 .and_then(|annotations| {
                     annotations
                         .get(enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION)
                 })
                 .and_then(|raw| raw.parse::<i64>().ok());
             if live == Some(generation.get()) {
+                // Last-writer proof alone is not creation proof: only the
+                // creation annotation (stamped by `apply_namespace`'s
+                // create POST) distinguishes a CAP-created namespace from a
+                // pre-existing one this apply adopted and stamped. The
+                // value must parse as a positive generation — a planted
+                // empty or non-numeric key proves nothing.
+                let created_by_cap = annotations
+                    .and_then(|annotations| {
+                        annotations
+                            .get(enclava_engine::apply::generation::NAMESPACE_CREATED_BY_ANNOTATION)
+                    })
+                    .and_then(|raw| raw.parse::<i64>().ok())
+                    .is_some_and(|value| value > 0);
+                if !created_by_cap {
+                    return InitialNamespaceOwnership::Adopted;
+                }
                 InitialNamespaceOwnership::Owned
             } else {
                 InitialNamespaceOwnership::Foreign
@@ -407,6 +689,20 @@ async fn delete_failed_generation_namespace(
                 "failed-apply cleanup found no live namespace before any delete; this generation never published it (or its routes)"
             );
             return NamespaceTeardown::NotOurs;
+        }
+        InitialNamespaceOwnership::Adopted => {
+            // Pre-existing namespace this apply adopted: not CAP's to
+            // destroy. Delete only the objects this generation published
+            // (generation-gated), then compensate routes; fences release
+            // normally because the namespace outlives the failed
+            // generation.
+            tracing::info!(
+                app_id = %app.id,
+                namespace = %app.namespace,
+                "failed-apply cleanup sweeps published objects from adopted namespace (no creation evidence; namespace not deleted)"
+            );
+            sweep_published_objects_from_adopted_namespace(app, generation).await;
+            return NamespaceTeardown::Adopted;
         }
         InitialNamespaceOwnership::Foreign => {
             // The namespace was created or last written by another
@@ -816,12 +1112,33 @@ mod tests {
     }
 
     fn annotated_namespace(generation: i64) -> k8s_openapi::api::core::v1::Namespace {
+        namespace_with_annotations(generation, true)
+    }
+
+    /// A live namespace carrying only the mutation-generation annotation of
+    /// this generation but NO creation evidence: a pre-existing namespace
+    /// this apply adopted.
+    fn adopted_namespace(generation: i64) -> k8s_openapi::api::core::v1::Namespace {
+        namespace_with_annotations(generation, false)
+    }
+
+    fn namespace_with_annotations(
+        generation: i64,
+        created_by_cap: bool,
+    ) -> k8s_openapi::api::core::v1::Namespace {
+        let mut annotations = std::collections::BTreeMap::from([(
+            enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION.to_string(),
+            generation.to_string(),
+        )]);
+        if created_by_cap {
+            annotations.insert(
+                enclava_engine::apply::generation::NAMESPACE_CREATED_BY_ANNOTATION.to_string(),
+                generation.to_string(),
+            );
+        }
         k8s_openapi::api::core::v1::Namespace {
             metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
-                annotations: Some(std::collections::BTreeMap::from([(
-                    enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION.to_string(),
-                    generation.to_string(),
-                )])),
+                annotations: Some(annotations),
                 ..Default::default()
             },
             ..Default::default()
@@ -854,6 +1171,32 @@ mod tests {
                 generation
             ),
             InitialNamespaceOwnership::Foreign
+        ));
+        // Codex P1: this generation's mutation annotation alone is only a
+        // last-writer proof. Without creation evidence the namespace
+        // pre-existed and was adopted — it must never be deleted.
+        assert!(matches!(
+            classify_initial_namespace_get(&Ok(adopted_namespace(7)), generation),
+            InitialNamespaceOwnership::Adopted
+        ));
+        // Creation evidence written by an earlier generation (the namespace
+        // was CAP-created, then re-applied by this generation which
+        // preserved it) still reads as foreign for THIS generation's
+        // mutation annotation mismatch — handled above — but the exact
+        // match with preserved evidence is Owned.
+        let mut recreated = annotated_namespace(5);
+        recreated
+            .metadata
+            .annotations
+            .as_mut()
+            .expect("annotations")
+            .insert(
+                enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION.to_string(),
+                "7".to_string(),
+            );
+        assert!(matches!(
+            classify_initial_namespace_get(&Ok(recreated), generation),
+            InitialNamespaceOwnership::Owned
         ));
     }
 

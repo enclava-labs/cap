@@ -22,6 +22,13 @@ const RECLAIM_QUARANTINE_SECONDS: i64 = 360;
 const HEARTBEAT_SECONDS: u64 = 30;
 const RENEW_TIMEOUT_SECONDS: u64 = 10;
 
+/// Bound for each individual namespace-absence probe in
+/// `release_retained_deployment_namespace_fences`. Without it, one stalled
+/// Kubernetes GET could hold the reconciliation loop (and anything sequenced
+/// after it) for the client's full 295 s read timeout. A timed-out probe is
+/// fail-closed: the fence is retained and revisited next cycle.
+const RETAINED_NAMESPACE_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Marker written to `external_resource_mutation_leases.operation_kind` when a
 /// failed deployment apply intentionally retains its `kubernetes_namespace`
 /// fence until reconciliation confirms the namespace is gone. The orphaned
@@ -1100,15 +1107,32 @@ async fn release_retained_deployment_namespace_fences_with(
     let api: kube::Api<k8s_openapi::api::core::v1::Namespace> = kube::Api::all(client);
     let mut released = 0u64;
     for (owner_token, namespace, operation_id, generation) in retained {
-        let absence = match api.get_opt(&namespace).await {
-            Ok(None) => true,
-            Ok(Some(_)) => false,
-            Err(error) => {
+        // Bound each individual probe so one stalled Kubernetes GET cannot
+        // block this loop (and, because the loop runs on its own task, the
+        // orphan-repair loop) for the client's full 295 s read timeout. A
+        // timed-out probe is treated exactly like a GET error: retain the
+        // fence and revisit next cycle.
+        let absence = match tokio::time::timeout(
+            RETAINED_NAMESPACE_PROBE_TIMEOUT,
+            api.get_opt(&namespace),
+        )
+        .await
+        {
+            Ok(Ok(None)) => true,
+            Ok(Ok(Some(_))) => false,
+            Ok(Err(error)) => {
                 // Fail closed: an unobservable namespace must not release.
                 tracing::warn!(
                     namespace = %namespace,
                     error = %error,
                     "retained-namespace fence reconciliation cannot inspect the namespace; retaining fence"
+                );
+                continue;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    namespace = %namespace,
+                    "retained-namespace fence reconciliation probe timed out; retaining fence"
                 );
                 continue;
             }
