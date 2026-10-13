@@ -416,14 +416,7 @@ async fn probe_tee(
         state,
         namespace,
         app_name,
-        probe_tee_unbounded(
-            state,
-            namespace,
-            app_name,
-            domain,
-            tee_domain,
-            tee_request_timeout(deadline),
-        ),
+        probe_tee_unbounded(state, namespace, app_name, domain, tee_domain, deadline),
         TEE_STATUS_PROBE_TIMEOUT,
     )
     .await
@@ -530,7 +523,7 @@ async fn probe_tee_unbounded(
     app_name: &str,
     domain: &str,
     tee_domain: Option<&str>,
-    request_timeout: Duration,
+    probe_deadline: tokio::time::Instant,
 ) -> TeeEvidence {
     let internal_transport = state.attestation.as_ref().is_some_and(|attestation| {
         enclava_engine::manifest::network_policy::cap_api_namespace_for_attestation(
@@ -572,9 +565,12 @@ async fn probe_tee_unbounded(
             confidential_status_url(domain, tee_domain, None),
         )
     };
+    // Computed here, after socket resolution and client construction, so the
+    // request allowance reflects the remaining probe budget rather than a
+    // snapshot taken before those steps (#219 review).
     let response = match client
         .get(&tee_status_url)
-        .timeout(request_timeout)
+        .timeout(tee_request_timeout(probe_deadline))
         .send()
         .await
     {
