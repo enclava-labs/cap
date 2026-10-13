@@ -165,6 +165,65 @@ pub fn side_effect_admission_for_pool(pool: &PgPool) -> Arc<Semaphore> {
     Arc::new(Semaphore::new(side_effect_admission_limit(pool)))
 }
 
+/// Maximum number of `namespace/app` failure signatures retained before the
+/// oldest entries are evicted. The map only exists to rate-limit warn logs;
+/// a bounded LRU-style cache keeps app churn (create, fail a probe, delete)
+/// from growing process memory indefinitely, as flagged in cap#219 review.
+pub const TEE_PROBE_FAILURE_CACHE_CAPACITY: usize = 1_024;
+
+/// Bounded cache of TEE probe failure signatures, keyed by `namespace/app`.
+///
+/// `HashMap` + insertion-order `VecDeque` approximates an LRU: re-observed
+/// keys are moved to the back (most recently used), and inserts past the
+/// capacity evict from the front. Stale keys of deleted apps are therefore
+/// evicted by churn rather than retained for the life of the process.
+#[derive(Debug, Default)]
+pub struct TeeProbeFailureCache {
+    entries: std::collections::HashMap<String, String>,
+    order: std::collections::VecDeque<String>,
+}
+
+impl TeeProbeFailureCache {
+    /// Inserts or refreshes `key`, returning the previous signature if one
+    /// existed. Evicts the least recently used entry when the cache is full.
+    pub fn insert(&mut self, key: String, signature: String) -> Option<String> {
+        let previous = self.entries.insert(key.clone(), signature);
+        match &previous {
+            // Refresh recency: move the existing key to the back.
+            Some(_) => self.order.retain(|k| k != &key),
+            None => {
+                if self.entries.len() > TEE_PROBE_FAILURE_CACHE_CAPACITY {
+                    // entries.len() is at most capacity + 1 here, so this
+                    // loop runs at most once.
+                    while self.entries.len() > TEE_PROBE_FAILURE_CACHE_CAPACITY {
+                        if let Some(evicted) = self.order.pop_front() {
+                            self.entries.remove(&evicted);
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        self.order.push_back(key);
+        previous
+    }
+
+    /// Returns the recorded signature for `key`, refreshing its recency.
+    pub fn get(&mut self, key: &str) -> Option<&String> {
+        let signature = self.entries.get(key)?;
+        self.order.retain(|k| k != key);
+        self.order.push_back(key.to_string());
+        Some(signature)
+    }
+
+    /// Removes `key` (e.g. after a successful probe for the app).
+    pub fn remove(&mut self, key: &str) -> Option<String> {
+        self.order.retain(|k| k != key);
+        self.entries.remove(key)
+    }
+}
+
 /// Shared application state accessible from all axum handlers.
 #[derive(Clone)]
 pub struct AppState {
@@ -201,9 +260,9 @@ pub struct AppState {
     /// Rate-limit state for live TEE probe failure warns: the last failure
     /// signature per `namespace/app`, so a persistently failing probe logs on
     /// the first failure and on change of error class instead of per request.
+    /// Bounded so keys of deleted apps cannot accumulate unboundedly (#219).
     /// Shared through the `AppState` clones handed to concurrent handlers.
-    pub recent_tee_probe_failures:
-        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+    pub recent_tee_probe_failures: std::sync::Arc<std::sync::Mutex<TeeProbeFailureCache>>,
     /// Sidecar/runtime settings used when generating Kubernetes manifests.
     pub attestation: Option<AttestationConfig>,
     /// Signed public platform release envelope used to derive
@@ -298,5 +357,53 @@ mod tests {
         assert_eq!(side_effect_admission_limit(&pool(3)), 1);
         assert_eq!(side_effect_admission_limit(&pool(4)), 2);
         assert_eq!(side_effect_admission_limit(&pool(20)), 8);
+    }
+
+    #[test]
+    fn tee_probe_failure_cache_evicts_least_recently_used_key() {
+        let mut cache = TeeProbeFailureCache::default();
+        for i in 0..TEE_PROBE_FAILURE_CACHE_CAPACITY {
+            cache.insert(format!("ns-{i}/app-{i}"), format!("failure-{i}"));
+        }
+        assert_eq!(cache.entries.len(), TEE_PROBE_FAILURE_CACHE_CAPACITY);
+
+        // Refresh an old key so it is the most recently used.
+        assert_eq!(
+            cache.get("ns-0/app-0").map(String::as_str),
+            Some("failure-0")
+        );
+
+        // Inserting one more key evicts ns-1/app-1, the least recently used,
+        // but keeps the refreshed ns-0/app-0 entry.
+        cache.insert("ns-new/app-new".to_string(), "failure-new".to_string());
+        assert_eq!(cache.entries.len(), TEE_PROBE_FAILURE_CACHE_CAPACITY);
+        assert!(cache.entries.contains_key("ns-0/app-0"));
+        assert!(cache.entries.contains_key("ns-new/app-new"));
+        assert!(!cache.entries.contains_key("ns-1/app-1"));
+    }
+
+    #[test]
+    fn tee_probe_failure_cache_remove_drops_the_key_and_signature() {
+        let mut cache = TeeProbeFailureCache::default();
+        cache.insert("ns/app".to_string(), "failure".to_string());
+        assert_eq!(cache.remove("ns/app").as_deref(), Some("failure"));
+        assert!(cache.get("ns/app").is_none());
+        assert!(cache.order.is_empty());
+    }
+
+    #[test]
+    fn tee_probe_failure_cache_insert_replaces_signature_and_refreshes_recency() {
+        let mut cache = TeeProbeFailureCache::default();
+        assert_eq!(
+            cache.insert("ns/app".to_string(), "first".to_string()),
+            None
+        );
+        assert_eq!(
+            cache.insert("ns/app".to_string(), "second".to_string()),
+            Some("first".to_string())
+        );
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.order.len(), 1);
+        assert_eq!(cache.get("ns/app").map(String::as_str), Some("second"));
     }
 }

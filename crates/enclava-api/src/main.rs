@@ -895,7 +895,7 @@ async fn main() {
         trustee_http_client,
         tee_http_client,
         recent_tee_probe_failures: std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::HashMap::new(),
+            enclava_api::state::TeeProbeFailureCache::default(),
         )),
         attestation,
         platform_release_envelope,

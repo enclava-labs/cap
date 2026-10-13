@@ -556,7 +556,10 @@ async fn probe_tee_unbounded(
                 app_name,
                 namespace,
                 "send",
-                &format!("request to {tee_status_url} failed: {error}"),
+                &format!(
+                    "request to {tee_status_url} failed: {}",
+                    crate::routes::workload::format_error_chain(&error)
+                ),
             );
             return TeeEvidence::Unavailable;
         }
@@ -1857,9 +1860,12 @@ mod tests {
         );
         assert!(text.contains("app=app-110"));
         assert!(text.contains("namespace=ns-110"));
+        // The full reqwest source chain must surface: a connect-stage failure
+        // carries a hyper source whose display names the connect error rather
+        // than the top-level "error sending request" summary alone.
         assert!(
-            text.to_lowercase().contains("error"),
-            "expected underlying error detail, got: {text}"
+            text.to_lowercase().contains("error") && text.to_lowercase().contains("connect"),
+            "expected underlying error-chain detail (error + connect), got: {text}"
         );
     }
 

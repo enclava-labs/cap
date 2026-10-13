@@ -179,7 +179,7 @@ fn truncate_for_log(value: &str) -> &str {
 /// `Display` carries only the error kind and URL; the DNS failure, TLS
 /// alert, or serde decode message operators need lives on the source
 /// chain and would otherwise be lost (#122).
-fn format_error_chain(err: &dyn std::error::Error) -> String {
+pub(crate) fn format_error_chain(err: &dyn std::error::Error) -> String {
     let mut chain = err.to_string();
     let mut source = err.source();
     while let Some(cause) = source {
