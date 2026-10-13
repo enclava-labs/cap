@@ -366,7 +366,7 @@ fn bad_request(message: &str) -> (StatusCode, Json<serde_json::Value>) {
 }
 
 /// keyring payloads are persisted as UTF-8 JSON that PostgreSQL must be able
-/// to re-parse as jsonb (migration 0058's shape CHECK, and the candidate
+/// to re-parse as jsonb (migration 0061's shape CHECK, and the candidate
 /// selector's cast).  serde_json is stricter than jsonb in exactly one
 /// practical way: it accepts `\u0000` escapes that jsonb cannot represent.
 /// The writers persist the client-supplied payload verbatim while
@@ -687,7 +687,7 @@ pub async fn put_keyring(
         .map_err(|_| db_error())?;
         // A new keyring generation can revoke the signer of retained signed
         // policy artifacts; the owed generation bump is deferred to
-        // migration 0058's INSERT trigger (durable selector debt) and
+        // migration 0061's INSERT trigger (durable selector debt) and
         // consumed only after the filtered policy body is published, never
         // bumped directly here.
     }
@@ -1741,9 +1741,9 @@ pub async fn rotate_org_owner(
     // Owner rotation can remove the signer of retained signed policy
     // artifacts still inside the KBS retention window (#130).  As with
     // put_keyring, the owed generation bump is recorded by migration
-    // 0058's org_keyrings INSERT trigger inside this transaction -- a
+    // 0061's org_keyrings INSERT trigger inside this transaction -- a
     // direct desired_generation bump here could be consumed by a
-    // pre-0058 replica's unfiltered reconciler during the rollout.
+    // pre-0061 replica's unfiltered reconciler during the rollout.
 
     let owner_status = read_live_service_owner(signing_service, org_id).await?;
     let service_owner = service_owner_pubkey(&owner_status);
@@ -5371,7 +5371,7 @@ mod tests {
 
         // Active signed mode, seeded at a nonzero desired generation: the
         // keyring insert must owe exactly one selector bump through
-        // migration 0058's trigger (never a direct desired_generation bump),
+        // migration 0061's trigger (never a direct desired_generation bump),
         // and the route must not report success until the owed generation is
         // live in the KBS.
         sqlx::query(
@@ -5759,7 +5759,7 @@ mod tests {
     /// Review follow-up: a `\u0000` escape in an unknown field passes
     /// SignedOrgKeyring deserialization (unknown fields ignored) and would be
     /// persisted verbatim, but jsonb cannot represent it -- the INSERT would
-    /// surface as a database error (500) once migration 0058's CHECK exists.
+    /// surface as a database error (500) once migration 0061's CHECK exists.
     /// The handler must reject it as a 400 before any signature work, and
     /// must never leave a row behind.
     #[tokio::test]
@@ -5848,7 +5848,7 @@ mod tests {
 
         // Active signed mode: every committed keyring insert (the v1 put
         // and the rotation v2) must owe exactly one selector bump through
-        // migration 0058's trigger, and the route must not report success
+        // migration 0061's trigger, and the route must not report success
         // until the owed generation is live in the KBS.
         sqlx::query(
             "UPDATE kbs_signed_policy_reconciliation
@@ -6050,7 +6050,7 @@ mod tests {
                     );
                 }
 
-                // The v1 predecessor row can be pruned by migration 0058's repair
+                // The v1 predecessor row can be pruned by migration 0061's repair
                 // pass while the committed v2 rotation stays intact.  Replaying the
                 // identical request after that prune must still confirm the
                 // rotation, not fail with "previous keyring authority is
