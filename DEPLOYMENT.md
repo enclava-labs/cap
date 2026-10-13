@@ -95,6 +95,28 @@ Cutover notes for `0066`:
 - Keep historical intent/directive/keyring rows and applied migration files
   unchanged; do not repair recovery by rewriting ledgers or checksums.
 
+## Quarantined Org Reinitialization
+
+Migration `0061_org_keyring_payload_shape.sql` drops every keyring row of an
+org whose CURRENT keyring version was malformed (the `\u0000`-in-unsigned-
+extension case pre-0061 writers could store), archiving the removed rows in
+`org_keyring_repairs`. Such an org is deliberately NOT returned to the
+ordinary first-keyring path: `PUT .../keyring` with version 1 is accepted
+only from the signer of the quarantined org's highest archived keyring
+version (resolved through `org_keyring_repairs.signing_key_id`), and the
+quarantine rows are cleared in the same transaction as the new version-1
+insert. Any other active membership owner with a registered key — including
+an owner the last signed keyring deliberately removed — is rejected with
+`409`. There is no out-of-band clearance step: deleting `org_keyring_repairs`
+rows manually would reopen the unrestricted first-keyring path and is never
+the repair.
+
+If the archived signer's key is lost or its `user_signing_keys` row was
+revoked/deleted, reinitialization fails closed; recovery then requires an
+operator-assisted keyring restore performed against verified out-of-band
+owner intent, with the `org_keyring_repairs` rows retained as the provenance
+record.
+
 ## Internal Keyring API Deferred Responses
 
 The internal keyring endpoints (`PUT /internal/paas/orgs/{org}/keyring`,
