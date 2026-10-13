@@ -1652,7 +1652,7 @@ async fn wait_for_template_bootstrap_endpoint(
                         pb.set_message("Ownership claim endpoint ready");
                         return Ok(true);
                     }
-                    Some(Err(_)) => {
+                    Some(Err(_)) | None => {
                         // One safe status read decides the challenge-failure
                         // fallback: a terminal diagnostic is never masked by a
                         // claimed ownership state.

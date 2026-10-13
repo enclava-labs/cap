@@ -42,7 +42,7 @@ use enclava_engine::types::{
     AttestationConfig, ConfidentialApp, Container, DomainSpec, GeneratedAgentPolicy,
     LogEncryptionConfig, StorageSpec, WorkloadArtifactBinding, WorkloadSecurityProfile,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use uuid::Uuid;
 
 use crate::commands::template::{normalize_ngrok_tcp_url, should_retry_api_transport_error};
@@ -1046,6 +1046,7 @@ pub(crate) async fn wait_for_bootstrap_endpoint(
     let deployment_id = deployment.deployment_id;
     let mut tee = None;
     let start = std::time::Instant::now();
+    let mut history = DeploymentHistoryProbe::new();
 
     loop {
         // Check the wait deadline before polling deployment history: once
@@ -1064,7 +1065,14 @@ pub(crate) async fn wait_for_bootstrap_endpoint(
         // request whose response would never satisfy it (#18). Every request
         // in this loop is cut at the finite per-attempt budget, so a stalled
         // response can never consume the wait (cap#220 review).
-        fail_if_template_deployment_failed(api, app_name, deployment_id, start + max_wait).await?;
+        fail_if_template_deployment_failed(
+            api,
+            app_name,
+            deployment_id,
+            start + max_wait,
+            &mut history,
+        )
+        .await?;
 
         pb.set_message(timed_progress(
             "TEE ownership: waiting for attested endpoint",
@@ -1113,10 +1121,18 @@ pub(crate) async fn wait_for_bootstrap_endpoint(
             }
         }
         let tee = tee.as_ref().expect("tee client was just acquired");
-        match tee.attest_receipt_key().await {
-            Ok((_attestation, attested_tee)) => {
-                match attested_tee.bootstrap_challenge().await {
-                    Ok(_) => {
+        // Attestation and the bootstrap challenge run under the same finite
+        // per-attempt budget as every other request in this loop (cap#220
+        // review follow-up #3): the ownership-probe client's own 15s request
+        // timeout bounds them, but the per-attempt guarantee must hold
+        // structurally -- clamped to the wait's remaining time -- instead of
+        // relying on client configuration.
+        match bounded_wait_attempt(start + max_wait, tee.attest_receipt_key()).await {
+            Some(Ok((_attestation, attested_tee))) => {
+                match bounded_wait_attempt(start + max_wait, attested_tee.bootstrap_challenge())
+                    .await
+                {
+                    Some(Ok(_)) => {
                         // A terminal diagnostic read over this attested,
                         // SPKI-pinned channel outranks a reachable challenge
                         // endpoint: stop before attempting any claim, but only
@@ -1140,7 +1156,7 @@ pub(crate) async fn wait_for_bootstrap_endpoint(
                         pb.set_message("Ownership claim endpoint ready");
                         return Ok(true);
                     }
-                    Err(_) => {
+                    Some(Err(_)) | None => {
                         // One safe status read decides the challenge-failure
                         // fallback: a terminal diagnostic is never masked by a
                         // claimed ownership state. The read runs under a
@@ -1201,7 +1217,7 @@ pub(crate) async fn wait_for_bootstrap_endpoint(
                     }
                 }
             }
-            Err(_) => {
+            Some(Err(_)) | None => {
                 pb.set_message(timed_progress(
                     "TEE ownership: waiting for attested endpoint",
                     start.elapsed(),
@@ -1226,6 +1242,7 @@ async fn wait_for_deploy_runtime(
     let expected_deployment_id = deployment.deployment_id;
     let start = std::time::Instant::now();
     let mut terminal_probe_at: Option<Instant> = None;
+    let mut history = DeploymentHistoryProbe::new();
 
     loop {
         // Check the wait deadline before polling deployment history: once
@@ -1243,8 +1260,14 @@ async fn wait_for_deploy_runtime(
         // (#18). Every request in this loop is cut at the finite per-attempt
         // budget, so a stalled response can never consume the wait and make
         // a healthy deployment report a boot timeout (cap#220 review).
-        fail_if_template_deployment_failed(api, app_name, expected_deployment_id, start + max_wait)
-            .await?;
+        fail_if_template_deployment_failed(
+            api,
+            app_name,
+            expected_deployment_id,
+            start + max_wait,
+            &mut history,
+        )
+        .await?;
 
         pb.set_message(timed_progress(
             "TEE boot: waiting for runtime",
@@ -1418,19 +1441,24 @@ fn observation_allows_direct_tee_fallback(
     })
 }
 
-/// Per-attempt budget for every request a wait loop makes: history lookups
-/// (terminal-failure check and deployment-state lookups) and readiness polls
-/// (unlock endpoint, runtime status). The shared HTTP client's per-request
-/// timeout is generous (it also covers slow deploy/setup calls), so without a
-/// cap a single stalled request can hold the loop for up to that timeout and
-/// consume the enclosing wait's entire budget (cap#220 review). 60s is the
-/// tradeoff the reviews converged on: comfortably longer than typical slow
-/// responses (a slow-but-valid 16s history answer must still be observed --
-/// that is the loop that surfaces the issue #18 rejection), finite and
-/// shorter than any wait (a stalled attempt is cut and the loop retries once
-/// the endpoint recovers), and never more than the wait's remaining time (a
-/// passed deadline yields zero budget and issues no request at all, so no
-/// request can outlive its wait).
+/// Per-attempt budget for the synchronous requests a wait loop makes (the
+/// readiness polls: unlock endpoint, runtime status, config keys, SSH
+/// command). The shared HTTP client's per-request timeout is generous (it
+/// also covers slow deploy/setup calls), so without a cap a single stalled
+/// request can hold the loop for up to that timeout and consume the
+/// enclosing wait's entire budget (cap#220 review). 60s is the tradeoff the
+/// reviews converged on: finite and shorter than any wait (a stalled attempt
+/// is cut and the loop retries once the endpoint recovers), and never more
+/// than the wait's remaining time (a passed deadline yields zero budget and
+/// issues no request at all, so no request can outlive its wait).
+///
+/// Deployment-history lookups deliberately do NOT cut at this budget: their
+/// answers are the wait loops' source of truth, and cutting a request at a
+/// fixed budget discards valid responses slower than it (cap#220 review
+/// follow-up: a history endpoint consistently answering after 70s must
+/// still be observed, not cancelled at 60s). They run as detached requests
+/// through [`DeploymentHistoryProbe`], for which this budget is only the
+/// refresh cadence.
 const WAIT_ATTEMPT_BUDGET: Duration = Duration::from_secs(60);
 
 fn wait_attempt_budget(wait_deadline: Instant) -> Duration {
@@ -1455,23 +1483,124 @@ pub(crate) async fn bounded_wait_attempt<T>(
     tokio::time::timeout(budget, request).await.ok()
 }
 
-/// Bounded deployment-history fetch shared by the wait loops (cap#220
-/// review). `Ok(None)` means no usable answer within the budget -- a passed
-/// deadline skips the request entirely, and a stalled response is cut at
-/// the budget -- so callers keep waiting and the enclosing wait's own
-/// deadline governs.
-async fn bounded_deployment_history(
-    api: &ApiClient,
-    app_name: &str,
-    wait_deadline: Instant,
-) -> Result<Option<Vec<DeploymentEntry>>, ApiError> {
-    // A history answer that cannot arrive within the attempt budget is
-    // indistinguishable from "no observation" -- keep waiting and let the
-    // wait's deadline decide, instead of burning the whole wait on a stalled
-    // response.
-    match bounded_wait_attempt(wait_deadline, api.list_deployments(app_name)).await {
-        Some(result) => result.map(Some),
-        None => Ok(None),
+/// One detached deployment-history request ([`DeploymentHistoryProbe`]): the
+/// handle stays in flight across wait-loop iterations, so a slow answer is
+/// still observed when it lands instead of being cancelled at a budget.
+struct HistoryRequest {
+    issued_at: Instant,
+    handle: tokio::task::JoinHandle<Result<Vec<DeploymentEntry>, ApiError>>,
+}
+
+/// Supersession depth for detached history requests: a request stays in
+/// flight across at most this many [`WAIT_ATTEMPT_BUDGET`] refresh windows
+/// before a newer one may replace it. That bounds sockets on a stalled
+/// endpoint while still observing any response slower than the attempt
+/// budget (see [`DeploymentHistoryProbe`]).
+const HISTORY_MAX_IN_FLIGHT: usize = 3;
+
+/// Detached deployment-history observation for the wait loops (cap#220
+/// review follow-ups).
+///
+/// Deployment history is the source of truth for the apply-start, health,
+/// and terminal-failure checks, so its answers must be observed however slow
+/// they are -- but no single request may consume the enclosing wait, and the
+/// wait must keep retrying after the endpoint recovers. One synchronous
+/// request cannot satisfy all three (the reviews alternated between "cut at
+/// a small budget", which discards valid slower answers, and "wait up to the
+/// deadline", which lets one stalled request block every retry), so history
+/// requests are detached from the wait loop instead:
+///
+/// - a pump issues at most one new request per [`WAIT_ATTEMPT_BUDGET`] window
+///   while older ones keep running, so an answer slower than the attempt
+///   budget (e.g. 70s) is observed whenever it lands instead of being
+///   cancelled at 60s -- any response arriving within
+///   [`HISTORY_MAX_IN_FLIGHT`] refresh windows (~3 minutes) of its request
+///   start is observed, and older pending requests are superseded;
+/// - landed answers are returned to exactly one caller, whenever they land,
+///   and a pump never blocks waiting for one, so a stalled history endpoint
+///   cannot spend the wait's budget before the readiness polls behind the
+///   check run (cap#220 review follow-up #2: a 30s template wait must still
+///   poll its ready TEE endpoint);
+/// - requests are only issued while the wait still has budget (a passed
+///   deadline issues nothing), a landed answer is never dropped (a request
+///   is only ever superseded while still pending), and the probe -- with
+///   every request it holds -- is dropped when the wait returns.
+pub(crate) struct DeploymentHistoryProbe {
+    in_flight: VecDeque<HistoryRequest>,
+    refresh_age: Duration,
+}
+
+impl DeploymentHistoryProbe {
+    pub(crate) fn new() -> Self {
+        Self::with_refresh_age(WAIT_ATTEMPT_BUDGET)
+    }
+
+    /// A probe with a non-default refresh window (tests exercise the
+    /// supersession behavior without waiting out the real budget).
+    fn with_refresh_age(refresh_age: Duration) -> Self {
+        Self {
+            in_flight: VecDeque::new(),
+            refresh_age,
+        }
+    }
+
+    /// Keep the observation current: issue a detached request when none is
+    /// in flight or the newest one is a refresh window old. A passed wait
+    /// deadline issues nothing.
+    fn ensure_request(&mut self, api: &ApiClient, app_name: &str, wait_deadline: Instant) {
+        if wait_attempt_budget(wait_deadline).is_zero() {
+            return;
+        }
+        let refresh_due = self
+            .in_flight
+            .back()
+            .is_none_or(|request| request.issued_at.elapsed() >= self.refresh_age);
+        if !refresh_due {
+            return;
+        }
+        let api = api.clone();
+        let app_name = app_name.to_owned();
+        self.in_flight.push_back(HistoryRequest {
+            issued_at: Instant::now(),
+            handle: tokio::spawn(async move { api.list_deployments(&app_name).await }),
+        });
+        while self.in_flight.len() > HISTORY_MAX_IN_FLIGHT {
+            // Never supersede a landed answer: its result would be dropped
+            // unobserved. A finished request is picked up on the next
+            // `take_landed`, one per call, before any further supersession.
+            if self
+                .in_flight
+                .front()
+                .is_some_and(|request| request.handle.is_finished())
+            {
+                break;
+            }
+            if let Some(superseded) = self.in_flight.pop_front() {
+                superseded.handle.abort();
+            }
+        }
+    }
+
+    /// Consume one landed observation, without blocking: `None` means no
+    /// answer has landed since the previous call (still in flight, or the
+    /// request was cancelled/panicked -- indistinguishable from "no
+    /// observation", so the caller keeps waiting and the wait's own deadline
+    /// governs).
+    async fn take_landed(&mut self) -> Option<Result<Vec<DeploymentEntry>, ApiError>> {
+        let index = self
+            .in_flight
+            .iter()
+            .position(|request| request.handle.is_finished())?;
+        let request = self.in_flight.remove(index)?;
+        // A cancelled or panicked task surfaces as `Err` and reads as "no
+        // observation", exactly like `take_landed`'s `None`.
+        request.handle.await.ok()
+    }
+}
+
+impl Default for DeploymentHistoryProbe {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1479,19 +1608,23 @@ async fn bounded_deployment_history(
 /// on (#18): a manifest-apply rejection (e.g. the KBS signed-policy byte
 /// budget) otherwise surfaces only as an opaque wait timeout ~10 minutes
 /// later. Shared by the standalone `app deploy` waits and the hosted
-/// template deploy flow. The history lookup is cut at the finite per-attempt
-/// budget so a stalled response can never consume the enclosing wait
-/// (cap#220 review).
+/// template deploy flow. The history lookup is a non-blocking pickup from
+/// the detached probe (cap#220 review follow-ups): the check issues a
+/// request and consumes an answer only if one has landed, so it can never
+/// spend the enclosing wait's budget on a stalled history endpoint before
+/// the readiness polls behind it run -- while a slow-but-valid answer (the
+/// one that carries the #18 rejection) is still observed when it lands.
 pub(crate) async fn fail_if_template_deployment_failed(
     api: &ApiClient,
     app_name: &str,
     deployment_id: &str,
     wait_deadline: Instant,
+    history: &mut DeploymentHistoryProbe,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if deployment_id == "pending" {
         return Ok(());
     }
-    match template_deployment_failure(api, app_name, deployment_id, wait_deadline).await {
+    match template_deployment_failure(api, app_name, deployment_id, wait_deadline, history).await {
         Ok(Some(message)) => Err(message.into()),
         Ok(None) => Ok(()),
         Err(error) if should_retry_template_deployment_status_error(&error) => Ok(()),
@@ -1504,15 +1637,18 @@ async fn template_deployment_failure(
     app_name: &str,
     deployment_id: &str,
     wait_deadline: Instant,
+    history: &mut DeploymentHistoryProbe,
 ) -> Result<Option<String>, ApiError> {
-    // Bounded per-attempt (cap#220 review): a stalled history endpoint is cut
-    // at the attempt budget so the readiness polls behind it still run every
-    // iteration, while a slow-but-valid answer is still observed -- this is
-    // the lookup that surfaces the issue #18 rejection.
-    let Some(deployments) = bounded_deployment_history(api, app_name, wait_deadline).await? else {
+    // Non-blocking pickup from the detached history probe (cap#220 review
+    // follow-ups): the request runs past any per-attempt budget, so a
+    // slow-but-valid answer -- including the issue #18 rejection -- is
+    // observed when it lands, while a stalled endpoint costs this check
+    // nothing and the readiness polls still run every iteration.
+    history.ensure_request(api, app_name, wait_deadline);
+    let Some(result) = history.take_landed().await else {
         return Ok(None);
     };
-    let deployment = deployments
+    let deployment = result?
         .into_iter()
         .find(|deployment| deployment.id == deployment_id);
     Ok(deployment
@@ -1555,14 +1691,21 @@ async fn find_deployment_entry(
     app_name: &str,
     deployment_id: &str,
     wait_deadline: Instant,
+    history: &mut DeploymentHistoryProbe,
 ) -> Result<Option<DeploymentEntry>, ApiError> {
-    Ok(bounded_deployment_history(api, app_name, wait_deadline)
-        .await?
-        .and_then(|deployments| {
-            deployments
-                .into_iter()
-                .find(|deployment| deployment.id == deployment_id)
-        }))
+    // Non-blocking pickup from the detached history probe (cap#220 review
+    // follow-ups): the apply-start and health waits learn deployment state
+    // only through this lookup, so its request must survive past any
+    // per-attempt budget -- a slow-but-valid `healthy` answer is observed
+    // when it lands instead of being cancelled and turning the wait into a
+    // false timeout.
+    history.ensure_request(api, app_name, wait_deadline);
+    let Some(result) = history.take_landed().await else {
+        return Ok(None);
+    };
+    Ok(result?
+        .into_iter()
+        .find(|deployment| deployment.id == deployment_id))
 }
 
 async fn wait_for_deployment_apply_start(
@@ -1574,6 +1717,7 @@ async fn wait_for_deployment_apply_start(
     pb: &ProgressBar,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let start = Instant::now();
+    let mut history = DeploymentHistoryProbe::new();
     loop {
         if start.elapsed() > max_wait {
             pb.abandon_with_message("Deployment apply timed out");
@@ -1584,7 +1728,9 @@ async fn wait_for_deployment_apply_start(
             .into());
         }
 
-        match find_deployment_entry(api, app_name, deployment_id, start + max_wait).await {
+        match find_deployment_entry(api, app_name, deployment_id, start + max_wait, &mut history)
+            .await
+        {
             Ok(Some(deployment)) => match deployment.status.as_str() {
                 "pending" => pb.set_message(timed_progress(
                     "Applying deployment: pending",
@@ -1627,6 +1773,7 @@ async fn wait_for_deployment_completion(
     let deployment_id = deployment.deployment_id;
     let start = Instant::now();
     let mut terminal_probe_at: Option<Instant> = None;
+    let mut history = DeploymentHistoryProbe::new();
     loop {
         if start.elapsed() > max_wait {
             pb.abandon_with_message("Workload health timed out");
@@ -1653,7 +1800,9 @@ async fn wait_for_deployment_completion(
             return Err(terminal_bootstrap_failure_message(app_name, &diagnostic).into());
         }
 
-        match find_deployment_entry(api, app_name, deployment_id, start + max_wait).await {
+        match find_deployment_entry(api, app_name, deployment_id, start + max_wait, &mut history)
+            .await
+        {
             Ok(Some(deployment)) => match deployment.status.as_str() {
                 "healthy" => return Ok(()),
                 "failed" => {

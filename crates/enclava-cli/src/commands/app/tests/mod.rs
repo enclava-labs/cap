@@ -698,13 +698,13 @@ fn deploy_waits_fail_fast_on_terminal_deployment_failure() {
             "async fn wait_for_bootstrap_endpoint",
             "TEE ownership timed out",
             "api.get_unlock_endpoint(app_name)",
-            "fail_if_template_deployment_failed(api,app_name,deployment_id,start+max_wait)",
+            "fail_if_template_deployment_failed(apiapp_namedeployment_idstart+max_wait&muthistory)",
         ),
         (
             "async fn wait_for_deploy_runtime",
             "TEE boot timed out",
             "api.get_status(app_name)",
-            "fail_if_template_deployment_failed(api,app_name,expected_deployment_id,start+max_wait)",
+            "fail_if_template_deployment_failed(apiapp_nameexpected_deployment_idstart+max_wait&muthistory)",
         ),
     ] {
         let fn_start = source
@@ -731,28 +731,36 @@ fn deploy_waits_fail_fast_on_terminal_deployment_failure() {
             failure_check < blocking,
             "{fn_name}: the terminal-failure check must run inside the wait loop before the (potentially blocking) readiness request, so a manifest-apply rejection (e.g. KBS signed-policy budget) fails fast instead of timing out ~10 minutes later (#18)"
         );
-        // Whitespace-insensitive so rustfmt line wrapping cannot break the
-        // wiring check: the failure check must receive the wait's deadline.
-        let dense: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        // Whitespace- and comma-insensitive so rustfmt line wrapping cannot
+        // break the wiring check: the failure check must receive the wait's
+        // deadline and the shared detached history probe (cap#220 review
+        // follow-ups).
+        let dense: String = body
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != ',')
+            .collect();
         assert!(
             dense.contains(bounded_check),
-            "{fn_name}: the history lookup must be bounded by the wait's remaining budget (cap#220 review)"
+            "{fn_name}: the failure check must take its observation from the detached history probe, bounded by the wait's deadline (cap#220 review follow-ups)"
         );
     }
 
     // The sibling deployment-history lookups (apply-start and health waits)
-    // receive the wait's deadline and use the same finite per-attempt budget:
-    // they are how deploy state is observed at all, so the budget must fit
-    // slow-but-valid responses, while staying short enough that one stalled
-    // request is cut and the loop retries once the endpoint recovers (cap#220
-    // review follow-ups). The wait's own deadline still bounds every attempt.
-    let dense_source: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    // receive the wait's deadline and the same detached probe: they are how
+    // deploy state is observed at all, so their requests must outlive any
+    // per-attempt budget (a slow-but-valid answer is observed when it lands)
+    // while never blocking the loop or outliving the wait (cap#220 review
+    // follow-ups).
+    let dense_source: String = source
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != ',')
+        .collect();
     assert_eq!(
         dense_source
-            .matches("find_deployment_entry(api,app_name,deployment_id,start+max_wait)")
+            .matches("find_deployment_entry(apiapp_namedeployment_idstart+max_wait&muthistory)")
             .count(),
         2,
-        "wait_for_deployment_apply_start and wait_for_deployment_completion must bound their history lookups per attempt (cap#220 review)"
+        "wait_for_deployment_apply_start and wait_for_deployment_completion must observe history through the detached probe (cap#220 review follow-ups)"
     );
 
     // The standalone ownership wait must not swallow non-retryable
@@ -792,16 +800,16 @@ fn wait_attempt_budget_is_finite_and_bounded_by_the_wait() {
 
 #[test]
 fn wait_loop_requests_use_the_finite_per_attempt_budget() {
-    // cap#220 review follow-ups: every request a wait loop makes -- the
-    // terminal-failure history lookup (which surfaces the issue #18
-    // rejection, so it must observe slow-but-valid answers), the
-    // deployment-state lookups (apply-start and health waits), and the
-    // readiness polls (unlock endpoint, runtime status) -- is cut at one
-    // finite per-attempt budget, bounded by the wait's remaining time. The
-    // budget must be long enough for slow responses (the earlier 15s
-    // advisory cap discarded them and hid deploy state) but finite and
-    // shorter than the wait (the earlier full-remaining-wait bound let one
-    // stalled request block retries after the endpoint recovered).
+    // cap#220 review follow-ups: every synchronous request a wait loop makes
+    // -- the readiness polls (unlock endpoint, runtime status, config keys,
+    // SSH command) and the direct-TEE probes (attest, challenge) -- is cut
+    // at one finite per-attempt budget, bounded by the wait's remaining
+    // time. The deployment-history lookups (the terminal-failure check and
+    // the apply-start/health state lookups) run on the detached probe
+    // instead: their answers are the loops' source of truth, so they must
+    // observe slow-but-valid responses (the 70s-history false timeout) while
+    // never blocking the loop or outliving the wait (the stalled-history
+    // false timeout).
     let source = include_str!("../../app.rs").replace("\r\n", "\n");
     let template_source = include_str!("../../template.rs").replace("\r\n", "\n");
     // Whitespace- and comma-insensitive: rustfmt may wrap call arguments
@@ -825,8 +833,13 @@ fn wait_loop_requests_use_the_finite_per_attempt_budget() {
         &source[start..end]
     };
     assert!(
-        dense(failure_check).contains("bounded_deployment_history(apiapp_namewait_deadline)"),
-        "the terminal-failure check must take the per-attempt budget from the wait deadline (cap#220 review): the shared client's 900s request timeout must never consume the wait"
+        dense(failure_check).contains("history.ensure_request(apiapp_namewait_deadline)")
+            && dense(failure_check).contains("history.take_landed().await"),
+        "the terminal-failure check must take its observation from the detached history probe (cap#220 review follow-ups): a slow answer is observed whenever it lands, and the shared client's 900s request timeout must never consume the wait"
+    );
+    assert!(
+        !failure_check.contains("bounded_wait_attempt") && !failure_check.contains("timeout("),
+        "the terminal-failure check must never block on deployment history (cap#220 review follow-up #2): even a 30s template wait must still poll its ready TEE endpoint"
     );
 
     let state_lookup = {
@@ -840,8 +853,13 @@ fn wait_loop_requests_use_the_finite_per_attempt_budget() {
         &source[start..end]
     };
     assert!(
-        dense(state_lookup).contains("bounded_deployment_history(apiapp_namewait_deadline)"),
-        "the deployment-state lookup must take the per-attempt budget from the wait deadline (cap#220 review follow-ups): slow responses must stay observable while a stall only costs one attempt"
+        dense(state_lookup).contains("history.ensure_request(apiapp_namewait_deadline)")
+            && dense(state_lookup).contains("history.take_landed().await"),
+        "the deployment-state lookup must take its observation from the detached history probe (cap#220 review follow-ups): slow responses stay observable while a stall never blocks the loop"
+    );
+    assert!(
+        !state_lookup.contains("bounded_wait_attempt") && !state_lookup.contains("timeout("),
+        "the deployment-state lookup must never block on deployment history (cap#220 review follow-up #2)"
     );
 
     // Readiness polls are bounded the same way (cap#220 review follow-up):
@@ -867,8 +885,26 @@ fn wait_loop_requests_use_the_finite_per_attempt_budget() {
     // the direct-TEE attest in the runtime wait, plus the managed-config and
     // SSH polls in the hosted template waits.
     assert!(
-        app.contains("bounded_wait_attempt(start+max_waittee.attest_receipt_key())"),
-        "wait_for_deploy_runtime must bound its direct-TEE attest per attempt (cap#220 review follow-up #2)"
+        app.matches("bounded_wait_attempt(start+max_waittee.attest_receipt_key())")
+            .count()
+            >= 2,
+        "wait_for_deploy_runtime and wait_for_bootstrap_endpoint must bound their direct-TEE attest per attempt (cap#220 review follow-up #2)"
+    );
+    assert!(
+        app.contains("bounded_wait_attempt(start+max_waitattested_tee.bootstrap_challenge())"),
+        "wait_for_bootstrap_endpoint must bound its bootstrap challenge per attempt (cap#220 review follow-up #3)"
+    );
+    assert!(
+        template.contains(
+            "bounded_wait_attempt(start+max_waittimings.run(DeployPhase::BootstrapAttestationtee.attest_receipt_key()))"
+        ),
+        "wait_for_template_bootstrap_endpoint must bound its attest per attempt (cap#220 review follow-up #3)"
+    );
+    assert!(
+        template.contains(
+            "bounded_wait_attempt(start+max_waittimings.run(DeployPhase::BootstrapChallengeattested_tee.bootstrap_challenge()))"
+        ),
+        "wait_for_template_bootstrap_endpoint must bound its bootstrap challenge per attempt (cap#220 review follow-up #3)"
     );
     assert!(
         template.contains("bounded_wait_attempt(deadlineapi.list_config_keys(instance_name))"),
@@ -2808,12 +2844,13 @@ mod terminal_diagnostics {
     }
 
     #[tokio::test]
-    async fn terminal_failure_check_bounds_a_stalled_history_lookup() {
-        // The terminal-failure check's history lookup must never consume the
-        // enclosing wait's budget (cap#220 review): a `/deployments` endpoint
-        // that accepts TCP but never responds is cut at the wait's remaining
-        // budget and reads as "no failure observed", and once the wait's
-        // deadline has passed no lookup is issued at all.
+    async fn terminal_failure_check_never_blocks_on_stalled_history() {
+        // The terminal-failure check's history lookup is a non-blocking
+        // pickup from the detached probe (cap#220 review follow-ups): a
+        // `/deployments` endpoint that accepts TCP but never responds cannot
+        // spend the enclosing wait's budget before the readiness polls behind
+        // the check run (the 30s-template-wait scenario), and once the
+        // wait's deadline has passed no request is issued at all.
         use std::sync::atomic::{AtomicUsize, Ordering};
         let accepted = std::sync::Arc::new(AtomicUsize::new(0));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2836,20 +2873,26 @@ mod terminal_diagnostics {
             }
         });
         let api = ApiClient::new(&format!("http://{address}"), Some("test".to_string()));
+        let mut history = DeploymentHistoryProbe::new();
 
         // Deadline already passed: no request may be issued at all.
-        fail_if_template_deployment_failed(&api, "demo", "deploy-1", std::time::Instant::now())
-            .await
-            .expect("an exhausted wait budget must not turn a stalled lookup into an error");
+        fail_if_template_deployment_failed(
+            &api,
+            "demo",
+            "deploy-1",
+            std::time::Instant::now(),
+            &mut history,
+        )
+        .await
+        .expect("an exhausted wait budget must not turn a stalled lookup into an error");
         assert_eq!(
             accepted.load(Ordering::SeqCst),
             0,
             "a passed wait deadline must skip the history lookup entirely"
         );
 
-        // Bounded by the remaining wait budget instead of the client's
-        // request timeout: the wait returns and a healthy deployment's
-        // readiness poll can still proceed.
+        // Non-blocking: against a stalled endpoint the check returns at
+        // once, leaving the wait's whole budget to the readiness polls.
         let started = std::time::Instant::now();
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -2858,23 +2901,25 @@ mod terminal_diagnostics {
                 "demo",
                 "deploy-1",
                 std::time::Instant::now() + std::time::Duration::from_millis(250),
+                &mut history,
             ),
         )
         .await
-        .expect("the failure check must return within the wait budget, not the client timeout");
+        .expect("the failure check must return without blocking on the history endpoint");
         outcome.expect("a stalled history lookup must read as no failure observed");
-        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "the failure check must not consume the wait's budget on a stalled history endpoint"
+        );
     }
 
     #[tokio::test]
-    async fn state_lookup_observes_slow_history_responses_within_the_wait_budget() {
-        // cap#220 review follow-up (the regression the 15s advisory cap
-        // caused for state lookups): when every deployment-history response
-        // is slower than the advisory cap but the enclosing wait still has
-        // budget, `find_deployment_entry` must still observe the deployment
-        // state -- the apply-start and health waits learn "started"/"healthy"
-        // only through this lookup. A response the given budget cannot cover
-        // is still cut.
+    async fn slow_terminal_failure_is_surfaced_when_it_lands() {
+        // Issue #18 fail-fast survives the non-blocking pickup (cap#220
+        // review follow-ups): a history answer carrying the terminal
+        // failure is observed however long it takes to land -- including
+        // slower than any per-attempt budget -- so a manifest-apply rejection
+        // still fails fast instead of hiding behind a wait timeout.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -2883,8 +2928,73 @@ mod terminal_diagnostics {
                     return;
                 };
                 tokio::spawn(async move {
-                    // Read the request, then answer slowly (slower than the
-                    // small budget below) but well within the large one.
+                    let mut sink = [0_u8; 4096];
+                    let _ = stream.read(&mut sink).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    let body = serde_json::json!([{
+                        "deployment_id": "deploy-1",
+                        "status": "failed",
+                        "error_message": "signed_policy_budget_exceeded",
+                        "image_digest": null,
+                        "created_at": "2026-10-13T00:00:00Z",
+                        "completed_at": "2026-10-13T00:01:00Z",
+                    }])
+                    .to_string();
+                    let _ = stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                });
+            }
+        });
+        let api = ApiClient::new(&format!("http://{address}"), Some("test".to_string()));
+        let mut history = DeploymentHistoryProbe::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+
+        // Nothing has landed yet: no failure observed, and no blocking.
+        fail_if_template_deployment_failed(&api, "demo", "deploy-1", deadline, &mut history)
+            .await
+            .expect("an in-flight lookup must not error");
+
+        // The slow answer lands: the next check surfaces the real rejection.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let error =
+            fail_if_template_deployment_failed(&api, "demo", "deploy-1", deadline, &mut history)
+                .await
+                .expect_err("a landed terminal failure must fail the wait");
+        assert!(
+            error
+                .to_string()
+                .contains("deployment deploy-1 failed: signed_policy_budget_exceeded"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn state_lookup_observes_slow_history_responses_whenever_they_land() {
+        // cap#220 review follow-ups: the apply-start and health waits learn
+        // deployment state only through `find_deployment_entry`, so its
+        // request must survive past any per-attempt budget. A response that
+        // lands after an earlier pickup returned nothing is still observed
+        // (the request is detached, not cancelled): the slow-but-valid
+        // `healthy` case completes the wait instead of reporting a false
+        // timeout.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    // Read the request, then answer slowly (slower than one
+                    // pickup interval) but well within the wait.
                     let mut sink = [0_u8; 4096];
                     let _ = stream.read(&mut sink).await;
                     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -2910,48 +3020,36 @@ mod terminal_diagnostics {
             }
         });
         let api = ApiClient::new(&format!("http://{address}"), Some("test".to_string()));
+        let mut history = DeploymentHistoryProbe::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
 
-        // A budget too small for this response must still cut it (no lookup
-        // may outlive its budget) and read as "no observation".
-        let started = std::time::Instant::now();
-        let cut = bounded_deployment_history(
-            &api,
-            "demo",
-            std::time::Instant::now() + std::time::Duration::from_millis(100),
-        )
-        .await
-        .expect("a budget cut must not be an error");
+        // First pickup: the request was just issued, nothing has landed.
         assert!(
-            cut.is_none(),
-            "a response slower than the given budget must read as no observation"
+            find_deployment_entry(&api, "demo", "deploy-1", deadline, &mut history)
+                .await
+                .expect("a slow-but-valid history response must not error")
+                .is_none(),
+            "no observation has landed yet"
         );
-        assert!(started.elapsed() < std::time::Duration::from_secs(5));
 
-        // But the deployment-state lookup uses the finite per-attempt budget
-        // (longer than the advisory cap), so the same slow-but-valid response
-        // is observed and the apply-start/health waits can complete instead of
-        // timing out.
-        let entry = find_deployment_entry(
-            &api,
-            "demo",
-            "deploy-1",
-            std::time::Instant::now() + std::time::Duration::from_secs(5),
-        )
-        .await
-        .expect("a slow-but-valid history response must not error");
-        let entry =
-            entry.expect("the state lookup must observe the slow response within its budget");
+        // The request is not cancelled when a pickup returns nothing: the
+        // slow answer is observed when it lands.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let entry = find_deployment_entry(&api, "demo", "deploy-1", deadline, &mut history)
+            .await
+            .expect("a slow-but-valid history response must not error")
+            .expect("the state lookup must observe the slow response whenever it lands");
         assert_eq!(entry.id, "deploy-1");
         assert_eq!(entry.status, "healthy");
     }
 
     #[tokio::test]
-    async fn stalled_state_lookup_is_cut_and_a_retry_observes_the_recovered_endpoint() {
-        // cap#220 review follow-up #2: one stalled history request must not
-        // consume the whole wait and prevent retries. The attempt is cut at
-        // its budget, and the next attempt observes the recovered endpoint --
-        // exactly the apply-start/health loop behavior with a finite
-        // per-attempt budget.
+    async fn stalled_history_request_is_superseded_and_a_fresh_request_observes_the_recovery() {
+        // cap#220 review follow-up #2: one stalled history request must
+        // neither consume the wait nor block retries. The probe keeps it in
+        // flight but refreshes alongside it once its refresh window passes,
+        // so a fresh request observes the recovered endpoint -- exactly the
+        // apply-start/health loop behavior.
         use std::sync::atomic::{AtomicUsize, Ordering};
         let connections = std::sync::Arc::new(AtomicUsize::new(0));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2993,36 +3091,43 @@ mod terminal_diagnostics {
             }
         });
         let api = ApiClient::new(&format!("http://{address}"), Some("test".to_string()));
+        // A short refresh window stands in for WAIT_ATTEMPT_BUDGET so the
+        // supersession path is exercised without waiting out the real one.
+        let mut history =
+            DeploymentHistoryProbe::with_refresh_age(std::time::Duration::from_millis(50));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
 
-        // Attempt 1: the stalled request is cut at the attempt budget and
-        // reads as "no observation" instead of holding the wait open.
-        let started = std::time::Instant::now();
-        let cut = bounded_deployment_history(
-            &api,
-            "demo",
-            std::time::Instant::now() + std::time::Duration::from_millis(150),
-        )
-        .await
-        .expect("a budget cut must not be an error");
+        // Pump 1: the stalled request is issued; no observation lands.
         assert!(
-            cut.is_none(),
+            find_deployment_entry(&api, "demo", "deploy-1", deadline, &mut history)
+                .await
+                .expect("a stalled lookup must not error")
+                .is_none(),
             "the stalled attempt must read as no observation"
         );
-        assert!(started.elapsed() < std::time::Duration::from_secs(5));
 
-        // Attempt 2 (as the wait loop would issue it): the recovered endpoint
-        // answers and the deployment state is observed.
-        let entry = find_deployment_entry(
-            &api,
-            "demo",
-            "deploy-1",
-            std::time::Instant::now() + std::time::Duration::from_secs(5),
-        )
-        .await
-        .expect("the retry must not error");
-        let entry = entry.expect("the retry must observe the recovered endpoint");
+        // The refresh window passes with the first request still stalled: a
+        // fresh request goes out alongside it (the stalled one is kept, not
+        // consuming anything) and the recovered endpoint answers.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            find_deployment_entry(&api, "demo", "deploy-1", deadline, &mut history)
+                .await
+                .expect("a stalled lookup must not error")
+                .is_none(),
+            "the refresh request has just been issued"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let entry = find_deployment_entry(&api, "demo", "deploy-1", deadline, &mut history)
+            .await
+            .expect("the retry must not error")
+            .expect("the refreshed request must observe the recovered endpoint");
         assert_eq!(entry.id, "deploy-1");
         assert_eq!(entry.status, "healthy");
+        assert!(
+            connections.load(Ordering::SeqCst) >= 2,
+            "the probe must refresh alongside the stalled request instead of waiting it out"
+        );
     }
 
     #[tokio::test]
