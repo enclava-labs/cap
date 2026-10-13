@@ -48,8 +48,10 @@ pub const MAX_CUSTOMER_CONFIG_ROLL_HOLD_SECONDS: i32 = 7_200;
 /// the workload is still being replaced: supersession terminalizes only
 /// the job rows, not an apply already in flight, so that rollout could
 /// boot or replace the TEE while the CLI holds the new roll. The hold is
-/// not armed against an unstable workload; the earlier rollout supersedes
-/// under the ordinary rules instead.
+/// not armed against an unstable workload; a request that explicitly asked
+/// for one is rejected instead (see
+/// [`customer_config_roll_hold_decision`]) so its safety guarantee is
+/// never silently dropped.
 pub fn customer_config_roll_hold_applies(
     is_new_app: bool,
     live_app_status: AppStatus,
@@ -129,6 +131,86 @@ pub fn normalize_customer_config_roll_hold_seconds(
         MIN_CUSTOMER_CONFIG_ROLL_HOLD_SECONDS,
         MAX_CUSTOMER_CONFIG_ROLL_HOLD_SECONDS,
     ))
+}
+
+/// Message of the transient conflict returned when a deployment explicitly
+/// requests a customer-config roll hold that cannot be armed because an
+/// earlier rollout may still replace the workload it must protect. The
+/// request is rejected, never accepted unheld: the client's whole safety
+/// contract is "write customer config into the live TEE before the roll",
+/// and an in-flight rollout can swap that TEE during the write. The conflict
+/// is known-not-applied (see `TRANSIENT_RETRY_CONFLICT_MESSAGES`), so a
+/// same-key retry re-executes once the earlier rollout settles.
+pub const CUSTOMER_CONFIG_HOLD_IN_FLIGHT_CONFLICT: &str =
+    "an earlier deployment rollout is still in progress; retry after it settles";
+
+/// Disposition of a deployment create's customer-config roll hold request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CustomerConfigRollHoldDecision {
+    /// No positive hold was requested, or no live TEE exists whose roll must
+    /// wait: the deployment starts immediately, exactly as before.
+    Unheld,
+    /// The accepted hold duration in seconds; the job stays `setup_pending`
+    /// until customer config is released or the deadline expires.
+    Hold(i32),
+    /// A positive hold was requested for a live TEE's replacement, but an
+    /// earlier rollout is still in flight and could replace that TEE while
+    /// the CLI writes config. Accepting unheld would silently drop the
+    /// requested guarantee, so the request is rejected instead and can be
+    /// retried after the rollout settles.
+    Conflict,
+}
+
+/// Decide how a create request's `customer_config_roll_hold_seconds` is
+/// honored. `requested_seconds` is the already-honored request (`None` on
+/// every path that may not arm holds). A first deploy and an app without a
+/// TEE domain ignore the field by design, so those stay `Unheld` even with
+/// a rollout in flight; `Conflict` fires where a live workload stands to be
+/// protected but the in-flight rollout blocks the hold — including while an
+/// apply has already projected the app to `Creating`, when the old TEE is
+/// exactly what a prior `healthy` deployment row says is still serving.
+pub fn customer_config_roll_hold_decision(
+    requested_seconds: Option<u32>,
+    is_new_app: bool,
+    live_app_status: AppStatus,
+    prior_healthy_workload: bool,
+    rollout_in_flight: bool,
+    tee_domain: Option<&str>,
+) -> CustomerConfigRollHoldDecision {
+    if let Some(seconds) = normalize_customer_config_roll_hold_seconds(
+        requested_seconds,
+        customer_config_roll_hold_applies(
+            is_new_app,
+            live_app_status,
+            prior_healthy_workload,
+            rollout_in_flight,
+            tee_domain,
+        ),
+    ) {
+        return CustomerConfigRollHoldDecision::Hold(seconds);
+    }
+    // The hold would arm but for the in-flight rollout, or the apply window
+    // has projected the app to `Creating` while an earlier deployment still
+    // reports healthy — the same live TEE, the same in-flight risk, and the
+    // window where `watch()` keeps publishing `creating` for the whole
+    // observation. A first deploy never has a healthy row and stays unheld.
+    let live_workload_to_protect = customer_config_roll_hold_applies(
+        is_new_app,
+        live_app_status,
+        prior_healthy_workload,
+        false,
+        tee_domain,
+    ) || (!is_new_app
+        && tee_domain.is_some_and(|domain| !domain.trim().is_empty())
+        && matches!(live_app_status, AppStatus::Creating)
+        && prior_healthy_workload);
+    if requested_seconds.is_some_and(|seconds| seconds > 0)
+        && rollout_in_flight
+        && live_workload_to_protect
+    {
+        return CustomerConfigRollHoldDecision::Conflict;
+    }
+    CustomerConfigRollHoldDecision::Unheld
 }
 const DEPLOYMENT_APPLY_FAILED_MESSAGE: &str = "deployment_apply_failed";
 const JOB_PAYLOAD_VERSION: i32 = 1;
@@ -4687,6 +4769,89 @@ mod tests {
         assert_eq!(
             normalize_customer_config_roll_hold_seconds(Some(u32::MAX), true),
             Some(MAX_CUSTOMER_CONFIG_ROLL_HOLD_SECONDS)
+        );
+    }
+
+    #[test]
+    fn customer_config_roll_hold_conflicts_with_a_requested_hold_over_an_in_flight_rollout() {
+        use CustomerConfigRollHoldDecision::{Conflict, Hold, Unheld};
+        let running = crate::models::AppStatus::Running;
+        let failed = crate::models::AppStatus::Failed;
+        let creating = crate::models::AppStatus::Creating;
+        let tee = Some("tee.example.test");
+        // A requested hold over an in-flight rollout is rejected, never
+        // silently accepted unheld: the roll it protects could otherwise
+        // start while the rollout replaces the TEE receiving the config.
+        assert_eq!(
+            customer_config_roll_hold_decision(Some(600), false, running, false, true, tee),
+            Conflict
+        );
+        assert_eq!(
+            customer_config_roll_hold_decision(Some(600), false, failed, true, true, tee),
+            Conflict
+        );
+        // Without a rollout in flight the same requests arm the hold, with
+        // the requested duration clamped as before.
+        assert_eq!(
+            customer_config_roll_hold_decision(Some(600), false, running, false, false, tee),
+            Hold(600)
+        );
+        assert_eq!(
+            customer_config_roll_hold_decision(Some(10), false, running, false, false, tee),
+            Hold(MIN_CUSTOMER_CONFIG_ROLL_HOLD_SECONDS)
+        );
+        // No positive hold requested means the client accepts an immediate
+        // roll, so there is nothing to reject.
+        for requested in [None, Some(0)] {
+            assert_eq!(
+                customer_config_roll_hold_decision(requested, false, running, false, true, tee),
+                Unheld
+            );
+        }
+        // First deploys and apps without a TEE domain ignore the field by
+        // design, so an in-flight rollout there is not a conflict.
+        assert_eq!(
+            customer_config_roll_hold_decision(Some(600), true, running, false, true, tee),
+            Unheld
+        );
+        assert_eq!(
+            customer_config_roll_hold_decision(Some(600), false, running, false, true, None),
+            Unheld
+        );
+        assert_eq!(
+            customer_config_roll_hold_decision(Some(600), false, running, false, true, Some("  ")),
+            Unheld
+        );
+        // A status that never showed a live TEE has nothing to protect.
+        assert_eq!(
+            customer_config_roll_hold_decision(Some(600), false, creating, false, true, tee),
+            Unheld
+        );
+        assert_eq!(
+            customer_config_roll_hold_decision(Some(600), false, failed, false, true, tee),
+            Unheld
+        );
+        // While an apply has projected the app to `Creating`, an earlier
+        // deployment still reporting healthy is the live TEE under threat:
+        // reject there too, or a hosted redeploy lands unheld for the whole
+        // observation window the `Creating` status lasts.
+        assert_eq!(
+            customer_config_roll_hold_decision(Some(600), false, creating, true, true, tee),
+            Conflict
+        );
+        assert_eq!(
+            customer_config_roll_hold_decision(Some(600), true, creating, true, true, tee),
+            Unheld
+        );
+        assert_eq!(
+            customer_config_roll_hold_decision(Some(600), false, creating, true, true, Some("  ")),
+            Unheld
+        );
+        // Without the in-flight rollout the same case has no rejection to
+        // make: the hold gate stays exactly as before.
+        assert_eq!(
+            customer_config_roll_hold_decision(Some(600), false, creating, true, false, tee),
+            Unheld
         );
     }
 

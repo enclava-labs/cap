@@ -1567,6 +1567,7 @@ const TRANSIENT_RETRY_CONFLICT_MESSAGES: &[&str] = &[
     "deployment mutation is still in progress; retry rollback",
     "current deployment generation is still in progress",
     "an earlier deployment is still completing setup; retry after setup is reconciled",
+    "an earlier deployment rollout is still in progress; retry after it settles",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8662,7 +8663,7 @@ mod tests {
         let messages: Vec<&str> = TRANSIENT_RETRY_CONFLICT_MESSAGES.to_vec();
         assert_eq!(
             messages.len(),
-            6,
+            7,
             "whitelist drift: update this count when editing the constant"
         );
         for (i, message) in messages.iter().enumerate() {

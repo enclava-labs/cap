@@ -599,28 +599,30 @@ async fn deploy_with_timings(
         pb.set_message("Delivering platform-managed config...");
         let (managed_key_baseline, managed_delivered_receipt, managed_delivery_id) = timings
             .run(DeployPhase::ManagedConfigEnqueue, async {
+                // These pre-release reads obey the same deadline as the
+                // waits below: the tighter of the roll hold and the requested
+                // phase budget, so a stalled request cannot run past a
+                // shorter `--ssh-timeout-seconds` and eat the release
+                // reserve from the far end of the hold.
+                let deadline =
+                    Some(Instant::now() + phase_budget(args.ssh_timeout_seconds));
                 // Snapshot each expected key's `updated_at` before the
                 // enqueue: config metadata persists across deployments, so
                 // key presence alone can prove only that the *previous*
                 // value reached the TEE.
-                let baseline = snapshot_managed_key_updates(
-                    api,
-                    &instance_name,
-                    pre_release_deadline,
-                )
-                .await?;
-                // The enqueue is a held pre-release request: bound it by
-                // the same deadline as the waits so a stalled response
-                // cannot consume the release reserve.
+                let baseline = snapshot_managed_key_updates(api, &instance_name, deadline).await?;
+                // The enqueue is a held pre-release request: bound it by the
+                // same deadline so a stalled response cannot consume the
+                // release reserve either.
                 let managed = match bounded_request(
-                    pre_release_deadline,
+                    deadline,
                     api.deliver_managed_template_config(&instance_name),
                 )
                 .await
                 {
                     Some(result) => result,
                     None => {
-                        return Err("customer-config roll hold deadline reached with the managed-config delivery request still in flight".into());
+                        return Err("this phase's deadline was reached with the managed-config delivery request still in flight".into());
                     }
                 };
                 let managed = managed.map_err(managed_template_config_api_error)?;
@@ -1534,12 +1536,14 @@ fn debian_ssh_config_pairs(public_keys: String) -> Vec<(&'static str, String)> {
 
 /// Wait for the password-mode TEE bootstrap endpoint to accept a claim.
 ///
-/// `hold_deadline` bounds every in-flight PaaS request and TEE probe, the
-/// whole loop, and each poll sleep on a held redeploy: the API client's own
-/// 900 s cap and the probe client's timeout would otherwise let one stalled
-/// call run past the roll hold. A cut is never a failure outcome; the wait's
-/// own expiry reports the timeout. `None` on unheld deploys keeps the
-/// unbounded behavior.
+/// `hold_deadline` bounds the whole loop and each poll sleep on a held
+/// redeploy so the release reserve survives. Every in-flight PaaS request
+/// and TEE probe is bounded by `wait_deadline` — the tighter of the roll
+/// hold and `max_wait` — matching the channel probes below: the API
+/// client's own 900 s cap and the probe client's timeout would otherwise
+/// let one stalled call run past the roll hold or a shorter requested
+/// budget. A cut is never a failure outcome; the wait's own expiry reports
+/// the timeout. `None` on unheld deploys keeps the unbounded loop bound.
 async fn wait_for_template_bootstrap_endpoint(
     api: &ApiClient,
     app_name: &str,
@@ -1558,7 +1562,8 @@ async fn wait_for_template_bootstrap_endpoint(
     let mut tee = None;
 
     loop {
-        fail_if_template_deployment_failed(api, app_name, deployment_id, hold_deadline).await?;
+        fail_if_template_deployment_failed(api, app_name, deployment_id, Some(wait_deadline))
+            .await?;
         if Instant::now() > wait_deadline {
             pb.abandon_with_message("TEE ownership timed out");
             return Err(format!(
@@ -1577,7 +1582,7 @@ async fn wait_for_template_bootstrap_endpoint(
             // A deadline cut is indistinguishable from a transient failure:
             // the loop's own expiry check reports the wait timeout.
             let acquired = match bounded_request(
-                hold_deadline,
+                Some(wait_deadline),
                 timings.run(
                     DeployPhase::BootstrapEndpointAcquisition,
                     api.get_unlock_endpoint(app_name),
@@ -1605,7 +1610,8 @@ async fn wait_for_template_bootstrap_endpoint(
                     ));
                     let _ = timings
                         .run(DeployPhase::BootstrapPollSleep, async {
-                            tokio::time::sleep(bounded_phase(hold_deadline, poll_interval)).await;
+                            tokio::time::sleep(bounded_phase(Some(wait_deadline), poll_interval))
+                                .await;
                             Ok::<(), std::convert::Infallible>(())
                         })
                         .await;
@@ -1618,14 +1624,14 @@ async fn wait_for_template_bootstrap_endpoint(
             .as_ref()
             .expect("TEE client must exist after endpoint acquisition");
         match bounded_request(
-            hold_deadline,
+            Some(wait_deadline),
             timings.run(DeployPhase::BootstrapAttestation, tee.attest_receipt_key()),
         )
         .await
         {
             Some(Ok((_attestation, attested_tee))) => {
                 match bounded_request(
-                    hold_deadline,
+                    Some(wait_deadline),
                     timings.run(
                         DeployPhase::BootstrapChallenge,
                         attested_tee.bootstrap_challenge(),
@@ -1740,7 +1746,7 @@ async fn wait_for_template_bootstrap_endpoint(
 
         let _ = timings
             .run(DeployPhase::BootstrapPollSleep, async {
-                tokio::time::sleep(bounded_phase(hold_deadline, poll_interval)).await;
+                tokio::time::sleep(bounded_phase(Some(wait_deadline), poll_interval)).await;
                 Ok::<(), std::convert::Infallible>(())
             })
             .await;
@@ -2339,11 +2345,11 @@ fn managed_config_progress_message(
 async fn snapshot_managed_key_updates(
     api: &ApiClient,
     instance_name: &str,
-    hold_deadline: Option<Instant>,
+    deadline: Option<Instant>,
 ) -> Result<HashMap<String, Option<String>>, Box<dyn std::error::Error>> {
     let mut last_error = String::new();
     for _attempt in 0..3 {
-        match bounded_request(hold_deadline, api.list_config_keys(instance_name)).await {
+        match bounded_request(deadline, api.list_config_keys(instance_name)).await {
             Some(Ok(response)) => {
                 return Ok(response
                     .keys
@@ -2353,11 +2359,11 @@ async fn snapshot_managed_key_updates(
             }
             Some(Err(error)) if should_retry_template_config_sync_error(&error) => {
                 last_error = error.to_string();
-                template_config_sleep_until_retry(hold_deadline).await;
+                template_config_sleep_until_retry(deadline).await;
             }
             Some(Err(error)) => return Err(error.into()),
             None => {
-                return Err("customer-config roll hold deadline reached while snapshotting the platform-managed config keys; this command did not deliver customer config".into());
+                return Err("this phase's deadline was reached while snapshotting the platform-managed config keys; this command did not deliver customer config".into());
             }
         }
     }
@@ -2435,11 +2441,13 @@ fn managed_key_is_fresh(
 /// values this call did not enqueue. `exhausted` or `cancelled` receipts
 /// fail the wait immediately.
 ///
-/// `hold_deadline` bounds each in-flight status read, the whole loop, and
-/// each retry sleep on a held redeploy: the API client's own 900 s cap would
-/// otherwise let one stalled read run past the roll hold. A cut read
-/// surfaces this wait's own not-available timeout. `None` on unheld deploys
-/// keeps the unbounded reads.
+/// `hold_deadline` bounds the whole loop and each retry sleep on a held
+/// redeploy: the API client's own 900 s cap would otherwise let one stalled
+/// read run past the roll hold. Each in-flight read is bounded by this
+/// wait's own `deadline` — the tighter of the roll hold and the requested
+/// phase budget — so a stalled request cannot run past the hold or a
+/// shorter `--ssh-timeout-seconds` and block the loop's expiry check. A cut
+/// read surfaces this wait's own not-available timeout.
 #[allow(clippy::too_many_arguments)]
 async fn wait_for_paas_managed_config_keys(
     api: &ApiClient,
@@ -2468,8 +2476,18 @@ async fn wait_for_paas_managed_config_keys(
     // remaining hold still stops at the hold, preserving the release
     // reserve. Unheld deploys keep start + timeout.
     let deadline = hold_deadline.map_or(start + timeout, |hold| hold.min(start + timeout));
+    // Bound every in-flight read in this loop by the wait's own `deadline`
+    // — the tighter of the roll hold and the requested phase budget —
+    // matching the terminal-diagnostic probe below. Bounding by the hold
+    // alone lets a stalled request run until nearly the end of the hold
+    // before the loop can enforce a shorter `--ssh-timeout-seconds`.
+    let read_deadline = Some(deadline);
     let mut terminal_probe_at: Option<Instant> = None;
     let mut delivered_receipt = delivered_receipt;
+    // Last observation, kept for the expiry report: reads are bounded by
+    // `deadline`, so at the deadline the loop can no longer poll for fresh
+    // counts before it must answer.
+    let mut last_missing = expected.clone();
     progress.set_message(managed_config_progress_message(
         0,
         expected.len(),
@@ -2477,8 +2495,23 @@ async fn wait_for_paas_managed_config_keys(
         timeout,
     ));
     loop {
-        fail_if_template_deployment_failed(api, instance_name, deployment_id, hold_deadline)
+        fail_if_template_deployment_failed(api, instance_name, deployment_id, read_deadline)
             .await?;
+        // Enforce the phase deadline before each read: once reads are bounded
+        // by `deadline`, a cut at the deadline is indistinguishable from an
+        // expiry, so the expiry is reported here — with the last
+        // observation's counts — and a cut read keeps its own in-flight
+        // message.
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "platform config for app {instance_name} timed out after {} ({}/{} ready); this command did not deliver customer config; missing entries: {}; inspect progress with `enclava config get --app {instance_name}`",
+                format_duration(timeout),
+                expected.len() - last_missing.len(),
+                expected.len(),
+                last_missing.join(", ")
+            )
+            .into());
+        }
         // TLS provisioning starts around the claim, so a terminal bootstrap
         // diagnostic must stop this post-claim wait promptly. The probe is
         // bound to the expected deployment via CAP before and after the
@@ -2496,7 +2529,7 @@ async fn wait_for_paas_managed_config_keys(
         // Poll this call's delivery receipt first: a matching `delivered`
         // satisfies every expected key regardless of metadata timestamps.
         if !delivered_receipt && let Some(receipt) = delivery_id {
-            match poll_managed_delivery_status(api, instance_name, receipt, hold_deadline).await? {
+            match poll_managed_delivery_status(api, instance_name, receipt, read_deadline).await? {
                 ManagedDeliveryPoll::Delivered => delivered_receipt = true,
                 ManagedDeliveryPoll::Pending => {}
                 ManagedDeliveryPoll::Failed(status) => {
@@ -2507,7 +2540,7 @@ async fn wait_for_paas_managed_config_keys(
                 }
             }
         }
-        match bounded_request(hold_deadline, api.list_config_keys(instance_name)).await {
+        match bounded_request(read_deadline, api.list_config_keys(instance_name)).await {
             Some(Ok(response)) => {
                 let observed = response
                     .keys
@@ -2528,6 +2561,7 @@ async fn wait_for_paas_managed_config_keys(
                     .cloned()
                     .collect::<Vec<_>>();
                 let ready = expected.len() - missing.len();
+                last_missing = missing.clone();
                 progress.set_message(managed_config_progress_message(
                     ready,
                     expected.len(),
@@ -2564,14 +2598,14 @@ async fn wait_for_paas_managed_config_keys(
             Some(Err(error)) => return Err(error.into()),
             None => {
                 return Err(format!(
-                    "platform config status for app {instance_name} did not become available within {}: customer-config roll hold deadline reached with the status read still in flight; this command did not deliver customer config; retry `enclava config get --app {instance_name}`",
+                    "platform config status for app {instance_name} did not become available within {}: this wait's deadline was reached with the status read still in flight; this command did not deliver customer config; retry `enclava config get --app {instance_name}`",
                     format_duration(timeout)
                 )
                 .into());
             }
         }
         progress.tick();
-        template_config_sleep_until_retry(hold_deadline).await;
+        template_config_sleep_until_retry(read_deadline).await;
     }
 }
 
@@ -2588,15 +2622,16 @@ enum ManagedDeliveryPoll {
 /// Read this call's delivery receipt once. Unknown or not-yet-observed
 /// receipts are treated as still pending so a replica lag cannot stall the
 /// wait, while retryable transport failures keep waiting under the normal
-/// deadline handling.
+/// deadline handling. `deadline` bounds this read — the caller passes the
+/// wait's own read deadline so a stalled request cannot outlive the phase.
 async fn poll_managed_delivery_status(
     api: &ApiClient,
     instance_name: &str,
     delivery_id: &str,
-    hold_deadline: Option<Instant>,
+    deadline: Option<Instant>,
 ) -> Result<ManagedDeliveryPoll, Box<dyn std::error::Error>> {
     match bounded_request(
-        hold_deadline,
+        deadline,
         api.managed_config_delivery_status(instance_name, delivery_id),
     )
     .await
@@ -2626,8 +2661,7 @@ async fn poll_managed_delivery_status(
         }
         Some(Err(error)) => Err(error.into()),
         None => Err(
-            "customer-config roll hold deadline reached with the delivery status read still in flight"
-                .into(),
+            "this wait's deadline was reached with the delivery status read still in flight".into(),
         ),
     }
 }
@@ -5643,6 +5677,88 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "the stalled wait must stop at the pre-release deadline instead of the 600s budget, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_managed_config_read_stops_at_the_phase_deadline() {
+        let (api, mut seen) = stalled_api_endpoint("/config").await;
+        let progress = ProgressBar::hidden();
+
+        // A long hold with a short requested budget: the effective deadline
+        // is `start + 300 ms`, not the hold. A stalled read bounded only by
+        // the hold would block past the budget for the rest of the hold
+        // window before the loop could enforce the phase timeout.
+        let hold = Instant::now() + Duration::from_secs(30);
+        let started = Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            wait_for_paas_managed_config_keys(
+                &api,
+                "shell",
+                &["MANAGED_KEY".to_string()],
+                DeploymentWait::trusted("deploy-1", None),
+                Duration::from_millis(300),
+                Some(hold),
+                &HashMap::new(),
+                false,
+                None,
+                &progress,
+            ),
+        )
+        .await
+        .expect("managed config must respect the phase deadline")
+        .expect_err("a stalled config read must not report readiness");
+        seen.try_recv().expect("the managed config read must start");
+        assert!(
+            started.elapsed() >= Duration::from_millis(200),
+            "the wait must run until the phase deadline, returned after {:?}",
+            started.elapsed()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the stalled read must stop at the phase deadline instead of the 30s hold, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_bootstrap_endpoint_wait_stops_at_the_phase_deadline() {
+        let (api, mut seen) = stalled_api_endpoint("/unlock/endpoint").await;
+        let timings = DeployTimings::new(false, |_line: &[u8]| Ok(()));
+        let progress = ProgressBar::hidden();
+
+        // Same shape as the managed-config loop: a long hold with a short
+        // requested budget must stop the stalled endpoint read at the phase
+        // deadline rather than run until nearly the end of the hold.
+        let hold = Instant::now() + Duration::from_secs(30);
+        let started = Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            wait_for_template_bootstrap_endpoint(
+                &api,
+                "shell",
+                DeploymentWait::trusted("deploy-1", None),
+                Duration::from_millis(300),
+                Some(hold),
+                &progress,
+                &timings,
+            ),
+        )
+        .await
+        .expect("bootstrap endpoint must respect the phase deadline")
+        .expect_err("a stalled endpoint must not report readiness");
+        seen.try_recv()
+            .expect("the unlock endpoint read must start");
+        assert!(
+            started.elapsed() >= Duration::from_millis(200),
+            "the wait must run until the phase deadline, returned after {:?}",
+            started.elapsed()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the stalled endpoint read must stop at the phase deadline instead of the 30s hold, took {:?}",
             started.elapsed()
         );
     }

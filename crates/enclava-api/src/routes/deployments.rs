@@ -1513,6 +1513,49 @@ async fn deploy_app_candidate(
         && app_has_rollout_in_flight(&mut tx, app.id)
             .await
             .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+    // The requested seconds are the idempotency identity. The accepted
+    // duration depends on the status read in this transaction, and apply
+    // changes that status before a lost-response retry arrives.
+    let customer_config_roll_hold_request = honor_customer_config_roll_hold
+        .then_some(body.customer_config_roll_hold_seconds)
+        .flatten();
+    // A failed app can still be serving its previous workload: a failed
+    // apply or rollout does not stop the old TEE, and the KBS selector keeps
+    // its authority for exactly that case. Hold only when an earlier
+    // deployment still reports healthy — the same evidence — so a failed app
+    // that never produced a live workload is not stranded waiting for a
+    // handshake no TEE can accept. `Creating` needs the same evidence: an
+    // apply in flight has projected the app to `Creating` while the previous
+    // workload keeps serving, and the hold decision below rejects a
+    // requested hold there instead of silently dropping it. A nonterminal
+    // earlier rollout means the workload is unstable: a requested hold is
+    // rejected rather than armed, because that rollout could still replace
+    // the TEE while this CLI writes config.
+    let prior_healthy_workload = matches!(
+        live_app_status,
+        crate::models::AppStatus::Failed | crate::models::AppStatus::Creating
+    ) && app_mutation != AppMutation::Insert
+        && app_has_prior_healthy_deployment(&mut tx, app.id)
+            .await
+            .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+    let customer_config_hold_seconds =
+        match crate::deployment_jobs::customer_config_roll_hold_decision(
+            customer_config_roll_hold_request,
+            app_mutation == AppMutation::Insert,
+            live_app_status,
+            prior_healthy_workload,
+            rollout_in_flight,
+            app.tee_domain.as_deref(),
+        ) {
+            crate::deployment_jobs::CustomerConfigRollHoldDecision::Hold(seconds) => Some(seconds),
+            crate::deployment_jobs::CustomerConfigRollHoldDecision::Unheld => None,
+            crate::deployment_jobs::CustomerConfigRollHoldDecision::Conflict => {
+                return Err(json_error(
+                    StatusCode::CONFLICT,
+                    crate::deployment_jobs::CUSTOMER_CONFIG_HOLD_IN_FLIGHT_CONFLICT,
+                ));
+            }
+        };
     crate::deploy::supersede_incomplete_deployments(&mut tx, app.id)
         .await
         .map_err(|error| match error {
@@ -1578,37 +1621,6 @@ async fn deploy_app_candidate(
             .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
     }
 
-    // The requested seconds are the idempotency identity. The accepted
-    // duration depends on the status read in this transaction, and apply
-    // changes that status before a lost-response retry arrives.
-    let customer_config_roll_hold_request = honor_customer_config_roll_hold
-        .then_some(body.customer_config_roll_hold_seconds)
-        .flatten();
-    // A failed app can still be serving its previous workload: a failed
-    // apply or rollout does not stop the old TEE, and the KBS selector keeps
-    // its authority for exactly that case. Hold only when an earlier
-    // deployment still reports healthy — the same evidence — so a failed app
-    // that never produced a live workload is not stranded waiting for a
-    // handshake no TEE can accept. A nonterminal earlier rollout means the
-    // workload is unstable, so the hold is not armed at all: that rollout
-    // could still replace the TEE while this CLI writes config.
-    let is_update = app_mutation != AppMutation::Insert;
-    let prior_healthy_workload = matches!(live_app_status, crate::models::AppStatus::Failed)
-        && is_update
-        && app_has_prior_healthy_deployment(&mut tx, app.id)
-            .await
-            .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
-    let customer_config_hold_seconds =
-        crate::deployment_jobs::normalize_customer_config_roll_hold_seconds(
-            customer_config_roll_hold_request,
-            crate::deployment_jobs::customer_config_roll_hold_applies(
-                app_mutation == AppMutation::Insert,
-                live_app_status,
-                prior_healthy_workload,
-                rollout_in_flight,
-                app.tee_domain.as_deref(),
-            ),
-        );
     sqlx::query(
         "UPDATE deployments
             SET spec_snapshot = jsonb_set(
