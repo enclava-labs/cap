@@ -1266,6 +1266,24 @@ pub fn spawn_deployment_dispatcher(state: AppState) {
                     "failed to repair orphaned deployment namespace mutation leases"
                 ),
             }
+            // Retained-namespace fences from incomplete failed-apply teardowns
+            // are released only after reconciliation observes the namespace
+            // gone; fail closed on any uncertainty.
+            match crate::mutation_leases::release_retained_deployment_namespace_fences(
+                &repair_state.db,
+            )
+            .await
+            {
+                Ok(released) if released > 0 => tracing::info!(
+                    released,
+                    "released retained deployment namespace fences after confirmed namespace deletion"
+                ),
+                Ok(_) => {}
+                Err(_) => tracing::warn!(
+                    error_code = "retained_namespace_fence_repair_failed",
+                    "failed to release retained deployment namespace fences"
+                ),
+            }
             tokio::time::sleep(TERMINAL_LEASE_REPAIR_INTERVAL).await;
         }
     });

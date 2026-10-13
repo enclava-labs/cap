@@ -32,8 +32,9 @@ const RENEW_TIMEOUT_SECONDS: u64 = 10;
 /// under Longhorn PVC finalizers — indistinguishable from a crash only to
 /// operators, never to the repair loop: the loop keeps bounding crashed
 /// pre-arms (still labeled `deployment_apply`) while a retained fence stays
-/// infinite until an operator or reconciler clears it after observing
-/// namespace 404.
+/// infinite until the retained-fence reconciler
+/// ([`release_retained_deployment_namespace_fences`]) clears it after
+/// observing namespace 404.
 pub const RETAINED_DEPLOYMENT_NAMESPACE_OPERATION: &str = "deployment_apply_retained_namespace";
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -1026,6 +1027,182 @@ pub async fn reconcile_orphaned_deployment_apply_leases(
     .execute(pool)
     .await?;
     Ok(resources.rows_affected())
+}
+
+/// Release retained-namespace fences whose Kubernetes namespace has since
+/// been confirmed gone. A failed apply whose namespace delete was issued but
+/// not confirmed complete retains its `kubernetes_namespace` fence under
+/// [`RETAINED_DEPLOYMENT_NAMESPACE_OPERATION`] (fail closed, mirroring app
+/// delete). Without this loop that fence stays infinite forever and every
+/// later mutation of the namespace name — redeploy or app delete — is
+/// rejected as `Busy` even after Kubernetes finishes the deletion.
+///
+/// For every expired retained fence the Kubernetes API is asked whether the
+/// namespace still exists, and only an observed 404 authorizes the release:
+/// the exact owner/generation/marker row is cleared with a compare-and-swap
+/// that also requires the fence to still be expired, so a snapshot taken
+/// before the (potentially slow) GET cannot authorize the release. A GET
+/// error or a still-existing namespace retains the fence; only positive
+/// evidence of absence releases it. The app owner row — re-resolved inside
+/// the release transaction, after the GET — is cleared with the same
+/// generation/expiry/no-remaining-resource guard the documented operator
+/// path uses, and only when a live app row still owns the namespace name,
+/// under that app's deployment-lane advisory lock (the same first lock
+/// `claim`/`finish` take). Multiple API replicas may run this concurrently —
+/// the CAS makes the release exactly-once and harmless to race.
+pub async fn release_retained_deployment_namespace_fences(
+    pool: &PgPool,
+) -> Result<u64, MutationLeaseError> {
+    let retained = select_expired_retained_namespace_fences(pool).await?;
+    if retained.is_empty() {
+        return Ok(0);
+    }
+    let client = match kube::Client::try_default().await {
+        Ok(client) => client,
+        Err(error) => {
+            // No Kubernetes authority to observe: retain every fence.
+            tracing::warn!(
+                error = %error,
+                "retained-namespace fence reconciliation cannot reach Kubernetes; retaining fences"
+            );
+            return Ok(0);
+        }
+    };
+    release_retained_deployment_namespace_fences_with(pool, client).await
+}
+
+async fn select_expired_retained_namespace_fences(
+    pool: &PgPool,
+) -> Result<Vec<(Uuid, String, Uuid, i64)>, MutationLeaseError> {
+    Ok(sqlx::query_as::<_, (Uuid, String, Uuid, i64)>(
+        "SELECT resource.owner_token, resource.resource_key, resource.operation_id, resource.generation
+           FROM external_resource_mutation_leases AS resource
+          WHERE resource.resource_scope = 'kubernetes_namespace'
+            AND resource.operation_kind = $1
+            AND resource.reclaim_after = 'infinity'::timestamptz
+            AND resource.locked_until <= clock_timestamp()",
+    )
+    .bind(RETAINED_DEPLOYMENT_NAMESPACE_OPERATION)
+    .fetch_all(pool)
+    .await?)
+}
+
+/// Testable core of [`release_retained_deployment_namespace_fences`]: the
+/// Kubernetes observation is made through the supplied client.
+async fn release_retained_deployment_namespace_fences_with(
+    pool: &PgPool,
+    client: kube::Client,
+) -> Result<u64, MutationLeaseError> {
+    let retained = select_expired_retained_namespace_fences(pool).await?;
+    if retained.is_empty() {
+        return Ok(0);
+    }
+    let api: kube::Api<k8s_openapi::api::core::v1::Namespace> = kube::Api::all(client);
+    let mut released = 0u64;
+    for (owner_token, namespace, operation_id, generation) in retained {
+        let absence = match api.get_opt(&namespace).await {
+            Ok(None) => true,
+            Ok(Some(_)) => false,
+            Err(error) => {
+                // Fail closed: an unobservable namespace must not release.
+                tracing::warn!(
+                    namespace = %namespace,
+                    error = %error,
+                    "retained-namespace fence reconciliation cannot inspect the namespace; retaining fence"
+                );
+                continue;
+            }
+        };
+        if !absence {
+            continue;
+        }
+        // Re-resolve the current app row inside the release transaction (the
+        // Kubernetes GET may have blocked far past any earlier snapshot) and
+        // take that app's deployment-lane advisory lock — the same first lock
+        // `claim` and `finish` acquire — before any lease write. When no live
+        // app row owns the namespace name anymore (the app was hard-deleted),
+        // there is no lane to lock and the name died with the app, so the
+        // fence is still released: external fences are deliberately not
+        // foreign-keyed to `apps`, and retaining forever would re-create the
+        // Busy-forever bug for the next app that reuses the name.
+        let mut tx = pool.begin().await?;
+        let lane_app: Option<Uuid> = sqlx::query_scalar(
+            "SELECT app.id
+               FROM apps AS app
+              WHERE app.namespace = $1",
+        )
+        .bind(&namespace)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(app_id) = lane_app {
+            crate::deploy::lock_app_deployment_lane(&mut tx, app_id).await?;
+        }
+        // Exactly-once compare-and-swap on the marker we observed: token,
+        // generation, and operation id must all still match, and the fence
+        // must still be the infinite retained one and still be expired —
+        // the pre-GET snapshot alone must not authorize the release.
+        let result = sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET owner_token = NULL,
+                    operation_kind = NULL,
+                    operation_id = NULL,
+                    locked_until = NULL,
+                    reclaim_after = NULL,
+                    updated_at = clock_timestamp()
+              WHERE resource_scope = 'kubernetes_namespace'
+                AND resource_key = $1
+                AND owner_token = $2
+                AND generation = $3
+                AND operation_id = $4
+                AND operation_kind = $5
+                AND reclaim_after = 'infinity'::timestamptz
+                AND locked_until <= clock_timestamp()",
+        )
+        .bind(&namespace)
+        .bind(owner_token)
+        .bind(generation)
+        .bind(operation_id)
+        .bind(RETAINED_DEPLOYMENT_NAMESPACE_OPERATION)
+        .execute(&mut *tx)
+        .await?;
+        let released_row = result.rows_affected() == 1;
+        // Clear the retained app owner only under the same guards the
+        // documented operator path uses: the app row must still be this
+        // exact operation's (token + operation id), expired, and hold no
+        // remaining provider fence for the token — sibling fences of the
+        // same failed apply (edge_config, kbs_policy, per-host edge) are
+        // still in their bounded quarantine and keep the app row owned.
+        sqlx::query(
+            "UPDATE app_mutation_leases AS app
+                SET owner_token = NULL,
+                    operation_kind = NULL,
+                    operation_id = NULL,
+                    locked_until = NULL,
+                    reclaim_after = NULL,
+                    updated_at = clock_timestamp()
+              WHERE app.owner_token = $1
+                AND app.operation_id = $2
+                AND app.operation_kind = 'deployment_apply'
+                AND app.locked_until <= clock_timestamp()
+                AND NOT EXISTS (
+                    SELECT 1 FROM external_resource_mutation_leases AS resource
+                     WHERE resource.owner_token = app.owner_token
+                )",
+        )
+        .bind(owner_token)
+        .bind(operation_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        if released_row {
+            tracing::info!(
+                namespace = %namespace,
+                "released retained deployment namespace fence after observed namespace deletion"
+            );
+            released += 1;
+        }
+    }
+    Ok(released)
 }
 
 async fn poison_resource_scope(
@@ -2242,5 +2419,343 @@ mod tests {
                 .expect("check desired-state lease")
         );
         tx.commit().await.expect("commit desired-state lease check");
+    }
+
+    fn mock_kube_client(server_url: &str) -> kube::Client {
+        let uri: http::Uri = server_url
+            .parse()
+            .expect("mock Kubernetes server URL parses");
+        kube::Client::try_from(kube::Config::new(uri)).expect("build mock Kubernetes client")
+    }
+
+    /// Mock Kubernetes API server modes.
+    const MOCK_NS_LIVE: u8 = 0;
+    const MOCK_NS_ABSENT: u8 = 1;
+    const MOCK_NS_ERROR: u8 = 2;
+
+    /// A mock Kubernetes API server reporting namespaces live (200), gone
+    /// (404), or unobservable (500), switchable at runtime. When a race
+    /// target is configured, a GET of that namespace first bumps the fence's
+    /// generation in the database — injecting the SELECT-then-UPDATE race the
+    /// release compare-and-swap must survive.
+    async fn mock_namespace_api_server(
+        race: Option<(PgPool, String)>,
+    ) -> (
+        String,
+        Arc<std::sync::atomic::AtomicU8>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        let mode = Arc::new(std::sync::atomic::AtomicU8::new(MOCK_NS_LIVE));
+        let state = mode.clone();
+        let app = Router::new().fallback(move |request: axum::extract::Request| {
+            let absent = state.clone();
+            let race = race.clone();
+            async move {
+                let name = request
+                    .uri()
+                    .path()
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("ns")
+                    .to_string();
+                if let Some((pool, race_namespace)) = race.as_ref()
+                    && request.method() == axum::http::Method::GET
+                    && name == *race_namespace
+                {
+                    sqlx::query(
+                        "UPDATE external_resource_mutation_leases
+                            SET generation = generation + 1
+                          WHERE resource_scope = 'kubernetes_namespace'
+                            AND resource_key = $1",
+                    )
+                    .bind(race_namespace)
+                    .execute(pool)
+                    .await
+                    .expect("race mutation bumps retained fence generation");
+                }
+                match absent.load(std::sync::atomic::Ordering::SeqCst) {
+                    MOCK_NS_ABSENT => (
+                        StatusCode::NOT_FOUND,
+                        axum::Json(serde_json::json!({
+                            "apiVersion": "v1", "kind": "Status",
+                            "status": "Failure", "reason": "NotFound",
+                            "message": "namespaces \"ns\" not found", "code": 404
+                        })),
+                    )
+                        .into_response(),
+                    MOCK_NS_ERROR => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        axum::Json(serde_json::json!({
+                            "apiVersion": "v1", "kind": "Status",
+                            "status": "Failure", "reason": "InternalError",
+                            "message": "unobservable", "code": 500
+                        })),
+                    )
+                        .into_response(),
+                    _ => (
+                        StatusCode::OK,
+                        axum::Json(serde_json::json!({
+                            "apiVersion": "v1", "kind": "Namespace",
+                            "metadata": {"name": name, "uid": "fixture", "resourceVersion": "1"}
+                        })),
+                    )
+                        .into_response(),
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock namespace API");
+        let address = listener.local_addr().expect("mock namespace API address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve mock namespace API");
+        });
+        (format!("http://{address}"), mode, server)
+    }
+
+    /// Stage exactly what `fail_apply_job_with_mutation` leaves behind after
+    /// an incomplete teardown retain plus a worker crash past every renewable
+    /// deadline: a failed apply's namespace fence retained under the marker,
+    /// with the sibling edge fence still in its bounded quarantine and the
+    /// app owner row expired-but-not-yet-reclaimable. Returns the owner token.
+    async fn stage_retained_namespace_fixture(
+        pool: &PgPool,
+        extra_fences: Vec<ResourceFence>,
+    ) -> (Uuid, Uuid, Uuid, String) {
+        let namespace = format!("retained-kube-{}", Uuid::new_v4().simple());
+        let hostname = format!("{namespace}.example.test");
+        let (org_id, app_id) = insert_app(pool, &hostname).await;
+        sqlx::query("UPDATE apps SET namespace = $1 WHERE id = $2")
+            .bind(&namespace)
+            .bind(app_id)
+            .execute(pool)
+            .await
+            .expect("set unique retained namespace fixture");
+        let state = state_with_pool(pool.clone());
+        let operation_id = Uuid::new_v4();
+        let mut fences = vec![ResourceFence::new("kubernetes_namespace", &namespace)];
+        fences.extend(extra_fences);
+        let mut retained = claim(
+            &state,
+            app_id,
+            "deployment_apply",
+            operation_id,
+            false,
+            fences,
+        )
+        .await
+        .expect("claim failed apply resources");
+        let owner_token = retained.token;
+        retained
+            .arm_resource_scope_until_reconciled("kubernetes_namespace")
+            .await
+            .expect("pre-arm namespace fence");
+        retained
+            .retain_resource_scope_under_marker(
+                "kubernetes_namespace",
+                RETAINED_DEPLOYMENT_NAMESPACE_OPERATION,
+            )
+            .await
+            .expect("retain namespace fence under marker");
+        // Crash steady state: every renewable deadline elapsed, but the
+        // bounded reclaim quarantines (app row and sibling edge fence) are
+        // still in the future.
+        sqlx::query(
+            "UPDATE app_mutation_leases
+                SET locked_until = clock_timestamp() - interval '2 seconds'
+              WHERE app_id = $1",
+        )
+        .bind(app_id)
+        .execute(pool)
+        .await
+        .expect("expire retained app owner deadline");
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET locked_until = clock_timestamp() - interval '2 seconds'
+              WHERE owner_token = $1",
+        )
+        .bind(owner_token)
+        .execute(pool)
+        .await
+        .expect("expire retained provider deadlines");
+        (org_id, app_id, owner_token, namespace)
+    }
+
+    #[tokio::test]
+    async fn retained_namespace_fence_releases_after_observed_deletion() {
+        let pool = database_test_pool(4).await;
+        let state = state_with_pool(pool.clone());
+
+        // Primary fixture: the namespace fence plus a sibling edge fence
+        // still owned by the same failed apply.
+        let (org_one, app_one, owner_one, namespace_one) =
+            stage_retained_namespace_fixture(&pool, vec![ResourceFence::edge_config()]).await;
+        // Race fixture: its generation is bumped by the mock server during
+        // the Kubernetes GET, after the reconciler's SELECT.
+        let (org_two, app_two, _, namespace_two) =
+            stage_retained_namespace_fixture(&pool, Vec::new()).await;
+        // Vanished-app fixture: the app row is gone; the fence must still be
+        // releasable so a future app reusing the name is not Busy forever.
+        let (org_three, _, _, namespace_three) =
+            stage_retained_namespace_fixture(&pool, Vec::new()).await;
+        sqlx::query("DELETE FROM apps WHERE namespace = $1")
+            .bind(&namespace_three)
+            .execute(&pool)
+            .await
+            .expect("hard-delete vanished-app fixture app row");
+
+        let (server_url, mode, server) =
+            mock_namespace_api_server(Some((pool.clone(), namespace_two.clone()))).await;
+        let client = mock_kube_client(&server_url);
+
+        // An unobservable namespace (GET error) must retain the fence.
+        mode.store(MOCK_NS_ERROR, std::sync::atomic::Ordering::SeqCst);
+        let released = release_retained_deployment_namespace_fences_with(&pool, client.clone())
+            .await
+            .expect("reconcile retained fence with erroring API");
+        assert_eq!(
+            released, 0,
+            "an unobservable namespace must retain its fence"
+        );
+
+        // A live namespace (Terminating counts as existing) must retain it.
+        mode.store(MOCK_NS_LIVE, std::sync::atomic::Ordering::SeqCst);
+        let released = release_retained_deployment_namespace_fences_with(&pool, client.clone())
+            .await
+            .expect("reconcile retained fence with live namespace");
+        assert_eq!(released, 0, "a live namespace must retain its fence");
+        for namespace in [&namespace_one, &namespace_two, &namespace_three] {
+            let still_retained: bool = sqlx::query_scalar(
+                "SELECT reclaim_after = 'infinity'::timestamptz
+                   FROM external_resource_mutation_leases
+                  WHERE resource_scope = 'kubernetes_namespace'
+                    AND resource_key = $1",
+            )
+            .bind(namespace)
+            .fetch_one(&pool)
+            .await
+            .expect("verify fence still retained");
+            assert!(still_retained, "{namespace} must still be retained");
+        }
+
+        // Observed deletion: the exact fence releases, the raced fence does
+        // not (generation moved under the SELECT), and the vanished-app fence
+        // releases too.
+        mode.store(MOCK_NS_ABSENT, std::sync::atomic::Ordering::SeqCst);
+        let released = release_retained_deployment_namespace_fences_with(&pool, client.clone())
+            .await
+            .expect("reconcile retained fences after namespace deletion");
+        assert_eq!(
+            released, 2,
+            "only the exact fence and the vanished-app fence release"
+        );
+        let (one_owner, two_owner, three_owner): (Option<Uuid>, Option<Uuid>, Option<Uuid>) =
+            sqlx::query_as(
+                "SELECT
+                    (SELECT owner_token FROM external_resource_mutation_leases
+                      WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1),
+                    (SELECT owner_token FROM external_resource_mutation_leases
+                      WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $2),
+                    (SELECT owner_token FROM external_resource_mutation_leases
+                      WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $3)",
+            )
+            .bind(&namespace_one)
+            .bind(&namespace_two)
+            .bind(&namespace_three)
+            .fetch_one(&pool)
+            .await
+            .expect("verify fence owners after release");
+        assert_eq!(one_owner, None, "the exact observed-404 fence is released");
+        assert!(two_owner.is_some(), "the raced fence is not released");
+        assert_eq!(three_owner, None, "the vanished-app fence is released");
+
+        // The sibling edge fence still in quarantine keeps the app owner
+        // row owned: the operator-path guard must not clear it early.
+        let app_one_owner: Option<Uuid> =
+            sqlx::query_scalar("SELECT owner_token FROM app_mutation_leases WHERE app_id = $1")
+                .bind(app_one)
+                .fetch_one(&pool)
+                .await
+                .expect("load primary fixture app owner");
+        assert_eq!(
+            app_one_owner,
+            Some(owner_one),
+            "a sibling fence in quarantine keeps the app owner row owned"
+        );
+
+        // Once the sibling quarantine elapses, a retry claims the name.
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET locked_until = clock_timestamp() - interval '2 seconds',
+                    reclaim_after = clock_timestamp() - interval '1 second'
+              WHERE resource_scope = 'edge_config' AND resource_key = 'global'",
+        )
+        .execute(&pool)
+        .await
+        .expect("expire sibling edge quarantine");
+        sqlx::query(
+            "UPDATE app_mutation_leases
+                SET reclaim_after = clock_timestamp() - interval '1 second'
+              WHERE app_id = $1",
+        )
+        .bind(app_one)
+        .execute(&pool)
+        .await
+        .expect("expire primary app reclaim window");
+        let retry = claim(
+            &state,
+            app_one,
+            "deployment_apply",
+            Uuid::new_v4(),
+            false,
+            vec![
+                ResourceFence::new("kubernetes_namespace", &namespace_one),
+                ResourceFence::edge_config(),
+            ],
+        )
+        .await
+        .expect("a retry may claim the name after reconciliation");
+        retry.finish().await.expect("finish retry generation");
+
+        server.abort();
+        for namespace in [&namespace_one, &namespace_two, &namespace_three] {
+            sqlx::query(
+                "DELETE FROM external_resource_mutation_leases
+                  WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1",
+            )
+            .bind(namespace)
+            .execute(&pool)
+            .await
+            .expect("remove retained-fence fixture");
+        }
+        sqlx::query(
+            "DELETE FROM external_resource_mutation_leases
+              WHERE resource_scope = 'edge_config' AND resource_key = 'global'",
+        )
+        .execute(&pool)
+        .await
+        .expect("remove sibling edge fixture");
+        for (org, app) in [
+            (org_one, Some(app_one)),
+            (org_two, Some(app_two)),
+            (org_three, None),
+        ] {
+            if let Some(app) = app {
+                sqlx::query("DELETE FROM apps WHERE id = $1")
+                    .bind(app)
+                    .execute(&pool)
+                    .await
+                    .expect("remove retained-fence app fixture");
+            }
+            sqlx::query("DELETE FROM organizations WHERE id = $1")
+                .bind(org)
+                .execute(&pool)
+                .await
+                .expect("remove retained-fence organization fixture");
+        }
     }
 }
