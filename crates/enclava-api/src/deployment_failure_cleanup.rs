@@ -265,12 +265,11 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
         {
             Ok(rows) => (
                 rows.iter()
-                    .filter_map(|(uid, created_at, deleted_confirmed_at, _, _, _)| {
-                        created_at.map(|created_at| StsProvenanceWindow {
-                            uid: uid.clone(),
-                            created_at,
-                            deleted_confirmed_at: *deleted_confirmed_at,
-                        })
+                    .filter_map(|(uid, created_at, _, _, _, _)| {
+                        // A row counts as a proven lineage record when the
+                        // apply response (or a prior sweep) persisted the
+                        // server-reported sts provenance.
+                        created_at.map(|_| StsProvenanceWindow { uid: uid.clone() })
                     })
                     .collect::<Vec<_>>(),
                 // A row that reached the StatefulSet step but recorded no
@@ -298,7 +297,72 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
             }
         };
     let mut failures = 0usize;
-    for target in adopted_namespace_sweep_targets(app) {
+    let mut targets = adopted_namespace_sweep_targets(app);
+    // Codex P2 (renamed pull secrets): candidate Secret discovery must not
+    // depend on the CURRENT process's `TENANT_IMAGE_PULL_SECRET_NAME`. An
+    // incomplete adopted-namespace cleanup can survive a restart into a
+    // world where the configured name changed or was removed; searching
+    // only the current name would sweep everything, clear all sibling
+    // cleanup evidence, and strand the earlier CAP-created Secret — and
+    // its registry credentials — indefinitely. Enumerate Secrets carrying
+    // CAP creation evidence and add them as candidates (per-target
+    // deletion stays evidence-gated below).
+    let secrets_api: kube::Api<k8s_openapi::api::core::v1::Secret> =
+        kube::Api::namespaced(client.clone(), &app.namespace);
+    match bounded_sweep_read(
+        sweep_deadline,
+        secrets_api.list(&kube::api::ListParams::default()),
+    )
+    .await
+    {
+        Ok(list) => {
+            for secret in list.items {
+                let Some(name) = secret.metadata.name.clone() else {
+                    continue;
+                };
+                let has_creation_evidence = secret
+                    .metadata
+                    .annotations
+                    .as_ref()
+                    .and_then(|annotations| {
+                        annotations
+                            .get(enclava_engine::apply::generation::RESOURCE_CREATED_BY_ANNOTATION)
+                    })
+                    .and_then(|raw| raw.parse::<i64>().ok())
+                    .is_some_and(|created_by| created_by > 0);
+                if has_creation_evidence
+                    && !targets
+                        .iter()
+                        .any(|target| target.kind == "Secret" && target.name == name)
+                {
+                    tracing::info!(
+                        app_id = %app.id,
+                        namespace = %app.namespace,
+                        secret = %name,
+                        "adopted-namespace sweep discovered a CAP-created Secret outside the configured pull-secret name; adding it as a sweep candidate"
+                    );
+                    targets.push(AdoptedNamespaceSweep {
+                        kind: "Secret",
+                        name,
+                    });
+                }
+            }
+        }
+        Err(error) => {
+            // Fail closed: a renamed CAP credential Secret may still be in
+            // the namespace. Clearing evidence over an uninspected
+            // namespace would strand its registry credentials with no
+            // later cleanup eligibility.
+            tracing::warn!(
+                app_id = %app.id,
+                namespace = %app.namespace,
+                error = %error,
+                "adopted-namespace sweep cannot enumerate Secrets for creation evidence; counting the sweep as failed for retry"
+            );
+            failures += 1;
+        }
+    }
+    for target in targets {
         if tokio::time::Instant::now() >= sweep_deadline {
             tracing::warn!(
                 app_id = %app.id,
@@ -321,8 +385,7 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
         let mut exhausted_conflicts = false;
         let mut statefulset_uid: Option<String> = None;
         let mut statefulset_created_at: Option<chrono::DateTime<chrono::Utc>> = None;
-        let mut sts_observed_deleted_at: Option<chrono::DateTime<chrono::Utc>> = None;
-        let mut sts_deleted_edge_persisted = false;
+        let mut claim_refs_armed = false;
         for attempt in 0..SWEEP_DELETE_RETRIES {
             let live = match bounded_sweep_read(sweep_deadline, api.get_opt(&target.name)).await {
                 Ok(live) => live,
@@ -339,7 +402,7 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
                     break;
                 }
             };
-            let Some(live) = live else {
+            let Some(mut live) = live else {
                 // Absent. For the StatefulSet this may be a RETRY after a
                 // previous sweep deleted it but could not finish its PVC
                 // sweep: run the claim sweep now under the retry-time
@@ -402,6 +465,67 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
                 }
                 break;
             }
+            if target.kind == "StatefulSet" && !claim_refs_armed {
+                claim_refs_armed = true;
+                // Codex P1: deletion authority for the claims is their
+                // controller ownerReference (see `classify_claim_lineage`),
+                // so ARM it before the set dies: flip the claim-retention
+                // policy to `whenDeleted: Delete` (a mutable field — VCT
+                // metadata is immutable), then give the controller a
+                // bounded window to reconcile the set's controller
+                // ownerReference onto the claims it manages. Without this,
+                // Retain/Retain claims carry no ownerReferences at all and
+                // could never be proven — leaving them undeletable and the
+                // sweep permanently incomplete.
+                let Some(sts_uid_for_refs) = live.metadata.uid.clone() else {
+                    tracing::warn!(
+                        app_id = %app.id,
+                        namespace = %app.namespace,
+                        statefulset = %target.name,
+                        "adopted-namespace sweep cannot arm claim ownerReferences (StatefulSet has no UID); leaving it live for a retry"
+                    );
+                    failures += 1;
+                    break;
+                };
+                if !arm_claim_owner_refs(
+                    &client,
+                    &app.namespace,
+                    &target.name,
+                    &sts_uid_for_refs,
+                    sweep_deadline,
+                )
+                .await
+                {
+                    // The retention-policy flip failed: deleting the set
+                    // now would orphan its claims with no proof left to
+                    // sweep them. Leave the set live and let a later
+                    // failure's sweep re-arm (fail closed, retryable).
+                    failures += 1;
+                    break;
+                }
+                // Re-read: our own patch moved the resourceVersion past
+                // the preconditions about to be captured.
+                match bounded_sweep_read(sweep_deadline, api.get_opt(&target.name)).await {
+                    Ok(Some(fresh)) => live = fresh,
+                    Ok(None) => {
+                        // Vanished between arming and re-read: treat as
+                        // deleted and let the claim sweep run below.
+                        deleted = true;
+                        break;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            app_id = %app.id,
+                            namespace = %app.namespace,
+                            statefulset = %target.name,
+                            error = %error,
+                            "adopted-namespace sweep cannot re-read the StatefulSet after arming claim ownerReferences; counting as failed for retry"
+                        );
+                        failures += 1;
+                        break;
+                    }
+                }
+            }
             let preconditions = kube::api::Preconditions {
                 uid: live.metadata.uid.clone(),
                 resource_version: live.metadata.resource_version.clone(),
@@ -421,14 +545,13 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
                             .ok()
                     });
                 statefulset_created_at = observed_created_at;
-                // Persist the proven window edges BEFORE the delete (Codex
-                // P1): the sts creation provenance (uid + server-reported
-                // creationTimestamp) and the deletion edge stamped now, so
-                // a sweep that deletes the sts but cannot finish the claim
-                // sweep leaves a CLOSED lineage window
-                // [sts_created_at, sts_observed_deleted_at] that retry
-                // sweeps (sts absent) can require — "created after the sts"
-                // alone was only a lower bound, never claim-specific proof.
+                // Persist the StatefulSet's proven lineage record BEFORE
+                // the delete (server-reported uid + creationTimestamp):
+                // retry sweeps after the sts is gone read these columns to
+                // know which StatefulSet UID is proven CAP lineage for the
+                // ownerReference match (Codex P1 — timestamps themselves
+                // never authorize deletion). The deletion edge is recorded
+                // alongside for observability.
                 let deleted_edge = chrono::Utc::now();
                 if let (Some(uid), Some(created)) =
                     (live.metadata.uid.as_deref(), observed_created_at)
@@ -451,16 +574,9 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
                         app_id = %app.id,
                         deployment_id = %failed_deployment_id,
                         error = %error,
-                        "adopted-namespace sweep could not persist the observed sts provenance; retry sweeps stay fail-closed"
+                        "adopted-namespace sweep could not persist the observed sts lineage record; retry sweeps stay fail-closed"
                     );
-                    // Best-effort write failed: the durable window may stay
-                    // OPEN (no deletion edge) — retry sweeps must then fail
-                    // closed on post-birth claims rather than accept them.
-                    sts_deleted_edge_persisted = false;
-                } else {
-                    sts_deleted_edge_persisted = true;
                 }
-                sts_observed_deleted_at = Some(deleted_edge);
             }
             match bounded_sweep_read(
                 sweep_deadline,
@@ -572,20 +688,10 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
                 // still-incomplete siblings (retry evidence).
                 &sts_proven_windows,
                 // The sts was proven live and just deleted by THIS sweep:
-                // its own window [creationTimestamp, pre-delete stamp] is
-                // this instance's lineage bound — server-reported
-                // creation, CAP-issued deletion. Only pass it as CLOSED
-                // when the pre-delete stamp was durably persisted (a
-                // failed best-effort write would leave retry sweeps with
-                // an open window, which they treat fail-closed).
-                statefulset_created_at.map(|created_at| StsProvenanceWindow {
+                // its UID is this instance's proven lineage record for the
+                // ownerReference match (Codex P1).
+                statefulset_created_at.map(|_| StsProvenanceWindow {
                     uid: statefulset_uid.clone(),
-                    created_at,
-                    deleted_confirmed_at: if sts_deleted_edge_persisted {
-                        sts_observed_deleted_at
-                    } else {
-                        None
-                    },
                 }),
                 reached_sts_step_without_window,
             )
@@ -666,183 +772,250 @@ fn any_legacy_evidence_row<'a>(
 /// Bounded re-read retry budget for preconditioned sweep deletes.
 const SWEEP_DELETE_RETRIES: usize = 3;
 
-/// Classify a claim's creation against the proven StatefulSet-step bound
-/// at Kubernetes timestamp precision. `metav1.Time` serializes as RFC 3339
-/// with SECOND precision (no sub-second digits), and the StatefulSet
-/// controller routinely creates the ordinal claims within the same second
-/// the StatefulSet itself was created — so a claim that is `==` the bound
-/// is a NORMAL outcome, not an exceptional clock race. Both sides are
-/// compared as instants: the chrono bound is rendered RFC 3339 and parsed
-/// into a jiff `Timestamp` (the string forms of the two libraries differ
-/// and misorder near-equal times), so the ordering is truly chronological
-/// before the three-way decision is made.
-#[derive(Debug, PartialEq, Eq)]
-enum ClaimBoundOrdering {
-    /// Created strictly after the bound (a later second): within this
-    /// workload's lineage window — sweep-eligible.
-    AfterBound,
-    /// The SAME second as the bound: at second precision this is
-    /// undecidable — the claim may be the controller's own same-second
-    /// creation or a tenant's race. Ownership is unresolved: retain the
-    /// claim (never delete) and count it as a failure so the sweep
-    /// reports INCOMPLETE and the caller keeps provider-state evidence
-    /// instead of silently clearing it over a retained claim.
-    SameSecondUnresolved,
-    /// Created strictly before the bound: a tenant's or a predecessor's
-    /// claim. Never swept, and not a failure.
-    BeforeBound,
-}
-
-fn classify_claim_creation(
-    created: &k8s_openapi::apimachinery::pkg::apis::meta::v1::Time,
-    bound: chrono::DateTime<chrono::Utc>,
-) -> ClaimBoundOrdering {
-    // Compare as the SAME type: the chrono threshold is parsed into a
-    // jiff Timestamp (both render/parse RFC 3339), so the ordering is
-    // truly chronological — string forms of the two libraries differ and
-    // misorder near-equal times. An unparseable bound proves nothing:
-    // treat it as undecidable (fail closed) rather than as "after".
-    let Ok(threshold) = bound.to_rfc3339().parse::<k8s_openapi::jiff::Timestamp>() else {
-        return ClaimBoundOrdering::SameSecondUnresolved;
-    };
-    if created.0 > threshold {
-        ClaimBoundOrdering::AfterBound
-    } else if created.0 < threshold {
-        ClaimBoundOrdering::BeforeBound
-    } else {
-        ClaimBoundOrdering::SameSecondUnresolved
-    }
-}
-
-/// A proven StatefulSet lineage window: server-reported evidence about a
-/// StatefulSet a CAP apply created (or a sweep observed live and deleted).
-/// `created_at` is the sts's own creationTimestamp; `deleted_confirmed_at`
-/// is the time a sweep stamped BEFORE issuing the sts delete (so a crash
-/// between stamp and delete still leaves a CLOSED window behind — an open
-/// one could never be closed again, wedging retry sweeps). `uid` is the
-/// sts's immutable Kubernetes identity.
-#[derive(Debug, Clone)]
-pub(crate) struct StsProvenanceWindow {
-    uid: Option<String>,
-    created_at: chrono::DateTime<chrono::Utc>,
-    deleted_confirmed_at: Option<chrono::DateTime<chrono::Utc>>,
-}
-
 /// Claim-specific lineage verdict for a name-matching PVC.
 #[derive(Debug, PartialEq, Eq)]
 enum ClaimLineage {
-    /// Proven CAP lineage — safe to delete: a controller ownerReference
-    /// pinning a proven sts UID (immutable server identity), or creation
-    /// strictly inside a CLOSED proven window (the exact-name claim was
-    /// created while CAP's sts held the name and before CAP's delete of
-    /// it was issued).
+    /// Proven CAP lineage — safe to delete: the claim carries a StatefulSet
+    /// controller ownerReference pinning the immutable UID of a StatefulSet
+    /// a CAP apply created (a `StsProvenanceWindow`). This is claim-specific,
+    /// NON-temporal evidence — the claim's own declared lifecycle (Kubernetes
+    /// GC deletes it together with that exact set), so sweeping it can never
+    /// hit a claim that does not belong to the workload. Codex P1: creation
+    /// during the StatefulSet's lifetime is NOT ownership proof (a tenant can
+    /// create the predictable ownerless `<vct>-<sts>-<ordinal>` name at any
+    /// moment, including the StatefulSet's birth second or the interval
+    /// before the delete edge is stamped).
     Proven,
-    /// Proven foreign — predates every proven sts birth, or postdates a
-    /// closed window's deletion edge: a tenant's or predecessor's claim
-    /// that CAP's StatefulSets can never have created. Skipped silently.
-    Foreign,
-    /// Cannot be proven either way — RETAINED, and counted as a failure so
-    /// the sweep stays incomplete (same-second edges, open windows, rows
-    /// that reached the sts step without recorded provenance, controller
-    /// references pinning an unknown UID). Fail closed: never delete, and
-    /// never let the caller clear evidence over the retained claim.
+    /// No controller ownerReference pins a proven StatefulSet UID: the claim
+    /// cannot be attributed to this workload's lineage. RETAINED and counted
+    /// as a failure so the sweep stays incomplete (fail closed): a retained
+    /// claim of ANY provenance that keeps the `<vct>-<sts>-<ordinal>` name
+    /// would be silently adopted at its old size — foreign data included —
+    /// by a later resized deployment once the storage guard's evidence were
+    /// cleared over it. Resolution paths: the namespace owner removes the
+    /// claim, or the app is deleted.
     Unproven,
 }
 
-/// Codex P1 (claim-specific provenance): a StatefulSet creation time is
-/// only a LOWER bound on CAP lineage — it is not proof that every later
-/// name-matching claim came from that StatefulSet. After an incomplete
-/// sweep deletes the sts, a tenant can create an ownerless
-/// `<vct>-<sts>-<ordinal>` claim (or park a foreign same-named sts's
-/// claim); a retry sweep must NOT accept "postdates the old bound" as
-/// lineage. Deletion now requires immutable claim-specific evidence:
-/// a controller ownerReference pinning a proven sts UID, or creation
-/// strictly INSIDE a closed window [sts_created_at,
-/// sts_observed_deleted_at] — anything created after the window's
-/// deletion edge is foreign by construction (the name was un-held from
-/// that moment). Same-second boundary cases are UNRESOLVED at Kubernetes'
-/// second-precision timestamps and fail closed.
-fn classify_claim_lineage(
-    created: &k8s_openapi::apimachinery::pkg::apis::meta::v1::Time,
-    controller_ref_uid: Option<&str>,
-    windows: &[StsProvenanceWindow],
-    unproven_sts_step: bool,
-) -> ClaimLineage {
-    // A StatefulSet controller ownerReference is the strongest possible
-    // evidence — but only when the pinned UID is one CAP recorded (the
-    // persisted sts_uid was never loaded for retry sweeps before; a
-    // foreign same-NAMED sts has a different, unknown UID). A ref
-    // pinning an UNKNOWN uid is positive evidence AGAINST this
-    // workload's lineage (a foreign sts held the claim name) — even
-    // inside a temporal window — and fails closed.
-    if let Some(uid) = controller_ref_uid {
-        return if windows.iter().any(|w| w.uid.as_deref() == Some(uid)) {
-            ClaimLineage::Proven
-        } else {
-            ClaimLineage::Unproven
-        };
-    }
-    let mut covered_by_open_window = unproven_sts_step;
-    for w in windows {
-        match classify_claim_creation(created, w.created_at) {
-            // Same second as the sts's birth: the controller's own claim
-            // and a tenant's race are indistinguishable — fail closed.
-            ClaimBoundOrdering::SameSecondUnresolved => return ClaimLineage::Unproven,
-            // Predates this sts: this window says nothing about the claim.
-            ClaimBoundOrdering::BeforeBound => continue,
-            ClaimBoundOrdering::AfterBound => match w.deleted_confirmed_at {
-                // Closed window, strictly before its deletion edge: the
-                // claim was created while CAP's sts provably held this
-                // exact claim name.
-                Some(deleted_at) => match classify_claim_creation(created, deleted_at) {
-                    ClaimBoundOrdering::BeforeBound => return ClaimLineage::Proven,
-                    ClaimBoundOrdering::SameSecondUnresolved => return ClaimLineage::Unproven,
-                    // Created after the delete was issued: the name was
-                    // no longer held by CAP — foreign unless another
-                    // window covers it.
-                    ClaimBoundOrdering::AfterBound => continue,
-                },
-                // Open window (sts proven created, deletion never stamped):
-                // no upper bound exists — an "after the lower bound" claim
-                // is exactly the attacker shape. Fail closed.
-                None => covered_by_open_window = true,
-            },
+/// A proven StatefulSet lineage record: the immutable Kubernetes identity
+/// (`uid`) of a StatefulSet a CAP apply created — persisted from the apply
+/// response, or observed live by a sweep before it deleted the set. This is
+/// the identity claim ownerReferences are matched against; the recorded
+/// creation/deletion timestamps remain in the database for observability
+/// but (Codex P1) never authorize deletion.
+#[derive(Debug, Clone)]
+pub(crate) struct StsProvenanceWindow {
+    uid: Option<String>,
+}
+
+/// VCT names the CAP manifest renders (`manifest::volumes`): the sweep's
+/// claim-name shape and the controller's claim set are these two templates.
+const CAP_VCT_NAMES: [&str; 2] = ["state", "tls-state"];
+
+/// How the upstream StatefulSet controller treats a claim's
+/// ownerReferences (`isClaimOwnerUpToDate` /
+/// `updateClaimOwnerRefForSetAndPod`): it rewrites only claims that carry
+/// no stale same-name StatefulSet reference and no foreign controller
+/// reference — everything else it leaves untouched. The sweep waits for
+/// this reconciliation after arming `whenDeleted: Delete`, so a claim that
+/// still carries no ownerReference afterwards is positive evidence the
+/// controller does NOT manage it.
+#[derive(Debug, PartialEq, Eq)]
+enum ClaimRefState {
+    /// The claim carries a controller ownerReference pinning exactly this
+    /// StatefulSet's UID — the controller adopted it into this workload.
+    Reconciled,
+    /// The claim carries references the controller will never rewrite (a
+    /// stale same-name StatefulSet ref, or a controller ref owned by any
+    /// other object): it sits outside this workload's claim management.
+    Unmanageable,
+    /// Nothing disqualifying: while the set lives under
+    /// `whenDeleted: Delete` the controller will attach the set's
+    /// controller ref to it.
+    Manageable,
+}
+
+/// Classify a name-matching claim against the StatefulSet whose claims the
+/// sweep manages, mirroring the upstream controller's ref-reconciliation
+/// rules.
+fn claim_ref_state(
+    claim: &k8s_openapi::api::core::v1::PersistentVolumeClaim,
+    statefulset: &str,
+    sts_uid: &str,
+) -> ClaimRefState {
+    let owners = claim.metadata.owner_references.as_deref().unwrap_or(&[]);
+    for owner in owners {
+        let ours = owner.kind == "StatefulSet" && owner.name == statefulset;
+        if ours && owner.uid == sts_uid && owner.controller == Some(true) {
+            return ClaimRefState::Reconciled;
         }
     }
-    if covered_by_open_window {
-        ClaimLineage::Unproven
-    } else {
-        ClaimLineage::Foreign
+    for owner in owners {
+        let ours = owner.kind == "StatefulSet" && owner.name == statefulset;
+        let our_pod = owner.kind == "Pod" && owner.name.starts_with(&format!("{statefulset}-"));
+        if ours && owner.uid != sts_uid {
+            // Stale same-name reference (a deleted predecessor set): the
+            // controller never rewrites these claims.
+            return ClaimRefState::Unmanageable;
+        }
+        if owner.controller == Some(true) && !ours && !our_pod {
+            // A controller ref owned by anything else — never rewritten.
+            return ClaimRefState::Unmanageable;
+        }
+    }
+    // No disqualifying references (possibly a non-controller ref to our set
+    // or pod, which upstream scrubs and fixes): keep waiting for reconcile.
+    ClaimRefState::Manageable
+}
+
+/// Codex P1 (non-temporal claim ownership): deletion authority for a PVC is
+/// its claim-specific, UID-pinned StatefulSet controller ownerReference —
+/// the claim's own declared lifecycle (Kubernetes GC deletes it with that
+/// set). Creation timestamps are NOT ownership proof, so temporal windows
+/// no longer authorize deletion at all; the recorded windows only say
+/// WHICH StatefulSet UIDs are proven CAP lineage for the ownerReference
+/// match. A ref pinning an unknown UID is positive evidence against this
+/// workload's lineage (a foreign same-named set's claim) and fails closed,
+/// exactly like a missing ref.
+fn classify_claim_lineage(
+    controller_ref_uid: Option<&str>,
+    windows: &[StsProvenanceWindow],
+) -> ClaimLineage {
+    match controller_ref_uid {
+        Some(uid) if windows.iter().any(|w| w.uid.as_deref() == Some(uid)) => ClaimLineage::Proven,
+        _ => ClaimLineage::Unproven,
+    }
+}
+
+/// Bounded window for the StatefulSet controller to reconcile claim
+/// ownerReferences after the retention-policy flip, and the poll interval
+/// while waiting. The flip is an ordinary mutable-field patch; the
+/// controller's sync period is sub-second, so a healthy controller
+/// converges well inside the wait. The wait is best-effort latency
+/// padding only — deletion authority comes from the refs themselves, and
+/// claims still unreferenced after the wait are simply retained.
+const CLAIM_REF_RECONCILE_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+const CLAIM_REF_RECONCILE_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Arm claim-deletion authority before a StatefulSet delete: flip the
+/// claim-retention policy to `whenDeleted: Delete` (a mutable field —
+/// `spec.volumeClaimTemplates` is immutable, so VCT-stamped markers are not
+/// available) and wait for the controller to reconcile the set's
+/// controller ownerReference onto the claims it manages. Only after this
+/// do claims carry the UID-pinned proof `classify_claim_lineage` requires.
+/// Returns false when the flip itself failed — the caller must then leave
+/// the StatefulSet live (deleting it would orphan its claims with no proof
+/// left to sweep them) and let a later retry re-arm.
+async fn arm_claim_owner_refs(
+    client: &kube::Client,
+    namespace: &str,
+    statefulset: &str,
+    sts_uid: &str,
+    sweep_deadline: tokio::time::Instant,
+) -> bool {
+    let sts_api: kube::Api<kube::api::DynamicObject> = kube::Api::namespaced_with(
+        client.clone(),
+        namespace,
+        &sweep_api_resource("StatefulSet"),
+    );
+    let flip = serde_json::json!({
+        "spec": { "persistentVolumeClaimRetentionPolicy": { "whenDeleted": "Delete" } }
+    });
+    if let Err(error) = bounded_sweep_read(
+        sweep_deadline,
+        sts_api.patch(
+            statefulset,
+            &kube::api::PatchParams::default(),
+            &kube::api::Patch::Merge(flip),
+        ),
+    )
+    .await
+    {
+        tracing::warn!(
+            namespace = %namespace,
+            statefulset = %statefulset,
+            error = %error,
+            "adopted-namespace sweep could not arm claim ownerReferences (retention-policy flip failed); leaving the StatefulSet for a retry"
+        );
+        return false;
+    }
+    let claims_api: kube::Api<k8s_openapi::api::core::v1::PersistentVolumeClaim> =
+        kube::Api::namespaced(client.clone(), namespace);
+    let wait_deadline =
+        (tokio::time::Instant::now() + CLAIM_REF_RECONCILE_WAIT).min(sweep_deadline);
+    loop {
+        let list = match bounded_sweep_read(
+            wait_deadline,
+            claims_api.list(&kube::api::ListParams::default()),
+        )
+        .await
+        {
+            Ok(list) => list,
+            Err(error) => {
+                tracing::warn!(
+                    namespace = %namespace,
+                    statefulset = %statefulset,
+                    error = %error,
+                    "adopted-namespace sweep cannot observe claim ownerReference reconciliation"
+                );
+                return false;
+            }
+        };
+        let mut pending = 0usize;
+        for claim in &list.items {
+            let Some(name) = claim.metadata.name.as_deref() else {
+                continue;
+            };
+            if !is_cap_claim_name(name, statefulset, &CAP_VCT_NAMES) {
+                continue;
+            }
+            if claim_ref_state(claim, statefulset, sts_uid) == ClaimRefState::Manageable {
+                pending += 1;
+            }
+        }
+        if pending == 0 {
+            return true;
+        }
+        if tokio::time::Instant::now() >= wait_deadline {
+            tracing::warn!(
+                namespace = %namespace,
+                statefulset = %statefulset,
+                pending,
+                "StatefulSet controller did not reconcile claim ownerReferences in time; unreferenced claims will be retained by the sweep"
+            );
+            return true;
+        }
+        tokio::time::sleep(CLAIM_REF_RECONCILE_POLL).await;
     }
 }
 
 /// Delete the PVCs this failed generation's StatefulSet created in an
-/// adopted namespace. A claim is deleted only on CLAIM-SPECIFIC evidence
-/// of CAP lineage (Codex P1 — see `classify_claim_lineage`):
+/// adopted namespace. A claim is deleted ONLY on claim-specific,
+/// non-temporal proof of CAP lineage (Codex P1 — see
+/// `classify_claim_lineage`): a controller ownerReference pinning the
+/// immutable UID of a proven CAP StatefulSet. Creation timestamps never
+/// authorize deletion — a tenant can create the predictable ownerless
+/// `<vct>-<sts>-<ordinal>` name at any moment (including the
+/// StatefulSet's birth second or the interval before a deletion edge is
+/// recorded), and a StatefulSet does not reserve that name.
 ///
-/// * its name matches the exact `<vct>-<statefulset>-<ordinal>` shape for
-///   a CAP-rendered VCT name, AND
-/// * it carries a controller ownerReference pinning a proven sts UID, OR
-///   was created strictly inside a CLOSED proven window
-///   [sts_created_at, sts_observed_deleted_at] — the live sts's own
-///   window when this sweep deleted it (deleted edge = the pre-delete
-///   stamp), else the durable recorded windows of this row and its
-///   still-incomplete siblings for a retry sweep after the sts is gone.
+/// Claims without that proof are RETAINED and counted as failures so the
+/// sweep reports INCOMPLETE (non-zero) while they remain — reporting zero
+/// would let the caller clear manifest evidence over retained claims,
+/// allowing a later resized deployment to silently adopt them at their
+/// old size. The proof is normally present: before deleting the
+/// StatefulSet the sweep arms `whenDeleted: Delete` and waits for the
+/// controller to reconcile the set's ownerReference onto the claims it
+/// manages (see `arm_claim_owner_refs`).
 ///
-/// When the StatefulSet is absent and NO proven window exists, matching
-/// claims cannot be proven either way: none are touched, but the sweep
-/// reports INCOMPLETE (non-zero) as long as name-matching claims remain —
-/// reporting zero would let the caller clear manifest evidence over
-/// unproven, retained claims (Codex P2 / devin). With no matching claims
-/// there is nothing to converge and the sweep is complete.
-///
-/// PVCs created by the controller from `spec.volumeClaimTemplates` never
-/// carry CAP annotations (VCT metadata is immutable — adding the
-/// annotation would break every redeploy of an existing StatefulSet with
-/// 422), and under the default Retain/Retain policy the controller
-/// attaches no PVC ownerReferences either, so closed lineage windows are
-/// the sound discriminator for controller-created claims and UID-pinned
-/// ownerReferences the hard proof when one is present.
+/// When the StatefulSet is absent and NO proven lineage record exists
+/// AND no row in scope ever reached the StatefulSet step, no CAP
+/// lineage could have created a claim at all (devin: pre-StatefulSet
+/// cleanup) — matching claims are then provably pre-existing and the
+/// sweep is complete without touching them. If some row DID reach the
+/// StatefulSet step without recording provenance, claims are unprovable
+/// and the sweep fails closed (non-zero) as long as name-matching
+/// claims remain.
 pub(crate) async fn sweep_statefulset_pvcs(
     client: &kube::Client,
     namespace: &str,
@@ -852,7 +1025,6 @@ pub(crate) async fn sweep_statefulset_pvcs(
     sts_live_window: Option<StsProvenanceWindow>,
     unproven_sts_step: bool,
 ) -> usize {
-    const CAP_VCT_NAMES: [&str; 2] = ["state", "tls-state"];
     let mut all_windows: Vec<_> = sts_proven_windows.to_vec();
     if let Some(live) = sts_live_window {
         all_windows.push(live);
@@ -874,10 +1046,8 @@ pub(crate) async fn sweep_statefulset_pvcs(
         }
     };
     // Inspect only name-matching claims, and decide the no-window outcome
-    // from what is actually retained rather than up front: an empty
-    // match set is a complete sweep even with no provenance, while any
-    // retained matching claim without a proven window keeps the sweep
-    // incomplete (retryable) instead of silently complete.
+    // from what is actually retained rather than up front: an empty match
+    // set is a complete sweep even with no provenance.
     let matching_claims: Vec<_> = list
         .items
         .into_iter()
@@ -892,27 +1062,40 @@ pub(crate) async fn sweep_statefulset_pvcs(
         return 0;
     }
     if all_windows.is_empty() {
-        // Codex P2 / devin: matching claims are retained but NO proven
-        // StatefulSet lineage window exists (e.g. a previous sweep
-        // deleted the sts and its best-effort provenance write failed).
-        // Touch nothing, but do NOT report the sweep complete: returning
-        // zero here would let the caller clear manifest_hash and the
-        // cleanup marker over claims that were never inspected, leaving
-        // them silently reusable by a later resized deployment.
+        if !unproven_sts_step {
+            // devin (pre-StatefulSet cleanup): no row in scope ever
+            // reached the StatefulSet step and no lineage record exists,
+            // so NO CAP apply could have created a claim — matching
+            // claims are provably pre-existing tenant objects. Touch
+            // nothing and report the sweep complete: the deployment
+            // never rendered workloads, so there is no retained CAP
+            // state the storage guard would be protecting.
+            tracing::info!(
+                namespace = %namespace,
+                statefulset = %statefulset,
+                claims = matching_claims.len(),
+                "adopted-namespace PVC sweep sees only pre-existing claims (no row reached the StatefulSet step); nothing to converge"
+            );
+            return 0;
+        }
+        // Some row reached the StatefulSet step without recording
+        // provenance (e.g. a previous sweep deleted the sts and its
+        // provenance write failed): claims are unprovable. Touch
+        // nothing, but do NOT report the sweep complete: returning zero
+        // here would let the caller clear manifest_hash and the cleanup
+        // marker over claims that were never inspected, leaving them
+        // silently reusable by a later resized deployment.
         tracing::warn!(
             namespace = %namespace,
             statefulset = %statefulset,
             claims = matching_claims.len(),
-            "adopted-namespace PVC sweep retains name-matching claims with no proven StatefulSet lineage window; counting the sweep incomplete for retry"
+            "adopted-namespace PVC sweep retains name-matching claims with no proven StatefulSet lineage record; counting the sweep incomplete for retry"
         );
         return 1;
     }
     let mut failures = 0usize;
     for pvc in matching_claims {
         let Some(name) = pvc.metadata.name.clone() else {
-            continue;
-        };
-        let Some(created) = pvc.metadata.creation_timestamp.as_ref() else {
             continue;
         };
         let controller_ref_uid = pvc
@@ -925,37 +1108,19 @@ pub(crate) async fn sweep_statefulset_pvcs(
                     .find(|owner| owner.kind == "StatefulSet" && owner.controller == Some(true))
             })
             .map(|owner| owner.uid.clone());
-        match classify_claim_lineage(
-            created,
-            controller_ref_uid.as_deref(),
-            &all_windows,
-            unproven_sts_step,
-        ) {
+        match classify_claim_lineage(controller_ref_uid.as_deref(), &all_windows) {
             ClaimLineage::Proven => {}
-            ClaimLineage::Foreign => {
-                // Count this as a failure: a foreign claim means the sweep
-                // cannot prove the namespace is clean of tenant data. A tenant
-                // could have created a same-named claim after CAP's STS was
-                // deleted, and clearing evidence would let a later deployment
-                // resize into that tenant claim. Retain evidence and keep the
-                // row retryable so a future sweep can re-inspect.
-                tracing::warn!(
-                    namespace = %namespace,
-                    pvc = %name,
-                    "adopted-namespace PVC sweep counts foreign claim as failure; evidence retained for retry"
-                );
-                failures += 1;
-                continue;
-            }
             ClaimLineage::Unproven => {
                 // Retain the claim and count a failure so the sweep
-                // stays INCOMPLETE: the skip must not let the caller
-                // clear manifest_hash / the cleanup marker while the
-                // claim remains (the silent-reuse hazard).
+                // stays INCOMPLETE: skipping it silently would let the
+                // caller clear manifest_hash / the cleanup marker while
+                // the claim remains (the silent-reuse hazard: a later
+                // resized deployment would adopt it at its old size).
                 tracing::warn!(
                     namespace = %namespace,
                     pvc = %name,
-                    "adopted-namespace PVC sweep cannot prove claim lineage from claim-specific evidence; retaining the claim and counting the sweep incomplete"
+                    controller_ref = ?controller_ref_uid,
+                    "adopted-namespace PVC sweep cannot prove claim lineage from a UID-pinned StatefulSet ownerReference; retaining the claim and counting the sweep incomplete"
                 );
                 failures += 1;
                 continue;
@@ -2925,50 +3090,131 @@ mod tests {
         ));
     }
 
-    fn k8s_time(rfc3339: &str) -> k8s_openapi::apimachinery::pkg::apis::meta::v1::Time {
-        rfc3339
-            .parse::<k8s_openapi::jiff::Timestamp>()
-            .map(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time)
-            .unwrap_or_else(|_| panic!("parse {rfc3339} as jiff Timestamp"))
+    /// Codex P1 (non-temporal claim ownership): deletion authority is the
+    /// claim-specific, UID-pinned StatefulSet controller ownerReference —
+    /// the claim's own declared lifecycle (Kubernetes GC deletes it with
+    /// exactly that set). Creation timestamps never prove ownership: a
+    /// tenant can create the predictable ownerless name at any moment,
+    /// including the StatefulSet's birth second or the interval before a
+    /// deletion edge is recorded.
+    #[test]
+    fn claim_lineage_requires_uid_pinned_controller_ref() {
+        let window = provenance_window(Some("uid-cap-1"));
+        // The controller's own claim: ref pins a proven UID — hard proof.
+        assert_eq!(
+            classify_claim_lineage(Some("uid-cap-1"), std::slice::from_ref(&window)),
+            ClaimLineage::Proven
+        );
+        // A foreign same-named set's claim: ref pins an UNKNOWN uid —
+        // positive evidence against this workload's lineage. Never delete.
+        assert_eq!(
+            classify_claim_lineage(Some("uid-foreign-sts"), std::slice::from_ref(&window)),
+            ClaimLineage::Unproven
+        );
+        // No ref at all (the Retain/Retain era, or a tenant's ownerless
+        // claim): unprovable — retained, sweep stays incomplete.
+        assert_eq!(
+            classify_claim_lineage(None, std::slice::from_ref(&window)),
+            ClaimLineage::Unproven
+        );
+        // Ref to a proven UID but no lineage record in scope (e.g. the
+        // provenance write was lost): fail closed.
+        assert_eq!(
+            classify_claim_lineage(Some("uid-cap-1"), &[]),
+            ClaimLineage::Unproven
+        );
+        // Sibling generation's proven UID counts (converging older
+        // incomplete siblings' claims under the same ref proof).
+        let sibling = provenance_window(Some("uid-cap-0"));
+        assert_eq!(
+            classify_claim_lineage(Some("uid-cap-0"), &[window, sibling]),
+            ClaimLineage::Proven
+        );
     }
 
-    /// Codex P1 (same-second PVC claims): metav1.Time is second-precision,
-    /// and the StatefulSet controller routinely creates the ordinal claims
-    /// in the same second as the StatefulSet itself. A strict `>` rejects
-    /// those claims AND (worse) lets the sweep complete while they remain.
-    /// The classifier must treat equality as UNRESOLVED and before as
-    /// foreign; only strictly-after claims are sweep-eligible.
+    /// Codex P1: `arm_claim_owner_refs` mirrors the upstream controller's
+    /// ref-reconciliation rules (`isClaimOwnerUpToDate` /
+    /// `updateClaimOwnerRefForSetAndPod`) when waiting for ownerReference
+    /// convergence before the StatefulSet delete.
     #[test]
-    fn claim_creation_classification_is_three_way_at_second_precision() {
-        let bound = chrono::DateTime::parse_from_rfc3339("2026-10-14T10:00:04Z")
-            .expect("parse bound")
-            .with_timezone(&chrono::Utc);
-        // Strictly after: the controller's claim in a later second.
+    fn claim_ref_state_mirrors_controller_rewrite_rules() {
+        use k8s_openapi::api::core::v1::PersistentVolumeClaim;
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
+
+        let pvc = |owners: Vec<OwnerReference>| PersistentVolumeClaim {
+            metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+                name: Some("state-app-0".to_string()),
+                owner_references: if owners.is_empty() {
+                    None
+                } else {
+                    Some(owners)
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let owner = |kind: &str, name: &str, uid: &str, controller: bool| OwnerReference {
+            api_version: "apps/v1".to_string(),
+            kind: kind.to_string(),
+            name: name.to_string(),
+            uid: uid.to_string(),
+            controller: Some(controller),
+            block_owner_deletion: None,
+        };
+
+        // No refs at all: the controller adopts it while the set lives
+        // under whenDeleted: Delete — keep waiting.
         assert_eq!(
-            classify_claim_creation(&k8s_time("2026-10-14T10:00:05Z"), bound),
-            ClaimBoundOrdering::AfterBound
+            claim_ref_state(&pvc(vec![]), "app", "uid-cap-1"),
+            ClaimRefState::Manageable
         );
-        // SAME second as the bound: undecidable at Kubernetes precision —
-        // the exact case the strict `>` misclassified as "too old" while
-        // still letting the sweep complete over the retained claim.
+        // Controller ref pinning exactly our set's UID: done.
         assert_eq!(
-            classify_claim_creation(&k8s_time("2026-10-14T10:00:04Z"), bound),
-            ClaimBoundOrdering::SameSecondUnresolved
+            claim_ref_state(
+                &pvc(vec![owner("StatefulSet", "app", "uid-cap-1", true)]),
+                "app",
+                "uid-cap-1"
+            ),
+            ClaimRefState::Reconciled
         );
-        // Strictly before: a tenant's or predecessor's claim.
+        // Stale same-name ref to a deleted predecessor set: never
+        // rewritten — outside our management.
         assert_eq!(
-            classify_claim_creation(&k8s_time("2026-10-14T10:00:03Z"), bound),
-            ClaimBoundOrdering::BeforeBound
+            claim_ref_state(
+                &pvc(vec![owner("StatefulSet", "app", "uid-old", true)]),
+                "app",
+                "uid-cap-1"
+            ),
+            ClaimRefState::Unmanageable
         );
-        // Cross-second-boundary sanity: instants, not string prefixes.
+        // Controller ref owned by a foreign object: never rewritten.
         assert_eq!(
-            classify_claim_creation(&k8s_time("2026-10-14T09:59:59Z"), bound),
-            ClaimBoundOrdering::BeforeBound
+            claim_ref_state(
+                &pvc(vec![owner("StatefulSet", "other", "uid-x", true)]),
+                "app",
+                "uid-cap-1"
+            ),
+            ClaimRefState::Unmanageable
         );
+        // Non-controller ref to our set: upstream scrubs and fixes it —
+        // still manageable.
         assert_eq!(
-            classify_claim_creation(&k8s_time("2026-10-14T10:00:04.500Z"), bound),
-            ClaimBoundOrdering::AfterBound,
-            "a sub-second claim after the second-bound is strictly after as an instant"
+            claim_ref_state(
+                &pvc(vec![owner("StatefulSet", "app", "uid-cap-1", false)]),
+                "app",
+                "uid-cap-1"
+            ),
+            ClaimRefState::Manageable
+        );
+        // Pod controller ref (whenScaled=Delete era): upstream scrubs and
+        // sets the set ref — manageable.
+        assert_eq!(
+            claim_ref_state(
+                &pvc(vec![owner("Pod", "app-0", "uid-pod", true)]),
+                "app",
+                "uid-cap-1"
+            ),
+            ClaimRefState::Manageable
         );
     }
 
@@ -3007,166 +3253,10 @@ mod tests {
             .with_timezone(&chrono::Utc)
     }
 
-    fn provenance_window(
-        uid: Option<&str>,
-        created: &str,
-        deleted: Option<&str>,
-    ) -> StsProvenanceWindow {
+    fn provenance_window(uid: Option<&str>) -> StsProvenanceWindow {
         StsProvenanceWindow {
             uid: uid.map(str::to_string),
-            created_at: chrono_time(created),
-            deleted_confirmed_at: deleted.map(chrono_time),
         }
-    }
-
-    /// Codex P1 (claim-specific provenance): "created after the sts's
-    /// creation time" is only a lower bound, never proof of CAP lineage.
-    /// After an incomplete sweep deletes the sts, a tenant can create an
-    /// ownerless matching claim (or park a foreign same-named sts's
-    /// claim); the retry sweep must not delete either. Deletion requires
-    /// immutable claim-specific evidence: a UID-pinned controller ref, or
-    /// creation strictly INSIDE a closed window.
-    #[test]
-    fn claim_lineage_requires_claim_specific_provenance() {
-        let closed = provenance_window(
-            Some("uid-cap-1"),
-            "2026-10-14T10:00:04Z",
-            Some("2026-10-14T10:05:00Z"),
-        );
-        // Controller's own claim inside the closed window: proven.
-        assert_eq!(
-            classify_claim_lineage(
-                &k8s_time("2026-10-14T10:00:05Z"),
-                None,
-                std::slice::from_ref(&closed),
-                false,
-            ),
-            ClaimLineage::Proven
-        );
-        // Tenant claim created AFTER the sweep deleted the sts: the exact
-        // attack — postdates the old lower bound, but the name was no
-        // longer held by CAP. Foreign, never deleted.
-        assert_eq!(
-            classify_claim_lineage(
-                &k8s_time("2026-10-14T11:00:00Z"),
-                None,
-                std::slice::from_ref(&closed),
-                false,
-            ),
-            ClaimLineage::Foreign
-        );
-        // Foreign same-named sts's claim: controller ref pinning an
-        // UNKNOWN uid — postdates the bound but is not CAP lineage.
-        assert_eq!(
-            classify_claim_lineage(
-                &k8s_time("2026-10-14T10:00:05Z"),
-                Some("uid-foreign-sts"),
-                std::slice::from_ref(&closed),
-                false,
-            ),
-            ClaimLineage::Unproven
-        );
-        // Same evidence, ref pinning the PROVEN uid: hard proof.
-        assert_eq!(
-            classify_claim_lineage(
-                &k8s_time("2026-10-14T11:00:00Z"),
-                Some("uid-cap-1"),
-                std::slice::from_ref(&closed),
-                false,
-            ),
-            ClaimLineage::Proven
-        );
-        // OPEN window (deletion never stamped — best-effort write lost):
-        // an after-birth claim cannot be proven and must fail closed.
-        let open = provenance_window(Some("uid-cap-1"), "2026-10-14T10:00:04Z", None);
-        assert_eq!(
-            classify_claim_lineage(
-                &k8s_time("2026-10-14T10:00:05Z"),
-                None,
-                std::slice::from_ref(&open),
-                false,
-            ),
-            ClaimLineage::Unproven
-        );
-        // OPEN window, but a UID-pinned controller ref still proves it.
-        assert_eq!(
-            classify_claim_lineage(
-                &k8s_time("2026-10-14T10:00:05Z"),
-                Some("uid-cap-1"),
-                std::slice::from_ref(&open),
-                false,
-            ),
-            ClaimLineage::Proven
-        );
-        // Claim predating every proven sts birth: foreign (tenant's or
-        // predecessor's), skipped silently.
-        assert_eq!(
-            classify_claim_lineage(
-                &k8s_time("2026-10-14T09:00:00Z"),
-                None,
-                std::slice::from_ref(&closed),
-                false,
-            ),
-            ClaimLineage::Foreign
-        );
-        // Same-second edges at both window boundaries stay unresolved.
-        assert_eq!(
-            classify_claim_lineage(
-                &k8s_time("2026-10-14T10:00:04Z"),
-                None,
-                std::slice::from_ref(&closed),
-                false,
-            ),
-            ClaimLineage::Unproven
-        );
-        assert_eq!(
-            classify_claim_lineage(
-                &k8s_time("2026-10-14T10:05:00Z"),
-                None,
-                std::slice::from_ref(&closed),
-                false,
-            ),
-            ClaimLineage::Unproven
-        );
-        // A sibling generation's window covers a claim this row's window
-        // does not (converging older incomplete siblings' claims).
-        let sibling = provenance_window(
-            Some("uid-cap-0"),
-            "2026-10-14T09:30:00Z",
-            Some("2026-10-14T09:35:00Z"),
-        );
-        assert_eq!(
-            classify_claim_lineage(
-                &k8s_time("2026-10-14T09:30:30Z"),
-                None,
-                &[closed.clone(), sibling],
-                false,
-            ),
-            ClaimLineage::Proven
-        );
-        // A row that reached the sts step but recorded no provenance: its
-        // claims could exist anywhere after that step, so an OUT-of-window
-        // claim is unprovable — fail closed, not foreign.
-        assert_eq!(
-            classify_claim_lineage(
-                &k8s_time("2026-10-14T11:00:00Z"),
-                None,
-                std::slice::from_ref(&closed),
-                true,
-            ),
-            ClaimLineage::Unproven
-        );
-        // Same flag, but the claim sits INSIDE a proven closed window:
-        // the window's evidence decides — proven.
-        assert_eq!(
-            classify_claim_lineage(
-                &k8s_time("2026-10-14T10:00:05Z"),
-                None,
-                std::slice::from_ref(&closed),
-                true,
-            ),
-            ClaimLineage::Proven
-        );
     }
 
     #[test]

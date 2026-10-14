@@ -102,7 +102,18 @@ pub async fn apply_namespace(
                 };
                 match super::bounded_kube_write(api.create(&post_params, &manifest)).await {
                     Ok(created) => {
-                        verify_creation_stamp(&created, generation)?;
+                        // Codex P2 (compensating create): the POST already
+                        // created the namespace — if a mutating admission
+                        // policy dropped or rewrote the creation
+                        // annotations, compensate the exact UID the
+                        // response identified before failing closed, or a
+                        // CAP-created namespace survives without valid
+                        // creation evidence and is then never cleaned up.
+                        if let Err(verify_error) = verify_creation_stamp(&created, generation) {
+                            super::generation::compensate_created_object(&api, name, &created)
+                                .await;
+                            return Err(verify_error);
+                        }
                         tracing::info!(namespace = %name, created = true, "namespace created via POST");
                         return Ok(created);
                     }

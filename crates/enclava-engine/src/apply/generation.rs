@@ -48,6 +48,50 @@ fn conflict_retry_delay(attempt: usize) -> Duration {
     Duration::from_millis((25 * (1 << attempt.min(5))).min(1000))
 }
 
+/// Codex P2 (compensating create): a successful POST has ALREADY created the
+/// object by the time post-create verification runs. If a mutating admission
+/// policy dropped or rewrote the creation annotation, failing closed without
+/// compensation leaves the object behind with no valid creation evidence:
+/// failed-apply cleanup then classifies it as adopted/foreign and never
+/// deletes it (in an adopted namespace it can survive as a live StatefulSet
+/// or registry Secret indefinitely). Compensate the EXACT object the POST
+/// response identified — a UID-preconditioned DELETE can never hit a
+/// same-named replacement — before propagating the verification error.
+pub(super) async fn compensate_created_object<K>(api: &Api<K>, name: &str, created: &K)
+where
+    K: Resource + Clone + Debug + DeserializeOwned,
+{
+    let uid = created.meta().uid.clone();
+    for attempt in 0..3 {
+        let params = DeleteParams {
+            preconditions: Some(Preconditions {
+                uid: uid.clone(),
+                resource_version: None,
+            }),
+            ..DeleteParams::default()
+        };
+        match api.delete(name, &params).await {
+            Ok(_) => return,
+            Err(kube::Error::Api(error)) if error.code == 404 => return,
+            Err(error) => {
+                tracing::warn!(
+                    kind = kind::<K>(),
+                    name,
+                    attempt,
+                    error = %error,
+                    "compensating delete of a just-created object failed; retrying"
+                );
+                tokio::time::sleep(conflict_retry_delay(attempt)).await;
+            }
+        }
+    }
+    tracing::error!(
+        kind = kind::<K>(),
+        name,
+        "compensating delete failed; the object may remain without valid creation evidence"
+    );
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct MutationGeneration(i64);
 
@@ -587,11 +631,16 @@ where
             annotate_created(&mut desired, generation);
             match super::bounded_kube_write(api.create(&post_params, &desired)).await {
                 Ok(applied) => {
-                    verify_applied_generation(&applied, generation)?;
                     // An admission rewrite that drops the creation evidence
                     // would leave the created object forever unsweepable in
-                    // an adopted namespace: fail closed instead.
-                    verify_creation_evidence(&applied, generation)?;
+                    // an adopted namespace: fail closed — but Codex P2 says
+                    // COMPENSATE first, the POST already created it.
+                    if let Err(verify_error) = verify_applied_generation(&applied, generation)
+                        .and_then(|()| verify_creation_evidence(&applied, generation))
+                    {
+                        compensate_created_object(api, name, &applied).await;
+                        return Err(verify_error);
+                    }
                     return Ok(applied);
                 }
                 Err(ApplyError::Kube(kube::Error::Api(error))) if error.code == 409 => {

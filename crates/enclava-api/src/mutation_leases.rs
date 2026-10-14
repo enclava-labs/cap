@@ -1101,6 +1101,12 @@ pub async fn release_retained_deployment_namespace_fences(
     release_retained_deployment_namespace_fences_with(pool, client).await
 }
 
+/// Expired retained namespace fences to probe this pass. `ORDER BY
+/// random()` ROTATES the candidate order between passes (Codex P2): with a
+/// bounded-concurrency batch under a shared deadline, a slow prefix
+/// returned in a stable order would starve every later fence of a real
+/// probe budget indefinitely (PostgreSQL is free to return the same slow
+/// rows first on every pass without an explicit order).
 async fn select_expired_retained_namespace_fences(
     pool: &PgPool,
 ) -> Result<Vec<(Uuid, String, Uuid, i64)>, MutationLeaseError> {
@@ -1110,7 +1116,8 @@ async fn select_expired_retained_namespace_fences(
           WHERE resource.resource_scope = 'kubernetes_namespace'
             AND resource.operation_kind = $1
             AND resource.reclaim_after = 'infinity'::timestamptz
-            AND resource.locked_until <= clock_timestamp()",
+            AND resource.locked_until <= clock_timestamp()
+          ORDER BY random()",
     )
     .bind(RETAINED_DEPLOYMENT_NAMESPACE_OPERATION)
     .fetch_all(pool)

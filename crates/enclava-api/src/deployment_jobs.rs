@@ -2475,22 +2475,58 @@ async fn fail_apply_job_with_mutation(
         && retain_namespace_fence
         && let Some(mutation) = mutation.as_mut()
     {
-        match mutation
-            .retain_resource_scope_under_marker(
-                "kubernetes_namespace",
-                crate::mutation_leases::RETAINED_DEPLOYMENT_NAMESPACE_OPERATION,
-            )
-            .await
-        {
-            Ok(()) => {
-                retain_marker_persisted = true;
-            }
-            Err(retain_error) => {
-                tracing::error!(
-                    deployment_id = %job.deployment_id,
-                    error_code = DeploymentJobError::from(retain_error).code(),
-                    "failed to retain the namespace fence after incomplete teardown; falling back to bounded quarantine"
-                );
+        // Codex P1: the retained marker is the ONLY durable distinction
+        // between this intentional infinite retain and a crashed worker's
+        // pre-armed fence (which
+        // `reconcile_orphaned_deployment_apply_leases` repairs into the
+        // bounded 360 s reclaim window). Losing it to a transient database
+        // error would silently convert the pre-armed infinite namespace
+        // fence into finite quarantine while the namespace DELETE is still
+        // in flight — a finalizer-stuck deletion can outlive that window
+        // and another deployment could reclaim the name. Retry the write
+        // before accepting the bounded fallback.
+        let mut retain_attempt = 0usize;
+        loop {
+            match mutation
+                .retain_resource_scope_under_marker(
+                    "kubernetes_namespace",
+                    crate::mutation_leases::RETAINED_DEPLOYMENT_NAMESPACE_OPERATION,
+                )
+                .await
+            {
+                Ok(()) => {
+                    retain_marker_persisted = true;
+                    break;
+                }
+                Err(crate::mutation_leases::MutationLeaseError::Lost) => {
+                    // The lease itself is gone — no retry can help.
+                    tracing::error!(
+                        deployment_id = %job.deployment_id,
+                        "namespace-fence lease lost while persisting the retained marker; falling back to bounded quarantine"
+                    );
+                    break;
+                }
+                Err(retain_error) if retain_attempt < 2 => {
+                    retain_attempt += 1;
+                    tracing::warn!(
+                        deployment_id = %job.deployment_id,
+                        error_code = DeploymentJobError::from(retain_error).code(),
+                        retain_attempt,
+                        "transient failure persisting the retained namespace-fence marker; retrying"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        250 * retain_attempt as u64,
+                    ))
+                    .await;
+                }
+                Err(retain_error) => {
+                    tracing::error!(
+                        deployment_id = %job.deployment_id,
+                        error_code = DeploymentJobError::from(retain_error).code(),
+                        "failed to retain the namespace fence after incomplete teardown despite retries; falling back to bounded quarantine"
+                    );
+                    break;
+                }
             }
         }
     }
