@@ -109,9 +109,9 @@ cargo test -p enclava-init --lib
 ```
 
 LUKS integration tests need root, `/dev/mapper` control, dm-crypt and
-dm-integrity kernel support, `cryptsetup`, and a writable `/run/enclava`.
-They use disposable backing files and random per-test mapper names and close
-their mappings even on failure:
+dm-integrity kernel support, `cryptsetup`, `mkfs.ext4`/`e2fsck`, and a
+writable `/run/enclava`. They use disposable backing files and random
+per-test mapper names and close their mappings even on failure:
 
 ```bash
 sudo cargo test -p enclava-init --features luks-integration

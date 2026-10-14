@@ -712,22 +712,24 @@ mod tests {
     const PAYLOAD: &[u8] = b"enclava-init integrity payload";
 
     /// RAII guard for a device-mapper mapping this test activated; Drop closes
-    /// it even when an assertion panics.
+    /// it even when an assertion panics and warns if cleanup actually fails.
     struct TestMapping {
         name: String,
+        /// False once `close` succeeded, so Drop only reports real leaks.
+        active: bool,
     }
 
     impl TestMapping {
         /// Activate `device` under a fresh random name; never reuse a name so
         /// no test touches mappings owned by anything else.
         fn activate(device: &Path, key: &DerivedSeed) -> Result<Self> {
-            let mapping = Self::random_name();
-            open(device, &mapping, key)?;
-            Ok(Self { name: mapping })
+            let name = Self::random_name();
+            open(device, &name, key)?;
+            Ok(Self { name, active: true })
         }
 
         fn new(name: String) -> Self {
-            Self { name }
+            Self { name, active: true }
         }
 
         fn random_name() -> String {
@@ -738,25 +740,44 @@ mod tests {
             PathBuf::from(format!("/dev/mapper/{}", self.name))
         }
 
-        /// Error-reporting close for mid-test close/reopen flows; Drop still
-        /// retries when this fails or never runs.
-        fn close(&self) -> Result<()> {
-            run_command(
+        /// Error-reporting close for mid-test close/reopen flows; on success
+        /// Drop skips the idempotent retry, on failure Drop still retries.
+        fn close(&mut self) -> Result<()> {
+            let result = run_command(
                 "cryptsetup",
                 &[
                     "--disable-locks".to_string(),
                     "close".to_string(),
                     self.name.clone(),
                 ],
-            )
+            );
+            if result.is_ok() {
+                self.active = false;
+            }
+            result
         }
     }
 
     impl Drop for TestMapping {
         fn drop(&mut self) {
-            let _ = std::process::Command::new("cryptsetup")
+            if !self.active {
+                return;
+            }
+            let output = std::process::Command::new("cryptsetup")
                 .args(["--disable-locks", "close", &self.name])
                 .output();
+            match output {
+                Ok(output) if output.status.success() => {}
+                Ok(output) => eprintln!(
+                    "warning: cryptsetup close {} failed: {}",
+                    self.name,
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+                Err(err) => eprintln!(
+                    "warning: cryptsetup close {} could not run: {err}",
+                    self.name
+                ),
+            }
         }
     }
 
@@ -903,12 +924,14 @@ mod tests {
         ensure_run_dir();
         let key = DerivedSeed([0x11u8; 32]);
 
-        let (_cli_dir, cli_img) = make_backing_file(64)?;
+        // Exact 32 MiB backing exercises the smallest volume the stack must
+        // support: LUKS2 header + integrity metadata + journal + ext4.
+        let (_cli_dir, cli_img) = make_backing_file(32)?;
         format_with_cryptsetup_cli(&cli_img, &key).expect("cli format");
         assert_integrity_header(&cli_img)?;
         integrity_round_trip(&cli_img, &key)?;
 
-        let (_lib_dir, lib_img) = make_backing_file(64)?;
+        let (_lib_dir, lib_img) = make_backing_file(32)?;
         format_with_libcryptsetup(&lib_img, &key).expect("libcryptsetup format");
         assert_integrity_header(&lib_img)?;
         integrity_round_trip(&lib_img, &key)?;
@@ -917,7 +940,7 @@ mod tests {
     }
 
     fn integrity_round_trip(device: &Path, key: &DerivedSeed) -> Result<()> {
-        let mapping = TestMapping::activate(device, key)?;
+        let mut mapping = TestMapping::activate(device, key)?;
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -939,12 +962,25 @@ mod tests {
         drop(file);
         mapping.close()?;
 
-        let reopened = TestMapping::activate(device, key)?;
+        let mut reopened = TestMapping::activate(device, key)?;
         let mut file = File::open(reopened.mapper_path())?;
         let mut buf = [0u8; PAYLOAD.len()];
         file.read_exact(&mut buf)?;
         assert_eq!(&buf[..], PAYLOAD, "payload must survive close and reopen");
-        Ok(())
+        drop(file);
+        // Real consumer flow after the raw round trip: mkfs (which erases the
+        // boot sector holding the payload) must fit inside the integrity data
+        // area and produce a checkable filesystem.
+        mkfs_ext4(&reopened.mapper_path())?;
+        run_command(
+            "e2fsck",
+            &[
+                "-f".to_string(),
+                "-n".to_string(),
+                path_arg(&reopened.mapper_path())?,
+            ],
+        )?;
+        reopened.close()
     }
 
     /// A wrong key must be refused without activating a mapping and without
@@ -957,13 +993,12 @@ mod tests {
 
         let (_dir, img) = make_backing_file(64)?;
         format(&img, &key)?;
-        let mapping = TestMapping::activate(&img, &key)?;
+        let mut mapping = TestMapping::activate(&img, &key)?;
         let mut file = OpenOptions::new().write(true).open(mapping.mapper_path())?;
         file.write_all(PAYLOAD)?;
         file.sync_all()?;
         drop(file);
         mapping.close()?;
-        drop(mapping);
 
         let bad_name = TestMapping::random_name();
         assert!(
@@ -992,7 +1027,7 @@ mod tests {
         let (_dir, img) = make_backing_file(64)?;
         format(&img, &key)?;
 
-        let mapping = TestMapping::activate(&img, &key)?;
+        let mut mapping = TestMapping::activate(&img, &key)?;
         let mut file = File::open(mapping.mapper_path())?;
         let len = file.seek(SeekFrom::End(0))?;
         let tail = len - 4096;
@@ -1002,7 +1037,6 @@ mod tests {
         assert!(buf.iter().all(|b| *b == 0), "tail tags uninitialized");
         drop(file);
         mapping.close()?;
-        drop(mapping);
 
         // The tail sector was never written through the mapper, so no journal
         // entry can replay over the tamper; its tag covers zeros. Locate its
