@@ -177,8 +177,7 @@ fn initialize_integrity_tags(dev: &mut CryptDevice, key: &DerivedSeed) -> Result
         )
         .map_err(|e| InitError::Luks(format!("activate wipe mapper: {e}")))?;
 
-    let result =
-        write_zeros_through_mapper(&PathBuf::from(format!("/dev/mapper/{wipe_name}")));
+    let result = write_zeros_through_mapper(&PathBuf::from(format!("/dev/mapper/{wipe_name}")));
     let deactivate = dev
         .activate_handle()
         .deactivate(&wipe_name, CryptDeactivate::empty())
