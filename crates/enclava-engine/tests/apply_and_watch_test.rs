@@ -536,89 +536,15 @@ mod fresh_claim_evidence {
     const NAMESPACE: &str = "cap-test-org-test-app";
     const WORKLOAD: &str = "test-app";
     const CREATED_JAN1: &str = "2026-01-01T00:00:00Z";
-    // Epoch milliseconds for the fixed RFC3339 anchors used below.
-    const JAN1_MILLIS: i64 = 1_767_225_600_000;
-    const JAN2_MILLIS: i64 = 1_767_312_000_000;
 
     async fn inspect(
         pvcs: std::collections::HashMap<String, serde_json::Value>,
         pods: std::collections::HashMap<String, serde_json::Value>,
         mask: FreshVolumeClaims,
-        initialized_at_millis: Option<i64>,
     ) -> Result<FreshVolumeClaims, ApplyError> {
         let (client, _requests) = evidence_mock_client(pvcs, pods, false);
         let engine = ApplyEngine::new(client, ApplyConfig::default());
-        inspect_fresh_volume_claims(&engine, NAMESPACE, WORKLOAD, mask, initialized_at_millis).await
-    }
-
-    /// A recorded healthy deployment in a LATER second than the claim's
-    /// creation proves initialization even with the pod long gone — a
-    /// proven legacy volume survives pod loss, crashes, and replacements.
-    #[tokio::test]
-    async fn recorded_healthy_deployment_proves_surviving_claim() {
-        let claims = inspect(
-            [created_pvc_entry("state-test-app-0", CREATED_JAN1)]
-                .into_iter()
-                .collect(),
-            std::collections::HashMap::new(),
-            FreshVolumeClaims::ALL,
-            Some(JAN2_MILLIS),
-        )
-        .await
-        .expect("lookup succeeds");
-        assert!(!claims.app_data, "history after claim creation is proof");
-        assert!(claims.tls_data, "missing tls claim stays fresh");
-    }
-
-    /// Same-bucket ambiguity must fail closed: a healthy completion at
-    /// 10.5s cannot distinguish a claim truly created at 10.1s from a
-    /// blank replacement created at 10.8s (both report "10s"), so a healthy
-    /// timestamp in the SAME whole second never proves the claim.
-    #[tokio::test]
-    async fn same_second_replacement_cannot_borrow_healthy_proof() {
-        for healthy_millis in [
-            JAN1_MILLIS,       // same reported second as the claim
-            JAN1_MILLIS + 500, // subsecond precision still shares the bucket
-        ] {
-            let claims = inspect(
-                [created_pvc_entry("state-test-app-0", CREATED_JAN1)]
-                    .into_iter()
-                    .collect(),
-                std::collections::HashMap::new(),
-                FreshVolumeClaims::ALL,
-                Some(healthy_millis),
-            )
-            .await
-            .expect("lookup succeeds");
-            assert!(
-                claims.app_data,
-                "healthy {healthy_millis} shares the claim's second bucket — no proof"
-            );
-        }
-    }
-
-    /// A claim recreated AFTER the last healthy deployment cannot borrow
-    /// that deployment's proof — the live PVC's creation timestamp is newer
-    /// than the evidence.
-    #[tokio::test]
-    async fn recreated_claim_cannot_borrow_old_healthy_proof() {
-        let claims = inspect(
-            [created_pvc_entry(
-                "state-test-app-0",
-                "2026-01-02T00:00:00Z",
-            )]
-            .into_iter()
-            .collect(),
-            std::collections::HashMap::new(),
-            FreshVolumeClaims::ALL,
-            Some(JAN1_MILLIS),
-        )
-        .await
-        .expect("lookup succeeds");
-        assert!(
-            claims.app_data,
-            "a claim created after the healthy deployment is fresh"
-        );
+        inspect_fresh_volume_claims(&engine, NAMESPACE, WORKLOAD, mask).await
     }
 
     /// The Ready pod path: a surviving claim mounted by the live Ready
@@ -642,7 +568,6 @@ mod fresh_claim_evidence {
                 app_data: true,
                 tls_data: false,
             },
-            None,
         )
         .await
         .expect("lookup succeeds");
@@ -666,7 +591,6 @@ mod fresh_claim_evidence {
                 app_data: true,
                 tls_data: false,
             },
-            None,
         )
         .await
         .expect("lookup succeeds");
@@ -700,7 +624,6 @@ mod fresh_claim_evidence {
                     app_data: true,
                     tls_data: false,
                 },
-                None,
             )
             .await
             .expect("lookup succeeds");
@@ -728,7 +651,6 @@ mod fresh_claim_evidence {
                 app_data: true,
                 tls_data: false,
             },
-            None,
         )
         .await
         .expect("lookup succeeds");
@@ -745,15 +667,14 @@ mod fresh_claim_evidence {
                 app_data: true,
                 tls_data: false,
             },
-            Some(JAN1_MILLIS),
         )
         .await
         .expect("lookup succeeds");
         assert!(claims.app_data, "a timestampless claim is fresh");
     }
 
-    /// Partial verdicts stay per-claim: history proves the surviving state
-    /// claim while the bound-but-unformatted tls claim stays fresh.
+    /// Partial verdicts stay per-claim: the Ready pod proves the surviving
+    /// state claim while the bound-but-unformatted tls claim stays fresh.
     #[tokio::test]
     async fn verdict_is_per_claim() {
         let claims = inspect(
@@ -763,13 +684,21 @@ mod fresh_claim_evidence {
             ]
             .into_iter()
             .collect(),
-            std::collections::HashMap::new(),
+            // The pod mounts both claims but predates the tls claim, so it
+            // proves only the state claim.
+            [pod_entry(
+                &["state-test-app-0", "tls-state-test-app-0"],
+                true,
+                "2026-01-02T00:00:00Z",
+                None,
+            )]
+            .into_iter()
+            .collect(),
             FreshVolumeClaims::ALL,
-            Some(JAN2_MILLIS),
         )
         .await
         .expect("lookup succeeds");
-        assert!(!claims.app_data, "history proves the state claim");
+        assert!(!claims.app_data, "the pod proves the state claim");
         assert!(claims.tls_data, "the newer tls claim is fresh");
     }
 
@@ -783,15 +712,10 @@ mod fresh_claim_evidence {
             true,
         );
         let engine = ApplyEngine::new(client, ApplyConfig::default());
-        let claims = inspect_fresh_volume_claims(
-            &engine,
-            NAMESPACE,
-            WORKLOAD,
-            FreshVolumeClaims::NONE,
-            None,
-        )
-        .await
-        .expect("NONE never touches the cluster");
+        let claims =
+            inspect_fresh_volume_claims(&engine, NAMESPACE, WORKLOAD, FreshVolumeClaims::NONE)
+                .await
+                .expect("NONE never touches the cluster");
         assert!(!claims.app_data);
         assert!(!claims.tls_data);
         assert!(
