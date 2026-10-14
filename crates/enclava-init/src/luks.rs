@@ -399,6 +399,9 @@ fn validate_existing_mapper(
                 device.display()
             )));
         }
+        // Same orphan sweep as the open path: a previous interrupted
+        // adoption could have left detached copies behind (cap#244 review).
+        cleanup_stale_detached_copies();
         let detached_path = detached_header_path(mapping_name);
         let result = (|| -> Result<()> {
             luks2_seal::write_detached_copy(&region, &detached_path)?;
@@ -1039,7 +1042,25 @@ fn cleanup_stale_detached_copies() {
         let Ok(pid) = pid_str.parse::<u32>() else {
             continue;
         };
-        if pid == my_pid || Path::new(&format!("/proc/{pid}")).exists() {
+        if pid != my_pid && Path::new(&format!("/proc/{pid}")).exists() {
+            continue;
+        }
+        // Our own PID entry after a crash-restart (PID reuse with the
+        // counter reset) or a dead owner's leftover. Never follow symlinks:
+        // the directory is shared with the workload, which could plant a
+        // symlink and have root wipe its target. Only regular files whose
+        // name still matches our exact generation scheme are removed.
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() {
+            // Not a regular file (symlink/otherwise): do not touch. Our own
+            // writer only creates regular files, so anything else was not
+            // written by enclava-init.
+            tracing::warn!(
+                path = %entry.path().display(),
+                "non-regular file in detached-header directory left untouched"
+            );
             continue;
         }
         // Best effort: plaintext header bytes never outlive the dead owner.
