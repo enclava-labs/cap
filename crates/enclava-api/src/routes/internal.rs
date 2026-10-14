@@ -7256,19 +7256,18 @@ mod tests {
         .expect("complete replay cutoff receipt");
         sqlx::query(
             "UPDATE cap_internal_idempotency
-                SET created_at = date_trunc('second', clock_timestamp()) - interval '299 seconds'
+                SET created_at = date_trunc('second', clock_timestamp()) - interval '270 seconds'
               WHERE idempotency_key = $1",
         )
         .bind(&replay_key)
         .execute(&pool)
         .await
-        .expect("move replay receipt next to expiry");
+        .expect("move replay receipt inside the capability window");
         let replay = expect_idempotency_execution(
             begin_test_config_token_receipt(&state, &replay_key, &path, &hash, &binding)
                 .await
-                .expect("begin near-expiry regeneration"),
+                .expect("begin in-window regeneration"),
         );
-        let expires_at = replay.config_token_receipt().unwrap().expires_at;
         let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
         let paused = tokio::spawn(async move {
             complete_deterministic_config_token_result_with_timeout(
@@ -7280,21 +7279,40 @@ mod tests {
                         serde_json::json!({"token": "must-not-cross-expiry"}),
                     ))
                 },
-                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(10),
                 std::time::Duration::from_secs(1),
             )
             .await
         });
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            loop {
-                if database_clock(&pool).await.expect("read DB clock") >= expires_at {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
+        // Cross the receipt's DB-authored expiry deterministically by moving
+        // created_at past the window instead of racing the wall clock: the
+        // regeneration begin above must never contend with a sub-second
+        // expiry margin (the #185 CI flake), and expiry is evaluated as
+        // (created_at + TTL) <= clock_timestamp() either way.
+        sqlx::query(
+            "UPDATE cap_internal_idempotency
+                SET created_at = date_trunc('second', clock_timestamp()) - interval '305 seconds'
+              WHERE idempotency_key = $1",
+        )
+        .bind(&replay_key)
+        .execute(&pool)
         .await
-        .expect("receipt reaches DB-authored expiry");
+        .expect("advance paused regeneration past DB-authored expiry");
+        let past_window: bool = sqlx::query_scalar(
+            "SELECT date_trunc('second', created_at)
+                    + ($2::bigint * interval '1 second') <= clock_timestamp()
+               FROM cap_internal_idempotency
+              WHERE idempotency_key = $1",
+        )
+        .bind(&replay_key)
+        .bind(crate::auth::jwt::CONFIG_TOKEN_TTL_SECONDS)
+        .fetch_one(&pool)
+        .await
+        .expect("verify staged anchor crosses DB-authored expiry");
+        assert!(
+            past_window,
+            "staged anchor must cross the receipt's DB-authored expiry"
+        );
         let terminal = expect_idempotency_replay(
             begin_test_config_token_receipt(&state, &replay_key, &path, &hash, &binding)
                 .await
