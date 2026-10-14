@@ -210,13 +210,38 @@ def check_steps(node, job):
         check_step_mapping(item, job)
 
 
+def check_defaults_run_shell(node, owner):
+    # defaults.run.shell — top-level or jobs.<id> — is a command template
+    # GitHub splices every run script into ({0}); interpolation there
+    # executes directly in every step of the job (or the whole workflow),
+    # exactly like step-level shell (Codex, #236).
+    if not isinstance(node, MappingNode):
+        return
+    for key, val in mapping_entries(node):
+        if not (isinstance(key, ScalarNode) and key.value == "run"):
+            continue
+        if not isinstance(val, MappingNode):
+            continue
+        for run_key, shell in mapping_entries(val):
+            if (isinstance(run_key, ScalarNode) and run_key.value == "shell"
+                    and isinstance(shell, ScalarNode) and "${{" in shell.value):
+                note(shell, "%s defaults.run.shell template interpolates"
+                            " ${{ ... }} directly; pass the value through"
+                            " an env: binding instead" % owner)
+
+
 def check_workflow_runs(root):
     if not isinstance(root, MappingNode):
         note(root, "workflow root must be a mapping")
         return
     found_jobs = False
     for key, val in mapping_entries(root):
-        if not (isinstance(key, ScalarNode) and key.value == "jobs"):
+        if not isinstance(key, ScalarNode):
+            continue
+        if key.value == "defaults":
+            check_defaults_run_shell(val, "workflow-level")
+            continue
+        if key.value != "jobs":
             continue
         found_jobs = True
         if not isinstance(val, MappingNode):
@@ -230,6 +255,9 @@ def check_workflow_runs(root):
             for step_key, steps in mapping_entries(job):
                 if isinstance(step_key, ScalarNode) and step_key.value == "steps":
                     check_steps(steps, name)
+                elif (isinstance(step_key, ScalarNode)
+                        and step_key.value == "defaults"):
+                    check_defaults_run_shell(steps, "job '%s'" % name)
     if not found_jobs:
         note(root, "workflow has no jobs mapping")
 
@@ -433,6 +461,37 @@ guard_steps_case shell_plain '      - run: echo ok
         shell: bash
 '
 guard_must_be_clean shell_plain
+
+# defaults.run.shell at either scope is a command template for every step
+# in the job (or workflow); interpolation there must be flagged, and a
+# plain default shell must stay clean (Codex, #236).
+guard_case job_defaults_shell 'jobs:
+  build:
+    defaults:
+      run:
+        shell: bash -c '"'"'echo "${{ github.head_ref }}"; bash {0}'"'"'
+    steps:
+      - run: echo ok
+'
+guard_must_flag_run job_defaults_shell
+guard_case top_defaults_shell 'defaults:
+  run:
+    shell: bash -c '"'"'echo "${{ github.head_ref }}"; bash {0}'"'"'
+jobs:
+  build:
+    steps:
+      - run: echo ok
+'
+guard_must_flag_run top_defaults_shell
+guard_case defaults_shell_plain 'defaults:
+  run:
+    shell: bash
+jobs:
+  build:
+    steps:
+      - run: echo ok
+'
+guard_must_be_clean defaults_shell_plain
 
 # GitHub parallel step groups nest executable steps under parallel:; each
 # nested step is checked like a top-level one (Codex, #236).
