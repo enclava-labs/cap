@@ -552,6 +552,54 @@ where
 /// Bounded re-read retry budget for preconditioned sweep deletes.
 const SWEEP_DELETE_RETRIES: usize = 3;
 
+/// Classify a claim's creation against the proven StatefulSet-step bound
+/// at Kubernetes timestamp precision. `metav1.Time` serializes as RFC 3339
+/// with SECOND precision (no sub-second digits), and the StatefulSet
+/// controller routinely creates the ordinal claims within the same second
+/// the StatefulSet itself was created — so a claim that is `==` the bound
+/// is a NORMAL outcome, not an exceptional clock race. Both sides are
+/// compared as instants: the chrono bound is rendered RFC 3339 and parsed
+/// into a jiff `Timestamp` (the string forms of the two libraries differ
+/// and misorder near-equal times), so the ordering is truly chronological
+/// before the three-way decision is made.
+#[derive(Debug, PartialEq, Eq)]
+enum ClaimBoundOrdering {
+    /// Created strictly after the bound (a later second): within this
+    /// workload's lineage window — sweep-eligible.
+    AfterBound,
+    /// The SAME second as the bound: at second precision this is
+    /// undecidable — the claim may be the controller's own same-second
+    /// creation or a tenant's race. Ownership is unresolved: retain the
+    /// claim (never delete) and count it as a failure so the sweep
+    /// reports INCOMPLETE and the caller keeps provider-state evidence
+    /// instead of silently clearing it over a retained claim.
+    SameSecondUnresolved,
+    /// Created strictly before the bound: a tenant's or a predecessor's
+    /// claim. Never swept, and not a failure.
+    BeforeBound,
+}
+
+fn classify_claim_creation(
+    created: &k8s_openapi::apimachinery::pkg::apis::meta::v1::Time,
+    bound: chrono::DateTime<chrono::Utc>,
+) -> ClaimBoundOrdering {
+    // Compare as the SAME type: the chrono threshold is parsed into a
+    // jiff Timestamp (both render/parse RFC 3339), so the ordering is
+    // truly chronological — string forms of the two libraries differ and
+    // misorder near-equal times. An unparseable bound proves nothing:
+    // treat it as undecidable (fail closed) rather than as "after".
+    let Ok(threshold) = bound.to_rfc3339().parse::<k8s_openapi::jiff::Timestamp>() else {
+        return ClaimBoundOrdering::SameSecondUnresolved;
+    };
+    if created.0 > threshold {
+        ClaimBoundOrdering::AfterBound
+    } else if created.0 < threshold {
+        ClaimBoundOrdering::BeforeBound
+    } else {
+        ClaimBoundOrdering::SameSecondUnresolved
+    }
+}
+
 /// Delete the PVCs this failed generation's StatefulSet created in an
 /// adopted namespace. A claim is deleted only when it carries
 /// CREATION-SPECIFIC evidence of this workload's lineage:
@@ -562,9 +610,18 @@ const SWEEP_DELETE_RETRIES: usize = 3;
 ///   the StatefulSet's OWN creationTimestamp when the sweep observed it
 ///   live (this sts instance's lineage; a claim older than the sts the
 ///   apply created can only be a tenant's or a predecessor's), or the
-///   row's `sts_apply_started_at` stamp for a retry sweep after the sts
-///   is gone, widened to the sibling-MIN when incomplete siblings'
-///   evidence is being converged.
+///   row's recorded provenance (`sts_created_at`, sibling-MIN'd across
+///   still-incomplete siblings) for a retry sweep after the sts is gone.
+///   A claim created in the SAME second as the bound is UNRESOLVED at
+///   Kubernetes' second-precision timestamps: retained, and counted as a
+///   failure so the sweep stays incomplete (see ClaimBoundOrdering).
+///
+/// When the StatefulSet is absent and NO proven bound exists, matching
+/// claims cannot be proven either way: none are touched, but the sweep
+/// reports INCOMPLETE (non-zero) as long as name-matching claims remain —
+/// reporting zero would let the caller clear manifest evidence over
+/// unproven, retained claims (Codex P2 / devin). With no matching claims
+/// there is nothing to converge and the sweep is complete.
 ///
 /// PVCs created by the controller from `spec.volumeClaimTemplates` never
 /// carry CAP annotations (VCT metadata is immutable — adding the
@@ -599,20 +656,10 @@ pub(crate) async fn sweep_statefulset_pvcs(
     // gen-2's sweep) without ever widening THIS instance's window past
     // its own proven creation: for claims newer than this instance's sts,
     // the sibling whose sts provably created them supplies the bound.
-    // All-None means no proven creation evidence exists — no matching
-    // claim is provably CAP lineage, so touch nothing (fail closed).
     let bound = [sts_observed_created_at, sts_proven_created_at]
         .into_iter()
         .flatten()
         .min();
-    let Some(bound) = bound else {
-        tracing::info!(
-            namespace = %namespace,
-            statefulset = %statefulset,
-            "adopted-namespace PVC sweep has no proven StatefulSet creation evidence; touching no claims"
-        );
-        return 0;
-    };
     let api: kube::Api<k8s_openapi::api::core::v1::PersistentVolumeClaim> =
         kube::Api::namespaced(client.clone(), namespace);
     let list = match bounded_sweep_read(sweep_deadline, api.list(&kube::api::ListParams::default()))
@@ -629,38 +676,81 @@ pub(crate) async fn sweep_statefulset_pvcs(
             return 1;
         }
     };
+    // Inspect only name-matching claims, and decide the no-bound outcome
+    // from what is actually retained rather than up front: an empty
+    // match set is a complete sweep even with no provenance, while any
+    // retained matching claim without a proven bound keeps the sweep
+    // incomplete (retryable) instead of silently complete.
+    let matching_claims: Vec<_> = list
+        .items
+        .into_iter()
+        .filter(|pvc| {
+            pvc.metadata
+                .name
+                .as_deref()
+                .is_some_and(|name| is_cap_claim_name(name, statefulset, &CAP_VCT_NAMES))
+        })
+        .collect();
+    if matching_claims.is_empty() {
+        return 0;
+    }
+    let Some(bound) = bound else {
+        // Codex P2 / devin: matching claims are retained but NO proven
+        // StatefulSet creation evidence exists (e.g. a previous sweep
+        // deleted the sts and its best-effort provenance write failed).
+        // Touch nothing, but do NOT report the sweep complete: returning
+        // zero here would let the caller clear manifest_hash and the
+        // cleanup marker over claims that were never inspected, leaving
+        // them silently reusable by a later resized deployment.
+        tracing::warn!(
+            namespace = %namespace,
+            statefulset = %statefulset,
+            claims = matching_claims.len(),
+            "adopted-namespace PVC sweep retains name-matching claims with no proven StatefulSet creation evidence; counting the sweep incomplete for retry"
+        );
+        return 1;
+    };
     let mut failures = 0usize;
-    for pvc in list.items {
+    for pvc in matching_claims {
         let Some(name) = pvc.metadata.name.clone() else {
             continue;
         };
-        if !is_cap_claim_name(&name, statefulset, &CAP_VCT_NAMES) {
-            continue;
-        }
         // Creation-specific lineage evidence (Codex P1): the claim must
         // postdate the proven StatefulSet-step bound — the observed
         // sts's OWN creationTimestamp when the sweep deleted it live,
-        // else the row's durable sts_apply_started_at (sibling-MIN).
-        // A tenant claim created after apply_started_at but BEFORE the
-        // apply reached the StatefulSet step predates this bound and is
-        // never swept, even when its name matches the VCT shape.
-        let created_after_sts_step = pvc.metadata.creation_timestamp.is_some_and(|created| {
-            // Compare as the SAME type: the chrono threshold is parsed
-            // into a jiff Timestamp (both render/parse RFC 3339), so
-            // the ordering is truly chronological — string forms of
-            // the two libraries differ and misorder near-equal times.
-            bound
-                .to_rfc3339()
-                .parse::<k8s_openapi::jiff::Timestamp>()
-                .is_ok_and(|threshold| created.0 > threshold)
-        });
-        if !created_after_sts_step {
-            tracing::info!(
-                namespace = %namespace,
-                pvc = %name,
-                "adopted-namespace PVC sweep skips claim predating the StatefulSet-step evidence bound"
-            );
+        // else the durable recorded provenance (sibling-MIN). A tenant
+        // claim created after apply_started_at but BEFORE the apply
+        // reached the StatefulSet step predates this bound and is never
+        // swept, even when its name matches the VCT shape.
+        let Some(created) = pvc.metadata.creation_timestamp.as_ref() else {
             continue;
+        };
+        match classify_claim_creation(created, bound) {
+            ClaimBoundOrdering::AfterBound => {}
+            ClaimBoundOrdering::BeforeBound => {
+                tracing::info!(
+                    namespace = %namespace,
+                    pvc = %name,
+                    "adopted-namespace PVC sweep skips claim predating the StatefulSet-step evidence bound"
+                );
+                continue;
+            }
+            ClaimBoundOrdering::SameSecondUnresolved => {
+                // Same-second claims (Codex P1): metav1.Time carries no
+                // sub-second precision, so the controller's own claim
+                // and a tenant's race are indistinguishable at equality.
+                // Retain the claim and count a failure so the sweep
+                // stays INCOMPLETE: the skip must not let the caller
+                // clear manifest_hash / the cleanup marker while the
+                // claim remains (the silent-reuse hazard).
+                tracing::warn!(
+                    namespace = %namespace,
+                    pvc = %name,
+                    "adopted-namespace PVC sweep cannot resolve same-second claim ownership at Kubernetes timestamp precision; retaining the claim and counting the sweep incomplete"
+                );
+                failures += 1;
+                continue;
+            }
         }
         let owner_refs_not_foreign = match statefulset_uid {
             Some(expected) => pvc.metadata.owner_references.as_ref().is_none_or(|owners| {
@@ -2648,6 +2738,53 @@ mod tests {
             &unparseable_mutation_object(),
             7
         ));
+    }
+
+    fn k8s_time(rfc3339: &str) -> k8s_openapi::apimachinery::pkg::apis::meta::v1::Time {
+        rfc3339
+            .parse::<k8s_openapi::jiff::Timestamp>()
+            .map(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time)
+            .unwrap_or_else(|_| panic!("parse {rfc3339} as jiff Timestamp"))
+    }
+
+    /// Codex P1 (same-second PVC claims): metav1.Time is second-precision,
+    /// and the StatefulSet controller routinely creates the ordinal claims
+    /// in the same second as the StatefulSet itself. A strict `>` rejects
+    /// those claims AND (worse) lets the sweep complete while they remain.
+    /// The classifier must treat equality as UNRESOLVED and before as
+    /// foreign; only strictly-after claims are sweep-eligible.
+    #[test]
+    fn claim_creation_classification_is_three_way_at_second_precision() {
+        let bound = chrono::DateTime::parse_from_rfc3339("2026-10-14T10:00:04Z")
+            .expect("parse bound")
+            .with_timezone(&chrono::Utc);
+        // Strictly after: the controller's claim in a later second.
+        assert_eq!(
+            classify_claim_creation(&k8s_time("2026-10-14T10:00:05Z"), bound),
+            ClaimBoundOrdering::AfterBound
+        );
+        // SAME second as the bound: undecidable at Kubernetes precision —
+        // the exact case the strict `>` misclassified as "too old" while
+        // still letting the sweep complete over the retained claim.
+        assert_eq!(
+            classify_claim_creation(&k8s_time("2026-10-14T10:00:04Z"), bound),
+            ClaimBoundOrdering::SameSecondUnresolved
+        );
+        // Strictly before: a tenant's or predecessor's claim.
+        assert_eq!(
+            classify_claim_creation(&k8s_time("2026-10-14T10:00:03Z"), bound),
+            ClaimBoundOrdering::BeforeBound
+        );
+        // Cross-second-boundary sanity: instants, not string prefixes.
+        assert_eq!(
+            classify_claim_creation(&k8s_time("2026-10-14T09:59:59Z"), bound),
+            ClaimBoundOrdering::BeforeBound
+        );
+        assert_eq!(
+            classify_claim_creation(&k8s_time("2026-10-14T10:00:04.500Z"), bound),
+            ClaimBoundOrdering::AfterBound,
+            "a sub-second claim after the second-bound is strictly after as an instant"
+        );
     }
 
     #[test]
