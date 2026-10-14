@@ -1685,12 +1685,23 @@ pub(crate) async fn delete_app_before(
     if !abandon_teardown {
         // Mirrors the CASE below: a retry of an already-deleting app keeps
         // its pin; anything else pins exactly when teardown is required.
+        // A teardown that already completed contributes no policy authority
+        // (the selector requires `workload_teardown_completed_at IS NULL`),
+        // so its deletion retry must bypass admission — otherwise a tight
+        // budget could 409 the only operation that removes the app.
         let pin_will_apply = if phase_app.status == AppStatus::Deleting {
-            sqlx::query_scalar("SELECT workload_teardown_required FROM apps WHERE id = $1")
-                .bind(phase_app.id)
-                .fetch_one(&mut *phase_tx)
-                .await
-                .map_err(|_| internal_server_error())?
+            let (teardown_required, teardown_completed): (
+                bool,
+                Option<chrono::DateTime<chrono::Utc>>,
+            ) = sqlx::query_as(
+                "SELECT workload_teardown_required, workload_teardown_completed_at
+                   FROM apps WHERE id = $1",
+            )
+            .bind(phase_app.id)
+            .fetch_one(&mut *phase_tx)
+            .await
+            .map_err(|_| internal_server_error())?;
+            teardown_required && teardown_completed.is_none()
         } else {
             requires_workload_teardown(phase_app.status)
         };

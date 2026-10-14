@@ -1175,6 +1175,19 @@ pub async fn teardown_unit_fits_signed_policy_budget(
     let Some(config) = config else {
         return Ok(true);
     };
+    // Completed teardowns contribute no policy authority: the selector's
+    // deleting-app arms require `workload_teardown_completed_at IS NULL`.
+    // A deletion retry after teardown succeeded but a later cleanup step
+    // failed must therefore bypass admission — projecting its unit here
+    // would return a phantom 409 that blocks the app's own removal.
+    let teardown_completed: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT workload_teardown_completed_at FROM apps WHERE id = $1")
+            .bind(app_id)
+            .fetch_one(db)
+            .await?;
+    if teardown_completed.is_some() {
+        return Ok(true);
+    }
     let candidates = load_signed_policy_candidates(db, config.signed_policy_retention).await?;
     let mut projected = Vec::new();
     let mut current = Vec::new();
@@ -4973,6 +4986,82 @@ resource_bindings := {
             .execute(&pool)
             .await
             .expect("delete non-growing delete fixture organization");
+    }
+
+    /// A deletion retry after the teardown already completed must bypass
+    /// admission: the selector excludes apps with
+    /// `workload_teardown_completed_at` set, so projecting the unit would
+    /// phantom-409 the only operation that removes the app when the budget
+    /// is tight.
+    #[tokio::test]
+    async fn teardown_admission_bypasses_completed_teardown_retries() {
+        let pool = crate::test_support::database_test_pool().await;
+        let now = Utc::now();
+
+        let (org_id, app_id) = insert_test_app(&pool, "deleting").await;
+        sqlx::query(
+            "UPDATE apps
+                SET workload_teardown_required = true,
+                    workload_teardown_completed_at = clock_timestamp()
+              WHERE id = $1",
+        )
+        .bind(app_id)
+        .execute(&pool)
+        .await
+        .expect("mark workload teardown completed");
+
+        // Two historical teardown artifacts that would never fit a tiny
+        // budget — exactly the phantom-pin scenario from review.
+        let completed = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, completed, "healthy", now).await;
+        let completed_artifact = insert_test_artifact(&pool, app_id, completed, "ee").await;
+        insert_test_job(
+            &pool,
+            org_id,
+            app_id,
+            completed,
+            completed,
+            Some((completed, &completed_artifact)),
+        )
+        .await;
+        let published = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            org_id,
+            app_id,
+            published,
+            "failed",
+            now + chrono::Duration::seconds(1),
+        )
+        .await;
+        let published_artifact = insert_test_artifact(&pool, app_id, published, "ff").await;
+        insert_failed_apply_job(&pool, org_id, app_id, published, &published_artifact, 9).await;
+        mark_test_workload_published(&pool, published).await;
+
+        let unit_len = signed_policy_artifact_policy_body(&[
+            completed_artifact.clone(),
+            published_artifact.clone(),
+        ])
+        .expect("serialize the would-be teardown unit")
+        .len();
+
+        let fits = teardown_unit_fits_signed_policy_budget(
+            &pool,
+            Some(&teardown_budget_config(unit_len / 2)),
+            app_id,
+        )
+        .await
+        .expect("admission check on a completed teardown");
+        assert!(
+            fits,
+            "a deletion retry after teardown completed must bypass budget admission"
+        );
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete completed-teardown fixture organization");
     }
 
     #[tokio::test]
