@@ -719,6 +719,27 @@ async fn main() {
             eprintln!("startup refused: {e}");
             std::process::exit(1);
         }
+        // LUKS2 header-seal rollout claim (cap#244 review): the value is
+        // rendered into every cc_init_data from the SIGNED release, so the
+        // API render always matches the CLI's signed hash. An
+        // ENCLAVA_LUKS2_HEADER_SEAL leftover that disagrees with the signed
+        // value is a misconfiguration and refuses startup: silently
+        // rendering either side's private value would let the signed
+        // `expected_cc_init_data_hash` diverge from the actual rollout
+        // state.
+        let seal_claim = release.luks2_header_seal_claim();
+        if let Some(env) = env_nonempty("ENCLAVA_LUKS2_HEADER_SEAL")
+            && env.trim() != seal_claim
+        {
+            eprintln!(
+                "startup refused: ENCLAVA_LUKS2_HEADER_SEAL conflicts with signed platform \
+                 release: env `{env}` != release `{seal_claim}`; the rollout value is sourced \
+                 from the signed platform release (luks2_header_seal), remove the environment \
+                 variable or sign a release carrying the intended value"
+            );
+            std::process::exit(1);
+        }
+        enclava_engine::manifest::cc_init_data::set_luks2_header_seal_claim(&seal_claim);
     }
 
     let startup_proxy_image = match release_env_value(

@@ -93,6 +93,7 @@ fn test_release() -> PlatformRelease {
             expected_firmware_measurement: "00".repeat(32),
             expected_runtime_class: "kata-qemu-snp".to_string(),
             genpolicy_version: "test-genpolicy".to_string(),
+            luks2_header_seal: "adopt".to_string(),
             created_at: "2026-05-09T00:00:00Z".to_string(),
         }
 }
