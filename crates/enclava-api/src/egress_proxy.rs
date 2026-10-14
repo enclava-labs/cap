@@ -405,17 +405,22 @@ fn find_head_end(buf: &[u8]) -> Option<usize> {
 async fn idle_bounded_copy(a: &mut TcpStream, b: &mut TcpStream) -> std::io::Result<()> {
     let mut buf_a = [0u8; 8192];
     let mut buf_b = [0u8; 8192];
-    let mut budget = TUNNEL_IDLE_TIMEOUT;
+    // Absolute idle deadline: only actual traffic (a read completing, a
+    // write advancing) moves it. EOF handling does NOT refresh it, so a
+    // direction that goes silent just before the deadline cannot gain a
+    // fresh full window by half-closing — the tunnel is torn down when
+    // the absolute deadline passes without progress (cap#241 review).
+    let mut deadline = tokio::time::Instant::now() + TUNNEL_IDLE_TIMEOUT;
     // EOF seen on `a` (a is done sending) / on `b`. A closed direction is
     // no longer polled; the opposite direction keeps flowing until it too
-    // EOFs or the idle budget expires.
+    // EOFs or the idle deadline expires.
     let mut eof_a = false;
     let mut eof_b = false;
     loop {
         if eof_a && eof_b {
             return Ok(());
         }
-        // Race whichever directions are still open against the budget
+        // Race whichever directions are still open against the deadline
         // (branch futures are not evaluated when the precondition is
         // false, so `a`/`b` are only borrowed by live reads). The futures
         // (and their borrows) end when the `select!` does, before the
@@ -423,7 +428,7 @@ async fn idle_bounded_copy(a: &mut TcpStream, b: &mut TcpStream) -> std::io::Res
         let outcome = tokio::select! {
             res = a.read(&mut buf_a), if !eof_a => Some((true, res?)),
             res = b.read(&mut buf_b), if !eof_b => Some((false, res?)),
-            _ = tokio::time::sleep(budget) => None,
+            _ = tokio::time::sleep_until(deadline) => None,
         };
         let (from_a, n) = match outcome {
             Some(x) => x,
@@ -446,7 +451,7 @@ async fn idle_bounded_copy(a: &mut TcpStream, b: &mut TcpStream) -> std::io::Res
                 eof_b = true;
                 let _ = a.shutdown().await;
             }
-            // EOF is not traffic: the idle budget is NOT reset here.
+            // EOF is not traffic: the absolute deadline is NOT moved.
             continue;
         }
         let data: Vec<u8> = if from_a {
@@ -455,16 +460,16 @@ async fn idle_bounded_copy(a: &mut TcpStream, b: &mut TcpStream) -> std::io::Res
             buf_b[..n].to_vec()
         };
         let dst = if from_a { &mut *b } else { &mut *a };
-        // Forward the chunk with the idle budget enforced per WRITE, not
-        // per chunk: a peer that drains a full socket SLOWLY makes
-        // partial progress (each positive write resets the deadline, so
-        // a live transfer is never cut), while a peer that stops reading
-        // entirely cannot hold the tunnel — and its proxy slot — past
-        // one idle window (cap#241 review).
-        budget = TUNNEL_IDLE_TIMEOUT;
+        // Forward the chunk with the idle deadline enforced per WRITE,
+        // not per chunk: a peer that drains a full socket SLOWLY makes
+        // partial progress (each positive write moves the deadline, so a
+        // live transfer is never cut), while a peer that stops reading
+        // entirely cannot hold the tunnel — and its proxy slot — past one
+        // idle window without write progress (cap#241 review).
+        deadline = tokio::time::Instant::now() + TUNNEL_IDLE_TIMEOUT;
         let mut off = 0;
         while off < data.len() {
-            match tokio::time::timeout(budget, dst.write(&data[off..])).await {
+            match tokio::time::timeout_at(deadline, dst.write(&data[off..])).await {
                 Ok(Ok(0)) => {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::WriteZero,
@@ -473,7 +478,7 @@ async fn idle_bounded_copy(a: &mut TcpStream, b: &mut TcpStream) -> std::io::Res
                 }
                 Ok(Ok(written)) => {
                     off += written;
-                    budget = TUNNEL_IDLE_TIMEOUT; // write progress resets the clock
+                    deadline = tokio::time::Instant::now() + TUNNEL_IDLE_TIMEOUT; // write progress moves the clock
                 }
                 Ok(Err(e)) => return Err(e),
                 Err(_) => {
