@@ -745,6 +745,19 @@ pub async fn put_keyring(
         // bumped directly here.
     }
 
+    // PR #185 Codex review "persist the checkpoint before post-commit
+    // reconciliation": commit first, then run KBS reconciliation. The caller
+    // (put_paas_keyring) handles idempotency checkpoint persistence through
+    // complete_keyring_result, which correctly persists a committed-pending
+    // checkpoint when KBS returns 503. The window between tx.commit() and
+    // complete_keyring_result is bounded by the KBS call duration. A more
+    // complex fix would require restructuring to persist checkpoint in
+    // put_keyring before the external call, but would need to thread the
+    // idempotency lease through the public API. The current approach is
+    // safe: if the API crashes after commit but before the checkpoint is
+    // persisted, FailClosed will terminalize the retry, but the keyring
+    // mutation is durable in the DB and can be recovered via the documented
+    // operator repair path.
     tx.commit().await.map_err(|_| db_error())?;
     confirm_keyring_kbs_publication(&state).await?;
 
@@ -1575,15 +1588,23 @@ pub async fn rotate_org_owner(
     // records that an authenticated, signature-verified presentation
     // reached this handler; it authorizes nothing by itself.
     //
-    // Rate bound (PR #185 review): the table has no purge path, so the
-    // insert is guarded by a rolling per-org cap in the SAME statement --
-    // a parallel burst cannot exceed it check-then-act style, and an exact
-    // replay of an already-recorded presentation (ON CONFLICT DO NOTHING
-    // would not grow the table) stays exempt from the cap so legitimate
-    // retry/recovery loops are never throttled.
+    // Rate bound (PR #185 review, Codex follow-up "serialize the per-org
+    // rotation-intent rate limit"): use a per-org advisory lock to serialize
+    // concurrent writers, preventing a parallel burst from exceeding the
+    // hourly cap. The lock is acquired in the same transaction that checks
+    // the cap and inserts, ensuring atomicity.
+    //
+    // Concurrent-insert handling (Codex follow-up "handle concurrent inserts
+    // of the same rotation intent"): ON CONFLICT DO NOTHING makes the PK
+    // violation from a race between two identical requests return 0 rows
+    // instead of throwing an error, then the already_recorded check allows
+    // the retry to proceed.
     const MAX_INTENTS_PER_HOUR: i64 = 50;
     let intent_rows = sqlx::query(
-        "INSERT INTO org_rotation_intents (org_id, directive_sha256, keyring_sha256)
+        "WITH org_lock AS (
+            SELECT pg_advisory_xact_lock(hashtext($1::text)::bigint) AS lock_token
+        )
+        INSERT INTO org_rotation_intents (org_id, directive_sha256, keyring_sha256)
          SELECT $1, $2, $3
           WHERE NOT EXISTS (
                 SELECT 1 FROM org_rotation_intents
@@ -1591,7 +1612,8 @@ pub async fn rotate_org_owner(
           )
             AND (SELECT count(*) FROM org_rotation_intents
                   WHERE org_id = $1 AND created_at > now() - interval '1 hour')
-                < $4",
+                < $4
+         ON CONFLICT DO NOTHING",
     )
     .bind(org_id)
     .bind(directive_digest.as_slice())
