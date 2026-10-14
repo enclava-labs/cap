@@ -240,63 +240,63 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
     // a query failure counts as sweep failure (retryable), not as "no
     // window" (which would silently skip claims then clear evidence
     // over them).
-    let (sts_proven_windows, reached_sts_step_without_window, legacy_unmarked_row) = match sqlx::query_as::<
-        _,
-        (
-            Option<String>,
-            Option<chrono::DateTime<chrono::Utc>>,
-            Option<chrono::DateTime<chrono::Utc>>,
-            Option<chrono::DateTime<chrono::Utc>>,
-            Option<String>,
-            Option<chrono::DateTime<chrono::Utc>>,
-        ),
-    >(
-        "SELECT sts_uid, sts_created_at, sts_observed_deleted_at, sts_apply_started_at,
+    let (sts_proven_windows, reached_sts_step_without_window, legacy_unmarked_row) =
+        match sqlx::query_as::<
+            _,
+            (
+                Option<String>,
+                Option<chrono::DateTime<chrono::Utc>>,
+                Option<chrono::DateTime<chrono::Utc>>,
+                Option<chrono::DateTime<chrono::Utc>>,
+                Option<String>,
+                Option<chrono::DateTime<chrono::Utc>>,
+            ),
+        >(
+            "SELECT sts_uid, sts_created_at, sts_observed_deleted_at, sts_apply_started_at,
                 manifest_hash, apply_started_at
            FROM deployments
           WHERE app_id = $1
             AND (id = $2 OR cleanup_sweep_incomplete)",
-    )
-    .bind(app.id)
-    .bind(failed_deployment_id)
-    .fetch_all(&state.db)
-    .await
-    {
-        Ok(rows) => (
-            rows.iter()
-                .filter_map(|(uid, created_at, deleted_confirmed_at, _, _, _)| {
-                    created_at.map(|created_at| StsProvenanceWindow {
-                        uid: uid.clone(),
-                        created_at,
-                        deleted_confirmed_at: *deleted_confirmed_at,
-                    })
-                })
-                .collect::<Vec<_>>(),
-            // A row that reached the StatefulSet step but recorded no
-            // server-reported provenance (the apply response's provenance
-            // write failed): its claims are unprovable — an out-of-window
-            // matching claim may still be that row's, so "foreign" skips
-            // must not let the sweep complete over it.
-            rows.iter().any(|(_, created_at, _, apply_started, _, _)| {
-                apply_started.is_some() && created_at.is_none()
-            }),
-            any_legacy_evidence_row(
+        )
+        .bind(app.id)
+        .bind(failed_deployment_id)
+        .fetch_all(&state.db)
+        .await
+        {
+            Ok(rows) => (
                 rows.iter()
-                    .map(|(_, _, _, _, manifest_hash, apply_started)| {
+                    .filter_map(|(uid, created_at, deleted_confirmed_at, _, _, _)| {
+                        created_at.map(|created_at| StsProvenanceWindow {
+                            uid: uid.clone(),
+                            created_at,
+                            deleted_confirmed_at: *deleted_confirmed_at,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+                // A row that reached the StatefulSet step but recorded no
+                // server-reported provenance (the apply response's provenance
+                // write failed): its claims are unprovable — an out-of-window
+                // matching claim may still be that row's, so "foreign" skips
+                // must not let the sweep complete over it.
+                rows.iter().any(|(_, created_at, _, apply_started, _, _)| {
+                    apply_started.is_some() && created_at.is_none()
+                }),
+                any_legacy_evidence_row(rows.iter().map(
+                    |(_, _, _, _, manifest_hash, apply_started)| {
                         (manifest_hash.as_deref(), *apply_started)
-                    }),
+                    },
+                )),
             ),
-        ),
-        Err(error) => {
-            tracing::warn!(
-                app_id = %app.id,
-                deployment_id = %failed_deployment_id,
-                error = %error,
-                "adopted-namespace sweep cannot load the proven sts lineage windows; counting the sweep as failed for retry"
-            );
-            return usize::MAX;
-        }
-    };
+            Err(error) => {
+                tracing::warn!(
+                    app_id = %app.id,
+                    deployment_id = %failed_deployment_id,
+                    error = %error,
+                    "adopted-namespace sweep cannot load the proven sts lineage windows; counting the sweep as failed for retry"
+                );
+                return usize::MAX;
+            }
+        };
     let mut failures = 0usize;
     for target in adopted_namespace_sweep_targets(app) {
         if tokio::time::Instant::now() >= sweep_deadline {
@@ -660,9 +660,7 @@ where
 fn any_legacy_evidence_row<'a>(
     mut rows: impl Iterator<Item = (Option<&'a str>, Option<chrono::DateTime<chrono::Utc>>)>,
 ) -> bool {
-    rows.any(|(manifest_hash, apply_started)| {
-        manifest_hash.is_some() && apply_started.is_none()
-    })
+    rows.any(|(manifest_hash, apply_started)| manifest_hash.is_some() && apply_started.is_none())
 }
 
 /// Bounded re-read retry budget for preconditioned sweep deletes.
