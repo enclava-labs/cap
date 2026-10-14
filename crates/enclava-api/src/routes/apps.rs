@@ -2571,8 +2571,11 @@ pub(crate) async fn reconcile_signer_publication(
         // flight on a configured replica; it reports the
         // publication-pending error exactly like the signed-mode
         // without-configuration case instead.
-        let obligation_recorded =
-            crate::kbs::lock_and_read_legacy_publication_obligation(&mut *obligation_tx)
+        let sentinel_present = crate::kbs::lock_legacy_publication_sentinel(&mut *obligation_tx)
+            .await
+            .map_err(|_| signer_publication_pending_error())?;
+        let obligation_recorded = !sentinel_present
+            || crate::kbs::read_legacy_publication_obligation(&mut *obligation_tx)
                 .await
                 .map_err(|_| signer_publication_pending_error())?;
         obligation_tx
@@ -2860,9 +2863,13 @@ pub(crate) async fn rotate_signer_commit(
         // reconciler holds the same lock across its binding read and
         // ConfigMap write), so a rotation cannot commit while a publication
         // that read the pre-rotation bindings is still about to write them.
-        if crate::kbs::lock_and_read_legacy_publication_obligation(&mut *tx)
+        let sentinel_present = crate::kbs::lock_legacy_publication_sentinel(&mut *tx)
             .await
-            .map_err(|_| internal_server_error())?
+            .map_err(|_| internal_server_error())?;
+        if !sentinel_present
+            || crate::kbs::read_legacy_publication_obligation(&mut *tx)
+                .await
+                .map_err(|_| internal_server_error())?
         {
             let error = crate::kbs::KbsPolicyError::NotConfigured;
             tracing::warn!(

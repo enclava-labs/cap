@@ -85,6 +85,8 @@ pub enum KbsPolicyError {
     RolloutTimedOut,
     #[error("Trustee deployment template no longer carries the reconciled policy digest")]
     TrusteePolicySuperseded,
+    #[error("legacy publication obligation sentinel row is missing; migration invariant broken")]
+    MissingPublicationSentinel,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -507,29 +509,41 @@ pub(crate) async fn load_legacy_tls_bindings<'e, E: sqlx::PgExecutor<'e>>(
     Ok(bindings)
 }
 
-/// Lock the publication-obligation sentinel row and read the obligation
-/// marker in one step. Both the legacy publication critical section and the
-/// signer-rotation gates take the sentinel FOR UPDATE, which serializes the
-/// refusal decision with an in-flight legacy publication: a rotation either
-/// commits before the publication reads its bindings (and is carried into
-/// them) or it waits for the publication to write its policy and then sees
-/// the recorded obligation and refuses. The marker is a separate row so the
-/// publisher can commit it independently while holding the sentinel lock
-/// (see record_legacy_publication_obligation) without deadlocking against
-/// itself. The migration keeps both rows; a missing row means that
-/// invariant is broken and fails closed.
-pub(crate) async fn lock_and_read_legacy_publication_obligation<'e, E: sqlx::PgExecutor<'e>>(
+/// Take the publication-obligation sentinel lock FOR UPDATE. Both the legacy
+/// publication critical section and the signer-rotation gates take this
+/// lock, which serializes the refusal decision with an in-flight legacy
+/// publication: a rotation either commits before the publication reads its
+/// bindings (and is carried into them) or it waits for the publication to
+/// write its policy and then sees the recorded obligation and refuses.
+/// Returns false when the sentinel row is missing: the migration keeps it,
+/// so a missing row means that invariant is broken and fails closed.
+pub(crate) async fn lock_legacy_publication_sentinel<'e, E: sqlx::PgExecutor<'e>>(
+    db: E,
+) -> Result<bool, KbsPolicyError> {
+    let sentinel: Option<bool> = sqlx::query_scalar(
+        "SELECT true FROM legacy_publication_obligation WHERE key = 'sentinel' FOR UPDATE",
+    )
+    .fetch_optional(db)
+    .await?;
+    Ok(sentinel.unwrap_or(false))
+}
+
+/// Read the obligation marker with a fresh snapshot. Deliberately a second
+/// statement after `lock_legacy_publication_sentinel`: under READ COMMITTED
+/// a statement's snapshot is taken before it waits on FOR UPDATE, and the
+/// sentinel row is never updated, so a combined lock+read statement would
+/// keep observing the pre-publication marker even after waiting out a
+/// concurrent publisher. Because the publisher commits the marker before it
+/// releases the sentinel, this post-lock read is ordered after it.
+pub(crate) async fn read_legacy_publication_obligation<'e, E: sqlx::PgExecutor<'e>>(
     db: E,
 ) -> Result<bool, KbsPolicyError> {
     let recorded: Option<bool> = sqlx::query_scalar(
-        "SELECT (SELECT recorded_at IS NOT NULL
-                   FROM legacy_publication_obligation
-                  WHERE key = 'obligation')
+        "SELECT recorded_at IS NOT NULL
            FROM legacy_publication_obligation
-          WHERE key = 'sentinel'
-          FOR UPDATE",
+          WHERE key = 'obligation'",
     )
-    .fetch_one(db)
+    .fetch_optional(db)
     .await?;
     Ok(recorded.unwrap_or(true))
 }
@@ -598,7 +612,14 @@ async fn reconcile_legacy_rego_policy_with_client(
         // held across the ConfigMap write and released before the
         // convergence wait below.
         let mut publication_tx = db.begin().await?;
-        lock_and_read_legacy_publication_obligation(&mut *publication_tx).await?;
+        // Lock and read are separate statements so the post-lock read (the
+        // obligation-marker check below via the gates) observes the marker
+        // with a fresh snapshot (see the helper docs). The publisher does
+        // not read the marker here; it takes the lock and fails closed if
+        // the sentinel row itself is gone.
+        if !lock_legacy_publication_sentinel(&mut *publication_tx).await? {
+            return Err(KbsPolicyError::MissingPublicationSentinel);
+        }
         let bindings: Vec<KbsOwnerBinding> = sqlx::query_as(
             "SELECT binding_key, repository, allowed_tags, namespace, service_account,
                 tenant_instance_identity_hash
@@ -5817,9 +5838,12 @@ resource_bindings := {
             crate::test_support::isolated_database_test_pool("cap187_legacy_obligation").await;
         let (_org_id, app_id) = insert_test_app(&pool, "running").await;
         assert!(
-            !lock_and_read_legacy_publication_obligation(&pool)
+            !lock_legacy_publication_sentinel(&pool)
                 .await
-                .expect("read publication obligation on a fresh install"),
+                .expect("lock publication sentinel on a fresh install")
+                || !read_legacy_publication_obligation(&pool)
+                    .await
+                    .expect("read publication obligation on a fresh install"),
             "a fresh install starts without any legacy publication obligation"
         );
         insert_measured_legacy_tls_binding(
@@ -5840,9 +5864,12 @@ resource_bindings := {
             })
             .await;
         assert!(
-            lock_and_read_legacy_publication_obligation(&pool)
+            lock_legacy_publication_sentinel(&pool)
                 .await
-                .expect("read publication obligation after the legacy render"),
+                .expect("lock publication sentinel after the legacy render")
+                && read_legacy_publication_obligation(&pool)
+                    .await
+                    .expect("read publication obligation after the legacy render"),
             "a legacy render carrying signer identities must record the publication obligation"
         );
     }
@@ -5883,9 +5910,12 @@ resource_bindings := {
             })
             .await;
         assert!(
-            !lock_and_read_legacy_publication_obligation(&pool)
+            !lock_legacy_publication_sentinel(&pool)
                 .await
-                .expect("read publication obligation after the null-identity render"),
+                .expect("lock sentinel after the null-identity render")
+                || !read_legacy_publication_obligation(&pool)
+                    .await
+                    .expect("read publication obligation after the null-identity render"),
             "a legacy render that pins no signer must not record the publication obligation"
         );
     }
