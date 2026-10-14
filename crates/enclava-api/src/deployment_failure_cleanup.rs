@@ -273,6 +273,10 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
                         None,
                         sweep_deadline,
                         apply_started_at,
+                        // No live StatefulSet anchors a temporal bound:
+                        // require the controller's own ownerReference
+                        // signature on each claim instead.
+                        true,
                     )
                     .await;
                 }
@@ -303,9 +307,11 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
                 // delete PVCs created by THIS StatefulSet, not ones a tenant
                 // created between apply_started_at and when CAP reached the
                 // StatefulSet step.
-                statefulset_created_at = live.metadata.creation_timestamp.as_ref()
-                    .and_then(|ts| chrono::DateTime::parse_from_rfc3339(&ts.0).ok())
-                    .map(|dt| dt.with_timezone(&chrono::Utc));
+                statefulset_created_at = live.metadata.creation_timestamp.as_ref().and_then(|ts| {
+                    ts.0.to_string()
+                        .parse::<chrono::DateTime<chrono::Utc>>()
+                        .ok()
+                });
             }
             match bounded_sweep_read(api.delete(
                 &target.name,
@@ -410,6 +416,10 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
                 // bound for PVC deletion, falling back to apply_started_at
                 // only for retry sweeps where the StatefulSet is already gone.
                 statefulset_created_at.or(apply_started_at),
+                // The StatefulSet was proven live and just deleted in THIS
+                // sweep: its own creationTimestamp is the claim bound; no
+                // ownerReference is required (Retain strips them).
+                false,
             )
             .await;
         }
@@ -493,6 +503,7 @@ pub(crate) async fn sweep_statefulset_pvcs(
     statefulset_uid: Option<&str>,
     sweep_deadline: tokio::time::Instant,
     apply_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    require_controller_owner_ref: bool,
 ) -> usize {
     const CAP_VCT_NAMES: [&str; 2] = ["state", "tls-state"];
     let api: kube::Api<k8s_openapi::api::core::v1::PersistentVolumeClaim> =
@@ -547,7 +558,19 @@ pub(crate) async fn sweep_statefulset_pvcs(
                     .is_ok_and(|threshold| created.0 > threshold)
             })
         });
-        if !created_after_apply_start {
+        let controller_owned = pvc.metadata.owner_references.as_ref().is_some_and(|owners| {
+            owners.iter().any(|owner| {
+                owner.kind == "StatefulSet"
+                    && owner.controller == Some(true)
+                    && owner.name == statefulset
+                    && statefulset_uid.is_none_or(|expected| owner.uid == expected)
+            })
+        });
+        if require_controller_owner_ref {
+            if !controller_owned {
+                continue;
+            }
+        } else if !created_after_apply_start {
             continue;
         }
         let owner_refs_not_foreign = match statefulset_uid {
@@ -772,17 +795,6 @@ enum NamespaceTeardown {
     /// Busy). The row is marked cleanup_sweep_incomplete so later failed
     /// generations stay cleanup-eligible and their sweeps converge.
     DeleteNotIssued,
-    /// The SAME-UID namespace no longer classifies as this generation's
-    /// (an external writer rewrote it — e.g. replaced the mutation
-    /// annotation — between the owning GET and the preconditioned
-    /// DELETE). This is NOT confirmed absence: the namespace and this
-    /// generation's CAP-created child objects are still live, so clearing
-    /// provider evidence here would strand them. Every DELETE 409'd
-    /// against the pinned resourceVersion, so nothing is in flight and
-    /// the fence releases normally; the row is marked
-    /// cleanup_sweep_incomplete so a LATER failed generation's
-    /// evidence-gated sweep converges the leftovers.
-    OwnedRewritten,
 }
 
 /// How the caller should release the mutation fences after cleanup.
@@ -1074,7 +1086,7 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
             // pre-sibling claim is skipped here and then forgotten when
             // the marker clears.
             let apply_started_at = match sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
-                "SELECT MIN(COALESCE(apply_started_at, observing_since, created_at)) FROM deployments WHERE app_id = $1 AND (id = $2 OR cleanup_sweep_incomplete)",
+                "SELECT MIN(COALESCE(statefulset_apply_started_at, apply_started_at, observing_since, created_at)) FROM deployments WHERE app_id = $1 AND (id = $2 OR cleanup_sweep_incomplete)",
             )
             .bind(app.id)
             .bind(failed_deployment_id)
@@ -1345,7 +1357,6 @@ async fn no_other_generation_owns_provider_state(
                     (
                         (manifest_hash IS NOT NULL OR observing_since IS NOT NULL)
                         AND NOT cleanup_sweep_incomplete
-                        AND status <> 'failed'::deploy_status_enum
                     )
                     OR status::text IN ('pending', 'applying', 'watching', 'healthy', 'rolled_back')
                 )
@@ -1842,10 +1853,7 @@ async fn wait_for_namespace_absence(
                 // definitely in flight; even without it, treat presence as
                 // ambiguous and retain the fence rather than using presence as
                 // proof the DELETE was not issued.
-                let is_terminating = ns
-                    .metadata
-                    .deletion_timestamp
-                    .is_some();
+                let is_terminating = ns.metadata.deletion_timestamp.is_some();
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                 if remaining.is_zero() || is_terminating {
                     tracing::warn!(
