@@ -646,6 +646,25 @@ fn terminal_rollout_settling_window_sql() -> String {
 /// already applied and the controller keeps converging toward it — so the
 /// most recent cluster-applied generation counts as in-flight for the
 /// settling window above.
+///
+/// "Cluster-applied" is proven by ONE authoritative persisted signal: the
+/// deployment's Kubernetes apply actually committed. `apply_committed_at`
+/// (stamped only after `apply_all_with_tenant_image_pull_secret` returns)
+/// is that proof, with `observing_since` (0047, set at the `watching`
+/// transition for rows that reached observation) accepted as its legacy
+/// equivalent. `manifest_hash` is deliberately NOT proof of apply: it is
+/// stored at the `'applying'` transition — before KBS reconciliation and
+/// before the provider write — so a newer attempt that failed before the
+/// provider call carries a hash without having changed the cluster's
+/// desired state, and must not suppress the older rollout's settling
+/// guard.
+///
+/// Post-apply failures count too: `deployment_apply_failed` rows that
+/// reached the provider (backend resolution or `ensure_haproxy_routes`
+/// failing after the SSA apply committed) leave the same converging
+/// controller behind, so both terminal error classes are settling
+/// evidence. Rows that never reached the cluster carry no
+/// `apply_committed_at`/`observing_since` and are excluded.
 async fn app_has_rollout_in_flight(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     app_id: Uuid,
@@ -669,17 +688,30 @@ async fn app_has_rollout_in_flight(
                FROM deployments AS failed_rollout
               WHERE failed_rollout.app_id = $1
                 AND failed_rollout.status = 'failed'
-                AND failed_rollout.error_message = 'deployment_rollout_failed'
+                AND failed_rollout.error_message IN (
+                    'deployment_rollout_failed',
+                    'deployment_apply_failed'
+                )
+                -- Only rows whose Kubernetes apply actually committed can
+                -- still own the cluster's desired generation: a failure
+                -- before the provider call changed nothing in-cluster.
+                AND (
+                    failed_rollout.apply_committed_at IS NOT NULL
+                    OR failed_rollout.observing_since IS NOT NULL
+                )
                 AND failed_rollout.completed_at
                     > clock_timestamp() - $2::interval
                 -- Only the newest cluster-applied generation's controller
-                -- still acts; a later applied deployment superseded this
-                -- one's desired state.
+                -- still acts; a later apply that actually reached the
+                -- cluster superseded this one's desired state.
                 AND NOT EXISTS (
                     SELECT 1
                       FROM deployments AS newer
                      WHERE newer.app_id = $1
-                       AND newer.manifest_hash IS NOT NULL
+                       AND (
+                           newer.apply_committed_at IS NOT NULL
+                           OR newer.observing_since IS NOT NULL
+                       )
                        AND newer.created_at > failed_rollout.created_at
                 )
          )",
@@ -2741,14 +2773,18 @@ mod tests {
         // A rollout that terminalized on failure inside the settling
         // window still counts: its Kubernetes Deployment was applied and
         // the controller can keep replacing the TEE even though the SQL
-        // rows are terminal.
+        // rows are terminal. `observing_since` is the legacy proof that
+        // the apply reached the cluster (stamped at the watching
+        // transition); `apply_committed_at` is the same proof for rows
+        // that failed after the provider write but before observation.
         sqlx::query(
             "INSERT INTO deployments (
                  id, org_id, app_id, trigger, status, spec_snapshot,
-                 error_message, completed_at, manifest_hash
+                 error_message, completed_at, manifest_hash, observing_since
              ) VALUES (
                  $1, $2, $3, 'api', 'failed', '{}'::jsonb,
-                 'deployment_rollout_failed', clock_timestamp(), 'timed-out'
+                 'deployment_rollout_failed', clock_timestamp(), 'timed-out',
+                 clock_timestamp()
              )",
         )
         .bind(Uuid::new_v4())
@@ -2783,8 +2819,9 @@ mod tests {
         );
 
         // The same fresh failure stops counting once a later deployment
-        // applied a newer generation: only the newest applied generation's
-        // controller still acts, so the timed-out one is superseded.
+        // actually committed a newer generation to the cluster: only the
+        // newest cluster-applied generation's controller still acts, so
+        // the timed-out one is superseded.
         sqlx::query(
             "UPDATE deployments
                 SET completed_at = clock_timestamp()
@@ -2798,14 +2835,22 @@ mod tests {
             in_flight(&pool, app.id).await,
             "a fresh timed-out rollout counts again before supersession"
         );
+
+        // A newer attempt that stored a manifest hash but failed BEFORE
+        // the provider apply (e.g. during KBS reconciliation) does NOT
+        // supersede the timed-out rollout: `manifest_hash` is written at
+        // the 'applying' transition, before the cluster's desired state
+        // changed, so the older generation's controller is still the one
+        // converging. The pre-provider failure itself carries no
+        // apply-committed marker and is not settling evidence either.
         sqlx::query(
             "INSERT INTO deployments (
                  id, org_id, app_id, trigger, status, spec_snapshot,
                  error_message, completed_at, manifest_hash, created_at
              ) VALUES (
-                 $1, $2, $3, 'api', 'healthy', '{}'::jsonb,
-                 NULL, clock_timestamp(), 'superseding',
-                 clock_timestamp() + interval '1 second'
+                 $1, $2, $3, 'api', 'failed', '{}'::jsonb,
+                 'deployment_apply_failed', clock_timestamp(),
+                 'kbs-reconcile-failed', clock_timestamp() + interval '1 second'
              )",
         )
         .bind(Uuid::new_v4())
@@ -2813,10 +2858,80 @@ mod tests {
         .bind(app.id)
         .execute(&pool)
         .await
-        .expect("insert newer applied generation");
+        .expect("insert hash-only pre-apply failure");
+        assert!(
+            in_flight(&pool, app.id).await,
+            "a hash-only newer failure does not hide the active rollout"
+        );
+
+        // A newer deployment whose Kubernetes apply actually committed
+        // (`apply_committed_at`, stamped after the SSA provider write)
+        // supersedes the failed generations: its controller is the only
+        // one still acting on the cluster.
+        sqlx::query(
+            "INSERT INTO deployments (
+                 id, org_id, app_id, trigger, status, spec_snapshot,
+                 error_message, completed_at, manifest_hash,
+                 apply_committed_at, created_at
+             ) VALUES (
+                 $1, $2, $3, 'api', 'healthy', '{}'::jsonb,
+                 NULL, clock_timestamp(), 'superseding',
+                 clock_timestamp(), clock_timestamp() + interval '2 seconds'
+             )",
+        )
+        .bind(Uuid::new_v4())
+        .bind(app.org_id)
+        .bind(app.id)
+        .execute(&pool)
+        .await
+        .expect("insert newer cluster-applied generation");
         assert!(
             !in_flight(&pool, app.id).await,
             "a superseded timed-out generation no longer blocks holds"
+        );
+
+        // A POST-apply failure (backend resolution or ensure_haproxy_routes
+        // failing after the SSA apply committed) leaves the same converging
+        // controller behind: it counts as an unsettled rollout for the
+        // settling window.
+        sqlx::query(
+            "INSERT INTO deployments (
+                 id, org_id, app_id, trigger, status, spec_snapshot,
+                 error_message, completed_at, apply_committed_at, created_at
+             ) VALUES (
+                 $1, $2, $3, 'api', 'failed', '{}'::jsonb,
+                 'deployment_apply_failed', clock_timestamp(),
+                 clock_timestamp(), clock_timestamp() + interval '3 seconds'
+             )",
+        )
+        .bind(Uuid::new_v4())
+        .bind(app.org_id)
+        .bind(app.id)
+        .execute(&pool)
+        .await
+        .expect("insert post-apply failure");
+        assert!(
+            in_flight(&pool, app.id).await,
+            "a post-apply failure still owns the cluster generation"
+        );
+
+        // The same failure WITHOUT the apply marker changed nothing
+        // in-cluster (it failed before the provider call) and stays
+        // settled — only the marker distinguishes the two.
+        sqlx::query(
+            "UPDATE deployments
+                SET apply_committed_at = NULL
+              WHERE app_id = $1
+                AND error_message = 'deployment_apply_failed'
+                AND created_at > clock_timestamp()",
+        )
+        .bind(app.id)
+        .execute(&pool)
+        .await
+        .expect("strip the apply marker from the newest failure");
+        assert!(
+            !in_flight(&pool, app.id).await,
+            "a pre-provider failure never owned the cluster generation"
         );
 
         delete_setup_test_org(&pool, app.org_id).await;

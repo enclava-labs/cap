@@ -2243,6 +2243,20 @@ pub async fn apply_deployment_manifests(
         generation,
     )
     .await?;
+    // Durable proof the SSA apply committed to the cluster: unlike
+    // `manifest_hash` (stored at the 'applying' transition, before KBS
+    // reconciliation and before the provider write), this marker survives a
+    // post-apply failure (backend resolution, edge routes) and still names
+    // the cluster's latest applied generation for the rollout settling
+    // guard. Idempotent re-applies keep the first commit time.
+    sqlx::query(
+        "UPDATE deployments
+            SET apply_committed_at = COALESCE(apply_committed_at, clock_timestamp())
+          WHERE id = $1",
+    )
+    .bind(deployment_id)
+    .execute(&pool)
+    .await?;
     let edge_config = crate::edge::EdgeRouteConfig::from_env();
     let org_slug: String = sqlx::query_scalar("SELECT cust_slug FROM organizations WHERE id = $1")
         .bind(app.org_id)
