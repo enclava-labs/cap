@@ -209,9 +209,11 @@ where
 /// retains provider-state evidence so later failed generations stay
 /// cleanup-eligible).
 pub(crate) async fn sweep_published_objects_from_adopted_namespace(
+    state: &crate::state::AppState,
     app: &App,
+    failed_deployment_id: Uuid,
     generation: enclava_engine::apply::generation::MutationGeneration,
-    apply_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    _apply_started_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> usize {
     let client = match kube::Client::try_default().await {
         Ok(client) => client,
@@ -226,6 +228,31 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
         }
     };
     let sweep_deadline = tokio::time::Instant::now() + SWEEP_DEADLINE;
+    // The durable PROVEN bound: server-reported sts creation times of this
+    // row and every still-incomplete sibling (a completed sweep cleared
+    // those siblings' evidence — their claims were converged). Loaded
+    // fail-closed: a query failure counts as sweep failure (retryable),
+    // not as "no bound" (which would silently skip claims then clear
+    // evidence over them).
+    let sts_proven_created_at = match sqlx::query_scalar::<_, Option<chrono::DateTime<chrono::Utc>>>(
+        "SELECT MIN(sts_created_at) FROM deployments WHERE app_id = $1 AND (id = $2 OR (cleanup_sweep_incomplete AND sts_created_at IS NOT NULL))",
+    )
+    .bind(app.id)
+    .bind(failed_deployment_id)
+    .fetch_one(&state.db)
+    .await
+    {
+        Ok(bound) => bound,
+        Err(error) => {
+            tracing::warn!(
+                app_id = %app.id,
+                deployment_id = %failed_deployment_id,
+                error = %error,
+                "adopted-namespace sweep cannot load the proven sts bound; counting the sweep as failed for retry"
+            );
+            return usize::MAX;
+        }
+    };
     let mut failures = 0usize;
     for target in adopted_namespace_sweep_targets(app) {
         if tokio::time::Instant::now() >= sweep_deadline {
@@ -280,8 +307,12 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
                         None,
                         sweep_deadline,
                         // Retry sweep after a previous sweep deleted the
-                        // sts: fall back to the durable sts-step bound.
-                        apply_started_at,
+                        // sts: the durable PROVEN bound (server-reported
+                        // sts creation persisted by the apply response or
+                        // a previous sweep's live observation). NULL for
+                        // rows that predate provenance recording — fail
+                        // closed, touch nothing.
+                        sts_proven_created_at,
                         None,
                     )
                     .await;
@@ -313,11 +344,39 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
                 // delete PVCs created by THIS StatefulSet, not ones a tenant
                 // created between apply_started_at and when CAP reached the
                 // StatefulSet step.
-                statefulset_created_at = live.metadata.creation_timestamp.as_ref().and_then(|ts| {
-                    ts.0.to_string()
-                        .parse::<chrono::DateTime<chrono::Utc>>()
-                        .ok()
-                });
+                let observed_created_at =
+                    live.metadata.creation_timestamp.as_ref().and_then(|ts| {
+                        ts.0.to_string()
+                            .parse::<chrono::DateTime<chrono::Utc>>()
+                            .ok()
+                    });
+                statefulset_created_at = observed_created_at;
+                // Persist the proven bound before the delete: a sweep that
+                // deletes the sts but cannot finish the claim sweep leaves
+                // the row a server-reported creation time that retry sweeps
+                // (sts now absent) can rely on without re-observation.
+                if let (Some(uid), Some(created)) =
+                    (live.metadata.uid.as_deref(), observed_created_at)
+                    && let Err(error) = sqlx::query(
+                        "UPDATE deployments
+                            SET sts_uid = COALESCE(sts_uid, $3),
+                                sts_created_at = COALESCE(sts_created_at, $4)
+                          WHERE app_id = $1 AND id = $2",
+                    )
+                    .bind(app.id)
+                    .bind(failed_deployment_id)
+                    .bind(uid)
+                    .bind(created)
+                    .execute(&state.db)
+                    .await
+                {
+                    tracing::warn!(
+                        app_id = %app.id,
+                        deployment_id = %failed_deployment_id,
+                        error = %error,
+                        "adopted-namespace sweep could not persist the observed sts provenance; retry sweeps stay fail-closed"
+                    );
+                }
             }
             match bounded_sweep_read(
                 sweep_deadline,
@@ -426,11 +485,13 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
                 &target.name,
                 statefulset_uid.as_deref(),
                 sweep_deadline,
-                // Retry fallback when the sts timestamp could not be read.
-                apply_started_at,
+                // The row's durable proven bound (apply-response or a
+                // previous sweep's live observation), MIN'd with the live
+                // observation below — see sweep_statefulset_pvcs.
+                sts_proven_created_at,
                 // The sts was proven live and just deleted by THIS sweep:
                 // its own creationTimestamp is this instance's lineage
-                // bound — tighter and more specific than any row stamp.
+                // bound — server-reported, creation-specific evidence.
                 statefulset_created_at,
             )
             .await;
@@ -519,20 +580,28 @@ pub(crate) async fn sweep_statefulset_pvcs(
     statefulset: &str,
     statefulset_uid: Option<&str>,
     sweep_deadline: tokio::time::Instant,
-    sts_step_bound: Option<chrono::DateTime<chrono::Utc>>,
+    sts_proven_created_at: Option<chrono::DateTime<chrono::Utc>>,
     sts_observed_created_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> usize {
     const CAP_VCT_NAMES: [&str; 2] = ["state", "tls-state"];
-    // The effective bound is the EARLIEST sts-step evidence across the
-    // converged rows: the sibling-MIN durable stamp (which includes this
-    // row) tightened only when no older evidence exists. The observed
-    // sts's own creationTimestamp never WIDENS the deletion window past
-    // an older incomplete sibling's retained claims (devin: gen-1's
-    // 10:00 claim must still be swept by gen-2's sweep). All-None means
-    // no apply of this app ever provably reached the StatefulSet step
-    // and no sts was observed — no matching claim is provably CAP
-    // lineage, so touch nothing.
-    let bound = [sts_step_bound, sts_observed_created_at]
+    // Codex P1 (proven-only bounds): the deletion bound must be a
+    // server-reported creation time of an object CAP provably created or
+    // observed — the live sts's own creationTimestamp, or the recorded
+    // sts_created_at provenance (sibling-MIN across this row and every
+    // still-incomplete sibling). The PRE-CALL sts_apply_started_at stamp
+    // is NEVER a deletion bound: it precedes the Kubernetes write by an
+    // unbounded interval (setup/signing/KBS precede the sts step), so
+    // using it would sweep tenant claims created in that gap (devin:
+    // stamp 10:00:00, tenant claim 10:00:02, sts created 10:00:04 — the
+    // 10:00:02 claim must NOT be deletable by an instance whose sts was
+    // born 10:00:04). The MIN across proven times converges older
+    // incomplete siblings' retained claims (gen-1's 10:00 claim swept by
+    // gen-2's sweep) without ever widening THIS instance's window past
+    // its own proven creation: for claims newer than this instance's sts,
+    // the sibling whose sts provably created them supplies the bound.
+    // All-None means no proven creation evidence exists — no matching
+    // claim is provably CAP lineage, so touch nothing (fail closed).
+    let bound = [sts_observed_created_at, sts_proven_created_at]
         .into_iter()
         .flatten()
         .min();
@@ -540,7 +609,7 @@ pub(crate) async fn sweep_statefulset_pvcs(
         tracing::info!(
             namespace = %namespace,
             statefulset = %statefulset,
-            "adopted-namespace PVC sweep has no StatefulSet-step evidence; touching no claims"
+            "adopted-namespace PVC sweep has no proven StatefulSet creation evidence; touching no claims"
         );
         return 0;
     };
@@ -1156,7 +1225,9 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
             };
             match mutation
                 .guard_provider(sweep_published_objects_from_adopted_namespace(
+                    state,
                     app,
+                    failed_deployment_id,
                     namespace_generation,
                     apply_started_at,
                 ))

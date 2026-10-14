@@ -33,8 +33,19 @@ ALTER TABLE deployments
 -- later failed apply delete the namespace under that workload. Rows with
 -- manifest_hash only are partial applies: their provider state is exactly
 -- what a later generation's compensating sweep converges.
+--
+-- Codex P1: observing_since was added by migration 0047 (2026-09-14)
+-- WITHOUT a backfill, so a NULL value does NOT prove a legacy row never
+-- reached watching — rollout failures that predate 0047 also have NULL
+-- even though their StatefulSet and PVCs may still be live. Restrict the
+-- backfill to rows created after 0047 shipped (the column then existed
+-- for the row's whole lifecycle, so NULL really means never-watched).
+-- Older rows keep the gate veto: conservative, but the alternative is
+-- authorizing a later failed apply to sweep a possibly-live historical
+-- workload and its data.
 UPDATE deployments
    SET cleanup_sweep_incomplete = true
  WHERE status = 'failed'
    AND manifest_hash IS NOT NULL
-   AND observing_since IS NULL;
+   AND observing_since IS NULL
+   AND created_at >= TIMESTAMPTZ '2026-09-14 15:52:53+00';

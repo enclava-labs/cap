@@ -383,7 +383,41 @@ async fn apply_all_with_tenant_image_pull_secret(
     .bind(deployment_id)
     .execute(pool)
     .await?;
-    apply_statefulset(engine, ns_name, &sts, generation).await?;
+    let sts_live = apply_statefulset(engine, ns_name, &sts, generation).await?;
+    // Codex P1 (proven PVC bound): persist the server-reported UID and
+    // creationTimestamp of the StatefulSet object this apply produced (the
+    // POST/SSA response — not a pre-call stamp). This is the ONLY temporal
+    // evidence the PVC sweep may use as a deletion bound: the pre-call
+    // sts_apply_started_at precedes the Kubernetes write by an unbounded
+    // interval, so a tenant claim created in that gap must predate the
+    // bound. First-writer-wins keeps a retry from advancing the bound past
+    // claims the first attempt created.
+    if let (Some(uid), Some(created)) = (
+        sts_live.metadata.uid.as_deref(),
+        sts_live
+            .metadata
+            .creation_timestamp
+            .as_ref()
+            .map(|ts| ts.0.to_string())
+            .and_then(|raw| raw.parse::<chrono::DateTime<chrono::Utc>>().ok()),
+    ) && let Err(error) = sqlx::query(
+        "UPDATE deployments
+            SET sts_uid = COALESCE(sts_uid, $2),
+                sts_created_at = COALESCE(sts_created_at, $3)
+          WHERE id = $1",
+    )
+    .bind(deployment_id)
+    .bind(uid)
+    .bind(created)
+    .execute(pool)
+    .await
+    {
+        tracing::warn!(
+            deployment_id = %deployment_id,
+            error = %error,
+            "could not persist StatefulSet provenance; PVC sweep will require a live sts observation (fail closed)"
+        );
+    }
     tracing::info!(
         namespace = %ns_name,
         manifest_hash = %manifest_hash,
