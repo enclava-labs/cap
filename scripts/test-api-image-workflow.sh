@@ -128,10 +128,14 @@ scan_workflow() {
         if (mode == "run" && value ~ /\$\{\{/) print FNR ": " $0
         # A bare alias as the entire run value (`run: *payload`) is resolved
         # by YAML before the shell ever sees the text, so ban it outright.
-        if (mode == "anchors" && value ~ /^\*[A-Za-z_0-9]/) print FNR ": " $0
+        # Anchor names follow the YAML grammar: any printable except
+        # whitespace, flow indicators (, [ ] { }), and & or * themselves
+        # (excluding & * keeps shell `&&`/`**` from matching); `]` first and
+        # `[` last inside the bracket expression keep it POSIX-portable.
+        if (mode == "anchors" && value ~ /^\*[^][[:space:]{},&*]/) print FNR ": " $0
         in_run = 1
       } else if (mode == "anchors" && $0 !~ /^[[:space:]]*$/) {
-        if ($0 ~ /(^|[[:space:]])[&*][A-Za-z_0-9]/) print FNR ": " $0
+        if ($0 ~ /(^|[[:space:]])[&*][^][[:space:]{},&*]/) print FNR ": " $0
       }
     }
   ' "$2"
@@ -243,6 +247,20 @@ guard_case bare_alias_run '        run: *payload
 '
 [[ -n "$(scan_anchor_tokens "$guard_tmp/bare_alias_run.yml")" ]] \
   || fail "run-injection guard self-test (bare_alias_run): bare alias run value must be flagged"
+
+# Punctuation anchor names (`&.`, `*-foo`) are valid YAML 1.2 and must be
+# flagged, while shell `&&`/`||`/`**` in run bodies must not be (reviewer
+# self-check on #236 follow-ups).
+guard_case punct_anchor '        env:
+          SCRIPT: &. echo "${{ github.ref }}"
+        run: *.
+'
+[[ -n "$(scan_anchor_tokens "$guard_tmp/punct_anchor.yml")" ]] \
+  || fail "run-injection guard self-test (punct_anchor): punctuation-named anchors must be flagged"
+guard_case shell_operators '        run: make -j2 && ./test.sh || true
+'
+[[ -z "$(scan_anchor_tokens "$guard_tmp/shell_operators.yml")" ]] \
+  || fail "run-injection guard self-test (shell_operators): shell operators in run: must not be flagged"
 rm -rf "$guard_tmp"
 
 grep -Fq -- '      - "deploy/api/**"' "$WORKFLOW" \
