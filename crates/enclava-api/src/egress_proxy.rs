@@ -455,21 +455,33 @@ async fn idle_bounded_copy(a: &mut TcpStream, b: &mut TcpStream) -> std::io::Res
             buf_b[..n].to_vec()
         };
         let dst = if from_a { &mut *b } else { &mut *a };
-        // The completed read is progress: refresh the idle budget, and
-        // bound the forward write by the SAME window — an upstream that
-        // stops reading (TCP backpressure parks `write_all`) must not
-        // hold the tunnel, and its proxy slot, forever. A forward write
-        // that cannot finish within one idle window tears the tunnel
-        // down (cap#241 review).
+        // Forward the chunk with the idle budget enforced per WRITE, not
+        // per chunk: a peer that drains a full socket SLOWLY makes
+        // partial progress (each positive write resets the deadline, so
+        // a live transfer is never cut), while a peer that stops reading
+        // entirely cannot hold the tunnel — and its proxy slot — past
+        // one idle window (cap#241 review).
         budget = TUNNEL_IDLE_TIMEOUT;
-        match tokio::time::timeout(budget, dst.write_all(&data)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(e),
-            Err(_) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "egress proxy tunnel idle (stalled forward write)",
-                ));
+        let mut off = 0;
+        while off < data.len() {
+            match tokio::time::timeout(budget, dst.write(&data[off..])).await {
+                Ok(Ok(0)) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "egress proxy peer closed mid-write",
+                    ));
+                }
+                Ok(Ok(written)) => {
+                    off += written;
+                    budget = TUNNEL_IDLE_TIMEOUT; // write progress resets the clock
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "egress proxy tunnel idle (stalled forward write)",
+                    ));
+                }
             }
         }
     }
@@ -1098,10 +1110,14 @@ mod tests {
             head.push(byte[0]);
         }
         // Upload more than the sockets' combined buffers so the proxy's
-        // forward write blocks on the non-reading upstream.
+        // forward write blocks on the non-reading upstream. The client's
+        // own write is deadline-bounded too: if a regression makes the
+        // proxy stop reading, the test must fail fast, not hang.
         let big = vec![b'x'; 4 * 1024 * 1024];
         let start = std::time::Instant::now();
-        let write_err = stream.write_all(&big).await;
+        let write_err = tokio::time::timeout(TUNNEL_IDLE_TIMEOUT * 3, stream.write_all(&big))
+            .await
+            .expect("client write must not hang forever");
         // The client's own write may error first (proxy tore the tunnel
         // down) or succeed partially — what matters is the proxy side
         // releases the slot. Wait for the close.
