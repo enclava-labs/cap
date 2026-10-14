@@ -360,7 +360,7 @@ fn handle_connection(
     // that stops reading — follow or not — and a rotation landing in that
     // window unlinks the inode this fd pins (~32 MiB). Staggered stalled
     // clients could otherwise pin successive rotation generations past the
-    // 64 MiB emptyDir cap, exactly the hazard the rotation-resync path
+    // 4 GiB emptyDir cap, exactly the hazard the rotation-resync path
     // already guards against inside follow_spool. For followers, seed the
     // follow state first (round-15 review P2): the anchor comes from
     // tail_lines' SNAPSHOT (never live content) and is cross-checked
@@ -851,7 +851,7 @@ fn tail_lines(path: &Path, count: usize) -> io::Result<(Vec<String>, u64, File, 
 /// open fd was the old rotation signal — while pinned, the filesystem
 /// cannot recycle the inode number — but a stalled client can block a socket
 /// write for up to FOLLOW_IO_TIMEOUT and every open fd keeps an unlinked
-/// ~32 MiB rotation generation alive against the 64 MiB emptyDir cap.
+/// ~32 MiB rotation generation alive against the 4 GiB emptyDir cap.
 ///
 /// The anchor trades the fd's non-recycling guarantee for a fingerprint
 /// probe: two rotations inside one blocked client write CAN numerically
@@ -1950,7 +1950,7 @@ mod tests {
     /// A stalled client can block the post-rotation client write for up to
     /// FOLLOW_IO_TIMEOUT while the unlinked old inode (~32 MiB) stays
     /// pinned; staggered stalled followers could each pin a different
-    /// rotation generation past the 64 MiB emptyDir cap. Deterministic pin:
+    /// rotation generation past the 4 GiB emptyDir cap. Deterministic pin:
     /// a writer that fails the post-rotation write must leave `held` empty —
     /// previously the old handle was only replaced after a successful write
     /// and flush, so a failed/blocked write kept it pinned.
