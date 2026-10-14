@@ -210,6 +210,19 @@ fn authenticated_open(
             HeaderSeal::Sealed => {
                 activate_detached(device, &detached_path, mapping_name, &keys.passphrase)?;
             }
+            HeaderSeal::InterruptedSeal => {
+                // A previous boot's seal was interrupted between the two slot
+                // writes. verify_header_seal already proved the surviving MAC
+                // authenticates this exact payload under our key (the host
+                // cannot forge that), so the header is not attacker-chosen:
+                // finish the seal and activate through the detached copy.
+                luks2_seal::seal_on_disk(device, region, &keys.header_mac_key)?;
+                tracing::info!(
+                    device = %device.display(),
+                    "completed interrupted header seal from previous boot"
+                );
+                activate_detached(device, &detached_path, mapping_name, &keys.passphrase)?;
+            }
             HeaderSeal::Unsealed => {
                 // Legacy pre-seal volume. Gate adoption on a passphrase test
                 // through the detached copy, then seal. Adoption never falls
@@ -279,7 +292,8 @@ fn validate_existing_mapper(device: &Path, mapping_name: &str, keys: &VolumeKeys
     // before trusting the existing activation.
     let region = luks2_seal::read_header_region(device)?;
     validate_region(&region)?;
-    if let HeaderSeal::Unsealed = luks2_seal::verify_header_seal(&region, &keys.header_mac_key)? {
+    let mut seal = luks2_seal::verify_header_seal(&region, &keys.header_mac_key)?;
+    if let HeaderSeal::Unsealed = seal {
         // Mapper already active for a legacy volume this boot; adopt+seal
         // through the same gate the open path uses.
         let detached_path = detached_header_path(mapping_name);
@@ -289,9 +303,129 @@ fn validate_existing_mapper(device: &Path, mapping_name: &str, keys: &VolumeKeys
             luks2_seal::seal_on_disk(device, &region, &keys.header_mac_key)
         })();
         luks2_seal::wipe_detached_copy(&detached_path, region.bytes.len());
-        return result;
+        result?;
+        seal = HeaderSeal::Sealed;
     }
+    if let HeaderSeal::InterruptedSeal = seal {
+        // Same recovery as the open path: the surviving MAC authenticated
+        // this exact payload under our key, so finish the interrupted seal.
+        luks2_seal::seal_on_disk(device, &region, &keys.header_mac_key)?;
+    }
+    // An existing mapper is dm-crypt state created by an earlier boot of this
+    // code, but the host controls the disk and could substitute a mapper we
+    // did not create. Prove the live mapper is encrypted with the volume key
+    // bound to the just-authenticated header before the caller mounts it:
+    // extract the volume key from the authenticated (MAC-verified) header via
+    // a detached copy using our passphrase, then ask libcryptsetup to verify
+    // that key against the *active* mapper.
+    verify_active_mapper_volume_key(device, &region, mapping_name, keys)?;
     Ok(())
+}
+
+/// Bind the active mapper to the authenticated header.
+///
+/// The host controls the disk and could substitute a mapper we did not
+/// create, so an existing `/dev/mapper/<name>` is never trusted on its
+/// backing device alone. Two properties tie the live mapper to the header we
+/// just MAC-verified:
+///
+/// 1. `cryptsetup status` reports the backing device, already checked by the
+///    caller (`paths_equivalent`).
+/// 2. The dm table's keyring key description has the form
+///    `:64:logon:cryptsetup:<luks-uuid>-d0` where `<luks-uuid>` is the UUID
+///    of the header cryptsetup loaded *at activation time*. Requiring that
+///    UUID to equal the UUID of the MAC-verified on-disk header binds the
+///    active mapper to this exact authenticated header — a mapper activated
+///    from any other header (including a substituted or rolled-back one)
+///    carries a different UUID and is rejected. The UUID sits at binary
+///    offset 0xa8 of each metadata copy, inside the region the header MAC
+///    covers, so it cannot be forged without the MAC key.
+fn verify_active_mapper_volume_key(
+    device: &Path,
+    region: &Luks2Region,
+    mapping_name: &str,
+    _keys: &VolumeKeys,
+) -> Result<()> {
+    let expected_uuid = region_header_uuid(region)?;
+    let table = dm_crypt_table(mapping_name)?;
+    let key_description = parse_dm_key_description(&table).ok_or_else(|| {
+        InitError::Luks(format!(
+            "existing mapper {mapping_name} does not expose a cryptsetup keyring key; \
+             refusing to use it"
+        ))
+    })?;
+    // Keyring key description format: cryptsetup:<luks-uuid>-d0
+    let bound_uuid = key_description
+        .strip_prefix("cryptsetup:")
+        .and_then(|rest| rest.strip_suffix("-d0"))
+        .ok_or_else(|| {
+            InitError::Luks(format!(
+                "existing mapper {mapping_name} key description {key_description:?} is not \
+                 a cryptsetup LUKS2 volume key; refusing to use it"
+            ))
+        })?;
+    if bound_uuid != expected_uuid {
+        return Err(InitError::Luks(format!(
+            "existing mapper {mapping_name} was activated from header UUID {bound_uuid}, \
+             but the authenticated header for {} has UUID {expected_uuid}; possible mapper \
+             or header substitution, refusing to use it",
+            device.display()
+        )));
+    }
+    tracing::info!(
+        mapping = mapping_name,
+        uuid = %expected_uuid,
+        "existing mapper bound to authenticated header via keyring key UUID"
+    );
+    Ok(())
+}
+
+/// LUKS2 UUID field offset inside each binary metadata copy (canonical
+/// on-disk layout; strictly inside the MAC-covered region and outside the
+/// checksum field our seal slot avoids).
+const LUKS2_UUID_OFFSET: usize = 0xa8;
+const LUKS2_UUID_LEN: usize = 36;
+
+/// Extract the LUKS2 UUID string from the (MAC-verified) header region.
+fn region_header_uuid(region: &Luks2Region) -> Result<String> {
+    let raw = &region.bytes[LUKS2_UUID_OFFSET..LUKS2_UUID_OFFSET + LUKS2_UUID_LEN];
+    let uuid = std::str::from_utf8(raw)
+        .map_err(|_| InitError::Luks("LUKS2 header UUID is not UTF-8".into()))?
+        .to_string();
+    if uuid.bytes().any(|b| !(b.is_ascii_hexdigit() || b == b'-')) || uuid.len() != 36 {
+        return Err(InitError::Luks(format!(
+            "LUKS2 header UUID {uuid:?} is malformed"
+        )));
+    }
+    Ok(uuid)
+}
+
+/// The dm table line of an active mapper, with keyring key descriptions
+/// visible (`dmsetup table --showkeys`), e.g.
+/// `0 98304 crypt aes-xts-plain64 :64:logon:cryptsetup:<uuid>-d0 0 7:0 32768`.
+fn dm_crypt_table(mapping_name: &str) -> Result<String> {
+    let output = std::process::Command::new("dmsetup")
+        .args(["table", "--showkeys", mapping_name])
+        .output()
+        .map_err(|e| InitError::Luks(format!("dmsetup table {mapping_name}: {e}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(InitError::Luks(format!(
+            "dmsetup table --showkeys {mapping_name} exited with {}: {}",
+            output.status,
+            stderr.trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Pull the `:64:logon:cryptsetup:<uuid>-d0` key description out of a dm
+/// crypt table line.
+fn parse_dm_key_description(table: &str) -> Option<String> {
+    let start = table.find(":logon:")?;
+    let rest = &table[start + ":logon:".len()..];
+    let end = rest.find(' ')?;
+    Some(rest[..end].to_string())
 }
 
 /// Format the device if it's not yet a LUKS2 volume, then activate it.
@@ -975,27 +1109,85 @@ mod tests {
         Ok((dir, path))
     }
 
+    fn volume_keys() -> VolumeKeys {
+        VolumeKeys::new(
+            DerivedSeed([0x11u8; 32]),
+            crate::seeds::derive(
+                &crate::secrets::OwnerSeed([0x11u8; 32]),
+                crate::seeds::STATE_HEADER_MAC_INFO,
+            )
+            .expect("mac key"),
+        )
+    }
+
+    /// Attach a loop device for the image when running privileged, so that
+    /// `cryptsetup status` reports exactly the device we pass (cryptsetup
+    /// otherwise silently auto-attaches its own loop device for file images
+    /// and the backing-device equivalence check sees /dev/loopN instead of
+    /// the image path). Falls back to the raw image when `losetup` is
+    /// unavailable or we lack privileges.
+    fn attach_loop_device(img: &Path) -> PathBuf {
+        let output = std::process::Command::new("losetup")
+            .args(["--find", "--show", "--partscan"])
+            .arg(img)
+            .output();
+        match output {
+            Ok(out) if out.status.success() => {
+                let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if path.is_empty() {
+                    img.to_path_buf()
+                } else {
+                    PathBuf::from(path)
+                }
+            }
+            _ => img.to_path_buf(),
+        }
+    }
+
+    fn detach_loop_device(device: &Path) {
+        if device.starts_with("/dev/loop") {
+            let _ = std::process::Command::new("losetup")
+                .arg("--detach")
+                .arg(device)
+                .status();
+        }
+    }
+
+    /// Best-effort removal of a mapper left behind by an earlier (possibly
+    /// crashed) test run, so fixed mapping names stay idempotent.
+    fn close_mapper(mapping_name: &str) {
+        let _ = std::process::Command::new("cryptsetup")
+            .args(["close", mapping_name])
+            .status();
+    }
+
     /// Detached-header plumbing writes under /run/enclava; without root or a
     /// real /run/enclava the tmpfs copy cannot be created, so integration
     /// tests run privileged (CI runs them compile-only; the SEV-SNP nightlies
-    /// run them for real).
+    /// run them for real). write_detached_copy also enforces tmpfs, so skip
+    /// on dev machines whose /run/enclava is not RAM-backed.
     fn can_write_run_enclava() -> bool {
-        let probe = format!(
-            "/run/enclava/.luks-integration-probe-{}-{}",
-            std::process::id(),
-            DETACHED_HEADER_COUNTER.fetch_add(1, Ordering::Relaxed)
-        );
         std::fs::create_dir_all("/run/enclava").is_ok()
-            && OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&probe)
-                .map(|f| {
-                    drop(f);
-                    let _ = remove_file(&probe);
-                    true
-                })
+            && nix::sys::statfs::statfs("/run/enclava")
+                .map(|s| s.filesystem_type() == nix::sys::statfs::TMPFS_MAGIC)
                 .unwrap_or(false)
+            && {
+                let probe = format!(
+                    "/run/enclava/.luks-integration-probe-{}-{}",
+                    std::process::id(),
+                    DETACHED_HEADER_COUNTER.fetch_add(1, Ordering::Relaxed)
+                );
+                OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&probe)
+                    .map(|f| {
+                        drop(f);
+                        let _ = remove_file(&probe);
+                        true
+                    })
+                    .unwrap_or(false)
+            }
     }
 
     #[test]
@@ -1005,20 +1197,24 @@ mod tests {
             return Ok(());
         }
         let (_dir, img) = make_backing_file(64)?;
+        let device = attach_loop_device(&img);
         let keys = volume_keys();
-        format(&img, &keys).expect("format+seal");
+        close_mapper("enclava-init-test");
+        format(&device, &keys).expect("format+seal");
 
         // On-disk header must now be invalid for stock cryptsetup.
         let status = std::process::Command::new("cryptsetup")
             .args(["isLuks", "--type", "luks2"])
-            .arg(&img)
+            .arg(&device)
             .status()
             .expect("run isLuks");
         assert_eq!(status.code(), Some(1), "sealed header must fail isLuks");
 
-        let opened = open(&img, "enclava-init-test", &keys).expect("open sealed volume");
+        let opened = open(&device, "enclava-init-test", &keys).expect("open sealed volume");
         assert!(opened.mapper_path.starts_with("/dev/mapper/"));
 
+        close_mapper("enclava-init-test");
+        detach_loop_device(&device);
         Ok(())
     }
 
@@ -1029,21 +1225,24 @@ mod tests {
             return Ok(());
         }
         let (_dir, img) = make_backing_file(64)?;
+        let device = attach_loop_device(&img);
         let keys = volume_keys();
-        format(&img, &keys).expect("format+seal");
+        close_mapper("enclava-init-test-tamper");
+        format(&device, &keys).expect("format+seal");
 
         // Flip one byte inside the keyslots area (host-tamper simulation).
-        let mut f = OpenOptions::new().write(true).open(&img)?;
+        let mut f = OpenOptions::new().write(true).open(&device)?;
         f.seek(SeekFrom::Start(0x80000))?;
         f.write_all(&[0xAA])?;
         drop(f);
 
-        let err = open(&img, "enclava-init-test-tamper", &keys)
+        let err = open(&device, "enclava-init-test-tamper", &keys)
             .expect_err("tampered header must fail closed");
         assert!(
             err.to_string().contains("MAC mismatch"),
             "expected MAC mismatch, got: {err}"
         );
+        detach_loop_device(&device);
         Ok(())
     }
 
@@ -1054,13 +1253,16 @@ mod tests {
             return Ok(());
         }
         let (_dir, img) = make_backing_file(64)?;
+        let device = attach_loop_device(&img);
         let keys = volume_keys();
-        format(&img, &keys).expect("format+seal");
+        close_mapper("enclava-init-test-wrongkey");
+        format(&device, &keys).expect("format+seal");
 
         let wrong = VolumeKeys::new(keys.passphrase.clone(), DerivedSeed([0xEEu8; 32]));
-        let err = open(&img, "enclava-init-test-wrongkey", &wrong)
+        let err = open(&device, "enclava-init-test-wrongkey", &wrong)
             .expect_err("wrong MAC key must fail closed");
         assert!(err.to_string().contains("MAC mismatch"));
+        detach_loop_device(&device);
         Ok(())
     }
 
@@ -1071,14 +1273,16 @@ mod tests {
             return Ok(());
         }
         let (_dir, img) = make_backing_file(64)?;
+        let device = attach_loop_device(&img);
         let keys = volume_keys();
+        close_mapper("enclava-init-test-adopt");
 
         // Simulate a pre-#242 volume: plain cryptsetup format, no seal.
         with_key_file(&keys.passphrase, |key_file| {
             let args = vec![
                 "--disable-locks".to_string(),
                 "luksFormat".to_string(),
-                path_arg(&img)?,
+                path_arg(&device)?,
                 "--key-file".to_string(),
                 path_arg(key_file)?,
                 "--type".to_string(),
@@ -1095,15 +1299,82 @@ mod tests {
         })?;
 
         let opened =
-            open(&img, "enclava-init-test-adopt", &keys).expect("legacy volume is adopted");
+            open(&device, "enclava-init-test-adopt", &keys).expect("legacy volume is adopted");
         assert!(opened.mapper_path.exists());
 
         // After adoption the header must be sealed on disk.
-        let region = luks2_seal::read_header_region(&img)?;
+        let region = luks2_seal::read_header_region(&device)?;
         assert_eq!(
             luks2_seal::verify_header_seal(&region, &keys.header_mac_key)?,
             HeaderSeal::Sealed
         );
+        close_mapper("enclava-init-test-adopt");
+        detach_loop_device(&device);
+        Ok(())
+    }
+
+    #[test]
+    fn interrupted_seal_is_completed_and_volume_opens() -> Result<()> {
+        if !can_write_run_enclava() {
+            eprintln!("skipping: cannot write /run/enclava (needs root)");
+            return Ok(());
+        }
+        let (_dir, img) = make_backing_file(64)?;
+        let device = attach_loop_device(&img);
+        let keys = volume_keys();
+        close_mapper("enclava-init-test-interrupted");
+        format(&device, &keys).expect("format+seal");
+
+        // Simulate a crash between the two seal slot writes: zero the second
+        // slot, leaving the first MAC in place.
+        let start = luks2_seal::LUKS2_METADATA_COPY_SIZE + luks2_seal::HEADER_MAC_SLOT_OFFSET;
+        let mut f = OpenOptions::new().write(true).open(&device)?;
+        f.seek(SeekFrom::Start(start as u64))?;
+        f.write_all(&vec![0u8; luks2_seal::HEADER_MAC_LEN])?;
+        drop(f);
+
+        // Interrupted seal must be reported as such and then self-heal.
+        let region = luks2_seal::read_header_region(&device)?;
+        assert_eq!(
+            luks2_seal::verify_header_seal(&region, &keys.header_mac_key)?,
+            HeaderSeal::InterruptedSeal
+        );
+
+        let opened = open(&device, "enclava-init-test-interrupted", &keys)
+            .expect("interrupted seal recovers and opens");
+        assert!(opened.mapper_path.exists());
+
+        let region = luks2_seal::read_header_region(&device)?;
+        assert_eq!(
+            luks2_seal::verify_header_seal(&region, &keys.header_mac_key)?,
+            HeaderSeal::Sealed
+        );
+        close_mapper("enclava-init-test-interrupted");
+        detach_loop_device(&device);
+        Ok(())
+    }
+
+    #[test]
+    fn existing_mapper_is_revalidated_against_authenticated_header() -> Result<()> {
+        if !can_write_run_enclava() {
+            eprintln!("skipping: cannot write /run/enclava (needs root)");
+            return Ok(());
+        }
+        let (_dir, img) = make_backing_file(64)?;
+        let device = attach_loop_device(&img);
+        let keys = volume_keys();
+        close_mapper("enclava-init-test-mapper");
+        format(&device, &keys).expect("format+seal");
+        let opened = open(&device, "enclava-init-test-mapper", &keys).expect("open");
+        assert!(opened.mapper_path.exists());
+
+        // Re-open with the mapper already active: validate_existing_mapper
+        // must pass (the mapper is genuinely ours) and complete without error.
+        let reopened = open(&device, "enclava-init-test-mapper", &keys)
+            .expect("existing mapper is revalidated and reused");
+        assert_eq!(reopened.mapper_path, opened.mapper_path);
+        close_mapper("enclava-init-test-mapper");
+        detach_loop_device(&device);
         Ok(())
     }
 }

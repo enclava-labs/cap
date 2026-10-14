@@ -92,6 +92,12 @@ pub enum HeaderSeal {
     Sealed,
     /// Both slots zero: a legacy pre-seal volume, eligible for adoption.
     Unsealed,
+    /// Exactly one slot zero and the other matching the MAC computed over
+    /// the payload: an interrupted `seal_on_disk` from a previous boot of
+    /// this code, eligible for self-healing (the seal is rewritten) but not
+    /// for legacy adoption. Any other single-slot-zero layout is an error
+    /// (see [`verify_header_seal`]).
+    InterruptedSeal,
 }
 
 /// The full authenticated header region `[0, data_offset)` read from disk.
@@ -393,18 +399,42 @@ pub fn compute_header_mac(region: &[u8], mac_key: &DerivedSeed) -> Result<[u8; H
 }
 
 /// Check the on-disk MAC slots. Fails closed on any inconsistency.
+///
+/// Crash consistency (cap#242 review): `seal_on_disk` writes two independent
+/// slots, so a crash or write error can leave one slot written and the other
+/// zero. That state is recoverable **without** the adoption passphrase gate:
+/// the surviving slot must authenticate the payload under `mac_key` — the
+/// host cannot forge it — so treating it as an interrupted seal and rewriting
+/// the seal cannot strand the volume. If the surviving slot does *not* match,
+/// the state is indistinguishable from tampering and we fail closed.
 pub fn verify_header_seal(region: &Luks2Region, mac_key: &DerivedSeed) -> Result<HeaderSeal> {
     let slot1 = region.slot(0);
     let slot2 = region.slot(LUKS2_METADATA_COPY_SIZE);
-    if slot1.iter().all(|&b| b == 0) && slot2.iter().all(|&b| b == 0) {
+    let slot1_zero = slot1.iter().all(|&b| b == 0);
+    let slot2_zero = slot2.iter().all(|&b| b == 0);
+    if slot1_zero && slot2_zero {
         return Ok(HeaderSeal::Unsealed);
+    }
+    let expected = compute_header_mac(&region.bytes, mac_key)?;
+    if slot1_zero != slot2_zero {
+        let survivor = if slot1_zero { slot2 } else { slot1 };
+        if survivor.ct_eq(&expected).unwrap_u8() == 1 {
+            tracing::warn!(
+                "LUKS2 header seal interrupted between slot writes; recovering (surviving MAC slot authenticates the header)"
+            );
+            return Ok(HeaderSeal::InterruptedSeal);
+        }
+        return Err(luks_error(
+            "LUKS2 header has exactly one zero MAC slot and the other does not authenticate \
+             the header; refusing to open (possible host tampering or corrupted seal)"
+                .into(),
+        ));
     }
     if slot1.ct_eq(slot2).unwrap_u8() != 1 {
         return Err(luks_error(
             "LUKS2 header MAC copies differ; refusing to open (possible host tampering)".into(),
         ));
     }
-    let expected = compute_header_mac(&region.bytes, mac_key)?;
     if slot1.ct_eq(&expected).unwrap_u8() == 1 {
         Ok(HeaderSeal::Sealed)
     } else {
@@ -434,10 +464,16 @@ pub fn seal_on_disk(device: &Path, region: &Luks2Region, mac_key: &DerivedSeed) 
 
 /// Write a tmpfs copy of the region (MAC slots zeroed) for detached-header
 /// cryptsetup operations. Never on the host-controlled disk.
+///
+/// The copy must land on tmpfs (RAM-backed) so the plaintext header never
+/// reaches host-controlled persistent storage, and the filesystem must have
+/// room for the full `[0, data_offset)` region — both enforced here rather
+/// than assumed from the deployment layout (cap#242 review).
 pub fn write_detached_copy(region: &Luks2Region, path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| luks_error(format!("create {}: {e}", parent.display())))?;
+        ensure_detached_copy_filesystem(parent, region.bytes.len())?;
     }
     let mut file = OpenOptions::new()
         .write(true)
@@ -449,6 +485,31 @@ pub fn write_detached_copy(region: &Luks2Region, path: &Path) -> Result<()> {
         .map_err(|e| luks_error(format!("write detached header {}: {e}", path.display())))?;
     file.sync_all()
         .map_err(|e| luks_error(format!("sync detached header {}: {e}", path.display())))?;
+    Ok(())
+}
+
+/// Fail closed unless the detached-header directory is tmpfs (which includes
+/// tmpfs rootfs in minimal guest images) with enough free space for the
+/// region.
+fn ensure_detached_copy_filesystem(dir: &Path, region_len: usize) -> Result<()> {
+    let fs_stat = nix::sys::statfs::statfs(dir)
+        .map_err(|e| luks_error(format!("statfs {}: {e}", dir.display())))?;
+    if fs_stat.filesystem_type() != nix::sys::statfs::TMPFS_MAGIC {
+        return Err(luks_error(format!(
+            "detached header directory {} is on filesystem type {:?}, not tmpfs; \
+             refusing to write the authenticated header outside RAM-backed storage",
+            dir.display(),
+            fs_stat.filesystem_type()
+        )));
+    }
+    let free = fs_stat.blocks_available() as u64 * fs_stat.block_size() as u64;
+    if free < region_len as u64 {
+        return Err(luks_error(format!(
+            "detached header directory {} has only {free} bytes free; \
+             need {region_len} for the header region",
+            dir.display()
+        )));
+    }
     Ok(())
 }
 
@@ -748,11 +809,6 @@ mod tests {
         let err = verify_header_seal(&region, &other_key).expect_err("wrong key");
         assert!(err.to_string().contains("MAC mismatch"));
 
-        // single-copy MAC -> copies differ
-        region.bytes[HEADER_MAC_SLOT_OFFSET..HEADER_MAC_SLOT_OFFSET + HEADER_MAC_LEN].fill(0);
-        let err = verify_header_seal(&region, &mac_key).expect_err("single copy");
-        assert!(err.to_string().contains("copies differ"));
-
         // restore, tamper payload -> mismatch
         region.bytes[HEADER_MAC_SLOT_OFFSET..HEADER_MAC_SLOT_OFFSET + HEADER_MAC_LEN]
             .copy_from_slice(&slot);
@@ -760,6 +816,52 @@ mod tests {
         region.bytes[mid] ^= 0xFF;
         let err = verify_header_seal(&region, &mac_key).expect_err("tampered payload");
         assert!(err.to_string().contains("MAC mismatch"));
+    }
+
+    #[test]
+    fn interrupted_seal_with_valid_survivor_is_recoverable() {
+        // seal_on_disk crashed after the first slot write: exactly one slot
+        // zero, the survivor authenticating the payload.
+        let mut region = synth_region(VALID_JSON);
+        let mac_key = DerivedSeed([0x24u8; 32]);
+        let slot = compute_header_mac(&region.bytes, &mac_key).unwrap();
+
+        region.bytes[HEADER_MAC_SLOT_OFFSET..HEADER_MAC_SLOT_OFFSET + HEADER_MAC_LEN]
+            .copy_from_slice(&slot);
+        assert_eq!(
+            verify_header_seal(&region, &mac_key).expect("interrupted (first write)"),
+            HeaderSeal::InterruptedSeal
+        );
+
+        // Symmetric case: second slot written, first still zero.
+        let mut region = synth_region(VALID_JSON);
+        let start = LUKS2_METADATA_COPY_SIZE + HEADER_MAC_SLOT_OFFSET;
+        region.bytes[start..start + HEADER_MAC_LEN].copy_from_slice(&slot);
+        assert_eq!(
+            verify_header_seal(&region, &mac_key).expect("interrupted (second write)"),
+            HeaderSeal::InterruptedSeal
+        );
+    }
+
+    #[test]
+    fn interrupted_seal_with_wrong_survivor_fails_closed() {
+        // One slot zero and the survivor NOT matching the MAC: tampering or
+        // corruption — never recoverable.
+        let mut region = synth_region(VALID_JSON);
+        let mac_key = DerivedSeed([0x24u8; 32]);
+        let other_key = DerivedSeed([0x42u8; 32]);
+        let wrong = compute_header_mac(&region.bytes, &other_key).unwrap();
+        region.bytes[HEADER_MAC_SLOT_OFFSET..HEADER_MAC_SLOT_OFFSET + HEADER_MAC_LEN]
+            .copy_from_slice(&wrong);
+        let err = verify_header_seal(&region, &mac_key).expect_err("forged survivor");
+        assert!(err.to_string().contains("one zero MAC slot"));
+
+        // Two different nonzero slots still fail as before.
+        let right = compute_header_mac(&region.bytes, &mac_key).unwrap();
+        let start = LUKS2_METADATA_COPY_SIZE + HEADER_MAC_SLOT_OFFSET;
+        region.bytes[start..start + HEADER_MAC_LEN].copy_from_slice(&right);
+        let err = verify_header_seal(&region, &mac_key).expect_err("differing copies");
+        assert!(err.to_string().contains("copies differ"));
     }
 
     #[test]

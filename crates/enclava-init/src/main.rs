@@ -1186,7 +1186,10 @@ fn open_luks_volumes(
     let state_opened = open_one_volume(
         &cfg.state,
         owner,
-        seeds::STATE_LUKS_INFO,
+        // The passphrase stays derived from the signed per-volume
+        // `hkdf_info` exactly as before this change: volumes provisioned
+        // with a custom signed value must keep unlocking (cap#242 review).
+        &cfg.state.hkdf_info,
         seeds::STATE_HEADER_MAC_INFO,
     )
     .with_context(|| format!("opening state volume {}", cfg.state.device))?;
@@ -1195,7 +1198,7 @@ fn open_luks_volumes(
     let tls_opened = open_one_volume(
         &cfg.tls_state,
         owner,
-        seeds::TLS_STATE_LUKS_INFO,
+        &cfg.tls_state.hkdf_info,
         seeds::TLS_STATE_HEADER_MAC_INFO,
     )
     .with_context(|| format!("opening tls-state volume {}", cfg.tls_state.device))?;
@@ -1207,13 +1210,19 @@ fn open_luks_volumes(
 fn open_one_volume(
     vol: &VolumeConfig,
     owner: &OwnerSeed,
-    luks_info: &[u8],
+    // Passphrase HKDF info: the signed per-volume value (validated against
+    // the signed cc-init-data by
+    // `validate_configmap_transport_against_signed_cc_init_data` before boot
+    // proceeds).
+    passphrase_info: &str,
+    // Header-MAC HKDF branch: pinned per volume kind, never configurable, so
+    // the MAC key cannot be steered by config data.
     header_mac_info: &[u8],
 ) -> Result<luks::LuksOpened> {
     // Distinct HKDF branches: the volume passphrase and the header MAC key
     // must never share material (cap#242).
     let keys = luks::VolumeKeys::new(
-        derive_volume_key(owner, luks_info)?,
+        derive_volume_key(owner, passphrase_info.as_bytes())?,
         derive_volume_key(owner, header_mac_info)?,
     );
     let device = Path::new(&vol.device);
