@@ -8,16 +8,29 @@ ALTER TABLE deployments
     ADD COLUMN apply_started_at timestamptz,
     ADD COLUMN sts_apply_started_at timestamptz,
     ADD COLUMN sts_uid text,
-    ADD COLUMN sts_created_at timestamptz;
+    ADD COLUMN sts_created_at timestamptz,
+    ADD COLUMN sts_observed_deleted_at timestamptz;
 
 -- sts_apply_started_at is stamped immediately before the apply attempts
 -- the StatefulSet step (the final apply phase): it is the earliest moment
 -- a `<vct>-<sts>-<ordinal>` claim of this workload could come under CAP
 -- lineage (the StatefulSet controller creates-or-adopts the ordinal-0
--- claims). The PVC sweep uses it as its temporal ownership bound, so a
--- tenant claim created after `apply_started_at` but before the StatefulSet
--- step can never be swept. NULL means the apply never reached the
--- StatefulSet step and its claim-name namespace was never CAP-touched.
+-- claims). It is NEVER a deletion bound (it precedes the Kubernetes
+-- write by an unbounded interval); its role is marking that the row
+-- REACHED the sts step, so a sweep that finds no sts_created_at
+-- provenance for it must fail closed on unproven claims.
+--
+-- sts_uid / sts_created_at / sts_observed_deleted_at record the PROVEN
+-- lineage window of the StatefulSet this row's apply created: the
+-- server-reported UID and creationTimestamp (from the apply response, or
+-- a sweep's live observation), and the time a sweep stamped BEFORE
+-- issuing the sts delete. A claim is deletable by a retry sweep (sts
+-- gone) only on claim-specific evidence: a controller ownerReference
+-- pinning the proven UID, or creation strictly INSIDE the closed window
+-- [sts_created_at, sts_observed_deleted_at] — the creation time alone is
+-- only a lower bound, and a tenant claim created after the sts deletion
+-- must never be swept. NULL sts_observed_deleted_at = open window =
+-- fail closed.
 
 -- Legacy terminal rows: historical apply failures commonly retain
 -- manifest_hash evidence. Without the marker they would make
