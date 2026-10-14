@@ -88,554 +88,417 @@ for required in \
   assert_contains "$required"
 done
 
-# No template interpolation may appear inside a `run:` block body (#226):
-# values influenced by ref content or dispatch inputs must reach the shell
-# only through an `env:` binding (runner-set, never shell-parsed). This guards
-# against direct interpolation being reintroduced anywhere in the workflow,
-# not just drift of the exact lines fixed above. Any `run:` value counts —
-# literal blocks (|), folded blocks (>), single-line scalars, and multi-line
-# continuation lines indented deeper than the `run:` key. The key is matched
-# after stripping an optional sequence marker, so the `- run: cmd` shorthand
-# (valid GitHub Actions syntax, already used in fuzz.yml) is covered, and
-# quoted forms like "run": and 'run': are matched since YAML permits quoted
-# mapping keys. Flow-style steps (`- { run: ... }`, `- [{ run: ... }]`, or a
-# flow collection under a block key like `steps: [{ ... }]`) are parsed by
-# YAML as ordinary run commands, so the guard walks flow collections
-# quote-/depth-aware, splits entries on commas at the collection's own depth,
-# and applies the same run-key matching to each entry - a sibling `env:`
-# entry with a safe binding is not part of the command and stays unflagged.
-# POSIX awk only (no interval expressions) so the guard also works under BWK awk on macOS.
+# No template interpolation may appear inside a jobs.*.steps[*].run value
+# (#226): values influenced by ref content or dispatch inputs must reach the
+# shell only through an env: binding (runner-set, never shell-parsed). The
+# workflow is parsed with a real YAML parser (PyYAML) and every
+# jobs.*.steps[*].run value is checked as the parser resolves it, so the
+# explicit-key mapping form (? run), quoted keys ("run"), flow collections
+# ({ run: ... }), the - run: shorthand, block scalars (| and >), multi-line
+# plain scalars, and aliases/merge keys that launder an interpolated scalar
+# into run: are all covered by construction - there is no line/regex scanner
+# left to evade. Only step-level run: values are checked: a `run` key
+# anywhere else (job env:, strategy.matrix:, action with: inputs,
+# defaults.run) is data, not shell, and an ampersand in a plain scalar is
+# just text. Invalid YAML fails closed: an unparsable workflow is rejected,
+# never silently skipped. The parser is python3 + PyYAML (preinstalled on
+# GitHub-hosted ubuntu runners); if it is missing the guard exits nonzero so
+# CI fails loud instead of letting the workflow through unscanned.
 scan_workflow() {
-  awk -v mode="$1" -v q="'" '
-    function indent(line) { return match(line, /[^[:space:]]/) - 1 }
-    function runkey(line,  k) {
-      k = line
-      sub(/^[[:space:]]*/, "", k)
-      sub(/^-[[:space:]]*/, "", k)
-      if (k ~ /^"run"[[:space:]]*:/) sub(/^"run"[[:space:]]*/, "", k)
-      else if (k ~ ("^" q "run" q "[[:space:]]*:")) sub(("^" q "run" q "[[:space:]]*"), "", k)
-      else if (k ~ /^run[[:space:]]*:/) sub(/^run:[[:space:]]*/, "", k)
-      else return ""
-      return k
-    }
-    # --- flow collections -------------------------------------------------
-    # YAML parses flow-style steps (- { run: ... }, steps: [{ ... }], a flow
-    # mapping nested anywhere in a job value, multi-line variants) as
-    # ordinary run commands, so closed flow collections are parsed
-    # recursively: items split on commas at their own depth, a whole-item
-    # or value-position nested collection recurses, and every mapping entry
-    # goes through the same run-key checks as block mode. Quotes follow the
-    # YAML rule that a quote only opens at a scalar start (after start,
-    # comma, bracket, brace, colon, or dash), so an apostrophe inside a
-    # plain scalar (name: dont-quote-me shapes) is literal text while a
-    # genuinely quoted scalar may span lines; a collection still open at
-    # EOF fails closed via the END block. Comments (a hash at line start or
-    # after whitespace, outside quotes) end the scanned region of a line.
-    # yaml_plain blanks quoted spans and comment tails so the anchor/alias
-    # regex only ever sees plain text.
-    function yaml_plain(text,  i, c, out, quote, prevsig) {
-      out = ""; quote = ""; prevsig = ""
-      for (i = 1; i <= length(text); i++) {
-        c = substr(text, i, 1)
-        if (quote != "") {
-          out = out " "
-          if (quote == "\"" && c == "\\") { i++; continue }
-          if (c == quote) {
-            if (quote == q && substr(text, i + 1, 1) == q) { i++; continue }
-            quote = ""; prevsig = c
-          }
-          continue
-        }
-        if (c == "#" && (i == 1 || substr(text, i - 1, 1) ~ /[[:space:]]/)) return out
-        if ((c == q || c == "\"") && (prevsig == "" || prevsig == "," || prevsig == "[" || prevsig == "{" || prevsig == ":" || prevsig == "-")) {
-          quote = c
-          out = out " "
-          continue
-        }
-        out = out c
-        if (c != " " && c != "\t") prevsig = c
-      }
-      return out
-    }
-    # Scan one line of an open flow collection. Returns the column of the
-    # closing bracket when the collection closes, the negated column of a
-    # comment start when the line ends in a comment, and 0 when the
-    # collection continues. fdepth/fquote/fsig persist across lines so
-    # multi-line quoted scalars keep their state.
-    function flow_scan_line(line,  i, c) {
-      for (i = 1; i <= length(line); i++) {
-        c = substr(line, i, 1)
-        if (fquote != "") {
-          if (fquote == "\"" && c == "\\") { i++; continue }
-          if (c == fquote) {
-            if (fquote == q && substr(line, i + 1, 1) == q) { i++; continue }
-            fquote = ""
-          }
-          continue
-        }
-        if (c == "#" && (i == 1 || substr(line, i - 1, 1) ~ /[[:space:]]/)) return -i
-        if ((c == q || c == "\"") && (fsig == "" || fsig == "," || fsig == "[" || fsig == "{" || fsig == ":" || fsig == "-")) {
-          fquote = c
-          continue
-        }
-        if (c == "{" || c == "[") { fdepth++; fsig = c; continue }
-        if (c == "}" || c == "]") {
-          fdepth--
-          if (fdepth <= 0) return i
-          fsig = c
-          continue
-        }
-        if (c != " " && c != "\t") fsig = c
-      }
-      return 0
-    }
-    # Column of the first flow opener outside quotes and comments, else 0.
-    function flow_find(text,  i, c, quote) {
-      quote = ""
-      for (i = 1; i <= length(text); i++) {
-        c = substr(text, i, 1)
-        if (quote != "") {
-          if (quote == "\"" && c == "\\") { i++; continue }
-          if (c == quote) {
-            if (quote == q && substr(text, i + 1, 1) == q) { i++; continue }
-            quote = ""
-          }
-          continue
-        }
-        if (c == "#" && (i == 1 || substr(text, i - 1, 1) ~ /[[:space:]]/)) return 0
-        if (c == q || c == "\"") { quote = c; continue }
-        if (c == "{" || c == "[") return i
-      }
-      return 0
-    }
-    # A flow collection is only walked when its opener plausibly starts a
-    # YAML node: at line start, after an optional sequence marker, or right
-    # after a block key (quoted keys included). In block context braces
-    # inside a plain scalar (name: deploy{region}) are literal text.
-    function flow_begin(line,  pos, pre) {
-      pos = flow_find(line)
-      if (pos == 0) return 0
-      pre = substr(line, 1, pos - 1)
-      if (pre ~ /^[[:space:]]*$/) return pos
-      if (pre ~ /^[[:space:]]*-[[:space:]]+$/) return pos
-      if (pre ~ /^[[:space:]]*-[[:space:]]*[A-Za-z0-9_.-]+:[[:space:]]*$/) return pos
-      if (pre ~ /^[[:space:]]*[A-Za-z0-9_.-]+:[[:space:]]*$/) return pos
-      if (pre ~ /^[[:space:]]*"[^"]*":[[:space:]]*$/) return pos
-      if (pre ~ ("^[[:space:]]*" q "[^" q "]*" q ":[[:space:]]*$")) return pos
-      return 0
-    }
-    # Split the inside of one collection into items on commas at depth 0,
-    # quotes (scalar-start rule) respected.
-    function flow_split(text, items,  i, c, quote, depth, cur, n, prev) {
-      n = 0; quote = ""; depth = 0; cur = ""; prev = ""
-      for (i = 1; i <= length(text); i++) {
-        c = substr(text, i, 1)
-        if (quote != "") {
-          cur = cur c
-          if (quote == "\"" && c == "\\") { cur = cur substr(text, i + 1, 1); i++; continue }
-          if (c == quote) {
-            if (quote == q && substr(text, i + 1, 1) == q) { cur = cur q; i++; continue }
-            quote = ""
-          }
-          continue
-        }
-        if (c == q || c == "\"") {
-          if (prev == "" || prev == "," || prev == "[" || prev == "{" || prev == ":" || prev == "-") quote = c
-          cur = cur c
-          if (quote == c) prev = c
-          continue
-        }
-        if (c == "{" || c == "[") { depth++; cur = cur c; prev = c; continue }
-        if (c == "}" || c == "]") { depth--; cur = cur c; prev = c; continue }
-        if (c == "," && depth == 0) { items[++n] = cur; cur = ""; prev = ""; continue }
-        cur = cur c
-        if (c != " " && c != "\t") prev = c
-      }
-      if (cur != "") items[++n] = cur
-      return n
-    }
-    # Recursively check a closed collection (text runs from its opening
-    # bracket to its matching close).
-    function flow_parse(text, fline,  inner, items, n, k) {
-      inner = substr(text, 2, length(text) - 2)
-      n = flow_split(inner, items)
-      for (k = 1; k <= n; k++) flow_item(items[k], fline)
-    }
-    # Check one flow item: whole-item collections recurse, run-key entries
-    # get the block-mode checks, other key/value entries recurse into a
-    # collection-valued right side (steps: [{ ... }] at any depth).
-    function flow_item(item, fline,  e, value, rest, pos, plain, lead) {
-      e = item
-      sub(/^[[:space:]]+/, "", e)
-      sub(/[[:space:]]+$/, "", e)
-      if (e == "") return
-      if ((substr(e, 1, 1) == "{" && substr(e, length(e), 1) == "}") ||
-          (substr(e, 1, 1) == "[" && substr(e, length(e), 1) == "]")) {
-        flow_parse(e, fline)
+  python3 - "$1" "$2" <<'PYGUARD'
+import sys
+
+mode, path = sys.argv[1], sys.argv[2]
+try:
+    import yaml
+except ImportError:
+    sys.stderr.write(
+        "error: the run-injection guard requires python3 with PyYAML"
+        " (python3 -c 'import yaml') to parse the workflow;"
+        " refusing to let the workflow through unscanned\n"
+    )
+    sys.exit(3)
+
+from yaml.nodes import MappingNode, ScalarNode, SequenceNode
+
+findings = []
+seen_notes = set()
+
+
+def note(node, msg):
+    if isinstance(node, int):
+        line = node
+    else:
+        line = node.start_mark.line + 1
+    key = (line, msg)
+    if key not in seen_notes:
+        seen_notes.add(key)
+        findings.append("%d: %s" % (line, msg))
+
+
+try:
+    with open(path, "r", encoding="utf-8") as handle:
+        text = handle.read()
+    root = yaml.compose(text, Loader=yaml.SafeLoader)
+except OSError as exc:
+    sys.stderr.write("error: cannot read %s: %s\n" % (path, exc))
+    sys.exit(3)
+except yaml.YAMLError as exc:
+    mark = getattr(exc, "problem_mark", None) or getattr(exc, "context_mark", None)
+    detail = str(exc).splitlines()
+    reason = detail[0] if detail else exc.__class__.__name__
+    note(mark.line + 1 if mark else 1, "invalid YAML, failing closed: %s" % reason)
+    root = None
+
+if root is None and not findings:
+    note(1, "empty workflow document, failing closed")
+
+
+def mapping_entries(node):
+    # (key, value) pairs of a mapping, recursing through YAML merge keys
+    # (<<) so an anchored template cannot hide a run:/steps: entry from
+    # the walk.
+    if not isinstance(node, MappingNode):
         return
-      }
-      value = runkey(e)
-      if (value != "") {
-        if (mode == "run" && value ~ /\$\{\{/) print fline ": " e
-        # A bare alias as the entire run value is resolved by YAML before
-        # the shell sees the text, so ban it outright (same rule as block).
-        if (mode == "anchors" && value ~ /^\*[^][[:space:]{},&*]/) print fline ": " e
-        lead = value
-        sub(/^[[:space:]]+/, "", lead)
-        if (substr(lead, 1, 1) == "{" || substr(lead, 1, 1) == "[") flow_parse(lead, fline)
+    for key, val in node.value:
+        if getattr(key, "tag", "") == "tag:yaml.org,2002:merge":
+            sources = val.value if isinstance(val, SequenceNode) else [val]
+            for source in sources:
+                for pair in mapping_entries(source):
+                    yield pair
+            continue
+        yield key, val
+
+
+def check_run_value(val):
+    if isinstance(val, ScalarNode):
+        if "${{" in val.value:
+            note(val, "run value interpolates ${{ ... }} directly;"
+                      " pass the value through an env: binding instead")
+    else:
+        note(val, "run value must be a scalar string;"
+                  " a %s cannot be a run command" % type(val).__name__)
+
+
+def check_steps(node, job):
+    if not isinstance(node, SequenceNode):
+        note(node, "job '%s': steps must be a sequence" % job)
         return
-      }
-      pos = flow_keysep(e)
-      if (pos > 0) {
-        rest = substr(e, pos + 1)
-        sub(/^[[:space:]]+/, "", rest)
-        if (substr(rest, 1, 1) == "{" || substr(rest, 1, 1) == "[") flow_parse(rest, fline)
-      }
-      if (mode == "anchors") {
-        plain = yaml_plain(e)
-        if (plain ~ /(^|[[:space:]])[&*][^][[:space:]{},&*]/) print fline ": " e
-      }
-    }
-    # Column of the key/value separator colon of a flow item (a colon
-    # followed by space or a flow indicator, outside quotes and nesting).
-    function flow_keysep(e,  i, c, nc, quote, depth) {
-      quote = ""; depth = 0
-      for (i = 1; i < length(e); i++) {
-        c = substr(e, i, 1)
-        if (quote != "") {
-          if (quote == "\"" && c == "\\") { i++; continue }
-          if (c == quote) {
-            if (quote == q && substr(e, i + 1, 1) == q) { i++; continue }
-            quote = ""
-          }
-          continue
-        }
-        if (c == q || c == "\"") { quote = c; continue }
-        if (c == "{" || c == "[") depth++
-        else if (c == "}" || c == "]") depth--
-        else if (c == ":" && depth == 0) {
-          # Portable separator test (busybox awk does not honor \\[ and
-          # \\] inside a bracket expression, so compare characters
-          # directly): a flow key/value colon is followed by whitespace,
-          # a comma, or a flow indicator, or ends the item.
-          nc = substr(e, i + 1, 1)
-          if (i == length(e) || nc == " " || nc == "\t" || nc == "," || nc == "{" || nc == "}" || nc == "[" || nc == "]") return i
-        }
-      }
-      return 0
-    }
-    # Locate the collection in a fully-buffered line group and parse it.
-    function flow_start(text, fline,  p) {
-      p = flow_find(text)
-      if (p > 0) flow_parse(substr(text, p), fline)
-    }
-    {
-      if (in_run) {
-        if ($0 ~ /^[[:space:]]*$/) next
-        if (indent($0) > run_indent) {
-          if (mode == "run" && $0 ~ /\$\{\{/) print FNR ": " $0
-          next
-        }
-        in_run = 0
-      }
-      if (in_flow) {
-        if ($0 ~ /^[[:space:]]*$/) next
-        cc = flow_scan_line($0)
-        if (cc > 0) {
-          fbuf = fbuf " " substr($0, 1, cc)
-          flow_start(fbuf, fline)
-          in_flow = 0
-        } else if (cc < 0) {
-          fbuf = fbuf " " substr($0, 1, -cc - 1)
-        } else {
-          fbuf = fbuf " " $0
-        }
-        next
-      }
-      value = runkey($0)
-      if (value != "") {
-        # run_indent is the column of the run key itself (indent + optional
-        # "- " marker), so sibling step keys like env: at the same level end
-        # the run body instead of being scanned as shell continuation text.
-        k = $0
-        sub(/^[[:space:]]*/, "", k)
-        sub(/^-[[:space:]]*/, "", k)
-        run_indent = length($0) - length(k)
-        if (mode == "run" && value ~ /\$\{\{/) print FNR ": " $0
-        # A bare alias as the entire run value (`run: *payload`) is resolved
-        # by YAML before the shell ever sees the text, so ban it outright.
-        # Anchor names follow the YAML grammar: any printable except
-        # whitespace, flow indicators (, [ ] { }), and & or * themselves
-        # (excluding & * keeps shell `&&`/`**` from matching); `]` first and
-        # `[` last inside the bracket expression keep it POSIX-portable.
-        if (mode == "anchors" && value ~ /^\*[^][[:space:]{},&*]/) print FNR ": " $0
-        in_run = 1
-      } else if ($0 !~ /^[[:space:]]*$/) {
-        pos = flow_begin($0)
-        if (pos > 0) {
-          fline = FNR
-          fdepth = 0
-          fquote = ""
-          fsig = ""
-          in_flow = 1
-          cc = flow_scan_line($0)
-          if (cc > 0) {
-            fbuf = substr($0, 1, cc)
-            flow_start(fbuf, fline)
-            in_flow = 0
-          } else if (cc < 0) {
-            fbuf = substr($0, 1, -cc - 1)
-          } else {
-            fbuf = $0
-          }
-        } else if (mode == "anchors") {
-          plain = yaml_plain($0)
-          if (plain ~ /(^|[[:space:]])[&*][^][[:space:]{},&*]/) print FNR ": " $0
-        }
-      }
-    }
-    END {
-      # Fail closed: a flow collection still open at EOF cannot be walked
-      # safely, so flag it instead of silently skipping the rest of the file.
-      if (in_flow) print fline ": unclosed flow collection (run entries cannot be scanned safely)"
-    }
-  ' "$2"
+    for item in node.value:
+        if not isinstance(item, MappingNode):
+            note(item, "job '%s': each step must be a mapping" % job)
+            continue
+        for key, val in mapping_entries(item):
+            if isinstance(key, ScalarNode) and key.value == "run":
+                check_run_value(val)
+
+
+def check_workflow_runs(root):
+    if not isinstance(root, MappingNode):
+        note(root, "workflow root must be a mapping")
+        return
+    found_jobs = False
+    for key, val in mapping_entries(root):
+        if not (isinstance(key, ScalarNode) and key.value == "jobs"):
+            continue
+        found_jobs = True
+        if not isinstance(val, MappingNode):
+            note(val, "jobs must be a mapping")
+            continue
+        for job_key, job in mapping_entries(val):
+            name = job_key.value if isinstance(job_key, ScalarNode) else "<non-scalar>"
+            if not isinstance(job, MappingNode):
+                note(job, "job '%s' must be a mapping" % name)
+                continue
+            for step_key, steps in mapping_entries(job):
+                if isinstance(step_key, ScalarNode) and step_key.value == "steps":
+                    check_steps(steps, name)
+    if not found_jobs:
+        note(root, "workflow has no jobs mapping")
+
+
+def check_anchors(text):
+    # GitHub Actions honors YAML anchors/aliases, and an aliased scalar is
+    # resolved before the shell ever sees the text. The resolved run values
+    # are checked in run mode, but anchors stay banned outright: the parser
+    # event stream reports every anchor/alias token with its position, so
+    # any use anywhere in the document is flagged without text matching
+    # (which means & in plain scalars, comments, and quoted strings cannot
+    # false-positive, and shell globs/operators in run bodies never match).
+    from yaml.events import AliasEvent
+
+    try:
+        events = yaml.parse(text, Loader=yaml.SafeLoader)
+        for event in events:
+            anchor = getattr(event, "anchor", None)
+            if anchor is None:
+                continue
+            if isinstance(event, AliasEvent):
+                note(event, "YAML alias *%s resolves before the shell sees"
+                            " the text; write the value out explicitly"
+                            " instead" % anchor)
+            else:
+                note(event, "YAML anchor &%s defined; aliases resolve before"
+                            " the shell sees the text, so write the value"
+                            " out explicitly instead" % anchor)
+    except yaml.YAMLError as exc:
+        mark = getattr(exc, "problem_mark", None) or getattr(exc, "context_mark", None)
+        reason = str(exc).splitlines()
+        note(mark.line + 1 if mark else 1,
+             "invalid YAML, failing closed: %s"
+             % (reason[0] if reason else exc.__class__.__name__))
+
+
+if root is not None:
+    if mode == "run":
+        check_workflow_runs(root)
+    elif mode == "anchors":
+        check_anchors(text)
+    else:
+        sys.stderr.write("error: unknown guard mode %r\n" % mode)
+        sys.exit(3)
+
+for line in findings:
+    print(line)
+PYGUARD
 }
 scan_run_injections() { scan_workflow run "$1"; }
-
-# GitHub Actions honors YAML anchors/aliases, so an interpolated scalar
-# defined anywhere in the file (e.g. `SCRIPT: &unsafe echo "${{ github.ref }}"`
-# under `env:`) could be laundered into `run: *unsafe`, where the raw-text
-# scan above never sees the `${{ }}`. Scanning resolved values would require a
-# full YAML parser in CI; this workflow uses no anchors, so anchor/alias
-# tokens are rejected outright to keep the guard sound.
-# Match valid YAML anchor/alias names: letters, underscores, digits (including
-# leading digits like &1), excluding shell globs that appear only in run: bodies.
 scan_anchor_tokens() { scan_workflow anchors "$1"; }
 
-run_body_injections="$(scan_run_injections "$WORKFLOW")"
+run_body_injections="$(scan_run_injections "$WORKFLOW")" \
+  || fail "run-injection guard could not run: python3 with PyYAML is required"
 [[ -z "$run_body_injections" ]] || {
   echo "$run_body_injections" >&2
   fail "workflow interpolates \${{ ... }} directly inside a run: block; pass the value through an env: binding instead"
 }
-anchor_tokens="$(scan_anchor_tokens "$WORKFLOW")"
+anchor_tokens="$(scan_anchor_tokens "$WORKFLOW")" \
+  || fail "anchor/alias guard could not run: python3 with PyYAML is required"
 [[ -z "$anchor_tokens" ]] || {
   echo "$anchor_tokens" >&2
-  fail "workflow must not use YAML anchors or aliases; an aliased scalar could carry \${{ ... }} into a run: command unscanned (write the env: binding out explicitly instead)"
+  fail "workflow must not use YAML anchors or aliases; an anchored scalar could carry \${{ ... }} past the run-value check (write the env: binding out explicitly instead)"
 }
 
-# Self-tests: prove the guard flags every smuggling shape it claims to cover
-# (inline scalar, folded block, plain-scalar continuation, aliased run) and
-# stays silent for env:-bound values, so the coverage claim cannot silently
+# Self-tests: the guard parses real YAML, so fixtures are full workflow
+# documents. Every smuggling shape the guard claims to cover must be flagged,
+# and every safe shape must stay clean, so the coverage claim cannot silently
 # regress.
 guard_tmp="$(mktemp -d)"
 guard_case() { printf '%s\n' "$2" >"$guard_tmp/$1.yml"; }
+guard_steps_case() {
+  printf 'jobs:\n  build:\n    steps:\n%s\n' "$2" >"$guard_tmp/$1.yml"
+}
 guard_must_flag_run() {
   [[ -n "$(scan_run_injections "$guard_tmp/$1.yml")" ]] \
-    || fail "run-injection guard self-test ($1): interpolation must be flagged"
+    || fail "run-injection guard self-test ($1): must be flagged"
+}
+guard_must_flag_anchors() {
+  [[ -n "$(scan_anchor_tokens "$guard_tmp/$1.yml")" ]] \
+    || fail "run-injection guard self-test ($1): anchor/alias use must be flagged"
+}
+guard_must_be_clean() {
+  local out
+  out="$(scan_run_injections "$guard_tmp/$1.yml")" \
+    || fail "run-injection guard self-test ($1): guard failed to run"
+  [[ -z "$out" ]] || fail "run-injection guard self-test ($1): must not be flagged: $out"
+  out="$(scan_anchor_tokens "$guard_tmp/$1.yml")" \
+    || fail "run-injection guard self-test ($1): guard failed to run"
+  [[ -z "$out" ]] || fail "run-injection guard self-test ($1): must not be anchor-flagged: $out"
 }
 
-guard_case inline '        run: echo "${{ github.ref }}"
+# The guard itself must run (python3 + PyYAML present) before anything else.
+guard_case canary 'jobs:
+  build:
+    steps:
+      - run: echo ok
+'
+scan_run_injections "$guard_tmp/canary.yml" >/dev/null \
+  || fail "run-injection guard could not run: python3 with PyYAML is required"
+guard_must_be_clean canary
+
+# Interpolation in a run: value must be flagged in every YAML shape.
+
+guard_steps_case inline '      - run: echo "${{ github.ref }}"
 '
 guard_must_flag_run inline
-guard_case folded '        run: >
+guard_steps_case folded '      - run: >
           echo "${{ github.ref }}"
 '
 guard_must_flag_run folded
-guard_case continuation '        run: echo start
+guard_steps_case continuation '      - run: echo start
           and "${{ github.ref }}"
 '
 guard_must_flag_run continuation
-guard_case aliased '        env:
+guard_steps_case quoted_run '      - "run": echo "${{ github.ref }}"
+'
+guard_must_flag_run quoted_run
+# Explicit-key mapping form (? run / : value): a real parser resolves it to
+# the same step mapping a line scanner can miss (Codex thread PRRT_kwDOSHSH5s6sODl2).
+guard_steps_case explicit_key '      - ? run
+        : echo "${{ github.ref }}"
+'
+guard_must_flag_run explicit_key
+guard_case flow_run 'jobs: {build: {steps: [{run: "echo ${{ github.ref }}"}]}}
+'
+guard_must_flag_run flow_run
+guard_steps_case flow_key_order '      - {name: deploy, run: "echo ${{ github.ref }}"}
+'
+guard_must_flag_run flow_key_order
+
+# Aliases and merge keys launder an interpolated scalar into run:; the
+# parser resolves them, so the run check flags the resolved value and the
+# anchor check flags the anchor itself.
+
+guard_steps_case aliased '      - env:
           SCRIPT: &unsafe_script echo "${{ github.ref }}"
         run: *unsafe_script
 '
-[[ -n "$(scan_anchor_tokens "$guard_tmp/aliased.yml")" ]] \
-  || fail "run-injection guard self-test (aliased): anchor/alias tokens must be flagged"
-guard_case env-bound '        env:
+guard_must_flag_run aliased
+guard_must_flag_anchors aliased
+guard_case merge_template 'templates:
+  risky: &risky_step
+    run: echo "${{ github.ref }}"
+jobs:
+  build:
+    steps:
+      - <<: *risky_step
+        name: merged from template
+'
+guard_must_flag_run merge_template
+guard_must_flag_anchors merge_template
+guard_case anchored_whole_step 'templates:
+  step: &whole_step
+    run: echo "${{ github.ref }}"
+jobs:
+  build:
+    steps:
+      - *whole_step
+'
+guard_must_flag_run anchored_whole_step
+guard_must_flag_anchors anchored_whole_step
+guard_steps_case numeric_alias '      - env:
+          SCRIPT: &1 echo "${{ github.ref }}"
+        run: *1
+'
+guard_must_flag_anchors numeric_alias
+
+# Malformed or unparsable workflow YAML fails closed, never silently clean.
+
+guard_steps_case non_scalar_run '      - run: [echo, "${{ github.ref }}"]
+'
+guard_must_flag_run non_scalar_run
+guard_steps_case scalar_step '      - just a string
+'
+guard_must_flag_run scalar_step
+guard_case no_jobs 'name: not a workflow
+'
+guard_must_flag_run no_jobs
+guard_case unclosed_flow 'jobs: {build: {steps: [{run: "echo ${{ github.ref }}"
+'
+guard_must_flag_run unclosed_flow
+guard_must_flag_anchors unclosed_flow
+guard_steps_case bare_alias_run '      - run: *payload
+'
+guard_must_flag_run bare_alias_run
+guard_steps_case punct_anchor '      - env:
+          SCRIPT: &. echo "${{ github.ref }}"
+        run: *.
+'
+guard_must_flag_run punct_anchor
+guard_must_flag_anchors punct_anchor
+
+# Safe shapes must stay clean.
+
+guard_steps_case env_bound '      - name: safe
+        env:
           PUSHED_REF: ${{ github.ref }}
         run: |
           echo "$PUSHED_REF"
 '
-[[ -z "$(scan_run_injections "$guard_tmp/env-bound.yml")" ]] \
-  || fail "run-injection guard self-test (env-bound): env: bindings must not be flagged"
-[[ -z "$(scan_anchor_tokens "$guard_tmp/env-bound.yml")" ]] \
-  || fail "run-injection guard self-test (env-bound): unexpected anchor/alias match"
+guard_must_be_clean env_bound
+guard_steps_case seq_marker_run_env '      - run: echo "$PUSHED_REF"
+        env:
+          PUSHED_REF: ${{ github.ref }}
+'
+guard_must_be_clean seq_marker_run_env
+# A `run` key that is not a step command (action input) is data, not shell
+# (Codex thread PRRT_kwDOSHSH5s6ODmD).
+guard_steps_case with_run_input '      - uses: example/action@0000000000000000000000000000000000000000
+        with:
+          run: deploy ${{ github.ref }}
+      - run: echo ok
+'
+guard_must_be_clean with_run_input
+# A `run` key in job env: is an environment variable name, not a command
+# (Codex thread PRRT_kwDOSHSH5s6ODmD).
+guard_case job_env_run 'jobs:
+  build:
+    env:
+      run: not-a-command
+    steps:
+      - run: echo ok
+'
+guard_must_be_clean job_env_run
+guard_case matrix_run 'jobs:
+  build:
+    strategy:
+      matrix:
+        run: [one, two]
+    steps:
+      - run: echo ok
+'
+guard_must_be_clean matrix_run
+# Flow-looking JSON inside a with: block scalar is action input data, not a
+# flow collection and not a run command (Codex thread PRRT_kwDOSHSH5s6sODmA).
+guard_steps_case with_metadata_json '      - uses: example/action@0000000000000000000000000000000000000000
+        with:
+          metadata: |
+            {"flow": "{ run: \"echo ${{ github.ref }}\" }"}
+      - run: echo ok
+'
+guard_must_be_clean with_metadata_json
+guard_case defaults_run 'jobs:
+  build:
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - run: echo ok
+'
+guard_must_be_clean defaults_run
+guard_steps_case flow_env_safe '      - {run: "echo \"$PUSHED_REF\"", env: {PUSHED_REF: "${{ github.ref }}"}}
+'
+guard_must_be_clean flow_env_safe
 
-# Numeric aliases like &1 and *1 are valid YAML (PRRT_kwDOSHSH5s6sKiuV)
-guard_case numeric_alias '        env:
-          SCRIPT: &1 echo "${{ github.ref }}"
-        run: *1
-'
-[[ -n "$(scan_anchor_tokens "$guard_tmp/numeric_alias.yml")" ]] \
-  || fail "run-injection guard self-test (numeric_alias): numeric anchor/alias tokens must be flagged"
+# Text that merely looks like anchor syntax must not trip the anchor ban.
 
-# Quoted run keys like "run": are valid YAML (PRRT_kwDOSHSH5s6sKkHX)
-guard_case quoted_run '        "run": echo "${{ github.ref }}"
-'
-guard_must_flag_run quoted_run
-
-# Shell globs in run: bodies should NOT trigger anchor ban (PRRT_kwDOSHSH5s6KitB)
-guard_case shell_glob '        run: ls -la *.txt
-'
-[[ -z "$(scan_anchor_tokens "$guard_tmp/shell_glob.yml")" ]] \
-  || fail "run-injection guard self-test (shell_glob): shell globs in run: must not be flagged as anchors"
-
-# Anchors on sequence-item key lines (`- name: &payload ...`) after a run:
-# step must not escape the anchor ban: the in_run state must end at the
-# shallower sequence-item line, not persist past it (Devin review, #236).
-guard_case aliased_seq_item '        run: |
-          echo "start"
-        - name: &payload echo "${{ github.ref }}"
-        - run: *payload
-'
-[[ -n "$(scan_anchor_tokens "$guard_tmp/aliased_seq_item.yml")" ]] \
-  || fail "run-injection guard self-test (aliased_seq_item): anchors on sequence-item lines must be flagged"
-
-# The `- run:` sequence-marker shorthand (valid GitHub Actions syntax, used
-# in fuzz.yml) must not bypass either guard (Codex review, #236).
-guard_case seq_marker_run '        - run: echo "${{ github.ref }}"
-'
-guard_must_flag_run seq_marker_run
-guard_case seq_marker_run_block '        - run: |
-            echo "${{ github.ref }}"
-'
-guard_must_flag_run seq_marker_run_block
-
-# A sibling env: block after a `- run:` shorthand is the safe pattern and
-# must NOT be treated as shell continuation text (Devin/Codex, #236).
-guard_case seq_marker_run_env '        - run: echo "$PUSHED_REF"
-          env:
-            PUSHED_REF: ${{ github.ref }}
-'
-[[ -z "$(scan_run_injections "$guard_tmp/seq_marker_run_env.yml")" ]] \
-  || fail "run-injection guard self-test (seq_marker_run_env): sibling env: bindings after - run: must not be flagged"
-
-# A bare alias as the entire run value is resolved before the shell sees the
-# text, so the anchor scan must flag the alias line itself.
-guard_case bare_alias_run '        run: *payload
-'
-[[ -n "$(scan_anchor_tokens "$guard_tmp/bare_alias_run.yml")" ]] \
-  || fail "run-injection guard self-test (bare_alias_run): bare alias run value must be flagged"
-
-# Punctuation anchor names (`&.`, `*-foo`) are valid YAML 1.2 and must be
-# flagged, while shell `&&`/`||`/`**` in run bodies must not be (reviewer
-# self-check on #236 follow-ups).
-guard_case punct_anchor '        env:
-          SCRIPT: &. echo "${{ github.ref }}"
-        run: *.
-'
-[[ -n "$(scan_anchor_tokens "$guard_tmp/punct_anchor.yml")" ]] \
-  || fail "run-injection guard self-test (punct_anchor): punctuation-named anchors must be flagged"
-guard_case shell_operators '        run: make -j2 && ./test.sh || true
-'
-[[ -z "$(scan_anchor_tokens "$guard_tmp/shell_operators.yml")" ]] \
-  || fail "run-injection guard self-test (shell_operators): shell operators in run: must not be flagged"
-
-# Flow-style mappings/sequences are parsed by YAML as ordinary run commands
-# (Codex review, #236): `- { run: ... }` must not bypass either guard.
-guard_case flow_run '- { run: '"'"'echo "${{ github.ref }}"'"'"' }
-'
-guard_must_flag_run flow_run
-guard_case flow_seq_run '- [{ run: "echo ${{ github.ref }}" }]
-'
-guard_must_flag_run flow_seq_run
-guard_case flow_multiline '- {
-     run: '"'"'echo
-       "${{ github.ref }}"'"'"',
-   }
-'
-guard_must_flag_run flow_multiline
-guard_case flow_key_run 'steps: [{ run: "echo ${{ github.ref }}" }]
-'
-guard_must_flag_run flow_key_run
-# A sibling env: entry inside the same flow mapping binds the value safely
-# and must NOT be flagged as part of the command.
-guard_case flow_env_safe '- { run: '"'"'echo "$PUSHED_REF"'"'"', env: { PUSHED_REF: "${{ github.ref }}" } }
-'
-[[ -z "$(scan_run_injections "$guard_tmp/flow_env_safe.yml")" ]] \
-  || fail "run-injection guard self-test (flow_env_safe): flow env bindings must not be flagged"
-# Anchor/alias tokens inside flow collections must still be flagged.
-guard_case flow_anchor '- { run: *payload, env: { SCRIPT: &unsafe echo } }
-'
-[[ -n "$(scan_anchor_tokens "$guard_tmp/flow_anchor.yml")" ]] \
-  || fail "run-injection guard self-test (flow_anchor): anchors/aliases in flow collections must be flagged"
-# A flow collection left open at EOF must fail closed, not skip the file.
-guard_case flow_unclosed '- { run: '"'"'echo "${{ github.ref }}"'"'"'
-'
-guard_must_flag_run flow_unclosed
-[[ -n "$(scan_anchor_tokens "$guard_tmp/flow_unclosed.yml")" ]] \
-  || fail "run-injection guard self-test (flow_unclosed): unclosed flow collections must fail closed"
-# Braces inside plain scalars are literal text, not flow collections, and
-# must not trip the walker (comment braces included).
-guard_case flow_literal_scalar '        name: deploy{region} west # {not a flow}
+# An ampersand in a plain scalar is literal text, not an anchor (Codex
+# thread PRRT_kwDOSHSH5s6sODl7).
+guard_case plain_amp 'name: Research &security release
+jobs:
+  build:
+    steps:
+      - name: R&D &ship it
         run: echo ok
 '
-[[ -z "$(scan_run_injections "$guard_tmp/flow_literal_scalar.yml")" ]] \
-  || fail "run-injection guard self-test (flow_literal_scalar): literal braces in scalars must not be flagged"
-[[ -z "$(scan_anchor_tokens "$guard_tmp/flow_literal_scalar.yml")" ]] \
-  || fail "run-injection guard self-test (flow_literal_scalar): unexpected anchor/alias match"
-
-# Re-review round on the flow walker (#236): recursion, quoting, comments.
-
-# env siblings inside steps: [{ ... }] are safe bindings, not command text
-# (Devin review): items split at their own depth, only run values checked.
-guard_case flow_seq_env_safe 'steps: [{ run: '"'"'echo ok'"'"', env: { REF: '"'"'${{ github.ref }}'"'"' } }]
+guard_must_be_clean plain_amp
+guard_steps_case shell_glob '      - run: ls -la *.txt
 '
-[[ -z "$(scan_run_injections "$guard_tmp/flow_seq_env_safe.yml")" ]] \
-  || fail "run-injection guard self-test (flow_seq_env_safe): env bindings inside steps: [{ ... }] must not be flagged"
-
-# A flow mapping nested in a job value is still parsed recursively so its
-# run entry is checked (Codex review): depth is not an escape hatch.
-guard_case flow_nested_job 'job: { runs-on: ubuntu-latest, steps: [{ name: exploit, run: '"'"'echo "${{ github.ref }}"'"'"' }] }
+guard_must_be_clean shell_glob
+guard_steps_case shell_operators '      - run: make -j2 && ./test.sh || true
 '
-guard_must_flag_run flow_nested_job
-guard_case flow_nested_job_safe 'job: { runs-on: ubuntu-latest, steps: [{ name: ok, run: '"'"'echo "$REF'"'"', env: { REF: '"'"'${{ github.ref }}'"'"' } }] }
+guard_must_be_clean shell_operators
+guard_steps_case anchor_in_comment '      - run: echo ok
+# Support R&D &security release naming
 '
-[[ -z "$(scan_run_injections "$guard_tmp/flow_nested_job_safe.yml")" ]] \
-  || fail "run-injection guard self-test (flow_nested_job_safe): nested safe env binding must not be flagged"
-
-# Key order inside a flow mapping is irrelevant: name before run must not
-# hide the run entry (Devin review).
-guard_case flow_key_order 'steps: [{ name: deploy, run: '"'"'echo "${{ github.ref }}"'"'"' }]
+guard_must_be_clean anchor_in_comment
+guard_case anchor_in_quoted 'name: "R&D &friends"
+jobs:
+  build:
+    steps:
+      - run: echo ok
 '
-guard_must_flag_run flow_key_order
-
-# Quoted flow scalars may span lines (Devin review): the quote state
-# persists across the collection's lines.
-guard_case flow_multiline_quoted 'steps: [{run: "echo
-  hi"}]
-'
-[[ -z "$(scan_run_injections "$guard_tmp/flow_multiline_quoted.yml")" ]] \
-  || fail "run-injection guard self-test (flow_multiline_quoted): safe multiline quoted scalar must not be flagged"
-guard_case flow_multiline_quoted_interp 'steps: [{run: "echo
-  ${{ github.ref }}"}]
-'
-guard_must_flag_run flow_multiline_quoted_interp
-
-# An apostrophe inside an unquoted plain scalar is literal text, not a
-# quote opener (Devin review): quotes only open at a scalar start.
-guard_case flow_plain_apostrophe 'steps: [{ name: dont panic, run: '"'"'echo ok'"'"' }]
-'
-[[ -z "$(scan_run_injections "$guard_tmp/flow_plain_apostrophe.yml")" ]] \
-  || fail "run-injection guard self-test (flow_plain_apostrophe): plain scalar text must not be treated as quoting"
-[[ -z "$(scan_anchor_tokens "$guard_tmp/flow_plain_apostrophe.yml")" ]] \
-  || fail "run-injection guard self-test (flow_plain_apostrophe): unexpected anchor/alias match"
-
-# Anchor-like text inside comments and quoted scalars must not trip the
-# anchor/alias ban (Codex review).
-guard_case flow_anchor_in_comment '        run: echo ok
-        # Support R&D &security release naming
-'
-[[ -z "$(scan_anchor_tokens "$guard_tmp/flow_anchor_in_comment.yml")" ]] \
-  || fail "run-injection guard self-test (flow_anchor_in_comment): anchor-like text in comments must not be flagged"
-guard_case flow_anchor_in_quoted '        name: "R&D &friends"
-        run: echo ok
-'
-[[ -z "$(scan_anchor_tokens "$guard_tmp/flow_anchor_in_quoted.yml")" ]] \
-  || fail "run-injection guard self-test (flow_anchor_in_quoted): anchor-like text in quoted scalars must not be flagged"
+guard_must_be_clean anchor_in_quoted
 rm -rf "$guard_tmp"
-
 grep -Fq -- '      - "deploy/api/**"' "$WORKFLOW" \
   || fail "API manifest changes must trigger image validation"
 grep -Fq -- "serviceAccountName: enclava-api" "$DEPLOYMENT" \
