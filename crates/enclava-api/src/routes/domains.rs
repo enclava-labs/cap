@@ -5,9 +5,9 @@
 //!    validate the FQDN, reject anything inside the platform `enclava.dev`
 //!    zone, mint a one-shot challenge token, and return the TXT record the
 //!    caller must publish on `_enclava-challenge.<domain>`.
-//! 2. `POST /apps/{name}/domains/{domain}/verify` — caller asks us to
-//!    against the stored token in constant time, and only on success track the
-//!    user-owned hostname, regenerate tenant ingress, publish HAProxy routing,
+//! 2. `POST /apps/{name}/domains/{domain}/verify` — look up the live TXT and
+//!    compare it against the stored token in constant time. On success, track
+//!    the user-owned hostname, regenerate ingress when changed, publish routing,
 //!    and update the app row. A live StatefulSet may only be restarted after
 //!    live cluster state proves both volume claims initialized (exact Ready
 //!    ordinal-0 pod); terminal deployment rows are not proof. Apps with no
@@ -256,8 +256,8 @@ pub struct VerifyResponse {
 /// transaction so a concurrently committing 'watching' transition cannot
 /// slip past it. 'pending' deployments have produced no provider objects
 /// yet and keep the predeploy verify path. Terminal rows pass THIS guard
-/// only: `ingress_restart_verdict` still requires live proof of completed
-/// initialization before any domain effect or pod restart.
+/// only: changing the domain still requires live initialization proof before
+/// restarting; same-domain DNS/edge re-verification does not restart the pod.
 async fn ensure_no_apply_in_progress(
     app_lane: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     app_id: Uuid,
@@ -394,11 +394,15 @@ pub async fn verify_challenge(
         .acquire_owned()
         .await
         .map_err(|_| internal_error())?;
-    // The restart-admission probe below needs a cluster client inside the
-    // deployment-lane transaction; build it before claiming the lease.
-    let engine = enclava_engine::apply::engine::ApplyEngine::try_default()
-        .await
-        .map_err(|_| internal_error())?;
+    let engine = if app.custom_domain.as_deref() != Some(domain.as_str()) {
+        Some(
+            enclava_engine::apply::engine::ApplyEngine::try_default()
+                .await
+                .map_err(|_| internal_error())?,
+        )
+    } else {
+        None
+    };
     let previous_custom = app.custom_domain.clone();
     let expected_namespace = app.namespace.clone();
     let mut resources = vec![
@@ -491,35 +495,36 @@ pub async fn verify_challenge(
         return Err(conflict);
     }
 
-    // A terminal DB outcome does not stop a formatter. Require live completion
-    // before metadata/DNS writes; no StatefulSet preserves DNS-only predeploy.
-    let refuse = match crate::deploy::ingress_restart_verdict(&engine, &app.namespace, &app.name)
-        .await
-    {
-        Ok(crate::deploy::IngressRestartVerdict::NotDeployed)
-        | Ok(crate::deploy::IngressRestartVerdict::Ready) => None,
-        Ok(crate::deploy::IngressRestartVerdict::Unproven) => Some((
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": "volume initialization has not proven complete; recover the deployment before changing domains"
-            })),
-        )),
-        Err(error) => {
-            tracing::error!(
-                app_id = %app.id,
-                %error,
-                "domain restart admission probe failed"
-            );
-            Some(internal_error())
-        }
-    };
-    if let Some(conflict) = refuse {
-        mutation
-            .finish_in_tx(&mut app_lane)
+    // Re-verification repairs DNS/edge only; changing the domain restarts the pod.
+    if let Some(engine) = engine.as_ref() {
+        let refuse = match crate::deploy::ingress_restart_verdict(engine, &app.namespace, &app.name)
             .await
-            .map_err(|_| internal_error())?;
-        app_lane.commit().await.map_err(|_| internal_error())?;
-        return Err(conflict);
+        {
+            Ok(crate::deploy::IngressRestartVerdict::NotDeployed)
+            | Ok(crate::deploy::IngressRestartVerdict::Ready) => None,
+            Ok(crate::deploy::IngressRestartVerdict::Unproven) => Some((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "volume initialization has not proven complete; recover the deployment before changing domains"
+                })),
+            )),
+            Err(error) => {
+                tracing::error!(
+                    app_id = %app.id,
+                    %error,
+                    "domain restart admission probe failed"
+                );
+                Some(internal_error())
+            }
+        };
+        if let Some(conflict) = refuse {
+            mutation
+                .finish_in_tx(&mut app_lane)
+                .await
+                .map_err(|_| internal_error())?;
+            app_lane.commit().await.map_err(|_| internal_error())?;
+            return Err(conflict);
+        }
     }
 
     // Commit proof and domain assignment together, only after restart admission.
