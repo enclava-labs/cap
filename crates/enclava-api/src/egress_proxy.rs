@@ -392,24 +392,37 @@ fn find_head_end(buf: &[u8]) -> Option<usize> {
 }
 
 /// Bidirectional copy torn down only after `TUNNEL_IDLE_TIMEOUT` elapses
-/// with NO traffic in either direction. Implemented as a chunked loop
-/// (not `timeout(copy_bidirectional)`, which would cap the TOTAL duration
-/// and cut healthy long transfers at exactly the deadline): each loop
-/// iteration races both directions' next read against the remaining idle
-/// budget, and any progress resets the deadline (cap#241 review).
+/// with NO traffic in either direction, and only after BOTH directions
+/// have finished. Implemented as a chunked loop (not
+/// `timeout(copy_bidirectional)`, which would cap the TOTAL duration and
+/// cut healthy long transfers at exactly the deadline): each loop
+/// iteration races the still-open directions' next read against the
+/// remaining idle budget, and any progress resets the deadline.
+/// EOF is tracked per direction and only the peer's WRITE half is shut
+/// down when one side finishes: a half-closing client (request sent,
+/// write side closed) must still receive the upstream's reply
+/// (cap#241 review).
 async fn idle_bounded_copy(a: &mut TcpStream, b: &mut TcpStream) -> std::io::Result<()> {
     let mut buf_a = [0u8; 8192];
     let mut buf_b = [0u8; 8192];
     let mut budget = TUNNEL_IDLE_TIMEOUT;
+    // EOF seen on `a` (a is done sending) / on `b`. A closed direction is
+    // no longer polled; the opposite direction keeps flowing until it too
+    // EOFs or the idle budget expires.
+    let mut eof_a = false;
+    let mut eof_b = false;
     loop {
-        let a_to_b = a.read(&mut buf_a);
-        tokio::pin!(a_to_b);
-        let b_to_a = b.read(&mut buf_b);
-        tokio::pin!(b_to_a);
-        // Race either direction making progress against the idle budget.
+        if eof_a && eof_b {
+            return Ok(());
+        }
+        // Race whichever directions are still open against the budget
+        // (branch futures are not evaluated when the precondition is
+        // false, so `a`/`b` are only borrowed by live reads). The futures
+        // (and their borrows) end when the `select!` does, before the
+        // shutdown/write below.
         let outcome = tokio::select! {
-            res = &mut a_to_b => Some((true, res?)),
-            res = &mut b_to_a => Some((false, res?)),
+            res = a.read(&mut buf_a), if !eof_a => Some((true, res?)),
+            res = b.read(&mut buf_b), if !eof_b => Some((false, res?)),
             _ = tokio::time::sleep(budget) => None,
         };
         let (from_a, n) = match outcome {
@@ -422,13 +435,20 @@ async fn idle_bounded_copy(a: &mut TcpStream, b: &mut TcpStream) -> std::io::Res
             }
         };
         if n == 0 {
-            // EOF on one side: half-close semantics are unnecessary for
-            // OCI traffic; tear the whole tunnel down.
-            return Ok(());
+            // EOF on one side: propagate it as a write-half shutdown of
+            // the peer (so the upstream or client sees end-of-request)
+            // and keep forwarding the OTHER direction — the reply to a
+            // half-closed request must still be delivered.
+            if from_a {
+                eof_a = true;
+                let _ = b.shutdown().await;
+            } else {
+                eof_b = true;
+                let _ = a.shutdown().await;
+            }
+            // EOF is not traffic: the idle budget is NOT reset here.
+            continue;
         }
-        // The read futures (and their borrows on `a`/`b`) end at the end
-        // of this loop iteration; `data` is copied out of the buffer
-        // before writing to the peer so no borrow overlaps the write.
         let data: Vec<u8> = if from_a {
             buf_a[..n].to_vec()
         } else {
@@ -949,6 +969,76 @@ mod tests {
                 "round {i} must round-trip"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn half_closed_client_still_receives_upstream_reply() {
+        // A client that sends its request and half-closes its write side
+        // must still receive the upstream's reply through the tunnel
+        // (cap#241 review): EOF is propagated as a write-half shutdown
+        // of the peer, and the reverse direction keeps flowing.
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = upstream.accept().await {
+                // Read the request until the client's EOF...
+                let mut buf = [0u8; 1024];
+                loop {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+                // ...then reply AFTER having seen the EOF: proves the
+                // proxy kept the reverse direction open.
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .await;
+            }
+        });
+
+        let proxy = EgressProxy::with_http_forwarding(Arc::new(BlockedNetworks::empty()), true);
+        let url = proxy.url().unwrap();
+        let mut stream = connect_raw(&url).await;
+        stream
+            .write_all(
+                format!("CONNECT {upstream_addr} HTTP/1.1\r\nHost: {upstream_addr}\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        // Consume the 200 Connection established.
+        let mut byte = [0u8; 1];
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            let n = stream.read(&mut byte).await.unwrap();
+            assert!(n == 1, "proxy closed before completing the handshake");
+            head.push(byte[0]);
+        }
+        // Send a request, then half-close our write side.
+        stream.write_all(b"ping").await.unwrap();
+        stream.shutdown().await.unwrap();
+        // The reply must still arrive.
+        let mut reply = Vec::new();
+        let mut chunk = [0u8; 256];
+        loop {
+            let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut chunk))
+                .await
+                .expect("reply must arrive after half-close, not hang")
+                .unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            reply.extend_from_slice(&chunk[..n]);
+            if reply.ends_with(b"ok") {
+                break;
+            }
+        }
+        let reply = String::from_utf8_lossy(&reply);
+        assert!(
+            reply.starts_with("HTTP/1.1 200") && reply.ends_with("ok"),
+            "half-closed client must receive the upstream reply, got: {reply}"
+        );
     }
 
     #[tokio::test]
