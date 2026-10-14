@@ -14,14 +14,15 @@
 //! Fresh LUKS2 volumes are formatted ext4 before the first mount, so the
 //! runtime image must include `mkfs.ext4`.
 
-use std::fs::{OpenOptions, remove_file};
-use std::io::{Read, Write};
+use std::fs::{File, OpenOptions, remove_file};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use libcryptsetup_rs::{
-    CryptInit, CryptParamsLuks2, CryptParamsLuks2Ref, consts::flags::CryptActivate,
+    CryptDevice, CryptInit, CryptParamsLuks2, CryptParamsLuks2Ref,
+    consts::flags::{CryptActivate, CryptDeactivate},
     consts::vals::EncryptionFormat,
 };
 
@@ -30,6 +31,16 @@ use crate::secrets::DerivedSeed;
 
 const LUKS2_SECTOR_SIZE: u32 = 512;
 static KEY_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Total LUKS2 volume-key bytes: 64 cipher key (AES-256-XTS) + 32 integrity
+/// key (hmac-sha256). The library takes the total; 64 silently downgrades to
+/// AES-128-XTS.
+const VOLUME_KEY_BYTES: usize = 96;
+/// CLI spelling of the integrity algorithm.
+const INTEGRITY_CLI: &str = "hmac-sha256";
+/// Kernel spelling the libcryptsetup API expects.
+const INTEGRITY_LIB: &str = "hmac(sha256)";
+const INTEGRITY_WIPE_CHUNK: usize = 4 * 1024 * 1024;
 
 /// Path to the activated mapper device.
 #[derive(Debug, Clone)]
@@ -80,8 +91,15 @@ pub fn is_formatted(device: &Path) -> Result<bool> {
 }
 
 /// Format `device` as LUKS2 and add `key` as keyslot 0.
-///
 /// Used on first boot when the underlying block device is fresh.
+///
+/// If we are interrupted after the LUKS header/keyslot is committed (during
+/// the integrity-tag wipe or before mkfs), the volume is left formatted but
+/// never initialized; later boots open it and fail at mount. That is by
+/// design: no on-disk marker may authorize re-running wipe/mkfs, since a
+/// replayed marker over a populated volume would destroy data. Recovery is
+/// operator recreation of the never-ready volume until external
+/// initialization state exists.
 pub fn format(device: &Path, key: &DerivedSeed) -> Result<()> {
     if let Err(cli_err) = format_with_cryptsetup_cli(device, key) {
         tracing::warn!(
@@ -102,16 +120,7 @@ pub fn format(device: &Path, key: &DerivedSeed) -> Result<()> {
 fn format_with_libcryptsetup(device: &Path, key: &DerivedSeed) -> Result<()> {
     let mut dev = CryptInit::init(device)
         .map_err(|e| InitError::Luks(format!("init {}: {e}", device.display())))?;
-    let params = CryptParamsLuks2 {
-        pbkdf: None,
-        integrity: None,
-        integrity_params: None,
-        data_alignment: 0,
-        data_device: None,
-        sector_size: LUKS2_SECTOR_SIZE,
-        label: None,
-        subsystem: None,
-    };
+    let params = luks2_format_params();
     let mut params: CryptParamsLuks2Ref<'_> = (&params)
         .try_into()
         .map_err(|e| InitError::Luks(format!("luks2 params: {e}")))?;
@@ -121,7 +130,7 @@ fn format_with_libcryptsetup(device: &Path, key: &DerivedSeed) -> Result<()> {
             EncryptionFormat::Luks2,
             ("aes", "xts-plain64"),
             None,
-            libcryptsetup_rs::Either::Right(64),
+            libcryptsetup_rs::Either::Right(VOLUME_KEY_BYTES),
             Some(&mut params),
         )
         .map_err(|e| InitError::Luks(format!("format: {e}")))?;
@@ -135,7 +144,84 @@ fn format_with_libcryptsetup(device: &Path, key: &DerivedSeed) -> Result<()> {
         )
         .map_err(|e| InitError::Luks(format!("add_by_key: {e}")))?;
 
-    Ok(())
+    initialize_integrity_tags(&mut dev, key)
+}
+
+fn luks2_format_params() -> CryptParamsLuks2 {
+    CryptParamsLuks2 {
+        pbkdf: None,
+        integrity: Some(INTEGRITY_LIB.to_string()),
+        // Let libcryptsetup derive dm-integrity defaults; the binding emits
+        // empty CStrings for CryptParamsIntegrity fields.
+        integrity_params: None,
+        data_alignment: 0,
+        data_device: None,
+        sector_size: LUKS2_SECTOR_SIZE,
+        label: None,
+        subsystem: None,
+    }
+}
+
+/// crypt_format does not initialize dm-integrity tags like `luksFormat` does,
+/// so reads of never-written sectors would fail. Writing zeros through the
+/// activated mapper tags the whole data area.
+fn initialize_integrity_tags(dev: &mut CryptDevice, key: &DerivedSeed) -> Result<()> {
+    let wipe_name = format!("enclava-init-wipe-{}", unguessable_suffix());
+
+    dev.activate_handle()
+        .activate_by_passphrase(
+            Some(&wipe_name),
+            None,
+            key.as_bytes(),
+            CryptActivate::empty(),
+        )
+        .map_err(|e| InitError::Luks(format!("activate wipe mapper: {e}")))?;
+
+    let result =
+        write_zeros_through_mapper(&PathBuf::from(format!("/dev/mapper/{wipe_name}")));
+    let deactivate = dev
+        .activate_handle()
+        .deactivate(&wipe_name, CryptDeactivate::empty())
+        .map_err(|e| InitError::Luks(format!("deactivate {wipe_name}: {e}")));
+
+    result.and(deactivate)
+}
+
+fn unguessable_suffix() -> String {
+    let mut bytes = [0u8; 16];
+    let random = File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut bytes));
+    if random.is_ok() {
+        return bytes.iter().map(|b| format!("{b:02x}")).collect();
+    }
+    let counter = KEY_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    format!("{}-{counter}-{nanos:x}", std::process::id())
+}
+
+fn write_zeros_through_mapper(mapper_path: &Path) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .open(mapper_path)
+        .map_err(|e| InitError::Luks(format!("open {}: {e}", mapper_path.display())))?;
+    let len = file
+        .seek(SeekFrom::End(0))
+        .map_err(|e| InitError::Luks(format!("seek {}: {e}", mapper_path.display())))?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| InitError::Luks(format!("seek {}: {e}", mapper_path.display())))?;
+
+    let zeros = vec![0u8; INTEGRITY_WIPE_CHUNK];
+    let mut remaining = len;
+    while remaining > 0 {
+        let chunk = &zeros[..zeros.len().min(remaining as usize)];
+        file.write_all(chunk)
+            .map_err(|e| InitError::Luks(format!("zero {}: {e}", mapper_path.display())))?;
+        remaining -= chunk.len() as u64;
+    }
+    file.sync_all()
+        .map_err(|e| InitError::Luks(format!("sync {}: {e}", mapper_path.display())))
 }
 
 /// Open `device` to `/dev/mapper/<mapping_name>` using `key`.
@@ -293,6 +379,8 @@ fn format_with_cryptsetup_cli(device: &Path, key: &DerivedSeed) -> Result<()> {
             "512".to_string(),
             "--sector-size".to_string(),
             "512".to_string(),
+            "--integrity".to_string(),
+            INTEGRITY_CLI.to_string(),
             "--batch-mode".to_string(),
         ];
         run_command("cryptsetup", &args)
@@ -611,13 +699,22 @@ mod unit_tests {
     fn cryptsetup_status_device_parser_allows_missing_device_line() {
         assert_eq!(parse_cryptsetup_status_device("inactive\n"), None);
     }
+
+    #[test]
+    fn luks2_format_params_request_hmac_sha256_integrity() {
+        let params = luks2_format_params();
+        assert_eq!(params.integrity.as_deref(), Some("hmac(sha256)"));
+        assert!(params.integrity_params.is_none());
+        // 64 cipher + 32 integrity; anything else silently changes the cipher.
+        assert_eq!(VOLUME_KEY_BYTES, 96);
+    }
 }
 
 #[cfg(all(test, feature = "luks-integration"))]
 mod tests {
     use super::*;
     use std::fs::File;
-    use std::io::{Seek, SeekFrom, Write};
+    use std::io::{Read, Seek, SeekFrom, Write};
     use tempfile::tempdir;
 
     fn make_backing_file(size_mb: u64) -> Result<(tempfile::TempDir, PathBuf)> {
@@ -631,11 +728,61 @@ mod tests {
 
     #[test]
     fn format_then_open_round_trip() -> Result<()> {
-        let (_dir, img) = make_backing_file(32)?;
         let key = DerivedSeed([0x11u8; 32]);
-        format(&img, &key).expect("format");
-        let opened = open(&img, "enclava-init-test", &key).expect("open");
+
+        let (_cli_dir, cli_img) = make_backing_file(32)?;
+        format_with_cryptsetup_cli(&cli_img, &key).expect("cli format");
+        assert_integrity_header(&cli_img)?;
+        integrity_round_trip(&cli_img, &key, "enclava-init-test-cli")?;
+
+        let (_lib_dir, lib_img) = make_backing_file(32)?;
+        format_with_libcryptsetup(&lib_img, &key).expect("libcryptsetup format");
+        assert_integrity_header(&lib_img)?;
+        integrity_round_trip(&lib_img, &key, "enclava-init-test-lib")?;
+
+        Ok(())
+    }
+
+    fn integrity_round_trip(device: &Path, key: &DerivedSeed, mapping: &str) -> Result<()> {
+        let opened = open(device, mapping, key).expect("open");
         assert!(opened.mapper_path.starts_with("/dev/mapper/"));
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&opened.mapper_path)?;
+        let payload = b"enclava-init integrity payload";
+        file.write_all(payload)?;
+        // Reads on never-written sectors must succeed: dm-integrity tags are
+        // initialized over the whole data area at format time, tail included.
+        let len = file.seek(SeekFrom::End(0))?;
+        file.seek(SeekFrom::Start(len - 4096))?;
+        let mut buf = [0xAAu8; 4096];
+        file.read_exact(&mut buf)?;
+        assert!(buf.iter().all(|b| *b == 0));
+        Ok(())
+    }
+
+    fn assert_integrity_header(device: &Path) -> Result<()> {
+        let output = std::process::Command::new("cryptsetup")
+            .args(["luksDump", "--dump-json-metadata"])
+            .arg(device)
+            .output()?;
+        assert!(output.status.success());
+        let metadata: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .map_err(|e| InitError::Luks(format!("luksDump json: {e}")))?;
+
+        let segments = metadata["segments"].as_object().expect("segments");
+        let integrity_types: Vec<&str> = segments
+            .values()
+            .filter_map(|seg| seg["integrity"]["type"].as_str())
+            .collect();
+        assert_eq!(integrity_types, ["hmac(sha256)"]);
+
+        let keyslots = metadata["keyslots"].as_object().expect("keyslots");
+        for keyslot in keyslots.values() {
+            assert_eq!(keyslot["key_size"].as_u64(), Some(VOLUME_KEY_BYTES as u64));
+        }
         Ok(())
     }
 }
