@@ -67,6 +67,13 @@ pub struct DeploymentApplyJobPayload {
     /// A failed first generic deployment owns the newly inserted app and may
     /// delete it after all tracked DNS records have been removed.
     pub delete_app_on_setup_failure: bool,
+    /// True when this rollout may meet an unformatted app-data volume and
+    /// must budget for whole-area dm-integrity tag initialization (the
+    /// app's first deployment). Frozen at acceptance so original and
+    /// resumed observers classify identically. Defaults to false for
+    /// payloads serialized before the field existed.
+    #[serde(default)]
+    pub expects_fresh_volume: bool,
 }
 
 impl DeploymentApplyJobPayload {
@@ -82,6 +89,33 @@ impl DeploymentApplyJobPayload {
         log_encryption: Option<LogEncryptionConfig>,
         delete_app_on_setup_failure: bool,
     ) -> Self {
+        Self::with_fresh_volume_hint(
+            app,
+            snapshot,
+            attestation_config,
+            api_signing_pubkey,
+            api_url,
+            artifact_deployment_id,
+            artifact_descriptor_core_hash,
+            log_encryption,
+            delete_app_on_setup_failure,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_fresh_volume_hint(
+        app: App,
+        snapshot: DeploymentApplySnapshot,
+        attestation_config: Option<AttestationConfig>,
+        api_signing_pubkey: String,
+        api_url: String,
+        artifact_deployment_id: Option<Uuid>,
+        artifact_descriptor_core_hash: Option<[u8; 32]>,
+        log_encryption: Option<LogEncryptionConfig>,
+        delete_app_on_setup_failure: bool,
+        expects_fresh_volume: bool,
+    ) -> Self {
         Self {
             version: JOB_PAYLOAD_VERSION,
             app,
@@ -93,6 +127,7 @@ impl DeploymentApplyJobPayload {
             artifact_descriptor_core_hash,
             log_encryption,
             delete_app_on_setup_failure,
+            expects_fresh_volume,
         }
     }
 
@@ -1723,6 +1758,7 @@ async fn apply_claimed_job(
                 manifest_hash,
                 observing_since,
                 &payload.snapshot.resources.app_data_size,
+                payload.expects_fresh_volume,
             )
             .watch()
             .await;
@@ -5305,6 +5341,7 @@ mod tests {
             // cumulative rollout budget is genuinely exhausted.
             chrono::Utc::now() - chrono::Duration::seconds(1201),
             "512Mi",
+            false,
         );
         let outcome = watch_committed_rollout(rollout, mutation).await;
         assert!(
@@ -5420,6 +5457,7 @@ mod tests {
                 manifest_hash,
                 observing_since,
                 "5Gi",
+                false,
             )
             .watch(),
         )

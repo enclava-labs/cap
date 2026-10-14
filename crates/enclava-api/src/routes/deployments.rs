@@ -584,6 +584,14 @@ async fn build_accepted_apply_payload(
     log_encryption: Option<LogEncryptionConfig>,
     delete_app_on_setup_failure: bool,
 ) -> Result<DeploymentApplyJobPayload, sqlx::Error> {
+    // The first deployment of an app is the only rollout that can meet an
+    // unformatted app-data volume and must budget for whole-area
+    // dm-integrity tag initialization.
+    let expects_fresh_volume: bool =
+        sqlx::query_scalar("SELECT NOT EXISTS(SELECT 1 FROM deployments WHERE app_id = $1)")
+            .bind(app_id)
+            .fetch_one(&mut **tx)
+            .await?;
     let accepted_app: App = sqlx::query_as("SELECT * FROM apps WHERE id = $1")
         .bind(app_id)
         .fetch_one(&mut **tx)
@@ -599,7 +607,7 @@ async fn build_accepted_apply_payload(
             .bind(app_id)
             .fetch_one(&mut **tx)
             .await?;
-    Ok(DeploymentApplyJobPayload::new(
+    Ok(DeploymentApplyJobPayload::with_fresh_volume_hint(
         accepted_app,
         crate::deploy::DeploymentApplySnapshot::new(accepted_containers, accepted_resources),
         attestation_config,
@@ -609,6 +617,7 @@ async fn build_accepted_apply_payload(
         artifact_descriptor_core_hash,
         log_encryption,
         delete_app_on_setup_failure,
+        expects_fresh_volume,
     ))
 }
 
