@@ -100,7 +100,7 @@ const HTTP_UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// A slow or nonresponsive resolver must not hold a connection slot (and
 /// thus one of the `MAX_PROXY_CONNECTIONS` permits) indefinitely
 /// (cap#241 review).
-const DNS_RESOLVE_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const DNS_RESOLVE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Maximum concurrent client connections served at once. Each in-flight
 /// connection (head read, tunnel, or forward) holds one slot for its whole

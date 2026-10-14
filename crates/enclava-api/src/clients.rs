@@ -343,10 +343,24 @@ pub async fn check_egress_destination(
     // This mirrors the GuardedResolver check the guarded transports get.
     // Resolution FAILURE is reported distinctly from a blocked answer so
     // callers (and offline test environments) can tell the two apart.
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host(format!("{host}:0"))
-        .await
-        .map_err(|e| ClientError::DnsLookupFailed(format!("failed to resolve `{host}`: {e}")))?
-        .collect();
+    // The lookup is bounded (cap#241 review): a slow or nonresponsive
+    // resolver must not hold the deployment request for its full retry
+    // period before the bounded proxy path is even reached.
+    let lookup = tokio::net::lookup_host(format!("{host}:0"));
+    let addrs: Vec<SocketAddr> =
+        match tokio::time::timeout(crate::egress_proxy::DNS_RESOLVE_TIMEOUT, lookup).await {
+            Ok(result) => result
+                .map_err(|e| {
+                    ClientError::DnsLookupFailed(format!("failed to resolve `{host}`: {e}"))
+                })?
+                .collect(),
+            Err(_) => {
+                return Err(ClientError::DnsLookupFailed(format!(
+                    "resolving `{host}` timed out after {:?}",
+                    crate::egress_proxy::DNS_RESOLVE_TIMEOUT
+                )));
+            }
+        };
     for addr in &addrs {
         if blocked.contains(addr.ip()) {
             return Err(ClientError::BlockedAddress(format!(
