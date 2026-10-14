@@ -94,8 +94,9 @@ done
 # against direct interpolation being reintroduced anywhere in the workflow,
 # not just drift of the exact lines fixed above. Any `run:` value counts —
 # literal blocks (|), folded blocks (>), single-line scalars, and multi-line
-# continuation lines indented deeper than the `run:` key. POSIX awk only (no
-# interval expressions) so the guard also works under BWK awk on macOS.
+# continuation lines indented deeper than the `run:` key. Also matches quoted
+# forms like "run": and 'run': since YAML permits quoted mapping keys.
+# POSIX awk only (no interval expressions) so the guard also works under BWK awk on macOS.
 scan_run_injections() {
   awk '
     function indent(line) { return match(line, /[^[:space:]]/) - 1 }
@@ -108,10 +109,13 @@ scan_run_injections() {
         }
         in_run = 0
       }
-      if ($0 ~ /^[[:space:]]*run:/) {
+      # Match literal run:, quoted "run":, or quoted '\''run'\'': keys
+      if ($0 ~ /^[[:space:]]*run:/ || $0 ~ /^[[:space:]]*"run":/ || $0 ~ /^[[:space:]]*'"'"'run'"'"':/) {
         run_indent = indent($0)
         value = $0
         sub(/^[[:space:]]*run:[[:space:]]*/, "", value)
+        sub(/^[[:space:]]*"run":[[:space:]]*/, "", value)
+        sub(/^[[:space:]]*'"'"'run'"'"':[[:space:]]*/, "", value)
         if (value ~ /\$\{\{/) print FNR ": " $0
         in_run = 1
       }
@@ -125,8 +129,27 @@ scan_run_injections() {
 # scan above never sees the `${{ }}`. Scanning resolved values would require a
 # full YAML parser in CI; this workflow uses no anchors, so anchor/alias
 # tokens are rejected outright to keep the guard sound.
+# Match valid YAML anchor/alias names: letters, underscores, digits (including
+# leading digits like &1), excluding shell globs that appear only in run: bodies.
 scan_anchor_tokens() {
-  grep -nE '(^|[[:space:]])[&*][A-Za-z_][A-Za-z0-9_-]*' "$1" || true
+  local in_run=0
+  local line
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^[[:space:]]*run: ]]; then
+      in_run=1
+    elif [[ "$line" =~ ^[[:space:]]*[a-zA-Z_][a-zA-z0-9_-]*[[:space:]]*: ]]; then
+      in_run=0
+    fi
+    if [[ $in_run -eq 0 ]]; then
+      # Check for letter/underscore-prefixed anchors (&foo, *bar)
+      if echo "$line" | grep -qE '(^|[[:space:]])[&*][A-Za-z_][[:alnum:]_-]*'; then
+        echo "$line"
+      # Check for numeric anchors (&1, *2)
+      elif echo "$line" | grep -qE '(^|[[:space:]])[&*][0-9]'; then
+        echo "$line"
+      fi
+    fi
+  done < "$1" || true
 }
 
 run_body_injections="$(scan_run_injections "$WORKFLOW")"
@@ -177,6 +200,25 @@ guard_case env-bound '        env:
   || fail "run-injection guard self-test (env-bound): env: bindings must not be flagged"
 [[ -z "$(scan_anchor_tokens "$guard_tmp/env-bound.yml")" ]] \
   || fail "run-injection guard self-test (env-bound): unexpected anchor/alias match"
+
+# Numeric aliases like &1 and *1 are valid YAML (PRRT_kwDOSHSH5s6sKiuV)
+guard_case numeric_alias '        env:
+          SCRIPT: &1 echo "${{ github.ref }}"
+        run: *1
+'
+[[ -n "$(scan_anchor_tokens "$guard_tmp/numeric_alias.yml")" ]] \
+  || fail "run-injection guard self-test (numeric_alias): numeric anchor/alias tokens must be flagged"
+
+# Quoted run keys like "run": are valid YAML (PRRT_kwDOSHSH5s6sKkHX)
+guard_case quoted_run '        "run": echo "${{ github.ref }}"
+'
+guard_must_flag_run quoted_run
+
+# Shell globs in run: bodies should NOT trigger anchor ban (PRRT_kwDOSHSH5s6sKitB)
+guard_case shell_glob '        run: ls -la *.txt
+'
+[[ -z "$(scan_anchor_tokens "$guard_tmp/shell_glob.yml")" ]] \
+  || fail "run-injection guard self-test (shell_glob): shell globs in run: must not be flagged as anchors"
 rm -rf "$guard_tmp"
 
 grep -Fq -- '      - "deploy/api/**"' "$WORKFLOW" \
