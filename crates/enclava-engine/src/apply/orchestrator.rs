@@ -144,7 +144,23 @@ pub async fn apply_and_watch(
         ApplyError::ManifestGeneration(format!("confidential app validation failed: {err}"))
     })?;
 
-    enforce_fresh_volume_floor(engine, app).await?;
+    // Inspect every claim ONCE before the first provider mutation: the same
+    // verdict gates the fresh-format floor and sizes the rollout budget, so
+    // a redeploy of initialized volumes keeps the base deadline while claims
+    // lacking positive initialization evidence add the first-boot allowance.
+    // Direct engine calls carry no deployment history (None): a surviving
+    // claim counts as initialized only while a later-created Ready pod
+    // mounts it — pod-loss reapply of an unrecorded legacy volume fails
+    // closed (refusal or base budget), never a destructive recovery.
+    let fresh_volume_claims = inspect_fresh_volume_claims(
+        engine,
+        &app.namespace,
+        &app.name,
+        FreshVolumeClaims::ALL,
+        None,
+    )
+    .await?;
+    enforce_floor_on_claims(app, fresh_volume_claims)?;
 
     // Generate manifests
     let manifests = generate_all_manifests(app);
@@ -155,12 +171,16 @@ pub async fn apply_and_watch(
     // Apply all
     apply_all(engine, &manifests, generation).await?;
 
-    // Watch rollout. The budget grows with the volumes' first-boot work:
-    // a fresh device is fully zero-scanned before format, so the timeout is
-    // computed from the exact rendered sizes, not a flat constant.
+    // Watch rollout. The budget grows only with claims that lack positive
+    // initialization evidence: a fresh device is fully zero-scanned before
+    // format, while an initialized volume is just opened.
     let rollout_timeout = engine
         .config()
-        .rollout_timeout_for_storage(&app.storage.app_data.size, &app.storage.tls_data.size)
+        .rollout_timeout_for_storage(
+            &app.storage.app_data.size,
+            &app.storage.tls_data.size,
+            fresh_volume_claims,
+        )
         .map_err(ApplyError::ManifestGeneration)?;
     let status = watch_rollout(engine, &app.namespace, &app.name, rollout_timeout).await?;
 
@@ -194,34 +214,17 @@ pub async fn apply_and_watch(
     Ok(status)
 }
 
-/// Refuse a fresh volume request below the 32 MiB LUKS2 fresh-format floor.
-///
-/// `validate_app` intentionally checks only quantity grammar — the spec
-/// carries no provisioning state, and a hard floor would lock out reapplies
-/// of apps whose volumes predate it (sub-floor LUKS2 volumes activate; the
-/// runtime probe never sees them). Here the engine asks the cluster: a
-/// live ordinal-0 claim is provisioned and keeps operating; a missing or
-/// terminating one is provisioned FRESH by this render, and enclava-init
-/// refuses to format a device below the floor — so reject it at the
-/// boundary instead of leaving the app unstartable on a StatefulSet
-/// volumeClaimTemplate that can never be resized.
-///
-/// Fails closed on lookup errors: a refused apply retries cleanly, a
-/// missed check bricks. A claim racing to be created mid-check errs on
-/// refusal; a claim racing to be deleted leaves the app already unable to
-/// boot, and refusing is the only recoverable outcome anyway.
-pub async fn enforce_fresh_volume_floor(
-    engine: &ApplyEngine,
+/// Enforce the 32 MiB LUKS2 fresh-format floor against an already-computed
+/// claim verdict: every claim flagged fresh must request at least the
+/// floor. Claims without positive initialization evidence are provisioned
+/// FRESH by this render, and enclava-init refuses to format a device below
+/// the floor — so reject at the boundary instead of leaving the app
+/// unstartable on a StatefulSet volumeClaimTemplate that can never be
+/// resized.
+pub fn enforce_floor_on_claims(
     app: &ConfidentialApp,
+    claims: FreshVolumeClaims,
 ) -> Result<(), ApplyError> {
-    let claims = sub_floor_fresh_claims(
-        engine,
-        &app.namespace,
-        &app.name,
-        &app.storage.app_data.size,
-        &app.storage.tls_data.size,
-    )
-    .await?;
     if claims.app_data {
         crate::validate::validate_persistent_volume_size_for_fresh_provisioning(
             "storage.app_data.size",
@@ -239,11 +242,11 @@ pub async fn enforce_fresh_volume_floor(
     Ok(())
 }
 
-/// Per-claim fresh-volume verdicts used to gate the 32 MiB floor. `true`
-/// means the size is sub-floor AND the claim has no live ordinal-0 PVC, so
-/// the floor must be enforced for it; `false` means the size is at or above
-/// the floor (nothing to check) or the claim is already provisioned
-/// (grandfathered — a surviving sub-floor volume activates).
+/// Per-claim fresh-volume verdicts. `true` means the claim lacks positive
+/// initialization evidence — it is missing, terminating, or never proven
+/// initialized — so this render provisions it FRESH: the 32 MiB floor and
+/// the first-boot rollout allowance apply to it. `false` means the claim
+/// was not inspected or proven initialized.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FreshVolumeClaims {
     /// state volume (`storage`/`app_data_size` → VCT `state`)
@@ -267,57 +270,171 @@ impl FreshVolumeClaims {
     };
 }
 
-/// Which of an app's persistent-volume claims a sub-floor size would
-/// provision FRESH — i.e. the generated `<vct>-<workload>-0` PVC has no
-/// live object. Verdicts are produced only for sizes below the floor;
-/// sizes at or above it short-circuit without any Kubernetes I/O. A claim
-/// that exists but is terminating does not count as provisioned. Fails
-/// closed: lookup errors propagate and never grant the waiver.
+/// Positive initialization evidence for the app's persistent-volume claims,
+/// per requested claim. `true` in the returned verdict means the checked
+/// claim LACKS positive initialization evidence — it is missing,
+/// terminating, has no creation timestamp, or exists but was never proven
+/// initialized — so it is provisioned FRESH by this render. `false` means
+/// the claim was not requested ([`FreshVolumeClaims::NONE`] performs no
+/// Kubernetes I/O at all) or positive evidence exists.
+///
+/// Positive evidence requires the EXACT surviving ordinal-0 claim
+/// `<vct>-<workload>-0` (`state`/`tls-state` VCTs, replicas:1 workload) with
+/// a populated creation timestamp, AND one of:
+///
+/// - `initialized_at_millis` in a LATER whole second than the claim's
+///   creation: a recorded successful healthy deployment proves this volume
+///   completed first-boot initialization and survives pod loss, crashes,
+///   and replacements.
+/// - the live ordinal-0 pod `<workload>-0` is non-terminating and Ready,
+///   mounts THIS exact claim, and was created in a LATER whole second than
+///   the claim — the workload is currently running on the initialized
+///   device.
+///
+/// Strict precedence is deliberate and fails closed: Kubernetes
+/// `creationTimestamp` serializes only whole seconds while
+/// `initialized_at_millis` carries subsecond precision, so a same-second
+/// pair cannot prove ordering — a claim recreated within the healthy
+/// deployment's second could otherwise borrow the old volume's proof, and
+/// a Ready pod created in the same second as a replacement claim could be
+/// running on the deleted volume's handle. The tradeoff is availability,
+/// never format authorization: a legitimately same-second initialization
+/// reads as unproven until a later healthy deployment records proof.
+///
+/// PVC existence, `Bound` phase, watching/applying deployment status, and
+/// manifest-hash markers are NOT evidence: a bound-but-unformatted claim
+/// stays fresh. Unknown-legacy claims (present but unproven) fail closed as
+/// fresh — a refusal or base budget, never a destructive recovery; this
+/// evidence only ever WAIVES the size floor and the first-boot time
+/// allowance, never authorizes format/wipe.
 ///
 /// `workload` is the generated StatefulSet name (`ConfidentialApp.name`,
 /// which the API renders from `apps.name`), not a guessed resource name.
-pub async fn sub_floor_fresh_claims(
+/// Fails closed: lookup errors propagate and never grant the waiver.
+pub async fn inspect_fresh_volume_claims(
     engine: &ApplyEngine,
     namespace: &str,
     workload: &str,
-    app_data_size: &str,
-    tls_data_size: &str,
+    claims_to_check: FreshVolumeClaims,
+    initialized_at_millis: Option<i64>,
 ) -> Result<FreshVolumeClaims, ApplyError> {
-    use k8s_openapi::api::core::v1::PersistentVolumeClaim;
+    use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod};
     use kube::api::Api;
 
-    let app_data_sub_floor = crate::validate::is_sub_floor_volume_size(app_data_size);
-    let tls_data_sub_floor = crate::validate::is_sub_floor_volume_size(tls_data_size);
-    if !app_data_sub_floor && !tls_data_sub_floor {
+    if !claims_to_check.app_data && !claims_to_check.tls_data {
         return Ok(FreshVolumeClaims::NONE);
     }
 
     let pvc_api: Api<PersistentVolumeClaim> = Api::namespaced(engine.client().clone(), namespace);
+    let pod_api: Api<Pod> = Api::namespaced(engine.client().clone(), namespace);
+    let pod_name = crate::manifest::volumes::provisioned_pod_name(workload);
+    // The pod fetch is lazy and shared: claims proven by deployment history
+    // need no second lookup, and both claims reuse the same pod.
+    let mut live_pod: Option<Option<Pod>> = None;
 
     async fn claim_is_fresh(
         pvc_api: &Api<PersistentVolumeClaim>,
+        pod_api: &Api<Pod>,
+        pod_name: &str,
+        live_pod: &mut Option<Option<Pod>>,
         claim_name: &str,
+        initialized_at_millis: Option<i64>,
     ) -> Result<bool, ApplyError> {
-        Ok(match pvc_api.get_opt(claim_name).await? {
-            Some(pvc) => pvc.metadata.deletion_timestamp.is_some(),
-            None => true,
-        })
+        let Some(pvc) = pvc_api.get_opt(claim_name).await? else {
+            return Ok(true);
+        };
+        if pvc.metadata.deletion_timestamp.is_some() {
+            return Ok(true);
+        }
+        let Some(created) = pvc.metadata.creation_timestamp else {
+            return Ok(true);
+        };
+        let pvc_millis = created.0.as_millisecond();
+        // The healthy timestamp must land in a LATER whole second than the
+        // claim's creation: PVC timestamps carry only second precision, so
+        // a same-bucket pair cannot prove the deployment ran on THIS claim
+        // — a same-second recreation must not borrow the old proof.
+        if initialized_at_millis
+            .is_some_and(|healthy| pvc_millis.div_euclid(1000) < healthy.div_euclid(1000))
+        {
+            return Ok(false);
+        }
+        if live_pod.is_none() {
+            *live_pod = Some(pod_api.get_opt(pod_name).await?);
+        }
+        Ok(!pod_proves_claim_initialized(
+            live_pod.as_ref().and_then(|pod| pod.as_ref()),
+            claim_name,
+            pvc_millis,
+        ))
     }
 
     let mut claims = FreshVolumeClaims::NONE;
-    if app_data_sub_floor {
+    if claims_to_check.app_data {
         claims.app_data = claim_is_fresh(
             &pvc_api,
+            &pod_api,
+            &pod_name,
+            &mut live_pod,
             &crate::manifest::volumes::provisioned_claim_name("state", workload),
+            initialized_at_millis,
         )
         .await?;
     }
-    if tls_data_sub_floor {
+    if claims_to_check.tls_data {
         claims.tls_data = claim_is_fresh(
             &pvc_api,
+            &pod_api,
+            &pod_name,
+            &mut live_pod,
             &crate::manifest::volumes::provisioned_claim_name("tls-state", workload),
+            initialized_at_millis,
         )
         .await?;
     }
     Ok(claims)
+}
+
+/// Whether the live ordinal-0 pod proves `claim_name` is initialized: the
+/// pod is not terminating, reports Ready, mounts exactly this claim, and
+/// was created in a LATER whole second than the claim. Same-second
+/// equality proves nothing (see the `inspect_fresh_volume_claims`
+/// timestamp note): both timestamps carry only second precision, so the
+/// pod could still be running on the deleted claim's volume handle.
+fn pod_proves_claim_initialized(
+    pod: Option<&k8s_openapi::api::core::v1::Pod>,
+    claim_name: &str,
+    pvc_millis: i64,
+) -> bool {
+    let Some(pod) = pod else { return false };
+    if pod.metadata.deletion_timestamp.is_some() {
+        return false;
+    }
+    let Some(pod_created) = pod.metadata.creation_timestamp.as_ref() else {
+        return false;
+    };
+    if pod_created.0.as_millisecond() <= pvc_millis {
+        return false;
+    }
+    let mounts_claim = pod.spec.as_ref().is_some_and(|spec| {
+        spec.volumes.as_ref().is_some_and(|volumes| {
+            volumes.iter().any(|volume| {
+                volume
+                    .persistent_volume_claim
+                    .as_ref()
+                    .is_some_and(|claim| claim.claim_name == claim_name)
+            })
+        })
+    });
+    if !mounts_claim {
+        return false;
+    }
+    pod.status
+        .as_ref()
+        .and_then(|status| status.conditions.as_ref())
+        .is_some_and(|conditions| {
+            conditions
+                .iter()
+                .any(|condition| condition.type_ == "Ready" && condition.status == "True")
+        })
 }

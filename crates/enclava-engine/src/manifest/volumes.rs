@@ -33,6 +33,13 @@ pub fn provisioned_claim_name(vct: &str, statefulset: &str) -> String {
     format!("{vct}-{statefulset}-0")
 }
 
+/// Name of the pod Kubernetes creates for a CAP StatefulSet's ordinal-0
+/// replica: `<statefulset>-0`. That pod is the only consumer of the claims
+/// [`provisioned_claim_name`] produces.
+pub fn provisioned_pod_name(statefulset: &str) -> String {
+    format!("{statefulset}-0")
+}
+
 /// Disk-backed bound for the workload log spool emptyDir. The relay tails at
 /// most MAX_TAIL_BYTES per container (2 MiB today) and enclava-wait-exec
 /// rotates its spool at 32 MiB (retaining the newest 8 MiB), so the spool's

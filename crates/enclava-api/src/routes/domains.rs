@@ -249,6 +249,38 @@ pub struct VerifyResponse {
     pub verified_at: chrono::DateTime<Utc>,
 }
 
+/// Refuse the verify when this app's apply is still in progress: restarting
+/// a live first-boot volume initialization can leave an unrecoverable
+/// partial volume. Evaluated inside the caller's deployment-lane
+/// transaction so a concurrently committing 'watching' transition cannot
+/// slip past it. 'pending' deployments have produced no provider objects
+/// yet and keep the predeploy verify path; terminal rows are free to
+/// proceed.
+async fn ensure_no_apply_in_progress(
+    app_lane: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    app_id: Uuid,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let apply_in_progress: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM deployments
+              WHERE app_id = $1
+                AND status IN ('applying'::deploy_status_enum, 'watching'::deploy_status_enum)
+         )",
+    )
+    .bind(app_id)
+    .fetch_one(&mut **app_lane)
+    .await
+    .map_err(|_| internal_error())?;
+    if apply_in_progress {
+        Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "app deployment in progress"})),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// POST /apps/{name}/domains/{domain}/verify -- verify a published TXT record.
 pub async fn verify_challenge(
     auth: AuthContext,
@@ -443,9 +475,19 @@ pub async fn verify_challenge(
     };
     app = current_app;
 
+    if let Err(conflict) = ensure_no_apply_in_progress(&mut app_lane, app.id).await {
+        mutation
+            .finish_in_tx(&mut app_lane)
+            .await
+            .map_err(|_| internal_error())?;
+        app_lane.commit().await.map_err(|_| internal_error())?;
+        return Err(conflict);
+    }
+
     // Persist the verification timestamp inside the apply transaction, after
-    // the lease and the CAS guard. A Busy lease or an authority mismatch
-    // returns above, so a proof can never be persisted without its apply:
+    // the lease, the CAS guard, and the in-progress-apply conflict. A Busy
+    // lease, an authority mismatch, or a live creating workload returns
+    // above, so a proof can never be persisted without its apply:
     // `verified_at` and the `apps.custom_domain` write commit or roll back
     // together in `app_lane`.
     if needs_persist {
@@ -871,5 +913,79 @@ mod tests {
                 "expected invalid for {bad:?}"
             );
         }
+    }
+
+    async fn insert_guard_app(pool: &sqlx::PgPool, status: &str) -> (Uuid, Uuid) {
+        let (app, deployment_id, _, _) =
+            crate::deployment_jobs::tests::insert_job_fixture(pool).await;
+        sqlx::query("UPDATE deployments SET status = $2::deploy_status_enum WHERE id = $1")
+            .bind(deployment_id)
+            .bind(status)
+            .execute(pool)
+            .await
+            .expect("set guard deployment phase");
+        (app.org_id, app.id)
+    }
+
+    async fn guard_verdict(
+        pool: &sqlx::PgPool,
+        app_id: Uuid,
+    ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+        let mut tx = pool.begin().await.expect("begin guard transaction");
+        ensure_no_apply_in_progress(&mut tx, app_id).await
+    }
+
+    #[tokio::test]
+    async fn in_progress_apply_blocks_domain_verify() {
+        // An 'applying' or 'watching' deployment means a workload mutation —
+        // possibly a first-boot volume format — is live; verification must
+        // conflict instead of restarting the pod mid-initialization.
+        let pool = crate::test_support::database_test_pool().await;
+        for status in ["applying", "watching"] {
+            let (org_id, app_id) = insert_guard_app(&pool, status).await;
+            let Err((code, _)) = guard_verdict(&pool, app_id).await else {
+                panic!("{status} deployment must conflict with domain verify");
+            };
+            assert_eq!(code, StatusCode::CONFLICT);
+            sqlx::query("DELETE FROM organizations WHERE id = $1")
+                .bind(org_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_or_finished_apply_allows_domain_verify() {
+        // 'pending' rows produced no provider objects (the predeploy path
+        // still works) and terminal rows no longer mutate anything.
+        let pool = crate::test_support::database_test_pool().await;
+        for status in ["pending", "healthy", "failed"] {
+            let (org_id, app_id) = insert_guard_app(&pool, status).await;
+            guard_verdict(&pool, app_id)
+                .await
+                .unwrap_or_else(|_| panic!("{status} deployment must not block domain verify"));
+            sqlx::query("DELETE FROM organizations WHERE id = $1")
+                .bind(org_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn other_apps_in_progress_apply_does_not_block_verify() {
+        let pool = crate::test_support::database_test_pool().await;
+        let (org_id, app_id) = insert_guard_app(&pool, "pending").await;
+        let (other_org, _) = insert_guard_app(&pool, "watching").await;
+        guard_verdict(&pool, app_id)
+            .await
+            .expect("unrelated app's in-progress apply must not block verify");
+        sqlx::query("DELETE FROM organizations WHERE id IN ($1, $2)")
+            .bind(org_id)
+            .bind(other_org)
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 }

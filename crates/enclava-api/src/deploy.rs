@@ -371,6 +371,8 @@ pub struct ApplyDeploymentManifestsRequest {
     pub pool: PgPool,
     pub app: App,
     pub snapshot: DeploymentApplySnapshot,
+    pub engine: ApplyEngine,
+    pub fresh_volume_claims: enclava_engine::apply::orchestrator::FreshVolumeClaims,
     pub deployment_id: Uuid,
     pub attestation_config: Option<AttestationConfig>,
     pub kbs_policy_config: Option<crate::kbs::KbsPolicyConfig>,
@@ -809,6 +811,29 @@ pub(crate) async fn latest_deployment_id_for_app(
     .fetch_optional(pool)
     .await?;
     Ok(deployment_id.unwrap_or_else(Uuid::nil))
+}
+/// Latest point at which this app's volumes are proven initialized: the
+/// completion timestamp of its most recent successful (`healthy`) deployment.
+/// Only terminal healthy publications count — a `watching` row or an apply
+/// that never reached the pod never proves `enclava-init` ran. Used as the
+/// durable half of fresh-volume evidence so an old, small, already-initialized
+/// volume keeps its grandfathered waiver even after its pod is gone. The
+/// engine compares whole seconds strictly (completion must land in a LATER
+/// second than claim creation): a same-second pair is treated as unproven.
+pub(crate) async fn last_initialized_at_millis(
+    pool: &PgPool,
+    app_id: Uuid,
+) -> Result<Option<i64>, sqlx::Error> {
+    sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT (EXTRACT(EPOCH FROM max(completed_at)) * 1000)::bigint
+           FROM deployments
+          WHERE app_id = $1
+            AND status = 'healthy'::deploy_status_enum
+            AND completed_at IS NOT NULL",
+    )
+    .bind(app_id)
+    .fetch_one(pool)
+    .await
 }
 
 pub(crate) const DEPLOYMENT_SUPERSEDED_ERROR: &str = "deployment_superseded";
@@ -1713,14 +1738,39 @@ mod tests {
         )
     }
 
-    fn expired_rollout_anchor() -> chrono::DateTime<chrono::Utc> {
-        let budget = rollout_test_engine()
-            .config()
-            .rollout_timeout_for_storage("32Mi", "32Mi")
-            .expect("fixture rollout budget");
+    fn expired_rollout_anchor(budget: std::time::Duration) -> chrono::DateTime<chrono::Utc> {
         chrono::Utc::now()
             - chrono::Duration::from_std(budget).unwrap()
             - chrono::Duration::seconds(1)
+    }
+
+    /// The base budget an initialized redeploy would carry: no fresh claim
+    /// contributes the first-boot allowance.
+    fn initialized_redeploy_budget() -> std::time::Duration {
+        rollout_test_engine()
+            .config()
+            .rollout_timeout_for_storage(
+                "2Ti",
+                "2Ti",
+                enclava_engine::apply::orchestrator::FreshVolumeClaims::NONE,
+            )
+            .expect("fixture rollout budget")
+    }
+
+    /// The budget a first render that must freshly initialize both volumes
+    /// would record with its watching marker.
+    fn fresh_initialization_budget(
+        app_data_size: &str,
+        tls_data_size: &str,
+    ) -> std::time::Duration {
+        rollout_test_engine()
+            .config()
+            .rollout_timeout_for_storage(
+                app_data_size,
+                tls_data_size,
+                enclava_engine::apply::orchestrator::FreshVolumeClaims::ALL,
+            )
+            .expect("fixture rollout budget")
     }
 
     #[tokio::test]
@@ -1733,10 +1783,9 @@ mod tests {
             rollout_test_engine(),
             "slice-manifest".to_string(),
             chrono::Utc::now(),
-            "32Mi",
-            "32Mi",
+            fresh_initialization_budget("32Mi", "32Mi"),
         )
-        .expect("valid rollout sizes")
+        .expect("valid rollout budget")
         .with_observation_slice(std::time::Duration::from_millis(50))
         .watch()
         .await;
@@ -1754,15 +1803,15 @@ mod tests {
         // fresh initialization budget.
         let mut auto_app = queued_apply_app();
         auto_app.unlock_mode = crate::models::UnlockMode::Auto;
+        let budget = fresh_initialization_budget("32Mi", "32Mi");
         let outcome = DeploymentRollout::observe_only(
             auto_app,
             rollout_test_engine(),
             "deadline-manifest".to_string(),
-            expired_rollout_anchor(),
-            "32Mi",
-            "32Mi",
+            expired_rollout_anchor(budget),
+            budget,
         )
-        .expect("valid rollout sizes")
+        .expect("valid rollout budget")
         .with_observation_slice(std::time::Duration::from_millis(50))
         .watch()
         .await;
@@ -1773,20 +1822,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn initialized_redeploy_expires_at_base_budget() {
+        // A redeploy whose volumes are already initialized carries only the
+        // base rollout budget. A 2 Ti manifest must NOT inherit a
+        // multi-hour first-boot allowance: once the recorded base budget is
+        // spent, the cumulative deadline ends the rollout normally.
+        let mut app = queued_apply_app();
+        app.unlock_mode = crate::models::UnlockMode::Auto;
+        let outcome = DeploymentRollout::observe_only(
+            app,
+            rollout_test_engine(),
+            "initialized-redeploy-manifest".to_string(),
+            expired_rollout_anchor(initialized_redeploy_budget()),
+            initialized_redeploy_budget(),
+        )
+        .expect("valid rollout budget")
+        .with_observation_slice(std::time::Duration::from_millis(50))
+        .watch()
+        .await;
+        assert_eq!(outcome.deploy_status, "failed");
+        assert_eq!(outcome.app_status, "failed");
+        assert!(outcome.terminal);
+        assert_eq!(outcome.error_code, Some("deployment_rollout_failed"));
+    }
+
+    #[tokio::test]
+    async fn resumed_observer_keeps_recorded_budget() {
+        // The budget persisted with the watching marker is the deadline.
+        // Simulating a restart where live pod/volume state has changed, the
+        // resumed observer must reuse the recorded value: a record smaller
+        // than any size-derived budget still expires, a record larger than
+        // one still keeps observing. Neither recomputes.
+        let mut expired_app = queued_apply_app();
+        expired_app.unlock_mode = crate::models::UnlockMode::Auto;
+        let recorded_small = std::time::Duration::from_secs(1);
+        let expired = DeploymentRollout::observe_only(
+            expired_app,
+            rollout_test_engine(),
+            "resumed-expired-manifest".to_string(),
+            expired_rollout_anchor(recorded_small),
+            recorded_small,
+        )
+        .expect("valid rollout budget")
+        .with_observation_slice(std::time::Duration::from_millis(50))
+        .watch()
+        .await;
+        assert_eq!(expired.deploy_status, "failed");
+        assert!(expired.terminal);
+
+        let mut waiting_app = queued_apply_app();
+        waiting_app.unlock_mode = crate::models::UnlockMode::Auto;
+        let waiting = DeploymentRollout::observe_only(
+            waiting_app,
+            rollout_test_engine(),
+            "resumed-waiting-manifest".to_string(),
+            chrono::Utc::now() - chrono::Duration::minutes(30),
+            fresh_initialization_budget("2Ti", "2Ti"),
+        )
+        .expect("valid rollout budget")
+        .with_observation_slice(std::time::Duration::from_millis(50))
+        .watch()
+        .await;
+        assert_eq!(waiting.deploy_status, "watching");
+        assert!(!waiting.terminal);
+        assert_eq!(waiting.error_code, None);
+    }
+
+    #[tokio::test]
     async fn rollout_watch_observes_late_owner_unlock_after_deadline() {
         let engine = ApplyEngine::new(
             rollout_client(true),
             enclava_engine::apply::types::ApplyConfig::default(),
         );
+        let budget = fresh_initialization_budget("32Mi", "32Mi");
         let outcome = DeploymentRollout::observe_only(
             queued_apply_app(),
             engine,
             "late-unlock-manifest".to_string(),
-            expired_rollout_anchor(),
-            "32Mi",
-            "32Mi",
+            expired_rollout_anchor(budget),
+            budget,
         )
-        .expect("valid rollout sizes")
+        .expect("valid rollout budget")
         .with_observation_slice(std::time::Duration::from_millis(50))
         .watch()
         .await;
@@ -1800,15 +1916,15 @@ mod tests {
         // Password-mode creates classify an exhausted rollout budget as a
         // continuing owner wait, but the observation slice still returns
         // promptly so the worker slot is released between probes.
+        let budget = fresh_initialization_budget("32Mi", "32Mi");
         let outcome = DeploymentRollout::observe_only(
             queued_apply_app(),
             rollout_test_engine(),
             "password-manifest".to_string(),
-            expired_rollout_anchor(),
-            "32Mi",
-            "32Mi",
+            expired_rollout_anchor(budget),
+            budget,
         )
-        .expect("valid rollout sizes")
+        .expect("valid rollout budget")
         .with_observation_slice(std::time::Duration::from_millis(50))
         .watch()
         .await;
@@ -1825,15 +1941,15 @@ mod tests {
         // snapshot must not terminalize a legitimate owner wait.
         let mut app = queued_apply_app();
         app.status = AppStatus::Failed;
+        let budget = fresh_initialization_budget("32Mi", "32Mi");
         let outcome = DeploymentRollout::observe_only(
             app,
             rollout_test_engine(),
             "password-redeploy-manifest".to_string(),
-            expired_rollout_anchor(),
-            "32Mi",
-            "32Mi",
+            expired_rollout_anchor(budget),
+            budget,
         )
-        .expect("valid rollout sizes")
+        .expect("valid rollout budget")
         .with_observation_slice(std::time::Duration::from_millis(50))
         .watch()
         .await;
@@ -1844,6 +1960,8 @@ mod tests {
 
     #[tokio::test]
     async fn large_volume_initialization_keeps_observing_after_base_deadline() {
+        // The recorded first-boot budget extends past the base deadline: 30
+        // minutes into observation a fresh 2 Ti render is still watching.
         let mut app = queued_apply_app();
         app.unlock_mode = crate::models::UnlockMode::Auto;
         let outcome = DeploymentRollout::observe_only(
@@ -1851,10 +1969,9 @@ mod tests {
             rollout_test_engine(),
             "initializing-manifest".to_string(),
             chrono::Utc::now() - chrono::Duration::minutes(30),
-            "2Ti",
-            "2Gi",
+            fresh_initialization_budget("2Ti", "2Gi"),
         )
-        .expect("valid rollout sizes")
+        .expect("valid rollout budget")
         .with_observation_slice(std::time::Duration::from_millis(50))
         .watch()
         .await;
@@ -1947,13 +2064,10 @@ pub async fn reapply_tenant_ingress(
     let cm = enclava_engine::manifest::ingress::generate_ingress_configmap(&app_spec);
 
     let engine = ApplyEngine::try_default().await?;
-    let rollout_timeout = engine
-        .config()
-        .rollout_timeout_for_storage(
-            &app_spec.storage.app_data.size,
-            &app_spec.storage.tls_data.size,
-        )
-        .map_err(DeployError::Validation)?;
+    // Domain-only reapply: the pod restart re-opens existing volumes, so the
+    // base rollout budget applies — the fresh-initialization allowance is
+    // reserved for renders that provision a new claim.
+    let rollout_timeout = engine.config().rollout_timeout;
     ensure_statefulset_exists(&engine, &app_spec.namespace, &app_spec.name).await?;
     let generation = MutationGeneration::new(kubernetes_mutation_generation)?;
     mutation
@@ -2065,7 +2179,10 @@ pub struct DeploymentRollout {
     pub(crate) manifest_hash: String,
     observing_since: chrono::DateTime<chrono::Utc>,
     observation_slice: std::time::Duration,
-    rollout_timeout: std::time::Duration,
+    /// Cumulative budget recorded by the watching transition. Resumed
+    /// observers reuse this value verbatim rather than recomputing it from
+    /// changing live cluster state.
+    pub(crate) rollout_timeout: std::time::Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2079,20 +2196,19 @@ pub struct DeploymentRolloutOutcome {
 
 impl DeploymentRollout {
     /// Read-only rollout observer for a generation whose durable deployment
-    /// row is already `watching`. It shares the recorded manifest hash and the
-    /// anchored observation window, and performs no provider mutation.
+    /// row is already `watching`. It shares the recorded manifest hash, the
+    /// anchored observation window, and the `rollout_timeout` budget that was
+    /// computed once before this generation's first provider apply and
+    /// persisted with the watching transition — resumed observation never
+    /// recomputes it from changing live pod or volume state. Performs no
+    /// provider mutation.
     pub(crate) fn observe_only(
         app: App,
         engine: ApplyEngine,
         manifest_hash: String,
         observing_since: chrono::DateTime<chrono::Utc>,
-        app_data_size: &str,
-        tls_data_size: &str,
+        rollout_timeout: std::time::Duration,
     ) -> Result<Self, DeployError> {
-        let rollout_timeout = engine
-            .config()
-            .rollout_timeout_for_storage(app_data_size, tls_data_size)
-            .map_err(DeployError::Validation)?;
         let namespace = app.namespace.clone();
         let workload_name = app.name.clone();
         Ok(Self {
@@ -2201,6 +2317,8 @@ pub async fn apply_deployment_manifests(
         pool,
         app,
         snapshot,
+        engine,
+        fresh_volume_claims,
         deployment_id,
         attestation_config,
         kbs_policy_config,
@@ -2267,13 +2385,24 @@ pub async fn apply_deployment_manifests(
     enclava_engine::validate::validate_app(&app_spec)
         .map_err(|e| DeployError::Validation(e.to_string()))?;
 
+    // Reuse the pre-lease inspection: a second provider read here would
+    // terminalize transient lookup failures after durable ownership begins.
+    enclava_engine::apply::orchestrator::enforce_floor_on_claims(&app_spec, fresh_volume_claims)?;
+    let rollout_timeout = engine
+        .config()
+        .rollout_timeout_for_storage(
+            &app_spec.storage.app_data.size,
+            &app_spec.storage.tls_data.size,
+            fresh_volume_claims,
+        )
+        .map_err(DeployError::Validation)?;
+
     let tenant_image_pull_secret_config =
         tenant_image_pull_secret_config_for_containers(&app_spec.containers);
     let manifests = generate_all_manifests(&app_spec);
     let hash = manifest_hash(&manifests);
     set_deployment_status(&pool, deployment_id, "applying", Some(&hash), None, false).await?;
     set_app_status(&pool, app.id, "creating").await?;
-
     if signed_policy_artifact.is_some() {
         if should_reconcile_global_signed_policy_artifacts(true, &app_spec.attestation) {
             // Acceptance already advanced the durable desired generation in
@@ -2299,23 +2428,12 @@ pub async fn apply_deployment_manifests(
     }
 
     let generation = MutationGeneration::new(kubernetes_mutation_generation)?;
-    let engine = ApplyEngine::try_default().await?;
-    let rollout_timeout = engine
-        .config()
-        .rollout_timeout_for_storage(
-            &app_spec.storage.app_data.size,
-            &app_spec.storage.tls_data.size,
-        )
-        .map_err(DeployError::Validation)?;
     mutation
         .arm_resource_scope_until_reconciled("kubernetes_namespace")
         .await?;
-    // Fresh-volume floor at the render boundary: admission and apply-job
-    // revalidation already gated these sizes, but a claim deleted between
-    // revalidation and this write would render an unformattable,
-    // unresizable template — re-check live PVC evidence immediately before
-    // applying. Provisioned sub-floor claims pass through unchanged.
-    enclava_engine::apply::orchestrator::enforce_fresh_volume_floor(&engine, &app_spec).await?;
+    // The floor verdict was already derived from live PVC evidence before
+    // the first provider write above; provisioned sub-floor claims pass
+    // through unchanged.
 
     apply_all_with_tenant_image_pull_secret(
         &engine,

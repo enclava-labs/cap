@@ -312,9 +312,10 @@ pub async fn rollback(
     );
     // Live claim evidence for the rollback target's resource sizes, computed
     // before the lanes so no kube I/O runs under them (and none at all for
-    // at/above-floor sizes): a surviving sub-floor claim keeps operating; a
-    // missing/terminating one is a fresh format and must meet the floor.
-    let fresh_volume_claims = super::fresh_volume_claims(&app, &target_resources)
+    // at/above-floor sizes): a proven-initialized sub-floor claim keeps
+    // operating; a missing/terminating/unproven one is a fresh format and
+    // must meet the floor.
+    let fresh_volume_claims = super::fresh_volume_claims(&state.db, &app, &target_resources)
         .await
         .map_err(|_| {
             json_error(

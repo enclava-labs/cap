@@ -76,18 +76,27 @@ The scan is O(device size). Progress is logged every 30 s with scanned/total
 bytes and a completion duration. Initialization time depends on actual guest
 and Longhorn throughput; do not infer it from the raw volume's zero contents.
 Devices below 32 MiB are refused before scanning. This fresh-format floor is
-enforced at API admission and immediately before render. Existing live
-ordinal-zero claims are grandfathered per volume; missing or terminating
-claims and unrelated ordinals cannot grant that exemption. Existing LUKS2
-volumes are opened without reformatting.
+ordinal-zero claims are grandfathered per volume when positive
+initialization evidence exists — a surviving claim proven initialized by a
+recorded healthy deployment completed in a later second than the claim's
+creation, or by the same live Ready ordinal-0 pod that mounts it and was
+created strictly after the claim. Missing or terminating claims, wrong
+ordinals, same-second pairs, and bare PVC existence without that evidence
+cannot grant the exemption. Existing LUKS2 volumes are opened without
+reformatting.
 
-The rollout budget adds two sequential passes over both requested volumes to
-the configured base timeout, assuming at least 32 MiB/s for scanning and
-integrity-tag initialization. This is a bounded estimate, not a throughput
-guarantee: qualify the intended storage sizes and lower that assumption if
-measurements are slower. Durable observers retain the original deadline
-across restarts and release worker slots after each 90-second observation
-slice. Password owner wait remains separately nonterminal.
+The rollout budget adds two sequential passes to the configured base
+timeout only for claims that lack positive initialization evidence —
+already-initialized volumes only open, so ordinary redeploys and
+domain-only reapplies keep the base deadline. The allowance assumes at
+least 32 MiB/s per pass for scanning and integrity-tag initialization.
+This is a bounded estimate, not a throughput guarantee: qualify the
+intended storage sizes and lower that assumption if measurements are
+slower. The API computes the budget once, before the first provider
+apply, and persists it next to the observation anchor; durable observers
+resume that recorded deadline verbatim across restarts and release worker
+slots after each 90-second observation slice. Password owner wait remains
+separately nonterminal.
 
 ## Verification Chain
 

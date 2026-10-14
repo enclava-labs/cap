@@ -87,14 +87,28 @@ pub struct ApplyConfig {
 }
 
 impl ApplyConfig {
+    /// Rollout budget for this render. Only claims `fresh` marked as lacking
+    /// positive initialization evidence contribute the first-boot allowance:
+    /// an already-initialized volume is opened, never re-scanned, so an
+    /// ordinary redeploy or domain reapply must not inherit the fresh-format
+    /// wait.
     pub fn rollout_timeout_for_storage(
         &self,
         app_data_size: &str,
         tls_data_size: &str,
+        fresh: crate::apply::orchestrator::FreshVolumeClaims,
     ) -> Result<Duration, String> {
-        let total_mib = crate::validate::storage_quantity_mib_ceil(app_data_size)?
-            .checked_add(crate::validate::storage_quantity_mib_ceil(tls_data_size)?)
-            .ok_or("volume initialization size is too large")?;
+        let mut total_mib = 0u128;
+        for (selected, size) in [
+            (fresh.app_data, app_data_size),
+            (fresh.tls_data, tls_data_size),
+        ] {
+            if selected {
+                total_mib = total_mib
+                    .checked_add(crate::validate::storage_quantity_mib_ceil(size)?)
+                    .ok_or("volume initialization size is too large")?;
+            }
+        }
         // shortcut: budgets two passes at 32 MiB/s; recalibrate if qualified guests are slower.
         let seconds = u64::try_from(total_mib.div_ceil(16))
             .map_err(|_| "volume initialization duration is too large")?;
@@ -113,5 +127,65 @@ impl Default for ApplyConfig {
             pvc_delete_timeout: Duration::from_secs(120),
             namespace_delete_timeout: Duration::from_secs(120),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::apply::orchestrator::FreshVolumeClaims;
+
+    #[test]
+    fn rollout_budget_selects_only_fresh_claims() {
+        let config = ApplyConfig::default();
+        // Initialized volumes only open: the base budget applies verbatim.
+        let initialized = config
+            .rollout_timeout_for_storage("2Ti", "2Ti", FreshVolumeClaims::NONE)
+            .unwrap();
+        assert_eq!(initialized, config.rollout_timeout);
+
+        // A single fresh claim adds only its own two-pass allowance: the
+        // mixed budget is exactly the all-fresh budget minus the other
+        // claim's share.
+        let tls_only = config
+            .rollout_timeout_for_storage(
+                "2Ti",
+                "2Ti",
+                FreshVolumeClaims {
+                    app_data: false,
+                    tls_data: true,
+                },
+            )
+            .unwrap();
+        let all = config
+            .rollout_timeout_for_storage("2Ti", "2Ti", FreshVolumeClaims::ALL)
+            .unwrap();
+        assert!(initialized < tls_only && tls_only < all);
+        assert_eq!(all - tls_only, tls_only - initialized);
+
+        // A non-selected claim contributes nothing, so its quantity is never
+        // consulted.
+        assert_eq!(
+            config
+                .rollout_timeout_for_storage(
+                    "bogus",
+                    "32Mi",
+                    FreshVolumeClaims {
+                        app_data: false,
+                        tls_data: true,
+                    },
+                )
+                .unwrap(),
+            config
+                .rollout_timeout_for_storage(
+                    "2Ti",
+                    "32Mi",
+                    FreshVolumeClaims {
+                        app_data: false,
+                        tls_data: true,
+                    },
+                )
+                .unwrap()
+        );
     }
 }

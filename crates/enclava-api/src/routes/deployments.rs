@@ -147,38 +147,44 @@ pub(crate) async fn enforce_authoritative_entitlement(
 }
 
 /// Which of the app's persistent-volume claims a sub-floor size would
-/// provision FRESH — derived from live PVC evidence, not render markers.
-/// `manifest_hash`/`observing_since` only ever proved the StatefulSet was
-/// WRITTEN: a crash after apply but before the observation commit can leave
-/// a formatted legacy volume with no marker (missing evidence must not lock
-/// a grandfathered app out), and a marker says nothing about a claim
-/// deleted later (present-but-stale evidence must not waive a fresh
-/// format). Only the exact ordinal-0 `<vct>-<workload>-0` claims the
-/// replicas:1 StatefulSet generates are consulted; a live claim waives the
-/// floor for that claim, a missing or terminating one enforces it.
+/// provision FRESH — derived from POSITIVE initialization evidence, not
+/// claim existence or render markers. `manifest_hash`/`observing_since`
+/// only ever proved the StatefulSet was WRITTEN, and a surviving PVC alone
+/// only ever proved the object exists: a bound-but-unformatted claim must
+/// still be refused below the floor. A claim is initialized only when a
+/// recorded HEALTHY deployment completed in a LATER second than the
+/// claim's creation (second-precision PVC timestamps make same-bucket
+/// ordering unprovable, so a recreated claim cannot borrow an older
+/// healthy proof) or the live Ready ordinal-0 pod mounts it.
 ///
 /// Sizes at/above the floor and grammar-invalid values (rejected by
-/// `validate_resource_limits` upstream) short-circuit without Kubernetes
-/// I/O. The workload name is `app.name` — the same field
+/// `validate_resource_limits` upstream) short-circuit without any lookup —
+/// no Kubernetes I/O and no database read beyond the caller's own work.
+/// The workload name is `app.name` — the same field
 /// `build_confidential_app_from_rows` renders into the StatefulSet — and
-/// the namespace is `app.namespace`. Fails closed: lookup errors abort the
-/// request rather than granting the waiver.
+/// the namespace is `app.namespace`. Fails closed: an unproven legacy claim
+/// keeps the floor (a refusal, never a destructive recovery), and lookup
+/// errors abort the request rather than granting the waiver.
 pub(crate) async fn fresh_volume_claims(
+    pool: &sqlx::PgPool,
     app: &App,
     resources: &AppResources,
 ) -> Result<enclava_engine::apply::orchestrator::FreshVolumeClaims, crate::deploy::DeployError> {
-    if !enclava_engine::validate::is_sub_floor_volume_size(&resources.app_data_size)
-        && !enclava_engine::validate::is_sub_floor_volume_size(&resources.tls_data_size)
-    {
+    let claims_to_check = enclava_engine::apply::orchestrator::FreshVolumeClaims {
+        app_data: enclava_engine::validate::is_sub_floor_volume_size(&resources.app_data_size),
+        tls_data: enclava_engine::validate::is_sub_floor_volume_size(&resources.tls_data_size),
+    };
+    if !claims_to_check.app_data && !claims_to_check.tls_data {
         return Ok(enclava_engine::apply::orchestrator::FreshVolumeClaims::NONE);
     }
+    let initialized_at_millis = crate::deploy::last_initialized_at_millis(pool, app.id).await?;
     let engine = enclava_engine::apply::engine::ApplyEngine::try_default().await?;
-    enclava_engine::apply::orchestrator::sub_floor_fresh_claims(
+    enclava_engine::apply::orchestrator::inspect_fresh_volume_claims(
         &engine,
         &app.namespace,
         &app.name,
-        &resources.app_data_size,
-        &resources.tls_data_size,
+        claims_to_check,
+        initialized_at_millis,
     )
     .await
     .map_err(crate::deploy::DeployError::Apply)
@@ -1199,8 +1205,9 @@ async fn deploy_app_candidate(
         "setup_state": DEPLOYMENT_SETUP_DNS_PENDING,
     });
 
-    // Fresh-volume floor: which sub-floor claims would provision a NEW PVC.
-    // Derived from live cluster evidence BEFORE opening the acceptance
+    // Fresh-volume floor: which sub-floor claims lack positive
+    // initialization evidence and would provision FRESH. Derived from live
+    // cluster + deployment-history evidence BEFORE opening the acceptance
     // transaction (no kube I/O under the authority lanes, no I/O at all for
     // at/above-floor sizes). App INSERT always validates fresh without a
     // lookup. A concurrent authority change invalidates this estimate, but
@@ -1209,7 +1216,7 @@ async fn deploy_app_candidate(
     let fresh_volume_claims = if app_mutation == AppMutation::Insert {
         enclava_engine::apply::orchestrator::FreshVolumeClaims::ALL
     } else {
-        fresh_volume_claims(&app, &candidate_resources)
+        fresh_volume_claims(&state.db, &app, &candidate_resources)
             .await
             .map_err(|_| {
                 json_error(
