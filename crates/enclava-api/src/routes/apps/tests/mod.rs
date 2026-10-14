@@ -717,6 +717,15 @@ fn app_delete_source_never_reads_or_formats_external_diagnostics() {
     );
     assert!(
         deletion
+            .find("guard_provider(crate::kbs::reconcile_pending_signed_policy_artifacts")
+            .expect("app deletion publishes the admitted teardown unit before teardown")
+            < deletion
+                .find("guard_provider(request_workload_teardown")
+                .expect("app deletion requests workload teardown"),
+        "the admitted teardown unit must be converged into the live policy before the workload is asked to erase its owner seed"
+    );
+    assert!(
+        deletion
             .contains("WHEN status = 'deleting'::app_status_enum THEN workload_teardown_required"),
         "app deletion must persist the pre-delete teardown decision across retries"
     );
