@@ -181,7 +181,17 @@ fn initialize_integrity_tags(dev: &mut CryptDevice, key: &DerivedSeed) -> Result
             key.as_bytes(),
             CryptActivate::PRIVATE | CryptActivate::NO_JOURNAL,
         )
-        .map_err(|e| InitError::Luks(format!("activate wipe mapper: {e}")))?;
+        .map_err(|e| {
+            // Loading the dm-integrity target is the first kernel touch in
+            // this flow. A failure here most often means the guest kernel
+            // lacks CONFIG_DM_INTEGRITY (it is a Kconfig target separate
+            // from dm_mod/dm_crypt); name it so operators see the actual
+            // fix instead of a generic activation error.
+            InitError::Luks(format!(
+                "activate wipe mapper (does the guest kernel provide \
+                 dm-integrity, CONFIG_DM_INTEGRITY?): {e}"
+            ))
+        })?;
 
     let result = write_zeros_through_mapper(&PathBuf::from(format!("/dev/mapper/{wipe_name}")));
     let deactivate = dev
