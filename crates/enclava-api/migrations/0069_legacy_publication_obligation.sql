@@ -1,37 +1,37 @@
 -- Durable legacy-publication obligation marker + rotation sentinel (Codex
--- review finding on #187): a signer rotation must not confirm as published
+-- review findings on #187): a signer rotation must not confirm as published
 -- while a previously rendered legacy Rego policy can keep authorizing the
--- rotated-out signer. A live kbs_tls_bindings row alone cannot prove
--- publication was ever required -- the binding is only the render source --
--- so an unconfigured replica needs durable evidence that a signer-bearing
--- legacy policy was actually rendered at least once before it may confirm a
--- rotation. recorded_at IS NOT NULL is that evidence.
+-- rotated-out signer, and the rotation decision must serialize with an
+-- in-flight legacy publication on a configured replica.
 --
--- The sentinel row is always present: both the legacy publication critical
--- section and the signer-rotation gates lock it FOR UPDATE (migration
--- comment and kbs.rs::lock_and_read_legacy_publication_obligation), which
--- serializes the rotation decision with an in-flight legacy publication.
--- An empty table cannot be locked, so exactly one row is kept.
+-- Two rows:
+--   sentinel   -- locked FOR UPDATE by both the signer-rotation identity
+--                 transaction and the legacy publication critical section
+--                 (binding read through ConfigMap write), serializing the
+--                 two against each other. Never updated.
+--   obligation -- the marker itself, recorded_at IS NOT NULL meaning a
+--                 signer-bearing legacy publication was owed at least
+--                 once. Only the publisher writes it, as its own committed
+--                 write taken while it holds the sentinel lock, so even a
+--                 failed or lost publication keeps the evidence without
+--                 deadlocking against the lock it holds.
 CREATE TABLE legacy_publication_obligation (
-    singleton   boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+    key         text PRIMARY KEY CHECK (key IN ('sentinel', 'obligation')),
     recorded_at timestamptz
 );
 
--- Conservative backfill, on the same predicate the runtime marker uses: a
--- binding row that pins a signer (non-null subject and issuer) at upgrade
--- time -- including soft-deleted ones, because deleting a binding does not
--- un-publish the policy that already carried it -- means this install may
--- have published a signer-bearing legacy policy before the marker existed.
--- Recording the obligation makes those installs fail closed on
--- unconfigured rotation confirmation. A binding that never pinned a signer
--- cannot have authorized the rotated-out signer, so null-identity rows and
--- never-bound installs stay unmarked and keep rotating exactly as before.
-INSERT INTO legacy_publication_obligation (singleton, recorded_at)
-SELECT true,
+INSERT INTO legacy_publication_obligation (key, recorded_at)
+VALUES ('sentinel', NULL);
+
+-- Conservative backfill: a binding row with a signer identity (including
+-- soft-deleted rows, whose deletion does not un-publish anything) is
+-- evidence that a signer-bearing legacy publication was owed before this
+-- marker existed. Null-identity bindings pin no signer and record nothing.
+INSERT INTO legacy_publication_obligation (key, recorded_at)
+SELECT 'obligation',
        CASE
            WHEN EXISTS (
-               SELECT 1
-                 FROM kbs_tls_bindings
+               SELECT 1 FROM kbs_tls_bindings
                 WHERE signer_identity_subject IS NOT NULL
                   AND signer_identity_issuer IS NOT NULL
            )
