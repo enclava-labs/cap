@@ -1057,8 +1057,6 @@ fn test_kbs_policy_config() -> crate::kbs::KbsPolicyConfig {
 use http_body_util::BodyExt;
 
 /// Issue #119 regression: a rotation token is single-use (its jti is
-
-/// Issue #119 regression: a rotation token is single-use (its jti is
 /// consumed in the rotation transaction; a replay is refused and the whole
 /// rotation, including the database trigger's withdrawal and owed bump, is
 /// rolled back), and rotation withdraws the rotated-out signer's artifacts
@@ -1466,6 +1464,73 @@ async fn signer_rotation_never_flips_an_unsigned_install_into_signed_mode() {
     );
 
     crate::test_support::drop_isolated_database("cap119_unsigned_rotation", pool).await;
+}
+
+/// Codex review finding on #187: the rotation-token route must embed the
+/// exact stored previous identity in its claims. `rotate_signer_commit`
+/// verifies the claims against the untrimmed database values, so trimming
+/// them at issuance made every token for a whitespace-padded stored
+/// identity fail verification and the signer could never be rotated. The
+/// route is exercised directly (not the jwt helper) because the trimming
+/// lived in the route; the token it hands out must drive a rotation.
+#[tokio::test]
+async fn signer_rotation_token_preserves_whitespace_padded_stored_identity() {
+    let (_db_cleanup, pool) =
+        crate::test_support::isolated_database_test_pool("cap119_padded_identity_rotation").await;
+    let stored_subject =
+        "  https://github.com/acme/old/.github/workflows/ci.yaml@refs/heads/main  ";
+    let stored_issuer = "  https://token.actions.githubusercontent.com  ";
+    let new_subject = "https://github.com/acme/new/.github/workflows/ci.yaml@refs/heads/main";
+    let new_issuer = "https://new-issuer.example.test";
+    let (org_id, user_id, app_id) =
+        insert_signer_rotation_app(&pool, Some(stored_subject), Some(stored_issuer)).await;
+    let mut state = crate::test_support::lazy_state();
+    state.db = pool.clone();
+    let auth = AuthContext {
+        user_id,
+        org_id,
+        org_name: "padded-identity-rotation-test".to_string(),
+        role: Role::Owner,
+        api_key: None,
+        management_origin: crate::auth::middleware::ManagementOrigin::Public,
+    };
+    let app_name = sqlx::query_scalar::<_, String>("SELECT name FROM apps WHERE id = $1")
+        .bind(app_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load padded app name");
+
+    let Json(token_response) = issue_signer_rotation_token_route(
+        clone_auth(&auth),
+        State(state.clone()),
+        Path(app_name.clone()),
+        Json(SignerRotationTokenRequest {
+            subject: new_subject.to_string(),
+            issuer: new_issuer.to_string(),
+        }),
+    )
+    .await
+    .expect("token issuance must accept a whitespace-padded stored identity");
+
+    let Json(rotated) = rotate_signer(
+        clone_auth(&auth),
+        State(state.clone()),
+        Path(app_name),
+        Json(RotateSignerRequest {
+            subject: new_subject.to_string(),
+            issuer: new_issuer.to_string(),
+            email_confirmation_token: Some(token_response.token),
+        }),
+    )
+    .await
+    .expect("the issued token must drive the rotation despite padded stored bytes");
+    assert_eq!(
+        rotated.signer_identity_subject.as_deref(),
+        Some(new_subject)
+    );
+    assert_eq!(rotated.signer_identity_issuer.as_deref(), Some(new_issuer));
+
+    crate::test_support::drop_isolated_database("cap119_padded_identity_rotation", pool).await;
 }
 
 /// Codex review finding on #187: when a legacy publication obligation is
