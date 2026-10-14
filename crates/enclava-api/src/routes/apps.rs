@@ -1834,18 +1834,68 @@ pub(crate) async fn delete_app_before(
         .await
         .map_err(|_| internal_server_error())?;
 
-    let teardown = delete_mutation
-        .guard_provider(request_workload_teardown(
-            &state,
-            &auth,
-            &deleting_app,
-            WorkloadTeardownDecision {
-                required: teardown_required,
-                completed: teardown_completed_at.is_some(),
-            },
-        ))
-        .await
-        .map_err(|_| internal_server_error())?;
+    // Publish the admitted teardown unit before any workload is asked to
+    // erase its owner seed (Codex review on 3b168c73): the phase transaction
+    // only flips the app to deleting, so with retention 1 or prior byte
+    // trimming one of the two artifacts the deleting-app selector now pins
+    // may still be absent from the live Trustee policy — teardown of a
+    // still-serving generation would then hit missing authorization. Enqueue
+    // the selector change and converge it here, while this delete holds the
+    // global kbs_policy fence, before the teardown request runs. A reconcile
+    // failure flows into the same handling as a teardown failure below
+    // (restore-or-keep disposition, lease released in the lane).
+    let teardown = if teardown_required && teardown_completed_at.is_none() {
+        let mut publish_tx = state
+            .db
+            .begin()
+            .await
+            .map_err(|_| internal_server_error())?;
+        let publish_enqueued =
+            crate::kbs::enqueue_signed_policy_revocation_if_active(&mut publish_tx)
+                .await
+                .map_err(|_| internal_server_error())?
+                .is_some();
+        publish_tx
+            .commit()
+            .await
+            .map_err(|_| internal_server_error())?;
+        if publish_enqueued {
+            match delete_mutation
+                .guard_provider(crate::kbs::reconcile_pending_signed_policy_artifacts(
+                    &state.db,
+                    state.kbs_policy.as_ref(),
+                ))
+                .await
+                .map_err(|_| internal_server_error())?
+            {
+                Ok(()) => None,
+                Err(error) => Some(app_delete_failure(
+                    deleting_app.id,
+                    AppDeleteFailure::KbsPolicy,
+                    error,
+                )),
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let teardown = match teardown {
+        Some(failure) => Err(failure),
+        None => delete_mutation
+            .guard_provider(request_workload_teardown(
+                &state,
+                &auth,
+                &deleting_app,
+                WorkloadTeardownDecision {
+                    required: teardown_required,
+                    completed: teardown_completed_at.is_some(),
+                },
+            ))
+            .await
+            .map_err(|_| internal_server_error())?,
+    };
     if let Err(failure) = teardown {
         if !abandon_teardown {
             // A failed teardown exits before any fenced resource is touched:
@@ -1916,6 +1966,60 @@ pub(crate) async fn delete_app_before(
             code = "app_delete_teardown_abandoned",
             "proceeding with deletion after failed workload teardown (operator override)"
         );
+        // The override must be able to unwind a wedged budget (Codex review on
+        // 3b168c73): with the completion marker still NULL the deleting-app
+        // selector keeps pinning this app's retention-exempt artifacts, and
+        // the mandatory reconciliation below would fail with the same
+        // SignedPolicyBudgetExceeded the override exists to escape. The
+        // workload is confirmed unreachable, so its pin protects nothing.
+        // Record the waiver explicitly first — the later owner-binding
+        // soft-delete only waives while the marker is NULL, so stamping the
+        // marker now would silently drop the same-name-recreate guard — then
+        // stamp the marker. Both run in a short transaction committed
+        // independently of the delete lane (like the teardown marker itself):
+        // an open-lane write would hold the waiver row lock against the later
+        // soft delete from the pool, and would stay invisible to the
+        // reconciliation below until the lane commits.
+        let mut abandon_tx = state
+            .db
+            .begin()
+            .await
+            .map_err(|_| internal_server_error())?;
+        sqlx::query(
+            "INSERT INTO kbs_owner_seed_waivers (binding_key, app_id, org_name, app_name)
+             SELECT $2, app.id, org.name, app.name
+               FROM apps AS app
+               JOIN organizations AS org ON org.id = app.org_id
+              WHERE app.id = $1
+             ON CONFLICT (binding_key) DO UPDATE
+                SET app_id = EXCLUDED.app_id,
+                    org_name = EXCLUDED.org_name,
+                    app_name = EXCLUDED.app_name,
+                    waived_at = now()",
+        )
+        .bind(deleting_app.id)
+        .bind(crate::kbs::owner_binding_key_for(
+            &deleting_app.namespace,
+            &deleting_app.name,
+        ))
+        .execute(&mut *abandon_tx)
+        .await
+        .map_err(|_| internal_server_error())?;
+        sqlx::query(
+            "UPDATE apps
+                SET workload_teardown_completed_at =
+                        COALESCE(workload_teardown_completed_at, clock_timestamp()),
+                    updated_at = clock_timestamp()
+              WHERE id = $1",
+        )
+        .bind(deleting_app.id)
+        .execute(&mut *abandon_tx)
+        .await
+        .map_err(|_| internal_server_error())?;
+        abandon_tx
+            .commit()
+            .await
+            .map_err(|_| internal_server_error())?;
     }
 
     // The running workload needs its current KBS authorization to erase the

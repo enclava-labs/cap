@@ -704,10 +704,10 @@ fn app_delete_source_never_reads_or_formats_external_diagnostics() {
     );
     assert!(
         deletion
-            .find("request_workload_teardown")
+            .rfind("request_workload_teardown")
             .expect("app deletion requests workload teardown")
             < deletion
-                .find("enqueue_signed_policy_revocation_if_active")
+                .rfind("enqueue_signed_policy_revocation_if_active")
                 .expect("app deletion enqueues signed-policy revocation"),
         "app deletion must preserve KBS authorization until workload teardown completes"
     );
