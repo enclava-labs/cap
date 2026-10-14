@@ -1967,6 +1967,10 @@ async fn acquire_apply_permit_and_revalidate(
         .acquire_owned()
         .await
         .map_err(|_| DeploymentJobError::ApplyLimiterClosed)?;
+    // Failed cluster lookups must not retain durable global mutation ownership.
+    let fresh_volume_claims =
+        crate::routes::deployments::fresh_volume_claims(&payload.app, &payload.snapshot.resources)
+            .await?;
     // Keep the apply-specific queue outside durable mutation admission. The
     // mutation claim acquires exactly one shared permit before any connection.
     let mut resources = vec![
@@ -1990,19 +1994,6 @@ async fn acquire_apply_permit_and_revalidate(
         resources,
     )
     .await?;
-
-    // Fresh-volume floor: which sub-floor claims in the accepted snapshot
-    // would provision a NEW PVC — live cluster evidence, computed BEFORE
-    // the authority lanes so no kube I/O runs under them (and none at all
-    // for at/above-floor snapshots). A surviving sub-floor claim keeps the
-    // snapshot operable; a missing/terminating one makes the floor
-    // authoritative HERE so a sub-floor snapshot that slipped past
-    // admission (mixed-version window, pre-floor API instance, or a retry
-    // after a crash between the hash write and apply_all) fails before the
-    // PVC is created, leaving the app correctable.
-    let fresh_volume_claims =
-        crate::routes::deployments::fresh_volume_claims(&payload.app, &payload.snapshot.resources)
-            .await?;
 
     // Revalidate every mutable authority immediately before external side
     // effects while holding the global authority order. Keyring rotation,

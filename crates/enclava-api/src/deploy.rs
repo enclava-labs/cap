@@ -1947,6 +1947,13 @@ pub async fn reapply_tenant_ingress(
     let cm = enclava_engine::manifest::ingress::generate_ingress_configmap(&app_spec);
 
     let engine = ApplyEngine::try_default().await?;
+    let rollout_timeout = engine
+        .config()
+        .rollout_timeout_for_storage(
+            &app_spec.storage.app_data.size,
+            &app_spec.storage.tls_data.size,
+        )
+        .map_err(DeployError::Validation)?;
     ensure_statefulset_exists(&engine, &app_spec.namespace, &app_spec.name).await?;
     let generation = MutationGeneration::new(kubernetes_mutation_generation)?;
     mutation
@@ -1966,7 +1973,7 @@ pub async fn reapply_tenant_ingress(
         &engine,
         &app_spec.namespace,
         &app_spec.name,
-        engine.config().rollout_timeout,
+        rollout_timeout,
     )
     .await?;
     if status.phase != DeployPhase::Running {
