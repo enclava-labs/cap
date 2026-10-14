@@ -308,6 +308,8 @@ fn generate_tenant_image_pull_secret(
 
 async fn apply_all_with_tenant_image_pull_secret(
     engine: &ApplyEngine,
+    pool: &sqlx::PgPool,
+    deployment_id: Uuid,
     manifests: &enclava_engine::manifest::GeneratedManifests,
     manifest_hash: &str,
     image_pull_secret_config: Option<&TenantImagePullSecretConfig>,
@@ -364,6 +366,23 @@ async fn apply_all_with_tenant_image_pull_secret(
             manifest_hash.to_string(),
         );
 
+    // Codex P1: creation-specific evidence for the PVC sweep. Stamped
+    // immediately before the StatefulSet step is attempted (the final
+    // apply phase). Under Retain/Retain the controller attaches no PVC
+    // ownerReferences, so this stamp — not apply_started_at (which
+    // precedes KBS reconciliation and every Kubernetes write) — is the
+    // earliest point a claim of this workload's lineage could exist: a
+    // tenant-created same-named claim predates it and is never swept.
+    // First-writer-wins (COALESCE) so a retry of a partially-failed apply
+    // does not advance the bound past claims the first attempt created.
+    sqlx::query(
+        "UPDATE deployments
+            SET sts_apply_started_at = COALESCE(sts_apply_started_at, clock_timestamp())
+          WHERE id = $1",
+    )
+    .bind(deployment_id)
+    .execute(pool)
+    .await?;
     apply_statefulset(engine, ns_name, &sts, generation).await?;
     tracing::info!(
         namespace = %ns_name,
@@ -2277,6 +2296,8 @@ pub async fn apply_deployment_manifests(
         .await?;
     apply_all_with_tenant_image_pull_secret(
         &engine,
+        &pool,
+        deployment_id,
         &manifests,
         &hash,
         tenant_image_pull_secret_config.as_ref(),

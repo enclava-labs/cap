@@ -2730,7 +2730,27 @@ async fn publish_apply_failure_with_mutation(
         "UPDATE deployments
             SET status = 'failed'::deploy_status_enum,
                 error_message = $1,
-                completed_at = clock_timestamp()
+                completed_at = clock_timestamp(),
+                -- Codex P2: arm the retryable-cleanup marker atomically with
+                -- terminal failure publication. If the process exits after
+                -- this commit but before/during the awaited compensating
+                -- cleanup, the row keeps provider evidence AND the marker,
+                -- so no_other_generation_owns_provider_state cannot treat
+                -- it as a permanent owner and block every later failed
+                -- generation's cleanup. The in-process compensation clears
+                -- it on completion (ConfirmedAbsent/Adopted paths); every
+                -- incomplete outcome deliberately keeps it.
+                -- ONLY for rows whose apply never completed: a row that
+                -- reached watching (observing_since set) may still back a
+                -- LIVE workload, so it must keep its full ownership veto
+                -- (devin: exempting it would let a later failed apply
+                -- delete the namespace under that workload). Rows
+                -- terminalized by supersede_incomplete_deployments do NOT
+                -- pass through here either and keep their veto.
+                cleanup_sweep_incomplete = CASE
+                    WHEN observing_since IS NULL THEN true
+                    ELSE cleanup_sweep_incomplete
+                END
           WHERE id = $2
             AND app_id = $3
             AND org_id = $4

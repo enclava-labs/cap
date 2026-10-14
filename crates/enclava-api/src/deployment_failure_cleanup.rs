@@ -168,17 +168,24 @@ const SWEEP_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3
 /// the next apply or app deletion converges the leftovers).
 const SWEEP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
 
-/// Bound a single sweep read. Returns Err on both transport failure and
-/// deadline expiry: both mean the target's state is undecidable within the
-/// sweep's budget.
-async fn bounded_sweep_read<F, T>(future: F) -> Result<T, kube::Error>
+/// Bound a single sweep read by BOTH the per-request budget and the
+/// sweep's overall deadline: a target started near the deadline must not
+/// stretch the sweep (and its shared fence retention) by further 30 s
+/// reads, delete attempts, and conflict retries. Returns Err on transport
+/// failure, deadline expiry, and per-request-budget expiry — all three
+/// mean the target's state is undecidable within the sweep's budget.
+async fn bounded_sweep_read<F, T>(
+    deadline: tokio::time::Instant,
+    future: F,
+) -> Result<T, kube::Error>
 where
     F: std::future::Future<Output = Result<T, kube::Error>>,
 {
-    match tokio::time::timeout(SWEEP_READ_TIMEOUT, future).await {
+    let per_request = tokio::time::Instant::now() + SWEEP_READ_TIMEOUT;
+    match tokio::time::timeout_at(deadline.min(per_request), future).await {
         Ok(result) => result,
         Err(_) => Err(kube::Error::Service(
-            "adopted-namespace sweep read exceeded its 30s per-request budget".into(),
+            "adopted-namespace sweep read exceeded its budget".into(),
         )),
     }
 }
@@ -244,7 +251,7 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
         let mut statefulset_uid: Option<String> = None;
         let mut statefulset_created_at: Option<chrono::DateTime<chrono::Utc>> = None;
         for attempt in 0..SWEEP_DELETE_RETRIES {
-            let live = match bounded_sweep_read(api.get_opt(&target.name)).await {
+            let live = match bounded_sweep_read(sweep_deadline, api.get_opt(&target.name)).await {
                 Ok(live) => live,
                 Err(error) => {
                     tracing::warn!(
@@ -272,11 +279,10 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
                         &target.name,
                         None,
                         sweep_deadline,
+                        // Retry sweep after a previous sweep deleted the
+                        // sts: fall back to the durable sts-step bound.
                         apply_started_at,
-                        // No live StatefulSet anchors a temporal bound:
-                        // require the controller's own ownerReference
-                        // signature on each claim instead.
-                        true,
+                        None,
                     )
                     .await;
                 }
@@ -313,20 +319,28 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
                         .ok()
                 });
             }
-            match bounded_sweep_read(api.delete(
-                &target.name,
-                &kube::api::DeleteParams {
-                    preconditions: Some(preconditions),
-                    ..kube::api::DeleteParams::default()
-                },
-            ))
+            match bounded_sweep_read(
+                sweep_deadline,
+                api.delete(
+                    &target.name,
+                    &kube::api::DeleteParams {
+                        preconditions: Some(preconditions),
+                        // Foreground propagation: the owner must not vanish
+                        // while its Pods or other dependents are still live
+                        // (background cascading deletion would let the 404
+                        // confirmation here run ahead of the collector).
+                        propagation_policy: Some(kube::api::PropagationPolicy::Foreground),
+                        ..kube::api::DeleteParams::default()
+                    },
+                ),
+            )
             .await
             {
                 Ok(_) => {
                     // Accepted DELETE is not absence: a finalizer can hold
                     // the object in Terminating indefinitely. Re-read and
                     // confirm 404 before counting the target complete.
-                    match bounded_sweep_read(api.get_opt(&target.name)).await {
+                    match bounded_sweep_read(sweep_deadline, api.get_opt(&target.name)).await {
                         Ok(None) => {
                             deleted = true;
                             break;
@@ -412,14 +426,12 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
                 &target.name,
                 statefulset_uid.as_deref(),
                 sweep_deadline,
-                // Use StatefulSet-specific creation timestamp as the evidence
-                // bound for PVC deletion, falling back to apply_started_at
-                // only for retry sweeps where the StatefulSet is already gone.
-                statefulset_created_at.or(apply_started_at),
-                // The StatefulSet was proven live and just deleted in THIS
-                // sweep: its own creationTimestamp is the claim bound; no
-                // ownerReference is required (Retain strips them).
-                false,
+                // Retry fallback when the sts timestamp could not be read.
+                apply_started_at,
+                // The sts was proven live and just deleted by THIS sweep:
+                // its own creationTimestamp is this instance's lineage
+                // bound — tighter and more specific than any row stamp.
+                statefulset_created_at,
             )
             .await;
         }
@@ -480,35 +492,63 @@ where
 const SWEEP_DELETE_RETRIES: usize = 3;
 
 /// Delete the PVCs this failed generation's StatefulSet created in an
-/// adopted namespace. A claim is deleted only when BOTH hold:
+/// adopted namespace. A claim is deleted only when it carries
+/// CREATION-SPECIFIC evidence of this workload's lineage:
 ///
 /// * its name matches the exact `<vct>-<statefulset>-<ordinal>` shape for
 ///   a CAP-rendered VCT name, AND
-/// * its controller ownerReference points at the EXACT StatefulSet UID
-///   this sweep just deleted (StatefulSet-controller-created claims carry
-///   that ownerReference). A pre-existing claim the controller merely
-///   ADOPTED by name — including one from a foreign StatefulSet with the
-///   same name, or a claim that predates CAP — carries a different or
-///   absent owner UID and is never touched.
+/// * it was created after the bound proven for the StatefulSet step —
+///   the StatefulSet's OWN creationTimestamp when the sweep observed it
+///   live (this sts instance's lineage; a claim older than the sts the
+///   apply created can only be a tenant's or a predecessor's), or the
+///   row's `sts_apply_started_at` stamp for a retry sweep after the sts
+///   is gone, widened to the sibling-MIN when incomplete siblings'
+///   evidence is being converged.
 ///
 /// PVCs created by the controller from `spec.volumeClaimTemplates` never
 /// carry CAP annotations (VCT metadata is immutable — adding the
 /// annotation would break every redeploy of an existing StatefulSet with
-/// 422), so ownership is derived from the ownerReference after the
-/// StatefulSet itself was proven CAP-created and deleted by this sweep.
+/// 422), and under Retain/Retain the controller attaches no PVC
+/// ownerReferences either, so temporal creation evidence is the only
+/// sound discriminator. When ownerReferences ARE present they must not
+/// contradict: a controller ownerRef must pin the deleted StatefulSet's
+/// UID (first sweep) or name it (retry sweep after it is gone).
 pub(crate) async fn sweep_statefulset_pvcs(
     client: &kube::Client,
     namespace: &str,
     statefulset: &str,
     statefulset_uid: Option<&str>,
     sweep_deadline: tokio::time::Instant,
-    apply_started_at: Option<chrono::DateTime<chrono::Utc>>,
-    require_controller_owner_ref: bool,
+    sts_step_bound: Option<chrono::DateTime<chrono::Utc>>,
+    sts_observed_created_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> usize {
     const CAP_VCT_NAMES: [&str; 2] = ["state", "tls-state"];
+    // The effective bound is the EARLIEST sts-step evidence across the
+    // converged rows: the sibling-MIN durable stamp (which includes this
+    // row) tightened only when no older evidence exists. The observed
+    // sts's own creationTimestamp never WIDENS the deletion window past
+    // an older incomplete sibling's retained claims (devin: gen-1's
+    // 10:00 claim must still be swept by gen-2's sweep). All-None means
+    // no apply of this app ever provably reached the StatefulSet step
+    // and no sts was observed — no matching claim is provably CAP
+    // lineage, so touch nothing.
+    let bound = [sts_step_bound, sts_observed_created_at]
+        .into_iter()
+        .flatten()
+        .min();
+    let Some(bound) = bound else {
+        tracing::info!(
+            namespace = %namespace,
+            statefulset = %statefulset,
+            "adopted-namespace PVC sweep has no StatefulSet-step evidence; touching no claims"
+        );
+        return 0;
+    };
     let api: kube::Api<k8s_openapi::api::core::v1::PersistentVolumeClaim> =
         kube::Api::namespaced(client.clone(), namespace);
-    let list = match bounded_sweep_read(api.list(&kube::api::ListParams::default())).await {
+    let list = match bounded_sweep_read(sweep_deadline, api.list(&kube::api::ListParams::default()))
+        .await
+    {
         Ok(list) => list,
         Err(error) => {
             tracing::warn!(
@@ -528,49 +568,29 @@ pub(crate) async fn sweep_statefulset_pvcs(
         if !is_cap_claim_name(&name, statefulset, &CAP_VCT_NAMES) {
             continue;
         }
-        // The claim must be OWNED by the exact StatefulSet this sweep just
-        // deleted (controller-created claims carry the ownerReference).
-        // Without the UID pin the controller's name-based adoption of a
-        // pre-existing claim would make this sweep destroy foreign data.
-        // Ownership without a controller ownerReference: the generated
-        // StatefulSet uses when_deleted/when_scaled Retain, under which the
-        // controller attaches no PVC ownerReferences at all — so retained
-        // claims carry NO creation evidence of their own. The sound bound
-        // is temporal: the CAP-created StatefulSet existed only from this
-        // apply's start, so a same-named `<vct>-<sts>-<ordinal>` claim
-        // CREATED after that point can only be this workload's (a foreign
-        // same-named StatefulSet would have made the apply SSA-patch
-        // instead of create, failing the StatefulSet's own
-        // creation-evidence gate). Claims predating the apply — including
-        // ones a tenant created by that name — are never touched. When
-        // ownerReferences ARE present they must not contradict: a
-        // controller ownerRef must pin the deleted StatefulSet's UID
-        // (first sweep) or name it (retry sweep after it is gone).
-        let created_after_apply_start = apply_started_at.is_some_and(|threshold| {
-            pvc.metadata.creation_timestamp.is_some_and(|created| {
-                // Compare as the SAME type: the chrono threshold is parsed
-                // into a jiff Timestamp (both render/parse RFC 3339), so
-                // the ordering is truly chronological — string forms of
-                // the two libraries differ and misorder near-equal times.
-                threshold
-                    .to_rfc3339()
-                    .parse::<k8s_openapi::jiff::Timestamp>()
-                    .is_ok_and(|threshold| created.0 > threshold)
-            })
+        // Creation-specific lineage evidence (Codex P1): the claim must
+        // postdate the proven StatefulSet-step bound — the observed
+        // sts's OWN creationTimestamp when the sweep deleted it live,
+        // else the row's durable sts_apply_started_at (sibling-MIN).
+        // A tenant claim created after apply_started_at but BEFORE the
+        // apply reached the StatefulSet step predates this bound and is
+        // never swept, even when its name matches the VCT shape.
+        let created_after_sts_step = pvc.metadata.creation_timestamp.is_some_and(|created| {
+            // Compare as the SAME type: the chrono threshold is parsed
+            // into a jiff Timestamp (both render/parse RFC 3339), so
+            // the ordering is truly chronological — string forms of
+            // the two libraries differ and misorder near-equal times.
+            bound
+                .to_rfc3339()
+                .parse::<k8s_openapi::jiff::Timestamp>()
+                .is_ok_and(|threshold| created.0 > threshold)
         });
-        let controller_owned = pvc.metadata.owner_references.as_ref().is_some_and(|owners| {
-            owners.iter().any(|owner| {
-                owner.kind == "StatefulSet"
-                    && owner.controller == Some(true)
-                    && owner.name == statefulset
-                    && statefulset_uid.is_none_or(|expected| owner.uid == expected)
-            })
-        });
-        if require_controller_owner_ref {
-            if !controller_owned {
-                continue;
-            }
-        } else if !created_after_apply_start {
+        if !created_after_sts_step {
+            tracing::info!(
+                namespace = %namespace,
+                pvc = %name,
+                "adopted-namespace PVC sweep skips claim predating the StatefulSet-step evidence bound"
+            );
             continue;
         }
         let owner_refs_not_foreign = match statefulset_uid {
@@ -610,13 +630,16 @@ pub(crate) async fn sweep_statefulset_pvcs(
             failures += 1;
             continue;
         }
-        match bounded_sweep_read(api.delete(
-            &name,
-            &kube::api::DeleteParams {
-                preconditions: Some(preconditions),
-                ..kube::api::DeleteParams::default()
-            },
-        ))
+        match bounded_sweep_read(
+            sweep_deadline,
+            api.delete(
+                &name,
+                &kube::api::DeleteParams {
+                    preconditions: Some(preconditions),
+                    ..kube::api::DeleteParams::default()
+                },
+            ),
+        )
         .await
         {
             Err(kube::Error::Api(error)) if error.code == 404 => {
@@ -636,7 +659,7 @@ pub(crate) async fn sweep_statefulset_pvcs(
                 // Accepted is not absent (Longhorn finalizers can hold a
                 // claim in Terminating): confirm 404, else the sweep is
                 // incomplete and retains provider-state evidence.
-                match bounded_sweep_read(api.get_opt(&name)).await {
+                match bounded_sweep_read(sweep_deadline, api.get_opt(&name)).await {
                     Ok(None) => {}
                     Ok(Some(_)) => {
                         tracing::warn!(
@@ -795,6 +818,15 @@ enum NamespaceTeardown {
     /// Busy). The row is marked cleanup_sweep_incomplete so later failed
     /// generations stay cleanup-eligible and their sweeps converge.
     DeleteNotIssued,
+    /// The SAME-UID namespace no longer classifies as this generation's
+    /// (an external writer rewrote its ownership annotations between the
+    /// owning GET and the preconditioned DELETE; every attempt 409'd
+    /// against the pinned resourceVersion). NOT confirmed absence — the
+    /// namespace and this generation's CAP-created children are live, so
+    /// provider evidence must be retained and the row marked retryable;
+    /// no delete is in flight, so fences release normally and a LATER
+    /// failed generation's evidence-gated sweep converges the leftovers.
+    OwnedRewritten,
 }
 
 /// How the caller should release the mutation fences after cleanup.
@@ -1067,26 +1099,20 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
                 namespace = %app.namespace,
                 "failed-apply cleanup sweeps published objects from adopted namespace (no creation evidence; namespace not deleted)"
             );
-            // The PVC ownership bound is when this apply ATTEMPTED the
-            // Kubernetes writes, not the row's creation (acceptance
-            // precedes setup/signing/apply by an unbounded margin, and a
-            // tenant could create a same-named claim in between).
-            // apply_started_at is stamped at the 'applying' transition —
-            // immediately before the first Kubernetes write — so it is
-            // set for exactly the partial applies this cleanup
-            // compensates (observing_since only appears AFTER a fully
-            // successful apply). Legacy rows fall back to observing_since
-            // (a failed apply that had completed its writes) and finally
-            // created_at.
-            // The bound is the EARLIEST write-window start across this
-            // row AND every still-incomplete sibling row: a completed
-            // sweep clears those siblings' evidence (their shared-name
-            // objects were converged), so their older retained claims
-            // must be within this sweep's deletion window — otherwise a
-            // pre-sibling claim is skipped here and then forgotten when
-            // the marker clears.
+            // The claim bound is the earliest StatefulSet-step start across
+            // THIS row AND every still-incomplete sibling row (a completed
+            // sweep clears those siblings' evidence — their shared-name
+            // objects, including retained claims, were converged — so
+            // their older claims must be within this sweep's deletion
+            // window). sts_apply_started_at is stamped immediately before
+            // the StatefulSet step, so a tenant claim created after
+            // apply_started_at but before that step predates the bound
+            // and can never be swept. Rows whose applies never reached
+            // the StatefulSet step (NULL sts stamp, incl. legacy rows
+            // predating the column) fall back to apply_started_at /
+            // observing_since / created_at.
             let apply_started_at = match sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
-                "SELECT MIN(COALESCE(statefulset_apply_started_at, apply_started_at, observing_since, created_at)) FROM deployments WHERE app_id = $1 AND (id = $2 OR cleanup_sweep_incomplete)",
+                "SELECT MIN(COALESCE(sts_apply_started_at, apply_started_at, observing_since, created_at)) FROM deployments WHERE app_id = $1 AND (id = $2 OR cleanup_sweep_incomplete)",
             )
             .bind(app.id)
             .bind(failed_deployment_id)
@@ -1269,23 +1295,24 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
             }
             CleanupFenceOutcome::ReleaseNormally
         }
-        NamespaceTeardown::AdoptedIncomplete | NamespaceTeardown::DeleteNotIssued => {
+        NamespaceTeardown::AdoptedIncomplete => CleanupFenceOutcome::ReleaseNormally,
+        NamespaceTeardown::DeleteNotIssued | NamespaceTeardown::OwnedRewritten => {
             // Evidence kept (storage guard + ownership gates), fences
             // release: the retained-fence reconciler requires a namespace
             // 404 — which never happens for an adopted namespace, nor for
-            // a proven-owned one no delete was issued against. Marking the
+            // a proven-owned one no delete was issued against (and this
+            // generation is no longer authorized to delete). Marking the
             // row cleanup_sweep_incomplete keeps later failed generations
             // cleanup-eligible so their sweeps converge the leftovers.
-            if matches!(teardown, NamespaceTeardown::DeleteNotIssued)
-                && let Err(error) = sqlx::query(
-                    "UPDATE deployments
-                     SET cleanup_sweep_incomplete = true
-                     WHERE id = $1 AND app_id = $2 AND status = 'failed'",
-                )
-                .bind(failed_deployment_id)
-                .bind(app.id)
-                .execute(&state.db)
-                .await
+            if let Err(error) = sqlx::query(
+                "UPDATE deployments
+                 SET cleanup_sweep_incomplete = true
+                 WHERE id = $1 AND app_id = $2 AND status = 'failed'",
+            )
+            .bind(failed_deployment_id)
+            .bind(app.id)
+            .execute(&state.db)
+            .await
             {
                 tracing::warn!(
                     app_id = %app.id,
@@ -1748,9 +1775,9 @@ async fn delete_owned_namespace(
                         tracing::warn!(
                             app_id = %app.id,
                             namespace = %app.namespace,
-                            "failed-apply cleanup: the owned namespace was externally rewritten (same UID, ownership annotations changed); treating the sweep as incomplete"
+                            "failed-apply cleanup: the owned namespace was externally rewritten (same UID, ownership annotations changed); retaining evidence for a later sweep"
                         );
-                        return NamespaceTeardown::AdoptedIncomplete;
+                        return NamespaceTeardown::OwnedRewritten;
                     }
                     tracing::info!(
                         app_id = %app.id,
@@ -1846,21 +1873,24 @@ async fn wait_for_namespace_absence(
                 return NamespaceTeardown::ConfirmedAbsent;
             }
             Ok(Ok(ns)) => {
-                // A live namespace after the DELETE was issued does NOT prove
-                // the DELETE was not accepted — dropping the client future
-                // cannot cancel a request already accepted by the API server.
-                // If the namespace carries a deletionTimestamp, a DELETE is
-                // definitely in flight; even without it, treat presence as
-                // ambiguous and retain the fence rather than using presence as
-                // proof the DELETE was not issued.
-                let is_terminating = ns.metadata.deletion_timestamp.is_some();
+                // A live read here is the NORMAL mid-deletion state after an
+                // ACCEPTED delete: namespace finalizers (kubernetes, other
+                // controllers) routinely hold the object Terminating for
+                // seconds before the observed 404 — a deletionTimestamp is
+                // expected progress, not proof of failure. Keep polling
+                // within the bounded wait so the worker that still holds the
+                // fences converges the teardown synchronously; only the
+                // deadline expiring (or the wait failing) retains the fence,
+                // handing convergence to the retained-fence reconciler. The
+                // request-timeout path above is the one that must retain on
+                // a live read — there, acceptance is undecidable.
+                let _ = ns;
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                if remaining.is_zero() || is_terminating {
+                if remaining.is_zero() {
                     tracing::warn!(
                         app_id = %app.id,
                         namespace = %app.namespace,
-                        is_terminating,
-                        "failed-apply namespace deletion did not converge within the bounded wait (or is terminating); retaining the namespace fence for reconciliation"
+                        "failed-apply namespace deletion did not converge within the bounded wait; retaining the namespace fence for reconciliation"
                     );
                     return NamespaceTeardown::DeleteIncomplete;
                 }
