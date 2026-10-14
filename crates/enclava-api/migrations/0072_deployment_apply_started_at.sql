@@ -64,12 +64,60 @@ ALTER TABLE deployments
 -- (nothing backfilled, every legacy row keeps the gate veto). Use the
 -- database's recorded installation time for migration 0047, or avoid
 -- backfilling rows whose lifecycle cannot be proven.
+--
+-- Codex P2 (apply timing, not row creation): `created_at >=` alone is the
+-- ACCEPTANCE time, not when the deployment actually applied. A deployment
+-- queued before the upgrade can first enter 'applying' and fail after 0047
+-- was installed: its NULL observing_since reliably means it never reached
+-- watching (its whole apply ran under observing_since-aware code), but its
+-- earlier created_at excludes it from the cutoff — leaving it unmarked, so
+-- no_other_generation_owns_provider_state rejects every later failure and
+-- compensation is permanently disabled for that app. The OR-clause below
+-- recovers exactly that population — but NOT by trusting the error code
+-- (devin 🔴 round-6: a pre-0047 WATCHED row can also carry these codes: it
+-- watched under pre-0047 code (no observing_since stamp), lost its lease,
+-- and a later re-apply failed; marking THAT row would exempt a possibly
+-- LIVE workload from the ownership gate). The sound positive signals:
+--
+--   * job.updated_at >= the 0047 install: the claim that terminal-published
+--     ran after 0047 was installed HERE (a terminal publish always happens
+--     inside its own claim; requeued claims never terminal-publish). This
+--     excludes pre-install publishes of watched rows.
+--   * job.attempts = 1: the job was claimed exactly once — a row that
+--     reached watching and then failed through a later claim necessarily
+--     has attempts >= 2 (the watch claim plus the failing claim). A single
+--     claim that terminal-publishes an apply/setup failure cannot have
+--     completed the watching transition first: after `watching` the flow
+--     only produces rollout outcomes, whose sole non-requeueable error is
+--     an app/org identity mismatch the schema's identity FKs make
+--     unreachable. (The watch transition itself stamps observing_since,
+--     which the outer WHERE already excludes.)
+--
+-- Together these prove the one and only claim ran post-install and failed
+-- before watching — the queued-across-upgrade population. Residual
+-- conservatism: rows that needed a transient-error requeue (attempts >= 2)
+-- before terminal failure keep the gate veto; they stay safe, just
+-- uncompensated until a future reconciliation pass. Superseded rows
+-- ('deployment_superseded') and completed applies keep the veto entirely.
 UPDATE deployments
    SET cleanup_sweep_incomplete = true
  WHERE status = 'failed'
    AND manifest_hash IS NOT NULL
    AND observing_since IS NULL
-   AND created_at >= COALESCE(
-        (SELECT installed_on FROM _sqlx_migrations WHERE version = 47 AND success),
-        TIMESTAMPTZ 'infinity'
-       );
+   AND (
+        created_at >= COALESCE(
+            (SELECT installed_on FROM _sqlx_migrations WHERE version = 47 AND success),
+            TIMESTAMPTZ 'infinity'
+        )
+        OR EXISTS (
+            SELECT 1 FROM deployment_apply_jobs AS job
+             WHERE job.deployment_id = deployments.id
+               AND job.attempts = 1
+               AND job.updated_at >= COALESCE(
+                    (SELECT installed_on FROM _sqlx_migrations WHERE version = 47 AND success),
+                    TIMESTAMPTZ 'infinity'
+               )
+               AND job.last_error_code IN
+                   ('deployment_apply_failed', 'deployment_setup_failed')
+        )
+   );

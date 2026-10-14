@@ -1923,6 +1923,16 @@ mod tests {
     }
 }
 
+/// Project a worker's deployment status transition. Two evidence-preserving
+/// quirks (devin 🔴 round-6 follow-up): the `watching` transition stamps
+/// `observing_since` as the observation anchor, AND a transition AWAY from a
+/// `watching` row keeps that stamp — the legacy re-apply path (a pre-0047
+/// watched row has NULL `observing_since`; `claim_rollout_observation` cannot
+/// resume it and re-applies) demotes `watching` -> `applying` here, and that
+/// demotion is the moment the row proves it already served a watched
+/// generation. Without the stamp the later failure publisher would see a
+/// NULL-`observing_since` partial apply and arm retryable cleanup whose sweep
+/// can then remove the routes and namespace under the still-live workload.
 pub async fn set_deployment_status(
     pool: &PgPool,
     deployment_id: Uuid,
@@ -1938,7 +1948,8 @@ pub async fn set_deployment_status(
              error_message = $3,
              completed_at = CASE WHEN $4 THEN now() ELSE completed_at END,
              observing_since = CASE
-                 WHEN $1 = 'watching' THEN COALESCE(observing_since, clock_timestamp())
+                 WHEN $1 = 'watching' OR status = 'watching'
+                     THEN COALESCE(observing_since, clock_timestamp())
                  ELSE observing_since
              END,
              apply_started_at = CASE

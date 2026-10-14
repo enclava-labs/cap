@@ -57,6 +57,17 @@ fn conflict_retry_delay(attempt: usize) -> Duration {
 /// or registry Secret indefinitely). Compensate the EXACT object the POST
 /// response identified — a UID-preconditioned DELETE can never hit a
 /// same-named replacement — before propagating the verification error.
+///
+/// devin 🔴 follow-up: this runs synchronously before the failed apply
+/// returns, and `fail_apply_job_with_mutation` holds the mutation lease —
+/// shared fences included — for the whole span. Raw client requests can sit
+/// on the ~295 s client timeout when the API server stalls after the POST,
+/// holding those fences far past the 30 s `bounded_kube_write` cap every
+/// other apply write obeys. Every request is now bounded by the remaining
+/// budget of a total compensation deadline (and the same per-request cap);
+/// a timeout is UNRESOLVED, not success — reported loudly below with a
+/// stable `error_code` so operators can find the object (the failed-apply
+/// cleanup will not remove it: it fails the creation-evidence gate).
 pub(super) async fn compensate_created_object<K>(api: &Api<K>, name: &str, created: &K)
 where
     K: Resource + Clone + Debug + DeserializeOwned,
@@ -68,10 +79,12 @@ where
         tracing::error!(
             kind = kind::<K>(),
             name,
+            error_code = "compensation_unpinned_uid",
             "just-created object has no UID; compensating delete would be unpinned — leaving the object for manual removal"
         );
         return;
     };
+    let deadline = tokio::time::Instant::now() + COMPENSATE_TOTAL_TIMEOUT;
     let mut accepted = false;
     for attempt in 0..3 {
         let params = DeleteParams {
@@ -81,13 +94,25 @@ where
             }),
             ..DeleteParams::default()
         };
-        match api.delete(name, &params).await {
+        match bounded_compensation(deadline, api.delete(name, &params)).await {
             Ok(_) => {
                 accepted = true;
                 break;
             }
-            Err(kube::Error::Api(error)) if error.code == 404 => return,
-            Err(error) => {
+            Err(CompensationError::Gone) => return,
+            Err(CompensationError::Timeout) => {
+                // devin 🔴: budget exhausted while the API server stalls.
+                // Stop hammering it: the fence hold is the cost, and the
+                // object is unresolved either way.
+                tracing::error!(
+                    kind = kind::<K>(),
+                    name,
+                    error_code = "compensation_timeout_unresolved",
+                    "compensating delete of a just-created object exceeded its bounded budget; leaving the object unresolved — failed-apply cleanup will NOT remove it, manual removal required"
+                );
+                return;
+            }
+            Err(CompensationError::Kube(error)) => {
                 tracing::warn!(
                     kind = kind::<K>(),
                     name,
@@ -95,6 +120,9 @@ where
                     error = %error,
                     "compensating delete of a just-created object failed; retrying"
                 );
+                if tokio::time::Instant::now() + conflict_retry_delay(attempt) >= deadline {
+                    break;
+                }
                 tokio::time::sleep(conflict_retry_delay(attempt)).await;
             }
         }
@@ -103,6 +131,7 @@ where
         tracing::error!(
             kind = kind::<K>(),
             name,
+            error_code = "compensation_delete_unresolved",
             "compensating delete failed; the object may remain without valid creation evidence"
         );
         return;
@@ -112,28 +141,88 @@ where
     // fails the creation-evidence gate). Confirm actual absence before
     // returning; a stuck object needs manual removal, so say so loudly.
     for wait in 0..5 {
+        if tokio::time::Instant::now() + Duration::from_secs(2) >= deadline {
+            break;
+        }
         tokio::time::sleep(Duration::from_secs(2)).await;
-        match api.get_opt(name).await {
+        match bounded_compensation(deadline, api.get_opt(name)).await {
             Ok(None) => return,
             Ok(Some(_)) => {
                 if wait == 4 {
                     tracing::error!(
                         kind = kind::<K>(),
                         name,
+                        error_code = "compensation_delete_unresolved",
                         "compensating delete was accepted but the object is not gone (finalizer?); failed-apply cleanup will NOT remove it — manual removal required"
                     );
                 }
             }
-            Err(error) => {
+            Err(CompensationError::Timeout) => {
+                tracing::error!(
+                    kind = kind::<K>(),
+                    name,
+                    error_code = "compensation_timeout_unresolved",
+                    "could not confirm compensating delete removed the object within the bounded budget; leaving it unresolved — manual removal required"
+                );
+                return;
+            }
+            Err(CompensationError::Gone) | Err(CompensationError::Kube(_)) => {
+                // Gone cannot occur on get_opt; a transport failure on the
+                // confirming read leaves the outcome undecidable within the
+                // budget — report it and stop (the earlier log lines carry
+                // the reconciliation evidence).
                 tracing::warn!(
                     kind = kind::<K>(),
                     name,
-                    error = %error,
                     "could not confirm compensating delete removed the object"
                 );
                 return;
             }
         }
+    }
+}
+
+/// Total budget for one compensating delete + absence confirmation. Sized
+/// below the 180 s mutation lease so the shared fences this apply holds are
+/// released well before their reclaim, while still covering three bounded
+/// DELETE attempts plus the finalizer grace window the confirmation poll
+/// observes (`conflict_retry_delay`'s worst-case conflict wait is ~60 s and
+/// is spent inside this budget, not on top of it).
+const COMPENSATE_TOTAL_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Per-request cap for compensation requests, matching `bounded_kube_write`
+/// so a stalled API server cannot stretch a single request past the budget
+/// every other apply write obeys.
+const COMPENSATE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A compensation request that ended without a decision.
+#[derive(Debug)]
+enum CompensationError {
+    /// The object is already absent (404): the compensation is complete.
+    Gone,
+    /// The request ran out of its bounded budget (total deadline or the
+    /// per-request cap). Unresolved, not failed — see the caller's log.
+    Timeout,
+    /// A transport/API error the caller may retry within the budget.
+    Kube(kube::Error),
+}
+
+/// Bound one compensation request by BOTH the remaining total compensation
+/// budget and the per-request cap (devin 🔴: raw calls could otherwise hold
+/// the mutation lease for the client's ~295 s timeout per request).
+async fn bounded_compensation<F, T>(
+    deadline: tokio::time::Instant,
+    future: F,
+) -> Result<T, CompensationError>
+where
+    F: std::future::Future<Output = Result<T, kube::Error>>,
+{
+    let per_request = tokio::time::Instant::now() + COMPENSATE_REQUEST_TIMEOUT;
+    match tokio::time::timeout_at(deadline.min(per_request), future).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(kube::Error::Api(error))) if error.code == 404 => Err(CompensationError::Gone),
+        Ok(Err(error)) => Err(CompensationError::Kube(error)),
+        Err(_) => Err(CompensationError::Timeout),
     }
 }
 

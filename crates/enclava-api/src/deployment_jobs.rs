@@ -2831,8 +2831,17 @@ async fn publish_apply_failure_with_mutation(
                 -- delete the namespace under that workload). Rows
                 -- terminalized by supersede_incomplete_deployments do NOT
                 -- pass through here either and keep their veto.
+                -- devin 🔴 round-6: do not infer 'never watched' from
+                -- NULL observing_since alone. A pre-0047 watched row carries
+                -- NULL observing_since (the column was added without a
+                -- backfill): the legacy re-apply path stamps it at its
+                -- watching->applying demotion (see set_deployment_status),
+                -- but a row STILL 'watching' here has not been through that
+                -- demotion and its NULL is uninformative — it must keep the
+                -- veto. status <> 'watching' is the conservative cut.
                 cleanup_sweep_incomplete = CASE
-                    WHEN observing_since IS NULL THEN true
+                    WHEN observing_since IS NULL AND status <> 'watching'
+                        THEN true
                     ELSE cleanup_sweep_incomplete
                 END
           WHERE id = $2

@@ -190,6 +190,64 @@ where
     }
 }
 
+/// Per-object budget for confirming a DELETE's absence (codex P2: poll
+/// foreground deletions before marking the sweep incomplete). A foreground
+/// delete of a StatefulSet with Pods keeps the set visible — a
+/// `deletionTimestamp` and a `foregroundDeletion` finalizer — until the
+/// garbage collector removes the
+/// dependents, so the first GET after an accepted DELETE commonly still
+/// returns the object even though the deletion is progressing normally.
+/// Longhorn PVC finalizers similarly hold claims after an accepted DELETE.
+/// Treating that first live response as the final outcome counted healthy
+/// deletions as incomplete (evidence retained, storage-size changes blocked)
+/// and skipped the StatefulSet's PVC sweep entirely. The poll is capped PER
+/// OBJECT so one wedged target cannot starve the remaining targets' own
+/// convergence inside the overall sweep deadline.
+const SWEEP_CONFIRM_ABSENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Poll interval while waiting for an accepted DELETE to converge.
+const SWEEP_CONFIRM_ABSENCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Outcome of polling an accepted DELETE for confirmed absence.
+#[derive(Debug, PartialEq, Eq)]
+enum SweepAbsence {
+    /// The object is confirmed gone (404 observed).
+    Absent,
+    /// The object is still live when the confirmation window closed
+    /// (foreground GC or a finalizer still holds it): the sweep must not
+    /// report completion while the object may survive.
+    StillLive,
+    /// Absence could not be confirmed (read failures/deadline): undecidable.
+    Uninspectable,
+}
+
+/// Poll for the object's absence within `min(sweep deadline, per-object
+/// confirmation budget)` instead of a single immediate GET.
+async fn wait_for_sweep_absence<K>(
+    api: &kube::Api<K>,
+    name: &str,
+    sweep_deadline: tokio::time::Instant,
+) -> SweepAbsence
+where
+    K: kube::Resource + Clone + std::fmt::Debug + serde::de::DeserializeOwned,
+{
+    let confirm_deadline =
+        (tokio::time::Instant::now() + SWEEP_CONFIRM_ABSENCE_TIMEOUT).min(sweep_deadline);
+    loop {
+        match bounded_sweep_read(confirm_deadline, api.get_opt(name)).await {
+            Ok(None) => return SweepAbsence::Absent,
+            Ok(Some(_)) => {
+                if tokio::time::Instant::now() + SWEEP_CONFIRM_ABSENCE_INTERVAL >= confirm_deadline
+                {
+                    return SweepAbsence::StillLive;
+                }
+                tokio::time::sleep(SWEEP_CONFIRM_ABSENCE_INTERVAL).await;
+            }
+            Err(_) => return SweepAbsence::Uninspectable,
+        }
+    }
+}
+
 /// Delete exactly the objects this failed generation created in an adopted
 /// namespace. Each target is first GET'd: an object is deleted only when
 /// its live mutation-generation annotation is positive and not newer than
@@ -332,7 +390,27 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
                     })
                     .and_then(|raw| raw.parse::<i64>().ok())
                     .is_some_and(|created_by| created_by > 0);
-                if has_creation_evidence
+                // Codex P2 (renamed legacy secrets): a pre-release failure
+                // that migration 0072 made cleanup-eligible can have created
+                // the image-pull Secret under an OLD configured name, and
+                // that generation can never carry RESOURCE_CREATED_BY_ANNOTATION.
+                // If the configured name changed before this sweep, the old
+                // Secret is invisible to both the configured-name target and
+                // the annotation filter above — the sweep would report
+                // success and clear both rows' evidence over live registry
+                // credentials. CAP's pull secret is always
+                // `kubernetes.io/dockerconfigjson`, so when a legacy evidence
+                // row is in scope an UNMARKED Secret of that type is a
+                // plausible legacy product: add it as a candidate. Deletion
+                // stays evidence-gated (an unmarked Secret cannot be deleted)
+                // and the per-target legacy handling below counts it
+                // UNRESOLVED — keeping the sweep incomplete — unless it
+                // provably predates every legacy row (then it is a foreign
+                // pre-existing Secret and is skipped).
+                let plausible_legacy_pull_secret = !has_creation_evidence
+                    && legacy_row_started_at.is_some()
+                    && secret.type_.as_deref() == Some("kubernetes.io/dockerconfigjson");
+                if (has_creation_evidence || plausible_legacy_pull_secret)
                     && !targets
                         .iter()
                         .any(|target| target.kind == "Secret" && target.name == name)
@@ -341,6 +419,7 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
                         app_id = %app.id,
                         namespace = %app.namespace,
                         secret = %name,
+                        created_evidence = has_creation_evidence,
                         "adopted-namespace sweep discovered a CAP-created Secret outside the configured pull-secret name; adding it as a sweep candidate"
                     );
                     targets.push(AdoptedNamespaceSweep {
@@ -558,34 +637,37 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
             {
                 Ok(_) => {
                     // Accepted DELETE is not absence: a finalizer can hold
-                    // the object in Terminating indefinitely. Re-read and
-                    // confirm 404 before counting the target complete.
-                    match bounded_sweep_read(sweep_deadline, api.get_opt(&target.name)).await {
-                        Ok(None) => {
+                    // the object in Terminating indefinitely — and with the
+                    // foreground propagation above, a StatefulSet with Pods
+                    // stays visible until garbage collection finishes.
+                    // Poll for confirmed 404 within the confirmation window
+                    // (codex P2) instead of treating the first live response
+                    // as the final outcome, then count the target complete.
+                    match wait_for_sweep_absence(&api, &target.name, sweep_deadline).await {
+                        SweepAbsence::Absent => {
                             deleted = true;
                             break;
                         }
-                        Ok(Some(_)) => {
-                            // Terminating or finalizer-stuck: the sweep
-                            // must not report completion while the object
-                            // may survive.
+                        SweepAbsence::StillLive => {
+                            // Still Terminating or finalizer-stuck when the
+                            // confirmation window closed: the sweep must not
+                            // report completion while the object may survive.
                             tracing::warn!(
                                 app_id = %app.id,
                                 namespace = %app.namespace,
                                 kind = target.kind,
                                 name = %target.name,
-                                "adopted-namespace sweep delete accepted but object still live (finalizer?); counting as incomplete"
+                                "adopted-namespace sweep delete accepted but object still live after the confirmation window (foreground GC or finalizer?); counting as incomplete"
                             );
                             failures += 1;
                             break;
                         }
-                        Err(error) => {
+                        SweepAbsence::Uninspectable => {
                             tracing::warn!(
                                 app_id = %app.id,
                                 namespace = %app.namespace,
                                 kind = target.kind,
                                 name = %target.name,
-                                error = %error,
                                 "adopted-namespace sweep cannot confirm absence after delete; counting as incomplete"
                             );
                             failures += 1;
@@ -843,14 +925,19 @@ fn classify_claim_lineage(
 /// fail-closed state for a failed generation that had claims; app
 /// deletion is the resolution path (tracked in issue #251).
 ///
-/// When the StatefulSet is absent and NO proven lineage record exists
-/// AND no row in scope ever reached the StatefulSet step, no CAP
-/// lineage could have created a claim at all (devin: pre-StatefulSet
-/// cleanup) — matching claims are then provably pre-existing and the
-/// sweep is complete without touching them. If some row DID reach the
-/// StatefulSet step without recording provenance, claims are unprovable
-/// and the sweep fails closed (non-zero) as long as name-matching
-/// claims remain.
+/// This applies to PRE-EXISTING claims exactly as it does to unprovable
+/// ones (devin 🔴 follow-up): when no row in scope ever reached the
+/// StatefulSet step, name-matching claims are provably not CAP's — but
+/// they are still ADOPTABLE at their old size by a later resized
+/// deployment, which is the same silent-reuse hazard the paragraph above
+/// guards. Clearing evidence over them would disarm the deploy route's
+/// storage-size guard (the only resize protection) while the claim stays
+/// intact, so the sweep reports incomplete and keeps the evidence;
+/// "provably pre-existing" only changes the log wording and the
+/// resolution path (the namespace owner can safely remove the claim),
+/// never the verdict. This deliberately supersedes the earlier
+/// pre-StatefulSet carve-out that reported these claims harmless: that
+/// unblocking traded exactly this hazard away.
 pub(crate) async fn sweep_statefulset_pvcs(
     client: &kube::Client,
     namespace: &str,
@@ -898,20 +985,25 @@ pub(crate) async fn sweep_statefulset_pvcs(
     }
     if all_windows.is_empty() {
         if !unproven_sts_step {
-            // devin (pre-StatefulSet cleanup): no row in scope ever
-            // reached the StatefulSet step and no lineage record exists,
-            // so NO CAP apply could have created a claim — matching
-            // claims are provably pre-existing tenant objects. Touch
-            // nothing and report the sweep complete: the deployment
-            // never rendered workloads, so there is no retained CAP
-            // state the storage guard would be protecting.
-            tracing::info!(
+            // devin 🔴 follow-up (preexisting claims bypass storage-size
+            // guard): no row in scope ever reached the StatefulSet step, so
+            // no CAP apply could have created these claims — but a matching
+            // claim is still ADOPTABLE at its old size by a later resized
+            // deployment (the StatefulSet controller reuses the claim the
+            // volumeClaimTemplate name points at). Reporting the sweep
+            // complete here would clear manifest_hash over the retained
+            // claim and disarm the deploy route's storage-size guard — the
+            // only thing preventing that silent old-size adoption. Keep the
+            // claims and count the sweep incomplete: evidence stays, size
+            // changes stay blocked. Resolution paths: the namespace owner
+            // removes the claim, or the app is deleted (#251).
+            tracing::warn!(
                 namespace = %namespace,
                 statefulset = %statefulset,
                 claims = matching_claims.len(),
-                "adopted-namespace PVC sweep sees only pre-existing claims (no row reached the StatefulSet step); nothing to converge"
+                "adopted-namespace PVC sweep retains provably pre-existing claims (no row reached the StatefulSet step): they are not CAP's to delete but would be silently adopted at their old size by a resized retry; counting the sweep incomplete and keeping manifest evidence"
             );
-            return 0;
+            return matching_claims.len();
         }
         // Some row reached the StatefulSet step without recording
         // provenance (e.g. a previous sweep deleted the sts and its
@@ -1003,23 +1095,25 @@ pub(crate) async fn sweep_statefulset_pvcs(
             }
             Ok(_) => {
                 // Accepted is not absent (Longhorn finalizers can hold a
-                // claim in Terminating): confirm 404, else the sweep is
-                // incomplete and retains provider-state evidence.
-                match bounded_sweep_read(sweep_deadline, api.get_opt(&name)).await {
-                    Ok(None) => {}
-                    Ok(Some(_)) => {
+                // claim in Terminating): poll for confirmed 404 within the
+                // confirmation window (codex P2 — a single immediate GET
+                // would count a normally-progressing deletion incomplete),
+                // else the sweep is incomplete and retains provider-state
+                // evidence.
+                match wait_for_sweep_absence(&api, &name, sweep_deadline).await {
+                    SweepAbsence::Absent => {}
+                    SweepAbsence::StillLive => {
                         tracing::warn!(
                             namespace = %namespace,
                             pvc = %name,
-                            "adopted-namespace sweep PVC delete accepted but claim still live (finalizer?); counting as incomplete"
+                            "adopted-namespace sweep PVC delete accepted but claim still live after the confirmation window (finalizer?); counting as incomplete"
                         );
                         failures += 1;
                     }
-                    Err(error) => {
+                    SweepAbsence::Uninspectable => {
                         tracing::warn!(
                             namespace = %namespace,
                             pvc = %name,
-                            error = %error,
                             "adopted-namespace sweep cannot confirm PVC absence; counting as incomplete"
                         );
                         failures += 1;
@@ -3032,18 +3126,22 @@ mod tests {
     }
 
     #[test]
-    fn initial_ownership_treats_pre_delete_absence_and_errors_as_not_ours() {
+    fn initial_ownership_classifies_pre_delete_absence_and_inspect_errors() {
         let generation = enclava_engine::apply::generation::MutationGeneration::new(7)
             .expect("valid generation");
-        // The round-3 regression: an initial 404 must NOT read as
-        // ConfirmedAbsent — this generation never published the namespace or
-        // its routes, so route removal against the shared HAProxy ConfigMap
-        // must be skipped (NotOurs), not run.
+        // An initial 404 must NOT read as an owning-then-vanished outcome:
+        // it classifies as AbsentBeforeDelete, whose caller compensates this
+        // generation's routes (a 404 cannot prove the apply never published
+        // them — it can publish routes and then fail, with the namespace
+        // deleted externally before this probe) but never issues a namespace
+        // delete. (devin 🔍 follow-up: the old "NotOurs → skip route
+        // removal" rollout note described superseded round-3 behavior.)
         assert!(matches!(
             classify_initial_namespace_get(&Err(api_error(404)), generation),
             InitialNamespaceOwnership::AbsentBeforeDelete
         ));
-        // Any non-404 inspect failure is equally undecided ownership.
+        // Any non-404 inspect failure is undecided ownership (Uninspectable):
+        // no provider state may be touched at all.
         assert!(matches!(
             classify_initial_namespace_get(&Err(api_error(500)), generation),
             InitialNamespaceOwnership::Uninspectable
