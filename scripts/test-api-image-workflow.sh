@@ -98,7 +98,12 @@ done
 # after stripping an optional sequence marker, so the `- run: cmd` shorthand
 # (valid GitHub Actions syntax, already used in fuzz.yml) is covered, and
 # quoted forms like "run": and 'run': are matched since YAML permits quoted
-# mapping keys.
+# mapping keys. Flow-style steps (`- { run: ... }`, `- [{ run: ... }]`, or a
+# flow collection under a block key like `steps: [{ ... }]`) are parsed by
+# YAML as ordinary run commands, so the guard walks flow collections
+# quote-/depth-aware, splits entries on commas at the collection's own depth,
+# and applies the same run-key matching to each entry - a sibling `env:`
+# entry with a safe binding is not part of the command and stays unflagged.
 # POSIX awk only (no interval expressions) so the guard also works under BWK awk on macOS.
 scan_workflow() {
   awk -v mode="$1" -v q="'" '
@@ -113,6 +118,130 @@ scan_workflow() {
       else return ""
       return k
     }
+    # --- flow-collection support ------------------------------------------
+    # YAML parses flow-style steps (`- { run: ... }`, `- [{ run: ... }]`,
+    # `steps: [{ run: ... }]`, multi-line variants) as ordinary run
+    # commands, so the guard walks flow collections with the same checks.
+    # The walk is quote-aware (with YAML quoting rules: backslash escapes in
+    # double quotes, doubled quotes in single quotes) and treats ${{ ... }}
+    # tokens as opaque so interpolation braces never count as flow syntax.
+    # A `#` outside quotes, at line start or after whitespace, starts a
+    # comment and ends the scanned region for that line. Entries are split
+    # on commas at the collection-s own depth, so a sibling env: entry
+    # with a safe binding is not part of the command and stays unflagged.
+    # Quoted scalars are treated as line-scoped: a quote still open at end
+    # of line is reset so an apostrophe inside a plain scalar cannot wedge
+    # the walker (any leftover entry text is still checked when the
+    # collection closes, so nothing is silently dropped).
+    # flow_quote/flow_depth/flow_cur persist across the lines of a
+    # multi-line collection; flow_line is the first line of the collection.
+    function flow_step(line,   i, c, j) {
+      for (i = 1; i <= length(line); i++) {
+        c = substr(line, i, 1)
+        if (flow_quote != "") {
+          flow_cur = flow_cur c
+          if (flow_quote == "\"" && c == "\\") { flow_cur = flow_cur substr(line, i + 1, 1); i++; continue }
+          if (c == flow_quote) {
+            if (flow_quote == q && substr(line, i + 1, 1) == q) { flow_cur = flow_cur q; i++; continue }
+            flow_quote = ""
+          }
+          continue
+        }
+        if (c == "#" && (i == 1 || substr(line, i - 1, 1) ~ /[[:space:]]/)) return
+        if (c == "\"" || c == q) { flow_quote = c; flow_cur = flow_cur c; continue }
+        if (c == "$" && substr(line, i + 1, 2) == "{{") {
+          j = index(substr(line, i), "}}")
+          if (j > 0) { flow_cur = flow_cur substr(line, i, j + 1); i = i + j }
+          else { flow_cur = flow_cur substr(line, i); i = length(line) }
+          continue
+        }
+        if (c == "{" || c == "[") {
+          flow_depth++
+          if (flow_depth == 1) { flow_started = 1; continue }
+          flow_cur = flow_cur c
+          continue
+        }
+        if (c == "}" || c == "]") {
+          flow_depth--
+          if (flow_depth <= 0) {
+            flow_entry(flow_cur, flow_line)
+            flow_cur = ""; flow_started = 0; flow_depth = 0
+            in_flow = 0
+            continue
+          }
+          flow_cur = flow_cur c
+          continue
+        }
+        if (c == "," && flow_depth == 1) { flow_entry(flow_cur, flow_line); flow_cur = ""; continue }
+        if (flow_started) flow_cur = flow_cur c
+      }
+      flow_quote = ""
+    }
+    # Column of the first flow opener that is outside quotes, comments and
+    # ${{ }} tokens, or 0 when the line opens no flow collection.
+    function flow_opener(line,   i, c, j, quote) {
+      quote = ""
+      for (i = 1; i <= length(line); i++) {
+        c = substr(line, i, 1)
+        if (quote != "") {
+          if (quote == "\"" && c == "\\") { i++; continue }
+          if (c == quote) {
+            if (quote == q && substr(line, i + 1, 1) == q) { i++; continue }
+            quote = ""
+          }
+          continue
+        }
+        if (c == "#" && (i == 1 || substr(line, i - 1, 1) ~ /[[:space:]]/)) return 0
+        if (c == "\"" || c == q) { quote = c; continue }
+        if (c == "$" && substr(line, i + 1, 2) == "{{") {
+          j = index(substr(line, i), "}}")
+          if (j > 0) i = i + j
+          else i = length(line)
+          continue
+        }
+        if (c == "{" || c == "[") return i
+      }
+      return 0
+    }
+    # A flow collection is only walked when the opener plausibly starts a
+    # YAML node: at the start of the line, after an optional sequence marker
+    # (`- `), or right after a block key (`steps:`, quoted keys included).
+    # In block context `{`/`[` inside a plain scalar (e.g. `name: a{b`) is
+    # literal text, not a collection, so anything else returns 0.
+    function flow_begin(line,   pos, pre) {
+      pos = flow_opener(line)
+      if (pos == 0) return 0
+      pre = substr(line, 1, pos - 1)
+      if (pre ~ /^[[:space:]]*$/) return pos
+      if (pre ~ /^[[:space:]]*-[[:space:]]+$/) return pos
+      if (pre ~ /^[[:space:]]*-[[:space:]]*[A-Za-z0-9_.-]+:[[:space:]]*$/) return pos
+      if (pre ~ /^[[:space:]]*[A-Za-z0-9_.-]+:[[:space:]]*$/) return pos
+      if (pre ~ /^[[:space:]]*"[^"]*":[[:space:]]*$/) return pos
+      if (pre ~ ("^[[:space:]]*" q "[^" q "]*" q ":[[:space:]]*$")) return pos
+      return 0
+    }
+    # Apply the block-mode checks to one flow entry, after trimming it and
+    # unwrapping any nested single-collection wrapper (`[ ... ]` / `{ ... }`).
+    function flow_entry(text, fline,   e, value) {
+      e = text
+      sub(/^[[:space:]]+/, "", e)
+      sub(/[[:space:]]+$/, "", e)
+      while ((substr(e, 1, 1) == "{" && substr(e, length(e), 1) == "}") ||
+             (substr(e, 1, 1) == "[" && substr(e, length(e), 1) == "]")) {
+        e = substr(e, 2, length(e) - 2)
+        sub(/^[[:space:]]+/, "", e)
+        sub(/[[:space:]]+$/, "", e)
+      }
+      value = runkey(e)
+      if (value != "") {
+        if (mode == "run" && value ~ /\$\{\{/) print fline ": " e
+        # A bare alias as the entire run value is resolved by YAML before
+        # the shell sees the text, so ban it outright (same rule as block).
+        if (mode == "anchors" && value ~ /^\*[^][[:space:]{},&*]/) print fline ": " e
+      } else if (mode == "anchors" && e != "") {
+        if (e ~ /(^|[[:space:]])[&*][^][[:space:]{},&*]/) print fline ": " e
+      }
+    }
     {
       if (in_run) {
         if ($0 ~ /^[[:space:]]*$/) next
@@ -121,6 +250,11 @@ scan_workflow() {
           next
         }
         in_run = 0
+      }
+      if (in_flow) {
+        if ($0 ~ /^[[:space:]]*$/) next
+        flow_step($0)
+        next
       }
       value = runkey($0)
       if (value != "") {
@@ -140,9 +274,28 @@ scan_workflow() {
         # `[` last inside the bracket expression keep it POSIX-portable.
         if (mode == "anchors" && value ~ /^\*[^][[:space:]{},&*]/) print FNR ": " $0
         in_run = 1
-      } else if (mode == "anchors" && $0 !~ /^[[:space:]]*$/) {
-        if ($0 ~ /(^|[[:space:]])[&*][^][[:space:]{},&*]/) print FNR ": " $0
+      } else if ($0 !~ /^[[:space:]]*$/) {
+        pos = flow_begin($0)
+        if (pos > 0) {
+          # A flow collection opened outside any run body: YAML parses its
+          # run entries as ordinary run commands, so walk it the same way.
+          flow_buf = substr($0, pos)
+          flow_line = FNR
+          flow_quote = ""
+          flow_depth = 0
+          flow_cur = ""
+          flow_started = 0
+          in_flow = 1
+          flow_step(flow_buf)
+        } else if (mode == "anchors" && $0 ~ /(^|[[:space:]])[&*][^][[:space:]{},&*]/) {
+          print FNR ": " $0
+        }
       }
+    }
+    END {
+      # Fail closed: a flow collection still open at EOF cannot be walked
+      # safely, so flag it instead of silently skipping the rest of the file.
+      if (in_flow) print flow_line ": unclosed flow collection (run entries cannot be scanned safely)"
     }
   ' "$2"
 }
@@ -276,6 +429,50 @@ guard_case shell_operators '        run: make -j2 && ./test.sh || true
 '
 [[ -z "$(scan_anchor_tokens "$guard_tmp/shell_operators.yml")" ]] \
   || fail "run-injection guard self-test (shell_operators): shell operators in run: must not be flagged"
+
+# Flow-style mappings/sequences are parsed by YAML as ordinary run commands
+# (Codex review, #236): `- { run: ... }` must not bypass either guard.
+guard_case flow_run '- { run: '"'"'echo "${{ github.ref }}"'"'"' }
+'
+guard_must_flag_run flow_run
+guard_case flow_seq_run '- [{ run: "echo ${{ github.ref }}" }]
+'
+guard_must_flag_run flow_seq_run
+guard_case flow_multiline '- {
+     run: '"'"'echo
+       "${{ github.ref }}"'"'"',
+   }
+'
+guard_must_flag_run flow_multiline
+guard_case flow_key_run 'steps: [{ run: "echo ${{ github.ref }}" }]
+'
+guard_must_flag_run flow_key_run
+# A sibling env: entry inside the same flow mapping binds the value safely
+# and must NOT be flagged as part of the command.
+guard_case flow_env_safe '- { run: '"'"'echo "$PUSHED_REF"'"'"', env: { PUSHED_REF: "${{ github.ref }}" } }
+'
+[[ -z "$(scan_run_injections "$guard_tmp/flow_env_safe.yml")" ]] \
+  || fail "run-injection guard self-test (flow_env_safe): flow env bindings must not be flagged"
+# Anchor/alias tokens inside flow collections must still be flagged.
+guard_case flow_anchor '- { run: *payload, env: { SCRIPT: &unsafe echo } }
+'
+[[ -n "$(scan_anchor_tokens "$guard_tmp/flow_anchor.yml")" ]] \
+  || fail "run-injection guard self-test (flow_anchor): anchors/aliases in flow collections must be flagged"
+# A flow collection left open at EOF must fail closed, not skip the file.
+guard_case flow_unclosed '- { run: '"'"'echo "${{ github.ref }}"'"'"'
+'
+guard_must_flag_run flow_unclosed
+[[ -n "$(scan_anchor_tokens "$guard_tmp/flow_unclosed.yml")" ]] \
+  || fail "run-injection guard self-test (flow_unclosed): unclosed flow collections must fail closed"
+# Braces inside plain scalars are literal text, not flow collections, and
+# must not trip the walker (comment braces included).
+guard_case flow_literal_scalar '        name: deploy{region} west # {not a flow}
+        run: echo ok
+'
+[[ -z "$(scan_run_injections "$guard_tmp/flow_literal_scalar.yml")" ]] \
+  || fail "run-injection guard self-test (flow_literal_scalar): literal braces in scalars must not be flagged"
+[[ -z "$(scan_anchor_tokens "$guard_tmp/flow_literal_scalar.yml")" ]] \
+  || fail "run-injection guard self-test (flow_literal_scalar): unexpected anchor/alias match"
 rm -rf "$guard_tmp"
 
 grep -Fq -- '      - "deploy/api/**"' "$WORKFLOW" \
