@@ -14266,6 +14266,142 @@ mod tests {
         crate::test_support::drop_isolated_database("cap_signer_during_publication", pool).await;
     }
 
+    async fn seed_committed_signer_identity(pool: &sqlx::PgPool, app_id: Uuid) -> i64 {
+        let subject =
+            "https://github.com/enclava/rotated/.github/workflows/build.yml@refs/heads/main";
+        let issuer = "https://rotated-issuer.example.test";
+        sqlx::query(
+            "UPDATE apps
+                SET signer_identity_subject = $2,
+                    signer_identity_issuer = $3
+              WHERE id = $1",
+        )
+        .bind(app_id)
+        .bind(subject)
+        .bind(issuer)
+        .execute(pool)
+        .await
+        .expect("commit the pending signer identity");
+        sqlx::query_scalar("SELECT signer_rotation_generation FROM apps WHERE id = $1")
+            .bind(app_id)
+            .fetch_one(pool)
+            .await
+            .expect("read the trigger-backed signer rotation generation")
+    }
+
+    async fn retained_kbs_fences(pool: &sqlx::PgPool) -> i64 {
+        sqlx::query_scalar(
+            "SELECT count(*) FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kbs_policy' AND resource_key = 'global'
+                AND owner_token IS NOT NULL
+                AND reclaim_after > clock_timestamp()",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("read KBS fence ownership")
+    }
+
+    #[tokio::test]
+    async fn uncertain_signer_publication_write_failure_retains_kbs_fence() {
+        let _singleton = crate::test_support::SIGNED_POLICY_SINGLETON_LOCK
+            .lock()
+            .await;
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_signer_fence_uncertain").await;
+        let (_org_id, _user_id, app_id, _app_name, _paas_org_id, _paas_user_id) =
+            seed_signer_rotation_fixture(&pool).await;
+        let (state, provider) = signer_rotation_publication_state(&pool, app_id).await;
+        let generation = seed_committed_signer_identity(&pool, app_id).await;
+        {
+            let mut gated = provider.lock().await;
+            gated.healthy = true;
+            // Fail every Trustee deployment write after the ConfigMap write
+            // has landed: the reconcile surfaces a Kubernetes mutating-request
+            // failure whose outcome cannot be proven.
+            gated.deployment_put_failures = usize::MAX;
+        }
+
+        crate::kbs::TEST_KUBE_CLIENT
+            .scope(
+                crate::test_support::kbs_policy_kube_client(provider.clone()),
+                async {
+                    let pending = crate::routes::apps::reconcile_signer_publication(
+                        &state,
+                        app_id,
+                        "https://github.com/enclava/rotated/.github/workflows/build.yml@refs/heads/main",
+                        "https://rotated-issuer.example.test",
+                        generation,
+                    )
+                    .await
+                    .expect_err("an uncertain provider write must stay pending");
+                    assert_eq!(pending.0, StatusCode::SERVICE_UNAVAILABLE);
+                    assert_eq!(
+                        pending.1.0["error"], "signer_rotation_publication_pending",
+                        "the committed rotation stays retryable: {:?}",
+                        pending.1.0
+                    );
+                },
+            )
+            .await;
+
+        assert_eq!(
+            retained_kbs_fences(&pool).await,
+            1,
+            "an uncertain provider write must keep the KBS fence owned through the reclaim \
+             quarantine so a possibly in-flight write cannot overlap the next publisher"
+        );
+        crate::test_support::drop_isolated_database("cap_signer_fence_uncertain", pool).await;
+    }
+
+    #[tokio::test]
+    async fn pre_write_signer_publication_failure_releases_kbs_fence() {
+        let _singleton = crate::test_support::SIGNED_POLICY_SINGLETON_LOCK
+            .lock()
+            .await;
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_signer_fence_pre_write").await;
+        let (_org_id, _user_id, app_id, _app_name, _paas_org_id, _paas_user_id) =
+            seed_signer_rotation_fixture(&pool).await;
+        let (state, provider) = signer_rotation_publication_state(&pool, app_id).await;
+        let generation = seed_committed_signer_identity(&pool, app_id).await;
+        // The provider double stays unhealthy: every request 404s at the
+        // ConfigMap READ, before any mutating request is sent, so the failure
+        // provably has no provider write in flight.
+
+        crate::kbs::TEST_KUBE_CLIENT
+            .scope(
+                crate::test_support::kbs_policy_kube_client(provider.clone()),
+                async {
+                    let pending = crate::routes::apps::reconcile_signer_publication(
+                        &state,
+                        app_id,
+                        "https://github.com/enclava/rotated/.github/workflows/build.yml@refs/heads/main",
+                        "https://rotated-issuer.example.test",
+                        generation,
+                    )
+                    .await
+                    .expect_err("the read failure must stay pending");
+                    assert_eq!(pending.0, StatusCode::SERVICE_UNAVAILABLE);
+                    assert_eq!(pending.1.0["error"], "signer_rotation_publication_pending");
+                },
+            )
+            .await;
+
+        assert_eq!(
+            retained_kbs_fences(&pool).await,
+            0,
+            "a failure with no provider write in flight must release the fence instead of \
+             holding the cluster-wide kbs_policy resource through the quarantine window"
+        );
+        crate::test_support::drop_isolated_database("cap_signer_fence_pre_write", pool).await;
+    }
+
+    /// A checkpoint written before the generation field existed (or otherwise
+    /// unverifiable: wrong type, negative, or contradictory metadata) must
+    /// terminalize to the bounded new-key disposition on the completed
+    /// channel — not 500 forever: the publication-checkpoint reclaim
+    /// carve-out would otherwise re-run the handler after every lease expiry
+    /// and never complete the row. No generation is ever invented for it.
     #[tokio::test]
     async fn rotate_signer_legacy_checkpoints_keep_their_original_fencing_semantics() {
         let _singleton = crate::test_support::SIGNED_POLICY_SINGLETON_LOCK

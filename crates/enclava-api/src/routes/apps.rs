@@ -2247,9 +2247,13 @@ pub(crate) async fn delete_app_before(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Best-effort fence release on a failed publish: nothing retries inside
+/// Release the KBS fence after a failed publish whose failure provably has
+/// no Kubernetes write in flight (see
+/// `KbsPolicyError::provider_write_may_be_in_flight`): nothing retries inside
 /// this request anymore, so do not leave the KBS fence claimed for the lease
-/// quarantine window.
+/// quarantine window. A failure that MAY have sent a mutating request must
+/// instead drop the lease untouched and keep the reclaim quarantine, so the
+/// possibly in-flight write cannot overlap the next publisher.
 async fn release_finished_lease(lease: crate::mutation_leases::ResourceMutationLease) {
     if let Err(error) = lease.finish().await {
         tracing::warn!(
@@ -2594,16 +2598,39 @@ pub(crate) async fn reconcile_signer_publication(
         .await
     {
         Err(error) => {
+            // guard_provider cancels the provider future when the lease
+            // heartbeat dies mid-write: the Kubernetes mutating request may
+            // already have reached (or may yet reach) the API server. Drop
+            // the lease untouched so the fence stays owned through the
+            // reclaim quarantine and that write cannot overlap the next
+            // publisher; the committed rotation stays retryable and the
+            // background reconciler converges once the quarantine expires.
             tracing::warn!(
                 app_id = %app_id,
                 error = %error,
                 error_code = "kbs_policy_fence_unavailable",
-                "signer rotation committed but lost the KBS policy fence during reconciliation"
+                "signer rotation committed but lost the KBS policy fence during reconciliation; retaining the fence through reclaim quarantine"
             );
-            release_finished_lease(lease).await;
+            return Err(signer_publication_pending_error());
+        }
+        Ok(Err(error)) if error.provider_write_may_be_in_flight() => {
+            // An uncertain Kubernetes mutating write (bounded_kube_write
+            // timeout or transport/API failure) carries the same in-flight
+            // ambiguity as a lost heartbeat: drop the lease untouched instead
+            // of clearing the fence a possibly in-flight write still needs.
+            tracing::warn!(
+                app_id = %app_id,
+                error = %error,
+                error_code = "kbs_policy_reconciliation_failed",
+                "signer rotation committed but KBS policy reconciliation failed with an uncertain provider write; retaining the fence through reclaim quarantine"
+            );
             return Err(signer_publication_pending_error());
         }
         Ok(Err(error)) => {
+            // The failure provably has no provider write in flight (see
+            // KbsPolicyError::provider_write_may_be_in_flight), so nothing
+            // can land late: release the fence instead of holding the
+            // cluster-wide kbs_policy resource through the quarantine window.
             tracing::warn!(
                 app_id = %app_id,
                 error = %error,
