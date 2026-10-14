@@ -124,7 +124,13 @@ scan_workflow() {
       }
       value = runkey($0)
       if (value != "") {
-        run_indent = indent($0)
+        # run_indent is the column of the run key itself (indent + optional
+        # "- " marker), so sibling step keys like env: at the same level end
+        # the run body instead of being scanned as shell continuation text.
+        k = $0
+        sub(/^[[:space:]]*/, "", k)
+        sub(/^-[[:space:]]*/, "", k)
+        run_indent = length($0) - length(k)
         if (mode == "run" && value ~ /\$\{\{/) print FNR ": " $0
         # A bare alias as the entire run value (`run: *payload`) is resolved
         # by YAML before the shell ever sees the text, so ban it outright.
@@ -237,9 +243,18 @@ guard_case seq_marker_run '        - run: echo "${{ github.ref }}"
 '
 guard_must_flag_run seq_marker_run
 guard_case seq_marker_run_block '        - run: |
-          echo "${{ github.ref }}"
+            echo "${{ github.ref }}"
 '
 guard_must_flag_run seq_marker_run_block
+
+# A sibling env: block after a `- run:` shorthand is the safe pattern and
+# must NOT be treated as shell continuation text (Devin/Codex, #236).
+guard_case seq_marker_run_env '        - run: echo "$PUSHED_REF"
+          env:
+            PUSHED_REF: ${{ github.ref }}
+'
+[[ -z "$(scan_run_injections "$guard_tmp/seq_marker_run_env.yml")" ]] \
+  || fail "run-injection guard self-test (seq_marker_run_env): sibling env: bindings after - run: must not be flagged"
 
 # A bare alias as the entire run value is resolved before the shell sees the
 # text, so the anchor scan must flag the alias line itself.
