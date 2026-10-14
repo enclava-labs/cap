@@ -2146,7 +2146,7 @@ pub(crate) mod test_support {
         )>,
     }
 
-impl KbsPolicyProvider {
+    impl KbsPolicyProvider {
         pub(crate) fn new(healthy: bool) -> Self {
             Self {
                 healthy,
@@ -2206,7 +2206,6 @@ impl KbsPolicyProvider {
                 .ok()
         }
     }
-
 
     pub(crate) fn kbs_policy_kube_client(
         provider: std::sync::Arc<tokio::sync::Mutex<KbsPolicyProvider>>,

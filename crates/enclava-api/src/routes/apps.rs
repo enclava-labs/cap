@@ -147,23 +147,6 @@ fn lease_retry_after_seconds(
 pub(crate) const SIGNER_ROTATION_PUBLICATION_PENDING_CODE: &str =
     "signer_rotation_publication_pending";
 
-pub(crate) fn signer_rotation_publication_pending_error(
-    context: &str,
-) -> (StatusCode, Json<serde_json::Value>) {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(serde_json::json!({
-            "error": "signer_rotation_publication_pending",
-            "code": SIGNER_ROTATION_PUBLICATION_PENDING_CODE,
-            "message": "the signer rotation committed but its KBS policy publication \
-                 is still pending; retry with the same parameters to complete publication",
-            "context": context,
-            "committed": true,
-            "retryable": true,
-        })),
-    )
-}
-
 /// Terminal disposition for a committed rotation whose identity a later
 /// authority replaced before publication was confirmed: the app's live
 /// signer identity is authoritative, so callers must not receive the
@@ -2373,16 +2356,16 @@ pub async fn issue_signer_rotation_token_route(
         Json(serde_json::json!({"error": "app signer authority is unavailable"})),
     ))?;
 
-    let previous_subject = app
-        .signer_identity_subject
-        .clone()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    let previous_issuer = app
-        .signer_identity_issuer
-        .clone()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
+    // Preserve the exact stored bytes: rotate_signer_commit builds its
+    // expected claims from the untrimmed database values and verifies the
+    // token against them byte-for-byte, so trimming the previous identity
+    // here would make every issued token for a whitespace-padded stored
+    // identity fail verification and strand the signer (Codex review
+    // finding on #187). The None/None classification below must likewise
+    // mirror rotate_signer_commit's is_initial_set check, which is also
+    // based on the raw stored values.
+    let previous_subject = app.signer_identity_subject.clone();
+    let previous_issuer = app.signer_identity_issuer.clone();
     let (previous_subject, previous_issuer) = match (previous_subject, previous_issuer) {
         (Some(subject), Some(issuer)) => (subject, issuer),
         (None, None) => {
@@ -2730,12 +2713,6 @@ pub async fn rotate_signer(
     )
     .await?;
     Ok(Json(app))
-}
-
-// Keep the commit-time fence outside the HTTP AppResponse contract.
-pub(crate) struct CommittedSignerRotation {
-    pub(crate) app: AppResponse,
-    pub(crate) rotation_count: i64,
 }
 
 /// Commit the signer rotation (or initial set) without confirming KBS
