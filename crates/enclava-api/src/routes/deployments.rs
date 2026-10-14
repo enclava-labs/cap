@@ -648,8 +648,9 @@ fn terminal_rollout_settling_window_sql() -> String {
 /// settling window above.
 ///
 /// "Cluster-applied" is proven by ONE authoritative persisted signal: the
-/// deployment's generation reached the Kubernetes apply stage.
-/// `apply_committed_at` (stamped as the SSA provider call is entered) is
+/// deployment's generation reached the Kubernetes workload apply (the
+/// StatefulSet write). `apply_committed_at` (stamped as that write is
+/// entered) is
 /// that proof, with `observing_since` (0047, set at the `watching`
 /// transition for rows that reached observation) accepted as its legacy
 /// equivalent. The stamp is deliberately conservative: it does not depend

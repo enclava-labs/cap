@@ -304,6 +304,8 @@ async fn apply_all_with_tenant_image_pull_secret(
     manifest_hash: &str,
     image_pull_secret_config: Option<&TenantImagePullSecretConfig>,
     generation: MutationGeneration,
+    pool: &PgPool,
+    deployment_id: Uuid,
 ) -> Result<(), DeployError> {
     let ns_name = manifests
         .namespace
@@ -356,6 +358,22 @@ async fn apply_all_with_tenant_image_pull_secret(
             manifest_hash.to_string(),
         );
 
+    // Conservative workload-apply evidence. The StatefulSet write is the
+    // first operation that can replace the TEE, so the settling guard's
+    // marker is stamped at ITS entry -- not at the multi-resource apply's
+    // entry (a namespace/standard-resource/gateway failure never touched
+    // the workload and must not count as a rollout) and not after the SSA
+    // response (a request Kubernetes accepted but whose response was lost
+    // to a timeout or connection error must still count). Idempotent
+    // re-applies keep the first stamp time.
+    sqlx::query(
+        "UPDATE deployments
+            SET apply_committed_at = COALESCE(apply_committed_at, clock_timestamp())
+          WHERE id = $1",
+    )
+    .bind(deployment_id)
+    .execute(pool)
+    .await?;
     apply_statefulset(engine, ns_name, &sts, generation).await?;
     tracing::info!(
         namespace = %ns_name,
@@ -2418,31 +2436,14 @@ pub async fn apply_deployment_manifests(
     mutation
         .arm_resource_scope_until_reconciled("kubernetes_namespace")
         .await?;
-    // Durable evidence that this generation reached the Kubernetes apply
-    // stage. Unlike `manifest_hash` (stored at the 'applying' transition,
-    // before KBS reconciliation), the marker is written only once the
-    // provider call is about to be entered; unlike a post-response stamp,
-    // it does not depend on the client observing the SSA response. A
-    // response lost to a timeout or connection error after Kubernetes
-    // accepted the request must still count as applied for the rollout
-    // settling guard (`app_has_rollout_in_flight`), and a failure before
-    // this point (KBS reconciliation, engine startup) must still not
-    // supersede an older in-flight rollout. Idempotent re-applies keep the
-    // first stamp time.
-    sqlx::query(
-        "UPDATE deployments
-            SET apply_committed_at = COALESCE(apply_committed_at, clock_timestamp())
-          WHERE id = $1",
-    )
-    .bind(deployment_id)
-    .execute(&pool)
-    .await?;
     apply_all_with_tenant_image_pull_secret(
         &engine,
         &manifests,
         &hash,
         tenant_image_pull_secret_config.as_ref(),
         generation,
+        &pool,
+        deployment_id,
     )
     .await?;
     let edge_config = crate::edge::EdgeRouteConfig::from_env();
