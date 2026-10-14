@@ -149,13 +149,13 @@ pub fn validate_app(app: &ConfidentialApp) -> Result<(), ValidationError> {
             detail: format!("memory uses binary Mi/Gi/Ti units: {detail}"),
         }
     })?;
-    validate_storage_size("storage.app_data.size", &app.storage.app_data.size).map_err(
+    validate_persistent_volume_size("storage.app_data.size", &app.storage.app_data.size).map_err(
         |detail| ValidationError::InvalidStorageSize {
             field: "storage.app_data.size",
             detail,
         },
     )?;
-    validate_storage_size("storage.tls_data.size", &app.storage.tls_data.size).map_err(
+    validate_persistent_volume_size("storage.tls_data.size", &app.storage.tls_data.size).map_err(
         |detail| ValidationError::InvalidStorageSize {
             field: "storage.tls_data.size",
             detail,
@@ -218,6 +218,7 @@ fn validate_resource_quantity(field: &'static str, value: &str) -> Result<(), St
     }
     let numeric = trimmed.strip_suffix('m').unwrap_or(trimmed);
     validate_scaled_decimal(numeric, 1)
+        .map(|_| ())
         .map_err(|_| format!("{field} must be a positive number or millicpu quantity"))
 }
 
@@ -231,7 +232,43 @@ fn validate_storage_size(field: &'static str, value: &str) -> Result<(), String>
     if trimmed.is_empty() || trimmed != value {
         return Err(format!("{field} must be a non-empty binary quantity"));
     }
-    // (suffix, multiplier-in-Mi) pairs mirroring the API's parse_binary_mib.
+    let Some((number, multiplier)) = binary_quantity_parts(trimmed) else {
+        return Err(format!("{field} must use Mi, Gi, or Ti binary units"));
+    };
+    validate_scaled_decimal(number, multiplier)
+        .map(|_| ())
+        .map_err(|_| format!("{field} must be a positive binary quantity"))
+}
+
+/// Persistent volumes (the LUKS-formatted state and tls-state devices) also
+/// need a lower bound: the default LUKS2 header + keyslot area occupies the
+/// first 16 MiB, so a smaller device can never hold a formattable volume and
+/// would fail first boot in enclava-init (`MIN_VOLUME_BYTES` there — keep the
+/// two bounds in lockstep). Rejecting here turns an opaque runtime refusal
+/// into a clear error at manifest-validation time.
+const MIN_VOLUME_SIZE_MIB: u128 = 16;
+
+fn validate_persistent_volume_size(field: &'static str, value: &str) -> Result<(), String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed != value {
+        return Err(format!("{field} must be a non-empty binary quantity"));
+    }
+    let Some((number, multiplier)) = binary_quantity_parts(trimmed) else {
+        return Err(format!("{field} must use Mi, Gi, or Ti binary units"));
+    };
+    // Exact rational compare (numerator / 10^scale Mi) — no float rounding.
+    let (numerator, scale) = validate_scaled_decimal(number, multiplier)
+        .map_err(|_| format!("{field} must be a positive binary quantity"))?;
+    if numerator < MIN_VOLUME_SIZE_MIB * 10u128.pow(scale) {
+        return Err(format!(
+            "{field} must be at least {MIN_VOLUME_SIZE_MIB}Mi — smaller volumes cannot hold the LUKS2 header + keyslot area and would fail first boot"
+        ));
+    }
+    Ok(())
+}
+
+/// (suffix, multiplier-in-Mi) pairs mirroring the API's parse_binary_mib.
+fn binary_quantity_parts(trimmed: &str) -> Option<(&str, u128)> {
     const BINARY_UNITS: [(&str, u128); 6] = [
         ("TiB", 1024 * 1024),
         ("Ti", 1024 * 1024),
@@ -240,22 +277,20 @@ fn validate_storage_size(field: &'static str, value: &str) -> Result<(), String>
         ("MiB", 1),
         ("Mi", 1),
     ];
-    let Some((number, multiplier)) = BINARY_UNITS
+    BINARY_UNITS
         .iter()
         .find_map(|(suffix, multiplier)| trimmed.strip_suffix(*suffix).map(|n| (n, *multiplier)))
-    else {
-        return Err(format!("{field} must use Mi, Gi, or Ti binary units"));
-    };
-    validate_scaled_decimal(number, multiplier)
-        .map_err(|_| format!("{field} must be a positive binary quantity"))
 }
 
 /// Digit, scale, and overflow bounds mirroring the API's
 /// `ScaledDecimal::parse` + `checked_mul` (entitlements.rs): plain decimal
 /// grammar, at most 38 total digits, at most 24 fractional digits, non-zero
 /// coefficient, and an exact-Mi conversion (`multiplier`) that must not
-/// overflow u128. f64 parsing would silently admit all of those.
-fn validate_scaled_decimal(number: &str, multiplier: u128) -> Result<(), String> {
+/// overflow u128. f64 parsing would silently admit all of those. Returns the
+/// normalized exact value as `(numerator, scale)` with
+/// `value_mib = numerator / 10^scale`, so callers can do exact bounds
+/// compares without floats.
+fn validate_scaled_decimal(number: &str, multiplier: u128) -> Result<(u128, u32), String> {
     if !is_plain_decimal(number) {
         return Err("must be a positive decimal quantity".to_string());
     }
@@ -282,10 +317,10 @@ fn validate_scaled_decimal(number: &str, multiplier: u128) -> Result<(), String>
         coefficient /= 10;
         scale -= 1;
     }
-    coefficient
+    let numerator = coefficient
         .checked_mul(multiplier)
         .ok_or_else(|| "is too large".to_string())?;
-    Ok(())
+    Ok((numerator, scale as u32))
 }
 
 /// True for plain decimal digits with at most one interior `.` — the grammar
