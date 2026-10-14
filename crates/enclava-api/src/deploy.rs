@@ -19,10 +19,14 @@ use enclava_engine::types::{
     AttestationConfig, BindMount, ConfidentialApp, Container, DomainSpec, EgressMode,
     LogEncryptionConfig, StorageSpec, WorkloadArtifactBinding, WorkloadSecurityProfile,
 };
-use k8s_openapi::api::core::v1::Secret;
+use k8s_openapi::api::core::v1::{Secret, ServiceAccount};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-use kube::{Api, Resource as _, api::DeleteParams};
+use kube::{
+    Api, Resource as _,
+    api::{DeleteParams, ListParams, Patch, PatchParams},
+};
 use sqlx::{PgPool, Postgres, Transaction};
+use std::collections::BTreeSet;
 use std::net::IpAddr;
 use uuid::Uuid;
 
@@ -40,6 +44,12 @@ pub(crate) fn default_tenant_image_pull_secret_name_for_cleanup() -> String {
 const TENANT_IMAGE_PULL_SECRET_NAME_ENV: &str = "TENANT_IMAGE_PULL_SECRET_NAME";
 const TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES_ENV: &str = "TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES";
 const PUBLIC_INTERNET_EGRESS_EXCLUDED_CIDRS_ENV: &str = "CAP_PUBLIC_INTERNET_EGRESS_EXCLUDED_CIDRS";
+/// Ownership marker on every generated tenant pull secret: the cleanup and
+/// reconcile paths recognize CAP-generated secrets by this label regardless of
+/// the secret's name (review finding on #243 — a changed
+/// `TENANT_IMAGE_PULL_SECRET_NAME` must not strand an old platform PAT).
+const MANAGED_BY_LABEL: &str = "app.kubernetes.io/managed-by";
+const MANAGED_BY_VALUE: &str = "enclava-platform";
 pub(crate) const PERSISTED_DEPLOYMENT_ERROR_MESSAGE: &str = "deployment_error";
 
 #[derive(Debug, Clone)]
@@ -256,12 +266,74 @@ fn parse_image_pull_repository_scope(raw: &str) -> Result<ImagePullRepositorySco
                 .to_string(),
         );
     }
+    // Review finding on #243: entries such as `registry/repository:latest`,
+    // `registry/repository@sha256:…`, or `https://registry/repository` used
+    // to parse into scopes whose repository can never equal the parsed
+    // repository of a digest-pinned workload image, so startup succeeded but
+    // every affected private workload silently lost its pull secret. Reject
+    // tags, digests, and schemes outright.
+    if value.contains('@') {
+        return Err(
+            "digests ('@…') are not allowed in a repository scope; use registry/repository \
+             (workload images are digest-pinned separately)"
+                .to_string(),
+        );
+    }
+    if value.contains("://") {
+        return Err(
+            "URL schemes are not allowed in a repository scope; use registry/repository[:port] \
+             without a scheme"
+                .to_string(),
+        );
+    }
     let value = value.trim_end_matches('/');
     let Some((registry, repository)) = value.split_once('/') else {
         return Err("expected registry/repository or registry/repository/*".to_string());
     };
-    if registry.is_empty() || repository.is_empty() {
-        return Err("expected registry/repository or registry/repository/*".to_string());
+    if repository.contains(':') {
+        return Err(
+            "tags (':…') are not allowed in a repository scope; use registry/repository"
+                .to_string(),
+        );
+    }
+    validate_repository_scope_registry(registry)?;
+    for component in repository.split('/') {
+        if component.is_empty() {
+            return Err(
+                "repository path components must be non-empty (no leading or repeated '/')"
+                    .to_string(),
+            );
+        }
+        if component == "." || component == ".." {
+            return Err(format!(
+                "repository path component {component:?} is not a valid path component"
+            ));
+        }
+        if !component
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+        {
+            return Err(format!(
+                "repository path component {component:?} contains characters the workload-image \
+                 grammar does not allow"
+            ));
+        }
+    }
+
+    // Compatibility guarantee: the scope must round-trip through the workload
+    // image parser unchanged, so `image_matches_repository_scope` compares
+    // registry/repository values that both sides derive with the same grammar.
+    let rendered = format!("{registry}/{repository}");
+    let parsed = ImageRef::parse(&rendered)
+        .map_err(|error| format!("{rendered:?} is not a valid repository reference: {error}"))?;
+    if parsed.registry() != registry || parsed.repository() != repository {
+        return Err(format!(
+            "{rendered:?} is not written the way workload images name their repositories \
+             (the image grammar reads it as {}/{}); use registry/repository exactly as it \
+             appears in image references",
+            parsed.registry(),
+            parsed.repository()
+        ));
     }
 
     Ok(ImagePullRepositoryScope {
@@ -269,6 +341,50 @@ fn parse_image_pull_repository_scope(raw: &str) -> Result<ImagePullRepositorySco
         repository: repository.to_string(),
         include_subrepositories,
     })
+}
+
+/// Registry side of a scope entry: an explicit `host[:port]` following the
+/// same grammar the workload-image parser enforces for registries
+/// (alphanumeric/`.`/`-` host with an optional numeric `:port`), plus the
+/// explicitness that grammar implies. An `ImageRef` registry is always either
+/// `docker.io` (the implicit-registry normalization) or contains a dot or a
+/// port, so a bare first component such as `org/private` — which the image
+/// grammar reads as the Docker Hub repository path `org/private` — can never
+/// equal any parsed registry. Rejecting it at startup beats accepting a scope
+/// that silently never matches (review finding on #243).
+fn validate_repository_scope_registry(registry: &str) -> Result<(), String> {
+    let (host, has_port) = match registry.split_once(':') {
+        Some((host, port)) => {
+            if port.is_empty() || !port.chars().all(|c| c.is_ascii_digit()) {
+                return Err(format!(
+                    "registry {registry:?} must be host[:port] with a numeric port \
+                     (a URL scheme like \"https:\" is not a registry name)"
+                ));
+            }
+            if port.parse::<u32>().ok().filter(|port| *port > 0).is_none() {
+                return Err(format!("registry {registry:?} has an out-of-range port"));
+            }
+            (host, true)
+        }
+        None => (registry, false),
+    };
+    if host.is_empty()
+        || !host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+    {
+        return Err(format!(
+            "registry {registry:?} is not a valid registry host name"
+        ));
+    }
+    if !has_port && !host.contains('.') {
+        return Err(format!(
+            "registry {registry:?} must be explicit (a dotted host name or host:port); workload \
+             images without an explicit registry are parsed as Docker Hub paths, so write \
+             \"docker.io/…\" if a Docker Hub repository is meant"
+        ));
+    }
+    Ok(())
 }
 
 fn tenant_image_pull_secret_config_for_containers(
@@ -392,10 +508,7 @@ fn generate_tenant_image_pull_secret(
     let mut labels = std::collections::BTreeMap::new();
     // Ownership marker: the stale-secret cleanup only ever deletes CAP-managed
     // secrets, and this label is how it recognizes them going forward.
-    labels.insert(
-        "app.kubernetes.io/managed-by".to_string(),
-        "enclava-platform".to_string(),
-    );
+    labels.insert(MANAGED_BY_LABEL.to_string(), MANAGED_BY_VALUE.to_string());
 
     Secret {
         metadata: ObjectMeta {
@@ -435,8 +548,8 @@ fn is_managed_tenant_image_pull_secret(
         .metadata
         .labels
         .as_ref()
-        .and_then(|labels| labels.get("app.kubernetes.io/managed-by"))
-        .is_some_and(|value| value == "enclava-platform");
+        .and_then(|labels| labels.get(MANAGED_BY_LABEL))
+        .is_some_and(|value| value == MANAGED_BY_VALUE);
     if managed_by {
         return true;
     }
@@ -519,80 +632,373 @@ fn namespace_keeps_tenant_image_pull_secret(
     })
 }
 
-/// Delete the managed tenant image pull secret from a namespace where the
-/// current scope does not apply. Fails on API errors other than "not found":
-/// if the platform credential cannot be removed from a namespace that must not
-/// hold it, continuing would silently leave the token exposed.
-async fn delete_stale_tenant_image_pull_secret(
+/// Environment-derived pull-secret settings for one reconciliation pass.
+struct PullSecretSettings {
+    /// The tenant image pull secret name CAP generates under the current
+    /// configuration.
+    configured_name: String,
+    /// The configured GHCR pair, when set — the credential proof used to
+    /// recognize unlabeled pre-label secrets.
+    ghcr_credentials: Option<(String, String)>,
+}
+
+impl PullSecretSettings {
+    fn from_env() -> Self {
+        Self {
+            configured_name: managed_tenant_image_pull_secret_name(),
+            ghcr_credentials: ghcr_pull_secret_credentials(),
+        }
+    }
+
+    fn ghcr(&self) -> Option<(&str, &str)> {
+        self.ghcr_credentials
+            .as_ref()
+            .map(|(username, token)| (username.as_str(), token.as_str()))
+    }
+}
+
+/// How a reconciliation pass deletes the managed secrets it must remove.
+#[derive(Clone, Copy, Debug)]
+enum PullSecretDeleteMode {
+    /// Per-deploy cleanup, inside the deploy's mutation lease: deleted fenced
+    /// by the deploy's mutation generation.
+    Fenced(MutationGeneration),
+    /// Startup sweep and background retry, outside any mutation lease:
+    /// deleted on the observed UID/resourceVersion preconditions instead of
+    /// the mutation-generation fence.
+    Unfenced,
+}
+
+/// Keep/remove decision for one discovered managed pull secret (review
+/// findings on #243). A managed secret stays only while the namespace is
+/// within the configured repository scope AND the secret is either the one
+/// the current configuration generates or still referenced by one of the
+/// namespace's generated ServiceAccounts — a workload deployed under an older
+/// `TENANT_IMAGE_PULL_SECRET_NAME` keeps pulling with its old secret until it
+/// redeploys. Everything else (every managed secret in an out-of-scope
+/// namespace; unreferenced residue such as a renamed old secret) is removed.
+fn keep_managed_pull_secret(
+    namespace_in_scope: bool,
+    secret_name: &str,
+    configured_name: &str,
+    referenced_names: &BTreeSet<String>,
+) -> bool {
+    namespace_in_scope && (secret_name == configured_name || referenced_names.contains(secret_name))
+}
+
+/// Every CAP-managed tenant pull secret in one namespace, discovered
+/// independently of the currently configured name (review finding on #243):
+///
+/// - every secret labeled `app.kubernetes.io/managed-by=enclava-platform`,
+///   under any name — so a changed `TENANT_IMAGE_PULL_SECRET_NAME` can never
+///   strand an old platform PAT; plus
+/// - unlabeled pre-label secrets at the names CAP could have generated them
+///   under (the configured name, the historical default name, or a name a
+///   generated ServiceAccount still references), recognized by their
+///   generated shape through [`is_managed_tenant_image_pull_secret`].
+///
+/// A tenant-owned secret is never returned: recognition is the label or the
+/// exact generated shape with the configured GHCR pair, never the name alone.
+/// Also returns every name the given ServiceAccounts reference in
+/// `imagePullSecrets` — the keep decision needs it and it seeds the legacy
+/// name candidates.
+async fn discover_managed_pull_secrets(
     engine: &ApplyEngine,
     namespace: &str,
-    generation: MutationGeneration,
-) -> Result<(), DeployError> {
-    let name = managed_tenant_image_pull_secret_name();
+    service_accounts: &[String],
+    settings: &PullSecretSettings,
+) -> Result<(Vec<Secret>, BTreeSet<String>), DeployError> {
     let api: Api<Secret> = Api::namespaced(engine.client().clone(), namespace);
-    let existing = match api.get(&name).await {
+    let sa_api: Api<ServiceAccount> = Api::namespaced(engine.client().clone(), namespace);
+
+    let mut managed: Vec<Secret> = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut referenced_names: BTreeSet<String> = BTreeSet::new();
+
+    // Label-selected list: managed secrets under any name, without reading
+    // tenant-owned secret contents.
+    let labeled = api
+        .list(&ListParams::default().labels(&format!("{MANAGED_BY_LABEL}={MANAGED_BY_VALUE}")))
+        .await
+        .map_err(|error| DeployError::Apply(error.into()))?;
+    for secret in labeled.items {
+        if let Some(name) = secret.metadata.name.clone() {
+            seen.insert(name);
+        }
+        managed.push(secret);
+    }
+
+    // Legacy (pre-label) secrets carry no label and are recognized by shape at
+    // the names CAP could have generated them under.
+    let mut legacy_names = vec![
+        settings.configured_name.clone(),
+        DEFAULT_TENANT_IMAGE_PULL_SECRET_NAME.to_string(),
+    ];
+    for service_account in service_accounts {
+        let account = match sa_api.get(service_account).await {
+            Ok(account) => account,
+            Err(kube::Error::Api(error)) if error.code == 404 => continue,
+            Err(error) => return Err(DeployError::Apply(error.into())),
+        };
+        for reference in account.image_pull_secrets.iter().flatten() {
+            referenced_names.insert(reference.name.clone());
+            legacy_names.push(reference.name.clone());
+        }
+    }
+    legacy_names.sort();
+    legacy_names.dedup();
+    for name in legacy_names {
+        if seen.contains(&name) {
+            continue;
+        }
+        match api.get(&name).await {
+            Ok(secret) => {
+                if is_managed_tenant_image_pull_secret(&secret, settings.ghcr()) {
+                    seen.insert(name);
+                    managed.push(secret);
+                }
+            }
+            Err(kube::Error::Api(error)) if error.code == 404 => {}
+            Err(error) => return Err(DeployError::Apply(error.into())),
+        }
+    }
+    Ok((managed, referenced_names))
+}
+
+/// Give a pre-label legacy secret the managed-by ownership label (review
+/// finding on #243). Unlabeled secrets are recognized by the configured GHCR
+/// pair, which stops proving ownership once the operator rotates the token —
+/// labeling the secret while the match still holds makes the ownership proof
+/// permanent, so the documented upgrade-then-rotate sequence cannot orphan
+/// it. Only kept secrets need this: removed ones are deleted while the match
+/// still proves ownership.
+async fn adopt_managed_pull_secret(
+    engine: &ApplyEngine,
+    namespace: &str,
+    secret: &Secret,
+) -> Result<(), DeployError> {
+    let Some(name) = secret.metadata.name.as_deref() else {
+        return Ok(());
+    };
+    let mut labels = std::collections::BTreeMap::new();
+    labels.insert(MANAGED_BY_LABEL.to_string(), MANAGED_BY_VALUE.to_string());
+    let patch = serde_json::json!({
+        "metadata": {
+            "name": name,
+            "resourceVersion": secret.metadata.resource_version,
+            "labels": labels,
+        }
+    });
+    let api: Api<Secret> = Api::namespaced(engine.client().clone(), namespace);
+    let patch_params = PatchParams::apply(&engine.config().field_manager);
+    api.patch(name, &patch_params, &Patch::Merge(&patch))
+        .await
+        .map_err(|error| DeployError::Apply(error.into()))?;
+    tracing::info!(
+        %namespace,
+        secret = %name,
+        "pre-label tenant image pull secret adopted: managed-by ownership label applied"
+    );
+    Ok(())
+}
+
+/// Reconcile the managed tenant pull secrets of one namespace to the set CAP
+/// should hold there (review findings on #243): discovery is name-independent
+/// (labeled secrets plus shape-recognized legacy secrets), kept secrets are
+/// adopted and left in place, and every other managed secret is removed
+/// together with its ServiceAccount references. Returns whether every write
+/// converged; the caller must treat `false` as "stale platform credentials may
+/// still be out there".
+async fn reconcile_managed_pull_secrets(
+    engine: &ApplyEngine,
+    namespace: &str,
+    service_accounts: &[String],
+    settings: &PullSecretSettings,
+    namespace_in_scope: bool,
+    delete_mode: PullSecretDeleteMode,
+) -> Result<bool, DeployError> {
+    let (managed, referenced_names) =
+        discover_managed_pull_secrets(engine, namespace, service_accounts, settings).await?;
+    let mut converged = true;
+    let mut removed = 0usize;
+    let mut kept = 0usize;
+    for secret in &managed {
+        let Some(name) = secret.metadata.name.as_deref() else {
+            continue;
+        };
+        if keep_managed_pull_secret(
+            namespace_in_scope,
+            name,
+            &settings.configured_name,
+            &referenced_names,
+        ) {
+            kept += 1;
+            if !is_labeled_managed_pull_secret(secret)
+                && let Err(error) = adopt_managed_pull_secret(engine, namespace, secret).await
+            {
+                converged = false;
+                tracing::warn!(
+                    %namespace,
+                    secret = %name,
+                    %error,
+                    "failed to label a kept legacy tenant image pull secret; a later GHCR \
+                     token rotation could no longer prove its ownership — will retry"
+                );
+            }
+            continue;
+        }
+        removed += 1;
+        // Only proven CAP-managed names are ever cleared from
+        // ServiceAccounts (review finding): a tenant-owned secret under the
+        // same name keeps both itself and its references.
+        for service_account in service_accounts {
+            match clear_pull_secret_reference_from_service_account(
+                engine,
+                namespace,
+                service_account,
+                name,
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(error) => {
+                    converged = false;
+                    tracing::warn!(
+                        %namespace,
+                        service_account = %service_account,
+                        secret = %name,
+                        %error,
+                        "tenant image pull secret reconcile: failed to clear stale \
+                         ServiceAccount reference"
+                    );
+                }
+            }
+        }
+        let removed_result = match delete_mode {
+            PullSecretDeleteMode::Unfenced => {
+                delete_managed_pull_secret_unfenced(engine, namespace, name, settings.ghcr()).await
+            }
+            PullSecretDeleteMode::Fenced(generation) => {
+                delete_managed_pull_secret_fenced(
+                    engine,
+                    namespace,
+                    name,
+                    generation,
+                    settings.ghcr(),
+                )
+                .await
+            }
+        };
+        match removed_result {
+            Ok(_) => {}
+            Err(error) => {
+                converged = false;
+                tracing::warn!(
+                    %namespace,
+                    secret = %name,
+                    %error,
+                    "tenant image pull secret reconcile: failed to remove stale secret"
+                );
+            }
+        }
+    }
+    tracing::info!(
+        %namespace,
+        removed,
+        kept,
+        converged,
+        "tenant image pull secret reconcile complete"
+    );
+    Ok(converged)
+}
+
+/// Whether the secret carries the managed-by ownership label (the proof that
+/// survives GHCR token rotation).
+fn is_labeled_managed_pull_secret(secret: &Secret) -> bool {
+    secret
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get(MANAGED_BY_LABEL))
+        .is_some_and(|value| value == MANAGED_BY_VALUE)
+}
+
+/// Delete a proven managed pull secret fenced by the deploy's mutation
+/// generation (per-deploy cleanup). Re-checks ownership on the live object
+/// right before deleting: the discovery pass may be stale, and a secret that
+/// was replaced by a tenant-owned look-alike in the meantime must survive.
+async fn delete_managed_pull_secret_fenced(
+    engine: &ApplyEngine,
+    namespace: &str,
+    name: &str,
+    generation: MutationGeneration,
+    ghcr_credentials: Option<(&str, &str)>,
+) -> Result<bool, DeployError> {
+    let api: Api<Secret> = Api::namespaced(engine.client().clone(), namespace);
+    let existing = match api.get(name).await {
         Ok(existing) => existing,
-        Err(kube::Error::Api(error)) if error.code == 404 => return Ok(()),
+        Err(kube::Error::Api(error)) if error.code == 404 => return Ok(false),
         Err(error) => return Err(DeployError::Apply(error.into())),
     };
-    let ghcr_credentials = ghcr_pull_secret_credentials();
-    let ghcr_credentials = ghcr_credentials
-        .as_ref()
-        .map(|(username, token)| (username.as_str(), token.as_str()));
     if !is_managed_tenant_image_pull_secret(&existing, ghcr_credentials) {
         tracing::warn!(
             namespace = %namespace,
             secret = %name,
             "tenant image pull secret cleanup skipped: secret exists but is not CAP-managed"
         );
-        return Ok(());
+        return Ok(false);
     }
-    delete_resource(&api, &name, generation, DeleteParams::default()).await?;
+    delete_resource(&api, name, generation, DeleteParams::default()).await?;
     tracing::info!(
         namespace = %namespace,
         secret = %name,
-        "stale tenant image pull secret removed (workload is outside the configured repository scope)"
+        "stale tenant image pull secret removed (not kept under the configured repository scope)"
     );
-    Ok(())
+    Ok(true)
 }
 
-/// Startup convergence for stale tenant image pull secrets (review finding):
-/// scope changes (narrowing `TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES`, removing
-/// GHCR credentials) previously left the platform token in namespaces whose
-/// workloads fell out of scope until each app happened to redeploy. Sweep the
-/// known app namespaces at startup and remove the managed secret wherever the
-/// current scope does not apply. Returns whether the sweep converged; on
-/// failure the caller must NOT start the deployment dispatcher (review
-/// finding): the dispatcher would re-apply workloads and re-attach secrets
-/// while the stale platform token is still exposed. The per-deploy cleanup in
+/// One sweep attempt for stale tenant image pull secrets (review findings on
+/// #243): scope changes (narrowing `TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES`,
+/// changing `TENANT_IMAGE_PULL_SECRET_NAME`, removing GHCR credentials)
+/// previously left platform tokens in namespaces whose workloads fell out of
+/// scope until each app happened to redeploy — and only under the single
+/// currently configured secret name. Sweep the known app namespaces and
+/// reconcile each one's managed pull secrets (any name) through
+/// [`reconcile_managed_pull_secrets`]. Returns whether the sweep converged; on
+/// failure the caller must keep workload admission closed (review finding):
+/// the dispatcher would re-apply workloads and re-attach secrets while a
+/// stale platform token is still exposed. The per-deploy cleanup in
 /// [`apply_all_with_tenant_image_pull_secret`] remains the hard gate.
 pub async fn cleanup_stale_tenant_image_pull_secrets_at_startup(pool: &PgPool) -> bool {
     match cleanup_stale_tenant_image_pull_secrets(pool).await {
         Ok(true) => true,
         Ok(false) => {
             tracing::error!(
-                "tenant image pull secret startup cleanup did not converge: stale secrets remain \
-                 in the cluster and deployment dispatch must not start until a clean sweep converges"
+                "tenant image pull secret cleanup did not converge: stale secrets may remain \
+                 and workload admission stays closed until a clean sweep converges"
             );
             false
         }
         Err(error) => {
             tracing::error!(
                 %error,
-                "tenant image pull secret startup cleanup failed; stale secrets remain and \
-                 deployment dispatch will not start until a clean sweep converges"
+                "tenant image pull secret cleanup failed; stale secrets may remain and \
+                 workload admission stays closed until a clean sweep converges"
             );
             false
         }
     }
 }
 
-/// Per-namespace janitor inventory: (per-app image lists, service accounts).
+/// Per-namespace janitor inventory: per-app image lists (`None` in an app
+/// slot means one of its stored image refs is unparsable, which never
+/// qualifies for the secret) plus the generated ServiceAccount names whose
+/// live `imagePullSecrets` references the keep decision protects.
 type NamespacePullSecretInventory =
     std::collections::BTreeMap<String, (Vec<Option<Vec<ImageRef>>>, Vec<String>)>;
 
 async fn cleanup_stale_tenant_image_pull_secrets(pool: &PgPool) -> Result<bool, DeployError> {
-    let secret_name = managed_tenant_image_pull_secret_name();
+    let settings = PullSecretSettings::from_env();
     let config = tenant_image_pull_secret_config_from_env();
 
     // LEFT JOIN: an app with no container rows must still be inventoried
@@ -645,69 +1051,53 @@ async fn cleanup_stale_tenant_image_pull_secrets(pool: &PgPool) -> Result<bool, 
     }
 
     let engine = ApplyEngine::try_default().await?;
-    let mut removed = 0usize;
-    // A failed delete leaves the platform token exposed in the namespace —
-    // the sweep must report that as not-converged, not "sweep complete"
-    // (review finding): the caller disables deployment dispatch on it.
+    // A failed write leaves the platform token exposed in the namespace — the
+    // sweep must report that as not-converged, not "sweep complete" (review
+    // finding): the caller keeps workload admission closed on it and retries.
     let mut converged = true;
     for (namespace, (app_images, service_accounts)) in &by_namespace {
-        if namespace_keeps_tenant_image_pull_secret(config.as_ref(), app_images) {
-            continue;
-        }
-        // Reconcile the live references too: the ServiceAccount generated by
-        // earlier deploys lists the secret in `imagePullSecrets` and would
-        // keep pointing at it after the secret is gone. (Existing pods embed
-        // the reference at creation time; it is only consulted at image-pull
-        // time, and out-of-scope images must not pull with the platform token
-        // in the first place.)
-        for service_account in service_accounts {
-            if let Err(error) = clear_pull_secret_reference_from_service_account(
-                &engine,
-                namespace,
-                service_account,
-                &secret_name,
-            )
-            .await
-            {
-                converged = false;
-                tracing::warn!(
-                    %namespace,
-                    service_account = %service_account,
-                    %error,
-                    "tenant image pull secret cleanup sweep: failed to clear stale ServiceAccount reference"
-                );
-            }
-        }
-        match delete_managed_pull_secret_unfenced(&engine, namespace, &secret_name).await {
-            Ok(true) => removed += 1,
-            Ok(false) => {}
+        // In-scope namespaces are reconciled too (review finding): pre-label
+        // secrets there must be adopted (labeled) before the keep decision
+        // applies, and unreferenced residue (e.g. a renamed old secret) must
+        // not survive.
+        let namespace_in_scope =
+            namespace_keeps_tenant_image_pull_secret(config.as_ref(), app_images);
+        match reconcile_managed_pull_secrets(
+            &engine,
+            namespace,
+            service_accounts,
+            &settings,
+            namespace_in_scope,
+            PullSecretDeleteMode::Unfenced,
+        )
+        .await
+        {
+            Ok(converged_namespace) => converged &= converged_namespace,
             Err(error) => {
                 converged = false;
                 tracing::warn!(
                     %namespace,
                     %error,
-                    "tenant image pull secret cleanup sweep: failed to remove stale secret"
+                    "tenant image pull secret cleanup sweep: reconciliation failed"
                 );
             }
         }
     }
-    tracing::info!(
-        removed,
-        converged,
-        "tenant image pull secret startup cleanup sweep complete"
-    );
+    tracing::info!(converged, "tenant image pull secret cleanup sweep complete");
     Ok(converged)
 }
 
 /// Unfenced janitor delete of the managed pull secret: unlike
-/// [`delete_stale_tenant_image_pull_secret`] this runs outside any mutation
-/// lease (startup sweep), so it relies on the observed UID/resourceVersion
-/// preconditions instead of the mutation-generation fence. Returns whether a
-/// secret was deleted.
+/// [`delete_managed_pull_secret_fenced`] this runs outside any mutation lease
+/// (startup sweep and its background retry), so it relies on the observed
+/// UID/resourceVersion preconditions instead of the mutation-generation
+/// fence. Re-checks ownership on the live object right before deleting (same
+/// reason as the fenced variant). Returns whether a secret was deleted.
 async fn delete_managed_pull_secret_unfenced(
     engine: &ApplyEngine,
     namespace: &str,
     name: &str,
+    ghcr_credentials: Option<(&str, &str)>,
 ) -> Result<bool, DeployError> {
     let api: Api<Secret> = Api::namespaced(engine.client().clone(), namespace);
     let existing = match api.get(name).await {
@@ -715,10 +1105,6 @@ async fn delete_managed_pull_secret_unfenced(
         Err(kube::Error::Api(error)) if error.code == 404 => return Ok(false),
         Err(error) => return Err(DeployError::Apply(error.into())),
     };
-    let ghcr_credentials = ghcr_pull_secret_credentials();
-    let ghcr_credentials = ghcr_credentials
-        .as_ref()
-        .map(|(username, token)| (username.as_str(), token.as_str()));
     if !is_managed_tenant_image_pull_secret(&existing, ghcr_credentials) {
         tracing::warn!(
             namespace = %namespace,
@@ -832,6 +1218,15 @@ async fn apply_all_with_tenant_image_pull_secret(
     apply_namespace(engine, &manifests.namespace, generation).await?;
     tracing::info!(namespace = %ns_name, "step 1/5: namespace ready");
 
+    let settings = PullSecretSettings::from_env();
+    let service_accounts = manifests
+        .service_account
+        .metadata
+        .name
+        .iter()
+        .cloned()
+        .collect::<Vec<String>>();
+
     if let Some(config) = image_pull_secret_config {
         let secret = generate_tenant_image_pull_secret(ns_name, config);
         apply_namespaced_resource(engine, ns_name, &secret, generation).await?;
@@ -844,12 +1239,64 @@ async fn apply_all_with_tenant_image_pull_secret(
         // The scope gate rejected this workload (or no scoped config exists).
         // Skipping the apply is not enough: a pull secret applied by an
         // earlier deployment would survive here with the platform credential
-        // still readable by namespace readers, so remove it (review finding).
-        delete_stale_tenant_image_pull_secret(engine, ns_name, generation).await?;
+        // still readable by namespace readers, so reconcile the whole managed
+        // inventory down to nothing — every CAP-managed secret, under any
+        // name, together with its ServiceAccount references (review findings
+        // on #243). This runs before the standard resources so a later apply
+        // failure cannot leave the token behind, and a cleanup that cannot
+        // converge fails the deploy instead of proceeding with a stale
+        // platform token in the namespace.
+        let converged = reconcile_managed_pull_secrets(
+            engine,
+            ns_name,
+            &service_accounts,
+            &settings,
+            false,
+            PullSecretDeleteMode::Fenced(generation),
+        )
+        .await?;
+        if !converged {
+            return Err(DeployError::Validation(
+                "tenant image pull secret cleanup did not converge; refusing to continue with a \
+                 stale platform pull secret in the namespace"
+                    .to_string(),
+            ));
+        }
     }
 
     apply_standard_resources(engine, manifests, generation).await?;
     tracing::info!(namespace = %ns_name, "step 2/5: standard resources applied");
+
+    if image_pull_secret_config.is_some() {
+        // Once the generated ServiceAccount carries its final
+        // `imagePullSecrets`, reconcile residue in this in-scope namespace
+        // (review findings on #243): pre-label secrets are adopted (labeled)
+        // while the configured GHCR pair still proves ownership, and managed
+        // secrets the workload no longer references — e.g. under a previous
+        // `TENANT_IMAGE_PULL_SECRET_NAME` — are removed. Best-effort: the
+        // startup sweep converges anything this pass cannot.
+        match reconcile_managed_pull_secrets(
+            engine,
+            ns_name,
+            &service_accounts,
+            &settings,
+            true,
+            PullSecretDeleteMode::Fenced(generation),
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => tracing::warn!(
+                namespace = %ns_name,
+                "tenant image pull secret residue cleanup did not converge; the startup sweep will retry"
+            ),
+            Err(error) => tracing::warn!(
+                namespace = %ns_name,
+                %error,
+                "tenant image pull secret residue cleanup failed; the startup sweep will retry"
+            ),
+        }
+    }
 
     apply_network_policy(engine, ns_name, &manifests.network_policy, generation).await?;
     tracing::info!(namespace = %ns_name, "step 3/5: CiliumNetworkPolicy applied");
@@ -1651,6 +2098,7 @@ mod tests {
         Capabilities, DeploymentDescriptor, EnvVar, Mount, OciRuntimeSpec, Port, Resources,
         SecurityContext, Sidecars, SignerIdentity,
     };
+    use std::sync::{Arc, Mutex};
 
     fn test_attestation_config() -> AttestationConfig {
         AttestationConfig {
@@ -3227,6 +3675,574 @@ mod tests {
             .execute(&pool)
             .await
             .expect("clean up fixture");
+    }
+
+    /// Codex review on #243 (P2): a scope entry must use the workload-image
+    /// reference grammar. Tags, digests, URL schemes, and malformed path
+    /// components used to parse into scopes that can never equal the parsed
+    /// repository of a digest-pinned image, so startup succeeded but every
+    /// affected private workload silently lost its pull secret.
+    #[test]
+    fn tenant_image_pull_scope_rejects_image_reference_syntax_errors() {
+        for invalid in [
+            "ghcr.io/org/private:latest",
+            "ghcr.io/org/private@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "https://ghcr.io/org/private",
+            "ghcr.io/org//private",
+            "ghcr.io//private",
+            "ghcr.io/org/.",
+            "ghcr.io/org/..",
+            "org/private",
+        ] {
+            assert!(
+                parse_image_pull_repository_scope(invalid).is_err(),
+                "scope {invalid:?} must be rejected"
+            );
+        }
+        // Valid scopes — with and without an explicit port, exact and
+        // wildcard — keep parsing unchanged.
+        assert!(parse_image_pull_repository_scope("ghcr.io/org/private").is_ok());
+        assert!(parse_image_pull_repository_scope("registry.example.com:5000/org/private").is_ok());
+        assert!(parse_image_pull_repository_scope("ghcr.io/org/private/*").is_ok());
+    }
+
+    /// Keep/remove decision gate (review findings on #243): a managed secret
+    /// stays only in an in-scope namespace, and only while it is the
+    /// configured name or still referenced by a generated ServiceAccount.
+    #[test]
+    fn keep_managed_pull_secret_gates_on_scope_name_and_references() {
+        let mut referenced = BTreeSet::new();
+        referenced.insert("old-name".to_string());
+
+        // In scope: the configured name and still-referenced old names stay.
+        assert!(keep_managed_pull_secret(
+            true,
+            "enclava-registry-auth",
+            "enclava-registry-auth",
+            &referenced
+        ));
+        assert!(keep_managed_pull_secret(
+            true,
+            "old-name",
+            "enclava-registry-auth",
+            &referenced
+        ));
+        // In scope: unreferenced residue (a renamed old secret) is removed.
+        assert!(!keep_managed_pull_secret(
+            true,
+            "renamed-old",
+            "enclava-registry-auth",
+            &referenced
+        ));
+        // Out of scope: nothing managed stays, references or not.
+        assert!(!keep_managed_pull_secret(
+            false,
+            "enclava-registry-auth",
+            "enclava-registry-auth",
+            &referenced
+        ));
+        assert!(!keep_managed_pull_secret(
+            false,
+            "old-name",
+            "enclava-registry-auth",
+            &referenced
+        ));
+    }
+
+    /// In-memory Kubernetes API double for the pull-secret reconcile tests:
+    /// holds Secrets and ServiceAccounts and serves exactly the verbs the
+    /// reconcile path exercises (label-selected list, get, merge patch and
+    /// delete on Secrets; get and merge patch on ServiceAccounts).
+    #[derive(Default)]
+    struct FakeCluster {
+        secrets: Vec<Secret>,
+        service_accounts: Vec<ServiceAccount>,
+    }
+
+    fn fake_managed_secret(name: &str, labeled: bool, username: &str, token: &str) -> Secret {
+        use k8s_openapi::ByteString;
+        let mut labels = std::collections::BTreeMap::new();
+        if labeled {
+            labels.insert(MANAGED_BY_LABEL.to_string(), MANAGED_BY_VALUE.to_string());
+        }
+        let docker_config = serde_json::json!({
+            "auths": {
+                "ghcr.io": { "username": username, "password": token }
+            }
+        });
+        Secret {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                namespace: Some("tenant-ns".to_string()),
+                uid: Some(format!("uid-{name}")),
+                resource_version: Some("1".to_string()),
+                labels: if labels.is_empty() {
+                    None
+                } else {
+                    Some(labels)
+                },
+                ..Default::default()
+            },
+            type_: Some("kubernetes.io/dockerconfigjson".to_string()),
+            data: Some(std::collections::BTreeMap::from([(
+                ".dockerconfigjson".to_string(),
+                ByteString(serde_json::to_vec(&docker_config).unwrap()),
+            )])),
+            ..Default::default()
+        }
+    }
+
+    fn fake_service_account(name: &str, references: &[&str]) -> ServiceAccount {
+        use k8s_openapi::api::core::v1::LocalObjectReference;
+        ServiceAccount {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                namespace: Some("tenant-ns".to_string()),
+                uid: Some(format!("uid-{name}")),
+                resource_version: Some("1".to_string()),
+                ..Default::default()
+            },
+            image_pull_secrets: if references.is_empty() {
+                None
+            } else {
+                Some(
+                    references
+                        .iter()
+                        .map(|name| LocalObjectReference {
+                            name: (*name).to_string(),
+                        })
+                        .collect(),
+                )
+            },
+            ..Default::default()
+        }
+    }
+
+    fn reconcile_engine(cluster: Arc<Mutex<FakeCluster>>) -> ApplyEngine {
+        use axum::http::{Request, Response};
+        use http_body_util::BodyExt;
+        use kube::client::Body;
+        use tower::service_fn;
+
+        let client = kube::Client::new(
+            service_fn(move |request: Request<Body>| {
+                let cluster = cluster.clone();
+                async move {
+                    let method = request.method().clone();
+                    let path = request.uri().path().to_string();
+                    let query = request.uri().query().map(str::to_string);
+                    let body = request.into_body().collect().await.unwrap().to_bytes();
+                    let mut state = cluster.lock().unwrap();
+                    let (status, value) = route_fake_cluster(
+                        &mut state,
+                        method.as_str(),
+                        &path,
+                        query.as_deref(),
+                        &body,
+                    );
+                    Ok::<_, std::io::Error>(
+                        Response::builder()
+                            .status(status)
+                            .body(Body::from(serde_json::to_vec(&value).unwrap()))
+                            .unwrap(),
+                    )
+                }
+            }),
+            "default",
+        );
+        ApplyEngine::new(client, enclava_engine::apply::types::ApplyConfig::default())
+    }
+
+    fn route_fake_cluster(
+        state: &mut FakeCluster,
+        method: &str,
+        path: &str,
+        query: Option<&str>,
+        body: &[u8],
+    ) -> (u16, serde_json::Value) {
+        fn not_found() -> (u16, serde_json::Value) {
+            (
+                404,
+                serde_json::json!({
+                    "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                    "reason": "NotFound", "code": 404,
+                }),
+            )
+        }
+        fn conflict() -> (u16, serde_json::Value) {
+            (
+                409,
+                serde_json::json!({
+                    "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                    "reason": "Conflict", "code": 409,
+                }),
+            )
+        }
+        let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
+        let (kind, name) = match segments.as_slice() {
+            ["api", "v1", "namespaces", _, "secrets"] => ("secrets", None),
+            ["api", "v1", "namespaces", _, "secrets", name] => ("secrets", Some(*name)),
+            ["api", "v1", "namespaces", _, "serviceaccounts", name] => {
+                ("serviceaccounts", Some(*name))
+            }
+            _ => return not_found(),
+        };
+        match (kind, method) {
+            ("secrets", "GET") if name.is_none() => {
+                // Label-selected list. `labelSelector=key=value` is compared
+                // against each secret's labels.
+                let selector = query
+                    .and_then(|query| {
+                        query.split('&').find_map(|pair| {
+                            let (key, value) = pair.split_once('=')?;
+                            (key == "labelSelector").then(|| decode_query_component(value))
+                        })
+                    })
+                    .unwrap_or_default();
+                let items: Vec<serde_json::Value> = state
+                    .secrets
+                    .iter()
+                    .filter(|secret| {
+                        selector.split(',').all(|requirement| {
+                            let Some((key, value)) = requirement.split_once('=') else {
+                                return false;
+                            };
+                            secret
+                                .metadata
+                                .labels
+                                .as_ref()
+                                .and_then(|labels| labels.get(key))
+                                .map(String::as_str)
+                                == Some(value)
+                        })
+                    })
+                    .map(|secret| serde_json::to_value(secret).unwrap())
+                    .collect();
+                (
+                    200,
+                    serde_json::json!({
+                        "apiVersion": "v1", "kind": "SecretList",
+                        "metadata": {}, "items": items,
+                    }),
+                )
+            }
+            ("secrets", "GET") => match state
+                .secrets
+                .iter()
+                .find(|secret| secret.metadata.name.as_deref() == name)
+            {
+                Some(secret) => (200, serde_json::to_value(secret).unwrap()),
+                None => not_found(),
+            },
+            ("secrets", "PATCH") => {
+                let patch: serde_json::Value = serde_json::from_slice(body).unwrap();
+                let Some(secret) = state
+                    .secrets
+                    .iter_mut()
+                    .find(|secret| secret.metadata.name.as_deref() == name)
+                else {
+                    return not_found();
+                };
+                if let Some(labels) = patch
+                    .pointer("/metadata/labels")
+                    .and_then(|labels| labels.as_object())
+                {
+                    let entry = secret.metadata.labels.get_or_insert_with(Default::default);
+                    for (key, value) in labels {
+                        entry.insert(key.clone(), value.as_str().unwrap_or_default().to_string());
+                    }
+                }
+                (200, serde_json::to_value(secret).unwrap())
+            }
+            ("secrets", "DELETE") => {
+                let index = state
+                    .secrets
+                    .iter()
+                    .position(|secret| secret.metadata.name.as_deref() == name);
+                let Some(index) = index else {
+                    return not_found();
+                };
+                // Preconditions mirror the API server: a stale uid or
+                // resourceVersion must conflict instead of deleting.
+                let delete_options: serde_json::Value = serde_json::from_slice(body).unwrap();
+                let preconditions = delete_options.pointer("/preconditions");
+                let live = &state.secrets[index];
+                if let Some(preconditions) = preconditions {
+                    let uid = preconditions.get("uid").and_then(|uid| uid.as_str());
+                    let resource_version = preconditions
+                        .get("resourceVersion")
+                        .and_then(|rv| rv.as_str());
+                    let uid_mismatch =
+                        uid.is_some_and(|uid| live.metadata.uid.as_deref() != Some(uid));
+                    let rv_mismatch = resource_version
+                        .is_some_and(|rv| live.metadata.resource_version.as_deref() != Some(rv));
+                    if uid_mismatch || rv_mismatch {
+                        return conflict();
+                    }
+                }
+                state.secrets.remove(index);
+                (
+                    200,
+                    serde_json::json!({
+                        "kind": "Status", "apiVersion": "v1", "status": "Success", "code": 200,
+                    }),
+                )
+            }
+            ("serviceaccounts", "GET") => match state
+                .service_accounts
+                .iter()
+                .find(|account| account.metadata.name.as_deref() == name)
+            {
+                Some(account) => (200, serde_json::to_value(account).unwrap()),
+                None => not_found(),
+            },
+            ("serviceaccounts", "PATCH") => {
+                let patch: serde_json::Value = serde_json::from_slice(body).unwrap();
+                let Some(account) = state
+                    .service_accounts
+                    .iter_mut()
+                    .find(|account| account.metadata.name.as_deref() == name)
+                else {
+                    return not_found();
+                };
+                if let Some(references) = patch.get("imagePullSecrets") {
+                    use k8s_openapi::api::core::v1::LocalObjectReference;
+                    account.image_pull_secrets = references.as_array().map(|references| {
+                        references
+                            .iter()
+                            .map(|reference| LocalObjectReference {
+                                name: reference
+                                    .get("name")
+                                    .and_then(|name| name.as_str())
+                                    .unwrap_or_default()
+                                    .to_string(),
+                            })
+                            .collect()
+                    });
+                }
+                (200, serde_json::to_value(account).unwrap())
+            }
+            _ => not_found(),
+        }
+    }
+
+    fn decode_query_component(raw: &str) -> String {
+        raw.replace("%3D", "=")
+            .replace("%2F", "/")
+            .replace("%2C", ",")
+    }
+
+    fn reconcile_settings() -> PullSecretSettings {
+        PullSecretSettings {
+            configured_name: "enclava-registry-auth".to_string(),
+            ghcr_credentials: Some(("cap-bot".to_string(), "ghp_platform".to_string())),
+        }
+    }
+
+    /// Devin review on #243 (BUG_…​_0002): an unlabeled secret holding a
+    /// tenant's OWN GHCR credentials under the managed name is not
+    /// CAP-generated. The sweep keeps it, so it must also keep the
+    /// ServiceAccount reference to it — clearing the reference would strip
+    /// the tenant's pods of their private-registry credentials.
+    #[tokio::test]
+    async fn reconcile_keeps_tenant_owned_look_alike_and_its_reference() {
+        use std::sync::{Arc, Mutex};
+
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![
+                // The tenant's own pull secret under the configured name,
+                // carrying the tenant's own credentials.
+                fake_managed_secret(
+                    "enclava-registry-auth",
+                    false,
+                    "tenant-user",
+                    "tenant-token",
+                ),
+            ],
+            service_accounts: vec![fake_service_account(
+                "cap-tenant-app",
+                &["enclava-registry-auth"],
+            )],
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        let converged = reconcile_managed_pull_secrets(
+            &engine,
+            "tenant-ns",
+            &["cap-tenant-app".to_string()],
+            &reconcile_settings(),
+            false,
+            PullSecretDeleteMode::Unfenced,
+        )
+        .await
+        .unwrap();
+        assert!(converged);
+
+        let state = cluster.lock().unwrap();
+        assert_eq!(state.secrets.len(), 1, "tenant-owned secret must survive");
+        assert_eq!(
+            state.service_accounts[0]
+                .image_pull_secrets
+                .as_ref()
+                .map(|references| references.len()),
+            Some(1),
+            "tenant-owned reference must survive"
+        );
+    }
+
+    /// Codex review on #243 (P1, "sweep all previously managed pull-secret
+    /// names"): a secret created under an older TENANT_IMAGE_PULL_SECRET_NAME
+    /// is discovered by its managed label and removed — with its
+    /// ServiceAccount references — even though the current configuration
+    /// generates a different name. While a generated ServiceAccount still
+    /// references it, it is kept until the workload redeploys (the documented
+    /// convergence order).
+    #[tokio::test]
+    async fn reconcile_removes_renamed_managed_secrets_and_clears_references() {
+        use std::sync::{Arc, Mutex};
+
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![
+                fake_managed_secret("enclava-registry-auth", true, "cap-bot", "ghp_platform"),
+                // Created before TENANT_IMAGE_PULL_SECRET_NAME was renamed;
+                // still labeled, no longer referenced by the workload.
+                fake_managed_secret("pull-secret-old-name", true, "cap-bot", "ghp_old_token"),
+            ],
+            service_accounts: vec![fake_service_account(
+                "cap-tenant-app",
+                &["enclava-registry-auth", "pull-secret-old-name"],
+            )],
+        }));
+        let engine = reconcile_engine(cluster.clone());
+
+        // In-scope with the old name still referenced: kept until redeploy.
+        let converged = reconcile_managed_pull_secrets(
+            &engine,
+            "tenant-ns",
+            &["cap-tenant-app".to_string()],
+            &reconcile_settings(),
+            true,
+            PullSecretDeleteMode::Unfenced,
+        )
+        .await
+        .unwrap();
+        assert!(converged);
+        {
+            let state = cluster.lock().unwrap();
+            assert_eq!(
+                state.secrets.len(),
+                2,
+                "referenced old secret stays in scope"
+            );
+        }
+
+        // Post-redeploy: the workload now references only the new name. The
+        // unreferenced old secret is removed by name-independent discovery.
+        cluster.lock().unwrap().service_accounts[0].image_pull_secrets =
+            Some(vec![k8s_openapi::api::core::v1::LocalObjectReference {
+                name: "enclava-registry-auth".to_string(),
+            }]);
+        let converged = reconcile_managed_pull_secrets(
+            &engine,
+            "tenant-ns",
+            &["cap-tenant-app".to_string()],
+            &reconcile_settings(),
+            true,
+            PullSecretDeleteMode::Unfenced,
+        )
+        .await
+        .unwrap();
+        assert!(converged);
+        {
+            let state = cluster.lock().unwrap();
+            assert_eq!(state.secrets.len(), 1);
+            assert_eq!(
+                state.secrets[0].metadata.name.as_deref(),
+                Some("enclava-registry-auth")
+            );
+        }
+
+        // Out of scope: the referenced old secret is removed together with
+        // its reference, while the current name is removed too.
+        cluster.lock().unwrap().secrets.push(fake_managed_secret(
+            "pull-secret-old-name",
+            true,
+            "cap-bot",
+            "ghp_old_token",
+        ));
+        cluster.lock().unwrap().service_accounts[0].image_pull_secrets = Some(vec![
+            k8s_openapi::api::core::v1::LocalObjectReference {
+                name: "enclava-registry-auth".to_string(),
+            },
+            k8s_openapi::api::core::v1::LocalObjectReference {
+                name: "pull-secret-old-name".to_string(),
+            },
+        ]);
+        let converged = reconcile_managed_pull_secrets(
+            &engine,
+            "tenant-ns",
+            &["cap-tenant-app".to_string()],
+            &reconcile_settings(),
+            false,
+            PullSecretDeleteMode::Unfenced,
+        )
+        .await
+        .unwrap();
+        assert!(converged);
+        {
+            let state = cluster.lock().unwrap();
+            assert!(state.secrets.is_empty(), "out-of-scope secrets are removed");
+            assert!(
+                state.service_accounts[0].image_pull_secrets.is_none(),
+                "managed references are cleared out of scope"
+            );
+        }
+    }
+
+    /// Codex review on #243 (P1, "adopt legacy secrets before skipping
+    /// in-scope namespaces"): in an in-scope namespace a pre-label secret is
+    /// adopted (labeled) while its credentials still prove the generated
+    /// shape — before any in-scope skip — so the documented upgrade-then-
+    /// rotate sequence cannot orphan it when the GHCR token is later rotated.
+    #[tokio::test]
+    async fn reconcile_adopts_kept_legacy_secrets_in_scope() {
+        use std::sync::{Arc, Mutex};
+
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![
+                // Pre-label (unlabeled) legacy secret whose shape matches the
+                // configured GHCR pair.
+                fake_managed_secret("enclava-registry-auth", false, "cap-bot", "ghp_platform"),
+            ],
+            service_accounts: vec![fake_service_account(
+                "cap-tenant-app",
+                &["enclava-registry-auth"],
+            )],
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        let converged = reconcile_managed_pull_secrets(
+            &engine,
+            "tenant-ns",
+            &["cap-tenant-app".to_string()],
+            &reconcile_settings(),
+            true,
+            PullSecretDeleteMode::Unfenced,
+        )
+        .await
+        .unwrap();
+        assert!(converged);
+
+        let state = cluster.lock().unwrap();
+        assert_eq!(state.secrets.len(), 1);
+        assert_eq!(
+            state.secrets[0]
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get(MANAGED_BY_LABEL))
+                .map(String::as_str),
+            Some(MANAGED_BY_VALUE),
+            "kept legacy secret must carry the managed-by ownership label"
+        );
     }
 }
 

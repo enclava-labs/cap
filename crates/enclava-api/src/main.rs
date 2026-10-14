@@ -925,23 +925,29 @@ async fn main() {
     let side_effect_admission = enclava_api::state::side_effect_admission_for_pool(&pool);
     // Converge stale tenant image pull secrets BEFORE the router is built
     // (review finding on #243): the dispatch-freeze middleware must see the
-    // final workload-admission decision from its very first request. If the
-    // sweep cannot converge (a failed delete leaves the platform token
-    // exposed), deployment dispatch stays disabled for the process lifetime —
-    // the API must not accept workload mutations while a stale token is out.
+    // workload-admission decision from its very first request. If the sweep
+    // cannot converge (a failed delete leaves the platform token exposed),
+    // workload admission stays closed and a background reconciler retries the
+    // sweep with bounded backoff — admission and the deployment dispatcher
+    // open together only once a sweep converges. The API must not accept
+    // workload mutations while a stale token is out, but a transient
+    // Kubernetes outage at startup must not freeze deployments for the
+    // process lifetime either (review finding).
     let pull_secret_sweep_converged =
         enclava_api::deploy::cleanup_stale_tenant_image_pull_secrets_at_startup(&pool).await;
     let dispatch_admission = deployment_dispatch_enabled && pull_secret_sweep_converged;
     if deployment_dispatch_enabled && !pull_secret_sweep_converged {
         tracing::error!(
-            "deployment dispatch disabled: tenant image pull secret cleanup sweep did not converge; \
-             restart the API once the cluster is reachable to re-run the sweep"
+            "workload admission closed: tenant image pull secret cleanup sweep did not converge; \
+             the sweep will retry with bounded backoff and open admission as soon as it converges"
         );
     }
     let state = AppState {
         db: pool,
         management_mode,
-        deployment_dispatch_enabled: dispatch_admission,
+        deployment_dispatch_enabled: Arc::new(std::sync::atomic::AtomicBool::new(
+            dispatch_admission,
+        )),
         startup_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         signing_key: Arc::new(signing_key),
         hmac_key: Arc::new(hmac_key),
@@ -1017,13 +1023,20 @@ async fn main() {
     enclava_api::routes::auth::spawn_device_login_reaper(state.db.clone());
     enclava_api::auth::nostr::spawn_nip98_replay_cache_reaper(state.db.clone());
     // The pull-secret cleanup sweep already ran before router construction;
-    // dispatch admission (`dispatch_admission`) encodes its result.
+    // `dispatch_admission` encodes its result together with the operator's
+    // CAP_DEPLOYMENT_DISPATCH_ENABLED intent.
     if dispatch_admission {
         enclava_api::deployment_jobs::spawn_deployment_dispatcher(state.clone());
+    } else if deployment_dispatch_enabled {
+        // The first sweep did not converge (review finding on #243): keep
+        // workload admission closed and retry the sweep with bounded backoff,
+        // enabling admission and spawning the dispatcher atomically once a
+        // sweep converges instead of freezing deployments until a restart.
+        spawn_pull_secret_sweep_reconciler(state.clone());
     } else {
         tracing::info!(
             "workload mutation and durable deployment dispatch are disabled \
-             (CAP_DEPLOYMENT_DISPATCH_ENABLED=false or the pull-secret cleanup sweep did not converge)"
+             (CAP_DEPLOYMENT_DISPATCH_ENABLED=false)"
         );
     }
     state.mark_startup_ready();
@@ -1035,9 +1048,80 @@ async fn main() {
         .expect("server error");
 }
 
+/// Bounded backoff between cleanup-sweep retries: doubles up to one minute,
+/// so a Kubernetes outage cannot make the retry loop hammer the API server,
+/// while a recovery is noticed within at most a minute.
+fn sweep_retry_backoff(previous: std::time::Duration) -> std::time::Duration {
+    (previous * 2).min(std::time::Duration::from_secs(60))
+}
+
+/// Retry the tenant image pull secret cleanup sweep until it converges
+/// (review finding on #243), then open workload admission and spawn the
+/// deployment dispatcher together. While this runs, the dispatch-freeze
+/// middleware keeps rejecting workload mutations, so the gate is preserved
+/// exactly until reconciliation succeeds — a transient Kubernetes outage at
+/// startup no longer freezes deployments for the process lifetime.
+fn spawn_pull_secret_sweep_reconciler(state: AppState) {
+    tokio::spawn(async move {
+        let mut backoff = std::time::Duration::from_secs(2);
+        loop {
+            tokio::time::sleep(backoff).await;
+            if enclava_api::deploy::cleanup_stale_tenant_image_pull_secrets_at_startup(&state.db)
+                .await
+            {
+                // Dispatcher first, admission second: whenever a workload
+                // mutation is admitted, the dispatcher is already running.
+                enclava_api::deployment_jobs::spawn_deployment_dispatcher(state.clone());
+                state.set_deployment_dispatch_enabled(true);
+                tracing::info!(
+                    "tenant image pull secret cleanup sweep converged on retry; \
+                     workload admission and deployment dispatch enabled"
+                );
+                return;
+            }
+            backoff = sweep_retry_backoff(backoff);
+            tracing::warn!(
+                backoff_secs = backoff.as_secs(),
+                "tenant image pull secret cleanup sweep did not converge; \
+                 workload admission stays closed, retrying"
+            );
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sweep_retry_backoff_is_bounded() {
+        // The cleanup-sweep reconciler retries with exponential backoff that
+        // must stay bounded (review finding on #243): a long Kubernetes
+        // outage must not hammer the API server, and recovery is noticed
+        // within at most the cap.
+        let mut backoff = std::time::Duration::from_secs(2);
+        let mut steps = Vec::new();
+        for _ in 0..10 {
+            backoff = sweep_retry_backoff(backoff);
+            steps.push(backoff);
+        }
+        assert_eq!(
+            steps[..5],
+            [
+                std::time::Duration::from_secs(4),
+                std::time::Duration::from_secs(8),
+                std::time::Duration::from_secs(16),
+                std::time::Duration::from_secs(32),
+                std::time::Duration::from_secs(60),
+            ]
+        );
+        assert!(
+            steps
+                .iter()
+                .all(|step| *step <= std::time::Duration::from_secs(60)),
+            "backoff must never exceed the cap: {steps:?}"
+        );
+    }
 
     #[test]
     fn acme_dns_settings_preserve_defaults_and_validate_explicit_values() {
