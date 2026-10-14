@@ -18,6 +18,10 @@ pub enum EnvGateError {
     )]
     InternalEgressWithoutExplicitAllow(&'static str),
     #[error(
+        "env var `{0}` contains a bare '*' host pattern; forwarding the platform registry credentials to every tenant-chosen registry host in a release build requires the explicit production opt-in COSIGN_REGISTRY_ALLOW_ALL_HOSTS=true"
+    )]
+    AllHostsCosignRegistryWithoutExplicitAllow(&'static str),
+    #[error(
         "env var `{0}` must use https; cleartext ACME would leak account credentials and challenge traffic"
     )]
     CleartextAcmeUrl(&'static str),
@@ -147,6 +151,23 @@ fn enforce_with(
         {
             return Err(EnvGateError::InternalEgressWithoutExplicitAllow(
                 CAP_EGRESS_ALLOW_INTERNAL_HOSTS,
+            ));
+        }
+
+        // A bare `*` in COSIGN_REGISTRY_ALLOWED_HOSTS forwards the platform
+        // registry credentials to every tenant-chosen registry host — the
+        // exact #225 leak as an explicit opt-in. Same bar as
+        // CAP_ALLOW_PRODUCTION_INTERNAL_EGRESS: it must never ride into a
+        // release build implicitly, so it requires a second explicit
+        // production acknowledgment.
+        let production_all_hosts_allowed =
+            lookup("COSIGN_REGISTRY_ALLOW_ALL_HOSTS").is_some_and(|value| flag_is_truthy(&value));
+        if lookup("COSIGN_REGISTRY_ALLOWED_HOSTS")
+            .is_some_and(|raw| raw.split(',').any(|pattern| pattern.trim() == "*"))
+            && !production_all_hosts_allowed
+        {
+            return Err(EnvGateError::AllHostsCosignRegistryWithoutExplicitAllow(
+                "COSIGN_REGISTRY_ALLOWED_HOSTS",
             ));
         }
 
@@ -609,6 +630,49 @@ mod tests {
         let mut env = ok_required();
         env.insert("CAP_EGRESS_ALLOW_INTERNAL_HOSTS", "true");
         run(env, true).expect("debug build should permit the internal-egress opt-out");
+    }
+
+    #[test]
+    fn release_rejects_bare_wildcard_cosign_hosts_without_explicit_allow() {
+        // A bare `*` sends the platform registry credentials to every
+        // tenant-chosen registry host (the #225 leak as an opt-in); same
+        // second-acknowledgment bar as CAP_ALLOW_PRODUCTION_INTERNAL_EGRESS.
+        for value in ["*", "ghcr.io, *", " * "] {
+            let mut env = ok_required();
+            env.insert("COSIGN_REGISTRY_ALLOWED_HOSTS", value);
+            let err = run(env, false).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    EnvGateError::AllHostsCosignRegistryWithoutExplicitAllow(
+                        "COSIGN_REGISTRY_ALLOWED_HOSTS"
+                    )
+                ),
+                "{value:?} must require the production opt-in"
+            );
+        }
+    }
+
+    #[test]
+    fn release_allows_bare_wildcard_cosign_hosts_with_explicit_allow() {
+        let mut env = ok_required();
+        env.insert("COSIGN_REGISTRY_ALLOWED_HOSTS", "*");
+        env.insert("COSIGN_REGISTRY_ALLOW_ALL_HOSTS", "true");
+        run(env, false).expect("explicit production opt-in should pass the gate");
+    }
+
+    #[test]
+    fn release_allows_scoped_cosign_hosts_without_allow() {
+        let mut env = ok_required();
+        env.insert("COSIGN_REGISTRY_ALLOWED_HOSTS", "ghcr.io,*.corp.example");
+        run(env, false).expect("scoped patterns must not trip the production gate");
+    }
+
+    #[test]
+    fn debug_allows_bare_wildcard_cosign_hosts_without_allow() {
+        let mut env = ok_required();
+        env.insert("COSIGN_REGISTRY_ALLOWED_HOSTS", "*");
+        run(env, true).expect("debug build should permit the all-hosts opt-out");
     }
 
     #[test]

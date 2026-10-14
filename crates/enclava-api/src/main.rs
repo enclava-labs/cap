@@ -923,10 +923,25 @@ async fn main() {
         build_trustee_http_client().expect("failed to build Trustee HTTP client");
 
     let side_effect_admission = enclava_api::state::side_effect_admission_for_pool(&pool);
+    // Converge stale tenant image pull secrets BEFORE the router is built
+    // (review finding on #243): the dispatch-freeze middleware must see the
+    // final workload-admission decision from its very first request. If the
+    // sweep cannot converge (a failed delete leaves the platform token
+    // exposed), deployment dispatch stays disabled for the process lifetime —
+    // the API must not accept workload mutations while a stale token is out.
+    let pull_secret_sweep_converged =
+        enclava_api::deploy::cleanup_stale_tenant_image_pull_secrets_at_startup(&pool).await;
+    let dispatch_admission = deployment_dispatch_enabled && pull_secret_sweep_converged;
+    if deployment_dispatch_enabled && !pull_secret_sweep_converged {
+        tracing::error!(
+            "deployment dispatch disabled: tenant image pull secret cleanup sweep did not converge; \
+             restart the API once the cluster is reachable to re-run the sweep"
+        );
+    }
     let state = AppState {
         db: pool,
         management_mode,
-        deployment_dispatch_enabled,
+        deployment_dispatch_enabled: dispatch_admission,
         startup_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         signing_key: Arc::new(signing_key),
         hmac_key: Arc::new(hmac_key),
@@ -1001,15 +1016,14 @@ async fn main() {
     enclava_api::kbs::spawn_signed_policy_reconciler(state.clone());
     enclava_api::routes::auth::spawn_device_login_reaper(state.db.clone());
     enclava_api::auth::nostr::spawn_nip98_replay_cache_reaper(state.db.clone());
-    // Converge stale tenant image pull secrets before deployment dispatch may
-    // re-apply workloads (review finding on #243): scope changes leave the
-    // platform GHCR token in namespaces whose workloads fell out of scope.
-    enclava_api::deploy::cleanup_stale_tenant_image_pull_secrets_at_startup(&state.db).await;
-    if deployment_dispatch_enabled {
+    // The pull-secret cleanup sweep already ran before router construction;
+    // dispatch admission (`dispatch_admission`) encodes its result.
+    if dispatch_admission {
         enclava_api::deployment_jobs::spawn_deployment_dispatcher(state.clone());
     } else {
         tracing::info!(
-            "workload mutation and durable deployment dispatch are disabled by CAP_DEPLOYMENT_DISPATCH_ENABLED"
+            "workload mutation and durable deployment dispatch are disabled \
+             (CAP_DEPLOYMENT_DISPATCH_ENABLED=false or the pull-secret cleanup sweep did not converge)"
         );
     }
     state.mark_startup_ready();

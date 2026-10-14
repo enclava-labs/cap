@@ -421,9 +421,16 @@ fn managed_tenant_image_pull_secret_name() -> String {
 /// before the label existed (the pre-scope "global fallback" that this change
 /// removes) are recognized by the legacy generated shape — a
 /// `kubernetes.io/dockerconfigjson` secret whose single auth entry is
-/// `ghcr.io`. Anything else in the namespace is tenant-owned and must never be
-/// deleted by the stale-secret cleanup.
-fn is_managed_tenant_image_pull_secret(secret: &Secret) -> bool {
+/// `ghcr.io` and whose embedded credentials match the configured GHCR pair.
+/// The credential match is required: a tenant (or operator) can legitimately
+/// store their own GHCR pull secret under the same name, and the cleanup must
+/// never delete a secret it cannot prove CAP generated (review finding).
+/// Anything else in the namespace is tenant-owned and must never be deleted
+/// by the stale-secret cleanup.
+fn is_managed_tenant_image_pull_secret(
+    secret: &Secret,
+    ghcr_credentials: Option<(&str, &str)>,
+) -> bool {
     let managed_by = secret
         .metadata
         .labels
@@ -433,6 +440,11 @@ fn is_managed_tenant_image_pull_secret(secret: &Secret) -> bool {
     if managed_by {
         return true;
     }
+    let Some((expected_username, expected_token)) = ghcr_credentials else {
+        // Without the configured credentials there is no way to prove an
+        // unlabeled secret is CAP-generated; leave it alone.
+        return false;
+    };
     if secret.type_.as_deref() != Some("kubernetes.io/dockerconfigjson") {
         return false;
     }
@@ -449,7 +461,20 @@ fn is_managed_tenant_image_pull_secret(secret: &Secret) -> bool {
     let Some(auths) = config.get("auths").and_then(|auths| auths.as_object()) else {
         return false;
     };
-    auths.len() == 1 && auths.contains_key("ghcr.io")
+    if auths.len() != 1 {
+        return false;
+    }
+    let Some(entry) = auths.get("ghcr.io") else {
+        return false;
+    };
+    entry.get("username").and_then(|v| v.as_str()) == Some(expected_username)
+        && entry.get("password").and_then(|v| v.as_str()) == Some(expected_token)
+}
+
+/// The GHCR credential pair CAP would have embedded in a generated pull
+/// secret, when configured.
+fn ghcr_pull_secret_credentials() -> Option<(String, String)> {
+    Some((env_nonempty("GHCR_USERNAME")?, env_nonempty("GHCR_TOKEN")?))
 }
 
 /// Every image must match at least one configured scope — the deploy-time
@@ -510,7 +535,11 @@ async fn delete_stale_tenant_image_pull_secret(
         Err(kube::Error::Api(error)) if error.code == 404 => return Ok(()),
         Err(error) => return Err(DeployError::Apply(error.into())),
     };
-    if !is_managed_tenant_image_pull_secret(&existing) {
+    let ghcr_credentials = ghcr_pull_secret_credentials();
+    let ghcr_credentials = ghcr_credentials
+        .as_ref()
+        .map(|(username, token)| (username.as_str(), token.as_str()));
+    if !is_managed_tenant_image_pull_secret(&existing, ghcr_credentials) {
         tracing::warn!(
             namespace = %namespace,
             secret = %name,
@@ -532,16 +561,29 @@ async fn delete_stale_tenant_image_pull_secret(
 /// GHCR credentials) previously left the platform token in namespaces whose
 /// workloads fell out of scope until each app happened to redeploy. Sweep the
 /// known app namespaces at startup and remove the managed secret wherever the
-/// current scope does not apply. Best-effort: failures are logged and must not
-/// block startup — the per-deploy cleanup in
+/// current scope does not apply. Returns whether the sweep converged; on
+/// failure the caller must NOT start the deployment dispatcher (review
+/// finding): the dispatcher would re-apply workloads and re-attach secrets
+/// while the stale platform token is still exposed. The per-deploy cleanup in
 /// [`apply_all_with_tenant_image_pull_secret`] remains the hard gate.
-pub async fn cleanup_stale_tenant_image_pull_secrets_at_startup(pool: &PgPool) {
+pub async fn cleanup_stale_tenant_image_pull_secrets_at_startup(pool: &PgPool) -> bool {
     match cleanup_stale_tenant_image_pull_secrets(pool).await {
-        Ok(()) => {}
-        Err(error) => tracing::warn!(
-            %error,
-            "tenant image pull secret startup cleanup failed; stale secrets may remain until the next redeploy"
-        ),
+        Ok(true) => true,
+        Ok(false) => {
+            tracing::error!(
+                "tenant image pull secret startup cleanup did not converge: stale secrets remain \
+                 in the cluster and deployment dispatch must not start until a clean sweep converges"
+            );
+            false
+        }
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "tenant image pull secret startup cleanup failed; stale secrets remain and \
+                 deployment dispatch will not start until a clean sweep converges"
+            );
+            false
+        }
     }
 }
 
@@ -549,15 +591,18 @@ pub async fn cleanup_stale_tenant_image_pull_secrets_at_startup(pool: &PgPool) {
 type NamespacePullSecretInventory =
     std::collections::BTreeMap<String, (Vec<Option<Vec<ImageRef>>>, Vec<String>)>;
 
-async fn cleanup_stale_tenant_image_pull_secrets(pool: &PgPool) -> Result<(), DeployError> {
+async fn cleanup_stale_tenant_image_pull_secrets(pool: &PgPool) -> Result<bool, DeployError> {
     let secret_name = managed_tenant_image_pull_secret_name();
     let config = tenant_image_pull_secret_config_from_env();
 
-    let rows: Vec<(Uuid, String, String, String)> = sqlx::query_as(
-        "SELECT app_containers.app_id, apps.namespace, apps.service_account, \
+    // LEFT JOIN: an app with no container rows must still be inventoried
+    // (as an app with no images), or its namespace is invisible to the sweep
+    // and a stale secret can survive there (review finding).
+    let rows: Vec<(Uuid, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT apps.id, apps.namespace, apps.service_account, \
                 app_containers.image_ref \
            FROM apps \
-           JOIN app_containers ON app_containers.app_id = apps.id",
+           LEFT JOIN app_containers ON app_containers.app_id = apps.id",
     )
     .fetch_all(pool)
     .await?;
@@ -571,6 +616,11 @@ async fn cleanup_stale_tenant_image_pull_secrets(pool: &PgPool) -> Result<(), De
             .entry(app_id)
             .or_insert_with(|| (namespace.clone(), service_account.clone(), Some(Vec::new())));
         let Some(images) = entry.2.as_mut() else {
+            continue;
+        };
+        // NULL image_ref = the app has no container rows; it contributes no
+        // images and therefore never qualifies for the secret.
+        let Some(image_ref) = image_ref else {
             continue;
         };
         match ImageRef::parse(&image_ref) {
@@ -596,6 +646,10 @@ async fn cleanup_stale_tenant_image_pull_secrets(pool: &PgPool) -> Result<(), De
 
     let engine = ApplyEngine::try_default().await?;
     let mut removed = 0usize;
+    // A failed delete leaves the platform token exposed in the namespace —
+    // the sweep must report that as not-converged, not "sweep complete"
+    // (review finding): the caller disables deployment dispatch on it.
+    let mut converged = true;
     for (namespace, (app_images, service_accounts)) in &by_namespace {
         if namespace_keeps_tenant_image_pull_secret(config.as_ref(), app_images) {
             continue;
@@ -615,6 +669,7 @@ async fn cleanup_stale_tenant_image_pull_secrets(pool: &PgPool) -> Result<(), De
             )
             .await
             {
+                converged = false;
                 tracing::warn!(
                     %namespace,
                     service_account = %service_account,
@@ -626,18 +681,22 @@ async fn cleanup_stale_tenant_image_pull_secrets(pool: &PgPool) -> Result<(), De
         match delete_managed_pull_secret_unfenced(&engine, namespace, &secret_name).await {
             Ok(true) => removed += 1,
             Ok(false) => {}
-            Err(error) => tracing::warn!(
-                %namespace,
-                %error,
-                "tenant image pull secret cleanup sweep: failed to remove stale secret"
-            ),
+            Err(error) => {
+                converged = false;
+                tracing::warn!(
+                    %namespace,
+                    %error,
+                    "tenant image pull secret cleanup sweep: failed to remove stale secret"
+                );
+            }
         }
     }
     tracing::info!(
         removed,
+        converged,
         "tenant image pull secret startup cleanup sweep complete"
     );
-    Ok(())
+    Ok(converged)
 }
 
 /// Unfenced janitor delete of the managed pull secret: unlike
@@ -656,7 +715,11 @@ async fn delete_managed_pull_secret_unfenced(
         Err(kube::Error::Api(error)) if error.code == 404 => return Ok(false),
         Err(error) => return Err(DeployError::Apply(error.into())),
     };
-    if !is_managed_tenant_image_pull_secret(&existing) {
+    let ghcr_credentials = ghcr_pull_secret_credentials();
+    let ghcr_credentials = ghcr_credentials
+        .as_ref()
+        .map(|(username, token)| (username.as_str(), token.as_str()));
+    if !is_managed_tenant_image_pull_secret(&existing, ghcr_credentials) {
         tracing::warn!(
             namespace = %namespace,
             secret = %name,
@@ -1991,18 +2054,22 @@ mod tests {
     fn managed_tenant_image_pull_secret_detection_matches_label_and_legacy_shape() {
         use k8s_openapi::ByteString;
 
+        let matching = Some(("cap-bot", "x"));
         let mut labeled = generate_tenant_image_pull_secret(
             "tenant-ns",
             &pull_secret_config(vec![
                 parse_image_pull_repository_scope("ghcr.io/enclava-ai/templates/*").unwrap(),
             ]),
         );
-        // generate_tenant_image_pull_secret fills string_data (write-only);
-        // is_managed_tenant_image_pull_secret must also accept that shape.
-        assert!(is_managed_tenant_image_pull_secret(&labeled));
+        // The managed-by label is the ownership proof for generated secrets:
+        // detection passes on the label alone, without reading any data.
+        assert!(is_managed_tenant_image_pull_secret(&labeled, matching));
+        // Labeled secrets are proven ours by the label alone.
+        assert!(is_managed_tenant_image_pull_secret(&labeled, None));
 
         // Legacy pre-label secret: dockerconfigjson with exactly one ghcr.io
-        // auth entry, as the old global fallback generated it.
+        // auth entry carrying the configured GHCR pair, as the old global
+        // fallback generated it.
         let legacy_json =
             serde_json::json!({"auths": {"ghcr.io": {"username": "cap-bot", "password": "x"}}})
                 .to_string();
@@ -2018,12 +2085,19 @@ mod tests {
             ".dockerconfigjson".to_string(),
             ByteString(legacy_json.into_bytes()),
         )]));
-        assert!(is_managed_tenant_image_pull_secret(&legacy));
+        assert!(is_managed_tenant_image_pull_secret(&legacy, matching));
+        // An unlabeled secret with a tenant's own GHCR credentials under the
+        // managed name is NOT CAP-generated: never delete it (review finding).
+        assert!(!is_managed_tenant_image_pull_secret(
+            &legacy,
+            Some(("tenant-user", "tenant-token"))
+        ));
+        assert!(!is_managed_tenant_image_pull_secret(&legacy, None));
 
         // A tenant's own multi-registry secret is never CAP-managed.
         let tenant_json = serde_json::json!({
             "auths": {
-                "ghcr.io": {"username": "tenant"},
+                "ghcr.io": {"username": "cap-bot", "password": "x"},
                 "registry.example": {"username": "tenant"}
             }
         })
@@ -2033,7 +2107,7 @@ mod tests {
             ".dockerconfigjson".to_string(),
             ByteString(tenant_json.into_bytes()),
         )]));
-        assert!(!is_managed_tenant_image_pull_secret(&tenant));
+        assert!(!is_managed_tenant_image_pull_secret(&tenant, matching));
 
         // Wrong type / missing payload is never CAP-managed.
         let opaque = Secret {
@@ -2043,12 +2117,12 @@ mod tests {
             },
             ..Default::default()
         };
-        assert!(!is_managed_tenant_image_pull_secret(&opaque));
+        assert!(!is_managed_tenant_image_pull_secret(&opaque, matching));
 
         // A stray managed-by label on an unparseable secret is still ours.
         labeled.data = None;
         labeled.string_data = None;
-        assert!(is_managed_tenant_image_pull_secret(&labeled));
+        assert!(is_managed_tenant_image_pull_secret(&labeled, matching));
     }
 
     #[test]

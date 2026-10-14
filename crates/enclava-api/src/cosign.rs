@@ -132,20 +132,33 @@ pub fn cosign_registry_credentials_configured() -> bool {
     CosignRegistryCredentials::from_env().is_configured()
 }
 
+/// Canonical host form for exact-match allowlist comparison. `docker.io` and
+/// `index.docker.io` are the same registry — OCI clients rewrite the former to
+/// the latter at dial time (`resolve_registry`), so a `docker.io` allowlist
+/// entry must describe the endpoint that actually receives the credentials.
+fn canonical_registry_host(host: &str) -> &str {
+    if host == "docker.io" {
+        "index.docker.io"
+    } else {
+        host
+    }
+}
+
 /// Exact or leading-wildcard host match against an allowlist pattern.
 ///
 /// Patterns: `host[:port]` matches exactly (case-insensitive), `*.example.com`
 /// matches `example.com` and any dot-separated subdomain of it, and the bare
 /// pattern `*` is an explicit operator opt-in matching every host. A wildcard
 /// never matches across a partial label (`*.example.com` does not match
-/// `notexample.com`).
+/// `notexample.com`). The host must be the one the registry client actually
+/// dials (`resolve_registry`), not a re-parse of the image reference.
 fn host_matches_allowed_pattern(host: &str, pattern: &str) -> bool {
     if pattern == "*" {
         return true;
     }
     let host = host.to_ascii_lowercase();
     let pattern = pattern.to_ascii_lowercase();
-    if host == pattern {
+    if host == pattern || canonical_registry_host(&host) == canonical_registry_host(&pattern) {
         return true;
     }
     pattern.strip_prefix("*.").is_some_and(|base| {
@@ -522,7 +535,15 @@ pub async fn verify_image(
             CosignError::VerificationFailed(format!("failed to initialize sigstore client: {e}"))
         })?;
 
-    let auth = registry_auth_from_env(&registry);
+    // Gate the credentials on the host the client will actually dial
+    // (`resolve_registry` — the same value sigstore's OciReference uses to
+    // connect), never on `parse_image_parts`' host: the two parsers disagree
+    // on single-label three-component references (`registry/foo/bar` is
+    // Docker Hub `registry/foo/bar` to the OCI parser but host `registry` to
+    // the custom parser), and the allowlist must describe the dialed host or
+    // a tenant-chosen ref still routes the platform password somewhere the
+    // operator never allowlisted (review finding).
+    let auth = registry_auth_from_env(image.resolve_registry());
     let (_, source_image_digest) = cosign_client
         .triangulate(&image, &auth)
         .await
@@ -706,7 +727,15 @@ pub async fn fetch_portable_verification_material(
         "application/vnd.docker.distribution.manifest.list.v2+json",
     ];
 
-    let (registry, repository) = parse_image_parts(image_ref)?;
+    // Parse with the same OCI reference grammar the client dials with (not
+    // `parse_image_parts`): the two disagree on single-label three-component
+    // references, and this path must fetch — and authenticate to — exactly
+    // the host/repository `verify_image` verified (review finding).
+    let image: OciReference = image_ref
+        .parse()
+        .map_err(|e| CosignError::VerificationFailed(format!("invalid image reference: {e}")))?;
+    let registry = image.resolve_registry().to_string();
+    let repository = image.repository().to_string();
     let base_url = registry_base_url(&registry)
         .map_err(|e| CosignError::VerificationFailed(format!("unsupported registry: {e}")))?;
     let registry_url = reqwest::Url::parse(&base_url)
@@ -1429,6 +1458,63 @@ mod tests {
                     .to_string(),
             fulcio_issuer: "https://token.actions.githubusercontent.com".to_string(),
         }
+    }
+
+    /// The allowlist must describe the host the registry client actually
+    /// dials. `parse_image_parts` and the OCI reference parser disagree on
+    /// single-label three-component refs (`registry/foo/bar` is host
+    /// `registry` to the custom parser but Docker Hub's `index.docker.io` to
+    /// the OCI parser), and a custom-parser allowlist match must never leak
+    /// the platform password to the host the client really connects to
+    /// (review finding on #243).
+    #[test]
+    fn allowlist_gates_the_dialed_registry_host_not_the_custom_parser() {
+        let image: OciReference = "registry/foo/bar@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            .parse()
+            .unwrap();
+        assert_eq!(image.resolve_registry(), "index.docker.io");
+        let creds = CosignRegistryCredentials::basic("cap-bot", "platform-token");
+        let allowed = ["registry".to_string()];
+        // The custom parser's host matches the allowlist (the pre-fix
+        // behavior)...
+        assert!(matches!(
+            registry_auth_with_allowlist("registry", Some(&creds), &allowed),
+            Auth::Basic(..)
+        ));
+        // ...but the client dials the OCI-resolved host, which must NOT
+        // receive the platform credentials.
+        assert!(matches!(
+            registry_auth_with_allowlist(image.resolve_registry(), Some(&creds), &allowed),
+            Auth::Anonymous
+        ));
+    }
+
+    /// `docker.io` is rewritten to `index.docker.io` at dial time, so a
+    /// `docker.io` allowlist entry must describe that real endpoint instead
+    /// of never matching (or matching some other host).
+    #[test]
+    fn docker_io_allowlist_entry_matches_the_real_hub_endpoint() {
+        let creds = CosignRegistryCredentials::basic("cap-bot", "platform-token");
+        assert!(matches!(
+            registry_auth_with_allowlist(
+                "index.docker.io",
+                Some(&creds),
+                &["docker.io".to_string()]
+            ),
+            Auth::Basic(..)
+        ));
+        assert!(matches!(
+            registry_auth_with_allowlist(
+                "index.docker.io",
+                Some(&creds),
+                &["*.docker.io".to_string()]
+            ),
+            Auth::Basic(..)
+        ));
+        assert!(matches!(
+            registry_auth_with_allowlist("notdocker.io", Some(&creds), &["docker.io".to_string()]),
+            Auth::Anonymous
+        ));
     }
 
     /// Issue #225 hardening: allowlist entries outside the grammar can never
