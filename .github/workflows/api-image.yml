@@ -198,10 +198,12 @@ jobs:
         uses: imranismail/setup-kustomize@2ba527d4d055ab63514ba50a99456fc35684947f # v2
 
       - name: Render digest-pinned release artifact
+        env:
+          WORKFLOW_REF: ${{ github.workflow_ref }}
         run: |
           mkdir -p dist
           image_ref="ghcr.io/enclava-labs/enclava-api@${{ steps.build.outputs.digest }}"
-          signer_subject="https://github.com/${{ github.workflow_ref }}"
+          signer_subject="https://github.com/$WORKFLOW_REF"
           scripts/render-api-release-manifest.sh "$image_ref" dist/enclava-api-deploy.yaml
           printf '%s\n' "$image_ref" > dist/enclava-api-image.txt
           printf '%s\n' "$signer_subject" > dist/enclava-api-signer-identity.txt

@@ -70,7 +70,8 @@ for required in \
   "dist/enclava-api-image.txt" \
   "dist/enclava-api-migration.txt" \
   "dist/enclava-api-signer-identity.txt" \
-  'signer_subject="https://github.com/${{ github.workflow_ref }}"' \
+  'WORKFLOW_REF: ${{ github.workflow_ref }}' \
+  'signer_subject="https://github.com/$WORKFLOW_REF"' \
   "cosign sign --yes" \
   "scripts/verify-api-image-ref.sh --cosign dist/enclava-api-image.txt" \
   "name: enclava-api-release-manifest" \
