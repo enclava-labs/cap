@@ -1816,6 +1816,114 @@ mod tests {
         assert_eq!(outcome.app_status, "creating");
         assert!(!outcome.terminal);
     }
+
+    fn settled_statefulset(
+        generation: i64,
+        observed: i64,
+        desired: i32,
+        ready: i32,
+        current: i32,
+        updated: i32,
+    ) -> k8s_openapi::api::apps::v1::StatefulSet {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": {"name": "app", "namespace": "cap-app", "generation": generation},
+            "spec": {"replicas": desired},
+            "status": {
+                "observedGeneration": observed,
+                "readyReplicas": ready,
+                "currentReplicas": current,
+                "updatedReplicas": updated,
+            },
+        }))
+        .expect("statefulset settling fixture")
+    }
+
+    #[test]
+    fn statefulset_rollout_settled_matches_the_rollout_completion_criterion() {
+        // Fully converged: the controller has observed the current
+        // generation and every replica matches the latest spec.
+        assert!(statefulset_rollout_settled(&settled_statefulset(
+            3, 3, 1, 1, 1, 1
+        )));
+        // The controller has not observed the newest applied generation:
+        // a failed rollout's spec is still being reconciled and its
+        // controller can still replace the TEE.
+        assert!(!statefulset_rollout_settled(&settled_statefulset(
+            3, 2, 1, 1, 1, 1
+        )));
+        // The replacement is not up yet: the workload is mid-swap even
+        // though the controller caught up with the generation.
+        assert!(!statefulset_rollout_settled(&settled_statefulset(
+            3, 3, 1, 0, 1, 1
+        )));
+        assert!(!statefulset_rollout_settled(&settled_statefulset(
+            3, 3, 1, 1, 1, 0
+        )));
+        // A scaled-down workload has no TEE that could be replaced.
+        assert!(statefulset_rollout_settled(&settled_statefulset(
+            3, 3, 0, 0, 0, 0
+        )));
+    }
+
+    #[tokio::test]
+    async fn workload_rollout_settled_reads_the_live_generation() {
+        let converged = ApplyEngine::new(
+            rollout_client(true),
+            enclava_engine::apply::types::ApplyConfig::default(),
+        );
+        assert!(
+            workload_rollout_settled(&converged, "cap-queued-app", "queued-app")
+                .await
+                .expect("probe converged workload"),
+            "a converged workload leaves no rollout that could replace the TEE"
+        );
+
+        let converging = ApplyEngine::new(
+            rollout_client(false),
+            enclava_engine::apply::types::ApplyConfig::default(),
+        );
+        assert!(
+            !workload_rollout_settled(&converging, "cap-queued-app", "queued-app")
+                .await
+                .expect("probe converging workload"),
+            "a workload without ready replicas is still replacing the TEE"
+        );
+    }
+
+    #[tokio::test]
+    async fn workload_rollout_settled_treats_a_missing_workload_as_settled() {
+        use axum::http::{Request, Response};
+        use http_body_util::BodyExt;
+        use kube::client::Body;
+        use tower::service_fn;
+
+        let client = kube::Client::new(
+            service_fn(move |request: Request<Body>| async move {
+                let _ = request.into_body().collect().await;
+                let status = serde_json::json!({
+                    "apiVersion": "v1", "kind": "Status",
+                    "status": "Failure", "reason": "NotFound",
+                    "message": "absent", "code": 404,
+                });
+                Ok::<_, std::io::Error>(
+                    Response::builder()
+                        .status(404)
+                        .body(Body::from(serde_json::to_vec(&status).unwrap()))
+                        .unwrap(),
+                )
+            }),
+            "default",
+        );
+        let engine = ApplyEngine::new(client, enclava_engine::apply::types::ApplyConfig::default());
+        assert!(
+            workload_rollout_settled(&engine, "cap-absent-app", "absent-app")
+                .await
+                .expect("probe missing workload"),
+            "no workload exists that could replace a TEE"
+        );
+    }
 }
 
 pub async fn set_deployment_status(
@@ -1944,6 +2052,55 @@ async fn ensure_statefulset_exists(
         ))),
         Err(e) => Err(enclava_engine::apply::engine::ApplyError::Kube(e).into()),
     }
+}
+
+/// One-shot evidence that the app's live workload has settled in the
+/// cluster: the StatefulSet controller has fully converged on the current
+/// desired state, so no earlier rollout can still replace the TEE behind a
+/// customer-config write. SQL rows alone cannot prove this — a terminally
+/// failed deployment row says nothing about a controller that keeps
+/// converging toward its already-applied spec past any settling window — so
+/// the customer-config roll hold verifies the live generation before it is
+/// armed. The convergence criterion is the same one rollout observation
+/// uses to declare a rollout complete (see `watch_rollout`). A missing
+/// StatefulSet is settled: there is no workload that could replace a TEE.
+pub async fn workload_rollout_settled(
+    engine: &ApplyEngine,
+    namespace: &str,
+    workload_name: &str,
+) -> Result<bool, DeployError> {
+    use k8s_openapi::api::apps::v1::StatefulSet;
+    use kube::Api;
+
+    let api: Api<StatefulSet> = Api::namespaced(engine.client().clone(), namespace);
+    match api.get(workload_name).await {
+        Ok(sts) => Ok(statefulset_rollout_settled(&sts)),
+        Err(kube::Error::Api(ae)) if ae.code == 404 => Ok(true),
+        Err(e) => Err(enclava_engine::apply::engine::ApplyError::Kube(e).into()),
+    }
+}
+
+/// Whether a live StatefulSet is fully converged: the controller has
+/// observed the current generation and every replica matches the latest
+/// spec. Anything less means the cluster may still replace the workload's
+/// pod — including past any SQL settling window, because a controller never
+/// abandons an applied generation. A scaled-down workload (`desired == 0`)
+/// has no TEE that could be replaced.
+pub fn statefulset_rollout_settled(sts: &k8s_openapi::api::apps::v1::StatefulSet) -> bool {
+    let status = sts.status.as_ref();
+    let generation = sts.metadata.generation.unwrap_or(0);
+    let observed_generation = status.and_then(|s| s.observed_generation).unwrap_or(0);
+    let desired = sts.spec.as_ref().and_then(|s| s.replicas).unwrap_or(1);
+    let ready = status.and_then(|s| s.ready_replicas).unwrap_or(0);
+    let current = status.and_then(|s| s.current_replicas).unwrap_or(0);
+    let updated = status.and_then(|s| s.updated_replicas).unwrap_or(0);
+    if desired <= 0 {
+        return true;
+    }
+    observed_generation >= generation
+        && ready >= desired
+        && current >= desired
+        && updated >= desired
 }
 
 async fn restart_statefulset_for_ingress(

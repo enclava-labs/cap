@@ -1289,6 +1289,56 @@ async fn deploy_app_candidate(
         "setup_state": DEPLOYMENT_SETUP_DNS_PENDING,
     });
 
+    // A customer-config roll hold's safety contract is "write config into
+    // the live TEE before the roll", so the live workload must be settled
+    // before the hold is armed. SQL evidence alone cannot prove the cluster
+    // stopped acting on a failed rollout: a terminal row says nothing about
+    // a controller still converging toward its already-applied spec past
+    // the settling window, and a config write acknowledged into the old TEE
+    // cannot detect a replacement that lands afterwards. Probe the live
+    // StatefulSet generation (the same convergence criterion rollout
+    // observation uses) and refuse the hold while it is still converging.
+    // Probe failures fail closed like an in-flight rollout: the request is
+    // rejected with the retryable conflict instead of arming a hold that
+    // cannot be trusted.
+    let mut cluster_workload_settled = true;
+    if honor_customer_config_roll_hold
+        && body
+            .customer_config_roll_hold_seconds
+            .is_some_and(|seconds| seconds > 0)
+        && app_mutation != AppMutation::Insert
+        && app
+            .tee_domain
+            .as_deref()
+            .is_some_and(|domain| !domain.trim().is_empty())
+    {
+        match enclava_engine::apply::engine::ApplyEngine::try_default().await {
+            Ok(engine) => {
+                match crate::deploy::workload_rollout_settled(&engine, &app.namespace, &app.name)
+                    .await
+                {
+                    Ok(settled) => cluster_workload_settled = settled,
+                    Err(error) => {
+                        tracing::warn!(
+                            app_id = %app.id,
+                            error = %error,
+                            "could not verify live rollout settling; failing the roll hold closed"
+                        );
+                        cluster_workload_settled = false;
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    app_id = %app.id,
+                    error = %error,
+                    "no Kubernetes client for the rollout settling probe; failing the roll hold closed"
+                );
+                cluster_workload_settled = false;
+            }
+        }
+    }
+
     // No requested app/container state has been persisted before this point.
     // Commit every accepted deployment row and its app/container changes as a
     // single unit so any database error rolls the candidate back completely.
@@ -1588,11 +1638,15 @@ async fn deploy_app_candidate(
 
     // Capture in-flight evidence before supersession: supersede rewrites
     // those rows to `failed`, which would erase the signal this hold
-    // decision depends on.
-    let rollout_in_flight = (app_mutation != AppMutation::Insert)
-        && app_has_rollout_in_flight(&mut tx, app.id)
-            .await
-            .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+    // decision depends on. The live-cluster settling probe is folded in
+    // here: a converged StatefulSet generation is the only proof that no
+    // earlier rollout's controller is still replacing the TEE behind the
+    // held write, and an unverifiable probe fails closed the same way.
+    let rollout_in_flight = !cluster_workload_settled
+        || ((app_mutation != AppMutation::Insert)
+            && app_has_rollout_in_flight(&mut tx, app.id)
+                .await
+                .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?);
     // The requested seconds are the idempotency identity. The accepted
     // duration depends on the status read in this transaction, and apply
     // changes that status before a lost-response retry arrives.
