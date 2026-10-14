@@ -994,8 +994,10 @@ const CUSTOMER_CONFIG_ROLL_HOLD_MIN_SECONDS: u64 = 30;
 const CUSTOMER_CONFIG_ROLL_HOLD_MAX_SECONDS: u64 = 7_200;
 /// Work that happens after CAP arms the hold and before the release call:
 /// the PaaS config-token handoff (240s), untimed TEE attestation retries
-/// (121 attempts * 2s), and a release round trip. The two ssh-timeout waits
-/// cover managed-config delivery and the password-mode owner wait.
+/// (121 attempts * 2s), and a release round trip. Four ssh-timeout-sized
+/// waits can run serially inside the window: the bootstrap wait, the
+/// managed-config enqueue block, managed-config delivery, and the
+/// password-mode owner wait.
 const CUSTOMER_CONFIG_ROLL_HOLD_PREFIX_SECONDS: u64 = 240 + (121 * 2) + 60;
 
 /// The pre-request clock conservatively precedes CAP arming the hold, so a
@@ -1033,9 +1035,16 @@ fn hold_expiry_instant(
     if let Some(until) = hold_until
         && let Ok(expiry) = chrono::DateTime::parse_from_rfc3339(until)
     {
+        // Cross-version responses carry only the absolute expiry. Deriving
+        // authority by subtracting the client wall clock is unsafe under
+        // skew — a clock behind CAP's can extend the window past CAP's
+        // stored deadline — so the derived deadline is capped at the
+        // pre-request estimate, which never outlives the hold CAP armed
+        // for this request.
         let remaining = expiry.timestamp_millis() - chrono::Utc::now().timestamp_millis();
-        return Instant::now()
-            + Duration::from_millis(u64::try_from(remaining.max(0)).unwrap_or(0));
+        return (Instant::now()
+            + Duration::from_millis(u64::try_from(remaining.max(0)).unwrap_or(0)))
+        .min(hold_expiry(armed_at, hold_seconds));
     }
     hold_expiry(armed_at, hold_seconds)
 }
@@ -1158,8 +1167,13 @@ fn release_failure_message(
 }
 
 fn customer_config_roll_hold_seconds(ssh_timeout_seconds: u64) -> u32 {
+    // Every pre-release phase that gets its own `ssh_timeout_seconds`
+    // budget runs serially inside the hold: the bootstrap wait, the
+    // managed-config enqueue block, managed-config delivery, and the
+    // password-mode owner wait. Reserving fewer would let an in-budget
+    // sequence of slow phases exhaust CAP's deadline before the release.
     let budget = ssh_timeout_seconds
-        .saturating_mul(2)
+        .saturating_mul(4)
         .saturating_add(CUSTOMER_CONFIG_ROLL_HOLD_PREFIX_SECONDS)
         .clamp(
             CUSTOMER_CONFIG_ROLL_HOLD_MIN_SECONDS,
@@ -5286,8 +5300,11 @@ mod tests {
 
     #[test]
     fn customer_config_roll_hold_covers_both_wait_budgets() {
-        assert_eq!(customer_config_roll_hold_seconds(1_800), 4_142);
-        assert_eq!(customer_config_roll_hold_seconds(10), 562);
+        // Four serial ssh-timeout-sized phases can run inside the window:
+        // bootstrap wait, managed-config enqueue, managed-config delivery,
+        // and the password-mode owner wait.
+        assert_eq!(customer_config_roll_hold_seconds(1_800), 7_200);
+        assert_eq!(customer_config_roll_hold_seconds(10), 582);
         assert_eq!(customer_config_roll_hold_seconds(10_000), 7_200);
     }
 
@@ -5818,7 +5835,10 @@ mod tests {
         );
 
         // Without the integer field but with the absolute expiry, the
-        // wall-clock subtraction path still applies for older responses.
+        // wall-clock subtraction path still applies for older responses,
+        // but it can never grant more than the pre-request estimate: a
+        // client clock behind CAP's must not stretch the window past the
+        // deadline CAP armed for this request.
         let until = chrono::DateTime::parse_from_rfc3339("2099-01-01T00:00:00Z").unwrap();
         let expiry = hold_expiry_instant(
             None,
@@ -5827,17 +5847,23 @@ mod tests {
             armed_at,
             CUSTOMER_CONFIG_ROLL_HOLD_MAX_SECONDS as u32,
         );
-        let expected = Instant::now()
-            + Duration::from_secs(
-                u64::try_from(until.timestamp() - chrono::Utc::now().timestamp()).unwrap_or(0),
-            );
-        let skew = expiry
-            .checked_duration_since(expected)
-            .or_else(|| expected.checked_duration_since(expiry))
-            .unwrap_or_default();
         assert!(
-            skew < Duration::from_secs(2),
-            "the stored expiry fallback must drive the deadline, skew {skew:?}"
+            expiry <= armed_at + Duration::from_secs(CUSTOMER_CONFIG_ROLL_HOLD_MAX_SECONDS),
+            "a skewed wall-clock expiry must not exceed the pre-request estimate"
+        );
+        // A near absolute expiry inside the local estimate still drives
+        // the deadline directly.
+        let soon = chrono::Utc::now() + chrono::Duration::seconds(30);
+        let soon_expiry = hold_expiry_instant(
+            None,
+            Some(&soon.to_rfc3339()),
+            received_at,
+            armed_at,
+            CUSTOMER_CONFIG_ROLL_HOLD_MAX_SECONDS as u32,
+        );
+        assert!(
+            soon_expiry <= Instant::now() + Duration::from_secs(35),
+            "a non-skewed absolute expiry must drive the deadline"
         );
 
         // Without either field (older PaaS), the local estimate stands in.

@@ -609,6 +609,28 @@ async fn app_has_prior_healthy_deployment(
     .await
 }
 
+/// How long a *terminally failed* rollout still counts as in-flight
+/// evidence for the hold decision. A rollout that exhausted its
+/// observation budget has already applied its Kubernetes Deployment, and
+/// nothing in SQL cancels that apply — the cluster controller can still
+/// replace the old pod later. CAP cannot distinguish "controller gave up"
+/// from "controller still converging", so the failure is honored for one
+/// engine rollout budget (`ApplyConfig::rollout_timeout`, the same budget
+/// observation itself used) and then treated as settled: a permanent
+/// conflict would strand the app, because terminal rows never change and
+/// the hosted CLI always requests the hold. Past the window the residual
+/// race still fails closed — a config write into a swapped TEE fails, the
+/// CLI does not release, and the held deployment expires unrolled.
+fn terminal_rollout_settling_window() -> std::time::Duration {
+    enclava_engine::apply::types::ApplyConfig::default().rollout_timeout
+}
+
+/// SQL interval literal for the settling window, bound as text and cast by
+/// the query (`$2::interval`), matching the repo's other interval binds.
+fn terminal_rollout_settling_window_sql() -> String {
+    format!("{} seconds", terminal_rollout_settling_window().as_secs())
+}
+
 /// True while an earlier rollout is still in flight: supersession
 /// terminalizes the job and deployment rows in SQL but cannot cancel an
 /// apply already running against the cluster, so a `watching` (or
@@ -618,6 +640,12 @@ async fn app_has_prior_healthy_deployment(
 /// these statuses to `failed`. An unreleased customer-config hold is
 /// excluded: its roll is deliberately frozen and must not block the next
 /// deployment's own hold decision.
+///
+/// A rollout that *terminalized on failure* (timeout or engine error) is
+/// equally capable of replacing the TEE — its Kubernetes Deployment was
+/// already applied and the controller keeps converging toward it — so the
+/// most recent cluster-applied generation counts as in-flight for the
+/// settling window above.
 async fn app_has_rollout_in_flight(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     app_id: Uuid,
@@ -635,9 +663,29 @@ async fn app_has_rollout_in_flight(
                        AND job.customer_config_hold
                        AND job.customer_config_released_at IS NULL
                 )
+         )
+         OR EXISTS (
+             SELECT 1
+               FROM deployments AS failed_rollout
+              WHERE failed_rollout.app_id = $1
+                AND failed_rollout.status = 'failed'
+                AND failed_rollout.error_message = 'deployment_rollout_failed'
+                AND failed_rollout.completed_at
+                    > clock_timestamp() - $2::interval
+                -- Only the newest cluster-applied generation's controller
+                -- still acts; a later applied deployment superseded this
+                -- one's desired state.
+                AND NOT EXISTS (
+                    SELECT 1
+                      FROM deployments AS newer
+                     WHERE newer.app_id = $1
+                       AND newer.manifest_hash IS NOT NULL
+                       AND newer.created_at > failed_rollout.created_at
+                )
          )",
     )
     .bind(app_id)
+    .bind(terminal_rollout_settling_window_sql())
     .fetch_one(&mut **tx)
     .await
 }
@@ -2670,6 +2718,105 @@ mod tests {
         assert!(
             in_flight(&pool, app.id).await,
             "a released hold is rolling again and blocks a new hold"
+        );
+
+        // The released roll completes: the deployment reaches a terminal
+        // applied state and stops counting as in flight.
+        sqlx::query(
+            "UPDATE deployments
+                SET status = 'healthy',
+                    manifest_hash = 'released-roll',
+                    completed_at = clock_timestamp()
+              WHERE id = $1",
+        )
+        .bind(held)
+        .execute(&pool)
+        .await
+        .expect("complete the released roll");
+        assert!(
+            !in_flight(&pool, app.id).await,
+            "a completed released roll is no longer in flight"
+        );
+
+        // A rollout that terminalized on failure inside the settling
+        // window still counts: its Kubernetes Deployment was applied and
+        // the controller can keep replacing the TEE even though the SQL
+        // rows are terminal.
+        sqlx::query(
+            "INSERT INTO deployments (
+                 id, org_id, app_id, trigger, status, spec_snapshot,
+                 error_message, completed_at, manifest_hash
+             ) VALUES (
+                 $1, $2, $3, 'api', 'failed', '{}'::jsonb,
+                 'deployment_rollout_failed', clock_timestamp(), 'timed-out'
+             )",
+        )
+        .bind(Uuid::new_v4())
+        .bind(app.org_id)
+        .bind(app.id)
+        .execute(&pool)
+        .await
+        .expect("insert timed-out rollout deployment");
+        assert!(
+            in_flight(&pool, app.id).await,
+            "a recently timed-out rollout may still replace the TEE"
+        );
+
+        // Past the settling window the failure is treated as settled.
+        // The window literal is interpolated from the Rust helper (a
+        // constant derived from ApplyConfig::default()) rather than bound,
+        // because the test needs it inside an interval arithmetic fold.
+        sqlx::query(&format!(
+            "UPDATE deployments
+                SET completed_at = clock_timestamp()
+                    - ('{}'::interval + interval '1 second')
+              WHERE app_id = $1 AND error_message = 'deployment_rollout_failed'",
+            terminal_rollout_settling_window_sql(),
+        ))
+        .bind(app.id)
+        .execute(&pool)
+        .await
+        .expect("age out the timed-out rollout");
+        assert!(
+            !in_flight(&pool, app.id).await,
+            "an aged-out timed-out rollout no longer blocks holds"
+        );
+
+        // The same fresh failure stops counting once a later deployment
+        // applied a newer generation: only the newest applied generation's
+        // controller still acts, so the timed-out one is superseded.
+        sqlx::query(
+            "UPDATE deployments
+                SET completed_at = clock_timestamp()
+              WHERE app_id = $1 AND error_message = 'deployment_rollout_failed'",
+        )
+        .bind(app.id)
+        .execute(&pool)
+        .await
+        .expect("refresh the timed-out rollout");
+        assert!(
+            in_flight(&pool, app.id).await,
+            "a fresh timed-out rollout counts again before supersession"
+        );
+        sqlx::query(
+            "INSERT INTO deployments (
+                 id, org_id, app_id, trigger, status, spec_snapshot,
+                 error_message, completed_at, manifest_hash, created_at
+             ) VALUES (
+                 $1, $2, $3, 'api', 'healthy', '{}'::jsonb,
+                 NULL, clock_timestamp(), 'superseding',
+                 clock_timestamp() + interval '1 second'
+             )",
+        )
+        .bind(Uuid::new_v4())
+        .bind(app.org_id)
+        .bind(app.id)
+        .execute(&pool)
+        .await
+        .expect("insert newer applied generation");
+        assert!(
+            !in_flight(&pool, app.id).await,
+            "a superseded timed-out generation no longer blocks holds"
         );
 
         delete_setup_test_org(&pool, app.org_id).await;

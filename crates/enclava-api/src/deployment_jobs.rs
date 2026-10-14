@@ -114,6 +114,75 @@ pub async fn customer_config_open_hold(
     })
 }
 
+/// Durable state of a deployment's customer-config hold, reloaded when an
+/// idempotent create replay must decide whether the cached response still
+/// describes a live handshake. Distinguishes *how* an ended hold ended: a
+/// released hold rolled normally, while an unreleased terminal hold
+/// expired or was superseded and its deployment never rolled.
+#[derive(Debug, Clone, Copy)]
+pub enum CustomerConfigHoldReplay {
+    /// The handshake is still open; carry the stored expiry and a fresh
+    /// database-clock remainder.
+    Open(CustomerConfigOpenHold),
+    /// The hold was released: the roll resumed and the deployment proceeds
+    /// normally. A replay must not keep reporting a live window.
+    Released,
+    /// The hold ended without a release — it expired or was superseded.
+    /// The deployment is terminal and its roll never happened, so a replay
+    /// must fail closed instead of describing an ordinary unheld deploy.
+    EndedUnreleased,
+    /// No held apply job exists for this deployment.
+    NotHeld,
+}
+
+/// Row shape of the hold-replay lookup: stored deadline, database-clock
+/// remainder, released flag, and job state.
+type CustomerConfigHoldReplayRow = (
+    Option<chrono::DateTime<chrono::Utc>>,
+    Option<f64>,
+    bool,
+    String,
+);
+
+/// Reload a deployment's hold for an idempotent response replay. A release
+/// is checked before the job state because a released job stays
+/// `setup_pending` until its setup is claimed; an unreleased job outside
+/// `setup_pending` can only have ended terminally.
+pub async fn customer_config_hold_replay_state(
+    pool: &PgPool,
+    deployment_id: Uuid,
+) -> Result<CustomerConfigHoldReplay, sqlx::Error> {
+    let row: Option<CustomerConfigHoldReplayRow> = sqlx::query_as(
+        "SELECT customer_config_hold_until,
+                CASE WHEN customer_config_hold_until IS NULL THEN NULL
+                     ELSE FLOOR(EXTRACT(EPOCH FROM (customer_config_hold_until
+                          - clock_timestamp())) * 1000)::float8
+                END,
+                customer_config_released_at IS NOT NULL,
+                state
+           FROM deployment_apply_jobs
+          WHERE deployment_id = $1
+            AND customer_config_hold",
+    )
+    .bind(deployment_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(match row {
+        None => CustomerConfigHoldReplay::NotHeld,
+        Some((_, _, true, _)) => CustomerConfigHoldReplay::Released,
+        Some((until, remaining, false, state)) => {
+            if state == "setup_pending" {
+                CustomerConfigHoldReplay::Open(CustomerConfigOpenHold {
+                    until: until.unwrap_or_else(chrono::Utc::now),
+                    remaining_ms: remaining.unwrap_or(0.0) as i64,
+                })
+            } else {
+                CustomerConfigHoldReplay::EndedUnreleased
+            }
+        }
+    })
+}
+
 /// Clamp a caller-requested hold. `None` and zero mean the roll starts
 /// immediately. Values outside the window are clamped, not rejected, so a
 /// CLI and CAP release can disagree on the exact budget without failing
