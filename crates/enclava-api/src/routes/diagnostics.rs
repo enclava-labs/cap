@@ -44,11 +44,16 @@
 //!   durable but cleanup may still be running, so the condition is NOT
 //!   terminal while a cleanup job is scheduled or held.
 //! - The deployment's own mutation-lease kinds (`deployment`,
-//!   `deployment_apply`, `deployment_setup`, `deployment_cleanup`) are
-//!   this deployment's lane, not a foreign blocker. Foreign kinds
-//!   (`app_delete`, `app_desired_state`, `custom_domain_*`,
-//!   `app_create_dns`) and a poisoned/armed `kubernetes_namespace`
-//!   resource fence DO block: a redeploy would 409 on them.
+//!   `deployment_setup`, `deployment_cleanup`) and its own namespace
+//!   fence (`deployment_apply` with this deployment's operation ID) are
+//!   this deployment's lane while its job worker lock is live: never a
+//!   foreign blocker. Once that worker lock expires the abandoned lease
+//!   still gates `mutation_leases::claim` until `reclaim_after` (the
+//!   claim predicate has no same-operation special case), so it becomes
+//!   a visible recovery blocker. Foreign kinds (`app_delete`,
+//!   `app_desired_state`, `custom_domain_*`, `app_create_dns`) and a
+//!   poisoned/armed `kubernetes_namespace` resource fence DO block: a
+//!   redeploy would 409 on them.
 
 use axum::Json;
 use axum::extract::State;
@@ -169,7 +174,6 @@ struct DiagnosticsRow {
     deployment_error_message: Option<String>,
     job_state: Option<String>,
     job_updated_at: Option<DateTime<Utc>>,
-    job_payload_version: Option<i32>,
     next_attempt_at: Option<DateTime<Utc>>,
     attempts: Option<i32>,
     job_locked_until: Option<DateTime<Utc>>,
@@ -184,6 +188,7 @@ struct DiagnosticsRow {
     /// NULLed in SQL: a poisoned fence carries no automatic release time.
     fence_reclaim_after: Option<DateTime<Utc>>,
     fence_operation_kind: Option<String>,
+    fence_operation_id: Option<Uuid>,
     app_deleting: bool,
 }
 
@@ -212,11 +217,6 @@ const OWN_OPERATION_KINDS: &[&str] = &[
     "deployment_setup",
     "deployment_cleanup",
 ];
-
-/// Supported job payload version range. Jobs with versions outside this range
-/// cannot be claimed by this API instance during a rolling upgrade.
-const MIN_SUPPORTED_JOB_PAYLOAD_VERSION: i32 = 1;
-const MAX_SUPPORTED_JOB_PAYLOAD_VERSION: i32 = 1;
 
 fn public_operation_kind(kind: Option<&str>) -> Option<&'static str> {
     match kind {
@@ -263,7 +263,6 @@ pub(crate) async fn deployment_diagnostics(
                 deployment.error_message AS deployment_error_message,
                 job.state AS job_state,
                 job.updated_at AS job_updated_at,
-                job.payload_version,
                 job.next_attempt_at,
                 job.attempts,
                 job.locked_until AS job_locked_until,
@@ -276,12 +275,22 @@ pub(crate) async fn deployment_diagnostics(
                 fence.locked_until AS fence_locked_until,
                 fence.reclaim_after AS fence_reclaim_after,
                 fence.operation_kind AS fence_operation_kind,
+                fence.fence_operation_id,
                 app_row.status = 'deleting'::app_status_enum AS app_deleting
            FROM apps AS app_row
            LEFT JOIN LATERAL (
-               SELECT * FROM deployments
-                WHERE app_id = app_row.id
-                ORDER BY created_at DESC, id DESC
+               SELECT dep.id, dep.status::text AS status, dep.spec_snapshot, dep.created_at,
+                      dep.completed_at, dep.observing_since, dep.error_message
+                 FROM deployments AS dep
+                 JOIN LATERAL (
+                     SELECT deployment_id
+                       FROM deployment_apply_jobs
+                      WHERE app_id = app_row.id
+                      ORDER BY generation DESC
+                      LIMIT 1
+                 ) AS latest_job ON true
+                WHERE dep.app_id = app_row.id
+                  AND dep.id = latest_job.deployment_id
                 LIMIT 1
            ) AS deployment ON true
            LEFT JOIN deployment_apply_jobs AS job
@@ -298,12 +307,16 @@ pub(crate) async fn deployment_diagnostics(
                SELECT locked_until,
                       NULLIF(reclaim_after, 'infinity'::timestamptz)
                           AS reclaim_after,
-                      operation_kind
+                      operation_kind,
+                      operation_id AS fence_operation_id
                  FROM external_resource_mutation_leases
                 WHERE resource_scope = 'kubernetes_namespace'
                   AND resource_key = app_row.namespace
                   AND owner_token IS NOT NULL
-                  AND reclaim_after > clock_timestamp()
+                  AND (
+                      reclaim_after = 'infinity'::timestamptz
+                      OR reclaim_after > clock_timestamp()
+                  )
                 LIMIT 1
            ) AS fence ON true
           WHERE app_row.id = $1",
@@ -349,40 +362,83 @@ fn unknown_diagnostics() -> DeploymentDiagnostics {
 }
 
 /// Which foreign holder (if any) blocks the app mutation lane for this
-/// deployment, and until when. Own-lane lease kinds never block. A held
-/// namespace fence always blocks — a redeploy would 409 on it regardless
-/// of which operation armed it — including poisoned fences that carry no
-/// automatic release time.
+/// deployment, and until when. Own-lane leases never block while their
+/// job worker lock is live. A held namespace fence blocks unless it is
+/// this deployment's own apply fence under a live worker — including
+/// poisoned fences, which carry no automatic release time and thus
+/// promise no admission deadline at all.
 struct ForeignBlock {
     operation: Option<&'static str>,
     until: Option<DateTime<Utc>>,
 }
 
 fn foreign_block(row: &DiagnosticsRow, now: DateTime<Utc>) -> ForeignBlock {
-    if !is_own_operation(
+    let worker_live = job_worker_lock_live(row, now);
+    let lease_blocks = (!is_own_operation(
         row.lease_operation_kind.as_deref(),
         row.lease_operation_id,
         row.deployment_id,
-    ) {
-        let deadline =
-            lease_admission_deadline(row.lease_locked_until, row.lease_reclaim_after, now);
-        if deadline.is_some() {
-            return ForeignBlock {
-                operation: public_operation_kind(row.lease_operation_kind.as_deref()),
-                until: deadline,
-            };
-        }
-    }
-    if row.fence_operation_kind.is_some() {
-        return ForeignBlock {
-            operation: public_operation_kind(row.fence_operation_kind.as_deref()),
-            until: lease_admission_deadline(row.fence_locked_until, row.fence_reclaim_after, now),
-        };
-    }
-    ForeignBlock {
+    ) || !worker_live)
+        && lease_admission_deadline(row.lease_locked_until, row.lease_reclaim_after, now).is_some();
+
+    // A poisoned fence never admits: when it is visible alongside a
+    // finite lease deadline it dominates the combined wait, because the
+    // lane only opens once EVERY holder clears and this one never does.
+    // A finite fence visible with a finite lease similarly means the
+    // lane opens only at the LATER of the two deadlines. Compute both,
+    // then pick the dominating blocker.
+    let mut block = ForeignBlock {
         operation: None,
         until: None,
+    };
+    if lease_blocks {
+        block.operation = public_operation_kind(row.lease_operation_kind.as_deref());
+        block.until =
+            lease_admission_deadline(row.lease_locked_until, row.lease_reclaim_after, now);
     }
+    if row.fence_operation_kind.is_some() {
+        // The apply worker holds this deployment's own namespace fence
+        // while it works: only report it once the worker lock has expired
+        // (the fence then gates a replacement worker's claim until
+        // `reclaim_after`). Foreign fences always report. A poisoned
+        // fence (reclaim_after = infinity, NULLed here) reports no
+        // deadline regardless of a live renewable lock: the claim
+        // predicate can never reclaim it at the displayed time.
+        let own_fence = worker_live
+            && is_own_operation(
+                row.fence_operation_kind.as_deref(),
+                row.fence_operation_id,
+                row.deployment_id,
+            );
+        let poisoned = row.fence_reclaim_after.is_none();
+        if !own_fence {
+            let fence_deadline = if poisoned {
+                None
+            } else {
+                lease_admission_deadline(row.fence_locked_until, row.fence_reclaim_after, now)
+            };
+            // A poisoned fence dominates any finite lease deadline; a
+            // finite fence dominates while its deadline is the later one.
+            let dominates = poisoned
+                || block
+                    .until
+                    .is_none_or(|lease_until| fence_deadline.is_some_and(|f| f > lease_until));
+            if dominates {
+                block = ForeignBlock {
+                    operation: public_operation_kind(row.fence_operation_kind.as_deref()),
+                    until: fence_deadline,
+                };
+            }
+        }
+    }
+    block
+}
+
+/// Whether this deployment's apply-job worker still holds its job lock:
+/// the durable signal that the worker owning the app mutation lease and
+/// the namespace fence is alive and renewing.
+fn job_worker_lock_live(row: &DiagnosticsRow, now: DateTime<Utc>) -> bool {
+    row.job_lock_token.is_some() && row.job_locked_until.is_some_and(|until| until > now)
 }
 
 fn project_diagnostics(row: Option<DiagnosticsRow>) -> DeploymentDiagnostics {
@@ -408,21 +464,51 @@ fn project_diagnostics(row: Option<DiagnosticsRow>) -> DeploymentDiagnostics {
             .map(str::to_string),
         ..unknown_diagnostics()
     };
-
     // An app being destroyed owns the lifecycle; the deployment underneath
     // is being torn down, not advanced. This is NOT terminal: teardown is
-    // an in-progress platform operation the owner must wait out.
+    // an in-progress platform operation. The live `app_delete` lease is
+    // the deletion's own machinery, never a foreign blocker to print.
+    // Deletion has no durable background job: `delete_app_before` only
+    // resumes when the client issues another DELETE. Once the delete
+    // lease has fully lapsed (past its reclaim quarantine — another
+    // delete request can claim the lane again), a still-`deleting` app
+    // is abandoned mid-teardown: tell the owner to retry the DELETE
+    // rather than wait forever.
     if row.app_deleting {
-        let condition = if row.lease_locked_until.is_some_and(|until| until > now) {
-            DeploymentCondition::Progressing
+        let delete_lease_live = row.lease_locked_until.is_some_and(|until| until > now)
+            || row.lease_reclaim_after.is_some_and(|after| after > now);
+        let condition = if delete_lease_live {
+            if row.lease_locked_until.is_some_and(|until| until > now) {
+                DeploymentCondition::Progressing
+            } else {
+                DeploymentCondition::WaitingExternal
+            }
         } else {
+            DeploymentCondition::BlockedByOperation
+        };
+        // Even when the delete lease has fully lapsed, a live or poisoned
+        // namespace fence from the interrupted teardown still rejects the
+        // retry DELETE: classify waiting rather than "retry now" while it
+        // holds. A poisoned fence (never auto-reclaims) keeps the owner
+        // waiting exactly like the API's own 409 semantics.
+        let fence_holds = row.fence_operation_kind.is_some()
+            && !is_own_operation(
+                row.fence_operation_kind.as_deref(),
+                row.fence_operation_id,
+                row.deployment_id,
+            );
+        let condition = if fence_holds && condition == DeploymentCondition::BlockedByOperation {
             DeploymentCondition::WaitingExternal
+        } else {
+            condition
         };
         return DeploymentDiagnostics {
             phase: DeploymentPhase::Destroying,
             condition,
             reason: Some(DeploymentReason::AppDeleting),
             next_retry_at: None,
+            blocked_until: None,
+            blocking_operation: None,
             ..base
         };
     }
@@ -438,8 +524,7 @@ fn project_diagnostics(row: Option<DiagnosticsRow>) -> DeploymentDiagnostics {
 
     let phase = classify_phase(deployment_status, row.job_state.as_deref());
     let reason = classify_reason(deployment_status, row.job_state.as_deref(), &row);
-    let (condition, next_retry_at) =
-        classify_condition_and_retry(phase, &row, foreign_blocked, now);
+    let (condition, next_retry_at) = classify_condition_and_retry(phase, &row, &blocked, now);
     let reason = match condition {
         DeploymentCondition::BlockedByOperation => {
             Some(DeploymentReason::MutationLeaseHeldByOperation)
@@ -447,11 +532,29 @@ fn project_diagnostics(row: Option<DiagnosticsRow>) -> DeploymentDiagnostics {
         _ => reason,
     };
 
+    // Blocker metadata is only meaningful when the condition actually
+    // says blocked_by_operation. A terminal deployment (healthy, or
+    // failed without cleanup work) cannot be blocked by a concurrent
+    // mutation: a 409 on the lane cannot undo the durable outcome, and
+    // printing a red Blocked:/Holder: section under a completed
+    // deployment misleads the owner. Non-terminal cleanup work keeps
+    // the blocker fields via its own (non-terminal) condition.
+    let show_blocker = condition == DeploymentCondition::BlockedByOperation;
     DeploymentDiagnostics {
         phase,
         condition,
         reason,
         next_retry_at,
+        blocked_until: if show_blocker {
+            base.blocked_until
+        } else {
+            None
+        },
+        blocking_operation: if show_blocker {
+            base.blocking_operation.clone()
+        } else {
+            None
+        },
         ..base
     }
 }
@@ -534,17 +637,26 @@ fn classify_reason(
 ///
 /// Precedence, per the durable state machine:
 /// 1. A live worker lease is durable progress evidence, always.
-/// 2. A foreign lease or an armed namespace fence blocks the lane — even
-///    when a retry is scheduled, because the admission deadline outlives
-///    it and any immediate claim would 409.
+/// 2. A foreign lease or an armed namespace fence blocks the lane when a
+///    claim would still 409 at the scheduled attempt time — i.e. unless
+///    the blocker's finite admission deadline expires before
+///    `next_attempt_at`. A poisoned fence (no automatic release time)
+///    always wins.
 /// 3. A future `next_attempt_at` is deliberate dispatch pacing.
 /// 4. Otherwise the job is claimable (due now, or a running state with an
 ///    expired lock): the dispatcher picks it up as soon as an apply slot
 ///    frees, which is normal queueing — progressing, never stalled.
+///
+/// Job payload versions outside this replica's supported range are NOT
+/// stalled: during a rolling upgrade an older replica can serve
+/// diagnostics for a newer-payload job that a newer replica claims
+/// moments later, and a replica-local verdict would flip the answer
+/// depending on which instance answered. Those jobs classify through the
+/// same schedule rules above.
 fn classify_condition_and_retry(
     phase: DeploymentPhase,
     row: &DiagnosticsRow,
-    foreign_blocked: bool,
+    blocked: &ForeignBlock,
     now: DateTime<Utc>,
 ) -> (DeploymentCondition, Option<DateTime<Utc>>) {
     match phase {
@@ -557,7 +669,7 @@ fn classify_condition_and_retry(
                 row.job_state.as_deref(),
                 Some("cleanup_pending" | "cleaning_up")
             ) {
-                worker_or_schedule_condition(row, foreign_blocked, now)
+                worker_or_schedule_condition(row, blocked, now)
             } else {
                 (DeploymentCondition::Terminal, None)
             }
@@ -572,7 +684,7 @@ fn classify_condition_and_retry(
                 // schema invariant: nothing can advance it.
                 return (DeploymentCondition::Stalled, None);
             }
-            worker_or_schedule_condition(row, foreign_blocked, now)
+            worker_or_schedule_condition(row, blocked, now)
         }
         // Destroying/Cancelled compute their condition at the short-circuit
         // in project_diagnostics; unreachable here.
@@ -584,25 +696,30 @@ fn classify_condition_and_retry(
 
 fn worker_or_schedule_condition(
     row: &DiagnosticsRow,
-    foreign_blocked: bool,
+    blocked: &ForeignBlock,
     now: DateTime<Utc>,
 ) -> (DeploymentCondition, Option<DateTime<Utc>>) {
-    let worker_live =
-        row.job_lock_token.is_some() && row.job_locked_until.is_some_and(|until| until > now);
-    if worker_live {
+    if job_worker_lock_live(row, now) {
         // A worker holds the job: lease renewals are durable progress
         // evidence even when the phase looks static.
         return (DeploymentCondition::Progressing, None);
-    } else if foreign_blocked {
-        return (DeploymentCondition::BlockedByOperation, None);
-    } else if let Some(version) = row.job_payload_version {
-        // Check if the job version is supported by this API instance.
-        // During rolling upgrades, an older API may serve diagnostics for jobs
-        // created by a newer API version. The dispatcher cannot claim it.
-        if !(MIN_SUPPORTED_JOB_PAYLOAD_VERSION..=MAX_SUPPORTED_JOB_PAYLOAD_VERSION)
-            .contains(&version)
-        {
-            return (DeploymentCondition::Stalled, None);
+    }
+    if blocked.operation.is_some() {
+        // A poisoned fence carries no automatic release time: no retry
+        // schedule can outlive it, so it always wins the condition.
+        let Some(blocker_until) = blocked.until else {
+            return (DeploymentCondition::BlockedByOperation, None);
+        };
+        // A finite foreign blocker wins only while it still gates the
+        // scheduled attempt. Once the lease (and its reclaim quarantine)
+        // expires before `next_attempt_at`, the dispatcher's attempt
+        // would be admitted: the actual reason for waiting is the retry
+        // schedule, so fall through and report that instead.
+        let attempt_after_blocker = row
+            .next_attempt_at
+            .is_some_and(|attempt_at| attempt_at > blocker_until);
+        if !attempt_after_blocker {
+            return (DeploymentCondition::BlockedByOperation, None);
         }
     }
 
@@ -618,16 +735,16 @@ fn worker_or_schedule_condition(
     if is_claimed_state {
         // Lock expired but job still in claimed state: ready for immediate
         // recovery by any worker. Normal progress, not waiting.
-        return (DeploymentCondition::Progressing, None);
+        (DeploymentCondition::Progressing, None)
     } else if let Some(attempt_at) = row.next_attempt_at.filter(|a| a > &now) {
         // Dispatch scheduled but not yet due. For a `watching`
         // deployment this is the steady state between observation
         // slices — deliberate pacing, not a fault.
-        return (DeploymentCondition::WaitingExternal, Some(attempt_at));
+        (DeploymentCondition::WaitingExternal, Some(attempt_at))
     } else {
         // Claimable now (due retry): waits only for a free apply slot. Normal
         // dispatcher queueing, not a stall.
-        return (DeploymentCondition::Progressing, None);
+        (DeploymentCondition::Progressing, None)
     }
 }
 
@@ -705,9 +822,11 @@ mod tests {
             lease_locked_until: None,
             lease_reclaim_after: None,
             lease_operation_kind: None,
+            lease_operation_id: None,
             fence_locked_until: None,
             fence_reclaim_after: None,
             fence_operation_kind: None,
+            fence_operation_id: None,
             app_deleting: false,
         }
     }
@@ -865,26 +984,55 @@ mod tests {
     fn deleting_app_is_destroying_not_terminal() {
         // Delete holds the app_delete lease across external teardown;
         // teardown is an in-progress operation the owner waits out, not a
-        // finished lifecycle.
+        // finished lifecycle. The delete lease is the deletion's own
+        // machinery: it must never render as a foreign Blocked:/Holder:
+        // section while teardown progresses.
         let mut input = row("applying", Some("running"), None);
         input.app_deleting = true;
         input.lease_locked_until = Some(Utc::now() + chrono::Duration::minutes(2));
+        input.lease_reclaim_after = Some(Utc::now() + chrono::Duration::minutes(5));
         input.lease_operation_kind = Some("app_delete".to_string());
         let diagnostics = project_diagnostics(Some(input));
         assert_eq!(diagnostics.phase, DeploymentPhase::Destroying);
         assert_eq!(diagnostics.condition, DeploymentCondition::Progressing);
         assert_eq!(diagnostics.reason, Some(DeploymentReason::AppDeleting));
+        assert!(diagnostics.blocking_operation.is_none());
+        assert!(diagnostics.blocked_until.is_none());
     }
 
     #[test]
-    fn deleting_app_with_lapsed_lease_still_waits() {
+    fn deleting_app_in_reclaim_quarantine_still_waits() {
+        // Lock lapsed but the reclaim quarantine still holds the lane:
+        // a retry DELETE would 409, so the owner waits.
         let mut input = row("applying", Some("running"), None);
         input.app_deleting = true;
         input.lease_locked_until = Some(Utc::now() - chrono::Duration::seconds(5));
+        input.lease_reclaim_after = Some(Utc::now() + chrono::Duration::minutes(2));
         input.lease_operation_kind = Some("app_delete".to_string());
         let diagnostics = project_diagnostics(Some(input));
         assert_eq!(diagnostics.phase, DeploymentPhase::Destroying);
         assert_eq!(diagnostics.condition, DeploymentCondition::WaitingExternal);
+        assert!(diagnostics.blocking_operation.is_none());
+    }
+
+    #[test]
+    fn deleting_app_with_fully_lapsed_lease_requires_retry() {
+        // Deletion has no durable background job: once the delete lease
+        // (and its quarantine) has fully lapsed, a still-`deleting` app
+        // is abandoned mid-teardown and only a client DELETE resumes it.
+        // Report it as needing action, not as automatically advancing.
+        let mut input = row("applying", Some("running"), None);
+        input.app_deleting = true;
+        input.lease_locked_until = Some(Utc::now() - chrono::Duration::minutes(5));
+        input.lease_reclaim_after = Some(Utc::now() - chrono::Duration::minutes(2));
+        input.lease_operation_kind = Some("app_delete".to_string());
+        let diagnostics = project_diagnostics(Some(input));
+        assert_eq!(diagnostics.phase, DeploymentPhase::Destroying);
+        assert_eq!(
+            diagnostics.condition,
+            DeploymentCondition::BlockedByOperation
+        );
+        assert_eq!(diagnostics.reason, Some(DeploymentReason::AppDeleting));
     }
 
     #[test]
@@ -976,10 +1124,57 @@ mod tests {
     }
 
     #[test]
-    fn own_lane_lease_never_blocks_or_populates_holder() {
-        // The deployment's own worker holds deployment_apply while it
-        // works: a healthy apply must not look blocked by itself, even
-        // after its job lock lapses (claimable => progressing).
+    fn own_lane_lease_under_live_worker_never_blocks() {
+        // The deployment's own worker holds deployment_apply (matching
+        // operation id) while it works: never blocked by itself.
+        let mut input = row("applying", Some("running"), None);
+        input.next_attempt_at = None;
+        input.lease_locked_until = Some(Utc::now() + chrono::Duration::minutes(2));
+        input.lease_reclaim_after = Some(Utc::now() + chrono::Duration::minutes(5));
+        input.lease_operation_kind = Some("deployment_apply".to_string());
+        input.lease_operation_id = input.deployment_id;
+        let diagnostics = project_diagnostics(Some(input));
+        assert_eq!(diagnostics.condition, DeploymentCondition::Progressing);
+        assert_eq!(diagnostics.reason, None);
+        assert!(diagnostics.blocking_operation.is_none());
+        assert!(diagnostics.blocked_until.is_none());
+    }
+
+    #[test]
+    fn abandoned_own_lane_lease_is_a_recovery_blocker() {
+        // The worker died after acquiring the mutation lease: the lease
+        // still carries this deployment's operation id, but the claim
+        // predicate rejects a replacement worker until reclaim_after.
+        // Diagnostics must surface that gate instead of "progressing".
+        let mut input = row("applying", Some("running"), None);
+        input.job_lock_token = None;
+        input.job_locked_until = None;
+        input.next_attempt_at = None;
+        input.lease_locked_until = Some(Utc::now() - chrono::Duration::seconds(30));
+        input.lease_reclaim_after = Some(Utc::now() + chrono::Duration::minutes(5));
+        input.lease_operation_kind = Some("deployment_apply".to_string());
+        input.lease_operation_id = input.deployment_id;
+        let diagnostics = project_diagnostics(Some(input));
+        assert_eq!(
+            diagnostics.condition,
+            DeploymentCondition::BlockedByOperation
+        );
+        assert_eq!(
+            diagnostics.reason,
+            Some(DeploymentReason::MutationLeaseHeldByOperation)
+        );
+        assert_eq!(
+            diagnostics.blocking_operation.as_deref(),
+            Some("deployment_apply")
+        );
+        assert!(diagnostics.blocked_until.is_some());
+    }
+
+    #[test]
+    fn stale_own_kind_lease_from_older_deployment_blocks() {
+        // A superseded deployment's expired lease can carry the same kind
+        // with a foreign operation id: kind-only matching would hide a
+        // real lane holder from the newer deployment.
         let mut input = row("applying", Some("pending"), None);
         input.job_lock_token = None;
         input.job_locked_until = None;
@@ -987,11 +1182,13 @@ mod tests {
         input.lease_locked_until = Some(Utc::now() + chrono::Duration::minutes(2));
         input.lease_reclaim_after = Some(Utc::now() + chrono::Duration::minutes(5));
         input.lease_operation_kind = Some("deployment_apply".to_string());
+        input.lease_operation_id = Some(Uuid::new_v4());
         let diagnostics = project_diagnostics(Some(input));
-        assert_eq!(diagnostics.condition, DeploymentCondition::Progressing);
-        assert_eq!(diagnostics.reason, None);
-        assert!(diagnostics.blocking_operation.is_none());
-        assert!(diagnostics.blocked_until.is_none());
+        assert_eq!(
+            diagnostics.condition,
+            DeploymentCondition::BlockedByOperation
+        );
+        assert!(diagnostics.blocked_until.is_some());
     }
 
     #[test]
@@ -1075,6 +1272,150 @@ mod tests {
     }
 
     #[test]
+    fn own_namespace_fence_under_live_worker_is_not_foreign() {
+        // During an in-flight apply the worker's mutation claim arms the
+        // kubernetes_namespace fence with THIS deployment's operation id:
+        // reporting it as foreign would print a Blocked: section for the
+        // worker's own fence while the apply progresses.
+        let mut input = row("applying", Some("running"), None);
+        input.fence_locked_until = Some(Utc::now() + chrono::Duration::minutes(2));
+        input.fence_reclaim_after = Some(Utc::now() + chrono::Duration::minutes(5));
+        input.fence_operation_kind = Some("deployment_apply".to_string());
+        input.fence_operation_id = input.deployment_id;
+        let diagnostics = project_diagnostics(Some(input));
+        assert_eq!(diagnostics.condition, DeploymentCondition::Progressing);
+        assert!(diagnostics.blocking_operation.is_none());
+        assert!(diagnostics.blocked_until.is_none());
+    }
+
+    #[test]
+    fn abandoned_own_fence_after_worker_loss_blocks_until_reclaim() {
+        // Same fence once the worker lock expired: it gates the
+        // replacement worker's claim until reclaim_after, so it must be
+        // visible as the recovery blocker.
+        let mut input = row("applying", Some("running"), None);
+        input.job_lock_token = None;
+        input.job_locked_until = None;
+        input.next_attempt_at = None;
+        input.fence_locked_until = Some(Utc::now() - chrono::Duration::seconds(30));
+        input.fence_reclaim_after = Some(Utc::now() + chrono::Duration::minutes(5));
+        input.fence_operation_kind = Some("deployment_apply".to_string());
+        input.fence_operation_id = input.deployment_id;
+        let diagnostics = project_diagnostics(Some(input));
+        assert_eq!(
+            diagnostics.condition,
+            DeploymentCondition::BlockedByOperation
+        );
+        assert_eq!(
+            diagnostics.blocking_operation.as_deref(),
+            Some("deployment_apply")
+        );
+        assert!(diagnostics.blocked_until.is_some());
+    }
+
+    #[test]
+    fn poisoned_fence_dominates_a_finite_foreign_lease_deadline() {
+        // The lane opens only once EVERY holder clears. A finite foreign
+        // lease plus a poisoned (never-reclaiming) fence therefore never
+        // admits at the lease's locked_until/reclaim_after: the fence
+        // must win the combined verdict and promise no deadline, instead
+        // of the early-returned lease deadline that a 409 would refute.
+        let mut input = row("applying", Some("running"), None);
+        input.job_lock_token = None;
+        input.job_locked_until = None;
+        input.next_attempt_at = None;
+        input.lease_locked_until = Some(Utc::now() + chrono::Duration::minutes(2));
+        input.lease_reclaim_after = Some(Utc::now() + chrono::Duration::minutes(5));
+        input.lease_operation_kind = Some("app_delete".to_string());
+        input.fence_reclaim_after = None;
+        input.fence_operation_kind = Some("custom_domain_set".to_string());
+        let diagnostics = project_diagnostics(Some(input));
+        assert_eq!(
+            diagnostics.condition,
+            DeploymentCondition::BlockedByOperation
+        );
+        assert_eq!(
+            diagnostics.blocking_operation.as_deref(),
+            Some("custom_domain_set"),
+            "the poisoned fence, not the finite lease, is the dominating blocker"
+        );
+        assert!(diagnostics.blocked_until.is_none());
+    }
+
+    #[test]
+    fn later_fence_deadline_dominates_an_earlier_lease_deadline() {
+        // Both holders finite: the lane admits only at the LATER
+        // deadline; reporting the lease's earlier one would promise an
+        // admission a 409 refutes.
+        let mut input = row("applying", Some("running"), None);
+        input.job_lock_token = None;
+        input.job_locked_until = None;
+        input.next_attempt_at = None;
+        input.lease_locked_until = Some(Utc::now() + chrono::Duration::minutes(1));
+        input.lease_reclaim_after = Some(Utc::now() + chrono::Duration::minutes(2));
+        input.lease_operation_kind = Some("app_delete".to_string());
+        input.fence_locked_until = Some(Utc::now() - chrono::Duration::minutes(1));
+        input.fence_reclaim_after = Some(Utc::now() + chrono::Duration::minutes(8));
+        input.fence_operation_kind = Some("custom_domain_set".to_string());
+        let diagnostics = project_diagnostics(Some(input));
+        assert_eq!(
+            diagnostics.condition,
+            DeploymentCondition::BlockedByOperation
+        );
+        assert_eq!(
+            diagnostics.blocking_operation.as_deref(),
+            Some("custom_domain_set")
+        );
+        let blocked_until = diagnostics.blocked_until.expect("later fence deadline");
+        assert!(blocked_until > Utc::now() + chrono::Duration::minutes(7));
+    }
+
+    #[test]
+    fn deleting_app_with_lapsed_lease_and_holding_fence_still_waits() {
+        // The delete lease fully lapsed but the interrupted teardown's
+        // namespace fence still rejects the retry DELETE: do not tell
+        // the owner to retry a request that would 409.
+        let mut input = row("applying", Some("running"), None);
+        input.app_deleting = true;
+        input.lease_locked_until = Some(Utc::now() - chrono::Duration::minutes(5));
+        input.lease_reclaim_after = Some(Utc::now() - chrono::Duration::minutes(2));
+        input.lease_operation_kind = Some("app_delete".to_string());
+        input.fence_reclaim_after = None;
+        input.fence_operation_kind = Some("app_delete".to_string());
+        input.fence_operation_id = Some(Uuid::new_v4());
+        let diagnostics = project_diagnostics(Some(input));
+        assert_eq!(diagnostics.phase, DeploymentPhase::Destroying);
+        assert_eq!(diagnostics.condition, DeploymentCondition::WaitingExternal);
+    }
+
+    #[test]
+    fn poisoned_fence_with_live_lock_promises_no_deadline() {
+        // A poisoned fence (reclaim_after = infinity) still under a live
+        // renewable lock: the claim predicate can never reclaim it at
+        // locked_until, so no admission deadline may be promised.
+        let mut input = row("watching", Some("pending"), None);
+        input.job_lock_token = None;
+        input.job_locked_until = None;
+        input.next_attempt_at = Some(Utc::now() - chrono::Duration::seconds(10));
+        input.fence_locked_until = Some(Utc::now() + chrono::Duration::minutes(2));
+        input.fence_reclaim_after = None;
+        input.fence_operation_kind = Some("custom_domain_set".to_string());
+        let diagnostics = project_diagnostics(Some(input));
+        assert_eq!(
+            diagnostics.condition,
+            DeploymentCondition::BlockedByOperation
+        );
+        assert_eq!(
+            diagnostics.blocking_operation.as_deref(),
+            Some("custom_domain_set")
+        );
+        assert!(
+            diagnostics.blocked_until.is_none(),
+            "poisoned fence must not promise locked_until as an admission deadline"
+        );
+    }
+
+    #[test]
     fn poisoned_fence_blocks_without_a_deadline() {
         // reclaim_after = infinity is NULLed in SQL: blocked with no
         // automatic release time. Still blocked, still named.
@@ -1098,6 +1439,48 @@ mod tests {
     }
 
     #[test]
+    fn later_retry_schedule_beats_earlier_finite_blocker() {
+        // The foreign lease (and its quarantine) expires BEFORE the
+        // scheduled attempt: the dispatcher's attempt will be admitted,
+        // so the retry schedule — not the stale lease deadline — is the
+        // actual reason for waiting.
+        let mut input = row("applying", Some("pending"), None);
+        input.job_lock_token = None;
+        input.job_locked_until = None;
+        input.next_attempt_at = Some(Utc::now() + chrono::Duration::minutes(10));
+        input.lease_locked_until = Some(Utc::now() - chrono::Duration::minutes(1));
+        input.lease_reclaim_after = Some(Utc::now() + chrono::Duration::minutes(2));
+        input.lease_operation_kind = Some("app_delete".to_string());
+        let diagnostics = project_diagnostics(Some(input));
+        assert_eq!(diagnostics.condition, DeploymentCondition::WaitingExternal);
+        assert_eq!(diagnostics.reason, None);
+        assert!(diagnostics.next_retry_at.is_some());
+        assert!(
+            diagnostics.blocked_until.is_none(),
+            "no Blocked: section when the retry outlives the blocker"
+        );
+    }
+
+    #[test]
+    fn poisoned_blocker_still_wins_over_any_retry_schedule() {
+        // A poisoned fence has no automatic release: no retry schedule
+        // can outlive it, so blocked_by_operation wins even with a far
+        // future next_attempt_at.
+        let mut input = row("applying", Some("pending"), None);
+        input.job_lock_token = None;
+        input.job_locked_until = None;
+        input.next_attempt_at = Some(Utc::now() + chrono::Duration::hours(1));
+        input.fence_reclaim_after = None;
+        input.fence_operation_kind = Some("custom_domain_set".to_string());
+        let diagnostics = project_diagnostics(Some(input));
+        assert_eq!(
+            diagnostics.condition,
+            DeploymentCondition::BlockedByOperation
+        );
+        assert!(diagnostics.next_retry_at.is_none());
+    }
+
+    #[test]
     fn unknown_operation_kind_degrades_to_fixed_token() {
         let mut input = row("applying", Some("pending"), None);
         input.job_lock_token = None;
@@ -1111,6 +1494,25 @@ mod tests {
             diagnostics.blocking_operation.as_deref(),
             Some("other_operation")
         );
+    }
+
+    #[test]
+    fn terminal_healthy_deployment_hides_unrelated_blockers() {
+        // A healthy deployment with a concurrent custom_domain_set lease
+        // is not blocked by it: the durable outcome cannot be undone by
+        // a lane 409, and a red Blocked:/Holder: section under a
+        // completed deployment misleads the owner.
+        let mut input = row("healthy", Some("completed"), None);
+        input.job_lock_token = None;
+        input.job_locked_until = None;
+        input.lease_locked_until = Some(Utc::now() + chrono::Duration::minutes(3));
+        input.lease_reclaim_after = Some(Utc::now() + chrono::Duration::minutes(6));
+        input.lease_operation_kind = Some("custom_domain_set".to_string());
+        let diagnostics = project_diagnostics(Some(input));
+        assert_eq!(diagnostics.phase, DeploymentPhase::Healthy);
+        assert_eq!(diagnostics.condition, DeploymentCondition::Terminal);
+        assert!(diagnostics.blocking_operation.is_none());
+        assert!(diagnostics.blocked_until.is_none());
     }
 
     #[test]

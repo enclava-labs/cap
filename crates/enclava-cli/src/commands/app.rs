@@ -1850,7 +1850,16 @@ pub async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> 
 /// appended, never provider or workload text.
 fn deployment_condition_action(condition: &str, phase: Option<&str>) -> &'static str {
     if phase == Some("destroying") {
-        return "the app is being deleted; wait for teardown to complete before creating it again";
+        // Deletion has no durable background job: the API distinguishes a
+        // live teardown (progressing/waiting) from an abandoned one
+        // (blocked_by_operation — the delete lease fully lapsed and only
+        // a client DELETE resumes it).
+        return match condition {
+            "blocked_by_operation" => {
+                "deletion stalled after the delete request ended; run the delete again to resume teardown"
+            }
+            _ => "the app is being deleted; wait for teardown to complete before creating it again",
+        };
     }
     match condition {
         "progressing" => "wait; the deployment is making progress",
