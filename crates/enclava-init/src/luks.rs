@@ -516,14 +516,17 @@ fn mapper_dm_uuid(mapping_name: &str) -> Result<String> {
     let mapper_path = PathBuf::from(format!("/dev/mapper/{mapping_name}"));
     let meta = std::fs::metadata(&mapper_path)
         .map_err(|e| InitError::Luks(format!("stat {}: {e}", mapper_path.display())))?;
-    // Decode the raw dev_t with the same gnu encoding libc's major()/minor()
-    // use, so renamed or reordered dm minors resolve correctly.
+    // Decode the raw dev_t with glibc's exact gnu_dev_major/gnu_dev_minor
+    // masks, so dm minors >= 256 (and extended majors) decode correctly
+    // (cap#244 review). Mask constants mirror bits/sysmacros.h:
+    // major = [0xfff00]>>8 | [0xfffff00000000000]>>32,
+    // minor = [0xff] | [0xffffff00000]>>12.
     let rdev = {
         use std::os::unix::fs::MetadataExt;
         meta.rdev()
     };
-    let major = ((rdev >> 8) & 0xfff) | ((rdev >> 32) & !0xfffu64);
-    let minor = (rdev & 0xff) | ((rdev >> 12) & !0xfffu64);
+    let major = ((rdev & 0x0000_0000_000f_ff00) >> 8) | ((rdev & 0xffff_f000_0000_0000) >> 32);
+    let minor = (rdev & 0x0000_0000_0000_00ff) | ((rdev & 0x00000ffffff00000) >> 12);
     let sys_dm = format!("/sys/dev/block/{major}:{minor}/dm");
     let name = std::fs::read_to_string(format!("{sys_dm}/name"))
         .map_err(|e| InitError::Luks(format!("read {sys_dm}/name: {e}")))?;
