@@ -25,6 +25,10 @@
 //! Fresh LUKS2 volumes are formatted ext4 before the first mount, so
 //! the runtime image must include `mkfs.ext4`.
 
+//! Fresh LUKS2 volumes are formatted AES-256-XTS with hmac-sha256
+//! (dm-integrity) tags and then ext4 before the first mount, so the runtime
+//! image must include `mkfs.ext4`.
+
 use std::fs::{File, OpenOptions, remove_file};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -627,7 +631,7 @@ fn format_decision(
 }
 
 fn mkfs_ext4(mapper_path: &Path) -> Result<()> {
-    let status = std::process::Command::new("mkfs.ext4")
+    let status = std::process::Command::new(luks2_seal::MKFS_EXT4_BIN)
         .arg("-F")
         .arg(mapper_path)
         .status()
@@ -701,7 +705,7 @@ fn format_with_cryptsetup_cli(device: &Path, key: &DerivedSeed) -> Result<()> {
             INTEGRITY_CLI.to_string(),
             "--batch-mode".to_string(),
         ];
-        run_command("cryptsetup", &args)
+        run_command(luks2_seal::CRYPTSETUP_BIN, &args)
     })
 }
 
@@ -724,7 +728,7 @@ fn open_detached_with_cryptsetup_cli(
             path_arg(device)?,
             mapping_name.to_string(),
         ];
-        run_command("cryptsetup", &args)
+        run_command(luks2_seal::CRYPTSETUP_BIN, &args)
     })
 }
 
@@ -775,7 +779,7 @@ fn test_passphrase_detached(device: &Path, detached_path: &Path, key: &DerivedSe
             "--key-file".to_string(),
             path_arg(key_file)?,
         ];
-        run_command("cryptsetup", &args)
+        run_command(luks2_seal::CRYPTSETUP_BIN, &args)
     })
 }
 
@@ -789,7 +793,7 @@ struct CryptsetupStatus {
 }
 
 fn cryptsetup_status_full(mapping_name: &str) -> Result<CryptsetupStatus> {
-    let output = std::process::Command::new("cryptsetup")
+    let output = std::process::Command::new(luks2_seal::CRYPTSETUP_BIN)
         .args(["status", mapping_name])
         .output()
         .map_err(|e| InitError::Luks(format!("cryptsetup status {mapping_name}: {e}")))?;
@@ -867,7 +871,7 @@ fn has_luks_keyslots(device: &Path) -> Result<Option<bool>> {
 }
 
 fn cryptsetup_is_luks(device: &Path) -> Result<Option<bool>> {
-    let status = match std::process::Command::new("cryptsetup")
+    let status = match std::process::Command::new(luks2_seal::CRYPTSETUP_BIN)
         .args(["isLuks", "--type", "luks2"])
         .arg(device)
         .status()
@@ -989,21 +993,35 @@ where
     let key_file = temporary_key_path();
     if let Some(parent) = key_file.parent() {
         luks2_seal::ensure_private_material_dir(parent)?;
+        // The passphrase must never land on host-visible storage: the same
+        // tmpfs gate the detached headers get. Checking only the later
+        // header copies cannot undo a key file already written to disk
+        // (cap#244 self-review).
+        luks2_seal::ensure_private_material_filesystem(parent, key.as_bytes().len())?;
     }
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&key_file)
-        .map_err(|e| InitError::Luks(format!("create key file {}: {e}", key_file.display())))?;
-    file.write_all(key.as_bytes())
-        .map_err(|e| InitError::Luks(format!("write key file {}: {e}", key_file.display())))?;
-    file.sync_all()
-        .map_err(|e| InitError::Luks(format!("sync key file {}: {e}", key_file.display())))?;
-    drop(file);
-
-    let result = f(&key_file);
+    // Registered for the whole write-to-wipe lifetime: the orphan sweep
+    // also sweeps `luks-key-*` (crash leftovers), and a concurrent
+    // operation's key file must not be wiped while this call uses it
+    // (cap#244 review).
+    luks2_seal::register_active_material_path(&key_file);
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&key_file)
+            .map_err(|e| InitError::Luks(format!("create key file {}: {e}", key_file.display())))?;
+        file.write_all(key.as_bytes())
+            .map_err(|e| InitError::Luks(format!("write key file {}: {e}", key_file.display())))?;
+        file.sync_all()
+            .map_err(|e| InitError::Luks(format!("sync key file {}: {e}", key_file.display())))?;
+        drop(file);
+        f(&key_file)
+    })();
+    // Best-effort wipe on every path, including a partial write: plaintext
+    // key bytes must not outlive this call.
     wipe_key_file(&key_file, key.as_bytes().len());
+    luks2_seal::unregister_active_material_path(&key_file);
     result
 }
 
@@ -1019,12 +1037,15 @@ fn detached_header_path(_mapping_name: &str) -> PathBuf {
         .join(format!("luks-header-{}-{counter}", std::process::id()))
 }
 
-/// Delete orphaned `luks-header-*` copies left behind by processes that no
-/// longer exist (crash/kill/OOM between write and wipe). A live PID that is
-/// not us still owns its file, and a copy currently registered by THIS
-/// process (a concurrent open's in-flight file, cap#244 review) is never
-/// touched: its PID component is ours, but wiping it would race the
-/// cryptsetup invocation reading it.
+/// Delete orphaned `luks-header-*` and `luks-key-*` files left behind by
+/// processes that no longer exist (crash/kill/OOM between write and wipe).
+/// A live PID that is not us still owns its file, and a file currently
+/// registered by THIS process (a concurrent operation's in-flight file,
+/// cap#244 review) is never touched: its PID component is ours, but wiping
+/// it would race the operation still using it. A crashed process's
+/// passphrase file must not survive for the life of the emptyDir, so the
+/// key files get the same sweep as the detached headers (cap#244
+/// self-review).
 fn cleanup_stale_detached_copies() {
     cleanup_stale_detached_copies_in(Path::new(luks2_seal::PRIVATE_MATERIAL_DIR));
 }
@@ -1037,7 +1058,10 @@ fn cleanup_stale_detached_copies_in(dir: &Path) {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let Some(rest) = name.strip_prefix("luks-header-") else {
+        let Some(rest) = name
+            .strip_prefix("luks-header-")
+            .or_else(|| name.strip_prefix("luks-key-"))
+        else {
             continue;
         };
         let Some(pid_str) = rest.split('-').next() else {
@@ -1049,7 +1073,7 @@ fn cleanup_stale_detached_copies_in(dir: &Path) {
         if pid != my_pid && Path::new(&format!("/proc/{pid}")).exists() {
             continue;
         }
-        if luks2_seal::is_active_detached_copy(&entry.path()) {
+        if luks2_seal::is_active_material_path(&entry.path()) {
             // In-flight copy of a concurrent open in this process: owned by
             // our PID but not stale.
             continue;
@@ -1271,7 +1295,7 @@ mod unit_tests {
         // must leave it alone even though its PID component is ours.
         let inflight = dir.path().join(format!("luks-header-{my_pid}-1"));
         std::fs::write(&inflight, b"in-flight").expect("write in-flight copy");
-        luks2_seal::register_active_detached_copy_for_test(&inflight);
+        luks2_seal::register_active_material_path_for_test(&inflight);
 
         // Copy owned by another live process (PID 1 always exists).
         let foreign = dir.path().join("luks-header-1-0");
@@ -1287,9 +1311,41 @@ mod unit_tests {
         assert!(foreign.exists(), "live other-PID copy must be kept");
 
         // After the open completes (wipe), the same name becomes stale.
-        luks2_seal::unregister_active_detached_copy_for_test(&inflight);
+        luks2_seal::unregister_active_material_path_for_test(&inflight);
         cleanup_stale_detached_copies_in(dir.path());
         assert!(!inflight.exists(), "unregistered copy must be swept");
+    }
+
+    /// cap#244 self-review: a crash between key-file write and wipe must not
+    /// leave the passphrase in the private dir for the life of the emptyDir —
+    /// `luks-key-*` gets the same sweep, with the same in-flight exemption.
+    #[test]
+    fn sweep_removes_stale_key_files_but_never_in_flight_ones() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let my_pid = std::process::id();
+
+        let stale = dir.path().join(format!("luks-key-{my_pid}-0"));
+        std::fs::write(&stale, b"passphrase leftover").expect("write stale key file");
+
+        let inflight = dir.path().join(format!("luks-key-{my_pid}-1"));
+        std::fs::write(&inflight, b"in-flight key").expect("write in-flight key file");
+        luks2_seal::register_active_material_path_for_test(&inflight);
+
+        let foreign = dir.path().join("luks-key-1-0");
+        std::fs::write(&foreign, b"live owner").expect("write foreign key file");
+
+        cleanup_stale_detached_copies_in(dir.path());
+
+        assert!(!stale.exists(), "own unregistered key file must be wiped");
+        assert!(
+            inflight.exists(),
+            "in-flight key file of a concurrent operation must never be wiped"
+        );
+        assert!(foreign.exists(), "live other-PID key file must be kept");
+
+        luks2_seal::unregister_active_material_path_for_test(&inflight);
+        cleanup_stale_detached_copies_in(dir.path());
+        assert!(!inflight.exists(), "unregistered key file must be swept");
     }
 
     #[test]

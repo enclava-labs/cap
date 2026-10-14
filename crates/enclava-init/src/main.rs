@@ -134,6 +134,20 @@ fn run() -> Result<()> {
             .with_context(|| format!("clearing stale ready file {}", ready_file.display()))?;
     }
 
+    record_stage("verifying trustee policy").ok();
+    // Fail-closed: any verification gap (missing inputs, missing policy-read
+    // availability) returns Err and aborts before seed release. This must
+    // run BEFORE the volume open path: open_luks_volumes may mutate the
+    // on-disk header (seal adoption), and the claim it enforces has to be
+    // pinned to the in-TEE-verified cc_init_data bytes first — otherwise a
+    // host could present a downgraded/stripped claim for exactly one
+    // adoption, keep the disk mutation after verification fails, and hand
+    // the next boot a rolled-back header that now carries a valid MAC
+    // (cap#244 self-review).
+    let phase = stats.elapsed_ms();
+    run_in_tee_verification(&cfg, cc_init_data.as_deref())?;
+    stats.record_tee_verify(phase);
+
     record_stage("waiting for owner seed").ok();
     let phase = stats.elapsed_ms();
     let owner = match cfg.mode {
@@ -522,8 +536,17 @@ fn read_cc_init_data(cfg: &Config) -> Result<Option<Vec<u8>>> {
 /// - `"required"`: every formatted volume must already carry a valid HMAC
 ///   seal. An unsealed header is rejected as rollback/tampering instead of
 ///   re-adopted. Operators flip the platform default to "required" once the
-///   fleet has migrated; the claim is signed, so the host cannot downgrade
-///   it per-guest.
+///   fleet has migrated; the claim is signed and its cc_init_data bytes are
+///   pinned by the in-TEE chain verification that now runs BEFORE the open
+///   path can mutate any header, so the host cannot downgrade it per-guest
+///   (a presented downgrade fails verification first, before adoption).
+///
+/// Do not flip the signed release value to `"required"` until the crash
+/// window between `luksFormat` and the first MAC-slot write is recoverable
+/// (or formally accepted as a manual-reset case): an interrupted format
+/// leaves a valid unsealed header that `"required"` rejects on every later
+/// boot, wedging the volume. `"adopt"` still recovers from that state
+/// (cap#244 self-review).
 ///
 /// Any other value fails the boot rather than guessing the intent.
 fn luks_rollout_policy(cc_init_data: Option<&[u8]>) -> Result<luks::LuksOpenPolicy> {

@@ -71,18 +71,30 @@ pub const PRIVATE_MATERIAL_DIR: &str = "/run/enclava/luks-private";
 /// directory can never `rmdir` the empty directory and replace the entry.
 const PRIVATE_MATERIAL_KEEP_FILE: &str = ".keep";
 
-/// Detached-header copies this process has written and not yet wiped.
-///
-/// Copy names embed the PID plus a counter, so concurrent opens in one
-/// process share the naming scheme and the orphan sweep would otherwise
-/// mistake an in-flight copy of ours for a crashed leftover and wipe it
-/// while another call's cryptsetup is reading it (cap#244 review). The
-/// sweep skips registered paths; registration covers the whole
-/// write-to-wipe lifetime.
-static ACTIVE_DETACHED_COPIES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+/// Absolute paths of the privileged helper binaries. `PATH` is
+/// host-controlled (lib.rs threat model): a substituted `cryptsetup` that
+/// exits 0 would skip the detached-header plumbing entirely (it can ignore
+/// `--header` and open the on-disk header), silently undoing the seal
+/// design — and `/run/enclava` surviving a container restart lets a planted
+/// binary in a PATH-listed directory be the one that runs. The image
+/// installs the vetted cryptsetup build at `/usr/local/sbin` (Dockerfile)
+/// and e2fsprogs ships mkfs.ext4 in `/usr/sbin`; privileged helpers are
+/// never resolved through PATH (cap#244 self-review).
+pub const CRYPTSETUP_BIN: &str = "/usr/local/sbin/cryptsetup";
+pub const MKFS_EXT4_BIN: &str = "/usr/sbin/mkfs.ext4";
 
-fn register_active_detached_copy(path: &Path) {
-    let mut active = ACTIVE_DETACHED_COPIES
+/// Private-material files (detached-header copies and passphrase key files)
+/// this process has written and not yet wiped.
+///
+/// Names embed the PID plus a counter, so concurrent operations in one
+/// process share the naming scheme and the orphan sweep would otherwise
+/// mistake an in-flight file of ours for a crashed leftover and wipe it
+/// while another call is still using it (cap#244 review). The sweep skips
+/// registered paths; registration covers the whole write-to-wipe lifetime.
+static ACTIVE_MATERIAL_PATHS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+pub(crate) fn register_active_material_path(path: &Path) {
+    let mut active = ACTIVE_MATERIAL_PATHS
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
     if !active.iter().any(|p| p == path) {
@@ -90,8 +102,8 @@ fn register_active_detached_copy(path: &Path) {
     }
 }
 
-fn unregister_active_detached_copy(path: &Path) {
-    let mut active = ACTIVE_DETACHED_COPIES
+pub(crate) fn unregister_active_material_path(path: &Path) {
+    let mut active = ACTIVE_MATERIAL_PATHS
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
     active.retain(|p| p != path);
@@ -100,21 +112,22 @@ fn unregister_active_detached_copy(path: &Path) {
 /// Test hook for the sweep's registry behavior (see the unit tests in
 /// `luks.rs`): marks a path as an in-flight detached copy.
 #[cfg(test)]
-pub(crate) fn register_active_detached_copy_for_test(path: &Path) {
-    register_active_detached_copy(path);
+pub(crate) fn register_active_material_path_for_test(path: &Path) {
+    register_active_material_path(path);
 }
 
 /// Test hook: clears an in-flight registration again.
 #[cfg(test)]
-pub(crate) fn unregister_active_detached_copy_for_test(path: &Path) {
-    unregister_active_detached_copy(path);
+pub(crate) fn unregister_active_material_path_for_test(path: &Path) {
+    unregister_active_material_path(path);
 }
 
-/// True while a detached copy at `path` is written but not yet wiped by
-/// this process. The orphan sweep must leave such a copy alone even though
-/// its PID component is our own (a concurrent open in this process).
-pub fn is_active_detached_copy(path: &Path) -> bool {
-    let active = ACTIVE_DETACHED_COPIES
+/// True while a private-material file at `path` is written but not yet
+/// wiped by this process. The orphan sweep must leave such a file alone
+/// even though its PID component is our own (a concurrent operation in
+/// this process).
+pub fn is_active_material_path(path: &Path) -> bool {
+    let active = ACTIVE_MATERIAL_PATHS
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
     active.iter().any(|p| p == path)
@@ -130,7 +143,8 @@ pub const LUKS2_JSON_SUB_OFFSET: usize = 0x1000;
 
 /// Offset of the 64-byte HMAC slot inside each binary-header copy. Chosen in
 /// the zero padding after the header checksum field (csum occupies
-/// `[0x1c0,0x1e0)`): verified empirically that nonzero bytes here invalidate
+/// `[0x1c0,0x200)`, LUKS2_CHECKSUM_L=64 in cryptsetup 2.8.8): verified
+/// empirically that nonzero bytes here invalidate
 /// the header for stock cryptsetup while a copy with the slot re-zeroed
 /// remains valid.
 pub const HEADER_MAC_SLOT_OFFSET: usize = 0x240;
@@ -546,12 +560,12 @@ pub fn seal_on_disk(device: &Path, region: &Luks2Region, mac_key: &DerivedSeed) 
 pub fn write_detached_copy(region: &Luks2Region, path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         ensure_private_material_dir(parent)?;
-        ensure_detached_copy_filesystem(parent, region.bytes.len())?;
+        ensure_private_material_filesystem(parent, region.bytes.len())?;
     }
     // Registered BEFORE the file exists: the sweep checks the registry per
     // directory entry, so a copy another call is about to create can never
     // be observed unregistered-but-present.
-    register_active_detached_copy(path);
+    register_active_material_path(path);
     let write = (|| -> Result<()> {
         let mut file = OpenOptions::new()
             .write(true)
@@ -566,7 +580,7 @@ pub fn write_detached_copy(region: &Luks2Region, path: &Path) -> Result<()> {
         Ok(())
     })();
     if write.is_err() {
-        unregister_active_detached_copy(path);
+        unregister_active_material_path(path);
     }
     write
 }
@@ -617,10 +631,16 @@ pub fn ensure_private_material_dir(dir: &Path) -> Result<()> {
 
     match std::fs::symlink_metadata(dir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::DirBuilder::new()
-                .mode(0o700)
-                .create(dir)
-                .map_err(|e| luks_error(format!("create {}: {e}", dir.display())))?;
+            match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+                Ok(()) => {}
+                // A concurrent operation in this process won the race; the
+                // validation below confirms it created a real 0700 dir
+                // instead of a replaceable entry (cap#244 self-review).
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    validate_private_dir(dir)?;
+                }
+                Err(e) => return Err(luks_error(format!("create {}: {e}", dir.display()))),
+            }
         }
         Err(e) => return Err(luks_error(format!("stat {}: {e}", dir.display()))),
         Ok(_) => validate_private_dir(dir)?,
@@ -645,25 +665,27 @@ pub fn ensure_private_material_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Fail closed unless the detached-header directory is tmpfs (which includes
-/// tmpfs rootfs in minimal guest images) with enough free space for the
-/// region.
-fn ensure_detached_copy_filesystem(dir: &Path, region_len: usize) -> Result<()> {
+/// Fail closed unless the private-material directory is tmpfs (which
+/// includes tmpfs rootfs in minimal guest images) with enough free space
+/// for the file about to be written. Shared by the detached-header copies
+/// and the passphrase key files: private material must never reach
+/// host-visible storage (cap#244 self-review).
+pub fn ensure_private_material_filesystem(dir: &Path, needed_bytes: usize) -> Result<()> {
     let fs_stat = nix::sys::statfs::statfs(dir)
         .map_err(|e| luks_error(format!("statfs {}: {e}", dir.display())))?;
     if fs_stat.filesystem_type() != nix::sys::statfs::TMPFS_MAGIC {
         return Err(luks_error(format!(
-            "detached header directory {} is on filesystem type {:?}, not tmpfs; \
-             refusing to write the authenticated header outside RAM-backed storage",
+            "private material directory {} is on filesystem type {:?}, not tmpfs; \
+             refusing to write sensitive LUKS material outside RAM-backed storage",
             dir.display(),
             fs_stat.filesystem_type()
         )));
     }
     let free = fs_stat.blocks_available() as u64 * fs_stat.block_size() as u64;
-    if free < region_len as u64 {
+    if free < needed_bytes as u64 {
         return Err(luks_error(format!(
-            "detached header directory {} has only {free} bytes free; \
-             need {region_len} for the header region",
+            "private material directory {} has only {free} bytes free; \
+             need {needed_bytes} for the file",
             dir.display()
         )));
     }
@@ -699,7 +721,7 @@ pub fn wipe_detached_copy(path: &Path, len: usize) {
         }
     }
     let _ = std::fs::remove_file(path);
-    unregister_active_detached_copy(path);
+    unregister_active_material_path(path);
 }
 
 /// Parse `cryptsetup --version` output (e.g. `cryptsetup 2.8.8 flags: ...`
@@ -718,7 +740,7 @@ pub fn parse_cryptsetup_version(output: &str) -> Option<(u64, u64, u64)> {
 
 /// Read the installed cryptsetup CLI version.
 pub fn cryptsetup_version() -> Result<(u64, u64, u64)> {
-    let output = std::process::Command::new("cryptsetup")
+    let output = std::process::Command::new(CRYPTSETUP_BIN)
         .arg("--version")
         .output()
         .map_err(|e| luks_error(format!("cryptsetup --version: {e}")))?;
@@ -1086,20 +1108,21 @@ mod tests {
         assert_eq!(parse_cryptsetup_version(""), None);
     }
 
-    // Empirically the binary-header checksum occupies [0x1c0,0x1e0); the
-    // MAC slot must live strictly beyond it, inside the zero padding.
-    const _: () = assert!(HEADER_MAC_SLOT_OFFSET >= 0x1e0);
+    // The binary-header checksum occupies [0x1c0,0x200) (LUKS2_CHECKSUM_L=64
+    // in cryptsetup 2.8.8); the MAC slot must live strictly beyond it,
+    // inside the zero padding.
+    const _: () = assert!(HEADER_MAC_SLOT_OFFSET >= 0x200);
     const _: () = assert!(HEADER_MAC_SLOT_OFFSET + HEADER_MAC_LEN <= LUKS2_JSON_SUB_OFFSET);
 
     #[test]
     fn active_detached_copy_registry_tracks_write_to_wipe_lifetime() {
         let dir = tempfile::tempdir().expect("temporary directory");
         let path = dir.path().join("luks-header-test-registry");
-        assert!(!is_active_detached_copy(&path));
-        register_active_detached_copy(&path);
-        assert!(is_active_detached_copy(&path));
-        unregister_active_detached_copy(&path);
-        assert!(!is_active_detached_copy(&path));
+        assert!(!is_active_material_path(&path));
+        register_active_material_path(&path);
+        assert!(is_active_material_path(&path));
+        unregister_active_material_path(&path);
+        assert!(!is_active_material_path(&path));
     }
 
     #[test]
