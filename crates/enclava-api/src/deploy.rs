@@ -718,7 +718,7 @@ fn keep_managed_pull_secret(
 /// Every CAP-managed tenant pull secret in one namespace, discovered
 /// independently of the currently configured name (review finding on #243):
 ///
-/// - every secret labeled `app.kubernetes.io/managed-by=enclava-platform`,
+/// - every secret labeled `cap.enclava.dev/tenant-image-pull-secret=true`,
 ///   under any name — so a changed `TENANT_IMAGE_PULL_SECRET_NAME` can never
 ///   strand an old platform PAT; plus
 /// - unlabeled pre-label secrets at the names CAP could have generated them
@@ -1049,9 +1049,11 @@ enum PullSecretRemovalOutcome {
     Deleted,
     /// No secret lives under the name.
     Missing,
-    /// A secret exists (or appeared) under the name but is not the verified
-    /// managed object — a tenant replacement or a concurrent write. It is
-    /// preserved, and so are its ServiceAccount references.
+    /// A secret exists (or appeared) under the name but the live object fails
+    /// the CAP-ownership check — a tenant replacement. It is preserved
+    /// together with its ServiceAccount references. A same-object update that
+    /// merely moved `resourceVersion` is NOT this outcome: it is retried and,
+    /// if it never settles, reported as an error so the caller stays closed.
     NotOurs,
 }
 
@@ -1075,59 +1077,77 @@ async fn delete_managed_pull_secret(
     delete_mode: PullSecretDeleteMode,
 ) -> Result<PullSecretRemovalOutcome, DeployError> {
     let api: Api<Secret> = Api::namespaced(engine.client().clone(), namespace);
-    let existing = match api.get(name).await {
-        Ok(existing) => existing,
-        Err(kube::Error::Api(error)) if error.code == 404 => {
-            return Ok(PullSecretRemovalOutcome::Missing);
-        }
-        Err(error) => return Err(DeployError::Apply(error.into())),
-    };
-    if !is_managed_tenant_image_pull_secret(&existing, ghcr_credentials) {
-        tracing::warn!(
-            namespace = %namespace,
-            secret = %name,
-            "tenant image pull secret cleanup skipped: secret exists but is not CAP-managed"
-        );
-        return Ok(PullSecretRemovalOutcome::NotOurs);
-    }
-    if let PullSecretDeleteMode::Fenced(generation) = delete_mode {
-        // The same generation fence `delete_resource` applies — but checked
-        // against the object this cleanup verified, not against a fresh read
-        // that could already be a replacement.
-        ensure_pull_secret_generation_not_stale(&existing, generation, name)?;
-    }
-    // Pin the delete to the verified object's identity: a replacement that
-    // lands after the ownership check conflicts (409) instead of being
-    // deleted in the managed secret's place.
-    let delete_params = DeleteParams {
-        preconditions: Some(kube::api::Preconditions {
-            uid: existing.meta().uid.clone(),
-            resource_version: existing.meta().resource_version.clone(),
-        }),
-        ..Default::default()
-    };
-    match api.delete(name, &delete_params).await {
-        Ok(_) => {
-            tracing::info!(
-                namespace = %namespace,
-                secret = %name,
-                "stale tenant image pull secret removed (not kept under the configured repository scope)"
-            );
-            Ok(PullSecretRemovalOutcome::Deleted)
-        }
-        Err(kube::Error::Api(error)) if error.code == 404 => Ok(PullSecretRemovalOutcome::Missing),
-        Err(kube::Error::Api(error)) if error.code == 409 => {
+    // Kubernetes reports 409 both for a replaced object (different UID) and
+    // for the SAME managed object merely updated (resourceVersion moved)
+    // (review finding on #243). Only a real replacement is "not ours": a
+    // same-object update is still the managed secret, and reporting it as a
+    // clean removal would let the sweep converge while the platform PAT stays
+    // in the namespace. Every attempt re-reads and re-verifies the live
+    // object; a bounded retry absorbs transient writers, and once exhausted
+    // the error keeps the caller's gate closed.
+    for _ in 0..3 {
+        let existing = match api.get(name).await {
+            Ok(existing) => existing,
+            Err(kube::Error::Api(error)) if error.code == 404 => {
+                return Ok(PullSecretRemovalOutcome::Missing);
+            }
+            Err(error) => return Err(DeployError::Apply(error.into())),
+        };
+        if !is_managed_tenant_image_pull_secret(&existing, ghcr_credentials) {
             tracing::warn!(
                 namespace = %namespace,
                 secret = %name,
-                "tenant image pull secret cleanup skipped: the secret changed after the \
-                 ownership check (replaced mid-cleanup); keeping it and its ServiceAccount \
-                 references"
+                "tenant image pull secret cleanup skipped: secret exists but is not CAP-managed"
             );
-            Ok(PullSecretRemovalOutcome::NotOurs)
+            return Ok(PullSecretRemovalOutcome::NotOurs);
         }
-        Err(error) => Err(DeployError::Apply(error.into())),
+        if let PullSecretDeleteMode::Fenced(generation) = delete_mode {
+            // The same generation fence `delete_resource` applies — but checked
+            // against the object this cleanup verified, not against a fresh read
+            // that could already be a replacement.
+            ensure_pull_secret_generation_not_stale(&existing, generation, name)?;
+        }
+        // Pin the delete to the verified object's identity: a replacement that
+        // lands after the ownership check conflicts (409) instead of being
+        // deleted in the managed secret's place.
+        let delete_params = DeleteParams {
+            preconditions: Some(kube::api::Preconditions {
+                uid: existing.meta().uid.clone(),
+                resource_version: existing.meta().resource_version.clone(),
+            }),
+            ..Default::default()
+        };
+        match api.delete(name, &delete_params).await {
+            Ok(_) => {
+                tracing::info!(
+                    namespace = %namespace,
+                    secret = %name,
+                    "stale tenant image pull secret removed (not kept under the configured repository scope)"
+                );
+                return Ok(PullSecretRemovalOutcome::Deleted);
+            }
+            Err(kube::Error::Api(error)) if error.code == 404 => {
+                return Ok(PullSecretRemovalOutcome::Missing);
+            }
+            Err(kube::Error::Api(error)) if error.code == 409 => {
+                // The next attempt's read decides (review finding on #243):
+                // an unmanaged live object is a replacement and is kept
+                // (NotOurs), a still-managed one is the same secret updated
+                // mid-cleanup and is retried, and an exhausted retry errors so
+                // the caller stays closed instead of claiming a clean sweep.
+                tracing::warn!(
+                    namespace = %namespace,
+                    secret = %name,
+                    "tenant image pull secret delete conflicted; re-reading before retry"
+                );
+                continue;
+            }
+            Err(error) => return Err(DeployError::Apply(error.into())),
+        }
     }
+    Err(DeployError::PullSecretDeleteConflict(format!(
+        "{namespace}/{name}"
+    )))
 }
 
 /// The mutation-generation fence [`enclava_engine::apply::generation::delete_resource`]
@@ -1831,6 +1851,11 @@ pub enum DeployError {
     EdgeRoute(#[from] crate::edge::EdgeRouteError),
     #[error("durable mutation fence error: {0}")]
     Mutation(#[from] crate::mutation_leases::MutationLeaseError),
+    #[error(
+        "managed pull secret {0} keeps changing under the cleanup (conflicting updates); \
+         removal did not converge"
+    )]
+    PullSecretDeleteConflict(String),
 }
 
 impl DeployError {
@@ -1848,6 +1873,7 @@ impl DeployError {
             Self::KbsPolicy(_) => "kbs_policy_error",
             Self::EdgeRoute(_) => "edge_route_error",
             Self::Mutation(_) => "mutation_fence_error",
+            Self::PullSecretDeleteConflict(_) => "pull_secret_delete_conflict",
         }
     }
 }
@@ -4003,6 +4029,11 @@ mod tests {
         namespace_missing: bool,
         replace_on_sa_patch: Option<Secret>,
         replace_on_delete: Option<Secret>,
+        /// Simulated same-object updates between the cleanup's ownership read
+        /// and its pinned delete: each delete request first bumps the live
+        /// secret's `resourceVersion` (same UID) this many times, forcing a
+        /// 409 precondition conflict without replacing the object.
+        rv_bumps_on_delete: u8,
     }
 
     fn fake_managed_secret(name: &str, labeled: bool, username: &str, token: &str) -> Secret {
@@ -4214,6 +4245,21 @@ mod tests {
                     // The tenant replaces the secret between the cleanup's
                     // ownership check and its delete (review finding on #243).
                     swap_secret(&mut state.secrets, replacement);
+                }
+                if state.rv_bumps_on_delete > 0 {
+                    // A concurrent writer updates the SAME managed secret
+                    // between the cleanup's ownership check and its delete:
+                    // only resourceVersion moves, and the pinned delete must
+                    // conflict without the object being replaced.
+                    state.rv_bumps_on_delete -= 1;
+                    if let Some(secret) = state
+                        .secrets
+                        .iter_mut()
+                        .find(|secret| secret.metadata.name.as_deref() == name)
+                    {
+                        secret.metadata.resource_version =
+                            Some(format!("rv-bumped-{}", state.rv_bumps_on_delete));
+                    }
                 }
                 let index = state
                     .secrets
@@ -4729,6 +4775,125 @@ mod tests {
         assert!(
             converged,
             "a missing namespace is an already-clean sweep, not a failure"
+        );
+    }
+
+    /// Self-check blocking finding on #243 ("a delete conflict is treated as
+    /// a clean removal"): Kubernetes 409s both for a replaced object and for
+    /// the SAME managed secret merely updated between the ownership read and
+    /// the pinned delete. A same-object conflict must be retried — the secret
+    /// is still CAP's — and the sweep must still converge and remove the
+    /// token once the concurrent writer settles.
+    #[tokio::test]
+    async fn delete_retries_same_object_conflicts_until_the_writer_settles() {
+        use std::sync::{Arc, Mutex};
+
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![fake_managed_secret(
+                "enclava-registry-auth",
+                true,
+                "cap-bot",
+                "ghp_platform",
+            )],
+            service_accounts: vec![fake_service_account(
+                "cap-tenant-app",
+                &["enclava-registry-auth"],
+            )],
+            // A concurrent writer updates the SAME managed secret before each
+            // of the first two delete attempts; the third attempt settles.
+            rv_bumps_on_delete: 2,
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        let converged = reconcile_managed_pull_secrets(
+            &engine,
+            "tenant-ns",
+            &["cap-tenant-app".to_string()],
+            &reconcile_settings(),
+            false,
+            PullSecretDeleteMode::Fenced(MutationGeneration::new(1).unwrap()),
+        )
+        .await
+        .unwrap();
+        assert!(
+            converged,
+            "a same-object resourceVersion conflict is retried, not reported as a replacement"
+        );
+
+        let state = cluster.lock().unwrap();
+        assert!(
+            state.secrets.is_empty(),
+            "the managed secret must be removed once the writer settles"
+        );
+        assert_eq!(
+            state.service_accounts[0]
+                .image_pull_secrets
+                .as_ref()
+                .map(|references| references.len())
+                .unwrap_or(0),
+            0,
+            "a converged removal keeps the ServiceAccount reference cleared"
+        );
+    }
+
+    /// The complement of the retry case: when the same managed secret keeps
+    /// changing under the delete and the bounded retries never settle, the
+    /// sweep must NOT report a clean removal (that is what let admission open
+    /// while the platform PAT stayed out), the error path must restore the
+    /// cleared references, and the live object must survive untouched.
+    #[tokio::test]
+    async fn persistent_same_object_conflicts_stay_closed_and_restore_references() {
+        use std::sync::{Arc, Mutex};
+
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![fake_managed_secret(
+                "enclava-registry-auth",
+                true,
+                "cap-bot",
+                "ghp_platform",
+            )],
+            service_accounts: vec![fake_service_account(
+                "cap-tenant-app",
+                &["enclava-registry-auth"],
+            )],
+            // The writer never settles: every delete attempt conflicts.
+            rv_bumps_on_delete: 5,
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        let converged = reconcile_managed_pull_secrets(
+            &engine,
+            "tenant-ns",
+            &["cap-tenant-app".to_string()],
+            &reconcile_settings(),
+            false,
+            PullSecretDeleteMode::Unfenced,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !converged,
+            "a sweep that cannot delete the managed secret must not report success"
+        );
+
+        let state = cluster.lock().unwrap();
+        assert_eq!(
+            state.secrets.len(),
+            1,
+            "the managed secret must survive the conflicting deletes"
+        );
+        assert_eq!(
+            state.secrets[0].metadata.uid.as_deref(),
+            Some("uid-enclava-registry-auth"),
+            "no attempt may have deleted or replaced the object"
+        );
+        assert_eq!(
+            state.service_accounts[0]
+                .image_pull_secrets
+                .as_ref()
+                .map(|references| references.len()),
+            Some(1),
+            "the cleared reference must be restored when removal does not converge"
         );
     }
 }
