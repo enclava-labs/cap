@@ -196,7 +196,17 @@ pub fn build_toml_with_options(app: &ConfidentialApp, options: &CcInitDataOption
         "tls_state_hkdf_info",
         crate::manifest::enclava_init_config::TLS_STATE_HKDF_INFO,
     );
-    push_toml_string(&mut toml, "luks2_header_seal", &luks2_header_seal_claim());
+    // cap#242 render compatibility: artifacts signed before this claim
+    // existed hash a render without it; the binding pin reproduces those
+    // exact bytes. A claim-less render means the rollout-window ("adopt")
+    // default on the guest side.
+    let omit_seal_claim = app
+        .workload_artifact_binding
+        .as_ref()
+        .is_some_and(|binding| binding.omit_luks2_header_seal_claim);
+    if !omit_seal_claim {
+        push_toml_string(&mut toml, "luks2_header_seal", &luks2_header_seal_claim());
+    }
     push_toml_string(
         &mut toml,
         "unlock_socket",

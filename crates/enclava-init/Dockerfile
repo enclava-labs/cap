@@ -118,13 +118,20 @@ COPY --from=builder /out/enclava-wait-exec /usr/local/bin/enclava-wait-exec
 
 # cap#244 review: prove every NEEDED library of the runtime binaries is
 # present in the final image; the build fails here rather than the guest
-# failing at boot with a missing .so.
+# failing at boot with a missing .so. enclava-wait-exec is statically linked
+# (musl), where ldd exits nonzero with "not a dynamic executable" — that is
+# a pass, not a failure.
 RUN set -eux; \
-    ldd /usr/local/bin/enclava-init; \
-    ldd /usr/local/bin/enclava-log-relay; \
-    ldd /usr/local/bin/enclava-wait-exec; \
-    ! ldd /usr/local/bin/enclava-init | grep -q "not found"; \
-    ! ldd /usr/local/bin/enclava-log-relay | grep -q "not found"; \
-    ! ldd /usr/local/bin/enclava-wait-exec | grep -q "not found"
+    for bin in /usr/local/bin/enclava-init \
+               /usr/local/bin/enclava-log-relay \
+               /usr/local/bin/enclava-wait-exec; do \
+        if ldd "$bin" 2>&1 | tee /dev/stderr | grep -q "not a dynamic executable"; then \
+            continue; \
+        fi; \
+        if ldd "$bin" 2>&1 | grep -q "not found"; then \
+            echo "missing NEEDED library for $bin" >&2; \
+            exit 1; \
+        fi; \
+    done
 
 ENTRYPOINT ["/usr/local/bin/enclava-init"]

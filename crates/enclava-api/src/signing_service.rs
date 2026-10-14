@@ -495,6 +495,7 @@ impl DeploymentSigningArtifacts {
             descriptor_signing_pubkey: self.descriptor_signing_pubkey,
             org_keyring_fingerprint: self.org_keyring_fingerprint,
             omit_log_encryption_claim: false,
+            omit_luks2_header_seal_claim: false,
         }
     }
 
@@ -708,22 +709,28 @@ impl DeploymentSigningArtifacts {
         app: &mut enclava_engine::types::ConfidentialApp,
     ) -> Result<(), SigningServiceError> {
         let expected = hex::encode(self.descriptor.expected_cc_init_data_hash);
-        let (_, modern_hash) = enclava_engine::manifest::cc_init_data::compute_cc_init_data(app);
-        if modern_hash == expected {
+        // Try the four render-compatibility combinations, newest layout
+        // first, and pin the exact one the artifact was signed over so every
+        // downstream consumer (statefulset, KBS policy, TLS binding,
+        // ConfigMap transport) renders identical bytes. The two legacy flags
+        // cover artifacts signed before the `log_encryption_json` claim
+        // (cap#204-era) and before the `luks2_header_seal` rollout claim
+        // (cap#242) existed; a claim-less seal render keeps the guest-side
+        // rollout-window ("adopt") default, so those artifacts boot exactly
+        // as they did pre-change.
+        for (omit_log, omit_seal) in [(false, false), (true, false), (false, true), (true, true)] {
             if let Some(binding) = app.workload_artifact_binding.as_mut() {
-                binding.omit_log_encryption_claim = false;
+                binding.omit_log_encryption_claim = omit_log;
+                binding.omit_luks2_header_seal_claim = omit_seal;
             }
-            return Ok(());
-        }
-        if let Some(binding) = app.workload_artifact_binding.as_mut() {
-            binding.omit_log_encryption_claim = true;
-        }
-        let (_, legacy_hash) = enclava_engine::manifest::cc_init_data::compute_cc_init_data(app);
-        if legacy_hash == expected {
-            return Ok(());
+            let (_, hash) = enclava_engine::manifest::cc_init_data::compute_cc_init_data(app);
+            if hash == expected {
+                return Ok(());
+            }
         }
         if let Some(binding) = app.workload_artifact_binding.as_mut() {
             binding.omit_log_encryption_claim = false;
+            binding.omit_luks2_header_seal_claim = false;
         }
         Err(SigningServiceError::Mismatch(
             "expected_cc_init_data_hash".into(),
@@ -1859,6 +1866,7 @@ fn decode_loaded_workload_artifacts(
             descriptor_signing_pubkey,
             org_keyring_fingerprint,
             omit_log_encryption_claim: false,
+            omit_luks2_header_seal_claim: false,
         },
         trustee_policy_json: trustee_policy_json(&signed_policy_artifact)?,
         workload_artifacts_json: serde_json::to_string(&artifacts_json)?,
@@ -2025,6 +2033,7 @@ pub async fn load_workload_artifact_binding(
             descriptor_signing_pubkey,
             org_keyring_fingerprint: keyring_fingerprint(&org_keyring),
             omit_log_encryption_claim: false,
+            omit_luks2_header_seal_claim: false,
         },
         signed_policy_artifact,
     )))
