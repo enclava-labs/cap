@@ -632,11 +632,19 @@ async fn signed_policy_mode_active(db: &PgPool) -> Result<bool, KbsPolicyError> 
     .await?)
 }
 
-/// True while any customer-config hold is still live: the job is frozen at
-/// `setup_pending`, never released, and the expiry sweeper has not failed
-/// it yet. Only a live hold may defer policy convergence — a released or
-/// already-failed hold cannot wedge revocation for unrelated apps.
-async fn unreleased_customer_config_hold_pending(db: &PgPool) -> Result<bool, KbsPolicyError> {
+/// True while a live customer-config hold withholds a signed authority:
+/// the job is frozen at `setup_pending`, never released, the expiry sweeper
+/// has not failed it yet, and the held transition carries a signed artifact
+/// (`artifact_deployment_id`) whose authority the candidate query withholds.
+/// Only such a hold may defer policy convergence: an unrelated hold on an
+/// unsigned transition cannot be what made the candidate set empty, and
+/// deferring on it would leave revoked artifacts authorized until that hold
+/// releases or expires. Combined with the caller's `candidates.is_empty()`
+/// gate, a withheld artifact here is by construction a would-be candidate
+/// missing from the empty set — the withholding caused the emptiness.
+async fn unreleased_signed_customer_config_hold_pending(
+    db: &PgPool,
+) -> Result<bool, KbsPolicyError> {
     Ok(sqlx::query_scalar(
         "SELECT EXISTS(
              SELECT 1
@@ -644,6 +652,7 @@ async fn unreleased_customer_config_hold_pending(db: &PgPool) -> Result<bool, Kb
               WHERE customer_config_hold
                 AND customer_config_released_at IS NULL
                 AND state = 'setup_pending'
+                AND artifact_deployment_id IS NOT NULL
          )",
     )
     .fetch_one(db)
@@ -1182,8 +1191,11 @@ async fn reconcile_pending_signed_policy_artifacts_with_client(
         // customer-config hold: publishing the empty body would flip a
         // legacy Rego install into fail-closed signed mode and revoke the
         // workload the hold deliberately left running. Defer this
-        // generation until release or hold expiry settles it.
-        if candidates.is_empty() && unreleased_customer_config_hold_pending(db).await? {
+        // generation until release or hold expiry settles it. The
+        // deferral is scoped to the holds whose withheld authority caused
+        // the emptiness: an unrelated hold on an unsigned transition must
+        // not wedge revocation of an already-deleted artifact.
+        if candidates.is_empty() && unreleased_signed_customer_config_hold_pending(db).await? {
             tracing::info!(
                 policy_generation = generation,
                 "deferring signed KBS policy convergence until held deployments release"
@@ -5194,12 +5206,12 @@ resource_bindings := {
     }
 
     #[tokio::test]
-    async fn unreleased_customer_config_hold_defers_an_empty_policy() {
+    async fn unreleased_signed_customer_config_hold_defers_an_empty_policy() {
         let pool = crate::test_support::database_test_pool().await;
         let (org_id, app_id) = insert_test_app(&pool, "running").await;
 
         assert!(
-            !unreleased_customer_config_hold_pending(&pool)
+            !unreleased_signed_customer_config_hold_pending(&pool)
                 .await
                 .expect("probe hold before fixture"),
             "no held deployment exists yet"
@@ -5207,8 +5219,16 @@ resource_bindings := {
 
         // The first signed deployment on this app is held: the schema
         // trigger requires the job row first, then the pending deployment
-        // lands in the same transaction.
+        // lands in the same transaction. The held transition carries a
+        // signed artifact (`artifact_deployment_id`), so its authority is
+        // exactly what the candidate query withholds.
         let held = Uuid::new_v4();
+        // The signed artifact the hold will withhold; its row lands in the
+        // same transaction (artifact -> deployment FK is checked at commit).
+        let mut artifact = test_signed_policy_artifact("09", 16);
+        artifact.metadata.app_id = app_id.to_string();
+        artifact.metadata.deploy_id = held.to_string();
+        let artifact_hash = hex::decode(&artifact.metadata.descriptor_core_hash).unwrap();
         let mut tx = pool.begin().await.expect("begin held fixture");
         sqlx::query(
             "INSERT INTO deployment_apply_jobs (
@@ -5221,7 +5241,7 @@ resource_bindings := {
              ) VALUES (
                  $1, $2, $3, $1, 1,
                  '{\"version\":1,\"log_encryption\":null}'::jsonb,
-                 $4, false, false, NULL, NULL, NULL, 'setup_pending',
+                 $4, false, true, $1, $5, NULL, 'setup_pending',
                  'infinity'::timestamptz,
                  true, clock_timestamp() + interval '1 hour'
              )",
@@ -5230,14 +5250,33 @@ resource_bindings := {
         .bind(app_id)
         .bind(org_id)
         .bind(vec![7u8; 32])
+        .bind(&artifact_hash)
         .execute(&mut *tx)
         .await
         .expect("insert held apply job");
         insert_test_deployment_in_tx(&mut tx, org_id, app_id, held, "pending").await;
+        sqlx::query(
+            "INSERT INTO workload_artifacts (
+                 descriptor_core_hash, app_id, deploy_id, descriptor_payload,
+                 descriptor_signature, descriptor_signing_key_id,
+                 org_keyring_payload, org_keyring_signature,
+                 signed_policy_artifact
+             ) VALUES ($1, $2, $3, '{}'::jsonb, $4, 'test-key',
+                       '{}'::jsonb, $5, $6)",
+        )
+        .bind(&artifact_hash)
+        .bind(app_id)
+        .bind(held)
+        .bind(vec![1u8; 64])
+        .bind(vec![2u8; 64])
+        .bind(serde_json::to_value(&artifact).unwrap())
+        .execute(&mut *tx)
+        .await
+        .expect("insert held signed artifact");
         tx.commit().await.expect("commit held fixture");
 
         assert!(
-            unreleased_customer_config_hold_pending(&pool)
+            unreleased_signed_customer_config_hold_pending(&pool)
                 .await
                 .expect("probe held deployment"),
             "the unreleased hold must defer an empty policy publish"
@@ -5261,7 +5300,7 @@ resource_bindings := {
         .await
         .expect("release the hold");
         assert!(
-            !unreleased_customer_config_hold_pending(&pool)
+            !unreleased_signed_customer_config_hold_pending(&pool)
                 .await
                 .expect("probe after release"),
             "a released hold no longer defers the policy"
@@ -5295,7 +5334,7 @@ resource_bindings := {
         .expect("expire the hold deployment fixture");
         expiry_tx.commit().await.expect("commit expiry fixture");
         assert!(
-            !unreleased_customer_config_hold_pending(&pool)
+            !unreleased_signed_customer_config_hold_pending(&pool)
                 .await
                 .expect("probe after hold expiry"),
             "a terminal failed hold must not defer the policy"
@@ -5306,5 +5345,57 @@ resource_bindings := {
             .execute(&pool)
             .await
             .expect("delete held fixture organization");
+    }
+
+    #[tokio::test]
+    async fn unrelated_unsigned_hold_does_not_defer_an_empty_policy() {
+        let pool = crate::test_support::database_test_pool().await;
+        let (org_id, app_id) = insert_test_app(&pool, "running").await;
+
+        // An unrelated app's hold on an UNSIGNED transition withholds no
+        // signed authority: it cannot be what made the candidate set
+        // empty. A revoked artifact must converge out of the policy body
+        // even while this hold stays live — deferring on it would leave the
+        // revoked artifact authorized for the full hold window.
+        let held = Uuid::new_v4();
+        let mut tx = pool.begin().await.expect("begin unsigned held fixture");
+        sqlx::query(
+            "INSERT INTO deployment_apply_jobs (
+                 deployment_id, app_id, org_id, source_deployment_id,
+                 payload_version, payload, payload_sha256,
+                 cleanup_app_on_setup_failure, signed_required,
+                 artifact_deployment_id, artifact_descriptor_core_hash,
+                 log_encryption, state, next_attempt_at,
+                 customer_config_hold, customer_config_hold_until
+             ) VALUES (
+                 $1, $2, $3, $1, 1,
+                 '{\"version\":1,\"log_encryption\":null}'::jsonb,
+                 $4, false, false, NULL, NULL, NULL, 'setup_pending',
+                 'infinity'::timestamptz,
+                 true, clock_timestamp() + interval '2 hours'
+             )",
+        )
+        .bind(held)
+        .bind(app_id)
+        .bind(org_id)
+        .bind(vec![7u8; 32])
+        .execute(&mut *tx)
+        .await
+        .expect("insert unsigned held apply job");
+        insert_test_deployment_in_tx(&mut tx, org_id, app_id, held, "pending").await;
+        tx.commit().await.expect("commit unsigned held fixture");
+
+        assert!(
+            !unreleased_signed_customer_config_hold_pending(&pool)
+                .await
+                .expect("probe unsigned held deployment"),
+            "an unsigned hold withholds no authority and must not defer policy convergence"
+        );
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete unsigned held fixture organization");
     }
 }

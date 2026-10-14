@@ -648,22 +648,26 @@ fn terminal_rollout_settling_window_sql() -> String {
 /// settling window above.
 ///
 /// "Cluster-applied" is proven by ONE authoritative persisted signal: the
-/// deployment's Kubernetes apply actually committed. `apply_committed_at`
-/// (stamped only after `apply_all_with_tenant_image_pull_secret` returns)
-/// is that proof, with `observing_since` (0047, set at the `watching`
+/// deployment's generation reached the Kubernetes apply stage.
+/// `apply_committed_at` (stamped as the SSA provider call is entered) is
+/// that proof, with `observing_since` (0047, set at the `watching`
 /// transition for rows that reached observation) accepted as its legacy
-/// equivalent. `manifest_hash` is deliberately NOT proof of apply: it is
-/// stored at the `'applying'` transition — before KBS reconciliation and
-/// before the provider write — so a newer attempt that failed before the
-/// provider call carries a hash without having changed the cluster's
-/// desired state, and must not suppress the older rollout's settling
-/// guard.
+/// equivalent. The stamp is deliberately conservative: it does not depend
+/// on the client observing the provider response, so an apply whose
+/// response was lost to a timeout or connection error after Kubernetes
+/// accepted the request still counts. `manifest_hash` is deliberately NOT
+/// proof of apply: it is stored at the `'applying'` transition — before
+/// KBS reconciliation and before the provider write — so a newer attempt
+/// that failed before the provider call carries a hash without having
+/// changed the cluster's desired state, and must not suppress the older
+/// rollout's settling guard.
 ///
-/// Post-apply failures count too: `deployment_apply_failed` rows that
-/// reached the provider (backend resolution or `ensure_haproxy_routes`
-/// failing after the SSA apply committed) leave the same converging
-/// controller behind, so both terminal error classes are settling
-/// evidence. Rows that never reached the cluster carry no
+/// Post-apply failures and supersession rewrites count too: any terminal
+/// row that reached the provider (`deployment_apply_failed` after the SSA
+/// apply, `deployment_rollout_failed` timeouts, `deployment_superseded`
+/// rewrites of watching/applying rows) leaves the same converging
+/// controller behind, so the marker -- not the error class -- is the
+/// settling evidence. Rows that never reached the cluster carry no
 /// `apply_committed_at`/`observing_since` and are excluded.
 async fn app_has_rollout_in_flight(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -688,13 +692,15 @@ async fn app_has_rollout_in_flight(
                FROM deployments AS failed_rollout
               WHERE failed_rollout.app_id = $1
                 AND failed_rollout.status = 'failed'
-                AND failed_rollout.error_message IN (
-                    'deployment_rollout_failed',
-                    'deployment_apply_failed'
-                )
-                -- Only rows whose Kubernetes apply actually committed can
-                -- still own the cluster's desired generation: a failure
-                -- before the provider call changed nothing in-cluster.
+                -- Any terminal error class is settling evidence as long as
+                -- the generation reached the Kubernetes apply stage:
+                -- rollout/apply timeouts, post-apply step failures (backend
+                -- resolution or `ensure_haproxy_routes` after the SSA
+                -- apply), and supersession rewrites
+                -- ('deployment_superseded') alike leave a controller that
+                -- SQL cannot cancel still converging toward the applied
+                -- spec. Rows that failed before the Kubernetes apply carry
+                -- no marker and changed nothing in-cluster.
                 AND (
                     failed_rollout.apply_committed_at IS NOT NULL
                     OR failed_rollout.observing_since IS NOT NULL
@@ -1289,6 +1295,33 @@ async fn deploy_app_candidate(
         "setup_state": DEPLOYMENT_SETUP_DNS_PENDING,
     });
 
+    // No requested app/container state has been persisted before this point.
+    // Commit every accepted deployment row and its app/container changes as a
+    // single unit so any database error rolls the candidate back completely.
+    let mut tx = state.db.begin().await.map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "database error"})),
+        )
+    })?;
+    crate::entitlements::lock_org_entitlement_lane(&mut tx, auth.org_id)
+        .await
+        .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+    if signing_artifacts.is_some() {
+        crate::signing_service::lock_org_signing_authority_lane(&mut tx, auth.org_id)
+            .await
+            .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+    }
+    let current_role = crate::auth::scopes::lock_and_read_active_membership_role_in_tx(
+        &mut tx,
+        auth.org_id,
+        auth.user_id,
+    )
+    .await?;
+    crate::auth::scopes::require_admin_role(current_role)?;
+    crate::deploy::lock_app_deployment_lane(&mut tx, app.id)
+        .await
+        .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
     // A customer-config roll hold's safety contract is "write config into
     // the live TEE before the roll", so the live workload must be settled
     // before the hold is armed. SQL evidence alone cannot prove the cluster
@@ -1298,9 +1331,13 @@ async fn deploy_app_candidate(
     // cannot detect a replacement that lands afterwards. Probe the live
     // StatefulSet generation (the same convergence criterion rollout
     // observation uses) and refuse the hold while it is still converging.
-    // Probe failures fail closed like an in-flight rollout: the request is
-    // rejected with the retryable conflict instead of arming a hold that
-    // cannot be trusted.
+    // The probe runs INSIDE the app deployment lane: a sample taken before
+    // the lane lock could be invalidated by the previous lane holder (an
+    // ingress restart that timed out leaves its controller replacing the
+    // pod while the lane releases), and the hold must not be armed against
+    // that stale sample. Probe failures fail closed like an in-flight
+    // rollout: the request is rejected with the retryable conflict instead
+    // of arming a hold that cannot be trusted.
     let mut cluster_workload_settled = true;
     if honor_customer_config_roll_hold
         && body
@@ -1338,34 +1375,6 @@ async fn deploy_app_candidate(
             }
         }
     }
-
-    // No requested app/container state has been persisted before this point.
-    // Commit every accepted deployment row and its app/container changes as a
-    // single unit so any database error rolls the candidate back completely.
-    let mut tx = state.db.begin().await.map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "database error"})),
-        )
-    })?;
-    crate::entitlements::lock_org_entitlement_lane(&mut tx, auth.org_id)
-        .await
-        .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
-    if signing_artifacts.is_some() {
-        crate::signing_service::lock_org_signing_authority_lane(&mut tx, auth.org_id)
-            .await
-            .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
-    }
-    let current_role = crate::auth::scopes::lock_and_read_active_membership_role_in_tx(
-        &mut tx,
-        auth.org_id,
-        auth.user_id,
-    )
-    .await?;
-    crate::auth::scopes::require_admin_role(current_role)?;
-    crate::deploy::lock_app_deployment_lane(&mut tx, app.id)
-        .await
-        .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
     enforce_authoritative_entitlement(
         &mut tx,
         auth.org_id,
@@ -2948,6 +2957,7 @@ mod tests {
         // failing after the SSA apply committed) leaves the same converging
         // controller behind: it counts as an unsettled rollout for the
         // settling window.
+        let post_apply_failure_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO deployments (
                  id, org_id, app_id, trigger, status, spec_snapshot,
@@ -2958,7 +2968,7 @@ mod tests {
                  clock_timestamp(), clock_timestamp() + interval '3 seconds'
              )",
         )
-        .bind(Uuid::new_v4())
+        .bind(post_apply_failure_id)
         .bind(app.org_id)
         .bind(app.id)
         .execute(&pool)
@@ -2969,23 +2979,44 @@ mod tests {
             "a post-apply failure still owns the cluster generation"
         );
 
-        // The same failure WITHOUT the apply marker changed nothing
-        // in-cluster (it failed before the provider call) and stays
-        // settled — only the marker distinguishes the two.
+        // A supersession rewrite ('deployment_superseded') of a watching
+        // generation carries the same converging-controller risk: SQL
+        // cannot cancel an apply the cluster already accepted, and the
+        // successor may die before its own provider write. The marker --
+        // not the error class -- is the settling evidence.
+        let superseded_failure_id = Uuid::new_v4();
         sqlx::query(
-            "UPDATE deployments
-                SET apply_committed_at = NULL
-              WHERE app_id = $1
-                AND error_message = 'deployment_apply_failed'
-                AND created_at > clock_timestamp()",
+            "INSERT INTO deployments (
+                 id, org_id, app_id, trigger, status, spec_snapshot,
+                 error_message, completed_at, apply_committed_at, created_at
+             ) VALUES (
+                 $1, $2, $3, 'api', 'failed', '{}'::jsonb,
+                 'deployment_superseded', clock_timestamp(),
+                 clock_timestamp(), clock_timestamp() + interval '4 seconds'
+             )",
         )
+        .bind(superseded_failure_id)
+        .bind(app.org_id)
         .bind(app.id)
         .execute(&pool)
         .await
-        .expect("strip the apply marker from the newest failure");
+        .expect("insert superseded applied generation");
+        assert!(
+            in_flight(&pool, app.id).await,
+            "a superseded applied generation still counts as in-flight"
+        );
+
+        // The same failures WITHOUT the apply marker changed nothing
+        // in-cluster (they failed before the provider call) and stay
+        // settled — only the marker distinguishes the two.
+        sqlx::query("UPDATE deployments SET apply_committed_at = NULL WHERE id = ANY($1)")
+            .bind(vec![post_apply_failure_id, superseded_failure_id])
+            .execute(&pool)
+            .await
+            .expect("strip the apply marker from the newest failures");
         assert!(
             !in_flight(&pool, app.id).await,
-            "a pre-provider failure never owned the cluster generation"
+            "pre-provider failures never owned the cluster generation"
         );
 
         delete_setup_test_org(&pool, app.org_id).await;

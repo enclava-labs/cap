@@ -1656,6 +1656,14 @@ mod tests {
 
     /// A Kubernetes API double with configurable readiness and an empty pod list.
     fn rollout_client(ready: bool) -> kube::Client {
+        rollout_client_with(1, 1, i32::from(ready))
+    }
+
+    fn rollout_client_with(
+        generation: i64,
+        observed_generation: i64,
+        ready_replicas: i32,
+    ) -> kube::Client {
         use axum::http::{Request, Response};
         use http_body_util::BodyExt;
         use kube::client::Body;
@@ -1679,15 +1687,15 @@ mod tests {
                         "metadata": {
                             "name": "queued-app",
                             "namespace": "cap-queued-app",
-                            "generation": 1,
+                            "generation": generation,
                         },
                         "spec": { "replicas": 1 },
                         "status": {
-                            "observedGeneration": 1,
-                            "replicas": 1,
-                            "readyReplicas": i32::from(ready),
-                            "currentReplicas": i32::from(ready),
-                            "updatedReplicas": i32::from(ready),
+                            "observedGeneration": observed_generation,
+                            "replicas": ready_replicas,
+                            "readyReplicas": ready_replicas,
+                            "currentReplicas": ready_replicas,
+                            "updatedReplicas": ready_replicas,
                         },
                     })
                 };
@@ -1889,6 +1897,24 @@ mod tests {
                 .await
                 .expect("probe converging workload"),
             "a workload without ready replicas is still replacing the TEE"
+        );
+    }
+
+    #[tokio::test]
+    async fn workload_rollout_settled_rejects_an_unobserved_generation() {
+        // observedGeneration behind metadata.generation: the controller has
+        // not caught up to the newest applied spec yet, so the failed
+        // rollout is still reconciling even though the replica counts look
+        // ready. The probe must read both fields through the client.
+        let lagging = ApplyEngine::new(
+            rollout_client_with(3, 2, 1),
+            enclava_engine::apply::types::ApplyConfig::default(),
+        );
+        assert!(
+            !workload_rollout_settled(&lagging, "cap-queued-app", "queued-app")
+                .await
+                .expect("probe lagging workload"),
+            "an unobserved generation is still being reconciled toward the TEE"
         );
     }
 
@@ -2392,20 +2418,17 @@ pub async fn apply_deployment_manifests(
     mutation
         .arm_resource_scope_until_reconciled("kubernetes_namespace")
         .await?;
-    apply_all_with_tenant_image_pull_secret(
-        &engine,
-        &manifests,
-        &hash,
-        tenant_image_pull_secret_config.as_ref(),
-        generation,
-    )
-    .await?;
-    // Durable proof the SSA apply committed to the cluster: unlike
-    // `manifest_hash` (stored at the 'applying' transition, before KBS
-    // reconciliation and before the provider write), this marker survives a
-    // post-apply failure (backend resolution, edge routes) and still names
-    // the cluster's latest applied generation for the rollout settling
-    // guard. Idempotent re-applies keep the first commit time.
+    // Durable evidence that this generation reached the Kubernetes apply
+    // stage. Unlike `manifest_hash` (stored at the 'applying' transition,
+    // before KBS reconciliation), the marker is written only once the
+    // provider call is about to be entered; unlike a post-response stamp,
+    // it does not depend on the client observing the SSA response. A
+    // response lost to a timeout or connection error after Kubernetes
+    // accepted the request must still count as applied for the rollout
+    // settling guard (`app_has_rollout_in_flight`), and a failure before
+    // this point (KBS reconciliation, engine startup) must still not
+    // supersede an older in-flight rollout. Idempotent re-applies keep the
+    // first stamp time.
     sqlx::query(
         "UPDATE deployments
             SET apply_committed_at = COALESCE(apply_committed_at, clock_timestamp())
@@ -2413,6 +2436,14 @@ pub async fn apply_deployment_manifests(
     )
     .bind(deployment_id)
     .execute(&pool)
+    .await?;
+    apply_all_with_tenant_image_pull_secret(
+        &engine,
+        &manifests,
+        &hash,
+        tenant_image_pull_secret_config.as_ref(),
+        generation,
+    )
     .await?;
     let edge_config = crate::edge::EdgeRouteConfig::from_env();
     let org_slug: String = sqlx::query_scalar("SELECT cust_slug FROM organizations WHERE id = $1")
