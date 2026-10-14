@@ -34,15 +34,25 @@ pub const CAP_VCT_NAMES: [&str; 2] = ["state", "tls-state"];
 ///
 /// The outer bound must additionally survive the volume's OTHER writer
 /// (#223): kata's direct-assigned-volume staging places a sparse dm-integrity
-/// `disk.img` on this volume (observed: ~98 GiB apparent, real blocks growing
-/// ~6.5 MB/s from pod start). Kubelet measures real usage against sizeLimit,
-/// so the pre-#223 64Mi cap was exhausted ~61 s into every first deploy,
-/// evicting the pod in a loop that a pre-ready pod can never escape (each
-/// eviction restarts the writer). 4 GiB gives ~10 min of runway at the
-/// observed growth rate vs the ~3 min a first deploy needs to converge —
-/// a >3x margin — while still bounding node-disk exhaustion from a runaway
-/// writer (#138). The container's 97 GiB-for-12 GiB sizing is a separate
-/// bug tracked in #223's root-fix item; this cap is the deployability fence.
+/// `disk.img` on this volume (~98 GiB apparent; real blocks grow at a
+/// phase-dependent ~6.5–70 MB/s, bursts ~100 MB/s, re-running from 0 on
+/// every pod boot). Kubelet measures real usage against sizeLimit — loosely:
+/// its poll lags, and under the pre-#223 64Mi cap pods were evicted at
+/// ~2.3 GB real usage, in a ~61 s loop a pre-ready pod can never escape
+/// (each eviction restarts the writer).
+///
+/// 4 GiB rests on the only hypothesis under which a moderate fence works
+/// (#223, n=2, unproven): both sampled generations ended at an identical
+/// ~2.3–2.4 GB real usage despite different growth rates (52 vs 70 MB/s),
+/// consistent with the write phase completing there. If growth instead
+/// never settles, 4 GiB is crossed in ~60–85 s at 52–70 MB/s (~43 s at a
+/// 100 MB/s burst) — inside the ~3 min first-deploy window — and the fence
+/// must rise past ~12 GiB or the kata-side root sizing fix must land; both
+/// stay tracked in #223. No pod has survived past ~2.4 GB under the old
+/// fence, so this raise is what makes the question answerable: a one-time
+/// 15-minute first-deploy usage watch after rollout decides it (plateau at
+/// or below the fence = settles). Either way the bound still fences a true
+/// runaway per pod, loosely, where an unbounded volume would not (#138).
 const LOGS_EMPTY_DIR_SIZE_LIMIT: &str = "4Gi";
 
 pub fn build_volumes(app: &ConfidentialApp) -> Vec<Volume> {
