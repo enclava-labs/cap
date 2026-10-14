@@ -652,6 +652,16 @@ async fn main() {
         eprintln!("startup refused: {e}");
         std::process::exit(1);
     }
+    // Issue #225 fail-closed gates: platform registry credentials must be
+    // explicitly scoped before they may be forwarded anywhere.
+    if let Some(error) = enclava_api::cosign::cosign_registry_credentials_startup_error() {
+        eprintln!("startup refused: {error}");
+        std::process::exit(1);
+    }
+    if let Some(error) = enclava_api::deploy::tenant_image_pull_secret_startup_error() {
+        eprintln!("startup refused: {error}");
+        std::process::exit(1);
+    }
     let deployment_dispatch_enabled = match load_deployment_dispatch_enabled() {
         Ok(enabled) => enabled,
         Err(error) => {

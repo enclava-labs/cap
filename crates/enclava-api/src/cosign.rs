@@ -110,16 +110,121 @@ fn env_nonempty(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn registry_auth_from_env(registry: &str) -> Auth {
-    if let Some(token) = env_nonempty("COSIGN_REGISTRY_BEARER_TOKEN") {
-        return Auth::Bearer(token);
+const COSIGN_REGISTRY_ALLOWED_HOSTS_ENV: &str = "COSIGN_REGISTRY_ALLOWED_HOSTS";
+
+/// Hosts the operator has explicitly allowlisted to receive the platform
+/// `COSIGN_*` registry credentials (issue #225). An unset or empty list
+/// means no host is trusted, so the credentials are never attached.
+pub fn cosign_registry_allowed_hosts_from_env() -> Vec<String> {
+    env_nonempty(COSIGN_REGISTRY_ALLOWED_HOSTS_ENV)
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|host| !host.is_empty())
+                .map(str::to_ascii_lowercase)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// True when any platform `COSIGN_*` registry credential is configured.
+pub fn cosign_registry_credentials_configured() -> bool {
+    CosignRegistryCredentials::from_env().is_configured()
+}
+
+/// Exact or leading-wildcard host match against an allowlist pattern.
+///
+/// Patterns: `host[:port]` matches exactly (case-insensitive), `*.example.com`
+/// matches `example.com` and any dot-separated subdomain of it, and the bare
+/// pattern `*` is an explicit operator opt-in matching every host. A wildcard
+/// never matches across a partial label (`*.example.com` does not match
+/// `notexample.com`).
+fn host_matches_allowed_pattern(host: &str, pattern: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    let host = host.to_ascii_lowercase();
+    let pattern = pattern.to_ascii_lowercase();
+    if host == pattern {
+        return true;
+    }
+    pattern.strip_prefix("*.").is_some_and(|base| {
+        host == base
+            || host
+                .strip_suffix(&format!(".{base}"))
+                .is_some_and(|label| !label.is_empty() && !label.contains('.'))
+    })
+}
+
+/// Platform `COSIGN_*` registry credentials read once from the environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CosignRegistryCredentials {
+    bearer_token: Option<String>,
+    username: Option<String>,
+    password: Option<String>,
+}
+
+impl CosignRegistryCredentials {
+    fn from_env() -> Self {
+        Self {
+            bearer_token: env_nonempty("COSIGN_REGISTRY_BEARER_TOKEN"),
+            username: env_nonempty("COSIGN_REGISTRY_USERNAME"),
+            password: env_nonempty("COSIGN_REGISTRY_PASSWORD"),
+        }
     }
 
-    if let (Some(username), Some(password)) = (
-        env_nonempty("COSIGN_REGISTRY_USERNAME"),
-        env_nonempty("COSIGN_REGISTRY_PASSWORD"),
-    ) {
-        return Auth::Basic(username, password);
+    #[cfg(test)]
+    fn basic(username: &str, password: &str) -> Self {
+        Self {
+            bearer_token: None,
+            username: Some(username.to_string()),
+            password: Some(password.to_string()),
+        }
+    }
+
+    fn is_configured(&self) -> bool {
+        self.bearer_token.is_some() || (self.username.is_some() && self.password.is_some())
+    }
+
+    fn auth(&self) -> Option<Auth> {
+        if let Some(token) = &self.bearer_token {
+            return Some(Auth::Bearer(token.clone()));
+        }
+        if let (Some(username), Some(password)) = (&self.username, &self.password) {
+            return Some(Auth::Basic(username.clone(), password.clone()));
+        }
+        None
+    }
+}
+
+/// Pure decision core of the credential-forwarding gate: platform registry
+/// credentials are only attached for allowlisted destination hosts.
+fn registry_auth_with_allowlist(
+    registry: &str,
+    credentials: Option<&CosignRegistryCredentials>,
+    allowed_hosts: &[String],
+) -> Auth {
+    // Platform registry credentials must never be forwarded to a host the
+    // tenant picked (issue #225): image references — including digest-pinned
+    // ones, which skip the registry allowlist — are attacker-controlled
+    // input, so the COSIGN_* credentials are only attached when the operator
+    // explicitly listed the destination host in COSIGN_REGISTRY_ALLOWED_HOSTS.
+    // An unset/empty allowlist fails closed to anonymous access.
+    if let Some(credentials) = credentials {
+        let host_allowed = allowed_hosts
+            .iter()
+            .any(|pattern| host_matches_allowed_pattern(registry, pattern));
+        match (credentials.auth(), host_allowed) {
+            (Some(auth), true) => return auth,
+            (Some(_), false) => {
+                tracing::warn!(
+                    registry = %registry,
+                    env = COSIGN_REGISTRY_ALLOWED_HOSTS_ENV,
+                    "platform registry credentials not attached: registry host is not allowlisted"
+                );
+            }
+            (None, _) => {}
+        }
     }
 
     if registry == "ghcr.io"
@@ -130,6 +235,36 @@ fn registry_auth_from_env(registry: &str) -> Auth {
     }
 
     Auth::Anonymous
+}
+
+fn registry_auth_from_env(registry: &str) -> Auth {
+    let credentials = CosignRegistryCredentials::from_env();
+    registry_auth_with_allowlist(
+        registry,
+        credentials.is_configured().then_some(&credentials),
+        &cosign_registry_allowed_hosts_from_env(),
+    )
+}
+
+/// Startup validation (issue #225): platform `COSIGN_*` registry credentials
+/// without an explicit `COSIGN_REGISTRY_ALLOWED_HOSTS` scope are refused —
+/// silently downgrading every registry to anonymous would break private-
+/// registry verification in confusing ways, so misconfiguration must be loud.
+pub fn cosign_registry_credentials_startup_error() -> Option<String> {
+    if !cosign_registry_credentials_configured() {
+        return None;
+    }
+    let hosts = cosign_registry_allowed_hosts_from_env();
+    if hosts.is_empty() {
+        return Some(
+            "COSIGN_REGISTRY_BEARER_TOKEN or COSIGN_REGISTRY_USERNAME/COSIGN_REGISTRY_PASSWORD \
+             is set but COSIGN_REGISTRY_ALLOWED_HOSTS is unset or empty; platform registry \
+             credentials are never forwarded to tenant-chosen registry hosts (issue #225), so \
+             set COSIGN_REGISTRY_ALLOWED_HOSTS to the hosts that should receive them"
+                .to_string(),
+        );
+    }
+    None
 }
 
 fn looks_like_not_signed_error(err: &str) -> bool {
@@ -1429,6 +1564,7 @@ mod tests {
             std::env::remove_var("COSIGN_REGISTRY_BEARER_TOKEN");
             std::env::remove_var("GHCR_USERNAME");
             std::env::remove_var("GHCR_TOKEN");
+            std::env::set_var("COSIGN_REGISTRY_ALLOWED_HOSTS", "ghcr.io");
         }
 
         let auth = registry_auth_from_env("ghcr.io");
@@ -1437,6 +1573,84 @@ mod tests {
             auth,
             Auth::Basic(username, password) if username == "cap-bot" && password == "ghp_example"
         ));
+    }
+
+    /// Issue #225: platform COSIGN_* credentials must never be forwarded to a
+    /// registry host the tenant picked. The allowlist gate is exercised
+    /// through the pure decision core so the env-dependent happy path above
+    /// stays the only test touching process-global environment state here.
+    #[test]
+    fn registry_credentials_are_not_forwarded_to_unlisted_hosts() {
+        let allowed = vec!["ghcr.io".to_string(), "*.corp.example".to_string()];
+        let credentials = CosignRegistryCredentials::basic("cap-bot", "ghp_example");
+
+        // Allowlisted hosts receive the credentials.
+        assert!(matches!(
+            registry_auth_with_allowlist("ghcr.io", Some(&credentials), &allowed),
+            Auth::Basic(..)
+        ));
+        assert!(matches!(
+            registry_auth_with_allowlist("registry.corp.example", Some(&credentials), &allowed),
+            Auth::Basic(..)
+        ));
+
+        // Tenant-chosen hosts do not — the exact attack from the issue.
+        for host in [
+            "attacker.example.com",
+            "evil.example.com:5000",
+            // wildcard must not leak into sibling domains
+            "notcorp.example",
+            "deep.sub.corp.example",
+        ] {
+            assert!(
+                matches!(
+                    registry_auth_with_allowlist(host, Some(&credentials), &allowed),
+                    Auth::Anonymous
+                ),
+                "credentials must not attach to {host}"
+            );
+        }
+
+        // Unset allowlist fails closed for every host.
+        assert!(matches!(
+            registry_auth_with_allowlist("ghcr.io", Some(&credentials), &[]),
+            Auth::Anonymous
+        ));
+
+        // Without credentials configured the gate is inert (anonymous anyway
+        // unless GHCR_* applies, which is separately host-bound).
+        assert!(matches!(
+            registry_auth_with_allowlist("attacker.example.com", None, &allowed),
+            Auth::Anonymous
+        ));
+    }
+
+    #[test]
+    fn host_allowlist_patterns_match_exact_and_single_level_wildcards() {
+        assert!(host_matches_allowed_pattern("ghcr.io", "ghcr.io"));
+        assert!(host_matches_allowed_pattern("GHCR.IO", "ghcr.io"));
+        assert!(host_matches_allowed_pattern(
+            "reg.example:5000",
+            "reg.example:5000"
+        ));
+        assert!(host_matches_allowed_pattern(
+            "a.corp.example",
+            "*.corp.example"
+        ));
+        assert!(host_matches_allowed_pattern(
+            "corp.example",
+            "*.corp.example"
+        ));
+        assert!(host_matches_allowed_pattern("any.host.example", "*"));
+        assert!(!host_matches_allowed_pattern(
+            "notexample.com",
+            "*.example.com"
+        ));
+        assert!(!host_matches_allowed_pattern(
+            "a.b.corp.example",
+            "*.corp.example"
+        ));
+        assert!(!host_matches_allowed_pattern("ghcr.io.evil.com", "ghcr.io"));
     }
 
     /// Regression test for issue #125: a malicious registry must not be able

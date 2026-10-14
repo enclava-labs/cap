@@ -133,27 +133,79 @@ fn configured_tenant_image_pull_secret_name() -> Option<String> {
     }
 }
 
+/// Startup validation (issue #225): GHCR pull-secret credentials without an
+/// explicit, valid `TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES` scope are refused.
+/// The platform GHCR PAT must never default into every tenant namespace.
+pub fn tenant_image_pull_secret_startup_error() -> Option<String> {
+    if tenant_image_pull_secret_config_from_env().is_some() {
+        return None;
+    }
+    let ghcr_configured =
+        env_nonempty("GHCR_USERNAME").is_some() && env_nonempty("GHCR_TOKEN").is_some();
+    if !ghcr_configured {
+        return None;
+    }
+    match env_nonempty(TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES_ENV) {
+        None => Some(
+            "GHCR_USERNAME/GHCR_TOKEN are set but TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES is \
+             unset; the tenant image pull secret is never attached without an explicit \
+             repository scope (issue #225). Set \
+             TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES (e.g. ghcr.io/enclava-ai/templates/*) \
+             or remove the GHCR credentials"
+                .to_string(),
+        ),
+        Some(_) => Some(
+            "GHCR_USERNAME/GHCR_TOKEN are set but TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES \
+             contains no valid entries; the tenant image pull secret is never attached \
+             without an explicit repository scope (issue #225). Use \
+             registry/repository or registry/repository/* entries"
+                .to_string(),
+        ),
+    }
+}
+
 fn tenant_image_pull_secret_config_from_env() -> Option<TenantImagePullSecretConfig> {
     let username = env_nonempty("GHCR_USERNAME")?;
     let token = env_nonempty("GHCR_TOKEN")?;
     let name = configured_tenant_image_pull_secret_name()
         .unwrap_or_else(|| DEFAULT_TENANT_IMAGE_PULL_SECRET_NAME.to_string());
 
+    // Fail closed (issue #225): the platform GHCR credential is only
+    // materialized into tenant namespaces when the operator pinned an
+    // explicit, valid repository scope. An unset, empty, or invalid
+    // TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES yields no secret at all rather
+    // than the previous default of every tenant namespace.
+    let allowed_repositories = tenant_image_pull_allowed_repositories_from_env_strict()?;
+
     Some(TenantImagePullSecretConfig {
         name,
         username,
         token,
-        allowed_repositories: tenant_image_pull_allowed_repositories_from_env(),
+        allowed_repositories,
     })
 }
 
-fn tenant_image_pull_allowed_repositories_from_env() -> Vec<ImagePullRepositoryScope> {
-    let Some(raw) = env_nonempty(TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES_ENV) else {
-        return Vec::new();
-    };
-    raw.split(',')
-        .filter_map(parse_image_pull_repository_scope)
-        .collect()
+/// Parse TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES, surfacing invalid entries
+/// instead of silently dropping them (issue #225): a scope list with a bad
+/// entry must not degrade into a narrower — or worse, unscoped — secret.
+/// `None` means unset/empty/invalid — no scoping information at all.
+fn tenant_image_pull_allowed_repositories_from_env_strict() -> Option<Vec<ImagePullRepositoryScope>>
+{
+    parse_image_pull_scopes_strict(&env_nonempty(TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES_ENV)?)
+}
+
+/// Pure core of [`tenant_image_pull_allowed_repositories_from_env_strict`]:
+/// every comma-separated entry must parse; any invalid entry rejects the
+/// whole list so a typo can never widen (or silently drop) the scope.
+fn parse_image_pull_scopes_strict(raw: &str) -> Option<Vec<ImagePullRepositoryScope>> {
+    let scopes = raw
+        .split(',')
+        .map(parse_image_pull_repository_scope)
+        .collect::<Option<Vec<_>>>()?;
+    if scopes.is_empty() {
+        return None;
+    }
+    Some(scopes)
 }
 
 fn parse_image_pull_repository_scope(raw: &str) -> Option<ImagePullRepositoryScope> {
@@ -202,8 +254,16 @@ fn tenant_image_pull_secret_applies_to_containers(
     if containers.is_empty() {
         return false;
     }
+    // Issue #225: an unscoped config must never attach the platform pull
+    // secret to tenant workloads. `tenant_image_pull_secret_config_from_env`
+    // already refuses to build a config without an explicit scope; treat an
+    // empty scope here as fail-closed defense in depth.
     if config.allowed_repositories.is_empty() {
-        return true;
+        tracing::warn!(
+            secret = %config.name,
+            "tenant image pull secret has no repository scope; refusing to attach"
+        );
+        return false;
     }
 
     containers.iter().all(|container| {
@@ -1459,17 +1519,34 @@ mod tests {
         assert!(parse_image_pull_repository_scope("ghcr.io").is_none());
     }
 
+    /// Issue #225: an unscoped config must never attach the platform pull
+    /// secret to tenant workloads — this was the previous "global fallback"
+    /// that materialized the platform GHCR PAT into every tenant namespace.
     #[test]
-    fn tenant_image_pull_secret_without_scope_preserves_global_fallback() {
+    fn tenant_image_pull_secret_without_scope_fails_closed() {
         let config = pull_secret_config(Vec::new());
         let containers = vec![test_container(
             "ghcr.io/tenant/private-app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         )];
 
-        assert!(tenant_image_pull_secret_applies_to_containers(
+        assert!(!tenant_image_pull_secret_applies_to_containers(
             &containers,
             &config
         ));
+    }
+
+    /// Issue #225: a scope list with invalid entries must not silently
+    /// degrade into a different (or missing) scope.
+    #[test]
+    fn tenant_image_pull_scope_parser_rejects_invalid_entries() {
+        assert!(parse_image_pull_scopes_strict("ghcr.io/enclava-ai/templates/*,bogus").is_none());
+        assert!(parse_image_pull_scopes_strict("ghcr.io").is_none());
+        assert_eq!(
+            parse_image_pull_scopes_strict("ghcr.io/enclava-ai/templates/*"),
+            Some(vec![
+                parse_image_pull_repository_scope("ghcr.io/enclava-ai/templates/*").unwrap()
+            ])
+        );
     }
 
     #[test]
