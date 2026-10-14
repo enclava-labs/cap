@@ -613,19 +613,43 @@ async fn reconcile_legacy_rego_policy_with_client(
             binding.signer_identity_subject.is_some() && binding.signer_identity_issuer.is_some()
         }) {
             // This render carries signer identities toward Trustee: record
-            // the obligation as its own committed write (see the helper) so
-            // even a lost ConfigMap write or a later deploy failure keeps
-            // the evidence. Only a binding that pins a signer can keep the
-            // rotated-out signer authorized; null-identity renders never
+            // the obligation as its own committed write on the pool -- not
+            // the publication transaction -- so even a lost ConfigMap write
+            // or a later deploy failure keeps the evidence (the render was
+            // still owed and may have reached Trustee). This second
+            // connection cannot deadlock against the sentinel lock held
+            // above: it only touches the obligation row, which nothing ever
+            // locks FOR UPDATE. Only a binding that pins a signer can keep
+            // the rotated-out signer authorized; null-identity renders never
             // record it and never fence rotations.
-            record_legacy_publication_obligation(&mut *publication_tx).await?;
+            record_legacy_publication_obligation(db).await?;
         }
         let next_policy = replace_tls_resource_bindings_block(current_policy, &tls_bindings)?;
         let next_policy = replace_owner_bindings_block(&next_policy, &bindings)?;
         let policy_sha256_hex = hex::encode(Sha256::digest(next_policy.as_bytes()));
         let policy_token = legacy_publication_token(config, &policy_sha256_hex);
+        let has_valid_publication_event = configmap
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get(POLICY_PUBLICATION_TOKEN_ANNOTATION))
+            .is_some_and(|token| {
+                token
+                    .strip_prefix(&policy_token)
+                    .and_then(|suffix| suffix.strip_prefix(':'))
+                    .is_some_and(|nonce| Uuid::parse_str(nonce).is_ok())
+            });
 
-        if next_policy != *current_policy {
+        // Publish whenever the bytes change OR the ConfigMap carries no
+        // valid single-use event for these bytes -- first adoption of a
+        // pre-upgrade ConfigMap, or an annotation that is absent, malformed,
+        // or left over from different policy bytes. Persisting a fresh nonce
+        // rather than falling back to the deterministic hash token keeps
+        // every adoption observable and single-use (Codex review finding on
+        // #187): a Deployment retaining an older token for the same bytes
+        // must not be accepted as a healthy rollout after another writer
+        // published and rolled out different policy in between.
+        if next_policy != *current_policy || !has_valid_publication_event {
             configmap
                 .data
                 .get_or_insert_with(BTreeMap::new)
@@ -5924,13 +5948,90 @@ resource_bindings := {
             .await;
         let guard = provider.lock().await;
         assert_eq!(
-            guard.configmap_replaces, 0,
-            "an unchanged ConfigMap must not be rewritten for template adoption"
+            guard.configmap_replaces, 1,
+            "one adoption write to persist the publication nonce, then none"
         );
         assert_eq!(
             guard.deployment_replaces, 1,
             "one adoption rollout, then zero recurring Trustee rewrites"
         );
+    }
+
+    /// Adopting unchanged legacy bytes must persist a single-use publication
+    /// event rather than leaning on the deterministic hash token (Codex
+    /// review finding on #187): a pre-upgrade ConfigMap without a valid
+    /// annotation gets a fresh nonce and a real rollout, so a Deployment that
+    /// kept an older token for the same bytes cannot be mistaken for a
+    /// healthy rollout of an intervening external publication.
+    #[tokio::test]
+    async fn legacy_adoption_persists_publication_nonce() {
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap187_legacy_adoption_nonce").await;
+        let config = legacy_kbs_test_config();
+        let mut fixture = KbsPolicyProvider::new(true);
+        let policy = fixture.configmap["data"]["policy.rego"].as_str().unwrap();
+        let policy = replace_tls_resource_bindings_block(policy, &[]).unwrap();
+        let policy = replace_owner_bindings_block(&policy, &[]).unwrap();
+        fixture.configmap["data"]["policy.rego"] = serde_json::json!(policy);
+        let provider = std::sync::Arc::new(tokio::sync::Mutex::new(fixture));
+        let client = crate::test_support::kbs_policy_kube_client(provider.clone());
+        crate::kbs::TEST_KUBE_CLIENT
+            .scope(client, async {
+                // First adoption of the pre-upgrade ConfigMap: the bytes are
+                // already correct but no publication event exists, so a
+                // nonce must be persisted and rolled out.
+                reconcile_policy(&pool, Some(&config)).await.unwrap();
+                {
+                    let guard = provider.lock().await;
+                    assert_eq!(guard.configmap_replaces, 1);
+                    assert_eq!(guard.deployment_replaces, 1);
+                    let annotation = guard.configmap["metadata"]["annotations"]
+                        [POLICY_PUBLICATION_TOKEN_ANNOTATION]
+                        .as_str()
+                        .expect("adoption must persist a publication token annotation");
+                    assert!(
+                        annotation.starts_with("legacy:kbs-test/resource-policy/policy.rego:"),
+                        "the persisted token must be namespaced to this policy body, got {annotation}"
+                    );
+                    let nonce = annotation.rsplit(':').next().unwrap();
+                    assert!(
+                        Uuid::parse_str(nonce).is_ok(),
+                        "the persisted token must carry a fresh single-use nonce, got {annotation}"
+                    );
+                }
+
+                // An external writer restores the original bytes but strips
+                // the publication event (or leaves a malformed one): the
+                // adoption must be re-observed with a fresh nonce and a real
+                // rollout, never accepted via the deterministic token.
+                {
+                    let mut guard = provider.lock().await;
+                    guard.configmap["metadata"]["resourceVersion"] = serde_json::json!("3");
+                    guard.configmap["metadata"]["annotations"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove(POLICY_PUBLICATION_TOKEN_ANNOTATION);
+                }
+                reconcile_policy(&pool, Some(&config)).await.unwrap();
+                {
+                    let guard = provider.lock().await;
+                    assert_eq!(
+                        guard.configmap_replaces, 2,
+                        "an adoption without a valid publication event must rewrite the ConfigMap"
+                    );
+                    assert_eq!(
+                        guard.deployment_replaces, 2,
+                        "the re-adoption must trigger a fresh Trustee rollout"
+                    );
+                }
+
+                // Steady state: a valid event for these bytes stays put.
+                reconcile_policy(&pool, Some(&config)).await.unwrap();
+                let guard = provider.lock().await;
+                assert_eq!(guard.configmap_replaces, 2);
+                assert_eq!(guard.deployment_replaces, 2);
+            })
+            .await;
     }
 
     #[tokio::test]
