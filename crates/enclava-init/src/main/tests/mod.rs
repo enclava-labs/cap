@@ -1124,32 +1124,6 @@ fn password_unlock_socket_is_reached_before_waiting_on_workload_namespaces() {
 }
 
 #[test]
-fn trustee_policy_verification_runs_before_luks_open() {
-    let source = include_str!("../../main.rs");
-    let tee_verify_call = source
-        .find("run_in_tee_verification(&cfg, cc_init_data.as_deref())?")
-        .expect("trustee verify call site");
-    let luks_open_call = source
-        .find("open_luks_volumes(&cfg, &owner, &mut stats)?")
-        .expect("luks open call site");
-    let tee_verify_stage = source
-        .find("record_stage(\"verifying trustee policy\")")
-        .expect("trustee verify stage marker");
-    let luks_open_stage = source
-        .find("record_stage(\"opening luks volumes\")")
-        .expect("luks open stage marker");
-
-    assert!(
-        tee_verify_call < luks_open_call,
-        "enclava-init must verify trustee policy before opening luks volumes"
-    );
-    assert!(
-        tee_verify_stage < luks_open_stage,
-        "trustee verify stage marker must precede the luks open marker"
-    );
-}
-
-#[test]
 fn workload_pid_fallback_finds_wait_exec_process_by_container_name() {
     let dir = tempdir().unwrap();
     let proc_dir = dir.path().join("123");

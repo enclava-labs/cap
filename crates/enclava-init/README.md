@@ -1,7 +1,7 @@
 # enclava-init
 
 `enclava-init` is the in-TEE runtime sidecar for CAP workloads. It runs inside
-the Kata guest, opens encrypted volumes, verifies the workload trust chain,
+the Kata guest, verifies the workload trust chain, opens encrypted volumes,
 prepares tenant TLS state, creates app bind mounts, and signals the app and
 tenant ingress containers through `/run/enclava/init-ready`.
 
@@ -73,7 +73,9 @@ When policy-read mode is enabled, `enclava-init` verifies:
 5. signed policy artifact and rendered Trustee policy;
 6. runtime identity and artifact bindings.
 
-Any mismatch fails startup before seeds are released.
+Any mismatch fails startup before encrypted volumes are opened or seeds are
+released. The check consumes the same signed `cc_init_data` bytes as the
+ConfigMap transport cross-check.
 
 ## TLS State
 
