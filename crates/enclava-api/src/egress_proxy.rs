@@ -24,19 +24,42 @@
 //! there is no second resolution to race.
 //!
 //! Scope notes:
-//! - Only CONNECT is served. Plain-HTTP proxy-style requests are refused,
-//!   matching the https-only egress policy.
+//! - CONNECT is served for HTTPS destinations (the production path). The
+//!   debug-only `COSIGN_ALLOW_HTTP_REGISTRY` flag routes cleartext registry
+//!   traffic as absolute-form proxy requests; those are served too, but the
+//!   destination is resolved and blocklist-checked here exactly like a
+//!   CONNECT target and the cleartext request is forwarded verbatim to the
+//!   validated address only (cap#241 review). Everything else — including
+//!   `https://` absolute-form (a cleartext request cannot carry TLS) and
+//!   origin-form requests — is refused.
 //! - The registry allowlist is NOT re-enforced here: a custom allowlisted
-//!   registry may legitimately run its token realm on a different host.
+//!   registry may legitimately run its token realm on a different host, and
+//!   manifest/blob redirects to CDN hosts are normal registry behavior.
 //!   The allowlist still gates the initial registry URL in
 //!   `EgressGuard::check_registry_url`; this proxy enforces the SSRF
-//!   network blocklist for every dialed destination.
+//!   network blocklist for every dialed destination (see the cap#241
+//!   review discussion for why per-hop hostname checks would break
+//!   legitimate registries without adding security).
 //! - Any port is accepted for CONNECT: the destination NETWORK is the SSRF
 //!   boundary, TLS is always performed by the client regardless of port,
-//!   and HTTPS registries on non-443 ports must keep working.
+//!   and HTTPS registries on non-443 ports (including HTTPS-on-80, whose
+//!   authority keeps its explicit `:80` — parsed straight from the CONNECT
+//!   authority because URL normalization would strip a scheme-default
+//!   port) must keep working.
+//! - Resource bounds (cap#241 review): a connection that sends no request
+//!   head within `REQUEST_HEAD_IDLE_TIMEOUT` is refused and closed, so a
+//!   local client cannot park unbounded idle tasks/sockets on the API;
+//!   established tunnels and forwarded exchanges that go silent for
+//!   `TUNNEL_IDLE_TIMEOUT` are torn down; at most
+//!   `MAX_PROXY_CONNECTIONS` connections are served concurrently, so even
+//!   a never-idle local client cannot accumulate unbounded tasks/sockets;
+//!   and the accept loop retries transient accept failures (e.g. temporary
+//!   FD exhaustion) with a bounded backoff instead of dying while callers
+//!   keep the cached URL.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream};
@@ -46,6 +69,38 @@ use crate::clients::{BlockedNetworks, ClientError};
 /// Maximum bytes accepted for a CONNECT request head. Anything larger is a
 /// malformed (or hostile) client and gets refused.
 const MAX_REQUEST_HEAD_BYTES: usize = 8192;
+
+/// A connection must send its request head within this window or it is
+/// refused and closed. Bounds the task/socket cost of idle connections.
+#[cfg(test)]
+const REQUEST_HEAD_IDLE_TIMEOUT: Duration = Duration::from_millis(750);
+#[cfg(not(test))]
+const REQUEST_HEAD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// An established CONNECT tunnel (or forwarded cleartext exchange) that
+/// transfers no data in either direction for this long is torn down.
+#[cfg(test)]
+const TUNNEL_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(not(test))]
+const TUNNEL_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Backoff (min and max) for transient `accept()` failures; the listener is
+/// retained and retried forever with exponential growth capped here.
+const ACCEPT_BACKOFF_START: Duration = Duration::from_millis(100);
+const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(5);
+
+/// Timeout for dialing a cleartext upstream in the forwarded-request path.
+const HTTP_UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Maximum concurrent client connections served at once. Each in-flight
+/// connection (head read, tunnel, or forward) holds one slot for its whole
+/// lifetime; when none remain, further connections are refused and closed
+/// immediately. Bounds the worst case a local client can impose even when
+/// it never goes idle (cap#241 review).
+#[cfg(test)]
+const MAX_PROXY_CONNECTIONS: usize = 4;
+#[cfg(not(test))]
+const MAX_PROXY_CONNECTIONS: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct EgressProxy {
@@ -99,17 +154,45 @@ impl EgressProxy {
 }
 
 async fn accept_loop(listener: TcpListener, blocked: Arc<BlockedNetworks>) {
+    let mut backoff = ACCEPT_BACKOFF_START;
+    // One permit per in-flight connection: head read, tunnel, or forward.
+    // Acquired BEFORE spawn so the slot is held from the moment the socket
+    // is accepted (no gap a connection could slip through), released when
+    // the handler finishes. `MAX_PROXY_CONNECTIONS` bounds the worst case
+    // even against a client that never goes idle (cap#241 review).
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_PROXY_CONNECTIONS));
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
+                backoff = ACCEPT_BACKOFF_START;
+                let permit = match slots.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        // At capacity: refuse and close immediately rather
+                        // than queueing (queueing would reintroduce the
+                        // unbounded task/socket cost the cap exists to
+                        // bound).
+                        tracing::warn!("egress proxy at connection cap; refusing");
+                        drop(stream);
+                        continue;
+                    }
+                };
                 let blocked = Arc::clone(&blocked);
                 tokio::spawn(async move {
                     handle_conn(stream, blocked).await;
+                    drop(permit);
                 });
             }
             Err(e) => {
-                tracing::warn!(error = %e, "egress proxy accept failed; stopping listener");
-                return;
+                // Transient accept failures (e.g. temporary FD exhaustion)
+                // must not kill the listener while `EgressProxy::url` keeps
+                // handing out its address: retry with a bounded backoff
+                // instead of returning (cap#241 review). Fatal listener
+                // errors surface again on the next accept attempt; the
+                // loop never exits silently.
+                tracing::warn!(error = %e, backoff_ms = backoff.as_millis() as u64, "egress proxy accept failed; retrying");
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(ACCEPT_BACKOFF_MAX);
             }
         }
     }
@@ -119,69 +202,139 @@ async fn handle_conn(mut stream: TcpStream, blocked: Arc<BlockedNetworks>) {
     let head = match read_request_head(&mut stream).await {
         Some(head) => head,
         None => {
+            // Includes idle-timeout: a client that never sends a request
+            // head is refused and closed, bounding the connection cost.
             let _ = write_forbidden(&mut stream).await;
             return;
         }
     };
     let first_line = head.lines().next().unwrap_or("");
-    let Some(target) = parse_connect_target(first_line) else {
-        // Not a valid CONNECT (includes plain proxy-style GET/POST, which
-        // the https-only policy refuses).
-        tracing::warn!(line = %first_line, "egress proxy refused non-CONNECT request");
-        let _ = write_forbidden(&mut stream).await;
-        return;
-    };
-
-    match resolve_tunnel_destination(&target, &blocked).await {
-        Ok(destination) => {
-            // Dial only addresses that were validated above: for hostnames
-            // `resolve_tunnel_destination` returns the checked answers
-            // themselves, so there is no second, unguarded resolution.
-            let upstream = match TcpStream::connect(destination.as_slice()).await {
-                Ok(upstream) => upstream,
-                Err(e) => {
-                    tracing::warn!(error = %e, target = %target.host, "egress proxy dial failed");
-                    let _ = write_forbidden(&mut stream).await;
+    if first_line.to_ascii_uppercase().starts_with("CONNECT") {
+        let Some(target) = parse_connect_target(first_line) else {
+            tracing::warn!(line = %first_line, "egress proxy refused malformed CONNECT");
+            let _ = write_forbidden(&mut stream).await;
+            return;
+        };
+        match resolve_tunnel_destination(&target, &blocked).await {
+            Ok(destination) => {
+                // Dial only addresses that were validated above: for hostnames
+                // `resolve_tunnel_destination` returns the checked answers
+                // themselves, so there is no second, unguarded resolution.
+                let upstream = match tokio::time::timeout(
+                    HTTP_UPSTREAM_CONNECT_TIMEOUT,
+                    TcpStream::connect(destination.as_slice()),
+                )
+                .await
+                {
+                    Ok(Ok(upstream)) => upstream,
+                    _ => {
+                        tracing::warn!(target = %target.host, "egress proxy dial failed");
+                        let _ = write_forbidden(&mut stream).await;
+                        return;
+                    }
+                };
+                if stream
+                    .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                    .await
+                    .is_err()
+                {
                     return;
                 }
-            };
-            if stream
-                .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
-                .await
-                .is_err()
-            {
-                return;
+                let mut upstream = upstream;
+                let _ = idle_bounded_copy(&mut stream, &mut upstream).await;
             }
-            let mut upstream = upstream;
-            // Errors here just tear down one tunnel; the proxy stays up.
-            let _ = copy_bidirectional(&mut stream, &mut upstream).await;
+            Err(reason) => {
+                tracing::warn!(reason = %reason, target = %target.host, "egress proxy refused CONNECT");
+                let _ = write_forbidden(&mut stream).await;
+            }
         }
-        Err(reason) => {
-            tracing::warn!(reason = %reason, target = %target.host, "egress proxy refused CONNECT");
-            let _ = write_forbidden(&mut stream).await;
-        }
+        return;
     }
+    // Not a CONNECT: the only other accepted form is the absolute-form
+    // `GET/... http://host:port/... HTTP/1.1` used when the debug-only
+    // `COSIGN_ALLOW_HTTP_REGISTRY` flag routes cleartext registry traffic
+    // through `http_proxy` (cap#241 review). The destination is validated
+    // exactly like a CONNECT target and the request is forwarded to the
+    // validated address only; redirects are NOT followed by this proxy —
+    // the client re-issues them through the proxy, re-validating each hop.
+    if let Some(target) = parse_absolute_form_http_target(first_line) {
+        match resolve_tunnel_destination(&target, &blocked).await {
+            Ok(destination) => {
+                let upstream = match tokio::time::timeout(
+                    HTTP_UPSTREAM_CONNECT_TIMEOUT,
+                    TcpStream::connect(destination.as_slice()),
+                )
+                .await
+                {
+                    Ok(Ok(upstream)) => upstream,
+                    _ => {
+                        tracing::warn!(target = %target.host, "egress proxy dial failed");
+                        let _ = write_forbidden(&mut stream).await;
+                        return;
+                    }
+                };
+                let mut upstream = upstream;
+                // Replay the full request head verbatim (the head reader
+                // buffers exactly up to the `\r\n\r\n` terminator, so a
+                // pipelined body stays in the socket)...
+                if upstream.write_all(head.as_bytes()).await.is_err() {
+                    return;
+                }
+                // ...then pipe bidirectionally (request body + response),
+                // torn down when the exchange goes idle.
+                let _ = idle_bounded_copy(&mut stream, &mut upstream).await;
+            }
+            Err(reason) => {
+                tracing::warn!(reason = %reason, target = %target.host, "egress proxy refused HTTP forward");
+                let _ = write_forbidden(&mut stream).await;
+            }
+        }
+        return;
+    }
+    tracing::warn!(line = %first_line, "egress proxy refused non-CONNECT request");
+    let _ = write_forbidden(&mut stream).await;
 }
 
 /// Read up to the end of the HTTP request head (`\r\n\r\n`), bounded by
-/// `MAX_REQUEST_HEAD_BYTES`. The CONNECT client waits for the proxy
-/// response before sending anything else, so the head cannot be followed
-/// by tunnel payload in the same read.
+/// `MAX_REQUEST_HEAD_BYTES` and `REQUEST_HEAD_IDLE_TIMEOUT`. The CONNECT
+/// client waits for the proxy response before sending anything else, so
+/// the head cannot be followed by tunnel payload in the same read. A
+/// connection that stays silent past the idle timeout is refused, so a
+/// local client cannot park unbounded idle tasks/sockets on the API
+/// (cap#241 review).
 async fn read_request_head(stream: &mut TcpStream) -> Option<String> {
     let mut buf = Vec::with_capacity(512);
     let mut chunk = [0u8; 1024];
-    loop {
-        let n = stream.read(&mut chunk).await.ok()?;
-        if n == 0 {
-            return None;
+    let read = async {
+        loop {
+            let n = stream.read(&mut chunk).await.ok()?;
+            if n == 0 {
+                return None;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.ends_with(b"\r\n\r\n") {
+                return Some(String::from_utf8_lossy(&buf).into_owned());
+            }
+            if buf.len() > MAX_REQUEST_HEAD_BYTES {
+                return None;
+            }
         }
-        buf.extend_from_slice(&chunk[..n]);
-        if buf.ends_with(b"\r\n\r\n") {
-            return Some(String::from_utf8_lossy(&buf).into_owned());
-        }
-        if buf.len() > MAX_REQUEST_HEAD_BYTES {
-            return None;
-        }
+    };
+    tokio::time::timeout(REQUEST_HEAD_IDLE_TIMEOUT, read)
+        .await
+        .ok()?
+}
+
+/// `copy_bidirectional` torn down when the tunnel goes silent for
+/// `TUNNEL_IDLE_TIMEOUT` in both directions: an established tunnel must
+/// not hold a task and two sockets alive indefinitely (cap#241 review).
+async fn idle_bounded_copy(a: &mut TcpStream, b: &mut TcpStream) -> std::io::Result<()> {
+    match tokio::time::timeout(TUNNEL_IDLE_TIMEOUT, copy_bidirectional(a, b)).await {
+        Ok(result) => result.map(|_| ()),
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "egress proxy tunnel idle",
+        )),
     }
 }
 
@@ -190,10 +343,32 @@ struct ConnectTarget {
     port: u16,
 }
 
+/// Split an authority-form host into (host, explicit port). Handles
+/// bracketed IPv6 literals (`[2001:db8::1]:443`) without URL parsing, so
+/// a scheme-default port (80 over `http://`, 443 over `https://`) cannot
+/// be normalized away — a CONNECT to an HTTPS-on-port-80 registry must
+/// keep its explicit `:80` (cap#241 review).
+fn split_authority_port(authority: &str) -> Option<(String, u16)> {
+    if let Some(rest) = authority.strip_prefix('[') {
+        // Bracketed IPv6 literal: the closing bracket must be followed by
+        // `:port`.
+        let (literal, tail) = rest.split_once(']')?;
+        let port = tail.strip_prefix(':')?.parse::<u16>().ok()?;
+        return Some((format!("[{literal}]"), port));
+    }
+    let (host, port) = authority.rsplit_once(':')?;
+    if host.contains(':') {
+        // Unbracketed IPv6 — malformed for an authority with a port.
+        return None;
+    }
+    Some((host.to_string(), port.parse::<u16>().ok()?))
+}
+
 /// Parse a `CONNECT host:port HTTP/1.1` request line. Accepts bracketed
 /// IPv6 literals; rejects anything carrying a path or userinfo, and
 /// requires an explicit `HTTP/` version token (a bare `CONNECT host:port`
-/// is malformed).
+/// is malformed). The port comes straight from the authority — URL
+/// normalization would drop a scheme-default port like `:80`.
 fn parse_connect_target(line: &str) -> Option<ConnectTarget> {
     let mut parts = line.split_whitespace();
     if !parts.next()?.eq_ignore_ascii_case("CONNECT") {
@@ -203,14 +378,50 @@ fn parse_connect_target(line: &str) -> Option<ConnectTarget> {
     if !parts.next()?.starts_with("HTTP/") {
         return None;
     }
-    // Parse as a URL to borrow reqwest's authority grammar; then require a
-    // bare authority (no path, no userinfo) and an explicit port.
+    let (host, port) = split_authority_port(target)?;
+    // Validate the host spelling via URL grammar (rejects userinfo,
+    // paths, and other garbage an authority must not carry).
     let url = reqwest::Url::parse(&format!("http://{target}")).ok()?;
     if url.path() != "/" || !url.username().is_empty() {
         return None;
     }
+    if url.host_str()? != host {
+        return None;
+    }
+    Some(ConnectTarget { host, port })
+}
+
+/// Parse an absolute-form proxy request line
+/// `GET http://host:port/path HTTP/1.1` (also HEAD/POST/PUT/DELETE/PATCH,
+/// the verbs an OCI client uses). Only cleartext `http://` URLs are
+/// accepted: reqwest sends absolute-form requests to `http_proxy` for
+/// plain-HTTP destinations when the debug-only
+/// `COSIGN_ALLOW_HTTP_REGISTRY` flag is enabled (cap#241 review), while
+/// HTTPS destinations always use CONNECT. An `https://` absolute-form
+/// request cannot be served — the proxy has no TLS material — and is
+/// refused.
+fn parse_absolute_form_http_target(line: &str) -> Option<ConnectTarget> {
+    let mut parts = line.split_whitespace();
+    let method = parts.next()?;
+    if !matches!(
+        method.to_ascii_uppercase().as_str(),
+        "GET" | "HEAD" | "POST" | "PUT" | "DELETE" | "PATCH"
+    ) {
+        return None;
+    }
+    let target = parts.next()?;
+    if !parts.next()?.starts_with("HTTP/") {
+        return None;
+    }
+    let url = reqwest::Url::parse(target).ok()?;
+    if url.scheme() != "http" {
+        return None;
+    }
     let host = url.host_str()?.to_string();
-    let port = url.port()?;
+    let port = url.port_or_known_default()?;
+    if !url.username().is_empty() {
+        return None;
+    }
     Some(ConnectTarget { host, port })
 }
 
@@ -333,17 +544,141 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_plain_http_proxy_requests() {
+    async fn rejects_plain_https_proxy_requests() {
         let proxy = EgressProxy::new(Arc::new(BlockedNetworks::defaults()));
         let url = proxy.url().unwrap();
+        // https:// absolute-form cannot be served: the proxy has no TLS
+        // material, HTTPS must go through CONNECT.
         let response = roundtrip(
             &url,
-            "GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            "GET https://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n",
         )
         .await;
         assert!(
             response.starts_with("HTTP/1.1 403"),
-            "non-CONNECT requests must be refused, got: {response}"
+            "https absolute-form must be refused, got: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_origin_form_requests() {
+        let proxy = EgressProxy::new(Arc::new(BlockedNetworks::defaults()));
+        let url = proxy.url().unwrap();
+        let response = roundtrip(&url, "GET /v2/ HTTP/1.1\r\nHost: example.com\r\n\r\n").await;
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "origin-form requests must be refused, got: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_connections_are_refused() {
+        // A connection that never sends a request head must be closed
+        // within the (test-shortened) idle window instead of parking a
+        // task and socket forever.
+        let proxy = EgressProxy::new(Arc::new(BlockedNetworks::defaults()));
+        let url = proxy.url().unwrap();
+        let mut stream = connect_raw(&url).await;
+        let mut chunk = [0u8; 64];
+        let start = std::time::Instant::now();
+        let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut chunk))
+            .await
+            .expect("proxy must respond within the idle window")
+            .unwrap_or(0);
+        assert!(
+            n == 0 || chunk[..n].starts_with(b"HTTP/1.1 403"),
+            "idle connection must be refused, got: {n} bytes"
+        );
+        assert!(
+            start.elapsed() >= REQUEST_HEAD_IDLE_TIMEOUT,
+            "refusal must come from the idle timeout, not instantly"
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_cap_refuses_beyond_limit() {
+        // `MAX_PROXY_CONNECTIONS` (4 under cfg(test)) connections may be
+        // in flight; the next one must be refused immediately (closed or
+        // 403) rather than accepted into an unbounded set.
+        let proxy = EgressProxy::new(Arc::new(BlockedNetworks::defaults()));
+        let url = proxy.url().unwrap();
+        // Hold the cap open with connections that send nothing (each
+        // occupies a slot until its idle timeout fires).
+        let mut holders = Vec::new();
+        for _ in 0..MAX_PROXY_CONNECTIONS {
+            holders.push(connect_raw(&url).await);
+        }
+        // Give the accept loop a moment to register the holders, then the
+        // over-cap connection must be refused right away: either closed
+        // with no bytes or served a 403 — never left hanging.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut extra = connect_raw(&url).await;
+        let mut chunk = [0u8; 64];
+        let n = tokio::time::timeout(Duration::from_secs(3), extra.read(&mut chunk))
+            .await
+            .expect("over-cap connection must not hang")
+            .unwrap_or(0);
+        assert!(
+            n == 0 || chunk[..n].starts_with(b"HTTP/1.1 403"),
+            "over-cap connection must be refused, got {n} bytes: {}",
+            String::from_utf8_lossy(&chunk[..n])
+        );
+    }
+
+    #[tokio::test]
+    async fn forwards_absolute_form_http_to_validated_destination() {
+        // The debug HTTP-registry path: an absolute-form request is
+        // resolved + blocklist-checked and forwarded to the validated
+        // address only (cap#241 review).
+        let echo = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = echo.accept().await {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                // Read the forwarded request head, then answer.
+                while !buf.ends_with(b"\r\n\r\n") {
+                    match sock.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await;
+            }
+        });
+
+        // Default blocklist refuses loopback, so run with an empty one;
+        // a companion test below proves loopback is refused with the
+        // default policy.
+        let proxy = EgressProxy::new(Arc::new(BlockedNetworks::empty()));
+        let url = proxy.url().unwrap();
+        let response = roundtrip(
+            &url,
+            &format!("GET http://{echo_addr}/v2/ HTTP/1.1\r\nHost: {echo_addr}\r\n\r\n"),
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 200") && response.ends_with("ok"),
+            "validated absolute-form request must be forwarded, got: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_absolute_form_http_to_blocked_destination() {
+        let proxy = EgressProxy::new(Arc::new(BlockedNetworks::defaults()));
+        let url = proxy.url().unwrap();
+        let response = roundtrip(
+            &url,
+            "GET http://127.0.0.1:5000/v2/ HTTP/1.1\r\nHost: 127.0.0.1:5000\r\n\r\n",
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "absolute-form request to blocked destination must be refused, got: {response}"
         );
     }
 
@@ -421,7 +756,39 @@ mod tests {
         assert_eq!(t.host, "[2001:db8::1]");
         assert_eq!(t.port, 8443);
 
+        // HTTPS-on-port-80 registry: the explicit `:80` must survive even
+        // though it is http's scheme-default port (URL normalization would
+        // strip it — cap#241 review).
+        let t = parse_connect_target("CONNECT registry.example:80 HTTP/1.1").unwrap();
+        assert_eq!(t.host, "registry.example");
+        assert_eq!(t.port, 80);
+
         assert!(parse_connect_target("GET http://x/ HTTP/1.1").is_none());
         assert!(parse_connect_target("CONNECT host:443").is_none()); // no version
+        assert!(parse_connect_target("CONNECT host HTTP/1.1").is_none()); // no port
+        assert!(parse_connect_target("CONNECT [2001:db8::1] HTTP/1.1").is_none()); // bare bracketed, no port
+    }
+
+    #[test]
+    fn parse_absolute_form_http_target_forms() {
+        let t = parse_absolute_form_http_target("GET http://registry.example:5000/v2/ HTTP/1.1")
+            .unwrap();
+        assert_eq!(t.host, "registry.example");
+        assert_eq!(t.port, 5000);
+
+        let t =
+            parse_absolute_form_http_target("POST http://registry.example/v2/ HTTP/1.1").unwrap();
+        assert_eq!(t.host, "registry.example");
+        assert_eq!(t.port, 80); // scheme default
+
+        // https:// absolute-form cannot be forwarded by a cleartext proxy.
+        assert!(parse_absolute_form_http_target("GET https://x/ HTTP/1.1").is_none());
+        // Origin-form is not a proxy request.
+        assert!(parse_absolute_form_http_target("GET /v2/ HTTP/1.1").is_none());
+        // Userinfo must not sneak a host through.
+        assert!(
+            parse_absolute_form_http_target("GET http://u:p@x/ HTTP/1.1").is_none(),
+            "userinfo must be rejected"
+        );
     }
 }
