@@ -62,6 +62,33 @@ Auto-unlock mode:
 - uses the configured owner resource path;
 - still runs the same runtime verification path before seed release.
 
+## Volume Initialization
+
+`state` and `tls-state` devices are LUKS2 volumes. On every boot the sidecar
+checks for a LUKS2 header; if one exists it opens the volume and no probe or
+scan runs — already-provisioned volumes (including sub-floor ones from
+before the 32 MiB minimum, which activate fine) are never re-scanned.
+
+When no header is found, `blank=true` would authorize `luksFormat`, so the
+device must be proven all-zero before the first format: the entire device is
+read in 1 MiB chunks (a short or failed read never counts as blank).
+The scan is O(device size). Progress is logged every 30 s with scanned/total
+bytes and a completion duration. Initialization time depends on actual guest
+and Longhorn throughput; do not infer it from the raw volume's zero contents.
+Devices below 32 MiB are refused before scanning. This fresh-format floor is
+enforced at API admission and immediately before render. Existing live
+ordinal-zero claims are grandfathered per volume; missing or terminating
+claims and unrelated ordinals cannot grant that exemption. Existing LUKS2
+volumes are opened without reformatting.
+
+The rollout budget adds two sequential passes over both requested volumes to
+the configured base timeout, assuming at least 32 MiB/s for scanning and
+integrity-tag initialization. This is a bounded estimate, not a throughput
+guarantee: qualify the intended storage sizes and lower that assumption if
+measurements are slower. Durable observers retain the original deadline
+across restarts and release worker slots after each 90-second observation
+slice. Password owner wait remains separately nonterminal.
+
 ## Verification Chain
 
 When policy-read mode is enabled, `enclava-init` verifies:

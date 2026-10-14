@@ -1717,10 +1717,16 @@ async fn apply_claimed_job(
             let engine = ApplyEngine::try_default()
                 .await
                 .map_err(|error| DeploymentJobError::Apply(error.into()))?;
-            let outcome =
-                DeploymentRollout::observe_only(*app, engine, manifest_hash, observing_since)
-                    .watch()
-                    .await;
+            let outcome = DeploymentRollout::observe_only(
+                *app,
+                engine,
+                manifest_hash,
+                observing_since,
+                &payload.snapshot.resources.app_data_size,
+                &payload.snapshot.resources.tls_data_size,
+            )?
+            .watch()
+            .await;
             return Ok(JobApplyOutcome::Applied(outcome));
         }
         None => {}
@@ -1985,6 +1991,19 @@ async fn acquire_apply_permit_and_revalidate(
     )
     .await?;
 
+    // Fresh-volume floor: which sub-floor claims in the accepted snapshot
+    // would provision a NEW PVC — live cluster evidence, computed BEFORE
+    // the authority lanes so no kube I/O runs under them (and none at all
+    // for at/above-floor snapshots). A surviving sub-floor claim keeps the
+    // snapshot operable; a missing/terminating one makes the floor
+    // authoritative HERE so a sub-floor snapshot that slipped past
+    // admission (mixed-version window, pre-floor API instance, or a retry
+    // after a crash between the hash write and apply_all) fails before the
+    // PVC is created, leaving the app correctable.
+    let fresh_volume_claims =
+        crate::routes::deployments::fresh_volume_claims(&payload.app, &payload.snapshot.resources)
+            .await?;
+
     // Revalidate every mutable authority immediately before external side
     // effects while holding the global authority order. Keyring rotation,
     // entitlement revocation, app mutation, deletion and generation
@@ -2038,26 +2057,12 @@ async fn acquire_apply_permit_and_revalidate(
         {
             return Err(DeploymentJobError::Authority);
         }
-        // Apply-job revalidation of the accepted snapshot's PERSISTED
-        // resources: grandfathered pre-floor sizes keep operating. Exception:
-        // if no deployment for this app has EVER persisted a manifest hash,
-        // this apply is the first render and provisions the volumes fresh —
-        // enforce the 32 MiB floor so a sub-floor snapshot that slipped past
-        // admission (mixed-version window, pre-floor API instance) fails
-        // HERE, before the hash is written and the PVC created, leaving the
-        // app correctable. A grandfathered app always has a hashed
-        // deployment, so it takes the false branch.
-        let fresh_volume_sizes = !crate::routes::deployments::app_has_ever_rendered_workload(
-            &mut authority_lane,
-            job.app_id,
-        )
-        .await?;
         crate::routes::deployments::enforce_authoritative_entitlement(
             &mut authority_lane,
             job.org_id,
             &payload.snapshot.resources,
             false,
-            fresh_volume_sizes,
+            fresh_volume_claims,
         )
         .await
         .map_err(|_| DeploymentJobError::Authority)?;
@@ -5312,7 +5317,10 @@ mod tests {
             engine,
             "admission-manifest".to_string(),
             chrono::Utc::now() - chrono::Duration::seconds(601),
-        );
+            "5Gi",
+            "2Gi",
+        )
+        .expect("observe-only rollout builds");
         let outcome = watch_committed_rollout(rollout, mutation).await;
         assert!(
             observed_free.load(std::sync::atomic::Ordering::SeqCst),
@@ -5382,14 +5390,25 @@ mod tests {
         .execute(&pool)
         .await
         .expect("stage mutated app row");
+        let budget = probing_rollout_engine(Arc::new(|| {}))
+            .config()
+            .rollout_timeout_for_storage(
+                &payload.snapshot.resources.app_data_size,
+                &payload.snapshot.resources.tls_data_size,
+            )
+            .expect("fixture rollout budget");
+        let expired_anchor = chrono::Utc::now()
+            - chrono::Duration::from_std(budget).expect("supported fixture duration")
+            - chrono::Duration::seconds(1);
         sqlx::query(
             "UPDATE deployments
                 SET status = 'watching'::deploy_status_enum,
                     manifest_hash = 'resumed-manifest',
-                    observing_since = clock_timestamp() - interval '700 seconds'
+                    observing_since = $2
               WHERE id = $1",
         )
         .bind(deployment_id)
+        .bind(expired_anchor)
         .execute(&pool)
         .await
         .expect("stage durable watching marker");
@@ -5421,8 +5440,16 @@ mod tests {
         let engine = probing_rollout_engine(Arc::new(|| {}));
         let outcome = tokio::time::timeout(
             Duration::from_secs(10),
-            DeploymentRollout::observe_only(*observed, engine, manifest_hash, observing_since)
-                .watch(),
+            DeploymentRollout::observe_only(
+                *observed,
+                engine,
+                manifest_hash,
+                observing_since,
+                &payload.snapshot.resources.app_data_size,
+                &payload.snapshot.resources.tls_data_size,
+            )
+            .expect("observe-only rollout builds")
+            .watch(),
         )
         .await
         .expect("resumed observation must not park in an owner wait");

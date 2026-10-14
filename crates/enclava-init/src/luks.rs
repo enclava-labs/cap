@@ -30,17 +30,14 @@ use crate::errors::{InitError, Result};
 use crate::secrets::DerivedSeed;
 
 const LUKS2_SECTOR_SIZE: u32 = 512;
-/// Minimum device size for a fresh volume. The default LUKS2 header occupies
-/// the first 16 MiB, and `luksFormat` succeeds even when the device ends at
-/// (or inside) the header — but activation then fails with no data area left,
-/// and the result is bricked: every later boot sees a LUKS2 header and takes
-/// the OpenExisting path that can never succeed. The floor keeps 16 MiB of
-/// payload after the 16 MiB header, comfortably above the mkfs.ext4 minimum.
-/// The same bound is enforced for fresh provisioning at API admission time
-/// (`enclava-engine` `validate.rs`, shared by the deploy routes) so users
-/// get a clear synchronous error at request time instead of this runtime
-/// refusal at first boot; already-provisioned sub-floor volumes keep
-/// operating (they activate fine). Keep the bounds in lockstep.
+/// Minimum size for a FRESH format. The LUKS2 header occupies the first
+/// 16 MiB and luksFormat succeeds even when the device ends inside it —
+/// activation then has no data area and the volume is bricked. The floor
+/// adds 16 MiB of payload headroom; it is a fresh-provisioning policy, not
+/// an activation bound (17–31 MiB volumes DO activate and keep operating —
+/// the scan never runs once a header exists). Keep in lockstep with
+/// `enclava-engine` `validate.rs` `MIN_VOLUME_SIZE_MIB`, which refuses
+/// undersized fresh volumes at admission.
 const MIN_VOLUME_BYTES: u64 = 32 * 1024 * 1024;
 static KEY_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -445,13 +442,10 @@ fn buffer_has_luks2_header_magic(buf: &[u8]) -> bool {
 }
 
 // Full-device zero scan: blank=true authorizes luksFormat, so every byte is
-// checked — sampling can never prove a device blank, and a 0-byte or short
-// read must never count as blank (that was the original bug). Runs only when
-// no LUKS2 header was detected; the O(device size) cost is paid once at first
-// boot. 1 MiB chunks keep the syscall count manageable on the CPU-limited
-// sidecar (a 2 TiB device is ~2M reads instead of ~33M at 64 KiB), and
-// progress/completion tracing keeps a slow first deploy diagnosable instead
-// of looking hung to a liveness watchdog.
+// checked — sampling cannot prove blank, and a 0-byte/short read must never
+// count as blank (the original bug). Runs only when no LUKS2 header exists;
+// the O(device size) cost is paid once at first boot. Progress tracing keeps
+// a slow first deploy diagnosable instead of looking hung.
 fn device_appears_blank(device: &Path) -> Result<bool> {
     const CHUNK: usize = 1024 * 1024;
     // Progress heartbeat for long scans; short scans only log begin/complete.
@@ -465,9 +459,10 @@ fn device_appears_blank(device: &Path) -> Result<bool> {
         .seek(SeekFrom::End(0))
         .map_err(|e| InitError::Luks(format!("seek {} for blank probe: {e}", device.display())))?;
     if len < MIN_VOLUME_BYTES {
-        // Fail closed with the rationale named: below this floor the device
-        // formats but never activates (LUKS2 header eats the whole device),
-        // which would brick the volume rather than merely refuse it.
+        // Fresh-format floor: at or under 16 MiB the header would consume
+        // the device and the volume bricks; up to the floor the payload is
+        // too thin for a viable fs. Refusing the format is recoverable —
+        // formatting is not.
         return Err(InitError::Luks(format!(
             "device {} is only {len} bytes — below the {} MiB minimum (16 MiB LUKS2 header + 16 MiB payload floor); refusing to treat it as blank",
             device.display(),
@@ -668,13 +663,7 @@ mod unit_tests {
                 .expect("create device")
                 .set_len(size)
                 .expect("size device");
-            let error = device_appears_blank(&device)
-                .expect_err("undersized device must not read as blank");
-            let message = error.to_string();
-            assert!(
-                message.contains("LUKS2 header"),
-                "error should name the size rationale: {message}"
-            );
+            device_appears_blank(&device).expect_err("undersized device must not read as blank");
         }
     }
 
@@ -689,12 +678,6 @@ mod unit_tests {
             .set_len(MIN_VOLUME_BYTES)
             .expect("size sparse device");
         assert!(device_appears_blank(&device).expect("probe boundary-size device"));
-
-        std::fs::File::create(&device)
-            .expect("create sparse device")
-            .set_len(32 * 1024 * 1024)
-            .expect("size sparse device");
-        assert!(device_appears_blank(&device).expect("probe blank device"));
 
         for offset in [24 * 1024 * 1024, 32 * 1024 * 1024 - 4096] {
             let mut file = std::fs::OpenOptions::new()

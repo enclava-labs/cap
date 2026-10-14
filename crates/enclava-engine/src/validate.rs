@@ -149,15 +149,12 @@ pub fn validate_app(app: &ConfidentialApp) -> Result<(), ValidationError> {
             detail: format!("memory uses binary Mi/Gi/Ti units: {detail}"),
         }
     })?;
-    // Grammar only (positive binary quantity): the 32 MiB LUKS2 fresh-format
-    // floor is deliberately NOT enforced here. validate_app runs on every
-    // apply path — including reapply/redeploy of apps whose volumes were
-    // provisioned before the floor existed — and the spec carries no
-    // provisioning state, so a floor here would brick every later apply of a
-    // grandfathered sub-floor app (its LUKS header exists, the runtime probe
-    // is never even reached). The floor is enforced at API admission
-    // (validate_persistent_volume_size below) exactly when the size governs
-    // a fresh, not-yet-provisioned volume.
+    // Grammar only (positive binary quantity): the 32 MiB fresh-format
+    // floor is deliberately NOT here — validate_app runs on every apply
+    // path and the spec carries no provisioning state, so a floor would
+    // break reapplies of apps whose volumes predate it. Callers enforce
+    // validate_persistent_volume_size_for_fresh_provisioning when the size
+    // governs a fresh volume (API admission; apply_and_watch's PVC check).
     validate_storage_size("storage.app_data.size", &app.storage.app_data.size).map_err(
         |detail| ValidationError::InvalidStorageSize {
             field: "storage.app_data.size",
@@ -249,23 +246,14 @@ fn validate_storage_size(field: &'static str, value: &str) -> Result<(), String>
         .map_err(|_| format!("{field} must be a positive binary quantity"))
 }
 
-/// Persistent volumes (the LUKS-formatted state and tls-state devices) also
-/// need a lower bound when a FRESH volume will be provisioned for the size.
-/// The default LUKS2 header occupies the first 16 MiB, and `luksFormat`
-/// succeeds even on devices that end at (or inside) the header — but
-/// activation then has no data area left and the volume is bricked (every
-/// later boot sees a LUKS2 header and can never open it). The floor keeps
-/// 16 MiB of payload after the header, comfortably above the mkfs.ext4
-/// minimum. Enforced in lockstep with enclava-init `MIN_VOLUME_BYTES` — keep
-/// the two bounds identical.
-///
-/// NOT part of `validate_app`: that runs on every apply path, including
-/// reapplies of apps whose volumes were provisioned before this floor
-/// existed (see the comment in `validate_app`). Callers should enforce this
-/// at admission time, exactly when the size governs a fresh volume
-/// (app creation, or setting initial sizes on a never-rendered app).
-/// Rejecting there turns an opaque runtime brick into a clear, synchronous
-/// error at request time.
+/// Fresh-provisioning floor for the LUKS-formatted state/tls-state volumes.
+/// The LUKS2 header occupies the first 16 MiB and `luksFormat` succeeds on
+/// devices that end inside it — activation then has no data area and the
+/// volume is bricked. The floor adds 16 MiB of payload headroom. It is a
+/// FRESH-format policy, not an activation bound: sub-floor volumes that
+/// already exist activate and keep operating, so `validate_app` must not
+/// enforce it (see its comment). Enforced in lockstep with enclava-init
+/// `MIN_VOLUME_BYTES` — keep the two bounds identical.
 pub const MIN_VOLUME_SIZE_MIB: u128 = 32;
 
 /// Validate that a persistent-volume size is a positive binary quantity of
@@ -286,7 +274,7 @@ pub fn validate_persistent_volume_size_for_fresh_provisioning(
         .map_err(|_| format!("{field} must be a positive binary quantity"))?;
     if numerator < MIN_VOLUME_SIZE_MIB * 10u128.pow(scale) {
         return Err(format!(
-            "{field} must be at least {MIN_VOLUME_SIZE_MIB}Mi — a fresh LUKS2 volume needs the 16 MiB header plus a viable ext4 payload; smaller volumes format but never activate"
+            "{field} must be at least {MIN_VOLUME_SIZE_MIB}Mi — the fresh-format floor: a LUKS2 volume needs its 16 MiB header plus enough data-area headroom to stay usable"
         ));
     }
     Ok(())
@@ -305,6 +293,44 @@ fn binary_quantity_parts(trimmed: &str) -> Option<(&str, u128)> {
     BINARY_UNITS
         .iter()
         .find_map(|(suffix, multiplier)| trimmed.strip_suffix(*suffix).map(|n| (n, *multiplier)))
+}
+
+/// Whether a persistent-volume size parses as a valid binary quantity that
+/// is strictly below [`MIN_VOLUME_SIZE_MIB`]. Only these sizes can need the
+/// fresh-format floor's cluster check; callers must still run
+/// `validate_persistent_volume_size_for_fresh_provisioning` for the actual
+/// admission error, and grammar-invalid values return false here (they are
+/// rejected by the validator/limits path, not waived by claim evidence).
+pub fn is_sub_floor_volume_size(value: &str) -> bool {
+    let Some((number, multiplier)) = binary_quantity_parts(value) else {
+        return false;
+    };
+    let Ok((numerator, scale)) = validate_scaled_decimal(number, multiplier) else {
+        return false;
+    };
+    numerator < MIN_VOLUME_SIZE_MIB * 10u128.pow(scale)
+}
+
+/// Exact MiB value of a binary quantity, rounded UP. Used where a
+/// quantity-derived budget must never underestimate the configured size
+/// (e.g. rollout windows sized by volume bytes). Reuses the same grammar
+/// and overflow bounds as `validate_storage_size`; errors bubble as plain
+/// strings for the caller to wrap.
+pub fn storage_quantity_mib_ceil(value: &str) -> Result<u128, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed != value {
+        return Err(format!(
+            "storage quantity {value:?} must be a non-empty binary quantity"
+        ));
+    }
+    let Some((number, multiplier)) = binary_quantity_parts(trimmed) else {
+        return Err(format!(
+            "storage quantity {value:?} must use Mi, Gi, or Ti binary units"
+        ));
+    };
+    let (numerator, scale) = validate_scaled_decimal(number, multiplier)
+        .map_err(|e| format!("storage quantity {value:?} is invalid: {e}"))?;
+    Ok(numerator.div_ceil(10u128.pow(scale)))
 }
 
 /// Digit, scale, and overflow bounds mirroring the API's

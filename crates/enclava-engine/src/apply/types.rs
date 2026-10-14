@@ -76,7 +76,7 @@ impl Default for DeployStatus {
 pub struct ApplyConfig {
     /// SSA field manager name.
     pub field_manager: String,
-    /// Maximum time to wait for rollout to complete.
+    /// Rollout budget excluding volume-size-dependent initialization work.
     pub rollout_timeout: Duration,
     /// Polling interval for rollout status checks.
     pub poll_interval: Duration,
@@ -84,6 +84,24 @@ pub struct ApplyConfig {
     pub pvc_delete_timeout: Duration,
     /// Timeout for waiting on namespace deletion during cleanup.
     pub namespace_delete_timeout: Duration,
+}
+
+impl ApplyConfig {
+    pub fn rollout_timeout_for_storage(
+        &self,
+        app_data_size: &str,
+        tls_data_size: &str,
+    ) -> Result<Duration, String> {
+        let total_mib = crate::validate::storage_quantity_mib_ceil(app_data_size)?
+            .checked_add(crate::validate::storage_quantity_mib_ceil(tls_data_size)?)
+            .ok_or("volume initialization size is too large")?;
+        // shortcut: budgets two passes at 32 MiB/s; recalibrate if qualified guests are slower.
+        let seconds = u64::try_from(total_mib.div_ceil(16))
+            .map_err(|_| "volume initialization duration is too large")?;
+        self.rollout_timeout
+            .checked_add(Duration::from_secs(seconds))
+            .ok_or_else(|| "volume initialization duration is too large".to_string())
+    }
 }
 
 impl Default for ApplyConfig {

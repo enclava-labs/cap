@@ -1713,6 +1713,16 @@ mod tests {
         )
     }
 
+    fn expired_rollout_anchor() -> chrono::DateTime<chrono::Utc> {
+        let budget = rollout_test_engine()
+            .config()
+            .rollout_timeout_for_storage("32Mi", "32Mi")
+            .expect("fixture rollout budget");
+        chrono::Utc::now()
+            - chrono::Duration::from_std(budget).unwrap()
+            - chrono::Duration::seconds(1)
+    }
+
     #[tokio::test]
     async fn rollout_watch_slice_returns_nonterminal_while_budget_remains() {
         // An owner-waiting workload must release its worker slot between
@@ -1723,7 +1733,10 @@ mod tests {
             rollout_test_engine(),
             "slice-manifest".to_string(),
             chrono::Utc::now(),
+            "32Mi",
+            "32Mi",
         )
+        .expect("valid rollout sizes")
         .with_observation_slice(std::time::Duration::from_millis(50))
         .watch()
         .await;
@@ -1738,15 +1751,18 @@ mod tests {
         // A restarted observer anchors at `observing_since`: once the
         // cumulative rollout budget is spent, the slice ends immediately and
         // returns the engine timeout classification instead of restarting a
-        // fresh 600s wait.
+        // fresh initialization budget.
         let mut auto_app = queued_apply_app();
         auto_app.unlock_mode = crate::models::UnlockMode::Auto;
         let outcome = DeploymentRollout::observe_only(
             auto_app,
             rollout_test_engine(),
             "deadline-manifest".to_string(),
-            chrono::Utc::now() - chrono::Duration::seconds(601),
+            expired_rollout_anchor(),
+            "32Mi",
+            "32Mi",
         )
+        .expect("valid rollout sizes")
         .with_observation_slice(std::time::Duration::from_millis(50))
         .watch()
         .await;
@@ -1766,8 +1782,11 @@ mod tests {
             queued_apply_app(),
             engine,
             "late-unlock-manifest".to_string(),
-            chrono::Utc::now() - chrono::Duration::seconds(601),
+            expired_rollout_anchor(),
+            "32Mi",
+            "32Mi",
         )
+        .expect("valid rollout sizes")
         .with_observation_slice(std::time::Duration::from_millis(50))
         .watch()
         .await;
@@ -1785,8 +1804,11 @@ mod tests {
             queued_apply_app(),
             rollout_test_engine(),
             "password-manifest".to_string(),
-            chrono::Utc::now() - chrono::Duration::seconds(601),
+            expired_rollout_anchor(),
+            "32Mi",
+            "32Mi",
         )
+        .expect("valid rollout sizes")
         .with_observation_slice(std::time::Duration::from_millis(50))
         .watch()
         .await;
@@ -1807,14 +1829,39 @@ mod tests {
             app,
             rollout_test_engine(),
             "password-redeploy-manifest".to_string(),
-            chrono::Utc::now() - chrono::Duration::seconds(601),
+            expired_rollout_anchor(),
+            "32Mi",
+            "32Mi",
         )
+        .expect("valid rollout sizes")
         .with_observation_slice(std::time::Duration::from_millis(50))
         .watch()
         .await;
         assert_eq!(outcome.deploy_status, "watching");
         assert_eq!(outcome.app_status, "creating");
         assert!(!outcome.terminal);
+    }
+
+    #[tokio::test]
+    async fn large_volume_initialization_keeps_observing_after_base_deadline() {
+        let mut app = queued_apply_app();
+        app.unlock_mode = crate::models::UnlockMode::Auto;
+        let outcome = DeploymentRollout::observe_only(
+            app,
+            rollout_test_engine(),
+            "initializing-manifest".to_string(),
+            chrono::Utc::now() - chrono::Duration::minutes(30),
+            "2Ti",
+            "2Gi",
+        )
+        .expect("valid rollout sizes")
+        .with_observation_slice(std::time::Duration::from_millis(50))
+        .watch()
+        .await;
+        assert_eq!(outcome.deploy_status, "watching");
+        assert_eq!(outcome.app_status, "creating");
+        assert!(!outcome.terminal);
+        assert_eq!(outcome.error_code, None);
     }
 }
 
@@ -1915,7 +1962,13 @@ pub async fn reapply_tenant_ingress(
     restart_statefulset_for_ingress(&engine, &app_spec.namespace, &app_spec.name, generation)
         .await?;
 
-    let status = watch_rollout(&engine, &app_spec.namespace, &app_spec.name).await?;
+    let status = watch_rollout(
+        &engine,
+        &app_spec.namespace,
+        &app_spec.name,
+        engine.config().rollout_timeout,
+    )
+    .await?;
     if status.phase != DeployPhase::Running {
         return Err(enclava_engine::apply::engine::ApplyError::RolloutFailed(
             status
@@ -2005,6 +2058,7 @@ pub struct DeploymentRollout {
     pub(crate) manifest_hash: String,
     observing_since: chrono::DateTime<chrono::Utc>,
     observation_slice: std::time::Duration,
+    rollout_timeout: std::time::Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2025,10 +2079,16 @@ impl DeploymentRollout {
         engine: ApplyEngine,
         manifest_hash: String,
         observing_since: chrono::DateTime<chrono::Utc>,
-    ) -> Self {
+        app_data_size: &str,
+        tls_data_size: &str,
+    ) -> Result<Self, DeployError> {
+        let rollout_timeout = engine
+            .config()
+            .rollout_timeout_for_storage(app_data_size, tls_data_size)
+            .map_err(DeployError::Validation)?;
         let namespace = app.namespace.clone();
         let workload_name = app.name.clone();
-        Self {
+        Ok(Self {
             app,
             engine,
             namespace,
@@ -2036,7 +2096,8 @@ impl DeploymentRollout {
             manifest_hash,
             observing_since,
             observation_slice: ROLLOUT_OBSERVATION_SLICE,
-        }
+            rollout_timeout,
+        })
     }
 
     #[cfg(test)]
@@ -2064,7 +2125,7 @@ impl DeploymentRollout {
             status => status,
         };
         let unlock_mode = self.app.unlock_mode;
-        let total = self.engine.config().rollout_timeout;
+        let total = self.rollout_timeout;
         let elapsed = chrono::Utc::now()
             .signed_duration_since(self.observing_since)
             .to_std()
@@ -2081,7 +2142,7 @@ impl DeploymentRollout {
         };
         let result = match tokio::time::timeout(
             slice,
-            watch_rollout(&self.engine, &self.namespace, &self.workload_name),
+            watch_rollout(&self.engine, &self.namespace, &self.workload_name, total),
         )
         .await
         {
@@ -2232,9 +2293,23 @@ pub async fn apply_deployment_manifests(
 
     let generation = MutationGeneration::new(kubernetes_mutation_generation)?;
     let engine = ApplyEngine::try_default().await?;
+    let rollout_timeout = engine
+        .config()
+        .rollout_timeout_for_storage(
+            &app_spec.storage.app_data.size,
+            &app_spec.storage.tls_data.size,
+        )
+        .map_err(DeployError::Validation)?;
     mutation
         .arm_resource_scope_until_reconciled("kubernetes_namespace")
         .await?;
+    // Fresh-volume floor at the render boundary: admission and apply-job
+    // revalidation already gated these sizes, but a claim deleted between
+    // revalidation and this write would render an unformattable,
+    // unresizable template — re-check live PVC evidence immediately before
+    // applying. Provisioned sub-floor claims pass through unchanged.
+    enclava_engine::apply::orchestrator::enforce_fresh_volume_floor(&engine, &app_spec).await?;
+
     apply_all_with_tenant_image_pull_secret(
         &engine,
         &manifests,
@@ -2280,6 +2355,7 @@ pub async fn apply_deployment_manifests(
         manifest_hash: hash,
         observing_since: chrono::Utc::now(),
         observation_slice: ROLLOUT_OBSERVATION_SLICE,
+        rollout_timeout,
     }))
 }
 

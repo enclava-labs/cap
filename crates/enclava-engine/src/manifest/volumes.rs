@@ -26,6 +26,13 @@ const GUEST_MEMORY_LAYOUT_MARKER: &str = "# enclava-cap-volume-layout: guest-mem
 /// Kubernetes (labels cannot be added to an existing StatefulSet's VCTs).
 pub const CAP_VCT_NAMES: [&str; 2] = ["state", "tls-state"];
 
+/// Name of the PVC Kubernetes creates for a CAP volumeClaimTemplate on a
+/// replica-0 StatefulSet: `<vct>-<statefulset>-0`. CAP renders `replicas: 1`,
+/// so ordinal 0 is the only claim any workload pod mounts.
+pub fn provisioned_claim_name(vct: &str, statefulset: &str) -> String {
+    format!("{vct}-{statefulset}-0")
+}
+
 /// Disk-backed bound for the workload log spool emptyDir. The relay tails at
 /// most MAX_TAIL_BYTES per container (2 MiB today) and enclava-wait-exec
 /// rotates its spool at 32 MiB (retaining the newest 8 MiB), so the spool's

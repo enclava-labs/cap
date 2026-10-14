@@ -3378,7 +3378,7 @@ pub async fn create_paas_app(
         &resources,
         true,
         // Hosted app creation provisions fresh volumes for these sizes.
-        true,
+        enclava_engine::apply::orchestrator::FreshVolumeClaims::ALL,
     )
     .await?;
 

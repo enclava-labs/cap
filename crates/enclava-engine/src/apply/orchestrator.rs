@@ -144,6 +144,8 @@ pub async fn apply_and_watch(
         ApplyError::ManifestGeneration(format!("confidential app validation failed: {err}"))
     })?;
 
+    enforce_fresh_volume_floor(engine, app).await?;
+
     // Generate manifests
     let manifests = generate_all_manifests(app);
 
@@ -153,8 +155,14 @@ pub async fn apply_and_watch(
     // Apply all
     apply_all(engine, &manifests, generation).await?;
 
-    // Watch rollout
-    let status = watch_rollout(engine, &app.namespace, &app.name).await?;
+    // Watch rollout. The budget grows with the volumes' first-boot work:
+    // a fresh device is fully zero-scanned before format, so the timeout is
+    // computed from the exact rendered sizes, not a flat constant.
+    let rollout_timeout = engine
+        .config()
+        .rollout_timeout_for_storage(&app.storage.app_data.size, &app.storage.tls_data.size)
+        .map_err(ApplyError::ManifestGeneration)?;
+    let status = watch_rollout(engine, &app.namespace, &app.name, rollout_timeout).await?;
 
     match status.phase {
         DeployPhase::Running => {
@@ -184,4 +192,132 @@ pub async fn apply_and_watch(
     }
 
     Ok(status)
+}
+
+/// Refuse a fresh volume request below the 32 MiB LUKS2 fresh-format floor.
+///
+/// `validate_app` intentionally checks only quantity grammar — the spec
+/// carries no provisioning state, and a hard floor would lock out reapplies
+/// of apps whose volumes predate it (sub-floor LUKS2 volumes activate; the
+/// runtime probe never sees them). Here the engine asks the cluster: a
+/// live ordinal-0 claim is provisioned and keeps operating; a missing or
+/// terminating one is provisioned FRESH by this render, and enclava-init
+/// refuses to format a device below the floor — so reject it at the
+/// boundary instead of leaving the app unstartable on a StatefulSet
+/// volumeClaimTemplate that can never be resized.
+///
+/// Fails closed on lookup errors: a refused apply retries cleanly, a
+/// missed check bricks. A claim racing to be created mid-check errs on
+/// refusal; a claim racing to be deleted leaves the app already unable to
+/// boot, and refusing is the only recoverable outcome anyway.
+pub async fn enforce_fresh_volume_floor(
+    engine: &ApplyEngine,
+    app: &ConfidentialApp,
+) -> Result<(), ApplyError> {
+    let claims = sub_floor_fresh_claims(
+        engine,
+        &app.namespace,
+        &app.name,
+        &app.storage.app_data.size,
+        &app.storage.tls_data.size,
+    )
+    .await?;
+    if claims.app_data {
+        crate::validate::validate_persistent_volume_size_for_fresh_provisioning(
+            "storage.app_data.size",
+            &app.storage.app_data.size,
+        )
+        .map_err(ApplyError::ManifestGeneration)?;
+    }
+    if claims.tls_data {
+        crate::validate::validate_persistent_volume_size_for_fresh_provisioning(
+            "storage.tls_data.size",
+            &app.storage.tls_data.size,
+        )
+        .map_err(ApplyError::ManifestGeneration)?;
+    }
+    Ok(())
+}
+
+/// Per-claim fresh-volume verdicts used to gate the 32 MiB floor. `true`
+/// means the size is sub-floor AND the claim has no live ordinal-0 PVC, so
+/// the floor must be enforced for it; `false` means the size is at or above
+/// the floor (nothing to check) or the claim is already provisioned
+/// (grandfathered — a surviving sub-floor volume activates).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FreshVolumeClaims {
+    /// state volume (`storage`/`app_data_size` → VCT `state`)
+    pub app_data: bool,
+    /// tls-state volume (`tls_storage`/`tls_data_size` → VCT `tls-state`)
+    pub tls_data: bool,
+}
+
+impl FreshVolumeClaims {
+    /// Both claims need the fresh-format floor (e.g. app creation, where no
+    /// cluster lookup is performed).
+    pub const ALL: Self = Self {
+        app_data: true,
+        tls_data: true,
+    };
+
+    /// No claim needs the floor.
+    pub const NONE: Self = Self {
+        app_data: false,
+        tls_data: false,
+    };
+}
+
+/// Which of an app's persistent-volume claims a sub-floor size would
+/// provision FRESH — i.e. the generated `<vct>-<workload>-0` PVC has no
+/// live object. Verdicts are produced only for sizes below the floor;
+/// sizes at or above it short-circuit without any Kubernetes I/O. A claim
+/// that exists but is terminating does not count as provisioned. Fails
+/// closed: lookup errors propagate and never grant the waiver.
+///
+/// `workload` is the generated StatefulSet name (`ConfidentialApp.name`,
+/// which the API renders from `apps.name`), not a guessed resource name.
+pub async fn sub_floor_fresh_claims(
+    engine: &ApplyEngine,
+    namespace: &str,
+    workload: &str,
+    app_data_size: &str,
+    tls_data_size: &str,
+) -> Result<FreshVolumeClaims, ApplyError> {
+    use k8s_openapi::api::core::v1::PersistentVolumeClaim;
+    use kube::api::Api;
+
+    let app_data_sub_floor = crate::validate::is_sub_floor_volume_size(app_data_size);
+    let tls_data_sub_floor = crate::validate::is_sub_floor_volume_size(tls_data_size);
+    if !app_data_sub_floor && !tls_data_sub_floor {
+        return Ok(FreshVolumeClaims::NONE);
+    }
+
+    let pvc_api: Api<PersistentVolumeClaim> = Api::namespaced(engine.client().clone(), namespace);
+
+    async fn claim_is_fresh(
+        pvc_api: &Api<PersistentVolumeClaim>,
+        claim_name: &str,
+    ) -> Result<bool, ApplyError> {
+        Ok(match pvc_api.get_opt(claim_name).await? {
+            Some(pvc) => pvc.metadata.deletion_timestamp.is_some(),
+            None => true,
+        })
+    }
+
+    let mut claims = FreshVolumeClaims::NONE;
+    if app_data_sub_floor {
+        claims.app_data = claim_is_fresh(
+            &pvc_api,
+            &crate::manifest::volumes::provisioned_claim_name("state", workload),
+        )
+        .await?;
+    }
+    if tls_data_sub_floor {
+        claims.tls_data = claim_is_fresh(
+            &pvc_api,
+            &crate::manifest::volumes::provisioned_claim_name("tls-state", workload),
+        )
+        .await?;
+    }
+    Ok(claims)
 }

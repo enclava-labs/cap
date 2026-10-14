@@ -1125,7 +1125,7 @@ pub async fn create_app(
         true,
         // App creation provisions fresh volumes for these sizes; enforce the
         // 32 MiB LUKS2 floor synchronously (defaults 5Gi/2Gi always pass).
-        true,
+        enclava_engine::apply::orchestrator::FreshVolumeClaims::ALL,
     )
     .await?;
 

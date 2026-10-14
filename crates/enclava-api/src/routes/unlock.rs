@@ -670,6 +670,7 @@ struct UnlockModeCommitRequest<'a> {
     attestation_config: Option<&'a enclava_engine::types::AttestationConfig>,
     signing_service_pubkey_hex: Option<&'a str>,
     signed_required: bool,
+    fresh_volume_claims: enclava_engine::apply::orchestrator::FreshVolumeClaims,
 }
 
 #[derive(Debug)]
@@ -810,11 +811,11 @@ async fn commit_unlock_mode_transition(
         request.org_id,
         &resources,
         false,
-        // Apply-path revalidation of PERSISTED resources: a pre-floor size
-        // (17–31 Mi) keeps operating — its LUKS header exists and the
-        // runtime probe is never reached. Enforcing the fresh-volume floor
-        // here would lock grandfathered apps out of unlock transitions.
-        false,
+        // Revalidation of PERSISTED resources against live claim evidence:
+        // a surviving sub-floor claim keeps operating (its LUKS header
+        // exists), a missing/terminating one is a fresh format and must
+        // meet the floor.
+        request.fresh_volume_claims,
     )
     .await?;
 
@@ -1579,6 +1580,23 @@ pub async fn update_unlock_mode(
             Json(serde_json::json!({"error": "receipt serialization error"})),
         )
     })?;
+    // Live claim evidence for the persisted resource sizes, computed
+    // outside the commit transaction (no kube I/O under the lanes; none at
+    // all for at/above-floor sizes). If app state changed since the read
+    // that produced `observed_resources`, the commit's authority check
+    // forces a retry that recomputes this.
+    let fresh_volume_claims = crate::routes::deployments::fresh_volume_claims(
+        &app,
+        &observed_resources,
+    )
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "volume provisioning state could not be verified; retry"})),
+        )
+    })?;
+
     let committed = commit_unlock_mode_transition(
         &state.db,
         UnlockModeCommitRequest {
@@ -1609,6 +1627,7 @@ pub async fn update_unlock_mode(
                 .as_ref()
                 .and_then(|config| config.signing_service_pubkey_hex.as_deref()),
             signed_required,
+            fresh_volume_claims,
         },
     )
     .await?;
@@ -2808,6 +2827,7 @@ mod tests {
                 attestation_config: None,
                 signing_service_pubkey_hex: None,
                 signed_required: false,
+                fresh_volume_claims: enclava_engine::apply::orchestrator::FreshVolumeClaims::ALL,
             },
         )
         .await;
@@ -2945,6 +2965,7 @@ mod tests {
                 attestation_config: None,
                 signing_service_pubkey_hex: None,
                 signed_required: false,
+                fresh_volume_claims: enclava_engine::apply::orchestrator::FreshVolumeClaims::ALL,
             },
         )
         .await;
@@ -3064,6 +3085,7 @@ mod tests {
                 attestation_config: None,
                 signing_service_pubkey_hex: None,
                 signed_required: false,
+                fresh_volume_claims: enclava_engine::apply::orchestrator::FreshVolumeClaims::ALL,
             },
         )
         .await;
@@ -3187,6 +3209,7 @@ mod tests {
                 attestation_config: None,
                 signing_service_pubkey_hex: None,
                 signed_required: false,
+                fresh_volume_claims: enclava_engine::apply::orchestrator::FreshVolumeClaims::ALL,
             },
         )
         .await;
@@ -3302,6 +3325,7 @@ mod tests {
                 attestation_config: None,
                 signing_service_pubkey_hex: None,
                 signed_required: false,
+                fresh_volume_claims: enclava_engine::apply::orchestrator::FreshVolumeClaims::ALL,
             },
         );
         let second = commit_unlock_mode_transition(
@@ -3331,6 +3355,7 @@ mod tests {
                 attestation_config: None,
                 signing_service_pubkey_hex: None,
                 signed_required: false,
+                fresh_volume_claims: enclava_engine::apply::orchestrator::FreshVolumeClaims::ALL,
             },
         );
 
@@ -3485,6 +3510,7 @@ mod tests {
                 attestation_config: None,
                 signing_service_pubkey_hex: None,
                 signed_required: false,
+                fresh_volume_claims: enclava_engine::apply::orchestrator::FreshVolumeClaims::ALL,
             },
         )
         .await
@@ -3532,6 +3558,7 @@ mod tests {
                 attestation_config: None,
                 signing_service_pubkey_hex: None,
                 signed_required: false,
+                fresh_volume_claims: enclava_engine::apply::orchestrator::FreshVolumeClaims::ALL,
             },
         )
         .await
