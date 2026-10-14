@@ -507,40 +507,46 @@ pub(crate) async fn load_legacy_tls_bindings<'e, E: sqlx::PgExecutor<'e>>(
     Ok(bindings)
 }
 
-/// Lock the publication-obligation sentinel and read it in one step. Both
-/// the legacy publication critical section and the signer-rotation gates
-/// take this row FOR UPDATE, which serializes the refusal decision with an
-/// in-flight legacy publication: a rotation either commits before the
-/// publication reads its bindings (and is carried into them) or it waits
-/// for the publication to write its policy and then sees the recorded
-/// obligation and refuses. The migration keeps exactly one sentinel row; a
-/// missing row means that invariant is broken and fails closed.
+/// Lock the publication-obligation sentinel row and read the obligation
+/// marker in one step. Both the legacy publication critical section and the
+/// signer-rotation gates take the sentinel FOR UPDATE, which serializes the
+/// refusal decision with an in-flight legacy publication: a rotation either
+/// commits before the publication reads its bindings (and is carried into
+/// them) or it waits for the publication to write its policy and then sees
+/// the recorded obligation and refuses. The marker is a separate row so the
+/// publisher can commit it independently while holding the sentinel lock
+/// (see record_legacy_publication_obligation) without deadlocking against
+/// itself. The migration keeps both rows; a missing row means that
+/// invariant is broken and fails closed.
 pub(crate) async fn lock_and_read_legacy_publication_obligation<'e, E: sqlx::PgExecutor<'e>>(
     db: E,
 ) -> Result<bool, KbsPolicyError> {
     let recorded: Option<bool> = sqlx::query_scalar(
-        "SELECT recorded_at IS NOT NULL
+        "SELECT (SELECT recorded_at IS NOT NULL
+                   FROM legacy_publication_obligation
+                  WHERE key = 'obligation')
            FROM legacy_publication_obligation
-          WHERE singleton
+          WHERE key = 'sentinel'
           FOR UPDATE",
     )
-    .fetch_optional(db)
+    .fetch_one(db)
     .await?;
     Ok(recorded.unwrap_or(true))
 }
 
 /// Record the legacy publication obligation. This is its own committed
-/// write, taken while the sentinel lock is held but independent of the
-/// publication transaction: even a publication whose ConfigMap write is
-/// lost or whose deploy later fails must keep the evidence. Recorded once
-/// and never cleared -- soft-deleting a binding does not un-publish the
-/// policy that already carried it.
-pub(crate) async fn record_legacy_publication_obligation(
-    db: &PgPool,
+/// write on the obligation row only, taken while the sentinel lock is held
+/// but independent of the publication transaction: even a publication whose
+/// ConfigMap write is lost or whose deploy later fails must keep the
+/// evidence, and the write must never block on the sentinel lock the caller
+/// holds. Recorded once and never cleared -- soft-deleting a binding does
+/// not un-publish the policy that already carried it.
+pub(crate) async fn record_legacy_publication_obligation<'e, E: sqlx::PgExecutor<'e>>(
+    db: E,
 ) -> Result<(), KbsPolicyError> {
     sqlx::query(
-        "INSERT INTO legacy_publication_obligation (singleton, recorded_at) VALUES (true, now())
-         ON CONFLICT (singleton) DO UPDATE
+        "INSERT INTO legacy_publication_obligation (key, recorded_at) VALUES ('obligation', now())
+         ON CONFLICT (key) DO UPDATE
             SET recorded_at = COALESCE(legacy_publication_obligation.recorded_at, now())",
     )
     .execute(db)
@@ -612,7 +618,7 @@ async fn reconcile_legacy_rego_policy_with_client(
             // the evidence. Only a binding that pins a signer can keep the
             // rotated-out signer authorized; null-identity renders never
             // record it and never fence rotations.
-            record_legacy_publication_obligation(db).await?;
+            record_legacy_publication_obligation(&mut *publication_tx).await?;
         }
         let next_policy = replace_tls_resource_bindings_block(current_policy, &tls_bindings)?;
         let next_policy = replace_owner_bindings_block(&next_policy, &bindings)?;
