@@ -180,6 +180,25 @@ def check_run_value(val):
                   " a %s cannot be a run command" % type(val).__name__)
 
 
+def check_step_mapping(item, job):
+    for key, val in mapping_entries(item):
+        if not isinstance(key, ScalarNode):
+            continue
+        if key.value == "run":
+            check_run_value(val)
+        elif key.value == "parallel":
+            # GitHub parallel step groups nest executable steps under the
+            # group item's parallel: key; the invariant applies to each.
+            check_steps(val, job)
+        elif key.value == "shell":
+            # A custom step shell is a command template GitHub splices the
+            # run script into ({0}); interpolation here executes directly,
+            # exactly like interpolation in the run value itself.
+            if isinstance(val, ScalarNode) and "${{" in val.value:
+                note(val, "step shell template interpolates ${{ ... }} directly;"
+                          " pass the value through an env: binding instead")
+
+
 def check_steps(node, job):
     if not isinstance(node, SequenceNode):
         note(node, "job '%s': steps must be a sequence" % job)
@@ -188,9 +207,7 @@ def check_steps(node, job):
         if not isinstance(item, MappingNode):
             note(item, "job '%s': each step must be a mapping" % job)
             continue
-        for key, val in mapping_entries(item):
-            if isinstance(key, ScalarNode) and key.value == "run":
-                check_run_value(val)
+        check_step_mapping(item, job)
 
 
 def check_workflow_runs(root):
@@ -400,11 +417,35 @@ guard_steps_case bare_alias_run '      - run: *payload
 '
 guard_must_flag_run bare_alias_run
 guard_steps_case punct_anchor '      - env:
-          SCRIPT: &. echo "${{ github.ref }}"
-        run: *.
+          SCRIPT: &-risky echo "${{ github.ref }}"
+        run: *-risky
 '
 guard_must_flag_run punct_anchor
 guard_must_flag_anchors punct_anchor
+
+# A custom step shell is a command template ({0} receives the run script):
+# interpolation there executes directly and must be flagged (Codex, #236).
+guard_steps_case shell_template '      - run: echo ok
+        shell: bash -c '"'"'echo "${{ github.head_ref }}"; bash {0}'"'"'
+'
+guard_must_flag_run shell_template
+guard_steps_case shell_plain '      - run: echo ok
+        shell: bash
+'
+guard_must_be_clean shell_plain
+
+# GitHub parallel step groups nest executable steps under parallel:; each
+# nested step is checked like a top-level one (Codex, #236).
+guard_steps_case parallel_group '      - parallel:
+          - run: echo "${{ github.head_ref }}"
+'
+guard_must_flag_run parallel_group
+guard_steps_case parallel_group_safe '      - parallel:
+          - run: echo "$PUSHED_REF"
+            env:
+              PUSHED_REF: ${{ github.ref }}
+'
+guard_must_be_clean parallel_group_safe
 
 # Safe shapes must stay clean.
 
