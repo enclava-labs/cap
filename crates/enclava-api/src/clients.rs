@@ -61,6 +61,15 @@ pub enum ClientError {
 pub struct BlockedNetworks {
     v4: Vec<(Ipv4Addr, u8)>,
     v6: Vec<(Ipv6Addr, u8)>,
+    /// Fail closed on the RFC 8215 local-use NAT64 prefix
+    /// `64:ff9b:1::/48`: the prefix is a container for operator-chosen
+    /// longer prefixes, so the embedded IPv4 position cannot be decoded
+    /// from the address alone and any fixed-offset decode can be evaded.
+    /// True for every guarded list — `defaults()` and any list extended
+    /// with explicit CIDRs. False only for `empty()`, whose documented
+    /// contract is "every destination allowed" for explicitly unguarded
+    /// paths (cap#241 review).
+    block_local_use_nat64: bool,
 }
 
 impl BlockedNetworks {
@@ -83,7 +92,11 @@ impl BlockedNetworks {
         // CGNAT is not strictly required, but blocking it is consistent with
         // the rest of the SSRF-defence list and is cheap.
         let _ = &mut v4;
-        Self { v4, v6 }
+        Self {
+            v4,
+            v6,
+            block_local_use_nat64: true,
+        }
     }
 
     /// Add CIDR strings of the form `10.0.0.0/8`. Invalid entries are skipped
@@ -99,6 +112,9 @@ impl BlockedNetworks {
                 ),
             }
         }
+        // An explicitly extended list is a guarded list: fail closed on the
+        // undecodable RFC 8215 local-use NAT64 prefix (cap#241 review).
+        self.block_local_use_nat64 = true;
     }
 
     /// An empty blocklist — every destination allowed. For tests and for
@@ -107,6 +123,7 @@ impl BlockedNetworks {
         Self {
             v4: Vec::new(),
             v6: Vec::new(),
+            block_local_use_nat64: false,
         }
     }
 
@@ -127,8 +144,10 @@ impl BlockedNetworks {
                 //     and must pass the v4 blocklist. The well-known /96
                 //     embeds IPv4 unambiguously in the low 32 bits; the RFC
                 //     8215 local-use /48 is a container for operator-chosen
-                //     longer prefixes, so its addresses are blocked whole.
-                if nat64_local_use_prefix(ip) {
+                //     longer prefixes, so its addresses are blocked whole —
+                //     but only on guarded lists; empty() must honor its
+                //     allow-everything contract (cap#241 review).
+                if self.block_local_use_nat64 && nat64_local_use_prefix(ip) {
                     return true;
                 }
                 if let Some(v4) = ip.to_ipv4().or_else(|| nat64_embedded_ipv4(ip))
@@ -762,6 +781,43 @@ mod tests {
             let parsed: IpAddr = ip.parse().unwrap();
             assert!(blocked.contains(parsed), "{ip} should be blocked");
         }
+    }
+
+    #[test]
+    fn blocked_networks_empty_allows_every_destination() {
+        // empty()'s documented contract is "every destination allowed" —
+        // including NAT64 spellings. It is reserved for explicitly
+        // unguarded paths, where the caller takes responsibility for the
+        // destination, so no heuristics may reject anything (cap#241
+        // review).
+        let blocked = BlockedNetworks::empty();
+        for ip in [
+            "10.0.5.7",
+            "127.0.0.1",
+            "169.254.169.254",
+            "::1",
+            "64:ff9b::a00:507",
+            "64:ff9b:1::a00:507",
+            "64:ff9b:1:102::a9fe:a9fe",
+        ] {
+            let parsed: IpAddr = ip.parse().unwrap();
+            assert!(!blocked.contains(parsed), "{ip} should be allowed");
+        }
+    }
+
+    #[test]
+    fn extended_empty_blocklist_still_fails_closed_on_local_use_nat64() {
+        // extend_from_cidrs marks the list as explicitly guarded: even if
+        // the added CIDRs cover nothing inside 64:ff9b:1::/48, the
+        // undecodable local-use NAT64 prefix keeps being blocked whole
+        // (cap#241 review).
+        let mut blocked = BlockedNetworks::empty();
+        blocked.extend_from_cidrs(["203.0.113.0/24"]);
+        let nat64: IpAddr = "64:ff9b:1::a9fe:a9fe".parse().unwrap();
+        assert!(
+            blocked.contains(nat64),
+            "extended list must fail closed on local-use NAT64"
+        );
     }
 
     #[test]
