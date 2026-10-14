@@ -114,6 +114,9 @@ pub enum DeploymentReason {
     /// post-expiry reclaim quarantine window) or the namespace resource
     /// fence is armed.
     MutationLeaseHeldByOperation,
+    /// The app deletion was interrupted by a poisoned resource fence that
+    /// must be cleared manually (namespace finalizers, orphaned resources).
+    AppDeletionBlockedByPoisonedFence,
     AppDeleting,
     NoApplyJobRecorded,
 }
@@ -279,18 +282,18 @@ pub(crate) async fn deployment_diagnostics(
                 app_row.status = 'deleting'::app_status_enum AS app_deleting
            FROM apps AS app_row
            LEFT JOIN LATERAL (
+               -- Canonical job-first, deterministic legacy-fallback ordering
+               -- (mirrors latest_deployment_id_for_app in deploy.rs)
                SELECT dep.id, dep.status::text AS status, dep.spec_snapshot, dep.created_at,
                       dep.completed_at, dep.observing_since, dep.error_message
                  FROM deployments AS dep
-                 JOIN LATERAL (
-                     SELECT deployment_id
-                       FROM deployment_apply_jobs
-                      WHERE app_id = app_row.id
-                      ORDER BY generation DESC
-                      LIMIT 1
-                 ) AS latest_job ON true
+                 LEFT JOIN deployment_apply_jobs AS apply_job
+                        ON apply_job.deployment_id = dep.id
                 WHERE dep.app_id = app_row.id
-                  AND dep.id = latest_job.deployment_id
+                ORDER BY (apply_job.generation IS NOT NULL) DESC,
+                         apply_job.generation DESC NULLS LAST,
+                         dep.created_at DESC,
+                         dep.id DESC
                 LIMIT 1
            ) AS deployment ON true
            LEFT JOIN deployment_apply_jobs AS job
@@ -502,10 +505,17 @@ fn project_diagnostics(row: Option<DiagnosticsRow>) -> DeploymentDiagnostics {
         } else {
             condition
         };
+        // A poisoned fence blocks forever with no automatic release: escalate
+        // to a distinct reason that tells the CLI to prompt operator action.
+        let reason = if fence_holds && row.fence_reclaim_after.is_none() {
+            DeploymentReason::AppDeletionBlockedByPoisonedFence
+        } else {
+            DeploymentReason::AppDeleting
+        };
         return DeploymentDiagnostics {
             phase: DeploymentPhase::Destroying,
             condition,
-            reason: Some(DeploymentReason::AppDeleting),
+            reason: Some(reason),
             next_retry_at: None,
             blocked_until: None,
             blocking_operation: None,
@@ -707,22 +717,35 @@ fn worker_or_schedule_condition(
     if blocked.operation.is_some() {
         // A poisoned fence carries no automatic release time: no retry
         // schedule can outlive it, so it always wins the condition.
-        let Some(blocker_until) = blocked.until else {
+        let Some(_blocker_until) = blocked.until else {
             return (DeploymentCondition::BlockedByOperation, None);
         };
-        // A finite foreign blocker wins only while it still gates the
-        // scheduled attempt. Once the lease (and its reclaim quarantine)
-        // expires before `next_attempt_at`, the dispatcher's attempt
-        // would be admitted: the actual reason for waiting is the retry
-        // schedule, so fall through and report that instead.
-        let attempt_after_blocker = row
+        // Compare against the actual claim admission boundary (reclaim_after),
+        // not the displayed blocker_until (which may be a live renewable
+        // locked_until that could be extended). The claim predicate admits
+        // only when reclaim_after <= now, so use that for the comparison.
+        // Check both lease and fence reclaim_after - use whichever is active.
+        let lease_reclaim = row.lease_reclaim_after.filter(|ra| ra > &now);
+        let fence_reclaim = row.fence_reclaim_after.filter(|ra| ra > &now);
+        let Some(reclaim_after) = lease_reclaim.or(fence_reclaim) else {
+            // No active reclaim boundary - fall through to schedule-based
+            return classify_condition_by_schedule(row, now);
+        };
+        let attempt_after_reclaim = row
             .next_attempt_at
-            .is_some_and(|attempt_at| attempt_at > blocker_until);
-        if !attempt_after_blocker {
+            .is_some_and(|attempt_at| attempt_at > reclaim_after);
+        if !attempt_after_reclaim {
             return (DeploymentCondition::BlockedByOperation, None);
         }
     }
 
+    classify_condition_by_schedule(row, now)
+}
+
+fn classify_condition_by_schedule(
+    row: &DiagnosticsRow,
+    now: DateTime<Utc>,
+) -> (DeploymentCondition, Option<DateTime<Utc>>) {
     // Determine if this is a claimed state (running, setting_up, cleaning_up)
     let is_claimed_state = matches!(
         row.job_state.as_deref(),

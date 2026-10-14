@@ -1858,6 +1858,9 @@ fn deployment_condition_action(condition: &str, phase: Option<&str>) -> &'static
             "blocked_by_operation" => {
                 "deletion stalled after the delete request ended; run the delete again to resume teardown"
             }
+            "waiting_external" => {
+                "deletion blocked by a poisoned resource fence; contact support to clear namespace finalizers"
+            }
             _ => "the app is being deleted; wait for teardown to complete before creating it again",
         };
     }
