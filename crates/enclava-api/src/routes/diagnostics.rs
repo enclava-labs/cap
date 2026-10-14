@@ -169,6 +169,7 @@ struct DiagnosticsRow {
     deployment_error_message: Option<String>,
     job_state: Option<String>,
     job_updated_at: Option<DateTime<Utc>>,
+    job_payload_version: Option<i32>,
     next_attempt_at: Option<DateTime<Utc>>,
     attempts: Option<i32>,
     job_locked_until: Option<DateTime<Utc>>,
@@ -177,6 +178,7 @@ struct DiagnosticsRow {
     lease_locked_until: Option<DateTime<Utc>>,
     lease_reclaim_after: Option<DateTime<Utc>>,
     lease_operation_kind: Option<String>,
+    lease_operation_id: Option<Uuid>,
     fence_locked_until: Option<DateTime<Utc>>,
     /// `reclaim_after` of the namespace fence with `infinity` already
     /// NULLed in SQL: a poisoned fence carries no automatic release time.
@@ -211,6 +213,11 @@ const OWN_OPERATION_KINDS: &[&str] = &[
     "deployment_cleanup",
 ];
 
+/// Supported job payload version range. Jobs with versions outside this range
+/// cannot be claimed by this API instance during a rolling upgrade.
+const MIN_SUPPORTED_JOB_PAYLOAD_VERSION: i32 = 1;
+const MAX_SUPPORTED_JOB_PAYLOAD_VERSION: i32 = 1;
+
 fn public_operation_kind(kind: Option<&str>) -> Option<&'static str> {
     match kind {
         Some(kind) => KNOWN_OPERATION_KINDS
@@ -222,8 +229,18 @@ fn public_operation_kind(kind: Option<&str>) -> Option<&'static str> {
     }
 }
 
-fn is_own_operation(kind: Option<&str>) -> bool {
-    kind.is_some_and(|kind| OWN_OPERATION_KINDS.contains(&kind))
+/// An "own" operation is one whose `operation_kind` is a deployment-lane kind
+/// AND whose `operation_id` matches this deployment's ID. A previous
+/// deployment's lease with the same kind but different ID blocks the lane.
+fn is_own_operation(
+    kind: Option<&str>,
+    operation_id: Option<Uuid>,
+    deployment_id: Option<Uuid>,
+) -> bool {
+    kind.is_some_and(|kind| {
+        OWN_OPERATION_KINDS.contains(&kind)
+            && operation_id.is_some_and(|op_id| deployment_id.is_some_and(|dep_id| op_id == dep_id))
+    })
 }
 
 /// Load the durable facts for the app's newest deployment and project them.
@@ -246,6 +263,7 @@ pub(crate) async fn deployment_diagnostics(
                 deployment.error_message AS deployment_error_message,
                 job.state AS job_state,
                 job.updated_at AS job_updated_at,
+                job.payload_version,
                 job.next_attempt_at,
                 job.attempts,
                 job.locked_until AS job_locked_until,
@@ -254,6 +272,7 @@ pub(crate) async fn deployment_diagnostics(
                 lease.locked_until AS lease_locked_until,
                 lease.reclaim_after AS lease_reclaim_after,
                 lease.operation_kind AS lease_operation_kind,
+                lease.operation_id AS lease_operation_id,
                 fence.locked_until AS fence_locked_until,
                 fence.reclaim_after AS fence_reclaim_after,
                 fence.operation_kind AS fence_operation_kind,
@@ -268,7 +287,7 @@ pub(crate) async fn deployment_diagnostics(
            LEFT JOIN deployment_apply_jobs AS job
                   ON job.deployment_id = deployment.id
            LEFT JOIN LATERAL (
-               SELECT locked_until, reclaim_after, operation_kind
+               SELECT locked_until, reclaim_after, operation_kind, operation_id
                  FROM app_mutation_leases
                 WHERE app_id = app_row.id
                   AND owner_token IS NOT NULL
@@ -284,6 +303,7 @@ pub(crate) async fn deployment_diagnostics(
                 WHERE resource_scope = 'kubernetes_namespace'
                   AND resource_key = app_row.namespace
                   AND owner_token IS NOT NULL
+                  AND reclaim_after > clock_timestamp()
                 LIMIT 1
            ) AS fence ON true
           WHERE app_row.id = $1",
@@ -339,7 +359,11 @@ struct ForeignBlock {
 }
 
 fn foreign_block(row: &DiagnosticsRow, now: DateTime<Utc>) -> ForeignBlock {
-    if !is_own_operation(row.lease_operation_kind.as_deref()) {
+    if !is_own_operation(
+        row.lease_operation_kind.as_deref(),
+        row.lease_operation_id,
+        row.deployment_id,
+    ) {
         let deadline =
             lease_admission_deadline(row.lease_locked_until, row.lease_reclaim_after, now);
         if deadline.is_some() {
@@ -571,14 +595,37 @@ fn worker_or_schedule_condition(
         (DeploymentCondition::Progressing, None)
     } else if foreign_blocked {
         (DeploymentCondition::BlockedByOperation, None)
+    } else if let Some(version) = row.job_payload_version {
+        // Check if the job version is supported by this API instance.
+        // During rolling upgrades, an older API may serve diagnostics for jobs
+        // created by a newer API version. The dispatcher cannot claim it.
+        if !(MIN_SUPPORTED_JOB_PAYLOAD_VERSION..=MAX_SUPPORTED_JOB_PAYLOAD_VERSION)
+            .contains(&version)
+        {
+            return (DeploymentCondition::Stalled, None);
+        }
+    }
+
+    // Determine if this is a claimed state (running, setting_up, cleaning_up)
+    let is_claimed_state = matches!(
+        row.job_state.as_deref(),
+        Some("running" | "setting_up" | "cleaning_up")
+    );
+
+    // For claimed states with expired locks, the job is immediately reclaimable
+    // regardless of next_attempt_at. For unclaimed states, next_attempt_at
+    // applies as the scheduled retry time.
+    if is_claimed_state {
+        // Lock expired but job still in claimed state: ready for immediate
+        // recovery by any worker. Normal progress, not waiting.
+        (DeploymentCondition::Progressing, None)
     } else if let Some(attempt_at) = row.next_attempt_at.filter(|a| a > &now) {
         // Dispatch scheduled but not yet due. For a `watching`
         // deployment this is the steady state between observation
         // slices — deliberate pacing, not a fault.
         (DeploymentCondition::WaitingExternal, Some(attempt_at))
     } else {
-        // Claimable now (due retry, or a running state whose lock
-        // expired): waits only for a free apply slot. Normal
+        // Claimable now (due retry): waits only for a free apply slot. Normal
         // dispatcher queueing, not a stall.
         (DeploymentCondition::Progressing, None)
     }
