@@ -6,7 +6,9 @@
 -- enters 'applying' — immediately before the first Kubernetes write.
 ALTER TABLE deployments
     ADD COLUMN apply_started_at timestamptz,
-    ADD COLUMN sts_apply_started_at timestamptz;
+    ADD COLUMN sts_apply_started_at timestamptz,
+    ADD COLUMN sts_uid text,
+    ADD COLUMN sts_created_at timestamptz;
 
 -- sts_apply_started_at is stamped immediately before the apply attempts
 -- the StatefulSet step (the final apply phase): it is the earliest moment
@@ -34,18 +36,27 @@ ALTER TABLE deployments
 -- manifest_hash only are partial applies: their provider state is exactly
 -- what a later generation's compensating sweep converges.
 --
--- Codex P1: observing_since was added by migration 0047 (2026-09-14)
--- WITHOUT a backfill, so a NULL value does NOT prove a legacy row never
--- reached watching — rollout failures that predate 0047 also have NULL
--- even though their StatefulSet and PVCs may still be live. Restrict the
--- backfill to rows created after 0047 shipped (the column then existed
--- for the row's whole lifecycle, so NULL really means never-watched).
--- Older rows keep the gate veto: conservative, but the alternative is
--- authorizing a later failed apply to sweep a possibly-live historical
--- workload and its data.
+-- Codex P1 (cutoff): the cutoff must be the time migration 0047 was
+-- INSTALLED in this database — observing_since was added by 0047 (2026-09-14)
+-- WITHOUT a backfill, so a NULL value only proves never-watched for rows
+-- created after 0047 was installed in THIS database. An installation that
+-- upgraded after the 0047 release date can hold failed rows created
+-- between the release and its actual upgrade; those rows also have NULL
+-- observing_since (their failure predates the column existing locally),
+-- yet may back live historical workloads — marking them retryable would
+-- let a later failed apply sweep a still-live workload and its PVCs.
+-- Deriving the cutoff from _sqlx_migrations.installed_on (the ledger row
+-- sqlx writes when 0047 ran HERE) keeps the guarantee database-local; the
+-- COALESCE fallback keeps ledger-less databases on the conservative side
+-- (nothing backfilled, every legacy row keeps the gate veto). Use the
+-- database's recorded installation time for migration 0047, or avoid
+-- backfilling rows whose lifecycle cannot be proven.
 UPDATE deployments
    SET cleanup_sweep_incomplete = true
  WHERE status = 'failed'
    AND manifest_hash IS NOT NULL
    AND observing_since IS NULL
-   AND created_at >= TIMESTAMPTZ '2026-09-14 15:52:53+00';
+   AND created_at >= COALESCE(
+        (SELECT installed_on FROM _sqlx_migrations WHERE version = 47 AND success),
+        TIMESTAMPTZ '-infinity'
+       );
