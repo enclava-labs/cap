@@ -96,7 +96,7 @@ done
 # literal blocks (|), folded blocks (>), single-line scalars, and multi-line
 # continuation lines indented deeper than the `run:` key. POSIX awk only (no
 # interval expressions) so the guard also works under BWK awk on macOS.
-run_body_injections="$(
+scan_run_injections() {
   awk '
     function indent(line) { return match(line, /[^[:space:]]/) - 1 }
     {
@@ -116,12 +116,68 @@ run_body_injections="$(
         in_run = 1
       }
     }
-  ' "$WORKFLOW"
-)"
+  ' "$1"
+}
+
+# GitHub Actions honors YAML anchors/aliases, so an interpolated scalar
+# defined anywhere in the file (e.g. `SCRIPT: &unsafe echo "${{ github.ref }}"`
+# under `env:`) could be laundered into `run: *unsafe`, where the raw-text
+# scan above never sees the `${{ }}`. Scanning resolved values would require a
+# full YAML parser in CI; this workflow uses no anchors, so anchor/alias
+# tokens are rejected outright to keep the guard sound.
+scan_anchor_tokens() {
+  grep -nE '(^|[[:space:]])[&*][A-Za-z_][A-Za-z0-9_-]*' "$1" || true
+}
+
+run_body_injections="$(scan_run_injections "$WORKFLOW")"
 [[ -z "$run_body_injections" ]] || {
   echo "$run_body_injections" >&2
   fail "workflow interpolates \${{ ... }} directly inside a run: block; pass the value through an env: binding instead"
 }
+anchor_tokens="$(scan_anchor_tokens "$WORKFLOW")"
+[[ -z "$anchor_tokens" ]] || {
+  echo "$anchor_tokens" >&2
+  fail "workflow must not use YAML anchors or aliases; an aliased scalar could carry \${{ ... }} into a run: command unscanned (write the env: binding out explicitly instead)"
+}
+
+# Self-tests: prove the guard flags every smuggling shape it claims to cover
+# (inline scalar, folded block, plain-scalar continuation, aliased run) and
+# stays silent for env:-bound values, so the coverage claim cannot silently
+# regress.
+guard_tmp="$(mktemp -d)"
+guard_case() { printf '%s\n' "$2" >"$guard_tmp/$1.yml"; }
+guard_must_flag_run() {
+  [[ -n "$(scan_run_injections "$guard_tmp/$1.yml")" ]] \
+    || fail "run-injection guard self-test ($1): interpolation must be flagged"
+}
+
+guard_case inline '        run: echo "${{ github.ref }}"
+'
+guard_must_flag_run inline
+guard_case folded '        run: >
+          echo "${{ github.ref }}"
+'
+guard_must_flag_run folded
+guard_case continuation '        run: echo start
+          and "${{ github.ref }}"
+'
+guard_must_flag_run continuation
+guard_case aliased '        env:
+          SCRIPT: &unsafe_script echo "${{ github.ref }}"
+        run: *unsafe_script
+'
+[[ -n "$(scan_anchor_tokens "$guard_tmp/aliased.yml")" ]] \
+  || fail "run-injection guard self-test (aliased): anchor/alias tokens must be flagged"
+guard_case env-bound '        env:
+          PUSHED_REF: ${{ github.ref }}
+        run: |
+          echo "$PUSHED_REF"
+'
+[[ -z "$(scan_run_injections "$guard_tmp/env-bound.yml")" ]] \
+  || fail "run-injection guard self-test (env-bound): env: bindings must not be flagged"
+[[ -z "$(scan_anchor_tokens "$guard_tmp/env-bound.yml")" ]] \
+  || fail "run-injection guard self-test (env-bound): unexpected anchor/alias match"
+rm -rf "$guard_tmp"
 
 grep -Fq -- '      - "deploy/api/**"' "$WORKFLOW" \
   || fail "API manifest changes must trigger image validation"
