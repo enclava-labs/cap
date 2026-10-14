@@ -716,6 +716,28 @@ mod tests {
     use std::io::{Read, Seek, SeekFrom, Write};
     use tempfile::tempdir;
 
+    /// Deactivates `/dev/mapper/<name>` when dropped, so a failing
+    /// assertion cannot leak an active device-mapper mapping across runs.
+    struct MappingGuard(&'static str);
+
+    impl Drop for MappingGuard {
+        fn drop(&mut self) {
+            let output = std::process::Command::new("cryptsetup")
+                .arg("close")
+                .arg(self.0)
+                .output();
+            if let Ok(output) = &output
+                && !output.status.success()
+            {
+                eprintln!(
+                    "warning: cryptsetup close {} failed: {}",
+                    self.0,
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    }
+
     fn make_backing_file(size_mb: u64) -> Result<(tempfile::TempDir, PathBuf)> {
         let dir = tempdir()?;
         let path = dir.path().join("disk.img");
@@ -742,8 +764,9 @@ mod tests {
         Ok(())
     }
 
-    fn integrity_round_trip(device: &Path, key: &DerivedSeed, mapping: &str) -> Result<()> {
+    fn integrity_round_trip(device: &Path, key: &DerivedSeed, mapping: &'static str) -> Result<()> {
         let opened = open(device, mapping, key).expect("open");
+        let _mapping = MappingGuard(mapping);
         assert!(opened.mapper_path.starts_with("/dev/mapper/"));
 
         let mut file = OpenOptions::new()
