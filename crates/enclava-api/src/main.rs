@@ -1001,6 +1001,10 @@ async fn main() {
     enclava_api::kbs::spawn_signed_policy_reconciler(state.clone());
     enclava_api::routes::auth::spawn_device_login_reaper(state.db.clone());
     enclava_api::auth::nostr::spawn_nip98_replay_cache_reaper(state.db.clone());
+    // Converge stale tenant image pull secrets before deployment dispatch may
+    // re-apply workloads (review finding on #243): scope changes leave the
+    // platform GHCR token in namespaces whose workloads fell out of scope.
+    enclava_api::deploy::cleanup_stale_tenant_image_pull_secrets_at_startup(&state.db).await;
     if deployment_dispatch_enabled {
         enclava_api::deployment_jobs::spawn_deployment_dispatcher(state.clone());
     } else {

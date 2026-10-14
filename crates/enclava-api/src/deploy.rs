@@ -5,7 +5,7 @@ use enclava_common::types::{ResourceLimits, UnlockMode as CommonUnlockMode};
 use enclava_engine::apply::{
     engine::ApplyEngine,
     gateway::apply_gateway_resources,
-    generation::MutationGeneration,
+    generation::{MutationGeneration, delete_resource},
     namespace::apply_namespace,
     network_policy::apply_network_policy,
     orchestrator::{MANIFEST_HASH_ANNOTATION, manifest_hash},
@@ -21,6 +21,7 @@ use enclava_engine::types::{
 };
 use k8s_openapi::api::core::v1::Secret;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+use kube::{Api, Resource as _, api::DeleteParams};
 use sqlx::{PgPool, Postgres, Transaction};
 use std::net::IpAddr;
 use uuid::Uuid;
@@ -154,13 +155,20 @@ pub fn tenant_image_pull_secret_startup_error() -> Option<String> {
              or remove the GHCR credentials"
                 .to_string(),
         ),
-        Some(_) => Some(
-            "GHCR_USERNAME/GHCR_TOKEN are set but TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES \
-             contains no valid entries; the tenant image pull secret is never attached \
-             without an explicit repository scope (issue #225). Use \
-             registry/repository or registry/repository/* entries"
-                .to_string(),
-        ),
+        Some(raw) => {
+            // Name the specific malformed entries: a list with one valid and
+            // one malformed scope must not report "no valid entries" (review
+            // finding), or operators cannot identify what to fix.
+            let reason = parse_image_pull_scopes_strict(&raw)
+                .err()
+                .unwrap_or_else(|| "no parseable entries".to_string());
+            Some(format!(
+                "GHCR_USERNAME/GHCR_TOKEN are set but TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES \
+                 is unusable: {reason}. Every comma-separated entry must be valid — use \
+                 registry/repository or registry/repository/* — and the tenant image pull \
+                 secret is never attached without a valid scope (issue #225)"
+            ))
+        }
     }
 }
 
@@ -191,40 +199,72 @@ fn tenant_image_pull_secret_config_from_env() -> Option<TenantImagePullSecretCon
 /// `None` means unset/empty/invalid — no scoping information at all.
 fn tenant_image_pull_allowed_repositories_from_env_strict() -> Option<Vec<ImagePullRepositoryScope>>
 {
-    parse_image_pull_scopes_strict(&env_nonempty(TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES_ENV)?)
+    let raw = env_nonempty(TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES_ENV)?;
+    match parse_image_pull_scopes_strict(&raw) {
+        Ok(scopes) => Some(scopes),
+        Err(reason) => {
+            tracing::error!(
+                env = TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES_ENV,
+                %reason,
+                "tenant image pull secret disabled: TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES is unusable"
+            );
+            None
+        }
+    }
 }
 
 /// Pure core of [`tenant_image_pull_allowed_repositories_from_env_strict`]:
 /// every comma-separated entry must parse; any invalid entry rejects the
-/// whole list so a typo can never widen (or silently drop) the scope.
-fn parse_image_pull_scopes_strict(raw: &str) -> Option<Vec<ImagePullRepositoryScope>> {
-    let scopes = raw
-        .split(',')
-        .map(parse_image_pull_repository_scope)
-        .collect::<Option<Vec<_>>>()?;
-    if scopes.is_empty() {
-        return None;
+/// whole list so a typo can never widen (or silently drop) the scope. The
+/// error names each malformed entry so operators can fix the exact typo.
+fn parse_image_pull_scopes_strict(raw: &str) -> Result<Vec<ImagePullRepositoryScope>, String> {
+    let mut scopes = Vec::new();
+    let mut invalid = Vec::new();
+    for (index, entry) in raw.split(',').enumerate() {
+        match parse_image_pull_repository_scope(entry) {
+            Ok(scope) => scopes.push(scope),
+            Err(reason) => invalid.push(format!("#{} {:?}: {}", index + 1, entry.trim(), reason)),
+        }
     }
-    Some(scopes)
+    if !invalid.is_empty() {
+        return Err(format!("invalid entries {}", invalid.join("; ")));
+    }
+    if scopes.is_empty() {
+        return Err("the list contains no entries".to_string());
+    }
+    Ok(scopes)
 }
 
-fn parse_image_pull_repository_scope(raw: &str) -> Option<ImagePullRepositoryScope> {
-    let mut value = raw.trim();
+fn parse_image_pull_repository_scope(raw: &str) -> Result<ImagePullRepositoryScope, String> {
+    let value = raw.trim();
     if value.is_empty() {
-        return None;
+        return Err("entry is empty".to_string());
     }
 
-    let include_subrepositories = value.ends_with("/*");
-    if include_subrepositories {
-        value = value.trim_end_matches("/*");
+    // Strip exactly one trailing "/*" subrepository marker. Stripping all
+    // trailing "/*" repetitions (e.g. `trim_end_matches`) would silently widen
+    // a malformed `registry/repository/*/*` into the broader
+    // `registry/repository/*` scope (P1 review): a repeated wildcard suffix
+    // must be rejected, never widened.
+    let (value, include_subrepositories) = match value.strip_suffix("/*") {
+        Some(base) => (base, true),
+        None => (value, false),
+    };
+    if value.contains('*') {
+        return Err(
+            "wildcard '*' is only allowed as a single trailing '/*' subrepository suffix"
+                .to_string(),
+        );
     }
     let value = value.trim_end_matches('/');
-    let (registry, repository) = value.split_once('/')?;
+    let Some((registry, repository)) = value.split_once('/') else {
+        return Err("expected registry/repository or registry/repository/*".to_string());
+    };
     if registry.is_empty() || repository.is_empty() {
-        return None;
+        return Err("expected registry/repository or registry/repository/*".to_string());
     }
 
-    Some(ImagePullRepositoryScope {
+    Ok(ImagePullRepositoryScope {
         registry: registry.to_string(),
         repository: repository.to_string(),
         include_subrepositories,
@@ -266,12 +306,7 @@ fn tenant_image_pull_secret_applies_to_containers(
         return false;
     }
 
-    containers.iter().all(|container| {
-        config
-            .allowed_repositories
-            .iter()
-            .any(|scope| image_matches_repository_scope(&container.image, scope))
-    })
+    images_match_repository_scopes(config, containers.iter().map(|container| &container.image))
 }
 
 fn image_matches_repository_scope(image: &ImageRef, scope: &ImagePullRepositoryScope) -> bool {
@@ -354,15 +389,360 @@ fn generate_tenant_image_pull_secret(
     let mut string_data = std::collections::BTreeMap::new();
     string_data.insert(".dockerconfigjson".to_string(), docker_config_json);
 
+    let mut labels = std::collections::BTreeMap::new();
+    // Ownership marker: the stale-secret cleanup only ever deletes CAP-managed
+    // secrets, and this label is how it recognizes them going forward.
+    labels.insert(
+        "app.kubernetes.io/managed-by".to_string(),
+        "enclava-platform".to_string(),
+    );
+
     Secret {
         metadata: ObjectMeta {
             name: Some(config.name.clone()),
             namespace: Some(namespace.to_string()),
+            labels: Some(labels),
             ..Default::default()
         },
         string_data: Some(string_data),
         type_: Some("kubernetes.io/dockerconfigjson".to_string()),
         ..Default::default()
+    }
+}
+
+/// The tenant image pull secret name CAP manages inside tenant namespaces.
+fn managed_tenant_image_pull_secret_name() -> String {
+    configured_tenant_image_pull_secret_name()
+        .unwrap_or_else(|| DEFAULT_TENANT_IMAGE_PULL_SECRET_NAME.to_string())
+}
+
+/// Whether an on-cluster Secret is the managed tenant image pull secret CAP
+/// owns. Newly generated secrets carry the managed-by label; secrets created
+/// before the label existed (the pre-scope "global fallback" that this change
+/// removes) are recognized by the legacy generated shape — a
+/// `kubernetes.io/dockerconfigjson` secret whose single auth entry is
+/// `ghcr.io`. Anything else in the namespace is tenant-owned and must never be
+/// deleted by the stale-secret cleanup.
+fn is_managed_tenant_image_pull_secret(secret: &Secret) -> bool {
+    let managed_by = secret
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get("app.kubernetes.io/managed-by"))
+        .is_some_and(|value| value == "enclava-platform");
+    if managed_by {
+        return true;
+    }
+    if secret.type_.as_deref() != Some("kubernetes.io/dockerconfigjson") {
+        return false;
+    }
+    let Some(raw) = secret
+        .data
+        .as_ref()
+        .and_then(|data| data.get(".dockerconfigjson"))
+    else {
+        return false;
+    };
+    let Ok(config) = serde_json::from_slice::<serde_json::Value>(&raw.0) else {
+        return false;
+    };
+    let Some(auths) = config.get("auths").and_then(|auths| auths.as_object()) else {
+        return false;
+    };
+    auths.len() == 1 && auths.contains_key("ghcr.io")
+}
+
+/// Every image must match at least one configured scope — the deploy-time
+/// gate for attaching the managed pull secret to a workload.
+fn images_match_repository_scopes<'a>(
+    config: &TenantImagePullSecretConfig,
+    images: impl IntoIterator<Item = &'a ImageRef>,
+) -> bool {
+    let mut seen_any = false;
+    for image in images {
+        seen_any = true;
+        if !config
+            .allowed_repositories
+            .iter()
+            .any(|scope| image_matches_repository_scope(image, scope))
+        {
+            return false;
+        }
+    }
+    seen_any
+}
+
+/// Whether any app in a namespace still qualifies for the managed pull secret
+/// under the current scope. The startup cleanup sweep keeps the secret in a
+/// namespace only while at least one of its apps would attach it on the next
+/// deploy (`None` in an app slot means its stored image refs are unparsable,
+/// which never qualifies).
+fn namespace_keeps_tenant_image_pull_secret(
+    config: Option<&TenantImagePullSecretConfig>,
+    app_images: &[Option<Vec<ImageRef>>],
+) -> bool {
+    let Some(config) = config else {
+        return false;
+    };
+    if config.allowed_repositories.is_empty() {
+        return false;
+    }
+    app_images.iter().any(|images| {
+        images
+            .as_ref()
+            .is_some_and(|images| images_match_repository_scopes(config, images.iter()))
+    })
+}
+
+/// Delete the managed tenant image pull secret from a namespace where the
+/// current scope does not apply. Fails on API errors other than "not found":
+/// if the platform credential cannot be removed from a namespace that must not
+/// hold it, continuing would silently leave the token exposed.
+async fn delete_stale_tenant_image_pull_secret(
+    engine: &ApplyEngine,
+    namespace: &str,
+    generation: MutationGeneration,
+) -> Result<(), DeployError> {
+    let name = managed_tenant_image_pull_secret_name();
+    let api: Api<Secret> = Api::namespaced(engine.client().clone(), namespace);
+    let existing = match api.get(&name).await {
+        Ok(existing) => existing,
+        Err(kube::Error::Api(error)) if error.code == 404 => return Ok(()),
+        Err(error) => return Err(DeployError::Apply(error.into())),
+    };
+    if !is_managed_tenant_image_pull_secret(&existing) {
+        tracing::warn!(
+            namespace = %namespace,
+            secret = %name,
+            "tenant image pull secret cleanup skipped: secret exists but is not CAP-managed"
+        );
+        return Ok(());
+    }
+    delete_resource(&api, &name, generation, DeleteParams::default()).await?;
+    tracing::info!(
+        namespace = %namespace,
+        secret = %name,
+        "stale tenant image pull secret removed (workload is outside the configured repository scope)"
+    );
+    Ok(())
+}
+
+/// Startup convergence for stale tenant image pull secrets (review finding):
+/// scope changes (narrowing `TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES`, removing
+/// GHCR credentials) previously left the platform token in namespaces whose
+/// workloads fell out of scope until each app happened to redeploy. Sweep the
+/// known app namespaces at startup and remove the managed secret wherever the
+/// current scope does not apply. Best-effort: failures are logged and must not
+/// block startup — the per-deploy cleanup in
+/// [`apply_all_with_tenant_image_pull_secret`] remains the hard gate.
+pub async fn cleanup_stale_tenant_image_pull_secrets_at_startup(pool: &PgPool) {
+    match cleanup_stale_tenant_image_pull_secrets(pool).await {
+        Ok(()) => {}
+        Err(error) => tracing::warn!(
+            %error,
+            "tenant image pull secret startup cleanup failed; stale secrets may remain until the next redeploy"
+        ),
+    }
+}
+
+/// Per-namespace janitor inventory: (per-app image lists, service accounts).
+type NamespacePullSecretInventory =
+    std::collections::BTreeMap<String, (Vec<Option<Vec<ImageRef>>>, Vec<String>)>;
+
+async fn cleanup_stale_tenant_image_pull_secrets(pool: &PgPool) -> Result<(), DeployError> {
+    let secret_name = managed_tenant_image_pull_secret_name();
+    let config = tenant_image_pull_secret_config_from_env();
+
+    let rows: Vec<(Uuid, String, String, String)> = sqlx::query_as(
+        "SELECT app_containers.app_id, apps.namespace, apps.service_account, \
+                app_containers.image_ref \
+           FROM apps \
+           JOIN app_containers ON app_containers.app_id = apps.id",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    // Per app: namespace, service account, and its images (None = a stored
+    // image ref failed to parse, so the app cannot qualify for the secret).
+    let mut apps: std::collections::BTreeMap<Uuid, (String, String, Option<Vec<ImageRef>>)> =
+        std::collections::BTreeMap::new();
+    for (app_id, namespace, service_account, image_ref) in rows {
+        let entry = apps
+            .entry(app_id)
+            .or_insert_with(|| (namespace.clone(), service_account.clone(), Some(Vec::new())));
+        let Some(images) = entry.2.as_mut() else {
+            continue;
+        };
+        match ImageRef::parse(&image_ref) {
+            Ok(image) => images.push(image),
+            Err(error) => {
+                tracing::warn!(
+                    %namespace,
+                    %image_ref,
+                    %error,
+                    "tenant image pull secret cleanup sweep: unparsable stored image; treating the app as out of scope"
+                );
+                entry.2 = None;
+            }
+        }
+    }
+
+    let mut by_namespace: NamespacePullSecretInventory = Default::default();
+    for (_app_id, (namespace, service_account, images)) in apps {
+        let entry = by_namespace.entry(namespace).or_default();
+        entry.0.push(images);
+        entry.1.push(service_account);
+    }
+
+    let engine = ApplyEngine::try_default().await?;
+    let mut removed = 0usize;
+    for (namespace, (app_images, service_accounts)) in &by_namespace {
+        if namespace_keeps_tenant_image_pull_secret(config.as_ref(), app_images) {
+            continue;
+        }
+        // Reconcile the live references too: the ServiceAccount generated by
+        // earlier deploys lists the secret in `imagePullSecrets` and would
+        // keep pointing at it after the secret is gone. (Existing pods embed
+        // the reference at creation time; it is only consulted at image-pull
+        // time, and out-of-scope images must not pull with the platform token
+        // in the first place.)
+        for service_account in service_accounts {
+            if let Err(error) = clear_pull_secret_reference_from_service_account(
+                &engine,
+                namespace,
+                service_account,
+                &secret_name,
+            )
+            .await
+            {
+                tracing::warn!(
+                    %namespace,
+                    service_account = %service_account,
+                    %error,
+                    "tenant image pull secret cleanup sweep: failed to clear stale ServiceAccount reference"
+                );
+            }
+        }
+        match delete_managed_pull_secret_unfenced(&engine, namespace, &secret_name).await {
+            Ok(true) => removed += 1,
+            Ok(false) => {}
+            Err(error) => tracing::warn!(
+                %namespace,
+                %error,
+                "tenant image pull secret cleanup sweep: failed to remove stale secret"
+            ),
+        }
+    }
+    tracing::info!(
+        removed,
+        "tenant image pull secret startup cleanup sweep complete"
+    );
+    Ok(())
+}
+
+/// Unfenced janitor delete of the managed pull secret: unlike
+/// [`delete_stale_tenant_image_pull_secret`] this runs outside any mutation
+/// lease (startup sweep), so it relies on the observed UID/resourceVersion
+/// preconditions instead of the mutation-generation fence. Returns whether a
+/// secret was deleted.
+async fn delete_managed_pull_secret_unfenced(
+    engine: &ApplyEngine,
+    namespace: &str,
+    name: &str,
+) -> Result<bool, DeployError> {
+    let api: Api<Secret> = Api::namespaced(engine.client().clone(), namespace);
+    let existing = match api.get(name).await {
+        Ok(existing) => existing,
+        Err(kube::Error::Api(error)) if error.code == 404 => return Ok(false),
+        Err(error) => return Err(DeployError::Apply(error.into())),
+    };
+    if !is_managed_tenant_image_pull_secret(&existing) {
+        tracing::warn!(
+            namespace = %namespace,
+            secret = %name,
+            "tenant image pull secret cleanup skipped: secret exists but is not CAP-managed"
+        );
+        return Ok(false);
+    }
+    let delete_params = DeleteParams {
+        preconditions: Some(kube::api::Preconditions {
+            uid: existing.meta().uid.clone(),
+            resource_version: existing.meta().resource_version.clone(),
+        }),
+        ..Default::default()
+    };
+    match api.delete(name, &delete_params).await {
+        Ok(_) => {
+            tracing::info!(
+                namespace = %namespace,
+                secret = %name,
+                "stale tenant image pull secret removed (namespace is outside the configured repository scope)"
+            );
+            Ok(true)
+        }
+        Err(kube::Error::Api(error)) if error.code == 404 => Ok(false),
+        Err(error) => Err(DeployError::Apply(error.into())),
+    }
+}
+
+/// Drop `secret_name` from a ServiceAccount's `imagePullSecrets`, keeping any
+/// other references. No-op when the ServiceAccount is gone or does not
+/// reference the secret. The patch is attributed to the engine field manager
+/// and pinned to the observed resourceVersion so a concurrent write wins.
+async fn clear_pull_secret_reference_from_service_account(
+    engine: &ApplyEngine,
+    namespace: &str,
+    service_account: &str,
+    secret_name: &str,
+) -> Result<(), DeployError> {
+    use k8s_openapi::api::core::v1::ServiceAccount;
+    use kube::api::{Patch, PatchParams};
+
+    let api: Api<ServiceAccount> = Api::namespaced(engine.client().clone(), namespace);
+    let existing = match api.get(service_account).await {
+        Ok(existing) => existing,
+        Err(kube::Error::Api(error)) if error.code == 404 => return Ok(()),
+        Err(error) => return Err(DeployError::Apply(error.into())),
+    };
+    let Some(references) = existing.image_pull_secrets.as_ref() else {
+        return Ok(());
+    };
+    if !references.iter().any(|r| r.name == secret_name) {
+        return Ok(());
+    }
+    let kept: Vec<serde_json::Value> = references
+        .iter()
+        .filter(|r| r.name != secret_name)
+        .map(|r| serde_json::json!({ "name": r.name }))
+        .collect();
+    let image_pull_secrets = if kept.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::Array(kept)
+    };
+    let patch = serde_json::json!({
+        "metadata": {
+            "name": service_account,
+            "resourceVersion": existing.meta().resource_version,
+        },
+        "imagePullSecrets": image_pull_secrets,
+    });
+    let patch_params = PatchParams::apply(&engine.config().field_manager);
+    match api
+        .patch(service_account, &patch_params, &Patch::Merge(&patch))
+        .await
+    {
+        Ok(_) => {
+            tracing::info!(
+                namespace = %namespace,
+                service_account = %service_account,
+                secret = %secret_name,
+                "stale imagePullSecrets reference cleared from ServiceAccount"
+            );
+            Ok(())
+        }
+        Err(kube::Error::Api(error)) if error.code == 404 => Ok(()),
+        Err(error) => Err(DeployError::Apply(error.into())),
     }
 }
 
@@ -397,6 +777,12 @@ async fn apply_all_with_tenant_image_pull_secret(
             secret = %config.name,
             "tenant image pull secret applied"
         );
+    } else {
+        // The scope gate rejected this workload (or no scoped config exists).
+        // Skipping the apply is not enough: a pull secret applied by an
+        // earlier deployment would survive here with the platform credential
+        // still readable by namespace readers, so remove it (review finding).
+        delete_stale_tenant_image_pull_secret(engine, ns_name, generation).await?;
     }
 
     apply_standard_resources(engine, manifests, generation).await?;
@@ -1457,6 +1843,15 @@ mod tests {
         );
         assert_eq!(secret.metadata.namespace.as_deref(), Some("tenant-ns"));
         assert_eq!(
+            secret
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get("app.kubernetes.io/managed-by"))
+                .map(String::as_str),
+            Some("enclava-platform")
+        );
+        assert_eq!(
             secret.type_.as_deref(),
             Some("kubernetes.io/dockerconfigjson")
         );
@@ -1501,22 +1896,45 @@ mod tests {
     #[test]
     fn tenant_image_pull_scope_parses_exact_and_prefix_repositories() {
         assert_eq!(
-            parse_image_pull_repository_scope("ghcr.io/enclava-ai/private-template"),
-            Some(ImagePullRepositoryScope {
+            parse_image_pull_repository_scope("ghcr.io/enclava-ai/private-template").unwrap(),
+            ImagePullRepositoryScope {
                 registry: "ghcr.io".to_string(),
                 repository: "enclava-ai/private-template".to_string(),
                 include_subrepositories: false,
-            })
+            }
         );
         assert_eq!(
-            parse_image_pull_repository_scope(" ghcr.io/enclava-ai/templates/* "),
-            Some(ImagePullRepositoryScope {
+            parse_image_pull_repository_scope(" ghcr.io/enclava-ai/templates/* ").unwrap(),
+            ImagePullRepositoryScope {
                 registry: "ghcr.io".to_string(),
                 repository: "enclava-ai/templates".to_string(),
                 include_subrepositories: true,
-            })
+            }
         );
-        assert!(parse_image_pull_repository_scope("ghcr.io").is_none());
+        assert!(parse_image_pull_repository_scope("ghcr.io").is_err());
+    }
+
+    /// A repeated wildcard suffix must be rejected, never stripped down into
+    /// the broader scope (P1 review): `registry/repository/*/*` would widen to
+    /// `registry/repository/*` if all `/*` repetitions were trimmed.
+    #[test]
+    fn tenant_image_pull_scope_rejects_repeated_wildcard_suffixes() {
+        assert!(parse_image_pull_repository_scope("ghcr.io/company/private/*/*").is_err());
+        assert!(parse_image_pull_repository_scope("ghcr.io/company/private/**").is_err());
+        assert!(parse_image_pull_repository_scope("ghcr.io/company*/private").is_err());
+        assert!(parse_image_pull_repository_scope("*/company/private").is_err());
+        assert!(parse_image_pull_repository_scope("ghcr.io/company/private/*x").is_err());
+
+        // A single trailing "/*" keeps its subrepository semantics — the
+        // rejection must not break the documented grammar.
+        assert_eq!(
+            parse_image_pull_repository_scope("ghcr.io/company/private/*").unwrap(),
+            ImagePullRepositoryScope {
+                registry: "ghcr.io".to_string(),
+                repository: "company/private".to_string(),
+                include_subrepositories: true,
+            }
+        );
     }
 
     /// Issue #225: an unscoped config must never attach the platform pull
@@ -1539,14 +1957,144 @@ mod tests {
     /// degrade into a different (or missing) scope.
     #[test]
     fn tenant_image_pull_scope_parser_rejects_invalid_entries() {
-        assert!(parse_image_pull_scopes_strict("ghcr.io/enclava-ai/templates/*,bogus").is_none());
-        assert!(parse_image_pull_scopes_strict("ghcr.io").is_none());
+        assert!(parse_image_pull_scopes_strict("ghcr.io/enclava-ai/templates/*,bogus").is_err());
+        assert!(parse_image_pull_scopes_strict("ghcr.io").is_err());
         assert_eq!(
-            parse_image_pull_scopes_strict("ghcr.io/enclava-ai/templates/*"),
-            Some(vec![
-                parse_image_pull_repository_scope("ghcr.io/enclava-ai/templates/*").unwrap()
-            ])
+            parse_image_pull_scopes_strict("ghcr.io/enclava-ai/templates/*").unwrap(),
+            vec![parse_image_pull_repository_scope("ghcr.io/enclava-ai/templates/*").unwrap()]
         );
+    }
+
+    /// A list with one valid and one malformed scope must name the malformed
+    /// entry in the error instead of claiming no valid entries exist (review
+    /// finding): operators need the exact offending entry to fix the typo.
+    #[test]
+    fn tenant_image_pull_scope_errors_name_malformed_entries() {
+        let error =
+            parse_image_pull_scopes_strict("ghcr.io/enclava-ai/templates/*,bogus,ghcr.io/a/b")
+                .unwrap_err();
+        assert!(error.contains("bogus"), "error should name entry: {error}");
+        assert!(error.contains("#2"), "error should give position: {error}");
+        assert!(
+            !error.contains("ghcr.io/a/b"),
+            "valid entries must not be reported: {error}"
+        );
+
+        let empty_entry = parse_image_pull_scopes_strict("ghcr.io/a/b,").unwrap_err();
+        assert!(
+            empty_entry.contains("#2"),
+            "error should give position: {empty_entry}"
+        );
+    }
+
+    #[test]
+    fn managed_tenant_image_pull_secret_detection_matches_label_and_legacy_shape() {
+        use k8s_openapi::ByteString;
+
+        let mut labeled = generate_tenant_image_pull_secret(
+            "tenant-ns",
+            &pull_secret_config(vec![
+                parse_image_pull_repository_scope("ghcr.io/enclava-ai/templates/*").unwrap(),
+            ]),
+        );
+        // generate_tenant_image_pull_secret fills string_data (write-only);
+        // is_managed_tenant_image_pull_secret must also accept that shape.
+        assert!(is_managed_tenant_image_pull_secret(&labeled));
+
+        // Legacy pre-label secret: dockerconfigjson with exactly one ghcr.io
+        // auth entry, as the old global fallback generated it.
+        let legacy_json =
+            serde_json::json!({"auths": {"ghcr.io": {"username": "cap-bot", "password": "x"}}})
+                .to_string();
+        let mut legacy = Secret {
+            metadata: ObjectMeta {
+                name: Some("enclava-registry-auth".to_string()),
+                ..Default::default()
+            },
+            type_: Some("kubernetes.io/dockerconfigjson".to_string()),
+            ..Default::default()
+        };
+        legacy.data = Some(std::collections::BTreeMap::from([(
+            ".dockerconfigjson".to_string(),
+            ByteString(legacy_json.into_bytes()),
+        )]));
+        assert!(is_managed_tenant_image_pull_secret(&legacy));
+
+        // A tenant's own multi-registry secret is never CAP-managed.
+        let tenant_json = serde_json::json!({
+            "auths": {
+                "ghcr.io": {"username": "tenant"},
+                "registry.example": {"username": "tenant"}
+            }
+        })
+        .to_string();
+        let mut tenant = legacy.clone();
+        tenant.data = Some(std::collections::BTreeMap::from([(
+            ".dockerconfigjson".to_string(),
+            ByteString(tenant_json.into_bytes()),
+        )]));
+        assert!(!is_managed_tenant_image_pull_secret(&tenant));
+
+        // Wrong type / missing payload is never CAP-managed.
+        let opaque = Secret {
+            metadata: ObjectMeta {
+                name: Some("enclava-registry-auth".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(!is_managed_tenant_image_pull_secret(&opaque));
+
+        // A stray managed-by label on an unparseable secret is still ours.
+        labeled.data = None;
+        labeled.string_data = None;
+        assert!(is_managed_tenant_image_pull_secret(&labeled));
+    }
+
+    #[test]
+    fn namespace_keeps_pull_secret_only_while_an_app_is_in_scope() {
+        let config = pull_secret_config(vec![
+            parse_image_pull_repository_scope("ghcr.io/enclava-ai/templates/*").unwrap(),
+        ]);
+        let in_scope = Some(vec![test_container(
+            "ghcr.io/enclava-ai/templates/ssh@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .image
+        .clone()]);
+        let out_of_scope = Some(vec![test_container(
+            "ghcr.io/tenant/private-app@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )
+        .image
+        .clone()]);
+
+        assert!(namespace_keeps_tenant_image_pull_secret(
+            Some(&config),
+            std::slice::from_ref(&in_scope)
+        ));
+        assert!(namespace_keeps_tenant_image_pull_secret(
+            Some(&config),
+            &[out_of_scope.clone(), in_scope.clone()]
+        ));
+        assert!(!namespace_keeps_tenant_image_pull_secret(
+            Some(&config),
+            &[out_of_scope]
+        ));
+        // Unparsable stored images never keep the secret by themselves …
+        assert!(!namespace_keeps_tenant_image_pull_secret(
+            Some(&config),
+            &[None]
+        ));
+        // … but they never evict it from a namespace with a valid in-scope app.
+        assert!(namespace_keeps_tenant_image_pull_secret(
+            Some(&config),
+            &[None, in_scope.clone()]
+        ));
+        assert!(namespace_keeps_tenant_image_pull_secret(
+            Some(&config),
+            &[Some(vec![]), in_scope]
+        ));
+        // No scoped config at all: nothing keeps the secret.
+        assert!(!namespace_keeps_tenant_image_pull_secret(None, &[]));
     }
 
     #[test]
