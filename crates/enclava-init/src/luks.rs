@@ -15,7 +15,7 @@
 //! runtime image must include `mkfs.ext4`.
 
 use std::fs::{OpenOptions, remove_file};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -431,17 +431,39 @@ fn buffer_has_luks2_header_magic(buf: &[u8]) -> bool {
     buf.len() >= 8 && &buf[..6] == LUKS_MAGIC && u16::from_be_bytes([buf[6], buf[7]]) == 2
 }
 
+// Full-device zero scan: blank=true authorizes luksFormat, so every byte is
+// checked. Runs only when no LUKS2 header was detected; the O(device size)
+// cost is paid once at first boot.
 fn device_appears_blank(device: &Path) -> Result<bool> {
-    const PROBE_BYTES: usize = 4096;
+    // Too small to hold our LUKS2 header + keyslot area: never treat as blank.
+    const MIN_BYTES: u64 = 16 * 1024 * 1024;
+    const CHUNK: usize = 64 * 1024;
     let mut file = OpenOptions::new()
         .read(true)
         .open(device)
         .map_err(|e| InitError::Luks(format!("open {} for blank probe: {e}", device.display())))?;
-    let mut buf = [0u8; PROBE_BYTES];
-    let read = file
-        .read(&mut buf)
-        .map_err(|e| InitError::Luks(format!("read {} blank probe: {e}", device.display())))?;
-    Ok(buf[..read].iter().all(|byte| *byte == 0))
+    // SeekFrom::End works on block devices; metadata().len() reports 0 for them.
+    let len = file
+        .seek(SeekFrom::End(0))
+        .map_err(|e| InitError::Luks(format!("seek {} for blank probe: {e}", device.display())))?;
+    if len < MIN_BYTES {
+        return Ok(false);
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| InitError::Luks(format!("seek {} for blank probe: {e}", device.display())))?;
+    let mut buf = [0u8; CHUNK];
+    let mut remaining = len;
+    while remaining > 0 {
+        let take = remaining.min(CHUNK as u64) as usize;
+        // read_exact: EOF before len is an error, not "blank".
+        file.read_exact(&mut buf[..take])
+            .map_err(|e| InitError::Luks(format!("read {} blank probe: {e}", device.display())))?;
+        if buf[..take].iter().any(|byte| *byte != 0) {
+            return Ok(false);
+        }
+        remaining -= take as u64;
+    }
+    Ok(true)
 }
 
 fn with_key_file<F>(key: &DerivedSeed, f: F) -> Result<()>
@@ -584,13 +606,30 @@ mod unit_tests {
     fn blank_probe_distinguishes_fresh_and_nonempty_devices() {
         let dir = tempfile::tempdir().expect("temporary directory");
         let device = dir.path().join("device");
-        std::fs::write(&device, [0u8; 4096]).expect("write blank device");
+
+        std::fs::File::create(&device).expect("create empty device");
+        assert!(!device_appears_blank(&device).expect("probe empty device"));
+
+        std::fs::write(&device, [0u8; 1024]).expect("write undersized device");
+        assert!(!device_appears_blank(&device).expect("probe undersized device"));
+
+        std::fs::File::create(&device)
+            .expect("create sparse device")
+            .set_len(32 * 1024 * 1024)
+            .expect("size sparse device");
         assert!(device_appears_blank(&device).expect("probe blank device"));
 
-        let mut nonempty = [0u8; 4096];
-        nonempty[512] = 1;
-        std::fs::write(&device, nonempty).expect("write nonempty device");
-        assert!(!device_appears_blank(&device).expect("probe nonempty device"));
+        for offset in [24 * 1024 * 1024, 32 * 1024 * 1024 - 4096] {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&device)
+                .expect("open sparse device");
+            file.seek(SeekFrom::Start(offset)).expect("seek");
+            file.write_all(&[1]).expect("write non-zero byte");
+            assert!(!device_appears_blank(&device).expect("probe dirty device"));
+            file.seek(SeekFrom::Start(offset)).expect("seek back");
+            file.write_all(&[0]).expect("restore zero byte");
+        }
     }
 
     #[test]
