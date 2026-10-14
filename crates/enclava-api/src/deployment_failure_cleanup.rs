@@ -240,16 +240,19 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
     // a query failure counts as sweep failure (retryable), not as "no
     // window" (which would silently skip claims then clear evidence
     // over them).
-    let (sts_proven_windows, reached_sts_step_without_window) = match sqlx::query_as::<
+    let (sts_proven_windows, reached_sts_step_without_window, legacy_unmarked_row) = match sqlx::query_as::<
         _,
         (
             Option<String>,
             Option<chrono::DateTime<chrono::Utc>>,
             Option<chrono::DateTime<chrono::Utc>>,
             Option<chrono::DateTime<chrono::Utc>>,
+            Option<String>,
+            Option<chrono::DateTime<chrono::Utc>>,
         ),
     >(
-        "SELECT sts_uid, sts_created_at, sts_observed_deleted_at, sts_apply_started_at
+        "SELECT sts_uid, sts_created_at, sts_observed_deleted_at, sts_apply_started_at,
+                manifest_hash, apply_started_at
            FROM deployments
           WHERE app_id = $1
             AND (id = $2 OR cleanup_sweep_incomplete)",
@@ -261,7 +264,7 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
     {
         Ok(rows) => (
             rows.iter()
-                .filter_map(|(uid, created_at, deleted_confirmed_at, _)| {
+                .filter_map(|(uid, created_at, deleted_confirmed_at, _, _, _)| {
                     created_at.map(|created_at| StsProvenanceWindow {
                         uid: uid.clone(),
                         created_at,
@@ -274,9 +277,15 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
             // write failed): its claims are unprovable — an out-of-window
             // matching claim may still be that row's, so "foreign" skips
             // must not let the sweep complete over it.
-            rows.iter().any(|(_, created_at, _, apply_started)| {
+            rows.iter().any(|(_, created_at, _, apply_started, _, _)| {
                 apply_started.is_some() && created_at.is_none()
             }),
+            any_legacy_evidence_row(
+                rows.iter()
+                    .map(|(_, _, _, _, manifest_hash, apply_started)| {
+                        (manifest_hash.as_deref(), *apply_started)
+                    }),
+            ),
         ),
         Err(error) => {
             tracing::warn!(
@@ -361,13 +370,36 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
                 // Foreign (no creation evidence — includes objects CAP
                 // merely SSA-patched), or a newer generation's publication:
                 // never delete on name alone.
-                tracing::info!(
-                    app_id = %app.id,
-                    namespace = %app.namespace,
-                    kind = target.kind,
-                    name = %target.name,
-                    "adopted-namespace sweep skips object not created by a CAP failed apply"
-                );
+                //
+                // Codex P1 (legacy unmarked rows): objects created by
+                // pre-release rows can never carry creation evidence —
+                // if a legacy evidence row (manifest_hash without
+                // apply_started_at, i.e. published before the column
+                // existed) is part of this sweep's row set, a live
+                // unmarked target is UNRESOLVED, not foreign. Skipping it
+                // silently would let the caller declare the sweep complete
+                // and clear both rows' evidence over the still-live legacy
+                // StatefulSet/Secret/Service/ConfigMaps (no later
+                // eligibility would ever exist). Count it as a failure:
+                // fail closed, keep both rows retryable.
+                if legacy_unmarked_row {
+                    tracing::warn!(
+                        app_id = %app.id,
+                        namespace = %app.namespace,
+                        kind = target.kind,
+                        name = %target.name,
+                        "adopted-namespace sweep cannot attribute live unmarked object (legacy evidence row in scope); counting the sweep incomplete"
+                    );
+                    failures += 1;
+                } else {
+                    tracing::info!(
+                        app_id = %app.id,
+                        namespace = %app.namespace,
+                        kind = target.kind,
+                        name = %target.name,
+                        "adopted-namespace sweep skips object not created by a CAP failed apply"
+                    );
+                }
                 break;
             }
             let preconditions = kube::api::Preconditions {
@@ -610,6 +642,27 @@ where
     let live_generation =
         annotation(enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION);
     live_generation.is_some_and(|live| live > 0 && live <= failed_generation)
+}
+
+/// Codex P1 (legacy unmarked rows): a failed row that holds provider-state
+/// evidence (`manifest_hash`) but predates the migration that added
+/// `apply_started_at` — the column is stamped in the SAME atomic UPDATE
+/// that writes `manifest_hash` (the `'applying'` transition in
+/// `set_deployment_status`), so evidence without it can only belong to a
+/// row published before the column existed. Objects such a row created
+/// can never carry `RESOURCE_CREATED_BY_ANNOTATION` (stamped only by the
+/// create POST of this release), so the evidence-gated sweep skip below
+/// would silently exempt them; the caller would then clear BOTH rows'
+/// evidence over possibly-live legacy objects. When such a row is in the
+/// sweep's row set, a live target WITHOUT creation evidence is therefore
+/// unresolved, not foreign: count it as a failure so the sweep stays
+/// incomplete and both rows keep their evidence (retryable, fail closed).
+fn any_legacy_evidence_row<'a>(
+    mut rows: impl Iterator<Item = (Option<&'a str>, Option<chrono::DateTime<chrono::Utc>>)>,
+) -> bool {
+    rows.any(|(manifest_hash, apply_started)| {
+        manifest_hash.is_some() && apply_started.is_none()
+    })
 }
 
 /// Bounded re-read retry budget for preconditioned sweep deletes.
@@ -2919,6 +2972,35 @@ mod tests {
             ClaimBoundOrdering::AfterBound,
             "a sub-second claim after the second-bound is strictly after as an instant"
         );
+    }
+
+    /// Codex P1 (legacy unmarked rows): evidence rows published before the
+    /// `apply_started_at` column existed (manifest_hash set, apply_started_at
+    /// NULL — both written by the same atomic UPDATE) can only be pre-release
+    /// rows; their objects can never carry creation evidence, so live
+    /// unmarked targets under them must count as sweep failures, not skips.
+    #[test]
+    fn legacy_evidence_row_detection() {
+        let t = chrono_time("2026-10-14T10:00:00Z");
+        // Legacy row: evidence without apply_started_at.
+        assert!(any_legacy_evidence_row(
+            [(Some("abc123"), None)].into_iter()
+        ));
+        // Modern row: both stamped.
+        assert!(!any_legacy_evidence_row(
+            [(Some("abc123"), Some(t))].into_iter()
+        ));
+        // No evidence at all: not a legacy evidence row.
+        assert!(!any_legacy_evidence_row([(None, None)].into_iter()));
+        // Mixed set: one legacy row among modern ones still flags.
+        assert!(any_legacy_evidence_row(
+            [
+                (Some("new-gen"), Some(t)),
+                (Some("old-gen"), None),
+                (None, None),
+            ]
+            .into_iter()
+        ));
     }
 
     fn chrono_time(rfc3339: &str) -> chrono::DateTime<chrono::Utc> {
