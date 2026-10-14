@@ -5,7 +5,7 @@ use enclava_common::types::{ResourceLimits, UnlockMode as CommonUnlockMode};
 use enclava_engine::apply::{
     engine::ApplyEngine,
     gateway::apply_gateway_resources,
-    generation::{MutationGeneration, delete_resource},
+    generation::MutationGeneration,
     namespace::apply_namespace,
     network_policy::apply_network_policy,
     orchestrator::{MANIFEST_HASH_ANNOTATION, manifest_hash},
@@ -559,10 +559,8 @@ fn managed_tenant_image_pull_secret_name() -> String {
 }
 
 /// Whether an on-cluster Secret is the managed tenant image pull secret CAP
-/// owns. Newly generated secrets carry the dedicated pull-secret label (and
-/// the generic managed-by marker); secrets created before the labels existed
-/// (the pre-scope "global fallback" that this change removes) are recognized
-/// by the legacy generated shape — a
+/// owns. Newly generated secrets carry the dedicated pull-secret label; a
+/// secret without it is recognized only by the legacy generated shape — a
 /// `kubernetes.io/dockerconfigjson` secret whose single auth entry is
 /// `ghcr.io` and whose embedded credentials match the configured GHCR pair.
 /// The credential match is required: a tenant (or operator) can legitimately
@@ -570,16 +568,18 @@ fn managed_tenant_image_pull_secret_name() -> String {
 /// never delete a secret it cannot prove CAP generated (review finding).
 /// Anything else in the namespace is tenant-owned and must never be deleted
 /// by the stale-secret cleanup.
+///
+/// The generic `app.kubernetes.io/managed-by=enclava-platform` marker is
+/// deliberately NOT sufficient proof (review finding on #243): it is used
+/// broadly across platform resources, so accepting it alone would put every
+/// generic-managed Secret at a managed name inside this cleanup's blast
+/// radius. Only the dedicated pull-secret label — introduced specifically to
+/// distinguish these secrets — or the legacy credential-shape proof counts.
 fn is_managed_tenant_image_pull_secret(
     secret: &Secret,
     ghcr_credentials: Option<(&str, &str)>,
 ) -> bool {
-    let labeled = secret.metadata.labels.as_ref().is_some_and(|labels| {
-        labels.get(TENANT_PULL_SECRET_LABEL).map(String::as_str)
-            == Some(TENANT_PULL_SECRET_LABEL_VALUE)
-            || labels.get(MANAGED_BY_LABEL).map(String::as_str) == Some(MANAGED_BY_VALUE)
-    });
-    if labeled {
+    if is_labeled_managed_pull_secret(secret) {
         return true;
     }
     let Some((expected_username, expected_token)) = ghcr_credentials else {
@@ -748,12 +748,25 @@ async fn discover_managed_pull_secrets(
     // tenant-owned secret contents. The dedicated label is the selector (and
     // the deletion marker), so no other managed Secret can enter the sweep
     // (review finding).
-    let labeled = api
+    let labeled = match api
         .list(&ListParams::default().labels(&format!(
             "{TENANT_PULL_SECRET_LABEL}={TENANT_PULL_SECRET_LABEL_VALUE}"
         )))
         .await
-        .map_err(|error| DeployError::Apply(error.into()))?;
+    {
+        Ok(labeled) => labeled,
+        // A missing namespace has no stale secrets (review finding on #243):
+        // an app row can exist before its namespace is created, or outlive the
+        // namespace after deletion. Treating the 404 as a sweep failure would
+        // keep workload admission closed and the dispatcher unspawned while
+        // the very pending work that creates the namespace or removes the row
+        // can never run — the sweep must see an already-clean namespace and
+        // continue.
+        Err(kube::Error::Api(error)) if error.code == 404 => {
+            return Ok((Vec::new(), BTreeSet::new()));
+        }
+        Err(error) => return Err(DeployError::Apply(error.into())),
+    };
     for secret in labeled.items {
         if let Some(name) = secret.metadata.name.clone() {
             seen.insert(name);
@@ -886,12 +899,10 @@ async fn reconcile_managed_pull_secrets(
             continue;
         }
         removed += 1;
-        // Re-check ownership on the LIVE object right before the two writes
+        // Re-check ownership on the LIVE object right before the writes
         // (review finding on #243): the discovery pass may be stale, and a
         // tenant who replaced the secret in the meantime must keep both the
-        // secret and its ServiceAccount references. The reference clears and
-        // the delete share this one fresh decision (the delete re-verifies
-        // with its own UID/resourceVersion preconditions as a second gate).
+        // secret and its ServiceAccount references.
         let live = match api.get(name).await {
             Ok(live) => live,
             Err(kube::Error::Api(error)) if error.code == 404 => continue,
@@ -919,6 +930,7 @@ async fn reconcile_managed_pull_secrets(
         // Only proven CAP-managed names are ever cleared from
         // ServiceAccounts (review finding): a tenant-owned secret under the
         // same name keeps both itself and its references.
+        let mut cleared_references: Vec<String> = Vec::new();
         for service_account in service_accounts {
             match clear_pull_secret_reference_from_service_account(
                 engine,
@@ -928,7 +940,8 @@ async fn reconcile_managed_pull_secrets(
             )
             .await
             {
-                Ok(()) => {}
+                Ok(true) => cleared_references.push(service_account.clone()),
+                Ok(false) => {}
                 Err(error) => {
                     converged = false;
                     tracing::warn!(
@@ -942,31 +955,63 @@ async fn reconcile_managed_pull_secrets(
                 }
             }
         }
-        let removed_result = match delete_mode {
-            PullSecretDeleteMode::Unfenced => {
-                delete_managed_pull_secret_unfenced(engine, namespace, name, settings.ghcr()).await
+        // The delete is the final ownership decision (review finding on
+        // #243): it re-reads the live secret, re-verifies CAP ownership, and
+        // deletes exactly the object that verification saw. The reference
+        // clears above were made from the earlier read, so whenever the
+        // delete does NOT remove that verified managed secret — the tenant
+        // replaced it mid-cleanup and the delete preserves the replacement —
+        // the clears are reversed: a replacement detected at deletion keeps
+        // its ServiceAccount references and its pods keep registry access.
+        let removal =
+            delete_managed_pull_secret(engine, namespace, name, settings.ghcr(), delete_mode).await;
+        let reverse_reference_clears = match &removal {
+            Ok(PullSecretRemovalOutcome::Deleted | PullSecretRemovalOutcome::Missing) => false,
+            Ok(PullSecretRemovalOutcome::NotOurs) => {
+                tracing::warn!(
+                    %namespace,
+                    secret = %name,
+                    "tenant image pull secret reconcile: the secret was replaced while it was \
+                     being cleaned up — keeping the replacement and restoring its ServiceAccount \
+                     references"
+                );
+                true
             }
-            PullSecretDeleteMode::Fenced(generation) => {
-                delete_managed_pull_secret_fenced(
-                    engine,
-                    namespace,
-                    name,
-                    generation,
-                    settings.ghcr(),
-                )
-                .await
-            }
-        };
-        match removed_result {
-            Ok(_) => {}
             Err(error) => {
                 converged = false;
                 tracing::warn!(
                     %namespace,
                     secret = %name,
                     %error,
-                    "tenant image pull secret reconcile: failed to remove stale secret"
+                    "tenant image pull secret reconcile: failed to remove stale secret; \
+                     restoring the ServiceAccount references cleared above"
                 );
+                true
+            }
+        };
+        if reverse_reference_clears {
+            for service_account in &cleared_references {
+                match restore_pull_secret_reference_to_service_account(
+                    engine,
+                    namespace,
+                    service_account,
+                    name,
+                )
+                .await
+                {
+                    Ok(()) => {}
+                    Err(error) => {
+                        converged = false;
+                        tracing::warn!(
+                            %namespace,
+                            service_account = %service_account,
+                            secret = %name,
+                            %error,
+                            "tenant image pull secret reconcile: failed to restore the \
+                             ServiceAccount reference after a mid-cleanup replacement"
+                        );
+                    }
+                }
             }
         }
     }
@@ -992,21 +1037,49 @@ fn is_labeled_managed_pull_secret(secret: &Secret) -> bool {
         .is_some_and(|value| value == TENANT_PULL_SECRET_LABEL_VALUE)
 }
 
-/// Delete a proven managed pull secret fenced by the deploy's mutation
-/// generation (per-deploy cleanup). Re-checks ownership on the live object
-/// right before deleting: the discovery pass may be stale, and a secret that
-/// was replaced by a tenant-owned look-alike in the meantime must survive.
-async fn delete_managed_pull_secret_fenced(
+/// What happened to the managed pull secret one cleanup removal attempted.
+/// This is the final ownership decision of a removal (review finding on
+/// #243): only [`PullSecretRemovalOutcome::Deleted`] and
+/// [`PullSecretRemovalOutcome::Missing`] mean the name no longer holds a
+/// tenant-replaceable secret, so only those two may leave the
+/// ServiceAccount reference cleared.
+#[derive(Debug)]
+enum PullSecretRemovalOutcome {
+    /// The verified managed secret was deleted.
+    Deleted,
+    /// No secret lives under the name.
+    Missing,
+    /// A secret exists (or appeared) under the name but is not the verified
+    /// managed object — a tenant replacement or a concurrent write. It is
+    /// preserved, and so are its ServiceAccount references.
+    NotOurs,
+}
+
+/// Delete one proven managed pull secret, fenced by the deploy's mutation
+/// generation (per-deploy cleanup) or by the observed UID/resourceVersion
+/// alone (startup sweep and background retry — see [`PullSecretDeleteMode`]).
+///
+/// This is the final ownership decision of the cleanup (review finding on
+/// #243): it re-reads the live secret, re-verifies CAP ownership right before
+/// deleting, and pins the delete to exactly the object that verification saw
+/// — a secret replaced after that check must conflict and survive, never be
+/// deleted. Callers coordinate their ServiceAccount reference cleanup with
+/// the returned outcome: references are only left cleared when the verified
+/// managed secret is provably gone ([`PullSecretRemovalOutcome::Deleted`] /
+/// [`PullSecretRemovalOutcome::Missing`]).
+async fn delete_managed_pull_secret(
     engine: &ApplyEngine,
     namespace: &str,
     name: &str,
-    generation: MutationGeneration,
     ghcr_credentials: Option<(&str, &str)>,
-) -> Result<bool, DeployError> {
+    delete_mode: PullSecretDeleteMode,
+) -> Result<PullSecretRemovalOutcome, DeployError> {
     let api: Api<Secret> = Api::namespaced(engine.client().clone(), namespace);
     let existing = match api.get(name).await {
         Ok(existing) => existing,
-        Err(kube::Error::Api(error)) if error.code == 404 => return Ok(false),
+        Err(kube::Error::Api(error)) if error.code == 404 => {
+            return Ok(PullSecretRemovalOutcome::Missing);
+        }
         Err(error) => return Err(DeployError::Apply(error.into())),
     };
     if !is_managed_tenant_image_pull_secret(&existing, ghcr_credentials) {
@@ -1015,15 +1088,88 @@ async fn delete_managed_pull_secret_fenced(
             secret = %name,
             "tenant image pull secret cleanup skipped: secret exists but is not CAP-managed"
         );
-        return Ok(false);
+        return Ok(PullSecretRemovalOutcome::NotOurs);
     }
-    delete_resource(&api, name, generation, DeleteParams::default()).await?;
-    tracing::info!(
-        namespace = %namespace,
-        secret = %name,
-        "stale tenant image pull secret removed (not kept under the configured repository scope)"
-    );
-    Ok(true)
+    if let PullSecretDeleteMode::Fenced(generation) = delete_mode {
+        // The same generation fence `delete_resource` applies — but checked
+        // against the object this cleanup verified, not against a fresh read
+        // that could already be a replacement.
+        ensure_pull_secret_generation_not_stale(&existing, generation, name)?;
+    }
+    // Pin the delete to the verified object's identity: a replacement that
+    // lands after the ownership check conflicts (409) instead of being
+    // deleted in the managed secret's place.
+    let delete_params = DeleteParams {
+        preconditions: Some(kube::api::Preconditions {
+            uid: existing.meta().uid.clone(),
+            resource_version: existing.meta().resource_version.clone(),
+        }),
+        ..Default::default()
+    };
+    match api.delete(name, &delete_params).await {
+        Ok(_) => {
+            tracing::info!(
+                namespace = %namespace,
+                secret = %name,
+                "stale tenant image pull secret removed (not kept under the configured repository scope)"
+            );
+            Ok(PullSecretRemovalOutcome::Deleted)
+        }
+        Err(kube::Error::Api(error)) if error.code == 404 => Ok(PullSecretRemovalOutcome::Missing),
+        Err(kube::Error::Api(error)) if error.code == 409 => {
+            tracing::warn!(
+                namespace = %namespace,
+                secret = %name,
+                "tenant image pull secret cleanup skipped: the secret changed after the \
+                 ownership check (replaced mid-cleanup); keeping it and its ServiceAccount \
+                 references"
+            );
+            Ok(PullSecretRemovalOutcome::NotOurs)
+        }
+        Err(error) => Err(DeployError::Apply(error.into())),
+    }
+}
+
+/// The mutation-generation fence [`enclava_engine::apply::generation::delete_resource`]
+/// applies before deleting, checked against the object this cleanup already
+/// verified as CAP-managed: a secret written by a NEWER mutation generation
+/// belongs to a newer deploy of the app and must never be deleted by this
+/// (stale) pass.
+fn ensure_pull_secret_generation_not_stale(
+    secret: &Secret,
+    desired: MutationGeneration,
+    name: &str,
+) -> Result<(), DeployError> {
+    use enclava_engine::apply::engine::ApplyError;
+    use enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION;
+
+    let raw = secret
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(MUTATION_GENERATION_ANNOTATION));
+    let actual = match raw {
+        None => 0,
+        Some(raw) => raw
+            .parse::<i64>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| {
+                DeployError::Apply(ApplyError::InvalidLiveMutationGeneration {
+                    kind: "Secret".to_string(),
+                    name: name.to_string(),
+                })
+            })?,
+    };
+    if actual > desired.get() {
+        return Err(DeployError::Apply(ApplyError::StaleMutationGeneration {
+            kind: "Secret".to_string(),
+            name: name.to_string(),
+            desired: desired.get(),
+            actual,
+        }));
+    }
+    Ok(())
 }
 
 /// One sweep attempt for stale tenant image pull secrets (review findings on
@@ -1156,77 +1302,33 @@ async fn cleanup_stale_tenant_image_pull_secrets(pool: &PgPool) -> Result<bool, 
     Ok(converged)
 }
 
-/// Unfenced janitor delete of the managed pull secret: unlike
-/// [`delete_managed_pull_secret_fenced`] this runs outside any mutation lease
-/// (startup sweep and its background retry), so it relies on the observed
-/// UID/resourceVersion preconditions instead of the mutation-generation
-/// fence. Re-checks ownership on the live object right before deleting (same
-/// reason as the fenced variant). Returns whether a secret was deleted.
-async fn delete_managed_pull_secret_unfenced(
-    engine: &ApplyEngine,
-    namespace: &str,
-    name: &str,
-    ghcr_credentials: Option<(&str, &str)>,
-) -> Result<bool, DeployError> {
-    let api: Api<Secret> = Api::namespaced(engine.client().clone(), namespace);
-    let existing = match api.get(name).await {
-        Ok(existing) => existing,
-        Err(kube::Error::Api(error)) if error.code == 404 => return Ok(false),
-        Err(error) => return Err(DeployError::Apply(error.into())),
-    };
-    if !is_managed_tenant_image_pull_secret(&existing, ghcr_credentials) {
-        tracing::warn!(
-            namespace = %namespace,
-            secret = %name,
-            "tenant image pull secret cleanup skipped: secret exists but is not CAP-managed"
-        );
-        return Ok(false);
-    }
-    let delete_params = DeleteParams {
-        preconditions: Some(kube::api::Preconditions {
-            uid: existing.meta().uid.clone(),
-            resource_version: existing.meta().resource_version.clone(),
-        }),
-        ..Default::default()
-    };
-    match api.delete(name, &delete_params).await {
-        Ok(_) => {
-            tracing::info!(
-                namespace = %namespace,
-                secret = %name,
-                "stale tenant image pull secret removed (namespace is outside the configured repository scope)"
-            );
-            Ok(true)
-        }
-        Err(kube::Error::Api(error)) if error.code == 404 => Ok(false),
-        Err(error) => Err(DeployError::Apply(error.into())),
-    }
-}
-
 /// Drop `secret_name` from a ServiceAccount's `imagePullSecrets`, keeping any
 /// other references. No-op when the ServiceAccount is gone or does not
 /// reference the secret. The patch is attributed to the engine field manager
 /// and pinned to the observed resourceVersion so a concurrent write wins.
+/// Returns whether a reference was actually removed — the caller needs it to
+/// reverse the clear when the delete later detects a mid-cleanup replacement
+/// (review finding on #243).
 async fn clear_pull_secret_reference_from_service_account(
     engine: &ApplyEngine,
     namespace: &str,
     service_account: &str,
     secret_name: &str,
-) -> Result<(), DeployError> {
+) -> Result<bool, DeployError> {
     use k8s_openapi::api::core::v1::ServiceAccount;
     use kube::api::{Patch, PatchParams};
 
     let api: Api<ServiceAccount> = Api::namespaced(engine.client().clone(), namespace);
     let existing = match api.get(service_account).await {
         Ok(existing) => existing,
-        Err(kube::Error::Api(error)) if error.code == 404 => return Ok(()),
+        Err(kube::Error::Api(error)) if error.code == 404 => return Ok(false),
         Err(error) => return Err(DeployError::Apply(error.into())),
     };
     let Some(references) = existing.image_pull_secrets.as_ref() else {
-        return Ok(());
+        return Ok(false);
     };
     if !references.iter().any(|r| r.name == secret_name) {
-        return Ok(());
+        return Ok(false);
     }
     let kept: Vec<serde_json::Value> = references
         .iter()
@@ -1257,11 +1359,67 @@ async fn clear_pull_secret_reference_from_service_account(
                 secret = %secret_name,
                 "stale imagePullSecrets reference cleared from ServiceAccount"
             );
-            Ok(())
+            Ok(true)
         }
-        Err(kube::Error::Api(error)) if error.code == 404 => Ok(()),
+        Err(kube::Error::Api(error)) if error.code == 404 => Ok(false),
         Err(error) => Err(DeployError::Apply(error.into())),
     }
+}
+
+/// Re-add `secret_name` to a ServiceAccount's `imagePullSecrets` after a
+/// reference clear turned out to rest on stale ownership information (review
+/// finding on #243): when the delete detects that the secret was replaced
+/// mid-cleanup, the replacement survives and must keep the reference it
+/// inherits by name — otherwise its pods lose registry access. No-op when the
+/// ServiceAccount is gone or already references the secret. The patch mirrors
+/// [`clear_pull_secret_reference_from_service_account`]: attributed to the
+/// engine field manager and pinned to the observed resourceVersion.
+async fn restore_pull_secret_reference_to_service_account(
+    engine: &ApplyEngine,
+    namespace: &str,
+    service_account: &str,
+    secret_name: &str,
+) -> Result<(), DeployError> {
+    use k8s_openapi::api::core::v1::ServiceAccount;
+    use kube::api::{Patch, PatchParams};
+
+    let api: Api<ServiceAccount> = Api::namespaced(engine.client().clone(), namespace);
+    let existing = match api.get(service_account).await {
+        Ok(existing) => existing,
+        Err(kube::Error::Api(error)) if error.code == 404 => return Ok(()),
+        Err(error) => return Err(DeployError::Apply(error.into())),
+    };
+    let mut references: Vec<serde_json::Value> = existing
+        .image_pull_secrets
+        .iter()
+        .flatten()
+        .map(|r| serde_json::json!({ "name": r.name }))
+        .collect();
+    if references
+        .iter()
+        .any(|r| r.get("name").and_then(|name| name.as_str()) == Some(secret_name))
+    {
+        return Ok(());
+    }
+    references.push(serde_json::json!({ "name": secret_name }));
+    let patch = serde_json::json!({
+        "metadata": {
+            "name": service_account,
+            "resourceVersion": existing.meta().resource_version,
+        },
+        "imagePullSecrets": references,
+    });
+    let patch_params = PatchParams::apply(&engine.config().field_manager);
+    api.patch(service_account, &patch_params, &Patch::Merge(&patch))
+        .await
+        .map_err(|error| DeployError::Apply(error.into()))?;
+    tracing::info!(
+        namespace = %namespace,
+        service_account = %service_account,
+        secret = %secret_name,
+        "imagePullSecrets reference restored (the secret was replaced mid-cleanup)"
+    );
+    Ok(())
 }
 
 async fn apply_all_with_tenant_image_pull_secret(
@@ -3833,10 +3991,18 @@ mod tests {
     /// holds Secrets and ServiceAccounts and serves exactly the verbs the
     /// reconcile path exercises (label-selected list, get, merge patch and
     /// delete on Secrets; get and merge patch on ServiceAccounts).
+    /// `namespace_missing` models an app row whose namespace does not exist
+    /// yet (or is already gone) — every namespaced request 404s. The two
+    /// `replace_*` hooks model a tenant replacing the pull secret mid-cleanup
+    /// at the exact windows the review asked to be tested: as the
+    /// ServiceAccount patch lands, and as the delete lands.
     #[derive(Default)]
     struct FakeCluster {
         secrets: Vec<Secret>,
         service_accounts: Vec<ServiceAccount>,
+        namespace_missing: bool,
+        replace_on_sa_patch: Option<Secret>,
+        replace_on_delete: Option<Secret>,
     }
 
     fn fake_managed_secret(name: &str, labeled: bool, username: &str, token: &str) -> Secret {
@@ -3962,6 +4128,11 @@ mod tests {
                 }),
             )
         }
+        if state.namespace_missing {
+            // The namespace does not exist: every namespaced request is a 404
+            // (Codex review on #243, P1).
+            return not_found();
+        }
         let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
         let (kind, name) = match segments.as_slice() {
             ["api", "v1", "namespaces", _, "secrets"] => ("secrets", None),
@@ -4039,6 +4210,11 @@ mod tests {
                 (200, serde_json::to_value(secret).unwrap())
             }
             ("secrets", "DELETE") => {
+                if let Some(replacement) = state.replace_on_delete.take() {
+                    // The tenant replaces the secret between the cleanup's
+                    // ownership check and its delete (review finding on #243).
+                    swap_secret(&mut state.secrets, replacement);
+                }
                 let index = state
                     .secrets
                     .iter()
@@ -4081,6 +4257,13 @@ mod tests {
                 None => not_found(),
             },
             ("serviceaccounts", "PATCH") => {
+                if let Some(replacement) = state.replace_on_sa_patch.take() {
+                    // The tenant replaces the secret between the cleanup's
+                    // ownership read and its ServiceAccount patch — the exact
+                    // window the review asked to be tested (review finding on
+                    // #243).
+                    swap_secret(&mut state.secrets, replacement);
+                }
                 let patch: serde_json::Value = serde_json::from_slice(body).unwrap();
                 let Some(account) = state
                     .service_accounts
@@ -4116,6 +4299,14 @@ mod tests {
             .replace("%2C", ",")
     }
 
+    /// Replace (or insert) a secret by name — models a tenant replacing the
+    /// pull secret between two of the cleanup's requests.
+    fn swap_secret(secrets: &mut Vec<Secret>, replacement: Secret) {
+        let name = replacement.metadata.name.clone();
+        secrets.retain(|secret| secret.metadata.name != name);
+        secrets.push(replacement);
+    }
+
     fn reconcile_settings() -> PullSecretSettings {
         PullSecretSettings {
             configured_name: "enclava-registry-auth".to_string(),
@@ -4147,6 +4338,7 @@ mod tests {
                 "cap-tenant-app",
                 &["enclava-registry-auth"],
             )],
+            ..Default::default()
         }));
         let engine = reconcile_engine(cluster.clone());
         let converged = reconcile_managed_pull_secrets(
@@ -4195,6 +4387,7 @@ mod tests {
                 "cap-tenant-app",
                 &["enclava-registry-auth", "pull-secret-old-name"],
             )],
+            ..Default::default()
         }));
         let engine = reconcile_engine(cluster.clone());
 
@@ -4301,6 +4494,7 @@ mod tests {
                 "cap-tenant-app",
                 &["enclava-registry-auth"],
             )],
+            ..Default::default()
         }));
         let engine = reconcile_engine(cluster.clone());
         let converged = reconcile_managed_pull_secrets(
@@ -4327,6 +4521,214 @@ mod tests {
             labels.get(MANAGED_BY_LABEL).map(String::as_str),
             Some(MANAGED_BY_VALUE),
             "kept legacy secret must carry the managed-by ownership label"
+        );
+    }
+
+    /// A tenant's own replacement secret under the managed name: a distinct
+    /// object (own UID/resourceVersion) with the tenant's credentials.
+    fn fake_replacement_secret(name: &str) -> Secret {
+        let mut secret = fake_managed_secret(name, false, "tenant-user", "tenant-token");
+        secret.metadata.uid = Some(format!("uid-replacement-{name}"));
+        secret.metadata.resource_version = Some("42".to_string());
+        secret
+    }
+
+    /// Devin review on #243 (BUG_…​_0001): a tenant that replaces the managed
+    /// pull secret after the cleanup's ownership read must keep both the
+    /// replacement and its ServiceAccount reference. The replacement lands in
+    /// the exact reviewed window — between the first Secret GET and the
+    /// ServiceAccount patch — and the delete that later detects it must
+    /// reverse the reference clear so the replacement's pods keep registry
+    /// access.
+    #[tokio::test]
+    async fn reconcile_restores_reference_when_secret_replaced_mid_cleanup() {
+        use std::sync::{Arc, Mutex};
+
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![fake_managed_secret(
+                "enclava-registry-auth",
+                true,
+                "cap-bot",
+                "ghp_platform",
+            )],
+            service_accounts: vec![fake_service_account(
+                "cap-tenant-app",
+                &["enclava-registry-auth"],
+            )],
+            // The tenant swaps in their own secret right as the reference
+            // clear is written.
+            replace_on_sa_patch: Some(fake_replacement_secret("enclava-registry-auth")),
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        let converged = reconcile_managed_pull_secrets(
+            &engine,
+            "tenant-ns",
+            &["cap-tenant-app".to_string()],
+            &reconcile_settings(),
+            false,
+            PullSecretDeleteMode::Fenced(MutationGeneration::new(1).unwrap()),
+        )
+        .await
+        .unwrap();
+        assert!(converged);
+
+        let state = cluster.lock().unwrap();
+        assert_eq!(
+            state.secrets[0].metadata.uid.as_deref(),
+            Some("uid-replacement-enclava-registry-auth"),
+            "the tenant replacement must survive"
+        );
+        assert_eq!(
+            state.service_accounts[0]
+                .image_pull_secrets
+                .as_ref()
+                .map(|references| references.len()),
+            Some(1),
+            "the replacement keeps the ServiceAccount reference it inherits by name"
+        );
+    }
+
+    /// Devin review on #243 (BUG_…​_0001), second window: a replacement that
+    /// lands between the delete's ownership read and the delete itself must
+    /// survive — the delete is pinned to the verified object's
+    /// UID/resourceVersion — and its ServiceAccount reference must survive
+    /// with it.
+    #[tokio::test]
+    async fn reconcile_never_deletes_a_replacement_that_lands_at_delete_time() {
+        use std::sync::{Arc, Mutex};
+
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![fake_managed_secret(
+                "enclava-registry-auth",
+                true,
+                "cap-bot",
+                "ghp_platform",
+            )],
+            service_accounts: vec![fake_service_account(
+                "cap-tenant-app",
+                &["enclava-registry-auth"],
+            )],
+            replace_on_delete: Some(fake_replacement_secret("enclava-registry-auth")),
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        let converged = reconcile_managed_pull_secrets(
+            &engine,
+            "tenant-ns",
+            &["cap-tenant-app".to_string()],
+            &reconcile_settings(),
+            false,
+            PullSecretDeleteMode::Fenced(MutationGeneration::new(1).unwrap()),
+        )
+        .await
+        .unwrap();
+        assert!(converged);
+
+        let state = cluster.lock().unwrap();
+        assert_eq!(
+            state.secrets[0].metadata.uid.as_deref(),
+            Some("uid-replacement-enclava-registry-auth"),
+            "the pinned delete must conflict instead of deleting the replacement"
+        );
+        assert_eq!(
+            state.service_accounts[0]
+                .image_pull_secrets
+                .as_ref()
+                .map(|references| references.len()),
+            Some(1),
+            "the cleared reference must be restored for the replacement"
+        );
+    }
+
+    /// Codex review on #243 (P2, "require the pull-secret label before
+    /// treating secrets as owned"): the generic managed-by label is used
+    /// broadly across platform resources and must not make an arbitrary
+    /// Secret fair game for this cleanup. Ownership requires the dedicated
+    /// pull-secret label or the legacy credential-shape proof — a
+    /// generically-labeled secret with foreign contents at the managed name
+    /// is tenant/operator-owned and must keep itself and its reference.
+    #[tokio::test]
+    async fn reconcile_keeps_generic_managed_by_look_alike() {
+        use std::sync::{Arc, Mutex};
+
+        let mut secret = fake_managed_secret(
+            "enclava-registry-auth",
+            false,
+            "tenant-user",
+            "tenant-token",
+        );
+        secret.metadata.labels = Some(std::collections::BTreeMap::from([(
+            MANAGED_BY_LABEL.to_string(),
+            MANAGED_BY_VALUE.to_string(),
+        )]));
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![secret],
+            service_accounts: vec![fake_service_account(
+                "cap-tenant-app",
+                &["enclava-registry-auth"],
+            )],
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        let converged = reconcile_managed_pull_secrets(
+            &engine,
+            "tenant-ns",
+            &["cap-tenant-app".to_string()],
+            &reconcile_settings(),
+            false,
+            PullSecretDeleteMode::Unfenced,
+        )
+        .await
+        .unwrap();
+        assert!(converged);
+
+        let state = cluster.lock().unwrap();
+        assert_eq!(
+            state.secrets.len(),
+            1,
+            "a generic-managed-by look-alike is not CAP's pull secret"
+        );
+        assert_eq!(
+            state.service_accounts[0]
+                .image_pull_secrets
+                .as_ref()
+                .map(|references| references.len()),
+            Some(1),
+            "the generic-managed-by look-alike keeps its ServiceAccount reference"
+        );
+    }
+
+    /// Codex review on #243 (P1, "treat missing tenant namespaces as an
+    /// already-clean sweep"): an app row can exist before its namespace is
+    /// created, or outlive the namespace after deletion, and the namespaced
+    /// Secret list then 404s. The sweep must treat that as "no stale
+    /// secrets" — a failure here would keep workload admission closed and
+    /// the dispatcher unspawned while the very pending setup/cleanup work
+    /// that would create the namespace or remove the row can never run, and
+    /// the background retry would loop on the same 404 forever.
+    #[tokio::test]
+    async fn reconcile_treats_missing_namespace_as_clean() {
+        use std::sync::{Arc, Mutex};
+
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            namespace_missing: true,
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        let converged = reconcile_managed_pull_secrets(
+            &engine,
+            "tenant-ns",
+            &["cap-tenant-app".to_string()],
+            &reconcile_settings(),
+            false,
+            PullSecretDeleteMode::Unfenced,
+        )
+        .await
+        .unwrap();
+        assert!(
+            converged,
+            "a missing namespace is an already-clean sweep, not a failure"
         );
     }
 }
