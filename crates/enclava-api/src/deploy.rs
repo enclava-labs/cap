@@ -1713,6 +1713,28 @@ mod tests {
         )
     }
 
+    #[test]
+    fn rollout_budget_scales_with_app_data_size() {
+        // Baseline for small volumes; integrity-tag initialization of a
+        // fresh large PVC must fit inside the budget instead of tripping the
+        // fixed 600s rollout timeout.
+        assert_eq!(
+            rollout_budget_for("5Gi"),
+            BASE_ROLLOUT_BUDGET + std::time::Duration::from_secs(5 * 8)
+        );
+        assert_eq!(
+            rollout_budget_for("1Ti"),
+            BASE_ROLLOUT_BUDGET + std::time::Duration::from_secs(1024 * 8)
+        );
+        assert_eq!(
+            rollout_budget_for("2Ti"),
+            BASE_ROLLOUT_BUDGET + std::time::Duration::from_secs(2048 * 8)
+        );
+        // Entitlement-invalid sizes fall back to the baseline budget.
+        assert_eq!(rollout_budget_for("nonsense"), BASE_ROLLOUT_BUDGET);
+        assert_eq!(rollout_budget_for("0.5Gi"), BASE_ROLLOUT_BUDGET);
+    }
+
     #[tokio::test]
     async fn rollout_watch_slice_returns_nonterminal_while_budget_remains() {
         // An owner-waiting workload must release its worker slot between
@@ -1723,6 +1745,7 @@ mod tests {
             rollout_test_engine(),
             "slice-manifest".to_string(),
             chrono::Utc::now(),
+            "5Gi",
         )
         .with_observation_slice(std::time::Duration::from_millis(50))
         .watch()
@@ -1746,6 +1769,9 @@ mod tests {
             rollout_test_engine(),
             "deadline-manifest".to_string(),
             chrono::Utc::now() - chrono::Duration::seconds(601),
+            // Sub-GiB size: budget stays at the 600s baseline, so a 601s-old
+            // anchor is genuinely exhausted.
+            "512Mi",
         )
         .with_observation_slice(std::time::Duration::from_millis(50))
         .watch()
@@ -1767,6 +1793,7 @@ mod tests {
             engine,
             "late-unlock-manifest".to_string(),
             chrono::Utc::now() - chrono::Duration::seconds(601),
+            "5Gi",
         )
         .with_observation_slice(std::time::Duration::from_millis(50))
         .watch()
@@ -1786,6 +1813,7 @@ mod tests {
             rollout_test_engine(),
             "password-manifest".to_string(),
             chrono::Utc::now() - chrono::Duration::seconds(601),
+            "5Gi",
         )
         .with_observation_slice(std::time::Duration::from_millis(50))
         .watch()
@@ -1808,6 +1836,7 @@ mod tests {
             rollout_test_engine(),
             "password-redeploy-manifest".to_string(),
             chrono::Utc::now() - chrono::Duration::seconds(601),
+            "5Gi",
         )
         .with_observation_slice(std::time::Duration::from_millis(50))
         .watch()
@@ -1992,6 +2021,34 @@ async fn restart_statefulset_for_ingress(
 /// before the job is released for the next dispatch.
 const ROLLOUT_OBSERVATION_SLICE: std::time::Duration = std::time::Duration::from_secs(90);
 
+/// Baseline rollout budget that every deployment receives regardless of
+/// volume size. Slices of this budget also cover image pull, KBS bootstrap,
+/// and normal pod startup.
+const BASE_ROLLOUT_BUDGET: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Additional rollout budget per GiB of app-data volume. On first boot the
+/// enclava-init sidecar initializes dm-integrity tags by writing the whole
+/// data area (cryptsetup's own `luksFormat --integrity` does the same via
+/// `crypt_wipe`); a fixed 600s cap would persist valid-but-slow fresh volumes
+/// as failed deployments while the sidecar is still formatting. This rate is
+/// deliberately conservative: it assumes ~100 MiB/s of sustained tag-write
+/// throughput (8 GiB/min), so any realistic cloud volume finishes well
+/// inside its budget.
+const ROLLOUT_BUDGET_PER_GIB: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Total rollout budget for a deployment: the fixed baseline plus a linear
+/// app-data-size extension. Unparseable or fractional sizes fall back to the
+/// baseline; the entitlement path has already rejected those before a job is
+/// queued, so this only guards against drift between acceptance and apply.
+fn rollout_budget_for(app_data_size: &str) -> std::time::Duration {
+    let gib = crate::entitlements::parse_binary_mib(app_data_size, "storage")
+        .ok()
+        .and_then(|mib| mib.whole_units())
+        .map(|mib| mib / 1024)
+        .unwrap_or(0);
+    BASE_ROLLOUT_BUDGET + ROLLOUT_BUDGET_PER_GIB * (gib as u32)
+}
+
 /// A rollout handle returned after Kubernetes accepted the rendered manifests.
 ///
 /// Callers must await [`DeploymentRollout::watch`]. Durable deployment workers
@@ -2005,6 +2062,10 @@ pub struct DeploymentRollout {
     pub(crate) manifest_hash: String,
     observing_since: chrono::DateTime<chrono::Utc>,
     observation_slice: std::time::Duration,
+    /// Total rollout budget for this generation. Scales with the app-data
+    /// volume size because first boot initializes dm-integrity tags across
+    /// the whole data area; see [`rollout_budget_for`].
+    rollout_budget: std::time::Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2025,6 +2086,7 @@ impl DeploymentRollout {
         engine: ApplyEngine,
         manifest_hash: String,
         observing_since: chrono::DateTime<chrono::Utc>,
+        app_data_size: &str,
     ) -> Self {
         let namespace = app.namespace.clone();
         let workload_name = app.name.clone();
@@ -2036,6 +2098,7 @@ impl DeploymentRollout {
             manifest_hash,
             observing_since,
             observation_slice: ROLLOUT_OBSERVATION_SLICE,
+            rollout_budget: rollout_budget_for(app_data_size),
         }
     }
 
@@ -2064,7 +2127,7 @@ impl DeploymentRollout {
             status => status,
         };
         let unlock_mode = self.app.unlock_mode;
-        let total = self.engine.config().rollout_timeout;
+        let total = self.rollout_budget;
         let elapsed = chrono::Utc::now()
             .signed_duration_since(self.observing_since)
             .to_std()
@@ -2280,6 +2343,7 @@ pub async fn apply_deployment_manifests(
         manifest_hash: hash,
         observing_since: chrono::Utc::now(),
         observation_slice: ROLLOUT_OBSERVATION_SLICE,
+        rollout_budget: rollout_budget_for(&snapshot.resources.app_data_size),
     }))
 }
 

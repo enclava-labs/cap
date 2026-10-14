@@ -1717,10 +1717,15 @@ async fn apply_claimed_job(
             let engine = ApplyEngine::try_default()
                 .await
                 .map_err(|error| DeploymentJobError::Apply(error.into()))?;
-            let outcome =
-                DeploymentRollout::observe_only(*app, engine, manifest_hash, observing_since)
-                    .watch()
-                    .await;
+            let outcome = DeploymentRollout::observe_only(
+                *app,
+                engine,
+                manifest_hash,
+                observing_since,
+                &payload.snapshot.resources.app_data_size,
+            )
+            .watch()
+            .await;
             return Ok(JobApplyOutcome::Applied(outcome));
         }
         None => {}
@@ -5297,6 +5302,8 @@ mod tests {
             engine,
             "admission-manifest".to_string(),
             chrono::Utc::now() - chrono::Duration::seconds(601),
+            // Sub-GiB size keeps the rollout budget at the 600s baseline.
+            "512Mi",
         );
         let outcome = watch_committed_rollout(rollout, mutation).await;
         assert!(
@@ -5406,8 +5413,14 @@ mod tests {
         let engine = probing_rollout_engine(Arc::new(|| {}));
         let outcome = tokio::time::timeout(
             Duration::from_secs(10),
-            DeploymentRollout::observe_only(*observed, engine, manifest_hash, observing_since)
-                .watch(),
+            DeploymentRollout::observe_only(
+                *observed,
+                engine,
+                manifest_hash,
+                observing_since,
+                "5Gi",
+            )
+            .watch(),
         )
         .await
         .expect("resumed observation must not park in an owner wait");

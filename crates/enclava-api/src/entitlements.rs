@@ -169,7 +169,7 @@ pub async fn authoritative_entitlement_in_tx(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ScaledDecimal {
+pub(crate) struct ScaledDecimal {
     coefficient: u128,
     scale: u32,
 }
@@ -229,6 +229,18 @@ impl ScaledDecimal {
         .normalized())
     }
 
+    /// Exact value in whole units (Mi for binary quantities), if it is an
+    /// integer. Returns `None` for fractional values or overflow.
+    pub(crate) fn whole_units(&self) -> Option<u128> {
+        if self.scale == 0 {
+            Some(self.coefficient)
+        } else {
+            let divisor = 10u128.checked_pow(self.scale)?;
+            (self.coefficient.is_multiple_of(divisor))
+                .then(|| self.coefficient.checked_div(divisor))?
+        }
+    }
+
     fn checked_scale(self, extra: u32, field: &'static str) -> Result<Self, String> {
         let scale = self
             .scale
@@ -286,7 +298,7 @@ fn parse_cpu_cores(value: &str) -> Result<ScaledDecimal, String> {
 /// Parse a binary quantity into exact Mi units. `resources.storage` maps to
 /// app data storage; TLS storage is a separate field and is intentionally not
 /// charged against the app-data `max_storage` limit.
-fn parse_binary_mib(value: &str, field: &'static str) -> Result<ScaledDecimal, String> {
+pub(crate) fn parse_binary_mib(value: &str, field: &'static str) -> Result<ScaledDecimal, String> {
     let trimmed = value.trim();
     if trimmed != value || trimmed.is_empty() {
         return Err(format!("{field} must be a positive binary quantity"));

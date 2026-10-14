@@ -169,6 +169,11 @@ fn luks2_format_params() -> CryptParamsLuks2 {
 fn initialize_integrity_tags(dev: &mut CryptDevice, key: &DerivedSeed) -> Result<()> {
     let wipe_name = format!("enclava-init-wipe-{}", unguessable_suffix());
 
+    // Match cryptsetup's own integrity initialization (`_wipe_data_device`):
+    // activate the temporary mapper with NO_JOURNAL so the whole-area zero
+    // write goes directly to dm-integrity tags instead of through the
+    // journal, halving the write amplification of this already long wipe.
+    // PRIVATE skips global udev rules for the throwaway device, as upstream.
     dev.activate_handle()
         .activate_by_passphrase(
             Some(&wipe_name),
