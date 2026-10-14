@@ -71,10 +71,10 @@ RUN set -eux; \
     ./configure \
       --disable-static \
       --disable-nls \
+      --disable-asciidoc \
       --disable-ssh-token \
       --disable-veritysetup \
       --disable-integritysetup \
-      --disable-gcrypt \
       --disable-kernel_crypto \
       --enable-static-cryptsetup; \
     make -j"$(nproc)" cryptsetup; \
