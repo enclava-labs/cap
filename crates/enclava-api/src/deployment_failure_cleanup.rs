@@ -1345,7 +1345,7 @@ async fn no_other_generation_owns_provider_state(
                     (
                         (manifest_hash IS NOT NULL OR observing_since IS NOT NULL)
                         AND NOT cleanup_sweep_incomplete
-                        AND status <> 'failed'::deployment_status_enum
+                        AND status <> 'failed'::deploy_status_enum
                     )
                     OR status::text IN ('pending', 'applying', 'watching', 'healthy', 'rolled_back')
                 )
