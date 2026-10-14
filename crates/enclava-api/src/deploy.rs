@@ -2989,27 +2989,57 @@ fn app_status_label(status: AppStatus) -> &'static str {
     }
 }
 
+/// Stamp attempts for `record_workload_spec_published` before the failure is
+/// allowed to terminalize a job whose StatefulSet write already happened.
+const WORKLOAD_SPEC_PUBLISHED_STAMP_ATTEMPTS: u32 = 4;
+
 async fn record_workload_spec_published(
     pool: &PgPool,
     deployment_id: Uuid,
 ) -> Result<(), DeployError> {
     // shortcut: crash after StatefulSet apply and before this commit, then lease expiry and supersession, looks unpublished; upgrade when supersession can tell a written spec from an applying row that never reached the StatefulSet
-    let updated = sqlx::query(
-        "UPDATE deployments
-            SET workload_spec_published_at = COALESCE(
-                    workload_spec_published_at,
-                    clock_timestamp()
-                )
-          WHERE id = $1",
-    )
-    .bind(deployment_id)
-    .execute(pool)
-    .await?
-    .rows_affected();
-    if updated != 1 {
-        return Err(DeployError::Db(sqlx::Error::RowNotFound));
+    //
+    // The stamp runs in its own autocommit after the StatefulSet write. A
+    // failed stamp would terminalize a job whose StatefulSet is already live
+    // and leave the generation looking unpublished forever — its teardown
+    // unit would then pin no authority. Retry before failing so only a
+    // sustained database outage (which breaks every path anyway) can lose
+    // the stamp to an error return; the crash window above stays the only
+    // known gap.
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        match sqlx::query(
+            "UPDATE deployments
+                SET workload_spec_published_at = COALESCE(
+                        workload_spec_published_at,
+                        clock_timestamp()
+                    )
+              WHERE id = $1",
+        )
+        .bind(deployment_id)
+        .execute(pool)
+        .await
+        {
+            Ok(result) => {
+                if result.rows_affected() != 1 {
+                    return Err(DeployError::Db(sqlx::Error::RowNotFound));
+                }
+                return Ok(());
+            }
+            Err(error) if attempts < WORKLOAD_SPEC_PUBLISHED_STAMP_ATTEMPTS => {
+                tracing::warn!(
+                    %deployment_id,
+                    attempts,
+                    error = %error,
+                    "workload spec publication stamp failed; retrying"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(250 * u64::from(attempts)))
+                    .await;
+            }
+            Err(error) => return Err(DeployError::Db(error)),
+        }
     }
-    Ok(())
 }
 
 /// Apply manifests and return durable rollout-observation context.

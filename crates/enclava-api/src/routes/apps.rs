@@ -150,6 +150,7 @@ enum AppDeleteFailure {
     KbsOwnerBinding,
     KbsTlsBinding,
     KbsPolicy,
+    KbsPolicyBudget,
 }
 
 impl AppDeleteFailure {
@@ -168,6 +169,7 @@ impl AppDeleteFailure {
             Self::KbsOwnerBinding => "app_delete_kbs_owner_binding_failed",
             Self::KbsTlsBinding => "app_delete_kbs_tls_binding_failed",
             Self::KbsPolicy => "app_delete_kbs_policy_failed",
+            Self::KbsPolicyBudget => "app_delete_kbs_policy_budget_exceeded",
         }
     }
 
@@ -177,7 +179,7 @@ impl AppDeleteFailure {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
             Self::DnsOutsideManagedZone => StatusCode::BAD_REQUEST,
-            Self::DnsHostnameInUse => StatusCode::CONFLICT,
+            Self::DnsHostnameInUse | Self::KbsPolicyBudget => StatusCode::CONFLICT,
             Self::TeardownLocked => StatusCode::LOCKED,
             Self::TeardownEndpoint
             | Self::DnsUnavailable
@@ -1665,8 +1667,57 @@ pub(crate) async fn delete_app_before(
             .map_err(|_| internal_server_error())?;
         return Err((
             StatusCode::CONFLICT,
-            Json(serde_json::json!({"error": "app resource authority changed; retry deletion"})),
+            Json(serde_json::json!({ "error": "app resource authority changed; retry deletion" })),
         ));
+    }
+    // Admission control for the teardown policy pin (Codex security finding
+    // 4a27950: teardown candidates can exhaust the global KBS policy budget).
+    // A teardown-pending workload keeps required, retention-exempt signed
+    // policy authority for as long as it can still be serving, and the byte
+    // budget fail-closes the whole reconciliation when the required set
+    // overflows — stacked deletions would then wedge every app's policy
+    // convergence. Refuse the delete here, under the global kbs_policy fence
+    // and before the pin exists, when this app's teardown unit no longer fits.
+    // Nothing is dropped from the policy to make a delete fit. `abandon_teardown`
+    // proceeds anyway: its deletion completes in this flow (the pin stays
+    // transient), and the operator override must remain reachable to unwind a
+    // wedged budget.
+    if !abandon_teardown {
+        // Mirrors the CASE below: a retry of an already-deleting app keeps
+        // its pin; anything else pins exactly when teardown is required.
+        let pin_will_apply = if phase_app.status == AppStatus::Deleting {
+            sqlx::query_scalar("SELECT workload_teardown_required FROM apps WHERE id = $1")
+                .bind(phase_app.id)
+                .fetch_one(&mut *phase_tx)
+                .await
+                .map_err(|_| internal_server_error())?
+        } else {
+            requires_workload_teardown(phase_app.status)
+        };
+        if pin_will_apply {
+            let fits = crate::kbs::teardown_unit_fits_signed_policy_budget(
+                &state.db,
+                state.kbs_policy.as_ref(),
+                phase_app.id,
+            )
+            .await
+            .map_err(|_| internal_server_error())?;
+            if !fits {
+                delete_mutation
+                    .finish_in_tx(&mut phase_tx)
+                    .await
+                    .map_err(|_| internal_server_error())?;
+                phase_tx
+                    .commit()
+                    .await
+                    .map_err(|_| internal_server_error())?;
+                return Err(app_delete_failure(
+                    phase_app.id,
+                    AppDeleteFailure::KbsPolicyBudget,
+                    (),
+                ));
+            }
+        }
     }
     sqlx::query(
         "UPDATE apps
