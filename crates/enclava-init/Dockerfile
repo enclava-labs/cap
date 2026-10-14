@@ -46,7 +46,10 @@ FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2
 # require glibc >= 2.38 (bookworm has 2.36), so build 2.8.8 from upstream
 # source, downloaded at build time and verified against the pinned sha256
 # (same pattern as the FRP tarball in the debian-ssh-frp template, #241).
-# The static cryptsetup binary needs no extra runtime libs.
+# The binary links against the freshly-built libcryptsetup.so.12 plus
+# bookworm runtime libs that are already present (libargon2, libblkid,
+# libdevmapper, libjson-c, libpopt, libssl3, libuuid1), so only the two
+# build artifacts are installed.
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
@@ -78,19 +81,23 @@ RUN set -eux; \
       --disable-kernel_crypto \
       --enable-static-cryptsetup; \
     make -j"$(nproc)" cryptsetup; \
-    install -m 0755 cryptsetup /usr/local/bin/cryptsetup; \
-    /usr/local/bin/cryptsetup --version; \
+    install -m 0755 .libs/cryptsetup /usr/local/sbin/cryptsetup; \
+    install -m 0755 .libs/libcryptsetup.so.12* /usr/local/lib/; \
+    ldconfig; \
+    /usr/local/sbin/cryptsetup --version; \
     cd /; \
     rm -rf /tmp/cryptsetup-2.8.8 /tmp/cryptsetup-2.8.8.tar.xz; \
     apt-get purge -y build-essential libargon2-dev libblkid-dev libc6-dev libdevmapper-dev libjson-c-dev libpopt-dev libssl-dev pkg-config curl; \
     apt-get autoremove -y; \
     rm -rf /var/lib/apt/lists/*
 
+# cryptsetup 2.8.8 supersedes bookworm's cryptsetup-bin (2.6.x); only the
+# runtime library of the distro package is still needed (enclava-init links
+# libcryptsetup.so.12 — the 2.8.8 build above satisfies it via ldconfig).
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       ca-certificates \
-      e2fsprogs \
-      libcryptsetup12 && \
+      e2fsprogs && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /out/enclava-init /usr/local/bin/enclava-init
