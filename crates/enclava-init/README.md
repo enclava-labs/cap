@@ -75,15 +75,19 @@ read in 1 MiB chunks (a short or failed read never counts as blank).
 The scan is O(device size). Progress is logged every 30 s with scanned/total
 bytes and a completion duration. Initialization time depends on actual guest
 and Longhorn throughput; do not infer it from the raw volume's zero contents.
-Devices below 32 MiB are refused before scanning. This fresh-format floor is
-ordinal-zero claims are grandfathered per volume when positive
-initialization evidence exists — a surviving claim proven initialized by a
-recorded healthy deployment completed in a later second than the claim's
-creation, or by the same live Ready ordinal-0 pod that mounts it and was
-created strictly after the claim. Missing or terminating claims, wrong
-ordinals, same-second pairs, and bare PVC existence without that evidence
-cannot grant the exemption. Existing LUKS2 volumes are opened without
-reformatting.
+Devices below 32 MiB are refused before scanning. The API and engine enforce
+this fresh-format floor for unproven claims. Existing ordinal-zero claims are
+grandfathered per volume only with positive initialization evidence: a
+surviving claim whose immutable automatic-mode deployment job completed
+healthy in a later whole second than claim creation, or the exact live Ready
+ordinal-zero pod mounting it and created strictly after it. Password redeploy
+timeouts can publish healthy without opening storage, so that historical
+status is not proof. Without retained automatic-mode history or live proof,
+even a genuinely initialized sub-floor volume is refused until readiness can
+be established; larger volumes receive the fresh initialization allowance.
+Missing or terminating claims, wrong ordinals, same-second pairs, and bare
+PVC existence cannot grant the exemption. Existing LUKS2 volumes are opened
+without reformatting; orchestration evidence never authorizes formatting.
 
 The rollout budget adds two sequential passes to the configured base
 timeout only for claims that lack positive initialization evidence —

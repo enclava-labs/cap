@@ -152,10 +152,10 @@ pub(crate) async fn enforce_authoritative_entitlement(
 /// only ever proved the StatefulSet was WRITTEN, and a surviving PVC alone
 /// only ever proved the object exists: a bound-but-unformatted claim must
 /// still be refused below the floor. A claim is initialized only when a
-/// recorded HEALTHY deployment completed in a LATER second than the
-/// claim's creation (second-precision PVC timestamps make same-bucket
-/// ordering unprovable, so a recreated claim cannot borrow an older
-/// healthy proof) or the live Ready ordinal-0 pod mounts it.
+/// recorded automatic-mode HEALTHY deployment completed in a LATER second
+/// than the claim's creation, or the live Ready ordinal-0 pod mounts it.
+/// Password timeout outcomes and same-second ordering cannot prove storage
+/// initialization; missing historical job evidence also fails closed.
 ///
 /// Sizes at/above the floor and grammar-invalid values (rejected by
 /// `validate_resource_limits` upstream) short-circuit without any lookup —

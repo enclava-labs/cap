@@ -812,24 +812,24 @@ pub(crate) async fn latest_deployment_id_for_app(
     .await?;
     Ok(deployment_id.unwrap_or_else(Uuid::nil))
 }
-/// Latest point at which this app's volumes are proven initialized: the
-/// completion timestamp of its most recent successful (`healthy`) deployment.
-/// Only terminal healthy publications count — a `watching` row or an apply
-/// that never reached the pod never proves `enclava-init` ran. Used as the
-/// durable half of fresh-volume evidence so an old, small, already-initialized
-/// volume keeps its grandfathered waiver even after its pod is gone. The
-/// engine compares whole seconds strictly (completion must land in a LATER
-/// second than claim creation): a same-second pair is treated as unproven.
+/// Latest completed automatic-mode deployment that observed Running.
+/// Password redeploy timeouts can also publish `healthy`, so only the
+/// deployment's immutable job payload can distinguish usable history.
+/// Missing history fails closed; a live Ready pod can still prove the claim.
+/// Floor seconds before converting to milliseconds: bigint casts round and
+/// could otherwise turn same-second claim replacement into older evidence.
 pub(crate) async fn last_initialized_at_millis(
     pool: &PgPool,
     app_id: Uuid,
 ) -> Result<Option<i64>, sqlx::Error> {
     sqlx::query_scalar::<_, Option<i64>>(
-        "SELECT (EXTRACT(EPOCH FROM max(completed_at)) * 1000)::bigint
-           FROM deployments
-          WHERE app_id = $1
-            AND status = 'healthy'::deploy_status_enum
-            AND completed_at IS NOT NULL",
+        "SELECT (FLOOR(EXTRACT(EPOCH FROM max(deployment.completed_at))) * 1000)::bigint
+           FROM deployments AS deployment
+           JOIN deployment_apply_jobs AS job ON job.deployment_id = deployment.id
+          WHERE deployment.app_id = $1
+            AND deployment.status = 'healthy'::deploy_status_enum
+            AND deployment.completed_at IS NOT NULL
+            AND job.payload #>> '{app,unlock_mode}' = 'auto'",
     )
     .bind(app_id)
     .fetch_one(pool)

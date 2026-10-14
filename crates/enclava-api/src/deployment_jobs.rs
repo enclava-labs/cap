@@ -3306,6 +3306,72 @@ pub(crate) mod tests {
         tx.commit().await.expect("commit raw job replacement");
     }
 
+    #[tokio::test]
+    async fn password_timeout_healthy_is_not_initialization_history() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _, mut payload) = insert_job_fixture(&pool).await;
+        payload.app.unlock_mode = crate::models::UnlockMode::Password;
+        replace_job_with_raw_payload(
+            &pool,
+            deployment_id,
+            serde_json::to_value(payload).unwrap(),
+            JOB_PAYLOAD_VERSION,
+            false,
+            "pending",
+        )
+        .await;
+        sqlx::query(
+            "UPDATE deployments SET status = 'healthy', completed_at = clock_timestamp()
+              WHERE id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let initialized = crate::deploy::last_initialized_at_millis(&pool, app.id)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            initialized, None,
+            "password redeploy timeout can publish healthy without storage readiness"
+        );
+    }
+
+    #[tokio::test]
+    async fn automatic_initialization_history_truncates_subsecond_completion() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _, _) = insert_job_fixture(&pool).await;
+        let completed = chrono::Timelike::with_nanosecond(
+            &(app.created_at + chrono::Duration::seconds(2)),
+            999_999_000,
+        )
+        .unwrap();
+        sqlx::query("UPDATE deployments SET status = 'healthy', completed_at = $2 WHERE id = $1")
+            .bind(deployment_id)
+            .bind(completed)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let initialized = crate::deploy::last_initialized_at_millis(&pool, app.id)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            initialized,
+            Some(completed.timestamp() * 1000),
+            "rounding must not turn same-second claim replacement into older evidence"
+        );
+    }
+
     async fn recreate_test_deployment_with_signed_hash(
         tx: &mut Transaction<'_, Postgres>,
         deployment_id: Uuid,
