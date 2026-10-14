@@ -36,9 +36,11 @@ const LUKS2_SECTOR_SIZE: u32 = 512;
 /// and the result is bricked: every later boot sees a LUKS2 header and takes
 /// the OpenExisting path that can never succeed. The floor keeps 16 MiB of
 /// payload after the 16 MiB header, comfortably above the mkfs.ext4 minimum.
-/// The same bound is enforced at manifest validation (`enclava-engine`
-/// `validate.rs`) so users get a clear error at deploy time instead of this
-/// runtime refusal at first boot. Keep the two bounds in lockstep.
+/// The same bound is enforced for fresh provisioning at API admission time
+/// (`enclava-engine` `validate.rs`, shared by the deploy routes) so users
+/// get a clear synchronous error at request time instead of this runtime
+/// refusal at first boot; already-provisioned sub-floor volumes keep
+/// operating (they activate fine). Keep the bounds in lockstep.
 const MIN_VOLUME_BYTES: u64 = 32 * 1024 * 1024;
 static KEY_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 

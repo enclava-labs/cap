@@ -3373,7 +3373,12 @@ pub async fn create_paas_app(
         .await
         .map_err(|_| db_error())?;
     crate::routes::deployments::enforce_authoritative_entitlement(
-        &mut tx, cap_org_id, &resources, true,
+        &mut tx,
+        cap_org_id,
+        &resources,
+        true,
+        // Hosted app creation provisions fresh volumes for these sizes.
+        true,
     )
     .await?;
 

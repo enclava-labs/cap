@@ -78,6 +78,7 @@ pub(crate) async fn enforce_authoritative_entitlement(
     org_id: Uuid,
     resources: &AppResources,
     creating_app: bool,
+    fresh_volume_sizes: bool,
 ) -> Result<crate::entitlements::AuthoritativeEntitlement, (StatusCode, Json<serde_json::Value>)> {
     let authority = crate::entitlements::authoritative_entitlement_in_tx(tx, org_id)
         .await
@@ -101,6 +102,25 @@ pub(crate) async fn enforce_authoritative_entitlement(
     })?;
     crate::entitlements::validate_resource_limits(resources, limits)
         .map_err(resource_limit_error_response)?;
+    if fresh_volume_sizes {
+        // The 32 MiB LUKS2 fresh-format floor (shared with enclava-init's
+        // MIN_VOLUME_BYTES and the engine's validate module). Enforced only
+        // when these sizes govern a volume that has not been provisioned
+        // yet: creating an app, or setting initial sizes on a never-rendered
+        // one. Persisted pre-floor sizes keep operating (sub-floor LUKS2
+        // volumes do activate; bricking only happens at fresh format), and
+        // apply-path revalidations pass fresh_volume_sizes=false so
+        // grandfathered apps are not locked out of redeploy/reapply.
+        for (field, value) in [
+            ("storage", resources.app_data_size.as_str()),
+            ("tls_storage", resources.tls_data_size.as_str()),
+        ] {
+            enclava_engine::validate::validate_persistent_volume_size_for_fresh_provisioning(
+                field, value,
+            )
+            .map_err(|message| json_error(StatusCode::BAD_REQUEST, message))?;
+        }
+    }
     if creating_app {
         let app_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM apps WHERE org_id = $1")
             .bind(org_id)
@@ -833,6 +853,25 @@ async fn deploy_app_candidate(
         )
     });
     let mut candidate_resources = base_resources;
+    // Whether the candidate storage sizes govern volumes that have not been
+    // provisioned yet (no workload ever rendered). Computed once: it gates
+    // both the immutable-resize refusal below and the 32 MiB fresh-volume
+    // floor in enforce_authoritative_entitlement.
+    let has_rendered_workload: bool = if app_mutation == AppMutation::Insert {
+        false
+    } else {
+        sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM deployments
+                 WHERE app_id = $1
+                   AND (status <> 'failed'::deploy_status_enum
+                        OR manifest_hash IS NOT NULL))",
+        )
+        .bind(app.id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?
+    };
     if let Some(resources) = body.resources.as_ref() {
         // Storage sizes render into StatefulSet volumeClaimTemplates, which
         // Kubernetes treats as immutable. Once a workload has been rendered
@@ -841,45 +880,32 @@ async fn deploy_app_candidate(
         // apply can never converge; refuse before touching anything.
         // Pre-created apps and definitively pre-apply failures can still set
         // their initial sizes.
-        if app_mutation != AppMutation::Insert {
-            let has_rendered_workload: bool = sqlx::query_scalar(
-                "SELECT EXISTS(
-                    SELECT 1 FROM deployments
-                     WHERE app_id = $1
-                       AND (status <> 'failed'::deploy_status_enum
-                            OR manifest_hash IS NOT NULL))",
-            )
-            .bind(app.id)
-            .fetch_one(&state.db)
-            .await
-            .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
-            if has_rendered_workload {
-                for (field, requested, persisted) in [
-                    (
-                        "storage",
-                        resources.storage.as_deref(),
-                        candidate_resources.app_data_size.as_str(),
-                    ),
-                    (
-                        "tls_storage",
-                        resources.tls_storage.as_deref(),
-                        candidate_resources.tls_data_size.as_str(),
-                    ),
-                ] {
-                    // Compare quantities numerically: "5Gi" and "5120Mi" are
-                    // the same immutable claim size, not a resize.
-                    let changed = requested.is_some_and(|requested| {
-                        !crate::entitlements::binary_quantities_equal(requested, persisted)
-                    });
-                    if changed {
-                        return Err(deploy_blocked_response(
-                            StatusCode::CONFLICT,
-                            "storage_resize_unsupported",
-                            format!(
-                                "changing {field} on an existing app would modify the StatefulSet volume claim template, which is immutable; create a new app instead"
-                            ),
-                        ));
-                    }
+        if has_rendered_workload {
+            for (field, requested, persisted) in [
+                (
+                    "storage",
+                    resources.storage.as_deref(),
+                    candidate_resources.app_data_size.as_str(),
+                ),
+                (
+                    "tls_storage",
+                    resources.tls_storage.as_deref(),
+                    candidate_resources.tls_data_size.as_str(),
+                ),
+            ] {
+                // Compare quantities numerically: "5Gi" and "5120Mi" are
+                // the same immutable claim size, not a resize.
+                let changed = requested.is_some_and(|requested| {
+                    !crate::entitlements::binary_quantities_equal(requested, persisted)
+                });
+                if changed {
+                    return Err(deploy_blocked_response(
+                        StatusCode::CONFLICT,
+                        "storage_resize_unsupported",
+                        format!(
+                            "changing {field} on an existing app would modify the StatefulSet volume claim template, which is immutable; create a new app instead"
+                        ),
+                    ));
                 }
             }
         }
@@ -1168,6 +1194,10 @@ async fn deploy_app_candidate(
         auth.org_id,
         &candidate_resources,
         app_mutation == AppMutation::Insert,
+        // A first deploy with a sub-floor size must be refused synchronously;
+        // an app whose volumes may already exist (anything ever rendered)
+        // keeps its persisted sizes operable (grandfathered pre-floor apps).
+        !has_rendered_workload,
     )
     .await?;
     if let Some(artifacts) = signing_artifacts.as_ref() {
@@ -1823,6 +1853,66 @@ mod tests {
             validate_log_encryption_config(Some(config)).expect_err("algorithm rejected");
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body.0["error"], "unsupported log_encryption.algorithm");
+    }
+
+    #[tokio::test]
+    async fn fresh_volume_floor_rejects_sub_luks2_minimum_sizes_synchronously() {
+        let pool = database_test_pool().await;
+        let app = insert_setup_test_app(&pool).await;
+
+        // 24 Mi passed the old grammar-only checks (positive binary
+        // quantity, under every cap) but bricks at first LUKS format; with
+        // fresh_volume_sizes=true admission must reject it synchronously
+        // instead of accepting a deployment the apply worker is guaranteed
+        // to fail (or worse, an enclava-init runtime brick).
+        let mut tx = pool.begin().await.expect("begin floor test tx");
+        let sub_floor = crate::models::AppResources {
+            app_id: app.id,
+            cpu_limit: "1".to_string(),
+            memory_limit: "1Gi".to_string(),
+            app_data_size: "24Mi".to_string(),
+            tls_data_size: "2Gi".to_string(),
+        };
+        let rejected =
+            super::enforce_authoritative_entitlement(&mut tx, app.org_id, &sub_floor, true, true)
+                .await
+                .expect_err("fresh sub-floor volume size must be rejected at admission");
+        assert_eq!(rejected.0, StatusCode::BAD_REQUEST);
+        assert!(
+            rejected.1.0["error"]
+                .as_str()
+                .expect("error message")
+                .contains("at least 32Mi"),
+            "error should name the floor: {}",
+            rejected.1.0["error"]
+        );
+        tx.rollback().await.expect("rollback floor test tx");
+
+        // Grandfathering: the same persisted size on an apply-path
+        // revalidation (fresh_volume_sizes=false) must keep operating —
+        // sub-floor LUKS2 volumes DO activate, so pre-floor apps are not
+        // locked out of redeploy/reapply/rollback.
+        let mut tx = pool.begin().await.expect("begin grandfather test tx");
+        super::enforce_authoritative_entitlement(&mut tx, app.org_id, &sub_floor, false, false)
+            .await
+            .expect("persisted pre-floor size must keep operating on apply paths");
+        tx.rollback().await.expect("rollback grandfather test tx");
+
+        // And the exact floor is accepted for fresh provisioning.
+        let mut tx = pool.begin().await.expect("begin boundary test tx");
+        let at_floor = crate::models::AppResources {
+            app_id: app.id,
+            cpu_limit: "1".to_string(),
+            memory_limit: "1Gi".to_string(),
+            app_data_size: "32Mi".to_string(),
+            tls_data_size: "32Mi".to_string(),
+        };
+        super::enforce_authoritative_entitlement(&mut tx, app.org_id, &at_floor, true, true)
+            .await
+            .expect("32Mi must be accepted for fresh provisioning");
+        tx.rollback().await.expect("rollback boundary test tx");
+
+        delete_setup_test_org(&pool, app.org_id).await;
     }
 
     #[tokio::test]

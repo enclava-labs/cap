@@ -433,8 +433,16 @@ pub async fn rollback(
             "rollback target authority changed; retry the rollback",
         ));
     }
-    super::enforce_authoritative_entitlement(&mut tx, auth.org_id, &target_resources, false)
-        .await?;
+    super::enforce_authoritative_entitlement(
+        &mut tx,
+        auth.org_id,
+        &target_resources,
+        false,
+        // Rollback re-applies an accepted snapshot's PERSISTED resources;
+        // grandfathered pre-floor sizes keep operating.
+        false,
+    )
+    .await?;
     if let Some(artifacts) = rollback_artifacts.as_ref() {
         let signing_service_pubkey_hex = state
             .attestation

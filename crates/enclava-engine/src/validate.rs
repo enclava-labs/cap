@@ -149,13 +149,22 @@ pub fn validate_app(app: &ConfidentialApp) -> Result<(), ValidationError> {
             detail: format!("memory uses binary Mi/Gi/Ti units: {detail}"),
         }
     })?;
-    validate_persistent_volume_size("storage.app_data.size", &app.storage.app_data.size).map_err(
+    // Grammar only (positive binary quantity): the 32 MiB LUKS2 fresh-format
+    // floor is deliberately NOT enforced here. validate_app runs on every
+    // apply path — including reapply/redeploy of apps whose volumes were
+    // provisioned before the floor existed — and the spec carries no
+    // provisioning state, so a floor here would brick every later apply of a
+    // grandfathered sub-floor app (its LUKS header exists, the runtime probe
+    // is never even reached). The floor is enforced at API admission
+    // (validate_persistent_volume_size below) exactly when the size governs
+    // a fresh, not-yet-provisioned volume.
+    validate_storage_size("storage.app_data.size", &app.storage.app_data.size).map_err(
         |detail| ValidationError::InvalidStorageSize {
             field: "storage.app_data.size",
             detail,
         },
     )?;
-    validate_persistent_volume_size("storage.tls_data.size", &app.storage.tls_data.size).map_err(
+    validate_storage_size("storage.tls_data.size", &app.storage.tls_data.size).map_err(
         |detail| ValidationError::InvalidStorageSize {
             field: "storage.tls_data.size",
             detail,
@@ -241,17 +250,31 @@ fn validate_storage_size(field: &'static str, value: &str) -> Result<(), String>
 }
 
 /// Persistent volumes (the LUKS-formatted state and tls-state devices) also
-/// need a lower bound. The default LUKS2 header occupies the first 16 MiB,
-/// and `luksFormat` succeeds even on devices that end at (or inside) the
-/// header — but activation then has no data area left and the volume is
-/// bricked (every later boot sees a LUKS2 header and can never open it). The
-/// floor keeps 16 MiB of payload after the header, comfortably above the
-/// mkfs.ext4 minimum. Enforced in lockstep with enclava-init
-/// `MIN_VOLUME_BYTES` — keep the two bounds identical. Rejecting here turns
-/// an opaque runtime brick into a clear error at manifest-validation time.
-const MIN_VOLUME_SIZE_MIB: u128 = 32;
+/// need a lower bound when a FRESH volume will be provisioned for the size.
+/// The default LUKS2 header occupies the first 16 MiB, and `luksFormat`
+/// succeeds even on devices that end at (or inside) the header — but
+/// activation then has no data area left and the volume is bricked (every
+/// later boot sees a LUKS2 header and can never open it). The floor keeps
+/// 16 MiB of payload after the header, comfortably above the mkfs.ext4
+/// minimum. Enforced in lockstep with enclava-init `MIN_VOLUME_BYTES` — keep
+/// the two bounds identical.
+///
+/// NOT part of `validate_app`: that runs on every apply path, including
+/// reapplies of apps whose volumes were provisioned before this floor
+/// existed (see the comment in `validate_app`). Callers should enforce this
+/// at admission time, exactly when the size governs a fresh volume
+/// (app creation, or setting initial sizes on a never-rendered app).
+/// Rejecting there turns an opaque runtime brick into a clear, synchronous
+/// error at request time.
+pub const MIN_VOLUME_SIZE_MIB: u128 = 32;
 
-fn validate_persistent_volume_size(field: &'static str, value: &str) -> Result<(), String> {
+/// Validate that a persistent-volume size is a positive binary quantity of
+/// at least [`MIN_VOLUME_SIZE_MIB`]. Shared by API admission paths; exact
+/// rational compare (numerator / 10^scale Mi) — no float rounding.
+pub fn validate_persistent_volume_size_for_fresh_provisioning(
+    field: &'static str,
+    value: &str,
+) -> Result<(), String> {
     let trimmed = value.trim();
     if trimmed.is_empty() || trimmed != value {
         return Err(format!("{field} must be a non-empty binary quantity"));
@@ -259,7 +282,6 @@ fn validate_persistent_volume_size(field: &'static str, value: &str) -> Result<(
     let Some((number, multiplier)) = binary_quantity_parts(trimmed) else {
         return Err(format!("{field} must use Mi, Gi, or Ti binary units"));
     };
-    // Exact rational compare (numerator / 10^scale Mi) — no float rounding.
     let (numerator, scale) = validate_scaled_decimal(number, multiplier)
         .map_err(|_| format!("{field} must be a positive binary quantity"))?;
     if numerator < MIN_VOLUME_SIZE_MIB * 10u128.pow(scale) {

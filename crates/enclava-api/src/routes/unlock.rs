@@ -810,6 +810,11 @@ async fn commit_unlock_mode_transition(
         request.org_id,
         &resources,
         false,
+        // Apply-path revalidation of PERSISTED resources: a pre-floor size
+        // (17–31 Mi) keeps operating — its LUKS header exists and the
+        // runtime probe is never reached. Enforcing the fresh-volume floor
+        // here would lock grandfathered apps out of unlock transitions.
+        false,
     )
     .await?;
 

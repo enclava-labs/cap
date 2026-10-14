@@ -2043,6 +2043,9 @@ async fn acquire_apply_permit_and_revalidate(
             job.org_id,
             &payload.snapshot.resources,
             false,
+            // Apply-job revalidation of the accepted snapshot's PERSISTED
+            // resources: grandfathered pre-floor sizes keep operating.
+            false,
         )
         .await
         .map_err(|_| DeploymentJobError::Authority)?;
