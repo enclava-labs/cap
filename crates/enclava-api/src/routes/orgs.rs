@@ -1388,6 +1388,18 @@ async fn confirm_owner_rotation_publication(
     }))
 }
 
+/// Advisory-lock domain for the per-org rotation-intent quota lock
+/// ("RINT"). Deliberately disjoint from `ORG_SIGNING_AUTHORITY_LANE_DOMAIN`
+/// ("SIGN") and `PAAS_USER_MAPPING_LANE_DOMAIN` ("PUSE"): the intent row is
+/// recorded BEFORE the signing-authority lane opens, and sharing a domain
+/// would make unrelated writers serialize on each other.
+const ORG_ROTATION_INTENT_LANE_DOMAIN: i32 = 0x5249_4e54;
+
+/// Distinct directive presentations accepted per org per rolling hour.
+/// `org_rotation_intents` has no purge path, so this bounds storage growth
+/// from a compromised owner key.
+const MAX_INTENTS_PER_HOUR: i64 = 50;
+
 pub async fn rotate_org_owner(
     auth: AuthContext,
     State(state): State<AppState>,
@@ -1588,23 +1600,38 @@ pub async fn rotate_org_owner(
     // records that an authenticated, signature-verified presentation
     // reached this handler; it authorizes nothing by itself.
     //
-    // Rate bound (PR #185 review, Codex follow-up "serialize the per-org
-    // rotation-intent rate limit"): use a per-org advisory lock to serialize
-    // concurrent writers, preventing a parallel burst from exceeding the
-    // hourly cap. The lock is acquired in the same transaction that checks
-    // the cap and inserts, ensuring atomicity.
+    // Rate bound (PR #185 review, Codex follow-ups "serialize the per-org
+    // rotation-intent rate limit" and "acquire the per-org intent lock
+    // before checking the quota"): concurrent writers serialize on a
+    // per-org advisory lock held across the count/insert. The lock must be
+    // acquired as its OWN statement in a short explicit transaction, with
+    // the count/insert as a subsequent statement: PostgreSQL never
+    // evaluates an unreferenced `WITH org_lock AS (...)` CTE (the first
+    // attempt therefore acquired no lock at all), and even a referenced
+    // CTE could not help -- a READ COMMITTED statement snapshot is fixed
+    // at statement start, so the count would still miss rows committed by
+    // a previous lock holder mid-statement. Locking first and counting in
+    // a later statement gives the count a post-lock snapshot, so the
+    // hourly cap holds under concurrent bursts. The lock is
+    // transaction-scoped (released at commit) and no other lock is taken
+    // in this transaction, so it cannot deadlock against the lane. The
+    // whole record stays on ONE pooled connection, preserving the
+    // short-lived-connection property the comment above requires.
     //
     // Concurrent-insert handling (Codex follow-up "handle concurrent inserts
     // of the same rotation intent"): ON CONFLICT DO NOTHING makes the PK
     // violation from a race between two identical requests return 0 rows
     // instead of throwing an error, then the already_recorded check allows
     // the retry to proceed.
-    const MAX_INTENTS_PER_HOUR: i64 = 50;
+    let mut intent_tx = state.db.begin().await.map_err(|_| db_error())?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
+        .bind(ORG_ROTATION_INTENT_LANE_DOMAIN)
+        .bind(crate::signing_service::org_signing_advisory_key(org_id))
+        .execute(&mut *intent_tx)
+        .await
+        .map_err(|_| db_error())?;
     let intent_rows = sqlx::query(
-        "WITH org_lock AS (
-            SELECT pg_advisory_xact_lock(hashtext($1::text)::bigint) AS lock_token
-        )
-        INSERT INTO org_rotation_intents (org_id, directive_sha256, keyring_sha256)
+        "INSERT INTO org_rotation_intents (org_id, directive_sha256, keyring_sha256)
          SELECT $1, $2, $3
           WHERE NOT EXISTS (
                 SELECT 1 FROM org_rotation_intents
@@ -1619,14 +1646,17 @@ pub async fn rotate_org_owner(
     .bind(directive_digest.as_slice())
     .bind(intent_digest.as_slice())
     .bind(MAX_INTENTS_PER_HOUR)
-    .execute(&state.db)
+    .execute(&mut *intent_tx)
     .await
     .map_err(|_| db_error())?
     .rows_affected();
+    // Distinguish the rate cap (reject) from the exact-replay case (already
+    // recorded; proceed -- the lane remains authoritative). Checked inside
+    // the same locked transaction: no other intent writer can commit
+    // between the insert attempt and this verdict.
+    let mut already_recorded = false;
     if intent_rows == 0 {
-        // Distinguish the rate cap (reject) from the exact-replay case
-        // (already recorded; proceed -- the lane remains authoritative).
-        let already_recorded: bool = sqlx::query_scalar(
+        already_recorded = sqlx::query_scalar(
             "SELECT EXISTS (
                 SELECT 1 FROM org_rotation_intents
                  WHERE org_id = $1 AND directive_sha256 = $2 AND keyring_sha256 = $3
@@ -1635,17 +1665,18 @@ pub async fn rotate_org_owner(
         .bind(org_id)
         .bind(directive_digest.as_slice())
         .bind(intent_digest.as_slice())
-        .fetch_one(&state.db)
+        .fetch_one(&mut *intent_tx)
         .await
         .map_err(|_| db_error())?;
-        if !already_recorded {
-            return Err((
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(serde_json::json!({
-                    "error": "owner rotation directive rate limit exceeded; retry later"
-                })),
-            ));
-        }
+    }
+    intent_tx.commit().await.map_err(|_| db_error())?;
+    if intent_rows == 0 && !already_recorded {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "error": "owner rotation directive rate limit exceeded; retry later"
+            })),
+        ));
     }
 
     // Phase 1: short lane transaction. Validate the request against live
@@ -3658,6 +3689,146 @@ mod tests {
             .await
             .expect("an exact replay of a recorded presentation is never rate-limited");
         assert_eq!(replayed.keyring_version, 2);
+    }
+
+    // PR #185 review (Codex P2 "acquire the per-org intent lock before
+    // checking the quota"): the first fix wrapped the advisory lock in an
+    // unreferenced `WITH org_lock AS (...)` CTE, which PostgreSQL never
+    // evaluates, so concurrent distinct directives still raced the count.
+    // The recording step must hold a real per-org lock across the
+    // count/insert, and the count must observe a post-lock snapshot.
+    #[tokio::test]
+    async fn owner_rotation_intent_quota_lock_serializes_concurrent_writers() {
+        let pool = database_test_pool().await;
+        let org_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let suffix = org_id.simple().to_string();
+        let org_name = format!("keyring-intent-quota-{suffix}");
+        crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+            .await
+            .expect("insert intent quota org");
+        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Intent Quota Owner')")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("insert intent quota user");
+        sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+            .bind(user_id)
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("insert intent quota membership");
+        let current_key = SigningKey::generate(&mut OsRng);
+        let replacement_key = SigningKey::generate(&mut OsRng);
+        sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2), ($1, $3)")
+            .bind(user_id)
+            .bind(current_key.verifying_key().to_bytes().to_vec())
+            .bind(replacement_key.verifying_key().to_bytes().to_vec())
+            .execute(&pool)
+            .await
+            .expect("insert intent quota signing keys");
+
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.signing_service = Some(
+            crate::signing_service::SigningServiceClient::new(
+                mock_signing_service_owner_api(org_id, current_key.verifying_key().to_bytes())
+                    .await,
+                None,
+            )
+            .expect("build mock signing service client"),
+        );
+        let auth = AuthContext {
+            user_id,
+            org_id,
+            org_name: org_name.clone(),
+            role: Role::Owner,
+            api_key: None,
+            management_origin: crate::auth::middleware::ManagementOrigin::Public,
+        };
+
+        // Hold the per-org rotation-intent lock, exactly as the recording
+        // step does, so the writer must queue behind this transaction.
+        let mut intent_blocker = pool.begin().await.expect("begin intent blocker");
+        sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
+            .bind(ORG_ROTATION_INTENT_LANE_DOMAIN)
+            .bind(crate::signing_service::org_signing_advisory_key(org_id))
+            .execute(&mut *intent_blocker)
+            .await
+            .expect("hold rotation intent lock");
+
+        let application = format!("keyring-intent-quota-writer-{suffix}");
+        let mut writer_state = crate::test_support::lazy_state();
+        writer_state.db = named_database_test_pool(&application).await;
+        writer_state.signing_service = state.signing_service.clone();
+        let writer = tokio::spawn(rotate_org_owner(
+            auth.clone(),
+            State(writer_state),
+            Path(org_name.clone()),
+            Json(rotation_request(
+                org_id,
+                user_id,
+                &current_key,
+                &replacement_key,
+                2,
+                2,
+                Utc::now(),
+                "quota-lock",
+            )),
+        ));
+        // The writer must actually queue on the intent lock: with the lock
+        // skipped (the unused-CTE bug) it would record its row immediately
+        // and this wait would time out and panic.
+        wait_for_named_lock_waiter(&pool, &application).await;
+        let queued: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM org_rotation_intents WHERE org_id = $1")
+                .bind(org_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count intent rows while the writer queues");
+        assert_eq!(
+            queued, 0,
+            "no intent row may be recorded before the lock is granted"
+        );
+
+        // Fill the hourly quota inside the lock-holding transaction, then
+        // commit: the rows become visible and the lock is released in one
+        // step. The writer's count runs after the grant, so it must observe
+        // this post-lock snapshot and throttle instead of inserting.
+        for i in 0..MAX_INTENTS_PER_HOUR {
+            sqlx::query(
+                "INSERT INTO org_rotation_intents
+                     (org_id, directive_sha256, keyring_sha256)
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT ON CONSTRAINT org_rotation_intents_pkey DO NOTHING",
+            )
+            .bind(org_id)
+            .bind([i as u8; 32])
+            .bind([0u8; 32])
+            .execute(&mut *intent_blocker)
+            .await
+            .expect("seed synthetic intent rows for the rate cap");
+        }
+        intent_blocker
+            .commit()
+            .await
+            .expect("commit quota rows and release the intent lock");
+
+        let throttled = writer
+            .await
+            .expect("join queued intent writer")
+            .expect_err("a fresh presentation must be throttled once the quota is full");
+        assert_eq!(throttled.0, StatusCode::TOO_MANY_REQUESTS);
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM org_rotation_intents WHERE org_id = $1")
+                .bind(org_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count intent rows after throttling");
+        assert_eq!(
+            rows, MAX_INTENTS_PER_HOUR,
+            "the throttled writer added no intent row"
+        );
     }
 
     #[tokio::test]
