@@ -642,12 +642,13 @@ pub async fn put_keyring(
         // registration stays live. A marker row records that this first
         // version restores quarantined authority instead of initializing a
         // fresh org, and the replacement signer must match the live
-        // signing-service owner before authority is restored (review
-        // finding: without this gate the unrestricted first-version path
-        // accepts any active org owner's registered key -- bypassing the
-        // current owner's cryptographic authorization, or leaving CAP pinned
-        // to a different owner than the signing service and blocking future
-        // signing and rotation).
+        // signing-service owner -- or, when no live owner is readable, the
+        // quarantined signing owner archived in org_keyring_repairs --
+        // before authority is restored (review finding: without this gate
+        // the unrestricted first-version path accepts any active org owner's
+        // registered key -- bypassing the current owner's cryptographic
+        // authorization, or leaving CAP pinned to a different owner than
+        // the signing service and blocking future signing and rotation).
         let recovery_marker: Option<i64> = sqlx::query_scalar(
             "SELECT quarantined_latest_version FROM org_keyring_shape_recoveries WHERE org_id = $1",
         )
@@ -655,8 +656,15 @@ pub async fn put_keyring(
         .fetch_optional(&mut *tx)
         .await
         .map_err(|_| db_error())?;
-        if recovery_marker.is_some() {
-            fence_quarantined_keyring_recovery(&state, &mut tx, org_id, &signing_pubkey).await?;
+        if let Some(quarantined_latest_version) = recovery_marker {
+            fence_quarantined_keyring_recovery(
+                &state,
+                &mut tx,
+                org_id,
+                quarantined_latest_version,
+                &signing_pubkey,
+            )
+            .await?;
         }
     }
 
@@ -1206,27 +1214,63 @@ async fn fence_successor_keyring_version(
 /// cryptographic authorization or pin CAP to a different owner than the
 /// signing service -- blocking future signing and rotation. Require the
 /// replacement v1 signer to match the live signing-service owner before
-/// authority is restored. A service holding no owner for this org (or an
-/// install without the signing service) has no live owner to bind to: that
-/// case keeps the successor fence's fail-closed rule for recorded rotation
-/// history and otherwise lets the org's owners restore authority exactly
-/// like a genuine first upload, after which the fresh v1 signer is the owner
-/// bootstrap_signing_service_owner must register upstream.
+/// authority is restored. When no live owner is readable, bind the recovery
+/// to the displaced signer instead: migration 0061 archived every dropped
+/// row in `org_keyring_repairs` before writing the recovery marker, so the
+/// signer of the quarantined latest version is durable provenance, and
+/// `put_keyring` already verifies the replacement envelope under the
+/// caller's own registered key -- a matching signer means the displaced
+/// owner signed the replacement (review finding: accepting any active
+/// owner's key here let a different owner replace the quarantined keyring
+/// without the previously authorized owner's signature). Unresolvable
+/// provenance fails closed instead of falling back to a genuine first
+/// upload: a genuine first upload has no recovery marker and never reaches
+/// this fence. Recorded rotation history without a configured service still
+/// fails closed inside `read_fence_service_owner`, because that history
+/// proves upstream authority existed and cannot be read now.
 async fn fence_quarantined_keyring_recovery(
     state: &AppState,
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     org_id: Uuid,
+    quarantined_latest_version: i64,
     replacement_signer: &[u8],
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     let service_owner = read_fence_service_owner(state, tx, org_id).await?;
-    if service_owner
-        .as_deref()
-        .is_some_and(|owner| owner != replacement_signer)
-    {
+    if let Some(owner) = service_owner {
+        if owner.as_slice() != replacement_signer {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "quarantined keyring recovery signer does not match the live signing-service owner"
+                })),
+            ));
+        }
+        return Ok(());
+    }
+    let displaced_signer: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT usk.pubkey
+           FROM org_keyring_repairs okr
+           JOIN user_signing_keys usk ON usk.id = okr.signing_key_id
+          WHERE okr.org_id = $1 AND okr.version = $2",
+    )
+    .bind(org_id)
+    .bind(quarantined_latest_version)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|_| db_error())?;
+    let Some(displaced_signer) = displaced_signer else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "quarantined keyring recovery provenance is unavailable"
+            })),
+        ));
+    };
+    if displaced_signer.as_slice() != replacement_signer {
         return Err((
             StatusCode::CONFLICT,
             Json(serde_json::json!({
-                "error": "quarantined keyring recovery signer does not match the live signing-service owner"
+                "error": "quarantined keyring recovery signer does not match the quarantined signing owner"
             })),
         ));
     }
@@ -3096,8 +3140,172 @@ mod tests {
         let (_db_cleanup, pool) = isolated_database_test_pool("cap187_quarantine_no_service").await;
         let org_id = Uuid::new_v4();
         let alice_id = Uuid::new_v4();
+        let bob_id = Uuid::new_v4();
         let suffix = org_id.simple().to_string();
         let org_name = format!("keyring-quarantine-nosvc-{suffix}");
+        crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+            .await
+            .expect("insert quarantine recovery org");
+        for (user_id, display_name) in [(alice_id, "Alice"), (bob_id, "Bob")] {
+            sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, $2)")
+                .bind(user_id)
+                .bind(display_name)
+                .execute(&pool)
+                .await
+                .expect("insert quarantine recovery user");
+            sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+                .bind(user_id)
+                .bind(org_id)
+                .execute(&pool)
+                .await
+                .expect("insert quarantine recovery membership");
+        }
+        let alice_key = SigningKey::generate(&mut OsRng);
+        let bob_key = SigningKey::generate(&mut OsRng);
+        let alice_signing_key_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(alice_id)
+        .bind(alice_key.verifying_key().to_bytes().to_vec())
+        .fetch_one(&pool)
+        .await
+        .expect("insert quarantine recovery signing key");
+        sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2)")
+            .bind(bob_id)
+            .bind(bob_key.verifying_key().to_bytes().to_vec())
+            .execute(&pool)
+            .await
+            .expect("insert quarantine recovery signing key");
+        sqlx::query(
+            "INSERT INTO org_keyring_shape_recoveries (org_id, quarantined_latest_version)
+             VALUES ($1, 3)",
+        )
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("insert quarantine recovery marker");
+        // Migration 0061 archives every dropped row in org_keyring_repairs
+        // before writing the marker, so the displaced signer of the
+        // quarantined latest version is durable provenance even on an
+        // install without the platform signing service.
+        sqlx::query(
+            "INSERT INTO org_keyring_repairs
+                 (org_id, version, keyring_payload, signature, signing_key_id, created_at)
+             VALUES ($1, 3, $2, $3, $4, now())",
+        )
+        .bind(org_id)
+        .bind(b"{\"members\":[]}".to_vec())
+        .bind(vec![0u8; 64])
+        .bind(alice_signing_key_id)
+        .execute(&pool)
+        .await
+        .expect("insert quarantined keyring provenance");
+
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        // signing_service stays None: an install without the platform signing
+        // service has no live owner recovery could bind to.
+        let auth_for = |user_id| AuthContext {
+            user_id,
+            org_id,
+            org_name: org_name.clone(),
+            role: Role::Owner,
+            api_key: None,
+            management_origin: crate::auth::middleware::ManagementOrigin::Public,
+        };
+
+        // Fail-closed parity with fence_successor_keyring_version: recorded
+        // owner-rotation history without a configured service means upstream
+        // authority existed but cannot be read now.
+        sqlx::query(
+            "INSERT INTO org_rotation_intents (org_id, directive_sha256, keyring_sha256)
+             VALUES ($1, $2, $3)",
+        )
+        .bind(org_id)
+        .bind(vec![0x11u8; 32])
+        .bind(vec![0x22u8; 32])
+        .execute(&pool)
+        .await
+        .expect("insert rotation history");
+        let refused = put_keyring(
+            auth_for(alice_id),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(signed_keyring_request(org_id, alice_id, &alice_key, 1, 1)),
+        )
+        .await
+        .expect_err("rotation history without a configured service must refuse recovery");
+        assert_eq!(refused.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            keyring_put_authority(&pool, org_id).await,
+            (0, 0, 0, 0),
+            "the refused recovery must not write keyring, audit, or generation state"
+        );
+
+        sqlx::query("DELETE FROM org_rotation_intents WHERE org_id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("clear rotation history");
+        // The recovery is bound to the displaced signing owner: a different
+        // active owner must not replace the quarantined keyring without that
+        // owner's signature.
+        let hijack = put_keyring(
+            auth_for(bob_id),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(signed_keyring_request(org_id, bob_id, &bob_key, 1, 1)),
+        )
+        .await
+        .expect_err(
+            "a different owner must not replace the quarantined keyring without the displaced owner's signature",
+        );
+        assert_eq!(hijack.0, StatusCode::CONFLICT);
+        assert_eq!(
+            hijack.1.0["error"],
+            "quarantined keyring recovery signer does not match the quarantined signing owner"
+        );
+        assert_eq!(
+            keyring_put_authority(&pool, org_id).await,
+            (0, 0, 0, 0),
+            "the refused recovery must not write keyring, audit, or generation state"
+        );
+
+        let recovered = put_keyring(
+            auth_for(alice_id),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(signed_keyring_request(org_id, alice_id, &alice_key, 1, 1)),
+        )
+        .await
+        .expect(
+            "the displaced signing owner must still be able to restore quarantined authority on a service-less install",
+        );
+        assert_eq!(recovered.0, StatusCode::OK);
+        assert_eq!(
+            keyring_put_authority(&pool, org_id).await,
+            (1, 1, 0, 0),
+            "the accepted recovery must commit exactly one keyring and audit row"
+        );
+        let marker: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM org_keyring_shape_recoveries WHERE org_id = $1",
+        )
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read recovery marker");
+        assert_eq!(marker, 0, "the committed recovery must consume its marker");
+    }
+
+    #[tokio::test]
+    async fn put_keyring_quarantine_recovery_without_provenance_fails_closed() {
+        let _singleton = keyring_enqueue_guard().await;
+        let (_db_cleanup, pool) =
+            isolated_database_test_pool("cap187_quarantine_no_provenance").await;
+        let org_id = Uuid::new_v4();
+        let alice_id = Uuid::new_v4();
+        let suffix = org_id.simple().to_string();
+        let org_name = format!("keyring-quarantine-noprovenance-{suffix}");
         crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
             .await
             .expect("insert quarantine recovery org");
@@ -3120,6 +3328,11 @@ mod tests {
             .execute(&pool)
             .await
             .expect("insert quarantine recovery signing key");
+        // A marker without readable org_keyring_repairs provenance cannot
+        // happen through migration 0061 (it archives every dropped row in
+        // the same run that writes the marker); when the displaced signer is
+        // unreadable anyway, the recovery fails closed instead of accepting
+        // any active owner's key.
         sqlx::query(
             "INSERT INTO org_keyring_shape_recoveries (org_id, quarantined_latest_version)
              VALUES ($1, 3)",
@@ -3141,54 +3354,24 @@ mod tests {
             api_key: None,
             management_origin: crate::auth::middleware::ManagementOrigin::Public,
         };
-        let envelope = || signed_keyring_request(org_id, alice_id, &alice_key, 1, 1);
 
-        // Fail-closed parity with fence_successor_keyring_version: recorded
-        // owner-rotation history without a configured service means upstream
-        // authority existed but cannot be read now.
-        sqlx::query(
-            "INSERT INTO org_rotation_intents (org_id, directive_sha256, keyring_sha256)
-             VALUES ($1, $2, $3)",
-        )
-        .bind(org_id)
-        .bind(vec![0x11u8; 32])
-        .bind(vec![0x22u8; 32])
-        .execute(&pool)
-        .await
-        .expect("insert rotation history");
         let refused = put_keyring(
-            auth.clone(),
+            auth,
             State(state.clone()),
             Path(org_name.clone()),
-            Json(envelope()),
+            Json(signed_keyring_request(org_id, alice_id, &alice_key, 1, 1)),
         )
         .await
-        .expect_err("rotation history without a configured service must refuse recovery");
+        .expect_err("recovery without readable provenance must fail closed");
         assert_eq!(refused.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            refused.1.0["error"],
+            "quarantined keyring recovery provenance is unavailable"
+        );
         assert_eq!(
             keyring_put_authority(&pool, org_id).await,
             (0, 0, 0, 0),
             "the refused recovery must not write keyring, audit, or generation state"
-        );
-
-        sqlx::query("DELETE FROM org_rotation_intents WHERE org_id = $1")
-            .bind(org_id)
-            .execute(&pool)
-            .await
-            .expect("clear rotation history");
-        let recovered = put_keyring(
-            auth.clone(),
-            State(state.clone()),
-            Path(org_name.clone()),
-            Json(envelope()),
-        )
-        .await
-        .expect("a service-less install must still be able to restore quarantined authority");
-        assert_eq!(recovered.0, StatusCode::OK);
-        assert_eq!(
-            keyring_put_authority(&pool, org_id).await,
-            (1, 1, 0, 0),
-            "the accepted recovery must commit exactly one keyring and audit row"
         );
         let marker: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM org_keyring_shape_recoveries WHERE org_id = $1",
@@ -3197,7 +3380,7 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("read recovery marker");
-        assert_eq!(marker, 0, "the committed recovery must consume its marker");
+        assert_eq!(marker, 1, "a refused recovery must keep its marker");
     }
 
     #[tokio::test]
