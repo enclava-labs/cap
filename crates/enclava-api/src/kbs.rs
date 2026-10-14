@@ -44,6 +44,8 @@ pub enum KbsPolicyError {
     Kube(#[from] kube::Error),
     #[error("Kubernetes mutating request exceeded its 30 second deadline")]
     ProviderWriteTimeout,
+    #[error("Kubernetes mutating request failed")]
+    ProviderWriteFailed(#[source] kube::Error),
     #[error("resource-policy ConfigMap is missing data key '{0}'")]
     MissingPolicyKey(String),
     #[error("resource-policy.rego does not contain an owner_resource_bindings block")]
@@ -100,7 +102,24 @@ where
     tokio::time::timeout(Duration::from_secs(30), future)
         .await
         .map_err(|_| KbsPolicyError::ProviderWriteTimeout)?
-        .map_err(KbsPolicyError::Kube)
+        .map_err(KbsPolicyError::ProviderWriteFailed)
+}
+
+impl KbsPolicyError {
+    /// True when the failure is a Kubernetes MUTATING request whose outcome
+    /// may be unknown: `bounded_kube_write` funnels every provider write in
+    /// this module, and both its timeout and its transport/API errors can
+    /// leave a request that already reached (or may yet reach) the API
+    /// server. Reads, client construction, database work, and serialization
+    /// failures never set this: errors propagate the moment they occur and
+    /// every write is awaited to a known outcome before later stages run, so
+    /// any other failure proves no write is still in flight.
+    pub(crate) fn provider_write_may_be_in_flight(&self) -> bool {
+        matches!(
+            self,
+            KbsPolicyError::ProviderWriteFailed(_) | KbsPolicyError::ProviderWriteTimeout
+        )
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, sqlx::FromRow)]
@@ -570,7 +589,11 @@ async fn reconcile_legacy_rego_policy_with_client(
             .await
             {
                 Ok(_) => {}
-                Err(KbsPolicyError::Kube(error)) if is_kubernetes_conflict(&error) => continue,
+                Err(KbsPolicyError::ProviderWriteFailed(error))
+                    if is_kubernetes_conflict(&error) =>
+                {
+                    continue;
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -1911,7 +1934,9 @@ async fn converge_signed_policy_configmap(
                     publication_token,
                 });
             }
-            Err(KbsPolicyError::Kube(error)) if is_kubernetes_conflict(&error) => continue,
+            Err(KbsPolicyError::ProviderWriteFailed(error)) if is_kubernetes_conflict(&error) => {
+                continue;
+            }
             Err(error) => return Err(error),
         }
     }
@@ -2056,7 +2081,9 @@ async fn converge_trustee_policy_generation(
                 }
                 return Ok(GenerationDecision::Replace);
             }
-            Err(KbsPolicyError::Kube(error)) if is_kubernetes_conflict(&error) => continue,
+            Err(KbsPolicyError::ProviderWriteFailed(error)) if is_kubernetes_conflict(&error) => {
+                continue;
+            }
             Err(error) => return Err(error),
         }
     }
@@ -2278,7 +2305,9 @@ async fn converge_legacy_trustee_publication(
                 )
                 .await;
             }
-            Err(KbsPolicyError::Kube(error)) if is_kubernetes_conflict(&error) => continue,
+            Err(KbsPolicyError::ProviderWriteFailed(error)) if is_kubernetes_conflict(&error) => {
+                continue;
+            }
             Err(error) => return Err(error),
         }
     }
@@ -2791,6 +2820,30 @@ mod tests {
             .boxed(),
         )));
         assert!(!kube.to_string().contains("tenant-sensitive"));
+    }
+
+    #[test]
+    fn provider_write_in_flight_classification_covers_only_mutations() {
+        // The KBS fence release on a failed publication depends on this
+        // classification: a mutating request's outcome can be unknown (it may
+        // have reached the API server), while every other failure provably
+        // precedes all provider writes and may release the fence.
+        assert!(KbsPolicyError::ProviderWriteTimeout.provider_write_may_be_in_flight());
+        let write_failure = KbsPolicyError::ProviderWriteFailed(kube::Error::Api(
+            kube::core::Status::failure("boom", "reason")
+                .with_code(500)
+                .boxed(),
+        ));
+        assert!(write_failure.provider_write_may_be_in_flight());
+        let read_failure = KbsPolicyError::Kube(kube::Error::Api(
+            kube::core::Status::failure("boom", "reason")
+                .with_code(404)
+                .boxed(),
+        ));
+        assert!(!read_failure.provider_write_may_be_in_flight());
+        assert!(
+            !KbsPolicyError::MissingPolicyKey("data".to_string()).provider_write_may_be_in_flight()
+        );
     }
 
     #[tokio::test]

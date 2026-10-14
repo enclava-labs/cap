@@ -51,7 +51,9 @@ LOCK TABLE org_keyrings IN ACCESS EXCLUSIVE MODE;
 --     selector already guarantees for a missing keyring (INNER JOIN drop),
 --     it can never resurrect a revoked signer, and the org recovers by
 --     uploading a fresh owner-signed keyring (the version-1 initial-upload
---     path).
+--     path).  That path is otherwise unrestricted, so the recovery marker
+--     table installed below binds it to the live signing-service owner --
+--     see the table comment for the full reasoning.
 --   * Malformed row strictly BELOW a clean current version: deleting just
 --     the malformed rows cannot change authority (the clean max version
 --     stays current, nothing is promoted), so the live keyring and the
@@ -113,7 +115,7 @@ BEGIN
          GROUP BY org_id
     LOOP
         IF affected.quarantined THEN
-            RAISE NOTICE 'migration 0061: malformed CURRENT keyring for org % (versions % present); dropping ALL of this org''s keyring rows -- no older generation may be promoted; the org must upload a fresh owner-signed keyring (originals archived in org_keyring_repairs)',
+            RAISE NOTICE 'migration 0061: malformed CURRENT keyring for org % (versions % present); dropping ALL of this org''s keyring rows -- no older generation may be promoted; the org must upload a fresh keyring signed by the live signing-service owner (recovery marker recorded in org_keyring_shape_recoveries; originals archived in org_keyring_repairs)',
                 affected.org_id, affected.versions;
         ELSE
             RAISE NOTICE 'migration 0061: dropping malformed historical keyring rows for org % (versions %); the clean current version is untouched (dropped originals archived in org_keyring_repairs)',
@@ -148,6 +150,32 @@ SELECT org_id, version, keyring_payload, signature, signing_key_id, created_at
 DELETE FROM org_keyrings
  WHERE org_id IN (SELECT org_id FROM org_keyrings_shape_quarantined)
     OR NOT org_keyrings_payload_matches_shape(keyring_payload);
+
+-- Recovery marker (review finding): the quarantine above drops every keyring
+-- row of an org whose CURRENT keyring was malformed, but the signing
+-- service's owner registration for that org stays live.  Without a marker,
+-- the replacement upload follows put_keyring's unrestricted first-version
+-- path, which accepts any active org owner's registered key without calling
+-- fence_successor_keyring_version -- that can either bypass the live owner's
+-- cryptographic authorization or leave CAP pinned to a different owner than
+-- the signing service, blocking future signing and rotation.  Record the
+-- quarantine so the first-version path can require the replacement v1 signer
+-- to match the live signing-service owner before restoring authority
+-- (fence_quarantined_keyring_recovery in crates/enclava-api/src/routes/orgs.rs).
+-- The marker row is consumed by the transaction that commits a keyring
+-- version; a version that reaches the insert at all has passed the recovery
+-- gate (or restored authority through the successor path).  Only the orgs
+-- that lost EVERY row are marked: an org whose clean current version
+-- survived keeps its authority and never takes the first-version path.
+CREATE TABLE org_keyring_shape_recoveries (
+    org_id                     uuid PRIMARY KEY REFERENCES organizations(id) ON DELETE CASCADE,
+    quarantined_latest_version bigint NOT NULL,
+    recorded_at                timestamptz NOT NULL DEFAULT now()
+);
+
+INSERT INTO org_keyring_shape_recoveries (org_id, quarantined_latest_version)
+SELECT org_id, latest_version
+  FROM org_keyrings_shape_quarantined;
 
 DROP TABLE org_keyrings_shape_quarantined;
 
