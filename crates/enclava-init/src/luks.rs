@@ -239,6 +239,11 @@ fn authenticated_open(
     let seal = luks2_seal::verify_header_seal(region, &keys.header_mac_key)?;
     let detached_path = detached_header_path(mapping_name);
 
+    // Remove detached header copies orphaned by earlier (crashed/killed)
+    // boots: they are PID-named and would otherwise accumulate until the
+    // tmpfs size check rejects every subsequent boot (cap#244 review).
+    cleanup_stale_detached_copies();
+
     let result = (|| -> Result<()> {
         luks2_seal::write_detached_copy(region, &detached_path)?;
 
@@ -444,6 +449,10 @@ fn verify_active_mapper_volume_key(
     _keys: &VolumeKeys,
 ) -> Result<()> {
     let expected_uuid = region_header_uuid(region)?;
+    // cryptsetup strips the hyphens from the LUKS UUID when it builds the dm
+    // UUID (CRYPT-LUKS2-<32 lowercase hex>-<name>), so compare the
+    // normalized forms (cap#244 review).
+    let expected_uuid_norm: String = expected_uuid.chars().filter(|c| *c != '-').collect();
     let dm_uuid = mapper_dm_uuid(mapping_name)?;
     // Kernel-held dm UUID format: CRYPT-LUKS2-<luks-uuid>-<mapping-name>
     let bound_uuid = dm_uuid
@@ -455,10 +464,10 @@ fn verify_active_mapper_volume_key(
                  cryptsetup mapper bound to this name; refusing to use it"
             ))
         })?;
-    if bound_uuid != expected_uuid {
+    if bound_uuid != expected_uuid_norm {
         return Err(InitError::Luks(format!(
             "existing mapper {mapping_name} was activated from header UUID {bound_uuid}, \
-             but the authenticated header for {} has UUID {expected_uuid}; possible mapper \
+             but the authenticated header for {} has UUID {expected_uuid_norm}; possible mapper \
              or header substitution, refusing to use it",
             device.display()
         )));
@@ -1003,6 +1012,39 @@ fn detached_header_path(_mapping_name: &str) -> PathBuf {
         "/run/enclava/luks-header-{}-{counter}",
         std::process::id()
     ))
+}
+
+/// Delete `/run/enclava/luks-header-*` files left behind by processes that
+/// no longer exist (crash/kill/OOM between write and wipe). A live PID that
+/// is not us still owns its file; our own files are handled by the normal
+/// wipe path.
+fn cleanup_stale_detached_copies() {
+    let dir = Path::new("/run/enclava");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let my_pid = std::process::id();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(rest) = name.strip_prefix("luks-header-") else {
+            continue;
+        };
+        let Some(pid_str) = rest.split('-').next() else {
+            continue;
+        };
+        let Ok(pid) = pid_str.parse::<u32>() else {
+            continue;
+        };
+        if pid == my_pid || Path::new(&format!("/proc/{pid}")).exists() {
+            continue;
+        }
+        // Best effort: plaintext header bytes never outlive the dead owner.
+        if let Ok(meta) = entry.metadata() {
+            let len = meta.len() as usize;
+            luks2_seal::wipe_detached_copy(&entry.path(), len);
+        }
+    }
 }
 
 fn wipe_key_file(path: &Path, len: usize) {

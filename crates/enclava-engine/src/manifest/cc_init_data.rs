@@ -62,6 +62,11 @@ pub struct CcInitDataOptions {
     pub kbs_url: String,
     pub kbs_ca_cert_pem: Option<String>,
     pub runtime_class: String,
+    /// LUKS2 header-seal rollout claim (cap#242): part of the deterministic
+    /// render options so every producer of `expected_cc_init_data_hash`
+    /// (enclava-api render, hosted/local CLI signing) renders identical
+    /// bytes instead of each process reading its private environment.
+    pub luks2_header_seal: String,
 }
 
 impl CcInitDataOptions {
@@ -70,6 +75,7 @@ impl CcInitDataOptions {
             kbs_url: trustee_kbs_url(),
             kbs_ca_cert_pem: trustee_kbs_ca_cert_pem(),
             runtime_class: runtime_class(),
+            luks2_header_seal: luks2_header_seal_claim(),
         }
     }
 }
@@ -205,7 +211,11 @@ pub fn build_toml_with_options(app: &ConfidentialApp, options: &CcInitDataOption
         .as_ref()
         .is_some_and(|binding| binding.omit_luks2_header_seal_claim);
     if !omit_seal_claim {
-        push_toml_string(&mut toml, "luks2_header_seal", &luks2_header_seal_claim());
+        push_toml_string(
+            &mut toml,
+            "luks2_header_seal",
+            &validate_luks2_header_seal_claim(&options.luks2_header_seal),
+        );
     }
     push_toml_string(
         &mut toml,

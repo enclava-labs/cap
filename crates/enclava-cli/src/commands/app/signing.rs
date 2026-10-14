@@ -762,6 +762,7 @@ pub(crate) async fn build_signed_deploy_blobs(
             &app_config.resources.memory,
             &cc_init_data::runtime_class(),
         ),
+        luks2_header_seal: cc_init_data::luks2_header_seal_claim(),
     };
     let cc_init_data_hash: [u8; 32] =
         Sha256::digest(cc_init_data::build_toml_with_options(&cc_app, &cc_init_options).as_bytes())

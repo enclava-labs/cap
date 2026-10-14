@@ -346,6 +346,7 @@ fn signed_cc_hash_app_uses_local_artifact_urls_like_live_apply() {
             kbs_url: "https://kbs.example.test:8080".to_string(),
             kbs_ca_cert_pem: None,
             runtime_class: cc_init_data::DEFAULT_RUNTIME_CLASS.to_string(),
+            luks2_header_seal: "adopt".to_string(),
         },
     );
 
@@ -414,6 +415,7 @@ fn signed_cc_hash_app_uses_api_deployment_context_without_env_exports() {
             kbs_url: "https://kbs.example.test:8080".to_string(),
             kbs_ca_cert_pem: None,
             runtime_class: cc_init_data::DEFAULT_RUNTIME_CLASS.to_string(),
+            luks2_header_seal: "adopt".to_string(),
         },
     );
 
