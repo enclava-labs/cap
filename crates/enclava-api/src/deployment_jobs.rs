@@ -5301,8 +5301,9 @@ mod tests {
             app.clone(),
             engine,
             "admission-manifest".to_string(),
-            chrono::Utc::now() - chrono::Duration::seconds(601),
-            // Sub-GiB size keeps the rollout budget at the 600s baseline.
+            // Anchor older than the 600s baseline plus any rounding, so the
+            // cumulative rollout budget is genuinely exhausted.
+            chrono::Utc::now() - chrono::Duration::seconds(1201),
             "512Mi",
         );
         let outcome = watch_committed_rollout(rollout, mutation).await;

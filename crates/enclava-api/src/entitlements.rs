@@ -229,16 +229,14 @@ impl ScaledDecimal {
         .normalized())
     }
 
-    /// Exact value in whole units (Mi for binary quantities), if it is an
-    /// integer. Returns `None` for fractional values or overflow.
-    pub(crate) fn whole_units(&self) -> Option<u128> {
-        if self.scale == 0 {
-            Some(self.coefficient)
-        } else {
-            let divisor = 10u128.checked_pow(self.scale)?;
-            (self.coefficient.is_multiple_of(divisor))
-                .then(|| self.coefficient.checked_div(divisor))?
-        }
+    /// Ceiling of `value * numerator / denominator` in whole units,
+    /// saturating on overflow. Exact u128 arithmetic: no float rounding for
+    /// fractional quantities.
+    pub(crate) fn ceil_mul_div(&self, numerator: u128, denominator: u128) -> u128 {
+        let scale_div = 10u128.saturating_pow(self.scale);
+        let num = self.coefficient.saturating_mul(numerator);
+        let den = scale_div.saturating_mul(denominator);
+        num.saturating_add(den - 1) / den
     }
 
     fn checked_scale(self, extra: u32, field: &'static str) -> Result<Self, String> {

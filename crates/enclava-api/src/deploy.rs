@@ -1720,19 +1720,20 @@ mod tests {
         // fixed 600s rollout timeout.
         assert_eq!(
             rollout_budget_for("5Gi"),
-            BASE_ROLLOUT_BUDGET + std::time::Duration::from_secs(5 * 8)
+            BASE_ROLLOUT_BUDGET + std::time::Duration::from_secs(5 * 16)
         );
+        // Fractional sizes round up so an accepted 1.1Ti volume keeps its
+        // full initialization budget.
         assert_eq!(
-            rollout_budget_for("1Ti"),
-            BASE_ROLLOUT_BUDGET + std::time::Duration::from_secs(1024 * 8)
+            rollout_budget_for("1.1Ti"),
+            BASE_ROLLOUT_BUDGET + std::time::Duration::from_secs(1127 * 16)
         );
         assert_eq!(
             rollout_budget_for("2Ti"),
-            BASE_ROLLOUT_BUDGET + std::time::Duration::from_secs(2048 * 8)
+            BASE_ROLLOUT_BUDGET + std::time::Duration::from_secs(2048 * 16)
         );
         // Entitlement-invalid sizes fall back to the baseline budget.
         assert_eq!(rollout_budget_for("nonsense"), BASE_ROLLOUT_BUDGET);
-        assert_eq!(rollout_budget_for("0.5Gi"), BASE_ROLLOUT_BUDGET);
     }
 
     #[tokio::test]
@@ -1768,9 +1769,9 @@ mod tests {
             auto_app,
             rollout_test_engine(),
             "deadline-manifest".to_string(),
-            chrono::Utc::now() - chrono::Duration::seconds(601),
-            // Sub-GiB size: budget stays at the 600s baseline, so a 601s-old
-            // anchor is genuinely exhausted.
+            // Anchor older than the 600s baseline plus any rounding, so the
+            // cumulative rollout budget is genuinely exhausted.
+            chrono::Utc::now() - chrono::Duration::seconds(1201),
             "512Mi",
         )
         .with_observation_slice(std::time::Duration::from_millis(50))
@@ -2030,23 +2031,22 @@ const BASE_ROLLOUT_BUDGET: std::time::Duration = std::time::Duration::from_secs(
 /// enclava-init sidecar initializes dm-integrity tags by writing the whole
 /// data area (cryptsetup's own `luksFormat --integrity` does the same via
 /// `crypt_wipe`); a fixed 600s cap would persist valid-but-slow fresh volumes
-/// as failed deployments while the sidecar is still formatting. This rate is
-/// deliberately conservative: it assumes ~100 MiB/s of sustained tag-write
-/// throughput (8 GiB/min), so any realistic cloud volume finishes well
-/// inside its budget.
-const ROLLOUT_BUDGET_PER_GIB: std::time::Duration = std::time::Duration::from_secs(8);
+/// as failed deployments while the sidecar is still formatting. This rate
+/// assumes only ~64 MiB/s of sustained tag-write throughput so that even a
+/// heavily loaded storage backend finishes well inside its budget.
+const ROLLOUT_BUDGET_PER_GIB: std::time::Duration = std::time::Duration::from_secs(16);
 
 /// Total rollout budget for a deployment: the fixed baseline plus a linear
-/// app-data-size extension. Unparseable or fractional sizes fall back to the
-/// baseline; the entitlement path has already rejected those before a job is
-/// queued, so this only guards against drift between acceptance and apply.
+/// app-data-size extension, rounded up so fractional sizes (e.g. 1.5Gi)
+/// never lose budget. Unparseable sizes fall back to the baseline; the
+/// entitlement path rejects those before a job is queued, so this only
+/// guards against drift between acceptance and apply.
 fn rollout_budget_for(app_data_size: &str) -> std::time::Duration {
     let gib = crate::entitlements::parse_binary_mib(app_data_size, "storage")
         .ok()
-        .and_then(|mib| mib.whole_units())
-        .map(|mib| mib / 1024)
+        .map(|mib| mib.ceil_mul_div(1, 1024))
         .unwrap_or(0);
-    BASE_ROLLOUT_BUDGET + ROLLOUT_BUDGET_PER_GIB * (gib as u32)
+    BASE_ROLLOUT_BUDGET + ROLLOUT_BUDGET_PER_GIB * u32::try_from(gib).unwrap_or(u32::MAX)
 }
 
 /// A rollout handle returned after Kubernetes accepted the rendered manifests.
