@@ -72,6 +72,10 @@ for required in \
   "dist/enclava-api-signer-identity.txt" \
   'WORKFLOW_REF: ${{ github.workflow_ref }}' \
   'signer_subject="https://github.com/$WORKFLOW_REF"' \
+  'IMAGE_DIGEST: ${{ steps.build.outputs.digest }}' \
+  'image_ref="ghcr.io/enclava-labs/enclava-api@${IMAGE_DIGEST}"' \
+  'PUSHED_REF: ${{ github.ref }}' \
+  'refs/tags/v[A-Za-z0-9][A-Za-z0-9._-]*$' \
   "cosign sign --yes" \
   "scripts/verify-api-image-ref.sh --cosign dist/enclava-api-image.txt" \
   "name: enclava-api-release-manifest" \
@@ -83,6 +87,27 @@ for required in \
   "bash -n scripts/verify-api-image-ref.bash"; do
   assert_contains "$required"
 done
+
+# No template interpolation may appear inside a `run:` block body (#226):
+# values influenced by ref content or dispatch inputs must reach the shell
+# only through an `env:` binding (runner-set, never shell-parsed). This guards
+# against direct interpolation being reintroduced anywhere in the workflow,
+# not just drift of the exact lines fixed above.
+run_body_injections="$(
+  awk '
+    /run: \|/ { in_run = 1; next }
+    in_run && /^[[:space:]]*$/ { next }
+    in_run && /^[[:space:]]{10,}[^[:space:]]/ {
+      if ($0 ~ /\$\{\{/) print FNR ": " $0
+      next
+    }
+    { in_run = 0 }
+  ' "$WORKFLOW"
+)"
+[[ -z "$run_body_injections" ]] || {
+  echo "$run_body_injections" >&2
+  fail "workflow interpolates \${{ ... }} directly inside a run: block; pass the value through an env: binding instead"
+}
 
 grep -Fq -- '      - "deploy/api/**"' "$WORKFLOW" \
   || fail "API manifest changes must trigger image validation"

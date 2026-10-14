@@ -145,6 +145,21 @@ jobs:
             exit 1
           fi
 
+      - name: Validate pushed tag name
+        # Belt and braces: the env:-bound WORKFLOW_REF below already prevents
+        # execution of tag-name metacharacters; this also keeps malformed tags
+        # from burning the keyless signing identity on a subject that
+        # scripts/verify-api-image-ref.bash (SIGNER_SUBJECT_PATTERN) would
+        # reject after signing. Mirrors the manual-tag gate above.
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        env:
+          PUSHED_REF: ${{ github.ref }}
+        run: |
+          if [[ ! "$PUSHED_REF" =~ ^refs/tags/v[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+            echo "::error::Pushed tag names must match ^v[A-Za-z0-9][A-Za-z0-9._-]*\$ (same alphabet as SIGNER_SUBJECT_PATTERN in scripts/verify-api-image-ref.bash)."
+            exit 1
+          fi
+
       - name: Log in to GHCR
         uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
         with:
@@ -200,9 +215,10 @@ jobs:
       - name: Render digest-pinned release artifact
         env:
           WORKFLOW_REF: ${{ github.workflow_ref }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           mkdir -p dist
-          image_ref="ghcr.io/enclava-labs/enclava-api@${{ steps.build.outputs.digest }}"
+          image_ref="ghcr.io/enclava-labs/enclava-api@${IMAGE_DIGEST}"
           signer_subject="https://github.com/$WORKFLOW_REF"
           scripts/render-api-release-manifest.sh "$image_ref" dist/enclava-api-deploy.yaml
           printf '%s\n' "$image_ref" > dist/enclava-api-image.txt
