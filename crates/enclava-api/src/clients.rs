@@ -50,6 +50,8 @@ pub enum ClientError {
     InvalidUrl(String),
     #[error("destination resolves to a blocked address: {0}")]
     BlockedAddress(String),
+    #[error("DNS lookup for destination failed: {0}")]
+    DnsLookupFailed(String),
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
 }
@@ -96,6 +98,15 @@ impl BlockedNetworks {
                     cidr.as_ref()
                 ),
             }
+        }
+    }
+
+    /// An empty blocklist — every destination allowed. For tests and for
+    /// explicitly unguarded internal paths only.
+    pub fn empty() -> Self {
+        Self {
+            v4: Vec::new(),
+            v6: Vec::new(),
         }
     }
 
@@ -330,9 +341,11 @@ pub async fn check_egress_destination(
     // A hostname: resolve it once here so a name pointing into private or
     // cluster space is refused before the unguarded transport dials it.
     // This mirrors the GuardedResolver check the guarded transports get.
+    // Resolution FAILURE is reported distinctly from a blocked answer so
+    // callers (and offline test environments) can tell the two apart.
     let addrs: Vec<SocketAddr> = tokio::net::lookup_host(format!("{host}:0"))
         .await
-        .map_err(|e| ClientError::BlockedAddress(format!("failed to resolve `{host}`: {e}")))?
+        .map_err(|e| ClientError::DnsLookupFailed(format!("failed to resolve `{host}`: {e}")))?
         .collect();
     for addr in &addrs {
         if blocked.contains(addr.ip()) {
@@ -414,6 +427,12 @@ impl RegistryClient {
 pub struct EgressGuard {
     pub blocked: Arc<BlockedNetworks>,
     pub allowlist: AllowList,
+    /// Loopback CONNECT proxy (see `egress_proxy`) that the sigstore and
+    /// oci-client transports are routed through, so the guarded resolution
+    /// is the one the connection actually uses and every redirect hop /
+    /// bearer-token realm is re-validated (DNS-rebinding and redirect
+    /// bypasses from the cap#241 review).
+    pub proxy: crate::egress_proxy::EgressProxy,
 }
 
 impl EgressGuard {
@@ -425,8 +444,10 @@ impl EgressGuard {
         if let Ok(svc) = std::env::var("CLUSTER_SERVICE_CIDR") {
             blocked.extend_from_cidrs(svc.split(','));
         }
+        let blocked = Arc::new(blocked);
         Self {
-            blocked: Arc::new(blocked),
+            proxy: crate::egress_proxy::EgressProxy::new(Arc::clone(&blocked)),
+            blocked,
             allowlist: AllowList::from_env_or_default(std::env::var("REGISTRY_ALLOWLIST").ok()),
         }
     }
@@ -516,8 +537,10 @@ mod tests {
     /// Test-local guard with default policy, independent of ambient env
     /// (REGISTRY_ALLOWLIST / CLUSTER_*_CIDR may be set by other tests).
     fn hermetic_egress_guard() -> EgressGuard {
+        let blocked = Arc::new(BlockedNetworks::defaults());
         EgressGuard {
-            blocked: Arc::new(BlockedNetworks::defaults()),
+            proxy: crate::egress_proxy::EgressProxy::new(Arc::clone(&blocked)),
+            blocked,
             allowlist: AllowList::from_env_or_default(None),
         }
     }
@@ -715,18 +738,17 @@ mod tests {
 
     #[tokio::test]
     async fn egress_guard_allows_default_allowlisted_registries() {
-        // Sanity: the default allowlist's own entries still pass the guard
-        // (they are names, so this also exercises the DNS path returning
-        // public addresses for ghcr.io when online; offline CI resolves to
-        // nothing and errors, which we tolerate for names).
+        // Sanity: the default allowlist's own entries still pass the guard.
+        // ghcr.io is a name, so the DNS path runs; offline CI resolves to
+        // nothing, which now surfaces as the distinct `DnsLookupFailed`
+        // variant (a resolution failure, not a block verdict) and is
+        // tolerated here (cap#241 review).
         let guard = hermetic_egress_guard();
         let parsed = reqwest::Url::parse("https://ghcr.io/v2/").unwrap();
         match guard.check_registry_url(&parsed).await {
             Ok(()) => {}
-            Err(ClientError::BlockedAddress(msg)) => {
-                panic!("ghcr.io must not be blocked: {msg}")
-            }
-            Err(_) => { /* DNS unavailable in offline test env: acceptable */ }
+            Err(ClientError::DnsLookupFailed(_)) => { /* offline test env: acceptable */ }
+            Err(other) => panic!("ghcr.io must not be blocked: {other:?}"),
         }
     }
 

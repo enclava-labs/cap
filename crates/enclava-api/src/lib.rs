@@ -7,6 +7,7 @@ pub mod deploy;
 pub mod deployment_jobs;
 pub mod dns;
 pub mod edge;
+pub mod egress_proxy;
 pub mod entitlements;
 pub mod env_gates;
 pub mod kbs;

@@ -297,6 +297,20 @@ pub async fn verify_image(
     if env_flag("COSIGN_ALLOW_HTTP_REGISTRY") {
         oci_client_config.protocol = ClientProtocol::Http;
     }
+    // Route the sigstore/oci transports through the loopback egress proxy
+    // (cap#241 review): those stacks build their own reqwest clients with
+    // their own resolvers and the default follow-redirect policy, so a
+    // pre-flight check alone leaves a DNS-rebinding window and unvalidated
+    // redirect/token-realm destinations. Through the proxy, every dialed
+    // destination — initial host, each redirect hop, each bearer realm —
+    // is resolved and blocklist-checked by the proxy itself, and the proxy
+    // dials the validated answers (no second resolution).
+    let proxy_url = egress
+        .proxy
+        .url()
+        .map_err(|e| CosignError::VerificationFailed(format!("egress proxy unavailable: {e}")))?;
+    oci_client_config.https_proxy = Some(proxy_url.clone());
+    oci_client_config.http_proxy = Some(proxy_url);
 
     let mut cosign_client = ClientBuilder::default()
         .with_oci_client_config(oci_client_config)
@@ -507,6 +521,15 @@ pub async fn fetch_portable_verification_material(
     if env_flag("COSIGN_ALLOW_HTTP_REGISTRY") {
         config.protocol = oci_client::client::ClientProtocol::Http;
     }
+    // Same proxy routing as `verify_image`: bind the guarded resolution to
+    // the actual connection and re-validate every redirect/token-realm
+    // destination the oci-client transport follows (cap#241 review).
+    let proxy_url = egress
+        .proxy
+        .url()
+        .map_err(|e| CosignError::VerificationFailed(format!("egress proxy unavailable: {e}")))?;
+    config.https_proxy = Some(proxy_url.clone());
+    config.http_proxy = Some(proxy_url);
     let client = Client::new(config);
     let source = oci_client::Reference::with_digest(
         registry.clone(),
@@ -1078,8 +1101,10 @@ mod tests {
     use crate::clients::EgressGuard;
 
     fn hermetic_egress_guard() -> EgressGuard {
+        let blocked = std::sync::Arc::new(crate::clients::BlockedNetworks::defaults());
         EgressGuard {
-            blocked: std::sync::Arc::new(crate::clients::BlockedNetworks::defaults()),
+            proxy: crate::egress_proxy::EgressProxy::new(std::sync::Arc::clone(&blocked)),
+            blocked,
             allowlist: crate::clients::AllowList::from_env_or_default(None),
         }
     }
