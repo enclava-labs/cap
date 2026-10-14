@@ -480,8 +480,8 @@ pub async fn soft_delete_tls_binding(
 /// measurements on a newer artifact do not prove the binding belongs to
 /// that artifact, so a fresh deployment must authorize through
 /// signed-policy candidates instead of readmitting the old binding.
-pub(crate) async fn load_legacy_tls_bindings(
-    db: &PgPool,
+pub(crate) async fn load_legacy_tls_bindings<'e, E: sqlx::PgExecutor<'e>>(
+    db: E,
 ) -> Result<Vec<KbsTlsBinding>, KbsPolicyError> {
     let bindings: Vec<KbsTlsBinding> = sqlx::query_as(
         "SELECT binding_key, repository, tag, namespace, service_account,
@@ -507,40 +507,41 @@ pub(crate) async fn load_legacy_tls_bindings(
     Ok(bindings)
 }
 
-/// Recheck signed authority on each CAS retry so a concurrent signed acceptance
-/// fences legacy writers.
-/// Re-render the legacy Rego ConfigMap from the current `kbs_tls_bindings`
-/// and `kbs_owner_bindings` (the unsigned/legacy policy authority).
-///
-/// Signed-policy checks re-run inside the CAS loop so a signed acceptance
-/// that commits mid-render fences this legacy writer before it can retry a
-/// resourceVersion conflict with stale Rego.
-/// Durable evidence that this install has rendered a signer-bearing legacy
-/// Rego policy at least once (migration 0069). A live `kbs_tls_bindings` row
-/// alone cannot prove publication was ever required -- the binding is only
-/// the render source -- so an unconfigured replica may only confirm a signer
-/// rotation while this marker is absent.
-pub(crate) async fn legacy_publication_obligation_recorded(
-    db: &PgPool,
+/// Lock the publication-obligation sentinel and read it in one step. Both
+/// the legacy publication critical section and the signer-rotation gates
+/// take this row FOR UPDATE, which serializes the refusal decision with an
+/// in-flight legacy publication: a rotation either commits before the
+/// publication reads its bindings (and is carried into them) or it waits
+/// for the publication to write its policy and then sees the recorded
+/// obligation and refuses. The migration keeps exactly one sentinel row; a
+/// missing row means that invariant is broken and fails closed.
+pub(crate) async fn lock_and_read_legacy_publication_obligation<'e, E: sqlx::PgExecutor<'e>>(
+    db: E,
 ) -> Result<bool, KbsPolicyError> {
-    let recorded: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM legacy_publication_obligation WHERE singleton)",
+    let recorded: Option<bool> = sqlx::query_scalar(
+        "SELECT recorded_at IS NOT NULL
+           FROM legacy_publication_obligation
+          WHERE singleton
+          FOR UPDATE",
     )
-    .fetch_one(db)
+    .fetch_optional(db)
     .await?;
-    Ok(recorded)
+    Ok(recorded.unwrap_or(true))
 }
 
-/// Record the legacy publication obligation. Written before any ConfigMap
-/// write so even a failed publication keeps the evidence; recorded once and
-/// never cleared, because soft-deleting a binding does not un-publish the
+/// Record the legacy publication obligation. This is its own committed
+/// write, taken while the sentinel lock is held but independent of the
+/// publication transaction: even a publication whose ConfigMap write is
+/// lost or whose deploy later fails must keep the evidence. Recorded once
+/// and never cleared -- soft-deleting a binding does not un-publish the
 /// policy that already carried it.
 pub(crate) async fn record_legacy_publication_obligation(
     db: &PgPool,
 ) -> Result<(), KbsPolicyError> {
     sqlx::query(
-        "INSERT INTO legacy_publication_obligation (singleton) VALUES (true)
-         ON CONFLICT (singleton) DO NOTHING",
+        "INSERT INTO legacy_publication_obligation (singleton, recorded_at) VALUES (true, now())
+         ON CONFLICT (singleton) DO UPDATE
+            SET recorded_at = COALESCE(legacy_publication_obligation.recorded_at, now())",
     )
     .execute(db)
     .await?;
@@ -581,8 +582,17 @@ async fn reconcile_legacy_rego_policy_with_client(
             return reconcile_pending_signed_policy_artifacts_with_client(db, config, None, client)
                 .await;
         }
-        // Read authority after the ConfigMap version, so a competing publication
-        // forces a CAS retry and a fresh authority snapshot.
+        // Publication critical section: lock the publication-obligation
+        // sentinel before reading authority so a signer rotation either
+        // commits before this render reads the bindings (and is carried
+        // into them) or waits for this publication to write its policy and
+        // then sees the recorded obligation and refuses. Read authority
+        // after the ConfigMap version, so a competing publication forces a
+        // CAS retry and a fresh authority snapshot. The sentinel lock is
+        // held across the ConfigMap write and released before the
+        // convergence wait below.
+        let mut publication_tx = db.begin().await?;
+        lock_and_read_legacy_publication_obligation(&mut *publication_tx).await?;
         let bindings: Vec<KbsOwnerBinding> = sqlx::query_as(
             "SELECT binding_key, repository, allowed_tags, namespace, service_account,
                 tenant_instance_identity_hash
@@ -590,17 +600,18 @@ async fn reconcile_legacy_rego_policy_with_client(
          WHERE deleted_at IS NULL
          ORDER BY binding_key",
         )
-        .fetch_all(db)
+        .fetch_all(&mut *publication_tx)
         .await?;
-        let tls_bindings = load_legacy_tls_bindings(db).await?;
-        if !tls_bindings.is_empty() {
-            // This render carries signer identities toward Trustee. Record
-            // the obligation before any ConfigMap write so even a failed
-            // publication keeps the evidence: an unconfigured replica must
-            // not confirm a signer rotation while a previously rendered
-            // legacy policy can still authorize the rotated-out signer.
-            // Recorded once and never cleared -- soft-deleting a binding
-            // does not un-publish the policy that already carried it.
+        let tls_bindings = load_legacy_tls_bindings(&mut *publication_tx).await?;
+        if tls_bindings.iter().any(|binding| {
+            binding.signer_identity_subject.is_some() && binding.signer_identity_issuer.is_some()
+        }) {
+            // This render carries signer identities toward Trustee: record
+            // the obligation as its own committed write (see the helper) so
+            // even a lost ConfigMap write or a later deploy failure keeps
+            // the evidence. Only a binding that pins a signer can keep the
+            // rotated-out signer authorized; null-identity renders never
+            // record it and never fence rotations.
             record_legacy_publication_obligation(db).await?;
         }
         let next_policy = replace_tls_resource_bindings_block(current_policy, &tls_bindings)?;
@@ -639,6 +650,10 @@ async fn reconcile_legacy_rego_policy_with_client(
                 Err(error) => return Err(error),
             }
         }
+        // Release the sentinel before the convergence wait: the policy
+        // content is written, and a rotation may now commit (it will see
+        // the recorded obligation) while the rollout converges.
+        publication_tx.commit().await?;
         let publication_token = configmap
             .metadata
             .annotations
@@ -5772,7 +5787,7 @@ resource_bindings := {
             crate::test_support::isolated_database_test_pool("cap187_legacy_obligation").await;
         let (_org_id, app_id) = insert_test_app(&pool, "running").await;
         assert!(
-            !legacy_publication_obligation_recorded(&pool)
+            !lock_and_read_legacy_publication_obligation(&pool)
                 .await
                 .expect("read publication obligation on a fresh install"),
             "a fresh install starts without any legacy publication obligation"
@@ -5795,10 +5810,53 @@ resource_bindings := {
             })
             .await;
         assert!(
-            legacy_publication_obligation_recorded(&pool)
+            lock_and_read_legacy_publication_obligation(&pool)
                 .await
                 .expect("read publication obligation after the legacy render"),
             "a legacy render carrying signer identities must record the publication obligation"
+        );
+    }
+
+    /// Finding-2 regression: the obligation is about policies that PIN a
+    /// signer. A legacy render whose bindings carry no signer identity
+    /// cannot authorize the rotated-out signer, so it must not record the
+    /// obligation and must not fence rotations on an unconfigured replica.
+    #[tokio::test]
+    async fn legacy_render_without_signer_identity_records_no_publication_obligation() {
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap187_null_identity_obligation")
+                .await;
+        let (_org_id, app_id) = insert_test_app(&pool, "running").await;
+        // A measured binding that pins no signer (the pre-signer-identity
+        // binding shape).
+        sqlx::query(
+            "INSERT INTO kbs_tls_bindings (
+                 app_id, binding_key, repository, tag, namespace, service_account,
+                 tenant_instance_identity_hash, image_digest, init_data_hash,
+                 signer_identity_subject, signer_identity_issuer
+             ) VALUES ($1, 'tls-null-identity', 'default', 'workload-secret-seed',
+                 'cap-null-identity', 'cap-null-identity-sa', $2, $3, $4, NULL, NULL)",
+        )
+        .bind(app_id)
+        .bind("22".repeat(32))
+        .bind("ghcr.io/enclava-labs/example@sha256:2222222222222222222222222222222222222222222222222222222222222222")
+        .bind(&[0x22u8; 32][..])
+        .execute(&pool)
+        .await
+        .expect("insert null-identity legacy tls binding");
+        let config = legacy_kbs_test_config();
+        let provider = std::sync::Arc::new(tokio::sync::Mutex::new(KbsPolicyProvider::new(true)));
+        let client = crate::test_support::kbs_policy_kube_client(provider.clone());
+        crate::kbs::TEST_KUBE_CLIENT
+            .scope(client, async {
+                reconcile_policy(&pool, Some(&config)).await.unwrap();
+            })
+            .await;
+        assert!(
+            !lock_and_read_legacy_publication_obligation(&pool)
+                .await
+                .expect("read publication obligation after the null-identity render"),
+            "a legacy render that pins no signer must not record the publication obligation"
         );
     }
 
