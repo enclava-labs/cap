@@ -30,13 +30,16 @@ use crate::errors::{InitError, Result};
 use crate::secrets::DerivedSeed;
 
 const LUKS2_SECTOR_SIZE: u32 = 512;
-/// Minimum device size that can ever hold a LUKS2 header + keyslot area (the
-/// default LUKS2 header alone occupies the first 16 MiB). Devices below this
-/// bound are refused up front — they cannot become formattable volumes, so
-/// they must never read as blank. The same bound is enforced at manifest
-/// validation (`enclava-engine` `validate.rs`) so users get a clear error at
-/// deploy time instead of this runtime refusal at first boot.
-const MIN_VOLUME_BYTES: u64 = 16 * 1024 * 1024;
+/// Minimum device size for a fresh volume. The default LUKS2 header occupies
+/// the first 16 MiB, and `luksFormat` succeeds even when the device ends at
+/// (or inside) the header — but activation then fails with no data area left,
+/// and the result is bricked: every later boot sees a LUKS2 header and takes
+/// the OpenExisting path that can never succeed. The floor keeps 16 MiB of
+/// payload after the 16 MiB header, comfortably above the mkfs.ext4 minimum.
+/// The same bound is enforced at manifest validation (`enclava-engine`
+/// `validate.rs`) so users get a clear error at deploy time instead of this
+/// runtime refusal at first boot. Keep the two bounds in lockstep.
+const MIN_VOLUME_BYTES: u64 = 32 * 1024 * 1024;
 static KEY_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Path to the activated mapper device.
@@ -460,10 +463,11 @@ fn device_appears_blank(device: &Path) -> Result<bool> {
         .seek(SeekFrom::End(0))
         .map_err(|e| InitError::Luks(format!("seek {} for blank probe: {e}", device.display())))?;
     if len < MIN_VOLUME_BYTES {
-        // Fail closed with the rationale named: the bound is the LUKS2
-        // header + keyslot area, not an arbitrary heuristic.
+        // Fail closed with the rationale named: below this floor the device
+        // formats but never activates (LUKS2 header eats the whole device),
+        // which would brick the volume rather than merely refuse it.
         return Err(InitError::Luks(format!(
-            "device {} is only {len} bytes — below the {} MiB minimum that can hold a LUKS2 header + keyslot area; refusing to treat it as blank",
+            "device {} is only {len} bytes — below the {} MiB minimum (16 MiB LUKS2 header + 16 MiB payload floor); refusing to treat it as blank",
             device.display(),
             MIN_VOLUME_BYTES / (1024 * 1024),
         )));
@@ -655,7 +659,9 @@ mod unit_tests {
         let dir = tempfile::tempdir().expect("temporary directory");
         let device = dir.path().join("device");
 
-        for size in [0u64, 1024, MIN_VOLUME_BYTES - 1] {
+        // 16 MiB (the bricking size from self-check) and anything below the
+        // 32 MiB floor must error rather than read as blank.
+        for size in [0u64, 1024, 16 * 1024 * 1024, MIN_VOLUME_BYTES - 1] {
             std::fs::File::create(&device)
                 .expect("create device")
                 .set_len(size)

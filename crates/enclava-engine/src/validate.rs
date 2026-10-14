@@ -241,12 +241,15 @@ fn validate_storage_size(field: &'static str, value: &str) -> Result<(), String>
 }
 
 /// Persistent volumes (the LUKS-formatted state and tls-state devices) also
-/// need a lower bound: the default LUKS2 header + keyslot area occupies the
-/// first 16 MiB, so a smaller device can never hold a formattable volume and
-/// would fail first boot in enclava-init (`MIN_VOLUME_BYTES` there — keep the
-/// two bounds in lockstep). Rejecting here turns an opaque runtime refusal
-/// into a clear error at manifest-validation time.
-const MIN_VOLUME_SIZE_MIB: u128 = 16;
+/// need a lower bound. The default LUKS2 header occupies the first 16 MiB,
+/// and `luksFormat` succeeds even on devices that end at (or inside) the
+/// header — but activation then has no data area left and the volume is
+/// bricked (every later boot sees a LUKS2 header and can never open it). The
+/// floor keeps 16 MiB of payload after the header, comfortably above the
+/// mkfs.ext4 minimum. Enforced in lockstep with enclava-init
+/// `MIN_VOLUME_BYTES` — keep the two bounds identical. Rejecting here turns
+/// an opaque runtime brick into a clear error at manifest-validation time.
+const MIN_VOLUME_SIZE_MIB: u128 = 32;
 
 fn validate_persistent_volume_size(field: &'static str, value: &str) -> Result<(), String> {
     let trimmed = value.trim();
@@ -261,7 +264,7 @@ fn validate_persistent_volume_size(field: &'static str, value: &str) -> Result<(
         .map_err(|_| format!("{field} must be a positive binary quantity"))?;
     if numerator < MIN_VOLUME_SIZE_MIB * 10u128.pow(scale) {
         return Err(format!(
-            "{field} must be at least {MIN_VOLUME_SIZE_MIB}Mi — smaller volumes cannot hold the LUKS2 header + keyslot area and would fail first boot"
+            "{field} must be at least {MIN_VOLUME_SIZE_MIB}Mi — a fresh LUKS2 volume needs the 16 MiB header plus a viable ext4 payload; smaller volumes format but never activate"
         ));
     }
     Ok(())

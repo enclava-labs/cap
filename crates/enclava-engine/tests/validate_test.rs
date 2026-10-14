@@ -104,3 +104,34 @@ fn rejects_caddy_without_digest() {
     let err = validate_app(&app).unwrap_err();
     assert!(err.to_string().contains("caddy"));
 }
+
+#[test]
+fn rejects_persistent_volume_sizes_below_luks2_floor() {
+    // 16 MiB is the bricking size: luksFormat succeeds but activation has no
+    // data area left, so anything below the 32 MiB floor (header + payload)
+    // must be refused at manifest validation. See MIN_VOLUME_SIZE_MIB.
+    for size in ["0.5Mi", "1Mi", "16Mi", "31Mi", "31.999Mi"] {
+        let mut app = sample_app();
+        app.storage.app_data.size = size.to_string();
+        let err = validate_app(&app).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("app_data"), "{size}: {message}");
+        assert!(message.contains("at least 32Mi"), "{size}: {message}");
+    }
+
+    let mut app = sample_app();
+    app.storage.tls_data.size = "16Mi".to_string();
+    let err = validate_app(&app).unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("tls_data"), "{message}");
+    assert!(message.contains("at least 32Mi"), "{message}");
+}
+
+#[test]
+fn accepts_persistent_volume_sizes_at_luks2_floor() {
+    for size in ["32Mi", "33Mi", "1Gi"] {
+        let mut app = sample_app();
+        app.storage.app_data.size = size.to_string();
+        validate_app(&app).unwrap_or_else(|e| panic!("{size} should be accepted: {e}"));
+    }
+}
