@@ -1586,7 +1586,6 @@ pub async fn update_unlock_mode(
     // that produced `observed_resources`, the commit's authority check
     // forces a retry that recomputes this.
     let fresh_volume_claims = crate::routes::deployments::fresh_volume_claims(
-        &state.db,
         &app,
         &observed_resources,
     )

@@ -151,22 +151,23 @@ pub(crate) async fn enforce_authoritative_entitlement(
 /// claim existence or render markers. `manifest_hash`/`observing_since`
 /// only ever proved the StatefulSet was WRITTEN, and a surviving PVC alone
 /// only ever proved the object exists: a bound-but-unformatted claim must
-/// still be refused below the floor. A claim is initialized only when a
-/// recorded automatic-mode HEALTHY deployment completed in a LATER second
-/// than the claim's creation, or the live Ready ordinal-0 pod mounts it.
-/// Password timeout outcomes and same-second ordering cannot prove storage
-/// initialization; missing historical job evidence also fails closed.
+/// still be refused below the floor. Live Kubernetes state is the only
+/// admissible evidence: the exact ordinal-0 pod non-terminating, Ready,
+/// mounting the exact claim, and created in a later whole second than it.
+/// Deployment history is deliberately NOT consulted — independent database
+/// and Kubernetes clocks cannot order a row against a claim, and a
+/// password-timeout redeploy can publish healthy without opening storage.
+/// Conservative availability cost: an initialized legacy sub-floor claim
+/// with no live proof is refused until the workload regains live readiness.
 ///
 /// Sizes at/above the floor and grammar-invalid values (rejected by
 /// `validate_resource_limits` upstream) short-circuit without any lookup —
-/// no Kubernetes I/O and no database read beyond the caller's own work.
-/// The workload name is `app.name` — the same field
-/// `build_confidential_app_from_rows` renders into the StatefulSet — and
-/// the namespace is `app.namespace`. Fails closed: an unproven legacy claim
-/// keeps the floor (a refusal, never a destructive recovery), and lookup
-/// errors abort the request rather than granting the waiver.
+/// no Kubernetes I/O at all. The workload name is `app.name` — the same
+/// field `build_confidential_app_from_rows` renders into the StatefulSet —
+/// and the namespace is `app.namespace`. Fails closed: an unproven legacy
+/// claim keeps the floor (a refusal, never a destructive recovery), and
+/// lookup errors abort the request rather than granting the waiver.
 pub(crate) async fn fresh_volume_claims(
-    pool: &sqlx::PgPool,
     app: &App,
     resources: &AppResources,
 ) -> Result<enclava_engine::apply::orchestrator::FreshVolumeClaims, crate::deploy::DeployError> {
@@ -177,14 +178,12 @@ pub(crate) async fn fresh_volume_claims(
     if !claims_to_check.app_data && !claims_to_check.tls_data {
         return Ok(enclava_engine::apply::orchestrator::FreshVolumeClaims::NONE);
     }
-    let initialized_at_millis = crate::deploy::last_initialized_at_millis(pool, app.id).await?;
     let engine = enclava_engine::apply::engine::ApplyEngine::try_default().await?;
     enclava_engine::apply::orchestrator::inspect_fresh_volume_claims(
         &engine,
         &app.namespace,
         &app.name,
         claims_to_check,
-        initialized_at_millis,
     )
     .await
     .map_err(crate::deploy::DeployError::Apply)
@@ -1207,16 +1206,16 @@ async fn deploy_app_candidate(
 
     // Fresh-volume floor: which sub-floor claims lack positive
     // initialization evidence and would provision FRESH. Derived from live
-    // cluster + deployment-history evidence BEFORE opening the acceptance
-    // transaction (no kube I/O under the authority lanes, no I/O at all for
-    // at/above-floor sizes). App INSERT always validates fresh without a
-    // lookup. A concurrent authority change invalidates this estimate, but
-    // the candidate tx's lane + authority checks catch that — the apply
-    // worker's own revalidation is the backstop either way.
+    // cluster evidence BEFORE opening the acceptance transaction (no kube
+    // I/O under the authority lanes, no I/O at all for at/above-floor
+    // sizes). App INSERT always validates fresh without a lookup. A
+    // concurrent authority change invalidates this estimate, but the
+    // candidate tx's lane + authority checks catch that — the apply
+    // worker's under-fence reinspection is the backstop either way.
     let fresh_volume_claims = if app_mutation == AppMutation::Insert {
         enclava_engine::apply::orchestrator::FreshVolumeClaims::ALL
     } else {
-        fresh_volume_claims(&state.db, &app, &candidate_resources)
+        fresh_volume_claims(&app, &candidate_resources)
             .await
             .map_err(|_| {
                 json_error(

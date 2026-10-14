@@ -148,18 +148,13 @@ pub async fn apply_and_watch(
     // verdict gates the fresh-format floor and sizes the rollout budget, so
     // a redeploy of initialized volumes keeps the base deadline while claims
     // lacking positive initialization evidence add the first-boot allowance.
-    // Direct engine calls carry no deployment history (None): a surviving
-    // claim counts as initialized only while a later-created Ready pod
-    // mounts it — pod-loss reapply of an unrecorded legacy volume fails
-    // closed (refusal or base budget), never a destructive recovery.
-    let fresh_volume_claims = inspect_fresh_volume_claims(
-        engine,
-        &app.namespace,
-        &app.name,
-        FreshVolumeClaims::ALL,
-        None,
-    )
-    .await?;
+    // Live Kubernetes state is the only admissible proof — a surviving claim
+    // counts as initialized only while a later-created Ready pod mounts it;
+    // everything else fails closed (refusal or base budget), never a
+    // destructive recovery.
+    let fresh_volume_claims =
+        inspect_fresh_volume_claims(engine, &app.namespace, &app.name, FreshVolumeClaims::ALL)
+            .await?;
     enforce_floor_on_claims(app, fresh_volume_claims)?;
 
     // Generate manifests
@@ -280,26 +275,23 @@ impl FreshVolumeClaims {
 ///
 /// Positive evidence requires the EXACT surviving ordinal-0 claim
 /// `<vct>-<workload>-0` (`state`/`tls-state` VCTs, replicas:1 workload) with
-/// a populated creation timestamp, AND one of:
+/// a populated creation timestamp, AND the live ordinal-0 pod
+/// `<workload>-0` non-terminating and Ready, mounting THIS exact claim,
+/// created in a LATER whole second than the claim — the workload is
+/// currently running on the initialized device.
 ///
-/// - `initialized_at_millis` in a LATER whole second than the claim's
-///   creation: a recorded successful healthy deployment proves this volume
-///   completed first-boot initialization and survives pod loss, crashes,
-///   and replacements.
-/// - the live ordinal-0 pod `<workload>-0` is non-terminating and Ready,
-///   mounts THIS exact claim, and was created in a LATER whole second than
-///   the claim — the workload is currently running on the initialized
-///   device.
-///
-/// Strict precedence is deliberate and fails closed: Kubernetes
-/// `creationTimestamp` serializes only whole seconds while
-/// `initialized_at_millis` carries subsecond precision, so a same-second
-/// pair cannot prove ordering — a claim recreated within the healthy
-/// deployment's second could otherwise borrow the old volume's proof, and
-/// a Ready pod created in the same second as a replacement claim could be
-/// running on the deleted volume's handle. The tradeoff is availability,
-/// never format authorization: a legitimately same-second initialization
-/// reads as unproven until a later healthy deployment records proof.
+/// Live Kubernetes state is the ONLY admissible evidence: database
+/// deployment history is not consulted because independent DB and
+/// Kubernetes clocks cannot order a row against a claim, and a healthy
+/// status can be published by a password-timeout redeploy without opening
+/// storage. Strict precedence is deliberate and fails closed: Kubernetes
+/// `creationTimestamp` serializes only whole seconds, so a same-second
+/// pod/claim pair cannot prove ordering — a Ready pod created in the same
+/// second as a replacement claim could be running on the deleted volume's
+/// handle. The tradeoff is availability, never format authorization: a
+/// legitimately initialized legacy claim with no live pod proof reads as
+/// unproven — a sub-floor one must regain live readiness before its size is
+/// re-admitted (or be resized above the floor).
 ///
 /// PVC existence, `Bound` phase, watching/applying deployment status, and
 /// manifest-hash markers are NOT evidence: a bound-but-unformatted claim
@@ -316,7 +308,6 @@ pub async fn inspect_fresh_volume_claims(
     namespace: &str,
     workload: &str,
     claims_to_check: FreshVolumeClaims,
-    initialized_at_millis: Option<i64>,
 ) -> Result<FreshVolumeClaims, ApplyError> {
     use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod};
     use kube::api::Api;
@@ -328,8 +319,7 @@ pub async fn inspect_fresh_volume_claims(
     let pvc_api: Api<PersistentVolumeClaim> = Api::namespaced(engine.client().clone(), namespace);
     let pod_api: Api<Pod> = Api::namespaced(engine.client().clone(), namespace);
     let pod_name = crate::manifest::volumes::provisioned_pod_name(workload);
-    // The pod fetch is lazy and shared: claims proven by deployment history
-    // need no second lookup, and both claims reuse the same pod.
+    // The pod fetch is lazy and shared: both claims reuse the same pod.
     let mut live_pod: Option<Option<Pod>> = None;
 
     async fn claim_is_fresh(
@@ -338,7 +328,6 @@ pub async fn inspect_fresh_volume_claims(
         pod_name: &str,
         live_pod: &mut Option<Option<Pod>>,
         claim_name: &str,
-        initialized_at_millis: Option<i64>,
     ) -> Result<bool, ApplyError> {
         let Some(pvc) = pvc_api.get_opt(claim_name).await? else {
             return Ok(true);
@@ -350,15 +339,6 @@ pub async fn inspect_fresh_volume_claims(
             return Ok(true);
         };
         let pvc_millis = created.0.as_millisecond();
-        // The healthy timestamp must land in a LATER whole second than the
-        // claim's creation: PVC timestamps carry only second precision, so
-        // a same-bucket pair cannot prove the deployment ran on THIS claim
-        // — a same-second recreation must not borrow the old proof.
-        if initialized_at_millis
-            .is_some_and(|healthy| pvc_millis.div_euclid(1000) < healthy.div_euclid(1000))
-        {
-            return Ok(false);
-        }
         if live_pod.is_none() {
             *live_pod = Some(pod_api.get_opt(pod_name).await?);
         }
@@ -377,7 +357,6 @@ pub async fn inspect_fresh_volume_claims(
             &pod_name,
             &mut live_pod,
             &crate::manifest::volumes::provisioned_claim_name("state", workload),
-            initialized_at_millis,
         )
         .await?;
     }
@@ -388,7 +367,6 @@ pub async fn inspect_fresh_volume_claims(
             &pod_name,
             &mut live_pod,
             &crate::manifest::volumes::provisioned_claim_name("tls-state", workload),
-            initialized_at_millis,
         )
         .await?;
     }

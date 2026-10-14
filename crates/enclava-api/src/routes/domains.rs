@@ -6,11 +6,12 @@
 //!    zone, mint a one-shot challenge token, and return the TXT record the
 //!    caller must publish on `_enclava-challenge.<domain>`.
 //! 2. `POST /apps/{name}/domains/{domain}/verify` — caller asks us to
-//!    verify the proof. We resolve the TXT record (via `hickory-resolver`
-//!    so the operator-side cache cannot lie to us), match the live TXT
 //!    against the stored token in constant time, and only on success track the
 //!    user-owned hostname, regenerate tenant ingress, publish HAProxy routing,
-//!    and update the app row.
+//!    and update the app row. A live StatefulSet may only be restarted after
+//!    live cluster state proves both volume claims initialized (exact Ready
+//!    ordinal-0 pod); terminal deployment rows are not proof. Apps with no
+//!    StatefulSet keep the DNS-only predeploy path.
 //! 3. `DELETE /apps/{name}/domains/{domain}` — remove a custom domain.
 
 use axum::{
@@ -254,8 +255,9 @@ pub struct VerifyResponse {
 /// partial volume. Evaluated inside the caller's deployment-lane
 /// transaction so a concurrently committing 'watching' transition cannot
 /// slip past it. 'pending' deployments have produced no provider objects
-/// yet and keep the predeploy verify path; terminal rows are free to
-/// proceed.
+/// yet and keep the predeploy verify path. Terminal rows pass THIS guard
+/// only: `ingress_restart_verdict` still requires live proof of completed
+/// initialization before any domain effect or pod restart.
 async fn ensure_no_apply_in_progress(
     app_lane: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     app_id: Uuid,
@@ -392,6 +394,11 @@ pub async fn verify_challenge(
         .acquire_owned()
         .await
         .map_err(|_| internal_error())?;
+    // The restart-admission probe below needs a cluster client inside the
+    // deployment-lane transaction; build it before claiming the lease.
+    let engine = enclava_engine::apply::engine::ApplyEngine::try_default()
+        .await
+        .map_err(|_| internal_error())?;
     let previous_custom = app.custom_domain.clone();
     let expected_namespace = app.namespace.clone();
     let mut resources = vec![
@@ -484,12 +491,38 @@ pub async fn verify_challenge(
         return Err(conflict);
     }
 
-    // Persist the verification timestamp inside the apply transaction, after
-    // the lease, the CAS guard, and the in-progress-apply conflict. A Busy
-    // lease, an authority mismatch, or a live creating workload returns
-    // above, so a proof can never be persisted without its apply:
-    // `verified_at` and the `apps.custom_domain` write commit or roll back
-    // together in `app_lane`.
+    // A terminal DB outcome does not stop a formatter. Require live completion
+    // before metadata/DNS writes; no StatefulSet preserves DNS-only predeploy.
+    let refuse = match crate::deploy::ingress_restart_verdict(&engine, &app.namespace, &app.name)
+        .await
+    {
+        Ok(crate::deploy::IngressRestartVerdict::NotDeployed)
+        | Ok(crate::deploy::IngressRestartVerdict::Ready) => None,
+        Ok(crate::deploy::IngressRestartVerdict::Unproven) => Some((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "volume initialization has not proven complete; recover the deployment before changing domains"
+            })),
+        )),
+        Err(error) => {
+            tracing::error!(
+                app_id = %app.id,
+                %error,
+                "domain restart admission probe failed"
+            );
+            Some(internal_error())
+        }
+    };
+    if let Some(conflict) = refuse {
+        mutation
+            .finish_in_tx(&mut app_lane)
+            .await
+            .map_err(|_| internal_error())?;
+        app_lane.commit().await.map_err(|_| internal_error())?;
+        return Err(conflict);
+    }
+
+    // Commit proof and domain assignment together, only after restart admission.
     if needs_persist {
         sqlx::query("UPDATE custom_domain_challenges SET verified_at = $1 WHERE id = $2")
             .bind(verified_at)

@@ -812,29 +812,6 @@ pub(crate) async fn latest_deployment_id_for_app(
     .await?;
     Ok(deployment_id.unwrap_or_else(Uuid::nil))
 }
-/// Latest completed automatic-mode deployment that observed Running.
-/// Password redeploy timeouts can also publish `healthy`, so only the
-/// deployment's immutable job payload can distinguish usable history.
-/// Missing history fails closed; a live Ready pod can still prove the claim.
-/// Floor seconds before converting to milliseconds: bigint casts round and
-/// could otherwise turn same-second claim replacement into older evidence.
-pub(crate) async fn last_initialized_at_millis(
-    pool: &PgPool,
-    app_id: Uuid,
-) -> Result<Option<i64>, sqlx::Error> {
-    sqlx::query_scalar::<_, Option<i64>>(
-        "SELECT (FLOOR(EXTRACT(EPOCH FROM max(deployment.completed_at))) * 1000)::bigint
-           FROM deployments AS deployment
-           JOIN deployment_apply_jobs AS job ON job.deployment_id = deployment.id
-          WHERE deployment.app_id = $1
-            AND deployment.status = 'healthy'::deploy_status_enum
-            AND deployment.completed_at IS NOT NULL
-            AND job.payload #>> '{app,unlock_mode}' = 'auto'",
-    )
-    .bind(app_id)
-    .fetch_one(pool)
-    .await
-}
 
 pub(crate) const DEPLOYMENT_SUPERSEDED_ERROR: &str = "deployment_superseded";
 
@@ -1980,6 +1957,239 @@ mod tests {
         assert!(!outcome.terminal);
         assert_eq!(outcome.error_code, None);
     }
+
+    /// Kubernetes API double for `ingress_restart_verdict`: exact-path GET
+    /// responses, 404 `Status` for anything absent — the same shape the real
+    /// API server returns to `get`/`get_opt`.
+    struct GateCluster {
+        responses: std::collections::HashMap<String, (u16, serde_json::Value)>,
+    }
+
+    impl GateCluster {
+        fn empty() -> Self {
+            Self {
+                responses: std::collections::HashMap::new(),
+            }
+        }
+
+        /// A live StatefulSet plus both claims created at a fixed timestamp.
+        fn deployed(namespace: &str, workload: &str) -> Self {
+            let mut cluster = Self::empty();
+            cluster.put(
+                format!("/apis/apps/v1/namespaces/{namespace}/statefulsets/{workload}"),
+                200,
+                serde_json::json!({
+                    "apiVersion": "apps/v1",
+                    "kind": "StatefulSet",
+                    "metadata": {"name": workload, "namespace": namespace},
+                }),
+            );
+            cluster.with_claims(namespace, workload, &["state", "tls-state"]);
+            cluster
+        }
+
+        fn with_claims(&mut self, namespace: &str, workload: &str, vcts: &[&str]) {
+            for vct in vcts {
+                let claim_name = format!("{vct}-{workload}-0");
+                self.put(
+                    format!("/api/v1/namespaces/{namespace}/persistentvolumeclaims/{claim_name}"),
+                    200,
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "PersistentVolumeClaim",
+                        "metadata": {
+                            "name": claim_name,
+                            "namespace": namespace,
+                            "creationTimestamp": "2025-01-01T00:00:00Z",
+                        },
+                    }),
+                );
+            }
+        }
+
+        /// Ordinal-0 pod created AFTER both claims (strict whole-second
+        /// ordering satisfied), mounting both claims, with configurable
+        /// readiness — a still-formatting initializer reports `ready=false`.
+        fn with_pod(&mut self, namespace: &str, workload: &str, ready: bool) {
+            let pod_name = format!("{workload}-0");
+            let state_claim = format!("state-{workload}-0");
+            let tls_claim = format!("tls-state-{workload}-0");
+            let ready_status = if ready { "True" } else { "False" };
+            self.put(
+                format!("/api/v1/namespaces/{namespace}/pods/{pod_name}"),
+                200,
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {
+                        "name": pod_name,
+                        "namespace": namespace,
+                        "creationTimestamp": "2025-01-01T00:01:00Z",
+                    },
+                    "spec": {
+                        "containers": [],
+                        "volumes": [
+                            {"name": "state",
+                             "persistentVolumeClaim": {"claimName": state_claim}},
+                            {"name": "tls-state",
+                             "persistentVolumeClaim": {"claimName": tls_claim}},
+                        ],
+                    },
+                    "status": {
+                        "conditions": [{
+                            "type": "Ready",
+                            "status": ready_status,
+                        }],
+                    },
+                }),
+            );
+        }
+
+        fn put(&mut self, path: String, status: u16, body: serde_json::Value) {
+            self.responses.insert(path, (status, body));
+        }
+
+        fn client(self) -> kube::Client {
+            use axum::http::{Request, Response};
+            use http_body_util::BodyExt;
+            use kube::client::Body;
+            use tower::service_fn;
+
+            kube::Client::new(
+                service_fn(move |request: Request<Body>| {
+                    let responses = self.responses.clone();
+                    async move {
+                        let path = request.uri().path().to_string();
+                        let _ = request.into_body().collect().await;
+                        let (status, body) = responses.get(&path).cloned().unwrap_or_else(|| {
+                            (
+                                404,
+                                serde_json::json!({
+                                    "apiVersion": "v1",
+                                    "kind": "Status",
+                                    "status": "Failure",
+                                    "reason": "NotFound",
+                                    "code": 404,
+                                    "message": format!("{path} not found"),
+                                }),
+                            )
+                        });
+                        Ok::<_, std::io::Error>(
+                            Response::builder()
+                                .status(status)
+                                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                                .unwrap(),
+                        )
+                    }
+                }),
+                "default",
+            )
+        }
+    }
+
+    fn gate_engine(cluster: GateCluster) -> ApplyEngine {
+        ApplyEngine::new(
+            cluster.client(),
+            enclava_engine::apply::types::ApplyConfig::default(),
+        )
+    }
+
+    #[tokio::test]
+    async fn ingress_restart_not_deployed_without_statefulset() {
+        // No StatefulSet: nothing to restart, so the predeploy verify keeps
+        // its DNS-only path. The probe must not provision or wait.
+        let engine = gate_engine(GateCluster::empty());
+        let verdict = ingress_restart_verdict(&engine, "cap-app", "app")
+            .await
+            .expect("404 StatefulSet lookup is a verdict, not an error");
+        assert_eq!(verdict, IngressRestartVerdict::NotDeployed);
+    }
+
+    #[tokio::test]
+    async fn ingress_restart_ready_when_live_pod_proves_both_claims() {
+        // Exact ordinal-0 Ready pod, created after both claims, mounting both:
+        // the restart only re-opens initialized volumes under the base budget.
+        let mut cluster = GateCluster::deployed("cap-app", "app");
+        cluster.with_pod("cap-app", "app", true);
+        let engine = gate_engine(cluster);
+        let verdict = ingress_restart_verdict(&engine, "cap-app", "app")
+            .await
+            .expect("live cluster proof must resolve");
+        assert_eq!(verdict, IngressRestartVerdict::Ready);
+    }
+
+    #[tokio::test]
+    async fn ingress_restart_unproven_when_claim_missing() {
+        // The tls-state claim is gone: a restart lands the replacement pod on
+        // a never-formatted device under the base deadline — refuse, never
+        // wait longer under the shared fences.
+        let mut cluster = GateCluster::deployed("cap-app", "app");
+        cluster.with_pod("cap-app", "app", true);
+        cluster
+            .responses
+            .remove("/api/v1/namespaces/cap-app/persistentvolumeclaims/tls-state-app-0");
+        let engine = gate_engine(cluster);
+        let verdict = ingress_restart_verdict(&engine, "cap-app", "app")
+            .await
+            .expect("live cluster proof must resolve");
+        assert_eq!(verdict, IngressRestartVerdict::Unproven);
+    }
+
+    #[tokio::test]
+    async fn ingress_restart_unproven_while_initializer_not_ready() {
+        // Live pod mounting both claims but not yet Ready: enclava-init may
+        // still be scanning/formatting — a restart now could strand a
+        // partially formatted volume.
+        let mut cluster = GateCluster::deployed("cap-app", "app");
+        cluster.with_pod("cap-app", "app", false);
+        let engine = gate_engine(cluster);
+        let verdict = ingress_restart_verdict(&engine, "cap-app", "app")
+            .await
+            .expect("live cluster proof must resolve");
+        assert_eq!(verdict, IngressRestartVerdict::Unproven);
+    }
+
+    #[tokio::test]
+    async fn ingress_restart_unproven_without_live_pod() {
+        // Claims exist but the ordinal-0 pod is absent (evicted/scaled): no
+        // live proof of completed initialization, fail closed.
+        let cluster = GateCluster::deployed("cap-app", "app");
+        let engine = gate_engine(cluster);
+        let verdict = ingress_restart_verdict(&engine, "cap-app", "app")
+            .await
+            .expect("live cluster proof must resolve");
+        assert_eq!(verdict, IngressRestartVerdict::Unproven);
+    }
+
+    #[tokio::test]
+    async fn terminal_failed_deployment_cannot_admit_restart_of_live_unready_pod() {
+        // A 'failed' deployment row is terminal — the DB guard passes it —
+        // but the pod it left behind is still mid first-boot. The verdict
+        // consults live cluster state only, so it must refuse regardless of
+        // the recorded status.
+        let pool = crate::test_support::database_test_pool().await;
+        let (app, deployment_id, _, _) =
+            crate::deployment_jobs::tests::insert_job_fixture(&pool).await;
+        sqlx::query("UPDATE deployments SET status = 'failed'::deploy_status_enum WHERE id = $1")
+            .bind(deployment_id)
+            .execute(&pool)
+            .await
+            .expect("record terminal deployment status");
+
+        let mut cluster = GateCluster::deployed(&app.namespace, &app.name);
+        cluster.with_pod(&app.namespace, &app.name, false);
+        let engine = gate_engine(cluster);
+        let verdict = ingress_restart_verdict(&engine, &app.namespace, &app.name)
+            .await
+            .expect("live cluster proof must resolve");
+        assert_eq!(verdict, IngressRestartVerdict::Unproven);
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("clean up fixture");
+    }
 }
 
 pub async fn set_deployment_status(
@@ -2026,6 +2236,54 @@ pub async fn set_app_status(pool: &PgPool, app_id: Uuid, status: &str) -> Result
     Ok(())
 }
 
+/// Whether a domain-triggered tenant-ingress restart may proceed.
+///
+/// `NotDeployed`: the workload StatefulSet does not exist yet, so there is
+/// nothing to restart — the caller keeps the DNS-only predeploy path.
+///
+/// `Ready`: a live StatefulSet exists and both persistent claims are proven
+/// initialized by the exact live Ready ordinal-0 pod, so the restart only
+/// re-opens finished volumes under the base rollout deadline.
+///
+/// `Unproven`: a live StatefulSet exists but at least one claim is missing,
+/// terminating, or not proven initialized — restarting could kill a still
+/// formatting first-boot pod or strand a fresh claim under the base wait,
+/// so the caller must conflict before any domain effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngressRestartVerdict {
+    NotDeployed,
+    Ready,
+    Unproven,
+}
+
+/// Probe live Kubernetes state before a domain mutation may restart the
+/// workload pod. Deployment-row status is NOT consulted: 'failed'/'healthy'
+/// rows cannot prove a first-boot formatter is finished, so only the shared
+/// live-proof inspector admits the restart. Lookup errors propagate (fail
+/// closed) and never admit.
+pub async fn ingress_restart_verdict(
+    engine: &ApplyEngine,
+    namespace: &str,
+    workload: &str,
+) -> Result<IngressRestartVerdict, DeployError> {
+    if !statefulset_exists(engine, namespace, workload).await? {
+        return Ok(IngressRestartVerdict::NotDeployed);
+    }
+    let fresh = enclava_engine::apply::orchestrator::inspect_fresh_volume_claims(
+        engine,
+        namespace,
+        workload,
+        enclava_engine::apply::orchestrator::FreshVolumeClaims::ALL,
+    )
+    .await
+    .map_err(DeployError::Apply)?;
+    if fresh.app_data || fresh.tls_data {
+        Ok(IngressRestartVerdict::Unproven)
+    } else {
+        Ok(IngressRestartVerdict::Ready)
+    }
+}
+
 /// Re-render and SSA-apply only the tenant-ingress ConfigMap for an app.
 ///
 /// Used when domain-only state changes (e.g. a custom-domain verification)
@@ -2033,6 +2291,11 @@ pub async fn set_app_status(pool: &PgPool, app_id: Uuid, status: &str) -> Result
 /// inside the pod runs `caddy run` with no live config-watch sidecar, so this
 /// function applies the new Caddyfile, triggers a StatefulSet rollout restart,
 /// and waits for the replacement pod to become ready before returning.
+///
+/// Callers MUST obtain `IngressRestartVerdict::Ready` (or `NotDeployed` for
+/// the DNS-only path) from [`ingress_restart_verdict`] before invoking this:
+/// it does not re-check initialization, and the rollout wait below assumes
+/// the restart only re-opens already-initialized volumes.
 ///
 /// Returns `DeployError::NotDeployed` when the app has no live StatefulSet yet.
 pub async fn reapply_tenant_ingress(
@@ -2102,21 +2365,33 @@ pub async fn reapply_tenant_ingress(
     Ok(())
 }
 
-async fn ensure_statefulset_exists(
+async fn statefulset_exists(
     engine: &ApplyEngine,
     namespace: &str,
     name: &str,
-) -> Result<(), DeployError> {
+) -> Result<bool, DeployError> {
     use k8s_openapi::api::apps::v1::StatefulSet;
     use kube::Api;
 
     let api: Api<StatefulSet> = Api::namespaced(engine.client().clone(), namespace);
     match api.get(name).await {
-        Ok(_) => Ok(()),
-        Err(kube::Error::Api(ae)) if ae.code == 404 => Err(DeployError::NotDeployed(format!(
-            "StatefulSet {namespace}/{name} not found"
-        ))),
+        Ok(_) => Ok(true),
+        Err(kube::Error::Api(ae)) if ae.code == 404 => Ok(false),
         Err(e) => Err(enclava_engine::apply::engine::ApplyError::Kube(e).into()),
+    }
+}
+
+async fn ensure_statefulset_exists(
+    engine: &ApplyEngine,
+    namespace: &str,
+    name: &str,
+) -> Result<(), DeployError> {
+    if statefulset_exists(engine, namespace, name).await? {
+        Ok(())
+    } else {
+        Err(DeployError::NotDeployed(format!(
+            "StatefulSet {namespace}/{name} not found"
+        )))
     }
 }
 
@@ -2385,8 +2660,9 @@ pub async fn apply_deployment_manifests(
     enclava_engine::validate::validate_app(&app_spec)
         .map_err(|e| DeployError::Validation(e.to_string()))?;
 
-    // Reuse the pre-lease inspection: a second provider read here would
-    // terminalize transient lookup failures after durable ownership begins.
+    // Reuse the under-fence verdict the worker reinspected immediately
+    // before this call: reading again here could terminalize a transient
+    // lookup failure after provider writes already began.
     enclava_engine::apply::orchestrator::enforce_floor_on_claims(&app_spec, fresh_volume_claims)?;
     let rollout_timeout = engine
         .config()

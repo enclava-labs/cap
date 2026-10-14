@@ -75,19 +75,23 @@ read in 1 MiB chunks (a short or failed read never counts as blank).
 The scan is O(device size). Progress is logged every 30 s with scanned/total
 bytes and a completion duration. Initialization time depends on actual guest
 and Longhorn throughput; do not infer it from the raw volume's zero contents.
-Devices below 32 MiB are refused before scanning. The API and engine enforce
 this fresh-format floor for unproven claims. Existing ordinal-zero claims are
-grandfathered per volume only with positive initialization evidence: a
-surviving claim whose immutable automatic-mode deployment job completed
-healthy in a later whole second than claim creation, or the exact live Ready
-ordinal-zero pod mounting it and created strictly after it. Password redeploy
-timeouts can publish healthy without opening storage, so that historical
-status is not proof. Without retained automatic-mode history or live proof,
-even a genuinely initialized sub-floor volume is refused until readiness can
-be established; larger volumes receive the fresh initialization allowance.
-Missing or terminating claims, wrong ordinals, same-second pairs, and bare
-PVC existence cannot grant the exemption. Existing LUKS2 volumes are opened
-without reformatting; orchestration evidence never authorizes formatting.
+grandfathered per volume only with positive LIVE initialization evidence: the
+exact ordinal-0 pod non-terminating, Ready, mounting the exact claim, and
+created in a later whole second than it — the workload observably running on
+the initialized device. Deployment history is deliberately not consulted:
+database and Kubernetes clocks cannot order a row against a claim, and a
+password-timeout redeploy can publish healthy without opening storage, so no
+historical status is proof. The availability cost is deliberate: a genuinely
+initialized legacy sub-floor volume with no live proof is refused until the
+workload regains readiness (or the volume is resized above the floor), never
+formatted. Missing or terminating claims, wrong ordinals, same-second pairs,
+and bare PVC existence cannot grant the exemption. External Kubernetes-admin
+claim deletions are outside CAP's mutation-fence serialization and read as
+fresh — the in-guest blank-scan still refuses to format a non-zero device, and
+CAP does not offer atomic cross-resource guarantees. Existing LUKS2 volumes
+are opened without reformatting; orchestration evidence never authorizes
+formatting.
 
 The rollout budget adds two sequential passes to the configured base
 timeout only for claims that lack positive initialization evidence —

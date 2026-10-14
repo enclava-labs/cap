@@ -315,7 +315,7 @@ pub async fn rollback(
     // at/above-floor sizes): a proven-initialized sub-floor claim keeps
     // operating; a missing/terminating/unproven one is a fresh format and
     // must meet the floor.
-    let fresh_volume_claims = super::fresh_volume_claims(&state.db, &app, &target_resources)
+    let fresh_volume_claims = super::fresh_volume_claims(&app, &target_resources)
         .await
         .map_err(|_| {
             json_error(

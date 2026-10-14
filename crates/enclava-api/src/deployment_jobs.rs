@@ -1998,13 +1998,15 @@ fn kube_error_is_transient(error: &kube::Error) -> bool {
     }
 }
 
-/// Classification for a failed pre-lease volume-evidence lookup: a
+/// Classification for a failed pre-mutation volume-evidence lookup: a
 /// transient provider read schedules a requeue, a database error already
 /// requeues, and every other failure stays terminal.
-/// `PreflightVolumeEvidenceUnavailable` may be produced ONLY here — the
-/// call site runs before any durable mutation ownership exists, so a
-/// requeue never leaks a lease. Post-permit apply errors never take this
-/// classification: no blanket retry of provider failures.
+/// `PreflightVolumeEvidenceUnavailable` is produced only by read-only
+/// pre-provider inspections — the pre-lease availability check (no
+/// ownership held) or the under-fence final read, whose validation-Err
+/// path releases leases via `finish_in_tx`+commit before the error
+/// returns. Post-inspection apply errors never take this classification:
+/// no blanket retry of provider failures.
 fn classify_preflight_lookup_error(error: crate::deploy::DeployError) -> DeploymentJobError {
     match error {
         crate::deploy::DeployError::Db(error) => DeploymentJobError::Db(error),
@@ -2017,19 +2019,20 @@ fn classify_preflight_lookup_error(error: crate::deploy::DeployError) -> Deploym
     }
 }
 
-async fn preflight_fresh_volume_claims(
-    state: &AppState,
+/// Read the live fresh-claim verdict for this payload. Used twice: once as
+/// a pre-lease AVAILABILITY check (its verdict is discarded — the fence
+/// wait can stale it) and again under the final fences/authority lane,
+/// where THAT verdict drives entitlement, the floor, and the rollout
+/// budget. Transient failures classify for safe requeue at both points.
+async fn read_fresh_volume_claims(
     payload: &DeploymentApplyJobPayload,
     engine: &ApplyEngine,
 ) -> Result<enclava_engine::apply::orchestrator::FreshVolumeClaims, DeploymentJobError> {
-    let initialized_at_millis =
-        crate::deploy::last_initialized_at_millis(&state.db, payload.app.id).await?;
     enclava_engine::apply::orchestrator::inspect_fresh_volume_claims(
         engine,
         &payload.app.namespace,
         &payload.app.name,
         enclava_engine::apply::orchestrator::FreshVolumeClaims::ALL,
-        initialized_at_millis,
     )
     .await
     .map_err(|error| classify_preflight_lookup_error(error.into()))
@@ -2056,10 +2059,13 @@ async fn acquire_apply_permit_and_revalidate(
         .acquire_owned()
         .await
         .map_err(|_| DeploymentJobError::ApplyLimiterClosed)?;
-    // Failed or transient cluster lookups must not retain durable global
-    // mutation ownership: this inspection runs before `claim` below, so a
-    // transient requeue releases only the apply permit, never a lease.
-    let fresh_volume_claims = preflight_fresh_volume_claims(state, payload, engine).await?;
+    // Pre-lease AVAILABILITY check only: a transient cluster failure must
+    // requeue before durable mutation ownership exists, so this inspection
+    // runs before `claim` below and releases only the apply permit. Its
+    // verdict is deliberately DISCARDED — a global fence wait can stale it,
+    // and the under-fence reinspection in `validation` below is the
+    // authoritative read for admission/floor/budget.
+    read_fresh_volume_claims(payload, engine).await?;
     // Keep the apply-specific queue outside durable mutation admission. The
     // mutation claim acquires exactly one shared permit before any connection.
     let mut resources = vec![
@@ -2094,7 +2100,13 @@ async fn acquire_apply_permit_and_revalidate(
     crate::signing_service::lock_org_signing_authority_lane(&mut authority_lane, job.org_id)
         .await?;
     crate::deploy::lock_app_deployment_lane(&mut authority_lane, job.app_id).await?;
-    let validation: Result<Option<ValidatedApplyArtifacts>, DeploymentJobError> = async {
+    let validation: Result<
+        Option<(
+            ValidatedApplyArtifacts,
+            enclava_engine::apply::orchestrator::FreshVolumeClaims,
+        )>,
+        DeploymentJobError,
+    > = async {
         let current_job: bool = sqlx::query_scalar(
             "SELECT EXISTS(
                  SELECT 1
@@ -2137,6 +2149,14 @@ async fn acquire_apply_permit_and_revalidate(
         {
             return Err(DeploymentJobError::Authority);
         }
+        // Final fresh-claim verdict, read under the mutation fences and
+        // authority lanes the pre-lease probe could stale across: THIS read
+        // drives entitlement, the persisted floor refusal, and the rollout
+        // budget before ANY provider mutation. A transient failure takes
+        // the classified requeue path — the validation-Err arm below
+        // releases this claim's leases, so accepted work requeues without
+        // leaking ownership.
+        let fresh_volume_claims = read_fresh_volume_claims(payload, engine).await?;
         crate::routes::deployments::enforce_authoritative_entitlement(
             &mut authority_lane,
             job.org_id,
@@ -2150,10 +2170,10 @@ async fn acquire_apply_permit_and_revalidate(
             validate_canonical_source_snapshot(&state.db, job, payload).await?;
         validate_apply_artifacts(state, job, payload, &primary_image_digest)
             .await
-            .map(Some)
+            .map(|artifacts| Some((artifacts, fresh_volume_claims)))
     }
     .await;
-    let validated = match validation {
+    let (validated, fresh_volume_claims) = match validation {
         Ok(Some(validated)) => validated,
         Ok(None) => {
             mutation.finish_in_tx(&mut authority_lane).await?;
@@ -2164,7 +2184,8 @@ async fn acquire_apply_permit_and_revalidate(
         Err(error) => {
             // No provider future has been polled yet, so releasing this claim
             // is safe and avoids quarantining KBS/namespace resources for a
-            // stale job or deterministic authority rejection.
+            // stale job, a transient final evidence read, or a deterministic
+            // authority rejection.
             mutation.finish_in_tx(&mut authority_lane).await?;
             authority_lane.commit().await?;
             drop(apply_permit);
@@ -3304,72 +3325,6 @@ pub(crate) mod tests {
         .await
         .expect("insert raw replacement job");
         tx.commit().await.expect("commit raw job replacement");
-    }
-
-    #[tokio::test]
-    async fn password_timeout_healthy_is_not_initialization_history() {
-        let pool = database_test_pool().await;
-        let (app, deployment_id, _, mut payload) = insert_job_fixture(&pool).await;
-        payload.app.unlock_mode = crate::models::UnlockMode::Password;
-        replace_job_with_raw_payload(
-            &pool,
-            deployment_id,
-            serde_json::to_value(payload).unwrap(),
-            JOB_PAYLOAD_VERSION,
-            false,
-            "pending",
-        )
-        .await;
-        sqlx::query(
-            "UPDATE deployments SET status = 'healthy', completed_at = clock_timestamp()
-              WHERE id = $1",
-        )
-        .bind(deployment_id)
-        .execute(&pool)
-        .await
-        .unwrap();
-        let initialized = crate::deploy::last_initialized_at_millis(&pool, app.id)
-            .await
-            .unwrap();
-        sqlx::query("DELETE FROM organizations WHERE id = $1")
-            .bind(app.org_id)
-            .execute(&pool)
-            .await
-            .unwrap();
-        assert_eq!(
-            initialized, None,
-            "password redeploy timeout can publish healthy without storage readiness"
-        );
-    }
-
-    #[tokio::test]
-    async fn automatic_initialization_history_truncates_subsecond_completion() {
-        let pool = database_test_pool().await;
-        let (app, deployment_id, _, _) = insert_job_fixture(&pool).await;
-        let completed = chrono::Timelike::with_nanosecond(
-            &(app.created_at + chrono::Duration::seconds(2)),
-            999_999_000,
-        )
-        .unwrap();
-        sqlx::query("UPDATE deployments SET status = 'healthy', completed_at = $2 WHERE id = $1")
-            .bind(deployment_id)
-            .bind(completed)
-            .execute(&pool)
-            .await
-            .unwrap();
-        let initialized = crate::deploy::last_initialized_at_millis(&pool, app.id)
-            .await
-            .unwrap();
-        sqlx::query("DELETE FROM organizations WHERE id = $1")
-            .bind(app.org_id)
-            .execute(&pool)
-            .await
-            .unwrap();
-        assert_eq!(
-            initialized,
-            Some(completed.timestamp() * 1000),
-            "rounding must not turn same-second claim replacement into older evidence"
-        );
     }
 
     async fn recreate_test_deployment_with_signed_hash(
@@ -5470,6 +5425,102 @@ pub(crate) mod tests {
         )
     }
 
+    /// A Kubernetes API double whose claim evidence changes between reads:
+    /// the first `serve_first` probe GETs return the app's PVC/pod objects
+    /// (an initialized workload), and every later probe answers
+    /// `stale_status` — 404 models objects deleted between the pre-lease
+    /// probe and the under-fence reinspection, 503 a transient read. An
+    /// early probe of an unrecognized name also answers `stale_status`.
+    fn degrading_volume_evidence_engine(
+        app: &App,
+        serve_first: usize,
+        stale_status: u16,
+    ) -> ApplyEngine {
+        use axum::http::{Request, Response};
+        use kube::client::Body;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tower::service_fn;
+
+        let namespace = app.namespace.clone();
+        let state_claim = format!("state-{}-0", app.name);
+        let tls_claim = format!("tls-state-{}-0", app.name);
+        let pod_name = format!("{}-0", app.name);
+        let reads = Arc::new(AtomicUsize::new(0));
+        ApplyEngine::new(
+            kube::Client::new(
+                service_fn(move |request: Request<Body>| {
+                    let reads = reads.clone();
+                    let namespace = namespace.clone();
+                    let state_claim = state_claim.clone();
+                    let tls_claim = tls_claim.clone();
+                    let pod_name = pod_name.clone();
+                    async move {
+                        let read = reads.fetch_add(1, Ordering::SeqCst);
+                        let name = request.uri().path().rsplit('/').next().unwrap_or_default();
+                        let object = if name == state_claim || name == tls_claim {
+                            serde_json::json!({
+                                "apiVersion": "v1",
+                                "kind": "PersistentVolumeClaim",
+                                "metadata": {
+                                    "name": name,
+                                    "namespace": namespace,
+                                    "creationTimestamp": "2026-01-01T00:00:00Z",
+                                },
+                            })
+                        } else if name == pod_name {
+                            serde_json::json!({
+                                "apiVersion": "v1",
+                                "kind": "Pod",
+                                "metadata": {
+                                    "name": pod_name,
+                                    "namespace": namespace,
+                                    "creationTimestamp": "2026-01-02T00:00:00Z",
+                                },
+                                "spec": {
+                                    "volumes": [
+                                        {"name": "state", "persistentVolumeClaim": {"claimName": state_claim}},
+                                        {"name": "tls", "persistentVolumeClaim": {"claimName": tls_claim}},
+                                    ],
+                                    "containers": [{"name": "app"}],
+                                },
+                                "status": {
+                                    "conditions": [{"type": "Ready", "status": "True"}],
+                                },
+                            })
+                        } else {
+                            serde_json::Value::Null
+                        };
+                        let reason = if stale_status == 404 {
+                            "NotFound"
+                        } else {
+                            "ServiceUnavailable"
+                        };
+                        let (status, body) = if read < serve_first && !object.is_null() {
+                            (200, object)
+                        } else {
+                            (
+                                stale_status,
+                                serde_json::json!({
+                                    "kind": "Status", "apiVersion": "v1",
+                                    "status": "Failure", "code": stale_status,
+                                    "reason": reason,
+                                }),
+                            )
+                        };
+                        Ok::<_, std::io::Error>(
+                            Response::builder()
+                                .status(status)
+                                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                                .unwrap(),
+                        )
+                    }
+                }),
+                "default",
+            ),
+            enclava_engine::apply::types::ApplyConfig::default(),
+        )
+    }
+
     /// A Kubernetes API double that runs `probe` on every request and reports
     /// a permanently not-ready StatefulSet with an empty pod list.
     fn probing_rollout_engine(probe: Arc<dyn Fn() + Send + Sync>) -> ApplyEngine {
@@ -5929,6 +5980,170 @@ pub(crate) mod tests {
             .execute(&pool)
             .await
             .expect("clean preflight fixture");
+    }
+
+    /// Deterministic claim-removal regression: the pre-lease probe sees an
+    /// initialized workload (claim + later-created Ready pod), but the
+    /// under-fence reinspection sees every object gone — an external
+    /// Kubernetes-admin deletion is outside CAP serialization. The FINAL
+    /// verdict, not the cached preflight one, must drive admission: the
+    /// sub-floor request loses its waiver and entitlement refuses it, and
+    /// the validation-Err path releases every fence.
+    #[tokio::test]
+    async fn removed_claim_under_fences_refuses_sub_floor_waiver() {
+        let _kbs_fence_guard = KBS_FENCE_TEST_LOCK.lock().await;
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _, _) = insert_job_fixture(&pool).await;
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.side_effect_admission = Arc::new(tokio::sync::Semaphore::new(2));
+        state.deployment_apply_permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim removal-test setup")
+            .expect("removal-test setup exists");
+        mark_setup_accepted(&pool, deployment_id, setup.lock_token)
+            .await
+            .expect("accept removal-test setup");
+        let job = claim_job(&pool, "pending", "running", Some(deployment_id))
+            .await
+            .expect("claim removal-test apply")
+            .expect("removal-test apply exists");
+        let mut payload = job.decode_payload().expect("decode removal-test payload");
+        payload.snapshot.resources.app_data_size = "24Mi".to_string();
+        payload.snapshot.resources.tls_data_size = "24Mi".to_string();
+        sqlx::query("UPDATE app_resources SET app_data_size = '24Mi', tls_data_size = '24Mi' WHERE app_id = $1")
+            .bind(app.id)
+            .execute(&pool)
+            .await
+            .expect("persist sub-floor resources matching the payload");
+
+        // Three pre-lease reads serve both claims and the later-created
+        // Ready pod (verdict: initialized); the under-fence reinspection
+        // sees them all deleted (verdict: fresh).
+        let engine = degrading_volume_evidence_engine(&app, 3, 404);
+        let result = acquire_apply_permit_and_revalidate(&state, &job, &payload, &engine).await;
+        let Err(DeploymentJobError::Authority) = result else {
+            panic!("the final verdict must refuse the sub-floor waiver, got {result:?}");
+        };
+        let app_owned: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM app_mutation_leases
+                  WHERE app_id = $1 AND owner_token IS NOT NULL
+             )",
+        )
+        .bind(app.id)
+        .fetch_one(&pool)
+        .await
+        .expect("read app claim state");
+        assert!(
+            !app_owned,
+            "a refused final verdict must not hold the app lease"
+        );
+        let owned_resources: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM external_resource_mutation_leases
+              WHERE owner_token IS NOT NULL
+                AND (
+                    (resource_scope = 'kbs_policy' AND resource_key = 'global')
+                    OR (resource_scope = 'kubernetes_namespace' AND resource_key = $1)
+                )",
+        )
+        .bind(&app.namespace)
+        .fetch_one(&pool)
+        .await
+        .expect("read provider claim state");
+        assert_eq!(
+            owned_resources, 0,
+            "a refused final verdict must not hold resource fences"
+        );
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("clean removal-test fixture");
+    }
+
+    /// A transient failure of the under-fence reinspection must release the
+    /// claim's fences and requeue cleanly — the validation-Err path owns the
+    /// release, so accepted work survives a flaky final read without leaking
+    /// ownership.
+    #[tokio::test]
+    async fn transient_final_volume_read_releases_fences_and_requeues() {
+        let _kbs_fence_guard = KBS_FENCE_TEST_LOCK.lock().await;
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _, _) = insert_job_fixture(&pool).await;
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.side_effect_admission = Arc::new(tokio::sync::Semaphore::new(2));
+        state.deployment_apply_permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim final-read-test setup")
+            .expect("final-read-test setup exists");
+        mark_setup_accepted(&pool, deployment_id, setup.lock_token)
+            .await
+            .expect("accept final-read-test setup");
+        let job = claim_job(&pool, "pending", "running", Some(deployment_id))
+            .await
+            .expect("claim final-read-test apply")
+            .expect("final-read-test apply exists");
+        let payload = job
+            .decode_payload()
+            .expect("decode final-read-test payload");
+
+        // The pre-lease read succeeds; the first under-fence probe fails
+        // transiently.
+        let engine = degrading_volume_evidence_engine(&app, 3, 503);
+        let result = acquire_apply_permit_and_revalidate(&state, &job, &payload, &engine).await;
+        let Err(error @ DeploymentJobError::PreflightVolumeEvidenceUnavailable) = result else {
+            panic!("a transient final read must requeue, got {result:?}");
+        };
+        assert!(error.should_requeue_without_terminal_failure());
+        requeue_apply_job(&pool, &job, error.code()).await.unwrap();
+        let (job_state, lock_token): (String, Option<Uuid>) = sqlx::query_as(
+            "SELECT state, lock_token FROM deployment_apply_jobs WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read requeued job");
+        assert_eq!(job_state, "pending");
+        assert_eq!(lock_token, None);
+        let app_owned: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM app_mutation_leases
+                  WHERE app_id = $1 AND owner_token IS NOT NULL
+             )",
+        )
+        .bind(app.id)
+        .fetch_one(&pool)
+        .await
+        .expect("read app claim state");
+        assert!(
+            !app_owned,
+            "a transient final read must not hold the app lease"
+        );
+        let owned_resources: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM external_resource_mutation_leases
+              WHERE owner_token IS NOT NULL
+                AND (
+                    (resource_scope = 'kbs_policy' AND resource_key = 'global')
+                    OR (resource_scope = 'kubernetes_namespace' AND resource_key = $1)
+                )",
+        )
+        .bind(&app.namespace)
+        .fetch_one(&pool)
+        .await
+        .expect("read provider claim state");
+        assert_eq!(
+            owned_resources, 0,
+            "a transient final read must not hold resource fences"
+        );
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("clean final-read fixture");
     }
 
     #[tokio::test]
