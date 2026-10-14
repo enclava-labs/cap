@@ -387,7 +387,6 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
         let mut exhausted_conflicts = false;
         let mut statefulset_uid: Option<String> = None;
         let mut statefulset_created_at: Option<chrono::DateTime<chrono::Utc>> = None;
-        let mut claim_refs_armed = false;
         for attempt in 0..SWEEP_DELETE_RETRIES {
             let live = match bounded_sweep_read(sweep_deadline, api.get_opt(&target.name)).await {
                 Ok(live) => live,
@@ -404,7 +403,7 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
                     break;
                 }
             };
-            let Some(mut live) = live else {
+            let Some(live) = live else {
                 // Absent. For the StatefulSet this may be a RETRY after a
                 // previous sweep deleted it but could not finish its PVC
                 // sweep: run the claim sweep now under the retry-time
@@ -487,67 +486,6 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
                     );
                 }
                 break;
-            }
-            if target.kind == "StatefulSet" && !claim_refs_armed {
-                claim_refs_armed = true;
-                // Codex P1: deletion authority for the claims is their
-                // controller ownerReference (see `classify_claim_lineage`),
-                // so ARM it before the set dies: flip the claim-retention
-                // policy to `whenDeleted: Delete` (a mutable field — VCT
-                // metadata is immutable), then give the controller a
-                // bounded window to reconcile the set's controller
-                // ownerReference onto the claims it manages. Without this,
-                // Retain/Retain claims carry no ownerReferences at all and
-                // could never be proven — leaving them undeletable and the
-                // sweep permanently incomplete.
-                let Some(sts_uid_for_refs) = live.metadata.uid.clone() else {
-                    tracing::warn!(
-                        app_id = %app.id,
-                        namespace = %app.namespace,
-                        statefulset = %target.name,
-                        "adopted-namespace sweep cannot arm claim ownerReferences (StatefulSet has no UID); leaving it live for a retry"
-                    );
-                    failures += 1;
-                    break;
-                };
-                if !arm_claim_owner_refs(
-                    &client,
-                    &app.namespace,
-                    &target.name,
-                    &sts_uid_for_refs,
-                    sweep_deadline,
-                )
-                .await
-                {
-                    // The retention-policy flip failed: deleting the set
-                    // now would orphan its claims with no proof left to
-                    // sweep them. Leave the set live and let a later
-                    // failure's sweep re-arm (fail closed, retryable).
-                    failures += 1;
-                    break;
-                }
-                // Re-read: our own patch moved the resourceVersion past
-                // the preconditions about to be captured.
-                match bounded_sweep_read(sweep_deadline, api.get_opt(&target.name)).await {
-                    Ok(Some(fresh)) => live = fresh,
-                    Ok(None) => {
-                        // Vanished between arming and re-read: treat as
-                        // deleted and let the claim sweep run below.
-                        deleted = true;
-                        break;
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            app_id = %app.id,
-                            namespace = %app.namespace,
-                            statefulset = %target.name,
-                            error = %error,
-                            "adopted-namespace sweep cannot re-read the StatefulSet after arming claim ownerReferences; counting as failed for retry"
-                        );
-                        failures += 1;
-                        break;
-                    }
-                }
             }
             let preconditions = kube::api::Preconditions {
                 uid: live.metadata.uid.clone(),
@@ -734,7 +672,7 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
 /// proved no other deployment of this app retains provider state, so an
 /// older created object can only be a leftover of an earlier failed
 /// apply — exactly what must not survive generation after generation.
-fn is_cap_created_generation_leftover<K>(resource: &K, failed_generation: i64) -> bool
+pub(crate) fn is_cap_created_generation_leftover<K>(resource: &K, failed_generation: i64) -> bool
 where
     K: kube::Resource,
 {
@@ -855,62 +793,6 @@ pub(crate) struct StsProvenanceWindow {
 /// claim-name shape and the controller's claim set are these two templates.
 const CAP_VCT_NAMES: [&str; 2] = ["state", "tls-state"];
 
-/// How the upstream StatefulSet controller treats a claim's
-/// ownerReferences (`isClaimOwnerUpToDate` /
-/// `updateClaimOwnerRefForSetAndPod`): it rewrites only claims that carry
-/// no stale same-name StatefulSet reference and no foreign controller
-/// reference — everything else it leaves untouched. The sweep waits for
-/// this reconciliation after arming `whenDeleted: Delete`, so a claim that
-/// still carries no ownerReference afterwards is positive evidence the
-/// controller does NOT manage it.
-#[derive(Debug, PartialEq, Eq)]
-enum ClaimRefState {
-    /// The claim carries a controller ownerReference pinning exactly this
-    /// StatefulSet's UID — the controller adopted it into this workload.
-    Reconciled,
-    /// The claim carries references the controller will never rewrite (a
-    /// stale same-name StatefulSet ref, or a controller ref owned by any
-    /// other object): it sits outside this workload's claim management.
-    Unmanageable,
-    /// Nothing disqualifying: while the set lives under
-    /// `whenDeleted: Delete` the controller will attach the set's
-    /// controller ref to it.
-    Manageable,
-}
-
-/// Classify a name-matching claim against the StatefulSet whose claims the
-/// sweep manages, mirroring the upstream controller's ref-reconciliation
-/// rules.
-fn claim_ref_state(
-    claim: &k8s_openapi::api::core::v1::PersistentVolumeClaim,
-    statefulset: &str,
-    sts_uid: &str,
-) -> ClaimRefState {
-    let owners = claim.metadata.owner_references.as_deref().unwrap_or(&[]);
-    for owner in owners {
-        let ours = owner.kind == "StatefulSet" && owner.name == statefulset;
-        if ours && owner.uid == sts_uid && owner.controller == Some(true) {
-            return ClaimRefState::Reconciled;
-        }
-    }
-    for owner in owners {
-        let ours = owner.kind == "StatefulSet" && owner.name == statefulset;
-        let our_pod = owner.kind == "Pod" && owner.name.starts_with(&format!("{statefulset}-"));
-        if ours && owner.uid != sts_uid {
-            // Stale same-name reference (a deleted predecessor set): the
-            // controller never rewrites these claims.
-            return ClaimRefState::Unmanageable;
-        }
-        if owner.controller == Some(true) && !ours && !our_pod {
-            // A controller ref owned by anything else — never rewritten.
-            return ClaimRefState::Unmanageable;
-        }
-    }
-    // No disqualifying references (possibly a non-controller ref to our set
-    // or pod, which upstream scrubs and fixes): keep waiting for reconcile.
-    ClaimRefState::Manageable
-}
-
 /// Codex P1 (non-temporal claim ownership): deletion authority for a PVC is
 /// its claim-specific, UID-pinned StatefulSet controller ownerReference —
 /// the claim's own declared lifecycle (Kubernetes GC deletes it with that
@@ -921,10 +803,10 @@ fn claim_ref_state(
 /// workload's lineage (a foreign same-named set's claim) and fails closed,
 /// exactly like a missing ref.
 fn classify_claim_lineage(
-    controller_ref_uid: Option<&str>,
+    sts_owner_ref_uid: Option<&str>,
     windows: &[StsProvenanceWindow],
 ) -> ClaimLineage {
-    match controller_ref_uid {
+    match sts_owner_ref_uid {
         Some(uid) if windows.iter().any(|w| w.uid.as_deref() == Some(uid)) => ClaimLineage::Proven,
         _ => ClaimLineage::Unproven,
     }
@@ -937,101 +819,6 @@ fn classify_claim_lineage(
 /// converges well inside the wait. The wait is best-effort latency
 /// padding only — deletion authority comes from the refs themselves, and
 /// claims still unreferenced after the wait are simply retained.
-const CLAIM_REF_RECONCILE_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
-const CLAIM_REF_RECONCILE_POLL: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// Arm claim-deletion authority before a StatefulSet delete: flip the
-/// claim-retention policy to `whenDeleted: Delete` (a mutable field —
-/// `spec.volumeClaimTemplates` is immutable, so VCT-stamped markers are not
-/// available) and wait for the controller to reconcile the set's
-/// controller ownerReference onto the claims it manages. Only after this
-/// do claims carry the UID-pinned proof `classify_claim_lineage` requires.
-/// Returns false when the flip itself failed — the caller must then leave
-/// the StatefulSet live (deleting it would orphan its claims with no proof
-/// left to sweep them) and let a later retry re-arm.
-async fn arm_claim_owner_refs(
-    client: &kube::Client,
-    namespace: &str,
-    statefulset: &str,
-    sts_uid: &str,
-    sweep_deadline: tokio::time::Instant,
-) -> bool {
-    let sts_api: kube::Api<kube::api::DynamicObject> = kube::Api::namespaced_with(
-        client.clone(),
-        namespace,
-        &sweep_api_resource("StatefulSet"),
-    );
-    let flip = serde_json::json!({
-        "spec": { "persistentVolumeClaimRetentionPolicy": { "whenDeleted": "Delete" } }
-    });
-    if let Err(error) = bounded_sweep_read(
-        sweep_deadline,
-        sts_api.patch(
-            statefulset,
-            &kube::api::PatchParams::default(),
-            &kube::api::Patch::Merge(flip),
-        ),
-    )
-    .await
-    {
-        tracing::warn!(
-            namespace = %namespace,
-            statefulset = %statefulset,
-            error = %error,
-            "adopted-namespace sweep could not arm claim ownerReferences (retention-policy flip failed); leaving the StatefulSet for a retry"
-        );
-        return false;
-    }
-    let claims_api: kube::Api<k8s_openapi::api::core::v1::PersistentVolumeClaim> =
-        kube::Api::namespaced(client.clone(), namespace);
-    let wait_deadline =
-        (tokio::time::Instant::now() + CLAIM_REF_RECONCILE_WAIT).min(sweep_deadline);
-    loop {
-        let list = match bounded_sweep_read(
-            wait_deadline,
-            claims_api.list(&kube::api::ListParams::default()),
-        )
-        .await
-        {
-            Ok(list) => list,
-            Err(error) => {
-                tracing::warn!(
-                    namespace = %namespace,
-                    statefulset = %statefulset,
-                    error = %error,
-                    "adopted-namespace sweep cannot observe claim ownerReference reconciliation"
-                );
-                return false;
-            }
-        };
-        let mut pending = 0usize;
-        for claim in &list.items {
-            let Some(name) = claim.metadata.name.as_deref() else {
-                continue;
-            };
-            if !is_cap_claim_name(name, statefulset, &CAP_VCT_NAMES) {
-                continue;
-            }
-            if claim_ref_state(claim, statefulset, sts_uid) == ClaimRefState::Manageable {
-                pending += 1;
-            }
-        }
-        if pending == 0 {
-            return true;
-        }
-        if tokio::time::Instant::now() >= wait_deadline {
-            tracing::warn!(
-                namespace = %namespace,
-                statefulset = %statefulset,
-                pending,
-                "StatefulSet controller did not reconcile claim ownerReferences in time; unreferenced claims will be retained by the sweep"
-            );
-            return true;
-        }
-        tokio::time::sleep(CLAIM_REF_RECONCILE_POLL).await;
-    }
-}
-
 /// Delete the PVCs this failed generation's StatefulSet created in an
 /// adopted namespace. A claim is deleted ONLY on claim-specific,
 /// non-temporal proof of CAP lineage (Codex P1 — see
@@ -1046,10 +833,15 @@ async fn arm_claim_owner_refs(
 /// sweep reports INCOMPLETE (non-zero) while they remain — reporting zero
 /// would let the caller clear manifest evidence over retained claims,
 /// allowing a later resized deployment to silently adopt them at their
-/// old size. The proof is normally present: before deleting the
-/// StatefulSet the sweep arms `whenDeleted: Delete` and waits for the
-/// controller to reconcile the set's ownerReference onto the claims it
-/// manages (see `arm_claim_owner_refs`).
+/// old size. Note the deliberate asymmetry: the sweep NEVER manufactures
+/// this proof (grok P1 — flipping `whenDeleted: Retain` to `Delete` makes
+/// the controller ADOPT name-matching tenant claims and stamp ownerRefs
+/// onto them; the GC cascade would then delete tenant data regardless of
+/// what this classifier says). Under the manifest's Retain/Retain policy
+/// natural ownerReferences are rare, so retained claims — and the kept
+/// manifest evidence blocking storage-size changes — are the expected
+/// fail-closed state for a failed generation that had claims; app
+/// deletion is the resolution path (tracked in issue #251).
 ///
 /// When the StatefulSet is absent and NO proven lineage record exists
 /// AND no row in scope ever reached the StatefulSet step, no CAP
@@ -1141,17 +933,19 @@ pub(crate) async fn sweep_statefulset_pvcs(
         let Some(name) = pvc.metadata.name.clone() else {
             continue;
         };
-        let controller_ref_uid = pvc
+        // GC alignment (grok P1): the garbage collector cascades a
+        // StatefulSet deletion onto EVERY claim carrying that set's uid in
+        // `ownerReferences` — controller-flagged or not. The classifier
+        // must therefore treat any StatefulSet ownerReference pinning a
+        // proven UID as the claim's identity; classifying narrower than GC
+        // would "retain" a claim the cascade deletes anyway.
+        let sts_owner_ref_uid = pvc
             .metadata
             .owner_references
             .as_ref()
-            .and_then(|owners| {
-                owners
-                    .iter()
-                    .find(|owner| owner.kind == "StatefulSet" && owner.controller == Some(true))
-            })
+            .and_then(|owners| owners.iter().find(|owner| owner.kind == "StatefulSet"))
             .map(|owner| owner.uid.clone());
-        match classify_claim_lineage(controller_ref_uid.as_deref(), &all_windows) {
+        match classify_claim_lineage(sts_owner_ref_uid.as_deref(), &all_windows) {
             ClaimLineage::Proven => {}
             ClaimLineage::Unproven => {
                 // Retain the claim and count a failure so the sweep
@@ -1162,7 +956,7 @@ pub(crate) async fn sweep_statefulset_pvcs(
                 tracing::warn!(
                     namespace = %namespace,
                     pvc = %name,
-                    controller_ref = ?controller_ref_uid,
+                    sts_owner_ref = ?sts_owner_ref_uid,
                     "adopted-namespace PVC sweep cannot prove claim lineage from a UID-pinned StatefulSet ownerReference; retaining the claim and counting the sweep incomplete"
                 );
                 failures += 1;
@@ -1454,10 +1248,11 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
     };
 
     // Namespace teardown first: the live annotation check is the proof that
-    // this generation published provider state at all. Only when it owns the
-    // namespace does route removal make sense — `ensure_haproxy_routes` runs
-    // strictly after `apply_namespace` inside the same provider phase, so a
-    // generation that never owned the namespace never published routes.
+    // this generation published provider state at all. Route removal is
+    // NOT gated on namespace ownership (see the AbsentBeforeDelete arm
+    // below): an initial 404 cannot prove the generation never published
+    // routes, so the routes are compensated in every outcome where no
+    // other generation owns provider state.
     //
     // The classification GET and the teardown run as separate guarded
     // provider steps: a lease lost during the classification (or the
@@ -2013,15 +1808,14 @@ async fn remove_failed_generation_edge_routes(
 
 /// The pre-delete namespace GET, classified. Only a live object carrying
 /// this exact generation's mutation-generation annotation authorizes a
-/// delete; every other outcome — including an initial 404 — is
-/// [`NamespaceTeardown::NotOurs`]. A generation that never owned the live
-/// namespace never published routes (`ensure_haproxy_routes` runs strictly
-/// after `apply_namespace`), so route removal must be skipped for these
-/// outcomes rather than run against the shared HAProxy ConfigMap.
-/// [`NamespaceTeardown::ConfirmedAbsent`] is reserved for a namespace that
-/// was observed under this generation's annotation and only later returned
-/// 404 (between the owning GET and the delete, or during the convergence
-/// wait).
+/// delete; every other outcome — including an initial 404 — does not.
+/// Route removal is NOT skipped on these outcomes: an initial 404 cannot
+/// prove the generation never published (`ensure_haproxy_routes` may have
+/// completed before a later failure, and the namespace can be deleted
+/// externally), so `cleanup_after_terminal_apply_failure` compensates this
+/// generation's routes whenever the row-level provider-ownership gate
+/// shows no other generation owns provider state — the same safety
+/// condition as the confirmed-absence path.
 pub(crate) enum InitialNamespaceOwnership {
     /// Live object carries this generation's annotation AND creation
     /// evidence (`enclava.dev/cap-namespace-created-by-generation`): CAP
@@ -2039,8 +1833,10 @@ pub(crate) enum InitialNamespaceOwnership {
     /// Never delete it — only the resources this apply published (routes)
     /// are compensated.
     Adopted,
-    /// GET returned 404 before any delete was issued. This generation never
-    /// published the namespace, so it never published routes either.
+    /// GET returned 404 before any delete was issued. The namespace is
+    /// gone, but routes may still exist (the apply can publish routes and
+    /// then fail; the namespace can be deleted externally) — the caller
+    /// compensates this generation's routes on this outcome.
     AbsentBeforeDelete,
     /// Live object carries another generation's annotation (or none).
     Foreign,
@@ -3141,7 +2937,7 @@ mod tests {
     /// including the StatefulSet's birth second or the interval before a
     /// deletion edge is recorded.
     #[test]
-    fn claim_lineage_requires_uid_pinned_controller_ref() {
+    fn claim_lineage_requires_uid_pinned_owner_ref() {
         let window = provenance_window(Some("uid-cap-1"));
         // The controller's own claim: ref pins a proven UID — hard proof.
         assert_eq!(
@@ -3172,92 +2968,6 @@ mod tests {
         assert_eq!(
             classify_claim_lineage(Some("uid-cap-0"), &[window, sibling]),
             ClaimLineage::Proven
-        );
-    }
-
-    /// Codex P1: `arm_claim_owner_refs` mirrors the upstream controller's
-    /// ref-reconciliation rules (`isClaimOwnerUpToDate` /
-    /// `updateClaimOwnerRefForSetAndPod`) when waiting for ownerReference
-    /// convergence before the StatefulSet delete.
-    #[test]
-    fn claim_ref_state_mirrors_controller_rewrite_rules() {
-        use k8s_openapi::api::core::v1::PersistentVolumeClaim;
-        use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
-
-        let pvc = |owners: Vec<OwnerReference>| PersistentVolumeClaim {
-            metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
-                name: Some("state-app-0".to_string()),
-                owner_references: if owners.is_empty() {
-                    None
-                } else {
-                    Some(owners)
-                },
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let owner = |kind: &str, name: &str, uid: &str, controller: bool| OwnerReference {
-            api_version: "apps/v1".to_string(),
-            kind: kind.to_string(),
-            name: name.to_string(),
-            uid: uid.to_string(),
-            controller: Some(controller),
-            block_owner_deletion: None,
-        };
-
-        // No refs at all: the controller adopts it while the set lives
-        // under whenDeleted: Delete — keep waiting.
-        assert_eq!(
-            claim_ref_state(&pvc(vec![]), "app", "uid-cap-1"),
-            ClaimRefState::Manageable
-        );
-        // Controller ref pinning exactly our set's UID: done.
-        assert_eq!(
-            claim_ref_state(
-                &pvc(vec![owner("StatefulSet", "app", "uid-cap-1", true)]),
-                "app",
-                "uid-cap-1"
-            ),
-            ClaimRefState::Reconciled
-        );
-        // Stale same-name ref to a deleted predecessor set: never
-        // rewritten — outside our management.
-        assert_eq!(
-            claim_ref_state(
-                &pvc(vec![owner("StatefulSet", "app", "uid-old", true)]),
-                "app",
-                "uid-cap-1"
-            ),
-            ClaimRefState::Unmanageable
-        );
-        // Controller ref owned by a foreign object: never rewritten.
-        assert_eq!(
-            claim_ref_state(
-                &pvc(vec![owner("StatefulSet", "other", "uid-x", true)]),
-                "app",
-                "uid-cap-1"
-            ),
-            ClaimRefState::Unmanageable
-        );
-        // Non-controller ref to our set: upstream scrubs and fixes it —
-        // still manageable.
-        assert_eq!(
-            claim_ref_state(
-                &pvc(vec![owner("StatefulSet", "app", "uid-cap-1", false)]),
-                "app",
-                "uid-cap-1"
-            ),
-            ClaimRefState::Manageable
-        );
-        // Pod controller ref (whenScaled=Delete era): upstream scrubs and
-        // sets the set ref — manageable.
-        assert_eq!(
-            claim_ref_state(
-                &pvc(vec![owner("Pod", "app-0", "uid-pod", true)]),
-                "app",
-                "uid-cap-1"
-            ),
-            ClaimRefState::Manageable
         );
     }
 

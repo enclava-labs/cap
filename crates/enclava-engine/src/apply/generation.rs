@@ -61,17 +61,31 @@ pub(super) async fn compensate_created_object<K>(api: &Api<K>, name: &str, creat
 where
     K: Resource + Clone + Debug + DeserializeOwned,
 {
-    let uid = created.meta().uid.clone();
+    // grok (minor): a missing UID would leave the precondition unpinned —
+    // never issue a name-only DELETE that could hit a same-named
+    // replacement. Fail loudly instead.
+    let Some(uid) = created.meta().uid.clone() else {
+        tracing::error!(
+            kind = kind::<K>(),
+            name,
+            "just-created object has no UID; compensating delete would be unpinned — leaving the object for manual removal"
+        );
+        return;
+    };
+    let mut accepted = false;
     for attempt in 0..3 {
         let params = DeleteParams {
             preconditions: Some(Preconditions {
-                uid: uid.clone(),
+                uid: Some(uid.clone()),
                 resource_version: None,
             }),
             ..DeleteParams::default()
         };
         match api.delete(name, &params).await {
-            Ok(_) => return,
+            Ok(_) => {
+                accepted = true;
+                break;
+            }
             Err(kube::Error::Api(error)) if error.code == 404 => return,
             Err(error) => {
                 tracing::warn!(
@@ -85,11 +99,42 @@ where
             }
         }
     }
-    tracing::error!(
-        kind = kind::<K>(),
-        name,
-        "compensating delete failed; the object may remain without valid creation evidence"
-    );
+    if !accepted {
+        tracing::error!(
+            kind = kind::<K>(),
+            name,
+            "compensating delete failed; the object may remain without valid creation evidence"
+        );
+        return;
+    }
+    // grok (minor): an accepted DELETE can sit on a finalizer, and the
+    // failed-apply cleanup will never remove this object afterwards (it
+    // fails the creation-evidence gate). Confirm actual absence before
+    // returning; a stuck object needs manual removal, so say so loudly.
+    for wait in 0..5 {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        match api.get_opt(name).await {
+            Ok(None) => return,
+            Ok(Some(_)) => {
+                if wait == 4 {
+                    tracing::error!(
+                        kind = kind::<K>(),
+                        name,
+                        "compensating delete was accepted but the object is not gone (finalizer?); failed-apply cleanup will NOT remove it — manual removal required"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    kind = kind::<K>(),
+                    name,
+                    error = %error,
+                    "could not confirm compensating delete removed the object"
+                );
+                return;
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
