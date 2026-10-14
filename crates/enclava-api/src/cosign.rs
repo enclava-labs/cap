@@ -246,16 +246,82 @@ fn registry_auth_from_env(registry: &str) -> Auth {
     )
 }
 
+/// Entry grammar for `COSIGN_REGISTRY_ALLOWED_HOSTS`: exactly `*`,
+/// `host[:port]`, or `*.host[:port]` over DNS labels / IPv4. Anything else
+/// (partial-label wildcards like `*ghcr.io`, repeated wildcards like
+/// `**.host`, empty labels like `ghcr..io`, paths, out-of-range ports) can
+/// never match a parsed registry name, so it is refused at startup: a typo'd
+/// pattern must fail loudly instead of quietly withholding the platform
+/// credentials from the host the operator meant to allow (same rationale as
+/// the strict tenant pull-secret scope collector).
+fn cosign_registry_host_pattern_error(pattern: &str) -> Option<&'static str> {
+    if pattern == "*" {
+        return None;
+    }
+    if pattern.is_empty() {
+        return Some("entry is empty");
+    }
+    let host = match pattern.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
+            match port.parse::<u16>() {
+                Ok(port) if port != 0 => host,
+                _ => return Some("port must be in 1..=65535"),
+            }
+        }
+        _ => pattern,
+    };
+    let base = host.strip_prefix("*.").unwrap_or(host);
+    if base.is_empty() || base.starts_with('.') || base.ends_with('.') || base.contains("..") {
+        return Some("host must be a DNS name or IPv4 address without empty labels");
+    }
+    if !base.split('.').all(|label| {
+        !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    }) {
+        return Some("host must be a DNS name or IPv4 address (labels of letters, digits, '-')");
+    }
+    None
+}
+
 /// Startup validation (issue #225): platform `COSIGN_*` registry credentials
 /// without an explicit `COSIGN_REGISTRY_ALLOWED_HOSTS` scope are refused —
 /// silently downgrading every registry to anonymous would break private-
 /// registry verification in confusing ways, so misconfiguration must be loud.
 pub fn cosign_registry_credentials_startup_error() -> Option<String> {
+    let patterns = cosign_registry_allowed_hosts_from_env();
+    if let Some(raw) = env_nonempty(COSIGN_REGISTRY_ALLOWED_HOSTS_ENV) {
+        let invalid: Vec<String> = raw
+            .split(',')
+            .map(str::trim)
+            .filter_map(|pattern| {
+                cosign_registry_host_pattern_error(pattern)
+                    .map(|reason| format!("{pattern:?} ({reason})"))
+            })
+            .collect();
+        if !invalid.is_empty() {
+            return Some(format!(
+                "COSIGN_REGISTRY_ALLOWED_HOSTS contains entries outside the allowed grammar \
+                 `*`, `host[:port]`, or `*.host[:port]`: {}; such a pattern can never match a \
+                 registry host, so startup is refused instead of silently withholding the \
+                 platform registry credentials",
+                invalid.join(", ")
+            ));
+        }
+    }
+    if patterns.iter().any(|pattern| pattern == "*") {
+        tracing::warn!(
+            env = COSIGN_REGISTRY_ALLOWED_HOSTS_ENV,
+            "allowlist contains bare `*`: platform registry credentials will be forwarded to \
+             every registry host named by tenant-supplied image references"
+        );
+    }
     if !cosign_registry_credentials_configured() {
         return None;
     }
-    let hosts = cosign_registry_allowed_hosts_from_env();
-    if hosts.is_empty() {
+    if patterns.is_empty() {
         return Some(
             "COSIGN_REGISTRY_BEARER_TOKEN or COSIGN_REGISTRY_USERNAME/COSIGN_REGISTRY_PASSWORD \
              is set but COSIGN_REGISTRY_ALLOWED_HOSTS is unset or empty; platform registry \
@@ -1362,6 +1428,53 @@ mod tests {
                 "https://github.com/example/repo/.github/workflows/build.yml@refs/heads/main"
                     .to_string(),
             fulcio_issuer: "https://token.actions.githubusercontent.com".to_string(),
+        }
+    }
+
+    /// Issue #225 hardening: allowlist entries outside the grammar can never
+    /// match a parsed registry name and must be refused at startup, not
+    /// silently ignored (same strictness as the pull-secret scope collector).
+    #[test]
+    fn cosign_registry_host_pattern_grammar_accepts_matchable_entries() {
+        for pattern in [
+            "*",
+            "ghcr.io",
+            "ghcr.io:5000",
+            "localhost",
+            "localhost:5000",
+            "10.0.0.1:5000",
+            "*.corp.example",
+            "*.corp.example:5000",
+        ] {
+            assert_eq!(
+                cosign_registry_host_pattern_error(pattern),
+                None,
+                "pattern {pattern:?} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn cosign_registry_host_pattern_grammar_rejects_never_matching_entries() {
+        for pattern in [
+            "",                // empty entry (e.g. a trailing comma)
+            "*ghcr.io",        // partial-label wildcard never matches
+            "**.corp.example", // repeated wildcard never matches
+            "*.",              // empty wildcard base
+            "ghcr..io",        // empty label
+            ".ghcr.io",        // leading dot
+            "ghcr.io.",        // trailing dot
+            "ghcr.io/path",    // path, not a host
+            "ghcr.io:",        // empty port
+            "ghcr.io:0",       // port zero
+            "ghcr.io:99999",   // port out of range
+            "-bad.example",    // leading-hyphen label
+            "bad-.example",    // trailing-hyphen label
+        ] {
+            assert!(
+                cosign_registry_host_pattern_error(pattern).is_some(),
+                "pattern {pattern:?} must be rejected"
+            );
         }
     }
 
