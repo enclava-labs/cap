@@ -13,8 +13,8 @@ use enclava_init::config::{
 use enclava_init::safe_diagnostics::SafeBootstrapDiagnostic;
 use enclava_init::secrets::{DerivedSeed, OwnerSeed, Password};
 use enclava_init::{
-    dev_no_luks_override, env_override, kbs_fetch, log_relay, luks, seeds, socket, tls_certificate,
-    trustee_verify, unlock, writes,
+    dev_no_luks_override, env_override, kbs_fetch, log_relay, luks, luks2_seal, seeds, socket,
+    tls_certificate, trustee_verify, unlock, writes,
 };
 use serde::Deserialize;
 
@@ -1179,22 +1179,45 @@ fn open_luks_volumes(
         tracing::warn!("ENCLAVA_INIT_DEV_NO_LUKS=true — skipping luks open (debug builds only)");
         return Ok(());
     }
+    // cap#242: reject cryptsetup releases below the null-cipher keyslot
+    // hardening floor before touching any volume.
+    luks2_seal::ensure_cryptsetup_floor()?;
     let state_phase = stats.elapsed_ms();
-    let state_opened = open_one_volume(&cfg.state, owner)
-        .with_context(|| format!("opening state volume {}", cfg.state.device))?;
+    let state_opened = open_one_volume(
+        &cfg.state,
+        owner,
+        seeds::STATE_LUKS_INFO,
+        seeds::STATE_HEADER_MAC_INFO,
+    )
+    .with_context(|| format!("opening state volume {}", cfg.state.device))?;
     stats.record_state_volume(state_phase, state_opened.formatted);
     let tls_phase = stats.elapsed_ms();
-    let tls_opened = open_one_volume(&cfg.tls_state, owner)
-        .with_context(|| format!("opening tls-state volume {}", cfg.tls_state.device))?;
+    let tls_opened = open_one_volume(
+        &cfg.tls_state,
+        owner,
+        seeds::TLS_STATE_LUKS_INFO,
+        seeds::TLS_STATE_HEADER_MAC_INFO,
+    )
+    .with_context(|| format!("opening tls-state volume {}", cfg.tls_state.device))?;
     stats.record_tls_volume(tls_phase, tls_opened.formatted);
     stats.record_post_luks_memory();
     Ok(())
 }
 
-fn open_one_volume(vol: &VolumeConfig, owner: &OwnerSeed) -> Result<luks::LuksOpened> {
-    let key = derive_volume_key(owner, &vol.hkdf_info)?;
+fn open_one_volume(
+    vol: &VolumeConfig,
+    owner: &OwnerSeed,
+    luks_info: &[u8],
+    header_mac_info: &[u8],
+) -> Result<luks::LuksOpened> {
+    // Distinct HKDF branches: the volume passphrase and the header MAC key
+    // must never share material (cap#242).
+    let keys = luks::VolumeKeys::new(
+        derive_volume_key(owner, luks_info)?,
+        derive_volume_key(owner, header_mac_info)?,
+    );
     let device = Path::new(&vol.device);
-    let opened = luks::format_if_unformatted_then_open(device, &vol.mapping_name, &key)?;
+    let opened = luks::format_if_unformatted_then_open(device, &vol.mapping_name, &keys)?;
     luks::mount(&opened.mapper_path, Path::new(&vol.mount_path))?;
     tracing::info!(
         device = %vol.device,
@@ -1450,8 +1473,8 @@ fn numeric_identity(uid: u32, gid: u32) -> ExecIdentity {
     }
 }
 
-fn derive_volume_key(owner: &OwnerSeed, info: &str) -> Result<DerivedSeed> {
-    let derived = seeds::derive(owner, info.as_bytes())?;
+fn derive_volume_key(owner: &OwnerSeed, info: &[u8]) -> Result<DerivedSeed> {
+    let derived = seeds::derive(owner, info)?;
     Ok(derived)
 }
 
