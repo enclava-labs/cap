@@ -987,6 +987,9 @@ where
     F: FnOnce(&Path) -> Result<()>,
 {
     let key_file = temporary_key_path();
+    if let Some(parent) = key_file.parent() {
+        luks2_seal::ensure_private_material_dir(parent)?;
+    }
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -1006,26 +1009,27 @@ where
 
 fn temporary_key_path() -> PathBuf {
     let counter = KEY_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    PathBuf::from(format!(
-        "/run/enclava/luks-key-{}-{counter}",
-        std::process::id()
-    ))
+    PathBuf::from(luks2_seal::PRIVATE_MATERIAL_DIR)
+        .join(format!("luks-key-{}-{counter}", std::process::id()))
 }
 
 fn detached_header_path(_mapping_name: &str) -> PathBuf {
     let counter = DETACHED_HEADER_COUNTER.fetch_add(1, Ordering::Relaxed);
-    PathBuf::from(format!(
-        "/run/enclava/luks-header-{}-{counter}",
-        std::process::id()
-    ))
+    PathBuf::from(luks2_seal::PRIVATE_MATERIAL_DIR)
+        .join(format!("luks-header-{}-{counter}", std::process::id()))
 }
 
-/// Delete `/run/enclava/luks-header-*` files left behind by processes that
-/// no longer exist (crash/kill/OOM between write and wipe). A live PID that
-/// is not us still owns its file; our own files are handled by the normal
-/// wipe path.
+/// Delete orphaned `luks-header-*` copies left behind by processes that no
+/// longer exist (crash/kill/OOM between write and wipe). A live PID that is
+/// not us still owns its file, and a copy currently registered by THIS
+/// process (a concurrent open's in-flight file, cap#244 review) is never
+/// touched: its PID component is ours, but wiping it would race the
+/// cryptsetup invocation reading it.
 fn cleanup_stale_detached_copies() {
-    let dir = Path::new("/run/enclava");
+    cleanup_stale_detached_copies_in(Path::new(luks2_seal::PRIVATE_MATERIAL_DIR));
+}
+
+fn cleanup_stale_detached_copies_in(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -1043,6 +1047,11 @@ fn cleanup_stale_detached_copies() {
             continue;
         };
         if pid != my_pid && Path::new(&format!("/proc/{pid}")).exists() {
+            continue;
+        }
+        if luks2_seal::is_active_detached_copy(&entry.path()) {
+            // In-flight copy of a concurrent open in this process: owned by
+            // our PID but not stale.
             continue;
         }
         // Our own PID entry after a crash-restart (PID reuse with the
@@ -1072,12 +1081,9 @@ fn cleanup_stale_detached_copies() {
 }
 
 fn wipe_key_file(path: &Path, len: usize) {
-    if let Ok(mut file) = OpenOptions::new().write(true).open(path) {
-        let zeros = vec![0u8; len];
-        let _ = file.write_all(&zeros);
-        let _ = file.sync_all();
-    }
-    let _ = remove_file(path);
+    // Same hardened wipe as detached headers: O_NOFOLLOW + regular-file
+    // check, so a replaced pathname can never redirect the zeroize.
+    luks2_seal::wipe_detached_copy(path, len);
 }
 
 fn path_arg(path: &Path) -> Result<String> {
@@ -1248,6 +1254,61 @@ mod unit_tests {
         assert_eq!(status.cipher, None);
         assert_eq!(status.keysize_bits, None);
         assert_eq!(status.offset_sectors, None);
+    }
+
+    #[test]
+    fn sweep_removes_own_pid_leftovers_but_never_in_flight_copies() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let my_pid = std::process::id();
+
+        // Leftover of ours (crash-restart with PID reuse + counter reset):
+        // not registered => stale.
+        let stale = dir.path().join(format!("luks-header-{my_pid}-0"));
+        std::fs::write(&stale, b"leftover").expect("write stale copy");
+
+        // In-flight copy of a concurrent open in THIS process: registered
+        // while cryptsetup is still reading it (cap#244 review) — the sweep
+        // must leave it alone even though its PID component is ours.
+        let inflight = dir.path().join(format!("luks-header-{my_pid}-1"));
+        std::fs::write(&inflight, b"in-flight").expect("write in-flight copy");
+        luks2_seal::register_active_detached_copy_for_test(&inflight);
+
+        // Copy owned by another live process (PID 1 always exists).
+        let foreign = dir.path().join("luks-header-1-0");
+        std::fs::write(&foreign, b"live owner").expect("write foreign copy");
+
+        cleanup_stale_detached_copies_in(dir.path());
+
+        assert!(!stale.exists(), "own unregistered leftover must be wiped");
+        assert!(
+            inflight.exists(),
+            "in-flight copy of a concurrent open must never be wiped"
+        );
+        assert!(foreign.exists(), "live other-PID copy must be kept");
+
+        // After the open completes (wipe), the same name becomes stale.
+        luks2_seal::unregister_active_detached_copy_for_test(&inflight);
+        cleanup_stale_detached_copies_in(dir.path());
+        assert!(!inflight.exists(), "unregistered copy must be swept");
+    }
+
+    #[test]
+    fn sweep_leaves_non_regular_files_untouched() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let my_pid = std::process::id();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"untouched").expect("write victim");
+        let link = dir.path().join(format!("luks-header-{my_pid}-9"));
+        std::os::unix::fs::symlink(&victim, &link).expect("plant symlink");
+
+        cleanup_stale_detached_copies_in(dir.path());
+
+        assert!(link.exists(), "symlink entries are left in place");
+        assert_eq!(
+            std::fs::read(&victim).expect("read victim"),
+            b"untouched",
+            "the sweep must never write through a symlink"
+        );
     }
 }
 
@@ -1420,7 +1481,7 @@ mod tests {
                     .open(&probe)
                     .map(|f| {
                         drop(f);
-                        let _ = remove_file(&probe);
+                        let _ = std::fs::remove_file(&probe);
                         true
                     })
                     .unwrap_or(false)

@@ -40,7 +40,8 @@
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use hmac::{Hmac, Mac};
 use serde_json::Value;
@@ -49,6 +50,75 @@ use subtle::ConstantTimeEq;
 
 use crate::errors::{InitError, Result};
 use crate::secrets::DerivedSeed;
+
+/// Root-only directory holding every piece of plaintext LUKS material this
+/// process writes (detached header copies, temporary key files).
+///
+/// The shared `/run/enclava` unlock-socket emptyDir is writable by the
+/// workload container (pod `fsGroup` 10001), so a predictable file name
+/// directly in it can be unlinked and replaced between our write and
+/// cryptsetup's pathname re-resolution — substituting unauthenticated
+/// header metadata, or (via a symlink) turning a cleanup wipe into a
+/// root-owned zero-write to an arbitrary target. Material therefore lives
+/// in a 0700 root-owned subdirectory the workload cannot enter, replace,
+/// or empty (a permanent `.keep` entry keeps it non-empty, which is what
+/// blocks `rmdir`-and-swap of the directory entry itself), and every open
+/// of a material path refuses to follow symlinks (cap#244 review).
+pub const PRIVATE_MATERIAL_DIR: &str = "/run/enclava/luks-private";
+
+/// Name of the permanent entry that keeps [`PRIVATE_MATERIAL_DIR`]
+/// non-empty forever, so a workload with write access to the parent
+/// directory can never `rmdir` the empty directory and replace the entry.
+const PRIVATE_MATERIAL_KEEP_FILE: &str = ".keep";
+
+/// Detached-header copies this process has written and not yet wiped.
+///
+/// Copy names embed the PID plus a counter, so concurrent opens in one
+/// process share the naming scheme and the orphan sweep would otherwise
+/// mistake an in-flight copy of ours for a crashed leftover and wipe it
+/// while another call's cryptsetup is reading it (cap#244 review). The
+/// sweep skips registered paths; registration covers the whole
+/// write-to-wipe lifetime.
+static ACTIVE_DETACHED_COPIES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+fn register_active_detached_copy(path: &Path) {
+    let mut active = ACTIVE_DETACHED_COPIES
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if !active.iter().any(|p| p == path) {
+        active.push(path.to_path_buf());
+    }
+}
+
+fn unregister_active_detached_copy(path: &Path) {
+    let mut active = ACTIVE_DETACHED_COPIES
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    active.retain(|p| p != path);
+}
+
+/// Test hook for the sweep's registry behavior (see the unit tests in
+/// `luks.rs`): marks a path as an in-flight detached copy.
+#[cfg(test)]
+pub(crate) fn register_active_detached_copy_for_test(path: &Path) {
+    register_active_detached_copy(path);
+}
+
+/// Test hook: clears an in-flight registration again.
+#[cfg(test)]
+pub(crate) fn unregister_active_detached_copy_for_test(path: &Path) {
+    unregister_active_detached_copy(path);
+}
+
+/// True while a detached copy at `path` is written but not yet wiped by
+/// this process. The orphan sweep must leave such a copy alone even though
+/// its PID component is our own (a concurrent open in this process).
+pub fn is_active_detached_copy(path: &Path) -> bool {
+    let active = ACTIVE_DETACHED_COPIES
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    active.iter().any(|p| p == path)
+}
 
 /// Size of one LUKS2 metadata copy (binary header + JSON area). `hdr_size` in
 /// the on-disk binary header; cryptsetup has always used 16 KiB and our
@@ -469,22 +539,109 @@ pub fn seal_on_disk(device: &Path, region: &Luks2Region, mac_key: &DerivedSeed) 
 /// reaches host-controlled persistent storage, and the filesystem must have
 /// room for the full `[0, data_offset)` region — both enforced here rather
 /// than assumed from the deployment layout (cap#242 review).
+///
+/// The copy is registered as active for its whole write-to-wipe lifetime so
+/// the orphan sweep never wipes a copy a concurrent open is still using
+/// (cap#244 review).
 pub fn write_detached_copy(region: &Luks2Region, path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| luks_error(format!("create {}: {e}", parent.display())))?;
+        ensure_private_material_dir(parent)?;
         ensure_detached_copy_filesystem(parent, region.bytes.len())?;
     }
-    let mut file = OpenOptions::new()
+    // Registered BEFORE the file exists: the sweep checks the registry per
+    // directory entry, so a copy another call is about to create can never
+    // be observed unregistered-but-present.
+    register_active_detached_copy(path);
+    let write = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| luks_error(format!("create detached header {}: {e}", path.display())))?;
+        file.write_all(&region.detached_bytes())
+            .map_err(|e| luks_error(format!("write detached header {}: {e}", path.display())))?;
+        file.sync_all()
+            .map_err(|e| luks_error(format!("sync detached header {}: {e}", path.display())))?;
+        Ok(())
+    })();
+    if write.is_err() {
+        unregister_active_detached_copy(path);
+    }
+    write
+}
+
+/// Create (or validate) a private material directory at `dir`.
+///
+/// Fail closed on anything that is not a root-owned (effective uid),
+/// 0700 real directory — a symlink or a workload-created directory must
+/// never be trusted, since every later pathname resolution (including
+/// cryptsetup's) goes through it. The directory is created 0700 and given
+/// a permanent `.keep` entry so it can never become empty again: a
+/// workload with write access to the parent directory can `rmdir` an
+/// empty directory and replace the entry, but never a non-empty one
+/// (unlinking `.keep` would require write access to the 0700 directory).
+/// The validation is repeated after the entry is created, closing the
+/// create-to-validate window (cap#244 review).
+pub fn ensure_private_material_dir(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+    fn validate_private_dir(dir: &Path) -> Result<()> {
+        let meta = std::fs::symlink_metadata(dir)
+            .map_err(|e| luks_error(format!("stat {}: {e}", dir.display())))?;
+        if !meta.file_type().is_dir() {
+            return Err(luks_error(format!(
+                "private material path {} is not a real directory (symlink or other file); \
+                 refusing to use a replaceable pathname",
+                dir.display()
+            )));
+        }
+        let euid = nix::unistd::Uid::effective().as_raw();
+        if meta.uid() != euid {
+            return Err(luks_error(format!(
+                "private material directory {} is owned by uid {}, not euid {euid}; refusing",
+                dir.display(),
+                meta.uid()
+            )));
+        }
+        if meta.permissions().mode() & 0o077 != 0 {
+            return Err(luks_error(format!(
+                "private material directory {} has mode {:o}, accessible to group/other; \
+                 refusing (must be 0700)",
+                dir.display(),
+                meta.permissions().mode() & 0o7777
+            )));
+        }
+        Ok(())
+    }
+
+    match std::fs::symlink_metadata(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(dir)
+                .map_err(|e| luks_error(format!("create {}: {e}", dir.display())))?;
+        }
+        Err(e) => return Err(luks_error(format!("stat {}: {e}", dir.display()))),
+        Ok(_) => validate_private_dir(dir)?,
+    }
+    // Permanent non-empty marker (see the doc comment). create_new refuses
+    // to touch anything already at the name (including a symlink).
+    let keep = dir.join(PRIVATE_MATERIAL_KEEP_FILE);
+    match OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(path)
-        .map_err(|e| luks_error(format!("create detached header {}: {e}", path.display())))?;
-    file.write_all(&region.detached_bytes())
-        .map_err(|e| luks_error(format!("write detached header {}: {e}", path.display())))?;
-    file.sync_all()
-        .map_err(|e| luks_error(format!("sync detached header {}: {e}", path.display())))?;
+        .open(&keep)
+    {
+        Ok(file) => drop(file),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(luks_error(format!("create {}: {e}", keep.display()))),
+    }
+    // Re-validate after the window between create and validate: if a
+    // workload replaced the directory entry in that window, the entry is
+    // no longer root-owned and this fails closed.
+    validate_private_dir(dir)?;
     Ok(())
 }
 
@@ -514,13 +671,35 @@ fn ensure_detached_copy_filesystem(dir: &Path, region_len: usize) -> Result<()> 
 }
 
 /// Best-effort wipe of a detached header copy (zeroize then remove).
+///
+/// Never follows a replaceable pathname (cap#244 review): the file is
+/// opened with `O_NOFOLLOW` and zeroed only when that open resolved to a
+/// regular file, so a symlink swapped in at the name cannot redirect a
+/// root-owned header-sized zero buffer to an arbitrary target. The final
+/// unlink removes the entry itself (symlink included) without following
+/// anything. Unregisters the copy from the active set last, so a
+/// concurrent sweep still sees it as in use while it is being wiped.
 pub fn wipe_detached_copy(path: &Path, len: usize) {
-    if let Ok(mut file) = OpenOptions::new().write(true).open(path) {
-        let zeros = vec![0u8; len];
-        let _ = file.write_all(&zeros);
-        let _ = file.sync_all();
+    if let Ok(file) = OpenOptions::new()
+        .write(true)
+        .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
+        .open(path)
+    {
+        // metadata() on an open fd is fstat: no path re-resolution, and it
+        // reflects what we actually opened.
+        if file
+            .metadata()
+            .map(|m| m.file_type().is_file())
+            .unwrap_or(false)
+        {
+            let zeros = vec![0u8; len];
+            let mut file = file;
+            let _ = file.write_all(&zeros);
+            let _ = file.sync_all();
+        }
     }
     let _ = std::fs::remove_file(path);
+    unregister_active_detached_copy(path);
 }
 
 /// Parse `cryptsetup --version` output (e.g. `cryptsetup 2.8.8 flags: ...`
@@ -911,4 +1090,96 @@ mod tests {
     // MAC slot must live strictly beyond it, inside the zero padding.
     const _: () = assert!(HEADER_MAC_SLOT_OFFSET >= 0x1e0);
     const _: () = assert!(HEADER_MAC_SLOT_OFFSET + HEADER_MAC_LEN <= LUKS2_JSON_SUB_OFFSET);
+
+    #[test]
+    fn active_detached_copy_registry_tracks_write_to_wipe_lifetime() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let path = dir.path().join("luks-header-test-registry");
+        assert!(!is_active_detached_copy(&path));
+        register_active_detached_copy(&path);
+        assert!(is_active_detached_copy(&path));
+        unregister_active_detached_copy(&path);
+        assert!(!is_active_detached_copy(&path));
+    }
+
+    #[test]
+    fn wipe_detached_copy_refuses_to_follow_a_symlink() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"untouched").expect("write victim");
+        let link = dir.path().join("luks-header-link");
+        std::os::unix::fs::symlink(&victim, &link).expect("plant symlink");
+
+        wipe_detached_copy(&link, 4096);
+
+        // The symlink entry is removed but the target is never zeroed: a
+        // workload-planted symlink must not become an arbitrary-file
+        // zero-write when root cleans up (cap#244 review).
+        assert!(!link.exists(), "symlink entry itself must be unlinked");
+        assert_eq!(
+            std::fs::read(&victim).expect("read victim"),
+            b"untouched",
+            "symlink target must not be followed by the wipe"
+        );
+    }
+
+    #[test]
+    fn wipe_detached_copy_zeroes_and_removes_regular_files() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let path = dir.path().join("luks-header-wipe");
+        std::fs::write(&path, vec![0xABu8; 64]).expect("write copy");
+        wipe_detached_copy(&path, 64);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn private_material_dir_is_created_0700_with_permanent_entry() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let private = dir.path().join("luks-private");
+        ensure_private_material_dir(&private).expect("create private dir");
+        let meta = std::fs::symlink_metadata(&private).expect("stat private dir");
+        assert!(meta.file_type().is_dir());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+        // The permanent entry keeps the directory non-empty forever, which
+        // is what prevents a workload with write access to the parent from
+        // rmdir-ing and replacing the directory entry.
+        assert!(private.join(PRIVATE_MATERIAL_KEEP_FILE).exists());
+        // Idempotent on repeat.
+        ensure_private_material_dir(&private).expect("validate existing private dir");
+    }
+
+    #[test]
+    fn private_material_dir_refuses_symlink_and_group_writable_dirs() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("temporary directory");
+
+        // A symlink at the name must never be followed.
+        let target = dir.path().join("elsewhere");
+        std::fs::create_dir(&target).expect("create target");
+        let link = dir.path().join("luks-private-link");
+        std::os::unix::fs::symlink(&target, &link).expect("plant symlink");
+        let err = ensure_private_material_dir(&link).expect_err("symlink must be refused");
+        assert!(
+            err.to_string().contains("not a real directory"),
+            "unexpected error: {err}"
+        );
+
+        // A group/other-accessible directory must be refused even when it
+        // is a real directory.
+        let loose = dir.path().join("luks-private-loose");
+        std::fs::create_dir(&loose).expect("create loose dir");
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o750))
+            .expect("chmod loose dir");
+        let err = ensure_private_material_dir(&loose).expect_err("loose dir must be refused");
+        assert!(
+            err.to_string().contains("accessible to group/other"),
+            "unexpected error: {err}"
+        );
+
+        // A plain file at the name must be refused too.
+        let file = dir.path().join("luks-private-file");
+        std::fs::write(&file, b"x").expect("write file");
+        assert!(ensure_private_material_dir(&file).is_err());
+    }
 }
