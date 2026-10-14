@@ -413,6 +413,55 @@ impl AppMutationLease {
         Ok(())
     }
 
+    /// Fail-closed fallback when the full retained-marker write could not be
+    /// persisted (Codex P1): relabel the namespace fence rows so
+    /// [`reconcile_orphaned_deployment_apply_leases`] — which joins on
+    /// `operation_kind = 'deployment_apply'` — can never convert the
+    /// pre-armed infinite fence into the bounded 360 s reclaim window while
+    /// the namespace DELETE is still in flight. Unlike
+    /// [`Self::retain_resource_scope_under_marker`] this skips the app
+    /// deployment-lane lock (which may itself be the failing step) and only
+    /// performs the durable relabel + poison, retried by the caller. The
+    /// label is the same retained marker on purpose: the retained-fence
+    /// reconciler then releases it exactly when the namespace is observed
+    /// gone — safe in both the fallback and the normal path — while a
+    /// never-reconciled special label would wedge the name permanently.
+    pub async fn relabel_namespace_fence_fail_closed(
+        &self,
+        resource_scope: &str,
+        marker_operation_kind: &str,
+    ) -> Result<(), MutationLeaseError> {
+        let mut tx = self.pool.begin().await?;
+        for resource in self
+            .resources
+            .iter()
+            .filter(|resource| resource.fence.scope == resource_scope)
+        {
+            let result = sqlx::query(
+                "UPDATE external_resource_mutation_leases
+                    SET operation_kind = $5,
+                        reclaim_after = 'infinity'::timestamptz,
+                        updated_at = clock_timestamp()
+                  WHERE resource_scope = $1
+                    AND resource_key = $2
+                    AND owner_token = $3
+                    AND generation = $4",
+            )
+            .bind(&resource.fence.scope)
+            .bind(&resource.fence.key)
+            .bind(self.token)
+            .bind(resource.generation)
+            .bind(marker_operation_kind)
+            .execute(&mut *tx)
+            .await?;
+            if result.rows_affected() != 1 {
+                return Err(MutationLeaseError::Lost);
+            }
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Stop renewal after a provider future has returned, but preserve the
     /// existing quarantine before this exact app/resource generation may be
     /// reclaimed. This converts any pre-send infinite ambiguity fence back to

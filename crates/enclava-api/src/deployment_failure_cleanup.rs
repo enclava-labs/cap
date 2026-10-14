@@ -240,7 +240,7 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
     // a query failure counts as sweep failure (retryable), not as "no
     // window" (which would silently skip claims then clear evidence
     // over them).
-    let (sts_proven_windows, reached_sts_step_without_window, legacy_unmarked_row) =
+    let (sts_proven_windows, reached_sts_step_without_window, legacy_row_started_at) =
         match sqlx::query_as::<
             _,
             (
@@ -250,10 +250,11 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
                 Option<chrono::DateTime<chrono::Utc>>,
                 Option<String>,
                 Option<chrono::DateTime<chrono::Utc>>,
+                chrono::DateTime<chrono::Utc>,
             ),
         >(
             "SELECT sts_uid, sts_created_at, sts_observed_deleted_at, sts_apply_started_at,
-                manifest_hash, apply_started_at
+                manifest_hash, apply_started_at, created_at
            FROM deployments
           WHERE app_id = $1
             AND (id = $2 OR cleanup_sweep_incomplete)",
@@ -265,7 +266,7 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
         {
             Ok(rows) => (
                 rows.iter()
-                    .filter_map(|(uid, created_at, _, _, _, _)| {
+                    .filter_map(|(uid, created_at, _, _, _, _, _)| {
                         // A row counts as a proven lineage record when the
                         // apply response (or a prior sweep) persisted the
                         // server-reported sts provenance.
@@ -277,12 +278,13 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
                 // write failed): its claims are unprovable — an out-of-window
                 // matching claim may still be that row's, so "foreign" skips
                 // must not let the sweep complete over it.
-                rows.iter().any(|(_, created_at, _, apply_started, _, _)| {
-                    apply_started.is_some() && created_at.is_none()
-                }),
-                any_legacy_evidence_row(rows.iter().map(
-                    |(_, _, _, _, manifest_hash, apply_started)| {
-                        (manifest_hash.as_deref(), *apply_started)
+                rows.iter()
+                    .any(|(_, created_at, _, apply_started, _, _, _)| {
+                        apply_started.is_some() && created_at.is_none()
+                    }),
+                earliest_legacy_row_started_at(rows.iter().map(
+                    |(_, _, _, _, manifest_hash, apply_started, row_created_at)| {
+                        (manifest_hash.as_deref(), *apply_started, *row_created_at)
                     },
                 )),
             ),
@@ -445,7 +447,28 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
                 // StatefulSet/Secret/Service/ConfigMaps (no later
                 // eligibility would ever exist). Count it as a failure:
                 // fail closed, keep both rows retryable.
-                if legacy_unmarked_row {
+                // Temporal carve-out (devin 🔴 follow-up): an object
+                // provably created BEFORE the earliest legacy row existed
+                // cannot be a legacy row's product — the pre-existing
+                // tenant ServiceAccount/ResourceQuota/Service with a
+                // target-shaped name. It stays foreign and is skipped:
+                // counting it would wedge the sweep (the ownership gate
+                // keeps it forever) and block storage-size changes
+                // permanently.
+                let provably_predates_legacy_rows = live
+                    .metadata
+                    .creation_timestamp
+                    .as_ref()
+                    .and_then(|ts| {
+                        ts.0.to_string()
+                            .parse::<chrono::DateTime<chrono::Utc>>()
+                            .ok()
+                    })
+                    .zip(legacy_row_started_at)
+                    .is_some_and(|(object_created, legacy_started)| {
+                        object_created < legacy_started
+                    });
+                if legacy_row_started_at.is_some() && !provably_predates_legacy_rows {
                     tracing::warn!(
                         app_id = %app.id,
                         namespace = %app.namespace,
@@ -763,10 +786,30 @@ where
 /// sweep's row set, a live target WITHOUT creation evidence is therefore
 /// unresolved, not foreign: count it as a failure so the sweep stays
 /// incomplete and both rows keep their evidence (retryable, fail closed).
-fn any_legacy_evidence_row<'a>(
-    mut rows: impl Iterator<Item = (Option<&'a str>, Option<chrono::DateTime<chrono::Utc>>)>,
-) -> bool {
-    rows.any(|(manifest_hash, apply_started)| manifest_hash.is_some() && apply_started.is_none())
+///
+/// Returns the EARLIEST such row's `created_at` so the caller can
+/// temporally carve out objects that provably predate every legacy row
+/// (devin 🔴 follow-up): a pre-existing tenant object with a target-shaped
+/// name — the ServiceAccount or ResourceQuota every namespace shares, a
+/// Service matching the app name — can never be deleted by the sweep (the
+/// ownership gate keeps it), so counting it as a failure would wedge
+/// cleanup and block storage-size changes forever. An object created
+/// strictly before the earliest legacy row's row-creation instant cannot
+/// be any legacy row's product and is skipped as foreign.
+fn earliest_legacy_row_started_at<'a>(
+    rows: impl Iterator<
+        Item = (
+            Option<&'a str>,
+            Option<chrono::DateTime<chrono::Utc>>,
+            chrono::DateTime<chrono::Utc>,
+        ),
+    >,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    rows.filter(|(manifest_hash, apply_started, _)| {
+        manifest_hash.is_some() && apply_started.is_none()
+    })
+    .map(|(_, _, row_created_at)| row_created_at)
+    .min()
 }
 
 /// Bounded re-read retry budget for preconditioned sweep deletes.
@@ -3224,27 +3267,46 @@ mod tests {
     /// rows; their objects can never carry creation evidence, so live
     /// unmarked targets under them must count as sweep failures, not skips.
     #[test]
-    fn legacy_evidence_row_detection() {
-        let t = chrono_time("2026-10-14T10:00:00Z");
-        // Legacy row: evidence without apply_started_at.
-        assert!(any_legacy_evidence_row(
-            [(Some("abc123"), None)].into_iter()
-        ));
-        // Modern row: both stamped.
-        assert!(!any_legacy_evidence_row(
-            [(Some("abc123"), Some(t))].into_iter()
-        ));
+    fn earliest_legacy_row_started_at_selects_earliest_legacy_row() {
+        let t0 = chrono_time("2026-10-14T10:00:00Z");
+        let t1 = chrono_time("2026-10-14T11:00:00Z");
+        let t2 = chrono_time("2026-10-14T12:00:00Z");
+        // Single legacy row: its row creation is the bound.
+        assert_eq!(
+            earliest_legacy_row_started_at([(Some("abc123"), None, t1)].into_iter()),
+            Some(t1)
+        );
+        // Modern rows: no legacy bound.
+        assert_eq!(
+            earliest_legacy_row_started_at([(Some("abc123"), Some(t0), t1)].into_iter()),
+            None
+        );
         // No evidence at all: not a legacy evidence row.
-        assert!(!any_legacy_evidence_row([(None, None)].into_iter()));
-        // Mixed set: one legacy row among modern ones still flags.
-        assert!(any_legacy_evidence_row(
-            [
-                (Some("new-gen"), Some(t)),
-                (Some("old-gen"), None),
-                (None, None),
-            ]
-            .into_iter()
-        ));
+        assert_eq!(
+            earliest_legacy_row_started_at([(None, None, t1)].into_iter()),
+            None
+        );
+        // Mixed set: the EARLIEST legacy row's created_at wins — an object
+        // created strictly before it provably predates every legacy row.
+        assert_eq!(
+            earliest_legacy_row_started_at(
+                [
+                    (Some("new-gen"), Some(t0), t0),
+                    (Some("old-gen"), None, t2),
+                    (Some("oldest-gen"), None, t1),
+                    (None, None, t0),
+                ]
+                .into_iter()
+            ),
+            Some(t1)
+        );
+        // The temporal carve-out predicate: only strictly-before counts as
+        // provably pre-existing (ties at second precision stay unresolved).
+        let bound = earliest_legacy_row_started_at([(Some("old-gen"), None, t1)].into_iter())
+            .expect("legacy row present");
+        assert!(chrono_time("2026-10-14T10:59:59Z") < bound);
+        assert!(!(chrono_time("2026-10-14T11:00:00Z") < bound));
+        assert!(!(chrono_time("2026-10-14T11:00:01Z") < bound));
     }
 
     fn chrono_time(rfc3339: &str) -> chrono::DateTime<chrono::Utc> {

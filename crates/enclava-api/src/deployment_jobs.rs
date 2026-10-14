@@ -2520,11 +2520,45 @@ async fn fail_apply_job_with_mutation(
                     .await;
                 }
                 Err(retain_error) => {
-                    tracing::error!(
-                        deployment_id = %job.deployment_id,
-                        error_code = DeploymentJobError::from(retain_error).code(),
-                        "failed to retain the namespace fence after incomplete teardown despite retries; falling back to bounded quarantine"
-                    );
+                    // Codex P1 (relabel on failure): the durable label is
+                    // what keeps `reconcile_orphaned_deployment_apply_leases`
+                    // from re-bounding the pre-armed infinite fence into the
+                    // 360 s reclaim window. Retry a lane-lock-free relabel
+                    // before giving up: it persists the same fail-closed
+                    // marker state the full write would have.
+                    let mut relabeled = false;
+                    for relabel_attempt in 0..2 {
+                        match mutation
+                            .relabel_namespace_fence_fail_closed(
+                                "kubernetes_namespace",
+                                crate::mutation_leases::RETAINED_DEPLOYMENT_NAMESPACE_OPERATION,
+                            )
+                            .await
+                        {
+                            Ok(()) => {
+                                relabeled = true;
+                                break;
+                            }
+                            Err(relabel_error) => {
+                                tracing::warn!(
+                                    deployment_id = %job.deployment_id,
+                                    error_code = DeploymentJobError::from(relabel_error).code(),
+                                    relabel_attempt,
+                                    "fail-closed namespace fence relabel failed; retrying"
+                                );
+                                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                            }
+                        }
+                    }
+                    if relabeled {
+                        retain_marker_persisted = true;
+                    } else {
+                        tracing::error!(
+                            deployment_id = %job.deployment_id,
+                            error_code = DeploymentJobError::from(retain_error).code(),
+                            "failed to persist the retained namespace fence marker AND its fail-closed relabel; the orphan reconciler may re-bound the fence"
+                        );
+                    }
                     break;
                 }
             }
