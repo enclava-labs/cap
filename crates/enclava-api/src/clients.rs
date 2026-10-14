@@ -356,6 +356,16 @@ fn build_inner(config: &ClientConfig) -> Result<reqwest::Client, ClientError> {
         .build()?)
 }
 
+/// Parse a URL host as a literal IP if it is one. Brackets are Url's
+/// spelling for IPv6 literals; stripping them lets a single `IpAddr` parse
+/// cover both families.
+fn parse_literal_ip(host: &str) -> Option<IpAddr> {
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<IpAddr>()
+        .ok()
+}
+
 /// Pre-flight destination check for outbound URLs whose transport cannot be
 /// routed through `build_guarded_client` (issue #224): reqwest never
 /// consults a custom DNS resolver for literal-IP hosts, so a literal such
@@ -379,13 +389,7 @@ pub async fn check_egress_destination(
     {
         return Err(ClientError::HostNotAllowed(host.to_string()));
     }
-    // Brackets are Url's spelling for IPv6 literals; strip them so the
-    // single IpAddr parse covers both families.
-    if let Ok(addr) = host
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .parse::<IpAddr>()
-    {
+    if let Some(addr) = parse_literal_ip(host) {
         if blocked.contains(addr) {
             return Err(ClientError::BlockedAddress(format!("{addr} (literal)")));
         }
@@ -430,6 +434,7 @@ pub async fn check_egress_destination(
 pub struct RegistryClient {
     inner: reqwest::Client,
     allowlist: AllowList,
+    blocked: Arc<BlockedNetworks>,
     body_limit: u64,
 }
 
@@ -444,6 +449,7 @@ impl RegistryClient {
         Ok(Self {
             inner: build_inner(&config)?,
             allowlist,
+            blocked: Arc::clone(&config.blocked),
             body_limit: config.body_limit_bytes,
         })
     }
@@ -471,6 +477,17 @@ impl RegistryClient {
         let host = parsed.host_str().ok_or(ClientError::MissingHost)?;
         if !self.allowlist.allows(host) {
             return Err(ClientError::HostNotAllowed(host.to_string()));
+        }
+        // reqwest bypasses its custom DNS resolver for literal-IP hosts, so
+        // the GuardedResolver blocklist never sees them — an allowlisted
+        // literal (e.g. a custom REGISTRY_ALLOWLIST entry like `10.0.5.7`)
+        // would otherwise be dialed directly. Every request this client
+        // issues goes through here, so enforce the literal-IP blocklist at
+        // the same pre-flight point (cap#241 review).
+        if let Some(addr) = parse_literal_ip(host)
+            && self.blocked.contains(addr)
+        {
+            return Err(ClientError::BlockedAddress(format!("{addr} (literal)")));
         }
         Ok(())
     }
@@ -671,6 +688,34 @@ mod tests {
             .check_url("http://ghcr.io/v2/foo/manifests/x")
             .unwrap_err();
         assert!(matches!(err, ClientError::SchemeNotAllowed(_)));
+    }
+
+    #[test]
+    fn registry_client_rejects_allowlisted_private_literal_ip() {
+        // cap#241 review: reqwest bypasses GuardedResolver for literal-IP
+        // hosts, so an operator adding a private literal to
+        // REGISTRY_ALLOWLIST must not let tag resolution dial it. The
+        // literal-IP blocklist is enforced in check_url itself.
+        let allow = AllowList::from_env_or_default(Some("10.0.5.7".into()));
+        let client = RegistryClient::new(cfg(), allow).unwrap();
+        let err = client
+            .check_url("https://10.0.5.7/v2/team/app/manifests/latest")
+            .unwrap_err();
+        assert!(matches!(err, ClientError::BlockedAddress(_)));
+    }
+
+    #[test]
+    fn registry_client_rejects_allowlisted_public_literal_ip() {
+        // A public literal is not on the blocklist and is explicitly
+        // allowlisted by the operator, so — mirroring
+        // check_egress_destination's literal branch — it passes the
+        // pre-flight. Only blocked literals fail; this pins that the two
+        // guards stay consistent rather than silently diverging.
+        let allow = AllowList::from_env_or_default(Some("8.8.8.8".into()));
+        let client = RegistryClient::new(cfg(), allow).unwrap();
+        client
+            .check_url("https://8.8.8.8/v2/team/app/manifests/latest")
+            .unwrap();
     }
 
     #[test]
