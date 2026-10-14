@@ -584,14 +584,22 @@ async fn build_accepted_apply_payload(
     log_encryption: Option<LogEncryptionConfig>,
     delete_app_on_setup_failure: bool,
 ) -> Result<DeploymentApplyJobPayload, sqlx::Error> {
-    // The first deployment of an app is the only rollout that can meet an
-    // unformatted app-data volume and must budget for whole-area
-    // dm-integrity tag initialization.
-    let expects_fresh_volume: bool =
-        sqlx::query_scalar("SELECT NOT EXISTS(SELECT 1 FROM deployments WHERE app_id = $1)")
-            .bind(app_id)
-            .fetch_one(&mut **tx)
-            .await?;
+    // A rollout meets an unformatted (fresh) app-data volume until some
+    // deployment of this app has reached `healthy` — only ready pods prove
+    // the volume was formatted and its dm-integrity tags initialized. A
+    // failed or superseded earlier attempt leaves a row but no formatted
+    // PVC, so its retry still needs the size-based initialization budget.
+    let expects_fresh_volume: bool = sqlx::query_scalar::<_, bool>(
+        "SELECT NOT EXISTS(
+             SELECT 1
+               FROM deployments
+              WHERE app_id = $1
+                AND status = 'healthy'::deploy_status_enum
+         )",
+    )
+    .bind(app_id)
+    .fetch_one(&mut **tx)
+    .await?;
     let accepted_app: App = sqlx::query_as("SELECT * FROM apps WHERE id = $1")
         .bind(app_id)
         .fetch_one(&mut **tx)
@@ -617,7 +625,7 @@ async fn build_accepted_apply_payload(
         artifact_descriptor_core_hash,
         log_encryption,
         delete_app_on_setup_failure,
-        expects_fresh_volume,
+        Some(expects_fresh_volume),
     ))
 }
 
@@ -2163,6 +2171,79 @@ mod tests {
             .rollback()
             .await
             .expect("release worker authority lane");
+
+        delete_setup_test_org(&pool, app.org_id).await;
+    }
+
+    #[tokio::test]
+    async fn fresh_volume_hint_requires_healthy_predecessor_not_row_existence() {
+        let pool = database_test_pool().await;
+        let app = insert_setup_test_app(&pool).await;
+        insert_authority_rows(&pool, &app).await;
+
+        async fn accepted_hint(pool: &sqlx::PgPool, app: &App) -> Option<bool> {
+            let mut tx = pool.begin().await.expect("begin acceptance transaction");
+            let payload = build_accepted_apply_payload(
+                &mut tx,
+                app.id,
+                None,
+                "test-api-key".to_string(),
+                "https://api.example.test".to_string(),
+                None,
+                None,
+                None,
+                false,
+            )
+            .await
+            .expect("build accepted payload");
+            tx.rollback()
+                .await
+                .expect("roll back acceptance transaction");
+            payload.expects_fresh_volume
+        }
+
+        // No deployment rows at all: the rollout may meet a fresh volume.
+        assert_eq!(accepted_hint(&pool, &app).await, Some(true));
+
+        // A failed first deployment leaves a row but no formatted PVC: the
+        // retry still expects a fresh volume and keeps the size-based budget.
+        sqlx::query(
+            "INSERT INTO deployments (id, org_id, app_id, trigger, spec_snapshot, image_digest, status)
+             VALUES ($1, $2, $3, 'api', '{}'::jsonb,
+                     'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                     'failed'::deploy_status_enum)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(app.org_id)
+        .bind(app.id)
+        .execute(&pool)
+        .await
+        .expect("insert failed first deployment");
+        assert_eq!(
+            accepted_hint(&pool, &app).await,
+            Some(true),
+            "a failed first attempt must not strip the initialization budget from its retry"
+        );
+
+        // Only a deployment that reached healthy proves the volume was
+        // formatted: later rollouts keep the baseline budget.
+        sqlx::query(
+            "INSERT INTO deployments (id, org_id, app_id, trigger, spec_snapshot, image_digest, status)
+             VALUES ($1, $2, $3, 'api', '{}'::jsonb,
+                     'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+                     'healthy'::deploy_status_enum)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(app.org_id)
+        .bind(app.id)
+        .execute(&pool)
+        .await
+        .expect("insert healthy deployment");
+        assert_eq!(
+            accepted_hint(&pool, &app).await,
+            Some(false),
+            "a healthy predecessor proves the volume is initialized"
+        );
 
         delete_setup_test_org(&pool, app.org_id).await;
     }

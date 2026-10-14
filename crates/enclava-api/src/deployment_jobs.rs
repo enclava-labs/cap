@@ -68,12 +68,15 @@ pub struct DeploymentApplyJobPayload {
     /// delete it after all tracked DNS records have been removed.
     pub delete_app_on_setup_failure: bool,
     /// True when this rollout may meet an unformatted app-data volume and
-    /// must budget for whole-area dm-integrity tag initialization (the
-    /// app's first deployment). Frozen at acceptance so original and
-    /// resumed observers classify identically. Defaults to false for
-    /// payloads serialized before the field existed.
+    /// must budget for whole-area dm-integrity tag initialization. Frozen at
+    /// acceptance (`Some`) so original and resumed observers classify
+    /// identically. `None` means the payload was serialized before the
+    /// field existed (or by a path without deployment history): a resumed
+    /// observer must recompute it from durable deployment rows instead of
+    /// assuming false, so a still-initializing first rollout keeps its
+    /// size-based budget across an API upgrade.
     #[serde(default)]
-    pub expects_fresh_volume: bool,
+    pub expects_fresh_volume: Option<bool>,
 }
 
 impl DeploymentApplyJobPayload {
@@ -99,7 +102,7 @@ impl DeploymentApplyJobPayload {
             artifact_descriptor_core_hash,
             log_encryption,
             delete_app_on_setup_failure,
-            false,
+            None,
         )
     }
 
@@ -114,7 +117,7 @@ impl DeploymentApplyJobPayload {
         artifact_descriptor_core_hash: Option<[u8; 32]>,
         log_encryption: Option<LogEncryptionConfig>,
         delete_app_on_setup_failure: bool,
-        expects_fresh_volume: bool,
+        expects_fresh_volume: Option<bool>,
     ) -> Self {
         Self {
             version: JOB_PAYLOAD_VERSION,
@@ -1752,13 +1755,22 @@ async fn apply_claimed_job(
             let engine = ApplyEngine::try_default()
                 .await
                 .map_err(|error| DeploymentJobError::Apply(error.into()))?;
+            // A payload serialized before `expects_fresh_volume` existed has
+            // no frozen hint. Recompute from durable deployment rows rather
+            // than assuming false, so a first rollout still initializing a
+            // large fresh volume keeps its size-based budget after an API
+            // upgrade; the observing window itself stays anchored.
+            let expects_fresh_volume = match payload.expects_fresh_volume {
+                Some(hint) => hint,
+                None => !crate::deploy::app_has_initialized_volume(&state.db, job.app_id).await?,
+            };
             let outcome = DeploymentRollout::observe_only(
                 *app,
                 engine,
                 manifest_hash,
                 observing_since,
                 &payload.snapshot.resources.app_data_size,
-                payload.expects_fresh_volume,
+                expects_fresh_volume,
             )
             .watch()
             .await;
@@ -2975,6 +2987,26 @@ mod tests {
             None,
             false,
         )
+    }
+
+    #[test]
+    fn pre_upgrade_payload_without_fresh_volume_hint_deserializes_as_unknown() {
+        // Payloads serialized before `expects_fresh_volume` existed must not
+        // deserialize as a confident false: the resumed observer recomputes
+        // the hint from durable deployment rows instead.
+        let app = test_app(Uuid::new_v4(), Uuid::new_v4());
+        let payload = test_payload(&app);
+        let mut json = serde_json::to_value(&payload).expect("encode current apply payload");
+        assert!(
+            json.as_object_mut()
+                .unwrap()
+                .remove("expects_fresh_volume")
+                .is_some(),
+            "current payloads must carry the fresh-volume hint"
+        );
+        let decoded: DeploymentApplyJobPayload =
+            serde_json::from_value(json).expect("decode pre-upgrade payload");
+        assert_eq!(decoded.expects_fresh_volume, None);
     }
 
     async fn insert_job_fixture(

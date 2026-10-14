@@ -2044,14 +2044,14 @@ const BASE_ROLLOUT_BUDGET: std::time::Duration = std::time::Duration::from_secs(
 /// heavily loaded storage backend finishes well inside its budget.
 const ROLLOUT_BUDGET_PER_GIB: std::time::Duration = std::time::Duration::from_secs(16);
 
-/// Total rollout budget for a deployment: the fixed baseline plus, only for
-/// the app's first deployment, a linear app-data-size extension rounded up
-/// so fractional sizes (e.g. 1.5Gi) never lose budget. Later redeployments
-/// of an existing volume perform no tag initialization, so they keep the
-/// baseline budget and a stalled rollout still fails within 600s.
-/// Unparseable sizes fall back to the baseline; the entitlement path rejects
-/// those before a job is queued, so this only guards against drift between
-/// acceptance and apply.
+/// Total rollout budget for a deployment: the fixed baseline plus, only when
+/// the app has no deployment that reached `healthy`, a linear app-data-size
+/// extension rounded up so fractional sizes (e.g. 1.5Gi) never lose budget.
+/// Redeployments of an initialized volume perform no tag initialization, so
+/// they keep the baseline budget and a stalled rollout still fails within
+/// 600s. Unparseable sizes fall back to the baseline; the entitlement path
+/// rejects those before a job is queued, so this only guards against drift
+/// between acceptance and apply.
 fn rollout_budget_for(app_data_size: &str, expects_fresh_volume: bool) -> std::time::Duration {
     let extension = if expects_fresh_volume {
         let gib = crate::entitlements::parse_binary_mib(app_data_size, "storage")
@@ -2065,20 +2065,31 @@ fn rollout_budget_for(app_data_size: &str, expects_fresh_volume: bool) -> std::t
     BASE_ROLLOUT_BUDGET + extension
 }
 
-/// True when `deployment_id` is the only deployment row for the app: the
-/// first rollout of an app is the only one that can meet an unformatted
-/// (fresh) app-data volume and must budget for whole-area integrity-tag
-/// initialization. Later redeployments open an existing formatted volume and
-/// keep the baseline budget.
-async fn latest_deployment_is_first_for_app(
+/// True when the app has a deployment that reached `healthy`: only a rollout
+/// whose pods went ready proves the app-data volume was formatted and its
+/// dm-integrity tags initialized (enclava-init completes whole-area tag
+/// initialization before the workload can become ready). Deployment-row
+/// existence is NOT such evidence: a failed or superseded first attempt
+/// leaves a row behind without ever creating or formatting the PVC, so its
+/// retry still meets a fresh volume and must budget for tag initialization.
+/// `rolled_back` rows are excluded: production rollback only targets a
+/// healthy deployment, so any rolled-back generation had a healthy
+/// predecessor.
+pub(crate) async fn app_has_initialized_volume(
     pool: &PgPool,
     app_id: Uuid,
 ) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM deployments WHERE app_id = $1")
-        .bind(app_id)
-        .fetch_one(pool)
-        .await
-        .map(|count| count <= 1)
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(
+             SELECT 1
+               FROM deployments
+              WHERE app_id = $1
+                AND status = 'healthy'::deploy_status_enum
+         )",
+    )
+    .bind(app_id)
+    .fetch_one(pool)
+    .await
 }
 
 /// A rollout handle returned after Kubernetes accepted the rendered manifests.
@@ -2368,7 +2379,7 @@ pub async fn apply_deployment_manifests(
     crate::edge::ensure_haproxy_routes(&pool, &edge_config, Some(edge_config_generation), &routes)
         .await?;
 
-    let expects_fresh_volume = latest_deployment_is_first_for_app(&pool, app.id).await?;
+    let expects_fresh_volume = !app_has_initialized_volume(&pool, app.id).await?;
     Ok(Some(DeploymentRollout {
         app,
         engine,
