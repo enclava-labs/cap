@@ -455,8 +455,23 @@ async fn idle_bounded_copy(a: &mut TcpStream, b: &mut TcpStream) -> std::io::Res
             buf_b[..n].to_vec()
         };
         let dst = if from_a { &mut *b } else { &mut *a };
-        dst.write_all(&data).await?;
-        budget = TUNNEL_IDLE_TIMEOUT; // progress resets the idle clock
+        // The completed read is progress: refresh the idle budget, and
+        // bound the forward write by the SAME window — an upstream that
+        // stops reading (TCP backpressure parks `write_all`) must not
+        // hold the tunnel, and its proxy slot, forever. A forward write
+        // that cannot finish within one idle window tears the tunnel
+        // down (cap#241 review).
+        budget = TUNNEL_IDLE_TIMEOUT;
+        match tokio::time::timeout(budget, dst.write_all(&data)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "egress proxy tunnel idle (stalled forward write)",
+                ));
+            }
+        }
     }
 }
 
@@ -1038,6 +1053,71 @@ mod tests {
         assert!(
             reply.starts_with("HTTP/1.1 200") && reply.ends_with("ok"),
             "half-closed client must receive the upstream reply, got: {reply}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_upstream_write_is_torn_down() {
+        // An upstream that accepts the connection but never READS parks
+        // the proxy's forward write under TCP backpressure. The write is
+        // bounded by one idle window: the tunnel (and its proxy slot)
+        // must be released rather than held forever (cap#241 review).
+        // Note the upstream also never sends anything, so after the
+        // client's payload fills both sockets' buffers the proxy must
+        // hit the stalled-write timeout (TUNNEL_IDLE_TIMEOUT = 5s in
+        // tests) and close the client side.
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let gate = Arc::clone(&release);
+        tokio::spawn(async move {
+            if let Ok((sock, _)) = upstream.accept().await {
+                // Accept but never read; hold the socket open until the
+                // test signals completion.
+                gate.notified().await;
+                drop(sock);
+            }
+        });
+
+        let proxy = EgressProxy::with_http_forwarding(Arc::new(BlockedNetworks::empty()), true);
+        let url = proxy.url().unwrap();
+        let mut stream = connect_raw(&url).await;
+        stream
+            .write_all(
+                format!("CONNECT {upstream_addr} HTTP/1.1\r\nHost: {upstream_addr}\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        // Consume the 200 Connection established.
+        let mut byte = [0u8; 1];
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            let n = stream.read(&mut byte).await.unwrap();
+            assert!(n == 1, "proxy closed before completing the handshake");
+            head.push(byte[0]);
+        }
+        // Upload more than the sockets' combined buffers so the proxy's
+        // forward write blocks on the non-reading upstream.
+        let big = vec![b'x'; 4 * 1024 * 1024];
+        let start = std::time::Instant::now();
+        let write_err = stream.write_all(&big).await;
+        // The client's own write may error first (proxy tore the tunnel
+        // down) or succeed partially — what matters is the proxy side
+        // releases the slot. Wait for the close.
+        let mut chunk = [0u8; 256];
+        let n = tokio::time::timeout(TUNNEL_IDLE_TIMEOUT * 3, stream.read(&mut chunk))
+            .await
+            .expect("proxy must tear the stalled tunnel down, not hang")
+            .unwrap_or(0);
+        release.notify_waiters();
+        assert!(
+            n == 0 || write_err.is_err(),
+            "stalled tunnel must be closed by the idle bound, got {n} bytes"
+        );
+        assert!(
+            start.elapsed() >= TUNNEL_IDLE_TIMEOUT,
+            "teardown must come from the stalled-write bound, not instantly"
         );
     }
 
