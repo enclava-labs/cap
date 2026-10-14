@@ -174,7 +174,7 @@ fn initialize_integrity_tags(dev: &mut CryptDevice, key: &DerivedSeed) -> Result
             Some(&wipe_name),
             None,
             key.as_bytes(),
-            CryptActivate::empty(),
+            CryptActivate::PRIVATE | CryptActivate::NO_JOURNAL,
         )
         .map_err(|e| InitError::Luks(format!("activate wipe mapper: {e}")))?;
 
