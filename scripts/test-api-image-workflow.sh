@@ -92,16 +92,30 @@ done
 # values influenced by ref content or dispatch inputs must reach the shell
 # only through an `env:` binding (runner-set, never shell-parsed). This guards
 # against direct interpolation being reintroduced anywhere in the workflow,
-# not just drift of the exact lines fixed above.
+# not just drift of the exact lines fixed above. Any `run:` value counts —
+# literal blocks (|), folded blocks (>), single-line scalars, and multi-line
+# continuation lines indented deeper than the `run:` key. POSIX awk only (no
+# interval expressions) so the guard also works under BWK awk on macOS.
 run_body_injections="$(
   awk '
-    /run: \|/ { in_run = 1; next }
-    in_run && /^[[:space:]]*$/ { next }
-    in_run && /^[[:space:]]{10,}[^[:space:]]/ {
-      if ($0 ~ /\$\{\{/) print FNR ": " $0
-      next
+    function indent(line) { return match(line, /[^[:space:]]/) - 1 }
+    {
+      if (in_run) {
+        if ($0 ~ /^[[:space:]]*$/) next
+        if (indent($0) > run_indent) {
+          if ($0 ~ /\$\{\{/) print FNR ": " $0
+          next
+        }
+        in_run = 0
+      }
+      if ($0 ~ /^[[:space:]]*run:/) {
+        run_indent = indent($0)
+        value = $0
+        sub(/^[[:space:]]*run:[[:space:]]*/, "", value)
+        if (value ~ /\$\{\{/) print FNR ": " $0
+        in_run = 1
+      }
     }
-    { in_run = 0 }
   ' "$WORKFLOW"
 )"
 [[ -z "$run_body_injections" ]] || {

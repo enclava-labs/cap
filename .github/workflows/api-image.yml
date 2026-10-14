@@ -150,13 +150,14 @@ jobs:
         # execution of tag-name metacharacters; this also keeps malformed tags
         # from burning the keyless signing identity on a subject that
         # scripts/verify-api-image-ref.bash (SIGNER_SUBJECT_PATTERN) would
-        # reject after signing. Mirrors the manual-tag gate above.
-        if: github.event_name == 'push' && github.ref_type == 'tag'
+        # reject after signing. Mirrors the manual-tag gate above. Covers both
+        # the push path and workflow_dispatch runs targeting a tag ref.
+        if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref_type == 'tag'
         env:
           PUSHED_REF: ${{ github.ref }}
         run: |
           if [[ ! "$PUSHED_REF" =~ ^refs/tags/v[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
-            echo "::error::Pushed tag names must match ^v[A-Za-z0-9][A-Za-z0-9._-]*\$ (same alphabet as SIGNER_SUBJECT_PATTERN in scripts/verify-api-image-ref.bash)."
+            echo "::error::Pushed tag names must match ^v[A-Za-z0-9][A-Za-z0-9._-]*$ (same alphabet as SIGNER_SUBJECT_PATTERN in scripts/verify-api-image-ref.bash)."
             exit 1
           fi
 
