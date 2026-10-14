@@ -2560,10 +2560,26 @@ pub(crate) async fn reconcile_signer_publication(
         // rotated-out signer (Codex review finding on #187). Report the
         // publication-pending error instead, exactly like the signed-mode
         // without-configuration case.
-        if crate::kbs::legacy_publication_obligation_recorded(&state.db)
+        let mut obligation_tx = state
+            .db
+            .begin()
             .await
-            .map_err(|_| signer_publication_pending_error())?
-        {
+            .map_err(|_| signer_publication_pending_error())?;
+        // Lock the same sentinel the legacy publication critical section
+        // holds, so this confirmation cannot report success while a
+        // publication that read the pre-rotation bindings is still in
+        // flight on a configured replica; it reports the
+        // publication-pending error exactly like the signed-mode
+        // without-configuration case instead.
+        let obligation_recorded =
+            crate::kbs::lock_and_read_legacy_publication_obligation(&mut *obligation_tx)
+                .await
+                .map_err(|_| signer_publication_pending_error())?;
+        obligation_tx
+            .commit()
+            .await
+            .map_err(|_| signer_publication_pending_error())?;
+        if obligation_recorded {
             tracing::warn!(
                 app_id = %app_id,
                 error_code = SIGNER_ROTATION_PUBLICATION_PENDING_CODE,
@@ -2838,7 +2854,13 @@ pub(crate) async fn rotate_signer_commit(
         // token, identity, withdrawal, and audit mutation and leaves the
         // request retryable. An install that never rendered such a policy
         // has no marker and keeps rotating exactly as before.
-        if crate::kbs::legacy_publication_obligation_recorded(&state.db)
+        // Take the publication-obligation sentinel FOR UPDATE on the
+        // identity transaction: this serializes the refusal decision with
+        // an in-flight legacy publication on a configured replica (the
+        // reconciler holds the same lock across its binding read and
+        // ConfigMap write), so a rotation cannot commit while a publication
+        // that read the pre-rotation bindings is still about to write them.
+        if crate::kbs::lock_and_read_legacy_publication_obligation(&mut *tx)
             .await
             .map_err(|_| internal_server_error())?
         {
