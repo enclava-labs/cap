@@ -515,6 +515,38 @@ pub(crate) async fn load_legacy_tls_bindings(
 /// Signed-policy checks re-run inside the CAS loop so a signed acceptance
 /// that commits mid-render fences this legacy writer before it can retry a
 /// resourceVersion conflict with stale Rego.
+/// Durable evidence that this install has rendered a signer-bearing legacy
+/// Rego policy at least once (migration 0069). A live `kbs_tls_bindings` row
+/// alone cannot prove publication was ever required -- the binding is only
+/// the render source -- so an unconfigured replica may only confirm a signer
+/// rotation while this marker is absent.
+pub(crate) async fn legacy_publication_obligation_recorded(
+    db: &PgPool,
+) -> Result<bool, KbsPolicyError> {
+    let recorded: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM legacy_publication_obligation WHERE singleton)",
+    )
+    .fetch_one(db)
+    .await?;
+    Ok(recorded)
+}
+
+/// Record the legacy publication obligation. Written before any ConfigMap
+/// write so even a failed publication keeps the evidence; recorded once and
+/// never cleared, because soft-deleting a binding does not un-publish the
+/// policy that already carried it.
+pub(crate) async fn record_legacy_publication_obligation(
+    db: &PgPool,
+) -> Result<(), KbsPolicyError> {
+    sqlx::query(
+        "INSERT INTO legacy_publication_obligation (singleton) VALUES (true)
+         ON CONFLICT (singleton) DO NOTHING",
+    )
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
 /// An unchanged ConfigMap may still have an unfinished Trustee rollout.
 async fn reconcile_legacy_rego_policy_with_client(
     db: &PgPool,
@@ -561,6 +593,16 @@ async fn reconcile_legacy_rego_policy_with_client(
         .fetch_all(db)
         .await?;
         let tls_bindings = load_legacy_tls_bindings(db).await?;
+        if !tls_bindings.is_empty() {
+            // This render carries signer identities toward Trustee. Record
+            // the obligation before any ConfigMap write so even a failed
+            // publication keeps the evidence: an unconfigured replica must
+            // not confirm a signer rotation while a previously rendered
+            // legacy policy can still authorize the rotated-out signer.
+            // Recorded once and never cleared -- soft-deleting a binding
+            // does not un-publish the policy that already carried it.
+            record_legacy_publication_obligation(db).await?;
+        }
         let next_policy = replace_tls_resource_bindings_block(current_policy, &tls_bindings)?;
         let next_policy = replace_owner_bindings_block(&next_policy, &bindings)?;
         let policy_sha256_hex = hex::encode(Sha256::digest(next_policy.as_bytes()));
@@ -5591,6 +5633,322 @@ resource_bindings := {
                 .await
                 .expect("delete receipt fixture organization");
         }
+    }
+
+    fn legacy_kbs_test_config() -> KbsPolicyConfig {
+        KbsPolicyConfig {
+            namespace: "kbs-test".to_string(),
+            configmap_name: "resource-policy".to_string(),
+            policy_key: "policy.rego".to_string(),
+            deployment_name: "trustee".to_string(),
+            required: true,
+            signed_policy_retention: 6,
+            signed_policy_max_bytes: 900 * 1024,
+        }
+    }
+
+    async fn insert_legacy_owner_binding(pool: &PgPool, app_id: Uuid, binding_key: &str) {
+        sqlx::query(
+            "INSERT INTO kbs_owner_bindings (
+                 app_id, binding_key, repository, namespace, service_account,
+                 tenant_instance_identity_hash
+             ) VALUES ($1, $2, 'default', 'cap-legacy', 'cap-legacy-sa', $3)",
+        )
+        .bind(app_id)
+        .bind(binding_key)
+        .bind("ab".repeat(32))
+        .execute(pool)
+        .await
+        .expect("insert legacy owner binding");
+    }
+
+    #[tokio::test]
+    async fn rollout_waits_for_old_replicas_to_leave() {
+        for signed in [false, true] {
+            let mut fixture = KbsPolicyProvider::new(true);
+            let token = if signed {
+                "signed-publication"
+            } else {
+                "legacy-publication"
+            };
+            let hash = "ab".repeat(32);
+            let mut annotations = serde_json::json!({
+                POLICY_PUBLICATION_TOKEN_ANNOTATION: token,
+            });
+            if signed {
+                annotations[POLICY_GENERATION_ANNOTATION] = serde_json::json!("1");
+                annotations[POLICY_SHA256_ANNOTATION] = serde_json::json!(hash);
+            }
+            fixture.deployment["spec"]["template"]["metadata"]["annotations"] = annotations;
+            fixture.deployment["status"]["replicas"] = serde_json::json!(2);
+            fixture.deployment_gets_before_failure = Some(1);
+            let provider = std::sync::Arc::new(tokio::sync::Mutex::new(fixture));
+            let client = crate::test_support::kbs_policy_kube_client(provider.clone());
+            let api = Api::<Deployment>::namespaced(client, "kbs-test");
+            let pending = if signed {
+                wait_for_deployment_policy_generation(&api, "trustee", 1, &hash, token, false).await
+            } else {
+                wait_for_legacy_publication(&api, "trustee", token).await
+            };
+            assert!(
+                matches!(pending, Err(KbsPolicyError::Kube(_))),
+                "the old ReplicaSet cannot satisfy publication readiness"
+            );
+            provider.lock().await.deployment["status"]["replicas"] = serde_json::json!(1);
+            let ready = if signed {
+                wait_for_deployment_policy_generation(&api, "trustee", 1, &hash, token, false).await
+            } else {
+                wait_for_legacy_publication(&api, "trustee", token).await
+            };
+            assert_eq!(ready.unwrap(), GenerationDecision::Current);
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_wait_rejects_another_publication() {
+        let mut fixture = KbsPolicyProvider::new(true);
+        fixture.deployment["spec"]["template"]["metadata"]["annotations"] = serde_json::json!({
+            POLICY_PUBLICATION_TOKEN_ANNOTATION: "another-publication",
+        });
+        let provider = std::sync::Arc::new(tokio::sync::Mutex::new(fixture));
+        let client = crate::test_support::kbs_policy_kube_client(provider);
+        let api = Api::<Deployment>::namespaced(client, "kbs-test");
+        assert_eq!(
+            wait_for_legacy_publication(&api, "trustee", "expected-publication")
+                .await
+                .unwrap(),
+            GenerationDecision::Superseded,
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_rollout_fails_closed_until_deployment_converges() {
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap187_legacy_fail_closed").await;
+        let (_org_id, app_id) = insert_test_app(&pool, "running").await;
+        insert_legacy_owner_binding(&pool, app_id, "legacy-owner").await;
+        let config = legacy_kbs_test_config();
+        let provider = std::sync::Arc::new(tokio::sync::Mutex::new(KbsPolicyProvider::new(true)));
+        provider.lock().await.deployment_put_failures = usize::MAX;
+        let client = crate::test_support::kbs_policy_kube_client(provider.clone());
+        crate::kbs::TEST_KUBE_CLIENT
+            .scope(client, async {
+                assert!(reconcile_policy(&pool, Some(&config)).await.is_err());
+                assert!(
+                    provider.lock().await.configmap["data"]["policy.rego"]
+                        .as_str()
+                        .unwrap()
+                        .contains("legacy-owner")
+                );
+                assert!(
+                    reconcile_policy(&pool, Some(&config)).await.is_err(),
+                    "an unchanged ConfigMap with an unconverged deployment marker must fail closed"
+                );
+                provider.lock().await.deployment_put_failures = 0;
+                reconcile_policy(&pool, Some(&config)).await.unwrap();
+                reconcile_policy(&pool, Some(&config)).await.unwrap();
+                reconcile_policy(&pool, Some(&config)).await.unwrap();
+            })
+            .await;
+        let guard = provider.lock().await;
+        assert_eq!(
+            guard.configmap_replaces, 1,
+            "recovery must reuse the persisted ConfigMap, not rewrite it"
+        );
+        assert_eq!(
+            guard.deployment_replaces, 1,
+            "converged passes must not rewrite the Trustee template"
+        );
+    }
+
+    /// The legacy render records the publication obligation before any
+    /// ConfigMap write whenever it carries signer identities (Codex review
+    /// finding on #187): an unconfigured replica may only confirm a signer
+    /// rotation while this durable evidence is absent, and a failed
+    /// publication must not lose the evidence either.
+    #[tokio::test]
+    async fn legacy_render_with_tls_binding_records_publication_obligation() {
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap187_legacy_obligation").await;
+        let (_org_id, app_id) = insert_test_app(&pool, "running").await;
+        assert!(
+            !legacy_publication_obligation_recorded(&pool)
+                .await
+                .expect("read publication obligation on a fresh install"),
+            "a fresh install starts without any legacy publication obligation"
+        );
+        insert_measured_legacy_tls_binding(
+            &pool,
+            app_id,
+            "https://github.com/acme/old/.github/workflows/ci.yaml@refs/heads/main",
+            "https://token.actions.githubusercontent.com",
+            "ghcr.io/enclava-labs/example@sha256:2222222222222222222222222222222222222222222222222222222222222222",
+            &[0x22; 32],
+        )
+        .await;
+        let config = legacy_kbs_test_config();
+        let provider = std::sync::Arc::new(tokio::sync::Mutex::new(KbsPolicyProvider::new(true)));
+        let client = crate::test_support::kbs_policy_kube_client(provider.clone());
+        crate::kbs::TEST_KUBE_CLIENT
+            .scope(client, async {
+                reconcile_policy(&pool, Some(&config)).await.unwrap();
+            })
+            .await;
+        assert!(
+            legacy_publication_obligation_recorded(&pool)
+                .await
+                .expect("read publication obligation after the legacy render"),
+            "a legacy render carrying signer identities must record the publication obligation"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_marker_match_still_requires_readiness_without_new_rollout() {
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap187_legacy_readiness").await;
+        let (_org_id, app_id) = insert_test_app(&pool, "running").await;
+        insert_legacy_owner_binding(&pool, app_id, "legacy-owner").await;
+        let config = legacy_kbs_test_config();
+        let provider = std::sync::Arc::new(tokio::sync::Mutex::new(KbsPolicyProvider::new(true)));
+        provider.lock().await.deployment_gets_before_failure = Some(1);
+        let client = crate::test_support::kbs_policy_kube_client(provider.clone());
+        crate::kbs::TEST_KUBE_CLIENT
+            .scope(client, async {
+                assert!(reconcile_policy(&pool, Some(&config)).await.is_err());
+                assert_eq!(provider.lock().await.deployment_replaces, 1);
+                provider.lock().await.deployment_gets_before_failure = Some(1);
+                assert!(reconcile_policy(&pool, Some(&config)).await.is_err());
+                assert_eq!(provider.lock().await.deployment_replaces, 1);
+                reconcile_policy(&pool, Some(&config)).await.unwrap();
+            })
+            .await;
+        let guard = provider.lock().await;
+        assert_eq!(
+            guard.deployment_replaces, 1,
+            "a readiness-only retry must not rewrite the Trustee template"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_converged_passes_perform_no_recurring_writes() {
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap187_legacy_no_churn").await;
+        let config = legacy_kbs_test_config();
+        let mut fixture = KbsPolicyProvider::new(true);
+        let policy = fixture.configmap["data"]["policy.rego"].as_str().unwrap();
+        let policy = replace_tls_resource_bindings_block(policy, &[]).unwrap();
+        let policy = replace_owner_bindings_block(&policy, &[]).unwrap();
+        fixture.configmap["data"]["policy.rego"] = serde_json::json!(policy);
+        let provider = std::sync::Arc::new(tokio::sync::Mutex::new(fixture));
+        let client = crate::test_support::kbs_policy_kube_client(provider.clone());
+        crate::kbs::TEST_KUBE_CLIENT
+            .scope(client, async {
+                reconcile_policy(&pool, Some(&config)).await.unwrap();
+                reconcile_policy(&pool, Some(&config)).await.unwrap();
+
+                // External metadata-only churn: resourceVersion, labels, and
+                // an unrelated data key advance without a policy change, so
+                // the converged publication must not rewrite anything.
+                let mut guard = provider.lock().await;
+                guard.configmap["metadata"]["resourceVersion"] = serde_json::json!("2");
+                guard.configmap["metadata"]["labels"] = serde_json::json!({"team": "platform"});
+                guard.configmap["data"]["unrelated.txt"] = serde_json::json!("noise");
+                drop(guard);
+
+                reconcile_policy(&pool, Some(&config)).await.unwrap();
+            })
+            .await;
+        let guard = provider.lock().await;
+        assert_eq!(
+            guard.configmap_replaces, 0,
+            "an unchanged ConfigMap must not be rewritten for template adoption"
+        );
+        assert_eq!(
+            guard.deployment_replaces, 1,
+            "one adoption rollout, then zero recurring Trustee rewrites"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_rollout_reconverges_when_configmap_changes_mid_rollout() {
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap187_legacy_reconverge").await;
+        let (_org_id, app_id) = insert_test_app(&pool, "running").await;
+        insert_legacy_owner_binding(&pool, app_id, "legacy-owner").await;
+        let config = legacy_kbs_test_config();
+        let mut fixture = KbsPolicyProvider::new(true);
+        let mut replacement = fixture.configmap.clone();
+        replacement["metadata"]["resourceVersion"] = serde_json::json!("external-rewrite");
+        fixture.replace_configmap_on_next_deployment_get = Some(replacement);
+        let provider = std::sync::Arc::new(tokio::sync::Mutex::new(fixture));
+        let client = crate::test_support::kbs_policy_kube_client(provider.clone());
+        crate::kbs::TEST_KUBE_CLIENT
+            .scope(client, async {
+                reconcile_policy(&pool, Some(&config)).await.unwrap();
+            })
+            .await;
+        let guard = provider.lock().await;
+        assert_eq!(
+            guard.configmap_replaces, 2,
+            "the externally replaced ConfigMap must be republished"
+        );
+        assert_eq!(
+            guard.deployment_replaces, 2,
+            "the new publication must trigger a fresh rollout"
+        );
+        assert!(
+            guard.configmap["data"]["policy.rego"]
+                .as_str()
+                .unwrap()
+                .contains("legacy-owner")
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_rollout_hands_off_to_signed_authority() {
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap187_legacy_signed_handoff").await;
+        let (org_id, app_id) = insert_test_app(&pool, "running").await;
+        insert_legacy_owner_binding(&pool, app_id, "legacy-owner").await;
+        let config = legacy_kbs_test_config();
+        let provider = std::sync::Arc::new(tokio::sync::Mutex::new(KbsPolicyProvider::new(true)));
+        provider.lock().await.deployment_gets_before_failure = Some(1);
+        let client = crate::test_support::kbs_policy_kube_client(provider.clone());
+        crate::kbs::TEST_KUBE_CLIENT
+            .scope(client, async {
+                assert!(reconcile_policy(&pool, Some(&config)).await.is_err());
+
+                let signer = "bb".repeat(32);
+                insert_test_keyring_version(&pool, org_id, 1, &[&signer]).await;
+                let deployment = Uuid::new_v4();
+                insert_test_deployment(&pool, org_id, app_id, deployment, "healthy", Utc::now())
+                    .await;
+                let artifact = insert_test_artifact(&pool, app_id, deployment, "aa").await;
+                sqlx::query(
+                    "UPDATE kbs_signed_policy_reconciliation
+                    SET desired_generation = 1
+                  WHERE singleton",
+                )
+                .execute(&pool)
+                .await
+                .expect("activate signed policy mode");
+
+                reconcile_policy(&pool, Some(&config)).await.unwrap();
+                let guard = provider.lock().await;
+                let body = guard.configmap["data"]["policy.rego"].as_str().unwrap();
+                assert!(
+                    body.contains(&artifact.metadata.descriptor_core_hash),
+                    "the signed artifact set must replace the legacy Rego body"
+                );
+                let annotations = &guard.deployment["spec"]["template"]["metadata"]["annotations"];
+                assert_eq!(
+                    annotations["enclava.dev/cap-policy-generation"]
+                        .as_str()
+                        .unwrap(),
+                    "1"
+                );
+            })
+            .await;
     }
 
     #[tokio::test]

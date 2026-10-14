@@ -1468,6 +1468,160 @@ async fn signer_rotation_never_flips_an_unsigned_install_into_signed_mode() {
     crate::test_support::drop_isolated_database("cap119_unsigned_rotation", pool).await;
 }
 
+/// Codex review finding on #187: when a legacy publication obligation is
+/// recorded (migration 0069: a signer-bearing legacy policy was rendered at
+/// least once) but KBS publication is unconfigured, the rotation must be
+/// refused inside the identity-change transaction instead of committing and
+/// then confirming success while the previously published legacy policy can
+/// keep authorizing the rotated-out signer. The refusal precedes every
+/// token, identity, withdrawal, and audit mutation and leaves the request
+/// retryable. The no-obligation positive case stays pinned by
+/// signer_rotation_never_flips_an_unsigned_install_into_signed_mode.
+#[tokio::test]
+async fn signer_rotation_refuses_when_legacy_publication_obligation_lacks_kbs_config() {
+    let (_db_cleanup, pool) =
+        crate::test_support::isolated_database_test_pool("cap119_legacy_obligation_refusal").await;
+    let previous_subject = "https://github.com/acme/old/.github/workflows/ci.yaml@refs/heads/main";
+    let previous_issuer = "https://token.actions.githubusercontent.com";
+    let (org_id, user_id, app_id) =
+        insert_signer_rotation_app(&pool, Some(previous_subject), Some(previous_issuer)).await;
+    insert_legacy_tls_binding(&pool, app_id, previous_subject, previous_issuer).await;
+    crate::kbs::record_legacy_publication_obligation(&pool)
+        .await
+        .expect("record legacy publication obligation");
+
+    let mut state = crate::test_support::lazy_state();
+    state.db = pool.clone();
+    let hmac_key = [7u8; 32];
+    let auth = AuthContext {
+        user_id,
+        org_id,
+        org_name: "legacy-obligation-refusal-test".to_string(),
+        role: Role::Owner,
+        api_key: None,
+        management_origin: crate::auth::middleware::ManagementOrigin::Public,
+    };
+    let new_subject = "https://github.com/acme/new/.github/workflows/ci.yaml@refs/heads/main";
+    let new_issuer = "https://new-issuer.example.test";
+    let token = crate::auth::jwt::issue_signer_rotation_token(
+        &hmac_key,
+        &SignerRotationTokenInput {
+            user_id,
+            org_id,
+            app_id,
+            previous_subject: previous_subject.to_string(),
+            previous_issuer: previous_issuer.to_string(),
+            new_subject: new_subject.to_string(),
+            new_issuer: new_issuer.to_string(),
+        },
+        chrono::Duration::seconds(600),
+    )
+    .expect("issue rotation token");
+    let app_name = sqlx::query_scalar::<_, String>("SELECT name FROM apps WHERE id = $1")
+        .bind(app_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load app name");
+
+    let refused = rotate_signer(
+        clone_auth(&auth),
+        State(state.clone()),
+        Path(app_name),
+        Json(RotateSignerRequest {
+            subject: new_subject.to_string(),
+            issuer: new_issuer.to_string(),
+            email_confirmation_token: Some(token),
+        }),
+    )
+    .await
+    .expect_err(
+        "rotation must be refused while a legacy publication obligation lacks KBS configuration",
+    );
+    assert_eq!(refused.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(refused.1.0["code"], "kbs_publication_not_configured");
+
+    // Nothing mutated: identity, binding, token, and audit are untouched.
+    let (subject, issuer): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT signer_identity_subject, signer_identity_issuer FROM apps WHERE id = $1",
+    )
+    .bind(app_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load app identity after refused rotation");
+    assert_eq!(subject.as_deref(), Some(previous_subject));
+    assert_eq!(issuer.as_deref(), Some(previous_issuer));
+    let (binding_subject, binding_issuer): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT signer_identity_subject, signer_identity_issuer
+           FROM kbs_tls_bindings WHERE app_id = $1",
+    )
+    .bind(app_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load tls binding identity after refused rotation");
+    assert_eq!(binding_subject.as_deref(), Some(previous_subject));
+    assert_eq!(binding_issuer.as_deref(), Some(previous_issuer));
+    let consumed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM consumed_signer_rotation_tokens WHERE app_id = $1",
+    )
+    .bind(app_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count consumed rotation tokens after refused rotation");
+    assert_eq!(consumed, 0, "the refusal must leave the token unconsumed");
+    let rotate_audits: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_log WHERE org_id = $1 AND action = 'app.signer.rotate'",
+    )
+    .bind(org_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count rotation audits after refused rotation");
+    assert_eq!(rotate_audits, 0);
+
+    crate::test_support::drop_isolated_database("cap119_legacy_obligation_refusal", pool).await;
+}
+
+/// Codex review finding on #187: the committed-rotation confirmation path
+/// must not report success for an unconfigured install with a recorded
+/// legacy publication obligation -- a previously rendered legacy policy can
+/// keep authorizing the rotated-out signer. It reports the same
+/// publication-pending error as the signed-mode-without-configuration case
+/// so the caller retries once KBS publication is configured again.
+#[tokio::test]
+async fn signer_publication_confirmation_pends_for_legacy_obligation_without_kbs_config() {
+    let (_db_cleanup, pool) =
+        crate::test_support::isolated_database_test_pool("cap119_legacy_obligation_pending").await;
+    let previous_subject = "https://github.com/acme/old/.github/workflows/ci.yaml@refs/heads/main";
+    let previous_issuer = "https://token.actions.githubusercontent.com";
+    let (_org_id, _user_id, app_id) =
+        insert_signer_rotation_app(&pool, Some(previous_subject), Some(previous_issuer)).await;
+    insert_legacy_tls_binding(&pool, app_id, previous_subject, previous_issuer).await;
+    crate::kbs::record_legacy_publication_obligation(&pool)
+        .await
+        .expect("record legacy publication obligation");
+
+    let mut state = crate::test_support::lazy_state();
+    state.db = pool.clone();
+
+    let pending = crate::routes::apps::reconcile_signer_publication(
+        &state,
+        app_id,
+        previous_subject,
+        previous_issuer,
+        0,
+    )
+    .await
+    .expect_err(
+        "unconfigured confirmation with a recorded legacy obligation must not report success",
+    );
+    assert_eq!(pending.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        pending.1.0["code"],
+        crate::routes::apps::SIGNER_ROTATION_PUBLICATION_PENDING_CODE
+    );
+
+    crate::test_support::drop_isolated_database("cap119_legacy_obligation_pending", pool).await;
+}
+
 /// Issue #119 rollout-window regression: between migration 0052 applying
 /// and the new binary replacing the old one, a pre-0052 replica's
 /// rotate_signer rewrites only the apps row -- it inserts no withdrawal

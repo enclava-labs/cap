@@ -2552,7 +2552,25 @@ pub(crate) async fn reconcile_signer_publication(
     if state.kbs_policy.is_none() {
         // The shared confirm helper fails closed exactly when signed-policy
         // mode is active without configuration, and performs no write on an
-        // unsigned, unconfigured install.
+        // unsigned, unconfigured install. A recorded legacy publication
+        // obligation (migration 0069) is the exception: it proves a
+        // signer-bearing legacy policy was rendered at least once, so
+        // confirming success here would report a rotation as published
+        // while that previously rendered policy can keep authorizing the
+        // rotated-out signer (Codex review finding on #187). Report the
+        // publication-pending error instead, exactly like the signed-mode
+        // without-configuration case.
+        if crate::kbs::legacy_publication_obligation_recorded(&state.db)
+            .await
+            .map_err(|_| signer_publication_pending_error())?
+        {
+            tracing::warn!(
+                app_id = %app_id,
+                error_code = SIGNER_ROTATION_PUBLICATION_PENDING_CODE,
+                "signer rotation committed; a legacy KBS publication obligation is recorded without KBS configuration"
+            );
+            return Err(signer_publication_pending_error());
+        }
         if let Err(error) = crate::kbs::confirm_keyring_kbs_publication(state).await {
             tracing::warn!(
                 app_id = %app_id,
@@ -2807,6 +2825,36 @@ pub(crate) async fn rotate_signer_commit(
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({
                     "error": "signed-policy mode is active but KBS publication is not configured; refusing to commit a signer rotation that could not be published",
+                    "code": "kbs_publication_not_configured",
+                })),
+            ));
+        }
+        // A recorded legacy publication obligation (migration 0069) proves
+        // this install rendered a signer-bearing legacy policy at least
+        // once, so without KBS configuration the rotated-out signer could
+        // stay authorized by that previously published policy while this
+        // rotation reports success (Codex review finding on #187). Refuse
+        // exactly like the signed-mode arm: the refusal precedes every
+        // token, identity, withdrawal, and audit mutation and leaves the
+        // request retryable. An install that never rendered such a policy
+        // has no marker and keeps rotating exactly as before.
+        if crate::kbs::legacy_publication_obligation_recorded(&state.db)
+            .await
+            .map_err(|_| internal_server_error())?
+        {
+            let error = crate::kbs::KbsPolicyError::NotConfigured;
+            tracing::warn!(
+                app = %app_name,
+                org_id = %auth.org_id,
+                %error,
+                error_code = "kbs_publication_not_configured",
+                "refusing signer rotation: a legacy KBS publication obligation is recorded without KBS configuration"
+            );
+            tx.rollback().await.map_err(|_| internal_server_error())?;
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "a legacy KBS publication obligation is recorded but KBS publication is not configured; refusing to commit a signer rotation that could not be published",
                     "code": "kbs_publication_not_configured",
                 })),
             ));
