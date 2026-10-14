@@ -817,7 +817,18 @@ pub async fn deploy(
         ))?;
 
     // The public deploy route has no customer-config release endpoint.
-    // Only the internal generic deployment path may arm a roll hold.
+    // Only the internal generic deployment path may arm a roll hold: a
+    // requested hold must be rejected here rather than silently dropped,
+    // or the caller would believe config-before-roll safety applied.
+    if body
+        .customer_config_roll_hold_seconds
+        .is_some_and(|seconds| seconds > 0)
+    {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "customer_config_roll_hold_seconds requires the internal generic deployment route; this route cannot release the hold",
+        ));
+    }
     deploy_app_candidate(auth, state, app, body, AppMutation::None, false).await
 }
 
@@ -1352,15 +1363,31 @@ async fn deploy_app_candidate(
     {
         match enclava_engine::apply::engine::ApplyEngine::try_default().await {
             Ok(engine) => {
-                match crate::deploy::workload_rollout_settled(&engine, &app.namespace, &app.name)
-                    .await
+                // Bounded: the probe runs under the acceptance transaction
+                // and the organization lanes, so a slow Kubernetes API must
+                // not pin them (and a pooled connection) for kube-client's
+                // full request timeout. Timeout fails closed like an
+                // in-flight rollout.
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    crate::deploy::workload_rollout_settled(&engine, &app.namespace, &app.name),
+                )
+                .await
                 {
-                    Ok(settled) => cluster_workload_settled = settled,
-                    Err(error) => {
+                    Ok(Ok(settled)) => cluster_workload_settled = settled,
+                    Ok(Err(error)) => {
                         tracing::warn!(
                             app_id = %app.id,
                             error = %error,
                             "could not verify live rollout settling; failing the roll hold closed"
+                        );
+                        cluster_workload_settled = false;
+                    }
+                    Err(elapsed) => {
+                        tracing::warn!(
+                            app_id = %app.id,
+                            error = %elapsed,
+                            "live rollout settling probe timed out; failing the roll hold closed"
                         );
                         cluster_workload_settled = false;
                     }

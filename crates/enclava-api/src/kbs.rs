@@ -632,31 +632,60 @@ async fn signed_policy_mode_active(db: &PgPool) -> Result<bool, KbsPolicyError> 
     .await?)
 }
 
-/// True while a live customer-config hold withholds a signed authority:
-/// the job is frozen at `setup_pending`, never released, the expiry sweeper
-/// has not failed it yet, and the held transition carries a signed artifact
+/// Apps whose live customer-config hold withholds a signed authority: the
+/// job is frozen at `setup_pending`, never released, the expiry sweeper has
+/// not failed it yet, and the held transition carries a signed artifact
 /// (`artifact_deployment_id`) whose authority the candidate query withholds.
-/// Only such a hold may defer policy convergence: an unrelated hold on an
-/// unsigned transition cannot be what made the candidate set empty, and
-/// deferring on it would leave revoked artifacts authorized until that hold
-/// releases or expires. Combined with the caller's `candidates.is_empty()`
-/// gate, a withheld artifact here is by construction a would-be candidate
-/// missing from the empty set — the withholding caused the emptiness.
-async fn unreleased_signed_customer_config_hold_pending(
+/// Only such a hold may defer policy convergence, and only for its own
+/// app's authority — see `hold_deferral_correlates`.
+async fn unreleased_signed_customer_config_hold_apps(
     db: &PgPool,
-) -> Result<bool, KbsPolicyError> {
+) -> Result<Vec<String>, KbsPolicyError> {
     Ok(sqlx::query_scalar(
-        "SELECT EXISTS(
-             SELECT 1
-               FROM deployment_apply_jobs
-              WHERE customer_config_hold
-                AND customer_config_released_at IS NULL
-                AND state = 'setup_pending'
-                AND artifact_deployment_id IS NOT NULL
-         )",
+        "SELECT app_id::text
+           FROM deployment_apply_jobs
+          WHERE customer_config_hold
+            AND customer_config_released_at IS NULL
+            AND state = 'setup_pending'
+            AND artifact_deployment_id IS NOT NULL",
     )
-    .fetch_one(db)
+    .fetch_all(db)
     .await?)
+}
+
+/// App owners of every signed authority in a published policy body, in both
+/// supported shapes: a schema-versioned artifact set and a single signed
+/// artifact. A non-signed body (legacy Rego) contributes no owners.
+fn published_authority_owners(policy: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(policy) else {
+        return Vec::new();
+    };
+    let owner = |artifact: &serde_json::Value| -> Option<String> {
+        artifact
+            .get("metadata")?
+            .get("app_id")?
+            .as_str()
+            .map(str::to_owned)
+    };
+    if let Some(artifacts) = value.get("artifacts").and_then(serde_json::Value::as_array) {
+        return artifacts.iter().filter_map(owner).collect();
+    }
+    owner(&value).into_iter().collect()
+}
+
+/// Whether the empty-candidate deferral may protect the live holds. The
+/// deferral is only legitimate when the authority converging would revoke
+/// belongs to a held transition's own app: the hold is what deliberately
+/// left that app's workload running (its signed authority is withheld, or,
+/// with nothing signed published yet, converging would flip a legacy Rego
+/// install into fail-closed signed mode and revoke that workload). A
+/// dropped authority owned by an app without a live signed hold must
+/// converge even while an unrelated hold is pending — revocation must not
+/// wait for someone else's hold to release or expire.
+fn hold_deferral_correlates(revoked_owners: &[String], hold_apps: &[String]) -> bool {
+    revoked_owners
+        .iter()
+        .all(|owner| hold_apps.iter().any(|app| app == owner))
 }
 
 /// Select policy authority from the latest operation generation, not from the
@@ -1191,16 +1220,29 @@ async fn reconcile_pending_signed_policy_artifacts_with_client(
         // customer-config hold: publishing the empty body would flip a
         // legacy Rego install into fail-closed signed mode and revoke the
         // workload the hold deliberately left running. Defer this
-        // generation until release or hold expiry settles it. The
-        // deferral is scoped to the holds whose withheld authority caused
-        // the emptiness: an unrelated hold on an unsigned transition must
-        // not wedge revocation of an already-deleted artifact.
-        if candidates.is_empty() && unreleased_signed_customer_config_hold_pending(db).await? {
-            tracing::info!(
-                policy_generation = generation,
-                "deferring signed KBS policy convergence until held deployments release"
-            );
-            return Ok(());
+        // generation until release or hold expiry settles it — but only
+        // when the revocation converging would perform correlates with the
+        // held transition's own app: an unrelated hold must not retain
+        // another app's obsolete authority (see `hold_deferral_correlates`).
+        if candidates.is_empty() {
+            let hold_apps = unreleased_signed_customer_config_hold_apps(db).await?;
+            if !hold_apps.is_empty() {
+                let configmap = cm_api.get(&config.configmap_name).await?;
+                let current_policy = configmap
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get(&config.policy_key))
+                    .map(String::as_str)
+                    .unwrap_or_default();
+                let revoked_owners = published_authority_owners(current_policy);
+                if hold_deferral_correlates(&revoked_owners, &hold_apps) {
+                    tracing::info!(
+                        policy_generation = generation,
+                        "deferring signed KBS policy convergence until held deployments release"
+                    );
+                    return Ok(());
+                }
+            }
         }
         if let Some(expected) = expected_artifact
             && !candidates.iter().any(|candidate| {
@@ -5211,9 +5253,10 @@ resource_bindings := {
         let (org_id, app_id) = insert_test_app(&pool, "running").await;
 
         assert!(
-            !unreleased_signed_customer_config_hold_pending(&pool)
+            unreleased_signed_customer_config_hold_apps(&pool)
                 .await
-                .expect("probe hold before fixture"),
+                .expect("probe hold before fixture")
+                .is_empty(),
             "no held deployment exists yet"
         );
 
@@ -5276,9 +5319,10 @@ resource_bindings := {
         tx.commit().await.expect("commit held fixture");
 
         assert!(
-            unreleased_signed_customer_config_hold_pending(&pool)
+            !unreleased_signed_customer_config_hold_apps(&pool)
                 .await
-                .expect("probe held deployment"),
+                .expect("probe held deployment")
+                .is_empty(),
             "the unreleased hold must defer an empty policy publish"
         );
         let candidates = load_signed_policy_candidates(&pool, 8)
@@ -5300,9 +5344,10 @@ resource_bindings := {
         .await
         .expect("release the hold");
         assert!(
-            !unreleased_signed_customer_config_hold_pending(&pool)
+            unreleased_signed_customer_config_hold_apps(&pool)
                 .await
-                .expect("probe after release"),
+                .expect("probe after release")
+                .is_empty(),
             "a released hold no longer defers the policy"
         );
 
@@ -5334,9 +5379,10 @@ resource_bindings := {
         .expect("expire the hold deployment fixture");
         expiry_tx.commit().await.expect("commit expiry fixture");
         assert!(
-            !unreleased_signed_customer_config_hold_pending(&pool)
+            unreleased_signed_customer_config_hold_apps(&pool)
                 .await
-                .expect("probe after hold expiry"),
+                .expect("probe after hold expiry")
+                .is_empty(),
             "a terminal failed hold must not defer the policy"
         );
 
@@ -5386,9 +5432,10 @@ resource_bindings := {
         tx.commit().await.expect("commit unsigned held fixture");
 
         assert!(
-            !unreleased_signed_customer_config_hold_pending(&pool)
+            unreleased_signed_customer_config_hold_apps(&pool)
                 .await
-                .expect("probe unsigned held deployment"),
+                .expect("probe unsigned held deployment")
+                .is_empty(),
             "an unsigned hold withholds no authority and must not defer policy convergence"
         );
 
@@ -5397,5 +5444,58 @@ resource_bindings := {
             .execute(&pool)
             .await
             .expect("delete unsigned held fixture organization");
+    }
+
+    #[test]
+    fn hold_deferral_correlates_revocation_with_the_held_app() {
+        // Nothing signed published yet (legacy Rego install): converging
+        // would flip the mode and revoke the held app's running workload,
+        // so the deferral is legitimate.
+        assert!(hold_deferral_correlates(&[], &["b".to_owned()]));
+        // The dropped authority belongs to the held app itself.
+        assert!(hold_deferral_correlates(
+            &["b".to_owned()],
+            &["b".to_owned()]
+        ));
+        // An unrelated hold (app B) must not retain app A's obsolete
+        // authority: revocation converges instead of waiting out the hold.
+        assert!(!hold_deferral_correlates(
+            &["a".to_owned()],
+            &["b".to_owned()]
+        ));
+        // Mixed drops converge unless every owner is held.
+        assert!(!hold_deferral_correlates(
+            &["a".to_owned(), "b".to_owned()],
+            &["b".to_owned()]
+        ));
+        assert!(hold_deferral_correlates(
+            &["a".to_owned(), "b".to_owned()],
+            &["b".to_owned(), "a".to_owned()]
+        ));
+    }
+
+    #[test]
+    fn published_authority_owners_parse_both_body_shapes() {
+        assert!(published_authority_owners("package authz").is_empty());
+        assert!(
+            published_authority_owners("not json at all").is_empty(),
+            "a non-JSON legacy body contributes no owners"
+        );
+        let set = serde_json::json!({
+            "schema_version": "signed-policy-artifacts/v1",
+            "artifacts": [
+                {"metadata": {"app_id": "aaa", "deploy_id": "d1"}},
+                {"metadata": {"app_id": "bbb", "deploy_id": "d2"}},
+            ]
+        })
+        .to_string();
+        assert_eq!(published_authority_owners(&set), ["aaa", "bbb"]);
+        let single = serde_json::json!({
+            "metadata": {"app_id": "ccc", "deploy_id": "d3"},
+            "rego_text": "package authz",
+            "signature": "sig"
+        })
+        .to_string();
+        assert_eq!(published_authority_owners(&single), ["ccc"]);
     }
 }
