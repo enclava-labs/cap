@@ -49,19 +49,23 @@
 //! - Resource bounds (cap#241 review): a connection that sends no request
 //!   head within `REQUEST_HEAD_IDLE_TIMEOUT` is refused and closed, so a
 //!   local client cannot park unbounded idle tasks/sockets on the API;
-//!   established tunnels and forwarded exchanges that go silent for
-//!   `TUNNEL_IDLE_TIMEOUT` are torn down; at most
+//!   tunnels and forwarded exchanges silent for `TUNNEL_IDLE_TIMEOUT`
+//!   (measured per-progress — an ACTIVE transfer never hits it, only a
+//!   silent one does) are torn down; at most
 //!   `MAX_PROXY_CONNECTIONS` connections are served concurrently, so even
 //!   a never-idle local client cannot accumulate unbounded tasks/sockets;
-//!   and the accept loop retries transient accept failures (e.g. temporary
-//!   FD exhaustion) with a bounded backoff instead of dying while callers
-//!   keep the cached URL.
+//!   a single DNS resolution or upstream dial is bounded by
+//!   `DNS_RESOLVE_TIMEOUT`/`HTTP_UPSTREAM_CONNECT_TIMEOUT` so a slow
+//!   resolver or unresponsive destination cannot hold a permit
+//!   indefinitely; and the accept loop retries transient accept failures
+//!   (e.g. temporary FD exhaustion) with a bounded backoff instead of
+//!   dying while callers keep the cached URL.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::clients::{BlockedNetworks, ClientError};
@@ -89,8 +93,14 @@ const TUNNEL_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const ACCEPT_BACKOFF_START: Duration = Duration::from_millis(100);
 const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(5);
 
-/// Timeout for dialing a cleartext upstream in the forwarded-request path.
+/// Timeout for dialing an upstream (CONNECT tunnel or cleartext forward).
 const HTTP_UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Timeout for a single DNS resolution of a tunnel/forward destination.
+/// A slow or nonresponsive resolver must not hold a connection slot (and
+/// thus one of the `MAX_PROXY_CONNECTIONS` permits) indefinitely
+/// (cap#241 review).
+const DNS_RESOLVE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Maximum concurrent client connections served at once. Each in-flight
 /// connection (head read, tunnel, or forward) holds one slot for its whole
@@ -106,13 +116,30 @@ const MAX_PROXY_CONNECTIONS: usize = 64;
 pub struct EgressProxy {
     blocked: Arc<BlockedNetworks>,
     bound: Arc<Mutex<Option<String>>>,
+    /// Whether absolute-form cleartext (`http://`) forwarding is served at
+    /// all. Bound to the debug-only `COSIGN_ALLOW_HTTP_REGISTRY` escape
+    /// hatch at construction so the production HTTPS path (flag unset)
+    /// cannot be downgraded to cleartext by an `http://` redirect or
+    /// token realm advertised by a registry (cap#241 review).
+    allow_http_forwarding: bool,
 }
 
 impl EgressProxy {
     pub fn new(blocked: Arc<BlockedNetworks>) -> Self {
+        Self::with_http_forwarding(
+            blocked,
+            crate::env_gates::flag_is_truthy(
+                &std::env::var("COSIGN_ALLOW_HTTP_REGISTRY").unwrap_or_default(),
+            ),
+        )
+    }
+
+    /// Test/explicit constructor: opt in or out of cleartext forwarding.
+    pub fn with_http_forwarding(blocked: Arc<BlockedNetworks>, allow: bool) -> Self {
         Self {
             blocked,
             bound: Arc::new(Mutex::new(None)),
+            allow_http_forwarding: allow,
         }
     }
 
@@ -144,8 +171,9 @@ impl EgressProxy {
             .local_addr()
             .map_err(|e| ClientError::InvalidUrl(format!("egress proxy local addr: {e}")))?;
         let blocked = Arc::clone(&self.blocked);
+        let allow_http_forwarding = self.allow_http_forwarding;
         tokio::spawn(async move {
-            accept_loop(listener, blocked).await;
+            accept_loop(listener, blocked, allow_http_forwarding).await;
         });
         let url = format!("http://{addr}");
         *bound = Some(url.clone());
@@ -153,7 +181,11 @@ impl EgressProxy {
     }
 }
 
-async fn accept_loop(listener: TcpListener, blocked: Arc<BlockedNetworks>) {
+async fn accept_loop(
+    listener: TcpListener,
+    blocked: Arc<BlockedNetworks>,
+    allow_http_forwarding: bool,
+) {
     let mut backoff = ACCEPT_BACKOFF_START;
     // One permit per in-flight connection: head read, tunnel, or forward.
     // Acquired BEFORE spawn so the slot is held from the moment the socket
@@ -178,8 +210,9 @@ async fn accept_loop(listener: TcpListener, blocked: Arc<BlockedNetworks>) {
                     }
                 };
                 let blocked = Arc::clone(&blocked);
+                let allow_http = allow_http_forwarding;
                 tokio::spawn(async move {
-                    handle_conn(stream, blocked).await;
+                    handle_conn(stream, blocked, allow_http).await;
                     drop(permit);
                 });
             }
@@ -198,9 +231,13 @@ async fn accept_loop(listener: TcpListener, blocked: Arc<BlockedNetworks>) {
     }
 }
 
-async fn handle_conn(mut stream: TcpStream, blocked: Arc<BlockedNetworks>) {
-    let head = match read_request_head(&mut stream).await {
-        Some(head) => head,
+async fn handle_conn(
+    mut stream: TcpStream,
+    blocked: Arc<BlockedNetworks>,
+    allow_http_forwarding: bool,
+) {
+    let (head, body_prefix) = match read_request_head(&mut stream).await {
+        Some(parts) => parts,
         None => {
             // Includes idle-timeout: a client that never sends a request
             // head is refused and closed, bounding the connection cost.
@@ -253,11 +290,23 @@ async fn handle_conn(mut stream: TcpStream, blocked: Arc<BlockedNetworks>) {
     // Not a CONNECT: the only other accepted form is the absolute-form
     // `GET/... http://host:port/... HTTP/1.1` used when the debug-only
     // `COSIGN_ALLOW_HTTP_REGISTRY` flag routes cleartext registry traffic
-    // through `http_proxy` (cap#241 review). The destination is validated
+    // through `http_proxy` (cap#241 review). The forwarding path is gated
+    // on that flag (bound at construction): with the flag unset — the
+    // production HTTPS configuration — an `http://` redirect or bearer
+    // realm advertised by a registry is refused, so nothing can downgrade
+    // the production path to cleartext. The destination is validated
     // exactly like a CONNECT target and the request is forwarded to the
     // validated address only; redirects are NOT followed by this proxy —
     // the client re-issues them through the proxy, re-validating each hop.
     if let Some(target) = parse_absolute_form_http_target(first_line) {
+        if !allow_http_forwarding {
+            tracing::warn!(
+                line = %first_line,
+                "egress proxy refused absolute-form http request (COSIGN_ALLOW_HTTP_REGISTRY not enabled)"
+            );
+            let _ = write_forbidden(&mut stream).await;
+            return;
+        }
         match resolve_tunnel_destination(&target, &blocked).await {
             Ok(destination) => {
                 let upstream = match tokio::time::timeout(
@@ -274,14 +323,18 @@ async fn handle_conn(mut stream: TcpStream, blocked: Arc<BlockedNetworks>) {
                     }
                 };
                 let mut upstream = upstream;
-                // Replay the full request head verbatim (the head reader
-                // buffers exactly up to the `\r\n\r\n` terminator, so a
-                // pipelined body stays in the socket)...
+                // Replay the full request head verbatim, followed by any
+                // body bytes that arrived in the same TCP read as the
+                // head (coalesced head+body); anything after that still
+                // sits in the socket and flows through the pipe below.
                 if upstream.write_all(head.as_bytes()).await.is_err() {
                     return;
                 }
-                // ...then pipe bidirectionally (request body + response),
-                // torn down when the exchange goes idle.
+                if !body_prefix.is_empty() && upstream.write_all(&body_prefix).await.is_err() {
+                    return;
+                }
+                // ...then pipe bidirectionally (remaining request body +
+                // response), torn down when the exchange goes idle.
                 let _ = idle_bounded_copy(&mut stream, &mut upstream).await;
             }
             Err(reason) => {
@@ -295,14 +348,17 @@ async fn handle_conn(mut stream: TcpStream, blocked: Arc<BlockedNetworks>) {
     let _ = write_forbidden(&mut stream).await;
 }
 
-/// Read up to the end of the HTTP request head (`\r\n\r\n`), bounded by
-/// `MAX_REQUEST_HEAD_BYTES` and `REQUEST_HEAD_IDLE_TIMEOUT`. The CONNECT
-/// client waits for the proxy response before sending anything else, so
-/// the head cannot be followed by tunnel payload in the same read. A
-/// connection that stays silent past the idle timeout is refused, so a
-/// local client cannot park unbounded idle tasks/sockets on the API
-/// (cap#241 review).
-async fn read_request_head(stream: &mut TcpStream) -> Option<String> {
+/// Read up to the end of the HTTP request head (first `\r\n\r\n`),
+/// bounded by `MAX_REQUEST_HEAD_BYTES` and `REQUEST_HEAD_IDLE_TIMEOUT`.
+/// The CONNECT client waits for the proxy response before sending
+/// anything else, but a cleartext proxy request may carry a body whose
+/// first bytes arrive in the same TCP read as the head: the terminator
+/// is matched ANYWHERE in the buffer (not just at its end) and any
+/// bytes after it are returned as the body prefix for forwarding
+/// (cap#241 review). A connection that stays silent past the idle
+/// timeout is refused, so a local client cannot park unbounded idle
+/// tasks/sockets on the API.
+async fn read_request_head(stream: &mut TcpStream) -> Option<(String, Vec<u8>)> {
     let mut buf = Vec::with_capacity(512);
     let mut chunk = [0u8; 1024];
     let read = async {
@@ -312,8 +368,13 @@ async fn read_request_head(stream: &mut TcpStream) -> Option<String> {
                 return None;
             }
             buf.extend_from_slice(&chunk[..n]);
-            if buf.ends_with(b"\r\n\r\n") {
-                return Some(String::from_utf8_lossy(&buf).into_owned());
+            // Head terminator can land mid-buffer (coalesced head+body).
+            if let Some(pos) = find_head_end(&buf) {
+                // The head includes its terminating CRLFCRLF: the replayed
+                // request must be a complete, well-formed head.
+                let head = String::from_utf8_lossy(&buf[..pos + 4]).into_owned();
+                let body = buf[pos + 4..].to_vec();
+                return Some((head, body));
             }
             if buf.len() > MAX_REQUEST_HEAD_BYTES {
                 return None;
@@ -325,16 +386,57 @@ async fn read_request_head(stream: &mut TcpStream) -> Option<String> {
         .ok()?
 }
 
-/// `copy_bidirectional` torn down when the tunnel goes silent for
-/// `TUNNEL_IDLE_TIMEOUT` in both directions: an established tunnel must
-/// not hold a task and two sockets alive indefinitely (cap#241 review).
+/// Offset of the first `\r\n\r\n` head terminator, if present.
+fn find_head_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+/// Bidirectional copy torn down only after `TUNNEL_IDLE_TIMEOUT` elapses
+/// with NO traffic in either direction. Implemented as a chunked loop
+/// (not `timeout(copy_bidirectional)`, which would cap the TOTAL duration
+/// and cut healthy long transfers at exactly the deadline): each loop
+/// iteration races both directions' next read against the remaining idle
+/// budget, and any progress resets the deadline (cap#241 review).
 async fn idle_bounded_copy(a: &mut TcpStream, b: &mut TcpStream) -> std::io::Result<()> {
-    match tokio::time::timeout(TUNNEL_IDLE_TIMEOUT, copy_bidirectional(a, b)).await {
-        Ok(result) => result.map(|_| ()),
-        Err(_) => Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "egress proxy tunnel idle",
-        )),
+    let mut buf_a = [0u8; 8192];
+    let mut buf_b = [0u8; 8192];
+    let mut budget = TUNNEL_IDLE_TIMEOUT;
+    loop {
+        let a_to_b = a.read(&mut buf_a);
+        tokio::pin!(a_to_b);
+        let b_to_a = b.read(&mut buf_b);
+        tokio::pin!(b_to_a);
+        // Race either direction making progress against the idle budget.
+        let outcome = tokio::select! {
+            res = &mut a_to_b => Some((true, res?)),
+            res = &mut b_to_a => Some((false, res?)),
+            _ = tokio::time::sleep(budget) => None,
+        };
+        let (from_a, n) = match outcome {
+            Some(x) => x,
+            None => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "egress proxy tunnel idle",
+                ));
+            }
+        };
+        if n == 0 {
+            // EOF on one side: half-close semantics are unnecessary for
+            // OCI traffic; tear the whole tunnel down.
+            return Ok(());
+        }
+        // The read futures (and their borrows on `a`/`b`) end at the end
+        // of this loop iteration; `data` is copied out of the buffer
+        // before writing to the peer so no borrow overlaps the write.
+        let data: Vec<u8> = if from_a {
+            buf_a[..n].to_vec()
+        } else {
+            buf_b[..n].to_vec()
+        };
+        let dst = if from_a { &mut *b } else { &mut *a };
+        dst.write_all(&data).await?;
+        budget = TUNNEL_IDLE_TIMEOUT; // progress resets the idle clock
     }
 }
 
@@ -448,10 +550,21 @@ async fn resolve_tunnel_destination(
         }
         return Ok(vec![SocketAddr::new(addr, target.port)]);
     }
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((target.host.as_str(), target.port))
-        .await
-        .map_err(|e| format!("DNS lookup for `{}` failed: {e}", target.host))?
-        .collect();
+    let lookup = tokio::net::lookup_host((target.host.as_str(), target.port));
+    let addrs: Vec<SocketAddr> = match tokio::time::timeout(DNS_RESOLVE_TIMEOUT, lookup).await {
+        Ok(result) => result
+            .map_err(|e| format!("DNS lookup for `{}` failed: {e}", target.host))?
+            .collect(),
+        // A slow/nonresponsive resolver must not hold a connection slot
+        // (one of the MAX_PROXY_CONNECTIONS permits) indefinitely
+        // (cap#241 review).
+        Err(_) => {
+            return Err(format!(
+                "DNS lookup for `{}` timed out after {DNS_RESOLVE_TIMEOUT:?}",
+                target.host
+            ));
+        }
+    };
     if addrs.is_empty() {
         return Err(format!("`{}` resolved to no addresses", target.host));
     }
@@ -653,8 +766,9 @@ mod tests {
 
         // Default blocklist refuses loopback, so run with an empty one;
         // a companion test below proves loopback is refused with the
-        // default policy.
-        let proxy = EgressProxy::new(Arc::new(BlockedNetworks::empty()));
+        // default policy. Forwarding requires the debug flag (cap#241
+        // review), so enable it via the explicit constructor.
+        let proxy = EgressProxy::with_http_forwarding(Arc::new(BlockedNetworks::empty()), true);
         let url = proxy.url().unwrap();
         let response = roundtrip(
             &url,
@@ -669,7 +783,9 @@ mod tests {
 
     #[tokio::test]
     async fn refuses_absolute_form_http_to_blocked_destination() {
-        let proxy = EgressProxy::new(Arc::new(BlockedNetworks::defaults()));
+        // Forwarding enabled, default blocklist: the BLOCKLIST must be
+        // what refuses (the flag gate is covered by its own test below).
+        let proxy = EgressProxy::with_http_forwarding(Arc::new(BlockedNetworks::defaults()), true);
         let url = proxy.url().unwrap();
         let response = roundtrip(
             &url,
@@ -680,6 +796,159 @@ mod tests {
             response.starts_with("HTTP/1.1 403"),
             "absolute-form request to blocked destination must be refused, got: {response}"
         );
+    }
+
+    #[tokio::test]
+    async fn refuses_absolute_form_http_without_debug_flag() {
+        // Flag unset (production HTTPS configuration): an `http://`
+        // absolute-form request — e.g. from a registry redirect or bearer
+        // realm — must be refused, not forwarded in cleartext (cap#241
+        // review). Even an empty blocklist must not save it.
+        let proxy = EgressProxy::with_http_forwarding(Arc::new(BlockedNetworks::empty()), false);
+        let url = proxy.url().unwrap();
+        let response = roundtrip(
+            &url,
+            "GET http://example.com/v2/ HTTP/1.1\r\nHost: example.com\r\n\r\n",
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "absolute-form http must be refused without COSIGN_ALLOW_HTTP_REGISTRY, got: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn forwards_coalesced_head_and_body() {
+        // A POST whose head and body arrive in ONE TCP write: the head
+        // reader must split at the FIRST terminator and the body prefix
+        // must reach the upstream verbatim, before any pipe traffic
+        // (cap#241 review).
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&received);
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = upstream.accept().await {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                // Read until the full request (head + 3-byte body) is in.
+                while !buf.ends_with(b"abc") {
+                    match sock.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                *captured.lock().unwrap() = buf.clone();
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await;
+            }
+        });
+
+        let proxy = EgressProxy::with_http_forwarding(Arc::new(BlockedNetworks::empty()), true);
+        let url = proxy.url().unwrap();
+        let mut stream = connect_raw(&url).await;
+        // Single write: head + body coalesced.
+        stream
+            .write_all(
+                format!(
+                    "POST http://{upstream_addr}/v2/ HTTP/1.1\r\nHost: {upstream_addr}\r\nContent-Length: 3\r\n\r\nabc"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut chunk))
+                .await
+                .expect("coalesced forward must not stall")
+                .unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            response.extend_from_slice(&chunk[..n]);
+            if response.ends_with(b"ok") {
+                break;
+            }
+        }
+        let response = String::from_utf8_lossy(&response);
+        assert!(
+            response.starts_with("HTTP/1.1 200") && response.ends_with("ok"),
+            "coalesced head+body must be forwarded, got: {response}"
+        );
+        let received = received.lock().unwrap().clone();
+        let received = String::from_utf8_lossy(&received);
+        assert!(
+            received.contains("Content-Length: 3") && received.ends_with("abc"),
+            "upstream must receive head followed by body prefix verbatim, got: {received}"
+        );
+    }
+
+    #[tokio::test]
+    async fn active_transfer_survives_beyond_idle_timeout() {
+        // TUNNEL_IDLE_TIMEOUT is 5s under cfg(test). A tunnel that keeps
+        // transferring data must NEVER be torn down by it — only a silent
+        // one may be. Stream chunks across >2x the idle window and verify
+        // they all arrive (cap#241 review).
+        let echo = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = echo.accept().await {
+                // Echo whatever arrives, for as long as it arrives.
+                let mut buf = [0u8; 1024];
+                loop {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if sock.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let proxy = EgressProxy::with_http_forwarding(Arc::new(BlockedNetworks::empty()), true);
+        let url = proxy.url().unwrap();
+        let mut stream = connect_raw(&url).await;
+        stream
+            .write_all(
+                format!("CONNECT {echo_addr} HTTP/1.1\r\nHost: {echo_addr}\r\n\r\n").as_bytes(),
+            )
+            .await
+            .unwrap();
+        // Consume the 200.
+        let mut byte = [0u8; 1];
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            let n = stream.read(&mut byte).await.unwrap();
+            assert!(n == 1, "proxy closed before completing the handshake");
+            head.push(byte[0]);
+        }
+        assert!(String::from_utf8_lossy(&head).starts_with("HTTP/1.1 200"));
+
+        // Keep the tunnel busy for well past the (test) idle timeout:
+        // 4 rounds of sleep(idle/2) + echo, total ~2x the idle window.
+        for i in 0..4 {
+            tokio::time::sleep(TUNNEL_IDLE_TIMEOUT / 2).await;
+            let payload = format!("round-{i}");
+            stream.write_all(payload.as_bytes()).await.unwrap();
+            let mut echoed = [0u8; 64];
+            let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut echoed))
+                .await
+                .expect("active tunnel must not be torn down by the idle timeout")
+                .expect("echo read failed");
+            assert_eq!(
+                &echoed[..n],
+                payload.as_bytes(),
+                "round {i} must round-trip"
+            );
+        }
     }
 
     #[tokio::test]
