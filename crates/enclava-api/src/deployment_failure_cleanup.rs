@@ -882,11 +882,18 @@ pub(crate) async fn sweep_statefulset_pvcs(
         ) {
             ClaimLineage::Proven => {}
             ClaimLineage::Foreign => {
-                tracing::info!(
+                // Count this as a failure: a foreign claim means the sweep
+                // cannot prove the namespace is clean of tenant data. A tenant
+                // could have created a same-named claim after CAP's STS was
+                // deleted, and clearing evidence would let a later deployment
+                // resize into that tenant claim. Retain evidence and keep the
+                // row retryable so a future sweep can re-inspect.
+                tracing::warn!(
                     namespace = %namespace,
                     pvc = %name,
-                    "adopted-namespace PVC sweep skips claim proven foreign to every CAP StatefulSet window"
+                    "adopted-namespace PVC sweep counts foreign claim as failure; evidence retained for retry"
                 );
+                failures += 1;
                 continue;
             }
             ClaimLineage::Unproven => {

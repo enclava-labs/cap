@@ -71,5 +71,5 @@ UPDATE deployments
    AND observing_since IS NULL
    AND created_at >= COALESCE(
         (SELECT installed_on FROM _sqlx_migrations WHERE version = 47 AND success),
-        TIMESTAMPTZ '-infinity'
+        TIMESTAMPTZ 'infinity'
        );

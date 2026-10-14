@@ -2514,8 +2514,22 @@ async fn fail_apply_job_with_mutation(
             );
         }
     }
+    // retain_marker_persisted = false means either:
+    // 1. we never tried to retain (retain_namespace_fence = false), OR
+    // 2. we tried but the marker persistence failed (retain_namespace_fence = true)
+    // In case 2, we MUST NOT convert to bounded quarantine - the delete is in flight
+    // and we need the infinite fence to stay armed until reconciliation confirms gone.
     if published && let Some(mutation) = mutation {
-        if retain_marker_persisted {
+        if retain_namespace_fence && !retain_marker_persisted {
+            // Codex P1: we asked to retain the infinite fence but couldn't persist
+            // the marker. Fail closed: do NOT convert to bounded quarantine.
+            // The infinite fence stays armed; reconciliation will eventually
+            // confirm the namespace is gone or the lease expires.
+            tracing::error!(
+                deployment_id = %job.deployment_id,
+                "failed to persist namespace fence marker; keeping infinite fence armed until reconciliation"
+            );
+        } else if retain_marker_persisted {
             // The namespace scope stays armed under the retained-namespace
             // marker operation until reconciliation confirms the namespace
             // is gone — mirroring the app-delete fail-closed teardown
