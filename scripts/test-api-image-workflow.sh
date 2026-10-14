@@ -118,98 +118,102 @@ scan_workflow() {
       else return ""
       return k
     }
-    # --- flow-collection support ------------------------------------------
-    # YAML parses flow-style steps (`- { run: ... }`, `- [{ run: ... }]`,
-    # `steps: [{ run: ... }]`, multi-line variants) as ordinary run
-    # commands, so the guard walks flow collections with the same checks.
-    # The walk is quote-aware (with YAML quoting rules: backslash escapes in
-    # double quotes, doubled quotes in single quotes) and treats ${{ ... }}
-    # tokens as opaque so interpolation braces never count as flow syntax.
-    # A `#` outside quotes, at line start or after whitespace, starts a
-    # comment and ends the scanned region for that line. Entries are split
-    # on commas at the collection-s own depth, so a sibling env: entry
-    # with a safe binding is not part of the command and stays unflagged.
-    # Quoted scalars are treated as line-scoped: a quote still open at end
-    # of line is reset so an apostrophe inside a plain scalar cannot wedge
-    # the walker (any leftover entry text is still checked when the
-    # collection closes, so nothing is silently dropped).
-    # flow_quote/flow_depth/flow_cur persist across the lines of a
-    # multi-line collection; flow_line is the first line of the collection.
-    function flow_step(line,   i, c, j) {
-      for (i = 1; i <= length(line); i++) {
-        c = substr(line, i, 1)
-        if (flow_quote != "") {
-          flow_cur = flow_cur c
-          if (flow_quote == "\"" && c == "\\") { flow_cur = flow_cur substr(line, i + 1, 1); i++; continue }
-          if (c == flow_quote) {
-            if (flow_quote == q && substr(line, i + 1, 1) == q) { flow_cur = flow_cur q; i++; continue }
-            flow_quote = ""
+    # --- flow collections -------------------------------------------------
+    # YAML parses flow-style steps (- { run: ... }, steps: [{ ... }], a flow
+    # mapping nested anywhere in a job value, multi-line variants) as
+    # ordinary run commands, so closed flow collections are parsed
+    # recursively: items split on commas at their own depth, a whole-item
+    # or value-position nested collection recurses, and every mapping entry
+    # goes through the same run-key checks as block mode. Quotes follow the
+    # YAML rule that a quote only opens at a scalar start (after start,
+    # comma, bracket, brace, colon, or dash), so an apostrophe inside a
+    # plain scalar (name: dont-quote-me shapes) is literal text while a
+    # genuinely quoted scalar may span lines; a collection still open at
+    # EOF fails closed via the END block. Comments (a hash at line start or
+    # after whitespace, outside quotes) end the scanned region of a line.
+    # yaml_plain blanks quoted spans and comment tails so the anchor/alias
+    # regex only ever sees plain text.
+    function yaml_plain(text,  i, c, out, quote, prevsig) {
+      out = ""; quote = ""; prevsig = ""
+      for (i = 1; i <= length(text); i++) {
+        c = substr(text, i, 1)
+        if (quote != "") {
+          out = out " "
+          if (quote == "\"" && c == "\\") { i++; continue }
+          if (c == quote) {
+            if (quote == q && substr(text, i + 1, 1) == q) { i++; continue }
+            quote = ""; prevsig = c
           }
           continue
         }
-        if (c == "#" && (i == 1 || substr(line, i - 1, 1) ~ /[[:space:]]/)) return
-        if (c == "\"" || c == q) { flow_quote = c; flow_cur = flow_cur c; continue }
-        if (c == "$" && substr(line, i + 1, 2) == "{{") {
-          j = index(substr(line, i), "}}")
-          if (j > 0) { flow_cur = flow_cur substr(line, i, j + 1); i = i + j }
-          else { flow_cur = flow_cur substr(line, i); i = length(line) }
+        if (c == "#" && (i == 1 || substr(text, i - 1, 1) ~ /[[:space:]]/)) return out
+        if ((c == q || c == "\"") && (prevsig == "" || prevsig == "," || prevsig == "[" || prevsig == "{" || prevsig == ":" || prevsig == "-")) {
+          quote = c
+          out = out " "
           continue
         }
-        if (c == "{" || c == "[") {
-          flow_depth++
-          if (flow_depth == 1) { flow_started = 1; continue }
-          flow_cur = flow_cur c
-          continue
-        }
-        if (c == "}" || c == "]") {
-          flow_depth--
-          if (flow_depth <= 0) {
-            flow_entry(flow_cur, flow_line)
-            flow_cur = ""; flow_started = 0; flow_depth = 0
-            in_flow = 0
-            continue
-          }
-          flow_cur = flow_cur c
-          continue
-        }
-        if (c == "," && flow_depth == 1) { flow_entry(flow_cur, flow_line); flow_cur = ""; continue }
-        if (flow_started) flow_cur = flow_cur c
+        out = out c
+        if (c != " " && c != "\t") prevsig = c
       }
-      flow_quote = ""
+      return out
     }
-    # Column of the first flow opener that is outside quotes, comments and
-    # ${{ }} tokens, or 0 when the line opens no flow collection.
-    function flow_opener(line,   i, c, j, quote) {
-      quote = ""
+    # Scan one line of an open flow collection. Returns the column of the
+    # closing bracket when the collection closes, the negated column of a
+    # comment start when the line ends in a comment, and 0 when the
+    # collection continues. fdepth/fquote/fsig persist across lines so
+    # multi-line quoted scalars keep their state.
+    function flow_scan_line(line,  i, c) {
       for (i = 1; i <= length(line); i++) {
         c = substr(line, i, 1)
+        if (fquote != "") {
+          if (fquote == "\"" && c == "\\") { i++; continue }
+          if (c == fquote) {
+            if (fquote == q && substr(line, i + 1, 1) == q) { i++; continue }
+            fquote = ""
+          }
+          continue
+        }
+        if (c == "#" && (i == 1 || substr(line, i - 1, 1) ~ /[[:space:]]/)) return -i
+        if ((c == q || c == "\"") && (fsig == "" || fsig == "," || fsig == "[" || fsig == "{" || fsig == ":" || fsig == "-")) {
+          fquote = c
+          continue
+        }
+        if (c == "{" || c == "[") { fdepth++; fsig = c; continue }
+        if (c == "}" || c == "]") {
+          fdepth--
+          if (fdepth <= 0) return i
+          fsig = c
+          continue
+        }
+        if (c != " " && c != "\t") fsig = c
+      }
+      return 0
+    }
+    # Column of the first flow opener outside quotes and comments, else 0.
+    function flow_find(text,  i, c, quote) {
+      quote = ""
+      for (i = 1; i <= length(text); i++) {
+        c = substr(text, i, 1)
         if (quote != "") {
           if (quote == "\"" && c == "\\") { i++; continue }
           if (c == quote) {
-            if (quote == q && substr(line, i + 1, 1) == q) { i++; continue }
+            if (quote == q && substr(text, i + 1, 1) == q) { i++; continue }
             quote = ""
           }
           continue
         }
-        if (c == "#" && (i == 1 || substr(line, i - 1, 1) ~ /[[:space:]]/)) return 0
-        if (c == "\"" || c == q) { quote = c; continue }
-        if (c == "$" && substr(line, i + 1, 2) == "{{") {
-          j = index(substr(line, i), "}}")
-          if (j > 0) i = i + j
-          else i = length(line)
-          continue
-        }
+        if (c == "#" && (i == 1 || substr(text, i - 1, 1) ~ /[[:space:]]/)) return 0
+        if (c == q || c == "\"") { quote = c; continue }
         if (c == "{" || c == "[") return i
       }
       return 0
     }
-    # A flow collection is only walked when the opener plausibly starts a
-    # YAML node: at the start of the line, after an optional sequence marker
-    # (`- `), or right after a block key (`steps:`, quoted keys included).
-    # In block context `{`/`[` inside a plain scalar (e.g. `name: a{b`) is
-    # literal text, not a collection, so anything else returns 0.
-    function flow_begin(line,   pos, pre) {
-      pos = flow_opener(line)
+    # A flow collection is only walked when its opener plausibly starts a
+    # YAML node: at line start, after an optional sequence marker, or right
+    # after a block key (quoted keys included). In block context braces
+    # inside a plain scalar (name: deploy{region}) are literal text.
+    function flow_begin(line,  pos, pre) {
+      pos = flow_find(line)
       if (pos == 0) return 0
       pre = substr(line, 1, pos - 1)
       if (pre ~ /^[[:space:]]*$/) return pos
@@ -220,17 +224,55 @@ scan_workflow() {
       if (pre ~ ("^[[:space:]]*" q "[^" q "]*" q ":[[:space:]]*$")) return pos
       return 0
     }
-    # Apply the block-mode checks to one flow entry, after trimming it and
-    # unwrapping any nested single-collection wrapper (`[ ... ]` / `{ ... }`).
-    function flow_entry(text, fline,   e, value) {
-      e = text
+    # Split the inside of one collection into items on commas at depth 0,
+    # quotes (scalar-start rule) respected.
+    function flow_split(text, items,  i, c, quote, depth, cur, n, prev) {
+      n = 0; quote = ""; depth = 0; cur = ""; prev = ""
+      for (i = 1; i <= length(text); i++) {
+        c = substr(text, i, 1)
+        if (quote != "") {
+          cur = cur c
+          if (quote == "\"" && c == "\\") { cur = cur substr(text, i + 1, 1); i++; continue }
+          if (c == quote) {
+            if (quote == q && substr(text, i + 1, 1) == q) { cur = cur q; i++; continue }
+            quote = ""
+          }
+          continue
+        }
+        if (c == q || c == "\"") {
+          if (prev == "" || prev == "," || prev == "[" || prev == "{" || prev == ":" || prev == "-") quote = c
+          cur = cur c
+          if (quote == c) prev = c
+          continue
+        }
+        if (c == "{" || c == "[") { depth++; cur = cur c; prev = c; continue }
+        if (c == "}" || c == "]") { depth--; cur = cur c; prev = c; continue }
+        if (c == "," && depth == 0) { items[++n] = cur; cur = ""; prev = ""; continue }
+        cur = cur c
+        if (c != " " && c != "\t") prev = c
+      }
+      if (cur != "") items[++n] = cur
+      return n
+    }
+    # Recursively check a closed collection (text runs from its opening
+    # bracket to its matching close).
+    function flow_parse(text, fline,  inner, items, n, k) {
+      inner = substr(text, 2, length(text) - 2)
+      n = flow_split(inner, items)
+      for (k = 1; k <= n; k++) flow_item(items[k], fline)
+    }
+    # Check one flow item: whole-item collections recurse, run-key entries
+    # get the block-mode checks, other key/value entries recurse into a
+    # collection-valued right side (steps: [{ ... }] at any depth).
+    function flow_item(item, fline,  e, value, rest, pos, plain, lead) {
+      e = item
       sub(/^[[:space:]]+/, "", e)
       sub(/[[:space:]]+$/, "", e)
-      while ((substr(e, 1, 1) == "{" && substr(e, length(e), 1) == "}") ||
-             (substr(e, 1, 1) == "[" && substr(e, length(e), 1) == "]")) {
-        e = substr(e, 2, length(e) - 2)
-        sub(/^[[:space:]]+/, "", e)
-        sub(/[[:space:]]+$/, "", e)
+      if (e == "") return
+      if ((substr(e, 1, 1) == "{" && substr(e, length(e), 1) == "}") ||
+          (substr(e, 1, 1) == "[" && substr(e, length(e), 1) == "]")) {
+        flow_parse(e, fline)
+        return
       }
       value = runkey(e)
       if (value != "") {
@@ -238,9 +280,54 @@ scan_workflow() {
         # A bare alias as the entire run value is resolved by YAML before
         # the shell sees the text, so ban it outright (same rule as block).
         if (mode == "anchors" && value ~ /^\*[^][[:space:]{},&*]/) print fline ": " e
-      } else if (mode == "anchors" && e != "") {
-        if (e ~ /(^|[[:space:]])[&*][^][[:space:]{},&*]/) print fline ": " e
+        lead = value
+        sub(/^[[:space:]]+/, "", lead)
+        if (substr(lead, 1, 1) == "{" || substr(lead, 1, 1) == "[") flow_parse(lead, fline)
+        return
       }
+      pos = flow_keysep(e)
+      if (pos > 0) {
+        rest = substr(e, pos + 1)
+        sub(/^[[:space:]]+/, "", rest)
+        if (substr(rest, 1, 1) == "{" || substr(rest, 1, 1) == "[") flow_parse(rest, fline)
+      }
+      if (mode == "anchors") {
+        plain = yaml_plain(e)
+        if (plain ~ /(^|[[:space:]])[&*][^][[:space:]{},&*]/) print fline ": " e
+      }
+    }
+    # Column of the key/value separator colon of a flow item (a colon
+    # followed by space or a flow indicator, outside quotes and nesting).
+    function flow_keysep(e,  i, c, nc, quote, depth) {
+      quote = ""; depth = 0
+      for (i = 1; i < length(e); i++) {
+        c = substr(e, i, 1)
+        if (quote != "") {
+          if (quote == "\"" && c == "\\") { i++; continue }
+          if (c == quote) {
+            if (quote == q && substr(e, i + 1, 1) == q) { i++; continue }
+            quote = ""
+          }
+          continue
+        }
+        if (c == q || c == "\"") { quote = c; continue }
+        if (c == "{" || c == "[") depth++
+        else if (c == "}" || c == "]") depth--
+        else if (c == ":" && depth == 0) {
+          # Portable separator test (busybox awk does not honor \\[ and
+          # \\] inside a bracket expression, so compare characters
+          # directly): a flow key/value colon is followed by whitespace,
+          # a comma, or a flow indicator, or ends the item.
+          nc = substr(e, i + 1, 1)
+          if (i == length(e) || nc == " " || nc == "\t" || nc == "," || nc == "{" || nc == "}" || nc == "[" || nc == "]") return i
+        }
+      }
+      return 0
+    }
+    # Locate the collection in a fully-buffered line group and parse it.
+    function flow_start(text, fline,  p) {
+      p = flow_find(text)
+      if (p > 0) flow_parse(substr(text, p), fline)
     }
     {
       if (in_run) {
@@ -253,7 +340,16 @@ scan_workflow() {
       }
       if (in_flow) {
         if ($0 ~ /^[[:space:]]*$/) next
-        flow_step($0)
+        cc = flow_scan_line($0)
+        if (cc > 0) {
+          fbuf = fbuf " " substr($0, 1, cc)
+          flow_start(fbuf, fline)
+          in_flow = 0
+        } else if (cc < 0) {
+          fbuf = fbuf " " substr($0, 1, -cc - 1)
+        } else {
+          fbuf = fbuf " " $0
+        }
         next
       }
       value = runkey($0)
@@ -277,25 +373,31 @@ scan_workflow() {
       } else if ($0 !~ /^[[:space:]]*$/) {
         pos = flow_begin($0)
         if (pos > 0) {
-          # A flow collection opened outside any run body: YAML parses its
-          # run entries as ordinary run commands, so walk it the same way.
-          flow_buf = substr($0, pos)
-          flow_line = FNR
-          flow_quote = ""
-          flow_depth = 0
-          flow_cur = ""
-          flow_started = 0
+          fline = FNR
+          fdepth = 0
+          fquote = ""
+          fsig = ""
           in_flow = 1
-          flow_step(flow_buf)
-        } else if (mode == "anchors" && $0 ~ /(^|[[:space:]])[&*][^][[:space:]{},&*]/) {
-          print FNR ": " $0
+          cc = flow_scan_line($0)
+          if (cc > 0) {
+            fbuf = substr($0, 1, cc)
+            flow_start(fbuf, fline)
+            in_flow = 0
+          } else if (cc < 0) {
+            fbuf = substr($0, 1, -cc - 1)
+          } else {
+            fbuf = $0
+          }
+        } else if (mode == "anchors") {
+          plain = yaml_plain($0)
+          if (plain ~ /(^|[[:space:]])[&*][^][[:space:]{},&*]/) print FNR ": " $0
         }
       }
     }
     END {
       # Fail closed: a flow collection still open at EOF cannot be walked
       # safely, so flag it instead of silently skipping the rest of the file.
-      if (in_flow) print flow_line ": unclosed flow collection (run entries cannot be scanned safely)"
+      if (in_flow) print fline ": unclosed flow collection (run entries cannot be scanned safely)"
     }
   ' "$2"
 }
@@ -473,6 +575,65 @@ guard_case flow_literal_scalar '        name: deploy{region} west # {not a flow}
   || fail "run-injection guard self-test (flow_literal_scalar): literal braces in scalars must not be flagged"
 [[ -z "$(scan_anchor_tokens "$guard_tmp/flow_literal_scalar.yml")" ]] \
   || fail "run-injection guard self-test (flow_literal_scalar): unexpected anchor/alias match"
+
+# Re-review round on the flow walker (#236): recursion, quoting, comments.
+
+# env siblings inside steps: [{ ... }] are safe bindings, not command text
+# (Devin review): items split at their own depth, only run values checked.
+guard_case flow_seq_env_safe 'steps: [{ run: '"'"'echo ok'"'"', env: { REF: '"'"'${{ github.ref }}'"'"' } }]
+'
+[[ -z "$(scan_run_injections "$guard_tmp/flow_seq_env_safe.yml")" ]] \
+  || fail "run-injection guard self-test (flow_seq_env_safe): env bindings inside steps: [{ ... }] must not be flagged"
+
+# A flow mapping nested in a job value is still parsed recursively so its
+# run entry is checked (Codex review): depth is not an escape hatch.
+guard_case flow_nested_job 'job: { runs-on: ubuntu-latest, steps: [{ name: exploit, run: '"'"'echo "${{ github.ref }}"'"'"' }] }
+'
+guard_must_flag_run flow_nested_job
+guard_case flow_nested_job_safe 'job: { runs-on: ubuntu-latest, steps: [{ name: ok, run: '"'"'echo "$REF'"'"', env: { REF: '"'"'${{ github.ref }}'"'"' } }] }
+'
+[[ -z "$(scan_run_injections "$guard_tmp/flow_nested_job_safe.yml")" ]] \
+  || fail "run-injection guard self-test (flow_nested_job_safe): nested safe env binding must not be flagged"
+
+# Key order inside a flow mapping is irrelevant: name before run must not
+# hide the run entry (Devin review).
+guard_case flow_key_order 'steps: [{ name: deploy, run: '"'"'echo "${{ github.ref }}"'"'"' }]
+'
+guard_must_flag_run flow_key_order
+
+# Quoted flow scalars may span lines (Devin review): the quote state
+# persists across the collection's lines.
+guard_case flow_multiline_quoted 'steps: [{run: "echo
+  hi"}]
+'
+[[ -z "$(scan_run_injections "$guard_tmp/flow_multiline_quoted.yml")" ]] \
+  || fail "run-injection guard self-test (flow_multiline_quoted): safe multiline quoted scalar must not be flagged"
+guard_case flow_multiline_quoted_interp 'steps: [{run: "echo
+  ${{ github.ref }}"}]
+'
+guard_must_flag_run flow_multiline_quoted_interp
+
+# An apostrophe inside an unquoted plain scalar is literal text, not a
+# quote opener (Devin review): quotes only open at a scalar start.
+guard_case flow_plain_apostrophe 'steps: [{ name: dont panic, run: '"'"'echo ok'"'"' }]
+'
+[[ -z "$(scan_run_injections "$guard_tmp/flow_plain_apostrophe.yml")" ]] \
+  || fail "run-injection guard self-test (flow_plain_apostrophe): plain scalar text must not be treated as quoting"
+[[ -z "$(scan_anchor_tokens "$guard_tmp/flow_plain_apostrophe.yml")" ]] \
+  || fail "run-injection guard self-test (flow_plain_apostrophe): unexpected anchor/alias match"
+
+# Anchor-like text inside comments and quoted scalars must not trip the
+# anchor/alias ban (Codex review).
+guard_case flow_anchor_in_comment '        run: echo ok
+        # Support R&D &security release naming
+'
+[[ -z "$(scan_anchor_tokens "$guard_tmp/flow_anchor_in_comment.yml")" ]] \
+  || fail "run-injection guard self-test (flow_anchor_in_comment): anchor-like text in comments must not be flagged"
+guard_case flow_anchor_in_quoted '        name: "R&D &friends"
+        run: echo ok
+'
+[[ -z "$(scan_anchor_tokens "$guard_tmp/flow_anchor_in_quoted.yml")" ]] \
+  || fail "run-injection guard self-test (flow_anchor_in_quoted): anchor-like text in quoted scalars must not be flagged"
 rm -rf "$guard_tmp"
 
 grep -Fq -- '      - "deploy/api/**"' "$WORKFLOW" \
