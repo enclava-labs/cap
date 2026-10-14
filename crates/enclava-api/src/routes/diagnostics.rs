@@ -592,9 +592,9 @@ fn worker_or_schedule_condition(
     if worker_live {
         // A worker holds the job: lease renewals are durable progress
         // evidence even when the phase looks static.
-        (DeploymentCondition::Progressing, None)
+        return (DeploymentCondition::Progressing, None);
     } else if foreign_blocked {
-        (DeploymentCondition::BlockedByOperation, None)
+        return (DeploymentCondition::BlockedByOperation, None);
     } else if let Some(version) = row.job_payload_version {
         // Check if the job version is supported by this API instance.
         // During rolling upgrades, an older API may serve diagnostics for jobs
@@ -618,16 +618,16 @@ fn worker_or_schedule_condition(
     if is_claimed_state {
         // Lock expired but job still in claimed state: ready for immediate
         // recovery by any worker. Normal progress, not waiting.
-        (DeploymentCondition::Progressing, None)
+        return (DeploymentCondition::Progressing, None);
     } else if let Some(attempt_at) = row.next_attempt_at.filter(|a| a > &now) {
         // Dispatch scheduled but not yet due. For a `watching`
         // deployment this is the steady state between observation
         // slices — deliberate pacing, not a fault.
-        (DeploymentCondition::WaitingExternal, Some(attempt_at))
+        return (DeploymentCondition::WaitingExternal, Some(attempt_at));
     } else {
         // Claimable now (due retry): waits only for a free apply slot. Normal
         // dispatcher queueing, not a stall.
-        (DeploymentCondition::Progressing, None)
+        return (DeploymentCondition::Progressing, None);
     }
 }
 
