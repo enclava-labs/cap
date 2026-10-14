@@ -97,9 +97,11 @@ done
 # ({ run: ... }), the - run: shorthand, block scalars (| and >), multi-line
 # plain scalars, and aliases/merge keys that launder an interpolated scalar
 # into run: are all covered by construction - there is no line/regex scanner
-# left to evade. Only step-level run: values are checked: a `run` key
-# anywhere else (job env:, strategy.matrix:, action with: inputs,
-# defaults.run) is data, not shell, and an ampersand in a plain scalar is
+# left to evade. Step-level run: values are checked, and so is
+# defaults.run.shell at both workflow and job scope: it is a command
+# template for every step, so interpolations in it are flagged the same
+# way. A `run` key anywhere else (job env:, strategy.matrix:, action with:
+# inputs) is data, not shell, and an ampersand in a plain scalar is
 # just text. Invalid YAML fails closed: an unparsable workflow is rejected,
 # never silently skipped. The parser is python3 + PyYAML (preinstalled on
 # GitHub-hosted ubuntu runners); if it is missing the guard exits nonzero so
