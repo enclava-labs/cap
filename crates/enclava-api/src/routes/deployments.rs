@@ -592,6 +592,30 @@ async fn app_has_incomplete_deployment_setup(
     .await
 }
 
+/// Whether ANY deployment for the app has ever persisted a manifest hash —
+/// i.e. a workload manifest (and therefore a volumeClaimTemplate/PVC) has
+/// been rendered for this app at least once. Used to derive whether the
+/// persisted storage sizes govern FRESH volumes (no render ever happened)
+/// or already-provisioned ones (grandfathered pre-floor sizes keep
+/// operating). Query executor is a transaction so callers can rely on it
+/// under their held lanes.
+pub(crate) async fn app_has_ever_rendered_workload(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    app_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM deployments
+             WHERE app_id = $1
+               AND manifest_hash IS NOT NULL
+         )",
+    )
+    .bind(app_id)
+    .fetch_one(&mut **tx)
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn build_accepted_apply_payload(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,

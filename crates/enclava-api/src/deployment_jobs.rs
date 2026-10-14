@@ -2038,14 +2038,26 @@ async fn acquire_apply_permit_and_revalidate(
         {
             return Err(DeploymentJobError::Authority);
         }
+        // Apply-job revalidation of the accepted snapshot's PERSISTED
+        // resources: grandfathered pre-floor sizes keep operating. Exception:
+        // if no deployment for this app has EVER persisted a manifest hash,
+        // this apply is the first render and provisions the volumes fresh —
+        // enforce the 32 MiB floor so a sub-floor snapshot that slipped past
+        // admission (mixed-version window, pre-floor API instance) fails
+        // HERE, before the hash is written and the PVC created, leaving the
+        // app correctable. A grandfathered app always has a hashed
+        // deployment, so it takes the false branch.
+        let fresh_volume_sizes = !crate::routes::deployments::app_has_ever_rendered_workload(
+            &mut authority_lane,
+            job.app_id,
+        )
+        .await?;
         crate::routes::deployments::enforce_authoritative_entitlement(
             &mut authority_lane,
             job.org_id,
             &payload.snapshot.resources,
             false,
-            // Apply-job revalidation of the accepted snapshot's PERSISTED
-            // resources: grandfathered pre-floor sizes keep operating.
-            false,
+            fresh_volume_sizes,
         )
         .await
         .map_err(|_| DeploymentJobError::Authority)?;
