@@ -31,6 +31,32 @@ pub fn trustee_kbs_resource_url() -> String {
     )
 }
 
+/// LUKS2 header-seal rollout gate rendered into the signed cc_init_data
+/// (cap#242): "adopt" during the migration window (legacy pre-seal volumes
+/// are adopted after the passphrase gate), "required" once the fleet has
+/// migrated (an unsealed header is rejected as rollback). One-way rollout:
+/// the platform default starts at "adopt"; operators set
+/// ENCLAVA_LUKS2_HEADER_SEAL=required fleet-wide after migration, and the
+/// claim is committed to the signed artifact, so a host cannot downgrade a
+/// guest that signed "required".
+pub fn luks2_header_seal_claim() -> String {
+    let value = std::env::var("ENCLAVA_LUKS2_HEADER_SEAL").unwrap_or_else(|_| "adopt".to_string());
+    validate_luks2_header_seal_claim(&value)
+}
+
+/// Validate an explicit claim value; testable without process-global env
+/// mutation (edition 2024 makes `set_var` unsafe, and env mutation races
+/// parallel tests anyway).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn validate_luks2_header_seal_claim(value: &str) -> String {
+    match value {
+        "adopt" | "required" => value.to_string(),
+        other => panic!(
+            "invalid ENCLAVA_LUKS2_HEADER_SEAL {other:?}: expected \"adopt\" or \"required\""
+        ),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CcInitDataOptions {
     pub kbs_url: String,
@@ -170,6 +196,7 @@ pub fn build_toml_with_options(app: &ConfidentialApp, options: &CcInitDataOption
         "tls_state_hkdf_info",
         crate::manifest::enclava_init_config::TLS_STATE_HKDF_INFO,
     );
+    push_toml_string(&mut toml, "luks2_header_seal", &luks2_header_seal_claim());
     push_toml_string(
         &mut toml,
         "unlock_socket",

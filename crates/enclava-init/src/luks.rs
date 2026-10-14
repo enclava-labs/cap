@@ -171,9 +171,19 @@ pub fn format(device: &Path, keys: &VolumeKeys) -> Result<()> {
 /// adoption for legacy volumes) before cryptsetup sees any bytes, and only
 /// ever via a detached copy on tmpfs.
 pub fn open(device: &Path, mapping_name: &str, keys: &VolumeKeys) -> Result<LuksOpened> {
+    open_with_policy(device, mapping_name, keys, &LuksOpenPolicy::default())
+}
+
+/// [`open`] with an explicit rollout policy; see [`LuksOpenPolicy`].
+pub fn open_with_policy(
+    device: &Path,
+    mapping_name: &str,
+    keys: &VolumeKeys,
+    policy: &LuksOpenPolicy,
+) -> Result<LuksOpened> {
     let mapper_path = PathBuf::from(format!("/dev/mapper/{mapping_name}"));
     if mapper_path.exists() {
-        validate_existing_mapper(device, mapping_name, keys)?;
+        validate_existing_mapper(device, mapping_name, keys, policy)?;
         return Ok(LuksOpened {
             mapper_path,
             formatted: false,
@@ -183,12 +193,37 @@ pub fn open(device: &Path, mapping_name: &str, keys: &VolumeKeys) -> Result<Luks
     luks2_seal::read_header_region(device)
         .and_then(|region| {
             validate_region(&region)?;
-            authenticated_open(device, &region, mapping_name, keys)
+            authenticated_open(device, &region, mapping_name, keys, policy)
         })
         .map(|_| LuksOpened {
             mapper_path,
             formatted: false,
         })
+}
+
+/// Policy for the LUKS2 header-seal rollout gate (cap#242 review: sealed
+/// volumes must not accept unsealed-header rollback).
+///
+/// `allow_legacy_adoption` governs the `HeaderSeal::Unsealed` branch: during
+/// the rollout window a pre-seal ("legacy") volume is adopted after the
+/// strict-validation + passphrase gate, but once the signed cc_init_data
+/// declares the seal required, an unsealed header on a formatted device is
+/// rejected as a rollback/host substitution instead of re-adopted. The value
+/// comes from the *signed* `luks2_header_seal` claim, so the host cannot
+/// flip it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LuksOpenPolicy {
+    pub allow_legacy_adoption: bool,
+}
+
+impl Default for LuksOpenPolicy {
+    fn default() -> Self {
+        // Rollout window: legacy volumes exist in the fleet, so absence of
+        // the signed claim (older signed artifacts) keeps adoption allowed.
+        Self {
+            allow_legacy_adoption: true,
+        }
+    }
 }
 
 /// Shared authenticated-open core: verify the seal (adopting legacy volumes
@@ -199,6 +234,7 @@ fn authenticated_open(
     region: &Luks2Region,
     mapping_name: &str,
     keys: &VolumeKeys,
+    policy: &LuksOpenPolicy,
 ) -> Result<()> {
     let seal = luks2_seal::verify_header_seal(region, &keys.header_mac_key)?;
     let detached_path = detached_header_path(mapping_name);
@@ -224,9 +260,22 @@ fn authenticated_open(
                 activate_detached(device, &detached_path, mapping_name, &keys.passphrase)?;
             }
             HeaderSeal::Unsealed => {
-                // Legacy pre-seal volume. Gate adoption on a passphrase test
-                // through the detached copy, then seal. Adoption never falls
-                // back to an in-place open.
+                // Legacy pre-seal volume — but only while the signed rollout
+                // gate still allows adoption. With the seal required, an
+                // unsealed header on a formatted device means the host
+                // restored a pre-seal header (rollback) or zeroed both MAC
+                // slots; fail closed either way.
+                if !policy.allow_legacy_adoption {
+                    return Err(InitError::Luks(format!(
+                        "LUKS2 header on {} carries no HMAC seal but the signed \
+                         configuration requires sealing; possible header rollback \
+                         or tampering, refusing to open",
+                        device.display()
+                    )));
+                }
+                // Gate adoption on a passphrase test through the detached
+                // copy, then seal. Adoption never falls back to an in-place
+                // open.
                 tracing::warn!(
                     device = %device.display(),
                     "LUKS2 header carries no HMAC seal (pre-#242 volume); adopting after strict validation and passphrase gate"
@@ -277,25 +326,74 @@ fn activate_detached(
     Ok(())
 }
 
-fn validate_existing_mapper(device: &Path, mapping_name: &str, keys: &VolumeKeys) -> Result<()> {
-    let status_device = cryptsetup_status_device(mapping_name)?;
-    if let Some(status_device) = &status_device
-        && !paths_equivalent(status_device, device)
-    {
+fn validate_existing_mapper(
+    device: &Path,
+    mapping_name: &str,
+    keys: &VolumeKeys,
+    policy: &LuksOpenPolicy,
+) -> Result<()> {
+    // The status fields (device, cipher, keysize, offset) tie the live
+    // mapper to the exact header shape we MAC-verified: cryptsetup reports
+    // them from the header it activated with, so a mapper activated from a
+    // substituted header (e.g. cipher_null-swapped metadata with the
+    // legitimate UUID cloned in) diverges here. A missing device line is an
+    // error, not a pass (cap#244 self-review).
+    let status = cryptsetup_status_full(mapping_name)?;
+    let Some(status_device) = &status.device else {
+        return Err(InitError::Luks(format!(
+            "cryptsetup status {mapping_name} reported no backing device; \
+             refusing to reuse the mapper"
+        )));
+    };
+    if !paths_equivalent(status_device, device) {
         return Err(InitError::Luks(format!(
             "existing mapper {mapping_name} is backed by {}, expected {}",
             status_device.display(),
             device.display()
         )));
     }
+    if status.cipher.as_deref() != Some("aes-xts-plain64") {
+        return Err(InitError::Luks(format!(
+            "existing mapper {mapping_name} cipher is {:?}, expected \
+             aes-xts-plain64; refusing to reuse the mapper",
+            status.cipher
+        )));
+    }
+    if status.keysize_bits != Some(512) {
+        return Err(InitError::Luks(format!(
+            "existing mapper {mapping_name} keysize is {:?} bits, expected 512; \
+             refusing to reuse the mapper",
+            status.keysize_bits
+        )));
+    }
     // The mapper may predate this boot's seal; re-verify the on-disk header
     // before trusting the existing activation.
     let region = luks2_seal::read_header_region(device)?;
     validate_region(&region)?;
+    // The offset must match the MAC-verified header's data_offset (sector
+    // size 512 is pinned by strict validation).
+    let expected_offset = region.layout.data_offset / 512;
+    if status.offset_sectors != Some(expected_offset) {
+        return Err(InitError::Luks(format!(
+            "existing mapper {mapping_name} offset is {:?} sectors, expected {} \
+             (data_offset of the authenticated header); refusing to reuse the mapper",
+            status.offset_sectors, expected_offset
+        )));
+    }
     let mut seal = luks2_seal::verify_header_seal(&region, &keys.header_mac_key)?;
     if let HeaderSeal::Unsealed = seal {
         // Mapper already active for a legacy volume this boot; adopt+seal
-        // through the same gate the open path uses.
+        // through the same gate the open path uses — including the signed
+        // rollout gate: once sealing is required, an unsealed header is a
+        // rollback, not a legacy volume.
+        if !policy.allow_legacy_adoption {
+            return Err(InitError::Luks(format!(
+                "existing mapper {mapping_name}: header on {} carries no HMAC seal but \
+                 the signed configuration requires sealing; possible header rollback \
+                 or tampering, refusing to reuse the mapper",
+                device.display()
+            )));
+        }
         let detached_path = detached_header_path(mapping_name);
         let result = (|| -> Result<()> {
             luks2_seal::write_detached_copy(&region, &detached_path)?;
@@ -313,11 +411,8 @@ fn validate_existing_mapper(device: &Path, mapping_name: &str, keys: &VolumeKeys
     }
     // An existing mapper is dm-crypt state created by an earlier boot of this
     // code, but the host controls the disk and could substitute a mapper we
-    // did not create. Prove the live mapper is encrypted with the volume key
-    // bound to the just-authenticated header before the caller mounts it:
-    // extract the volume key from the authenticated (MAC-verified) header via
-    // a detached copy using our passphrase, then ask libcryptsetup to verify
-    // that key against the *active* mapper.
+    // did not create. Bind the live mapper to the MAC-verified header via its
+    // kernel-held dm UUID before the caller mounts it.
     verify_active_mapper_volume_key(device, &region, mapping_name, keys)?;
     Ok(())
 }
@@ -331,9 +426,11 @@ fn validate_existing_mapper(device: &Path, mapping_name: &str, keys: &VolumeKeys
 ///
 /// 1. `cryptsetup status` reports the backing device, already checked by the
 ///    caller (`paths_equivalent`).
-/// 2. The dm table's keyring key description has the form
-///    `:64:logon:cryptsetup:<luks-uuid>-d0` where `<luks-uuid>` is the UUID
-///    of the header cryptsetup loaded *at activation time*. Requiring that
+/// 2. The kernel-held dm UUID for the mapper (sysfs
+///    `/sys/block/dm-N/dm/uuid`, written by device-mapper at table load and
+///    not writable from userspace) has the form
+///    `CRYPT-LUKS2-<luks-uuid>-<mapping-name>` where `<luks-uuid>` is the
+///    UUID of the header cryptsetup loaded *at activation time*. Requiring that
 ///    UUID to equal the UUID of the MAC-verified on-disk header binds the
 ///    active mapper to this exact authenticated header — a mapper activated
 ///    from any other header (including a substituted or rolled-back one)
@@ -347,21 +444,15 @@ fn verify_active_mapper_volume_key(
     _keys: &VolumeKeys,
 ) -> Result<()> {
     let expected_uuid = region_header_uuid(region)?;
-    let table = dm_crypt_table(mapping_name)?;
-    let key_description = parse_dm_key_description(&table).ok_or_else(|| {
-        InitError::Luks(format!(
-            "existing mapper {mapping_name} does not expose a cryptsetup keyring key; \
-             refusing to use it"
-        ))
-    })?;
-    // Keyring key description format: cryptsetup:<luks-uuid>-d0
-    let bound_uuid = key_description
-        .strip_prefix("cryptsetup:")
-        .and_then(|rest| rest.strip_suffix("-d0"))
+    let dm_uuid = mapper_dm_uuid(mapping_name)?;
+    // Kernel-held dm UUID format: CRYPT-LUKS2-<luks-uuid>-<mapping-name>
+    let bound_uuid = dm_uuid
+        .strip_prefix("CRYPT-LUKS2-")
+        .and_then(|rest| rest.strip_suffix(&format!("-{mapping_name}")))
         .ok_or_else(|| {
             InitError::Luks(format!(
-                "existing mapper {mapping_name} key description {key_description:?} is not \
-                 a cryptsetup LUKS2 volume key; refusing to use it"
+                "existing mapper {mapping_name} dm UUID {dm_uuid:?} is not a LUKS2 \
+                 cryptsetup mapper bound to this name; refusing to use it"
             ))
         })?;
     if bound_uuid != expected_uuid {
@@ -375,7 +466,7 @@ fn verify_active_mapper_volume_key(
     tracing::info!(
         mapping = mapping_name,
         uuid = %expected_uuid,
-        "existing mapper bound to authenticated header via keyring key UUID"
+        "existing mapper bound to authenticated header via kernel dm UUID"
     );
     Ok(())
 }
@@ -400,32 +491,49 @@ fn region_header_uuid(region: &Luks2Region) -> Result<String> {
     Ok(uuid)
 }
 
-/// The dm table line of an active mapper, with keyring key descriptions
-/// visible (`dmsetup table --showkeys`), e.g.
-/// `0 98304 crypt aes-xts-plain64 :64:logon:cryptsetup:<uuid>-d0 0 7:0 32768`.
-fn dm_crypt_table(mapping_name: &str) -> Result<String> {
-    let output = std::process::Command::new("dmsetup")
-        .args(["table", "--showkeys", mapping_name])
-        .output()
-        .map_err(|e| InitError::Luks(format!("dmsetup table {mapping_name}: {e}")))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+/// The kernel-held device-mapper UUID of an active mapper, read from sysfs.
+///
+/// The dm device backing `/dev/mapper/<mapping_name>` is resolved through
+/// its `stat` device number to `/sys/dev/block/<maj:min>/dm/name`, which is
+/// verified to equal the mapping name, and the sibling `dm/uuid` file holds
+/// the UUID device-mapper assigned at table load
+/// (`CRYPT-LUKS2-<luks-uuid>-<name>` for cryptsetup LUKS2 mappers). Both are
+/// kernel-truth: userspace (including a malicious host process in the
+/// guest's mount namespace view) cannot rewrite them for an active mapper.
+/// Fails closed when the mapper is not backed by sysfs-visible dm state
+/// (unexpected for a LUKS2 mapper). No `dmsetup` binary is required — the
+/// runtime image does not install one (cap#244 review).
+fn mapper_dm_uuid(mapping_name: &str) -> Result<String> {
+    let mapper_path = PathBuf::from(format!("/dev/mapper/{mapping_name}"));
+    let meta = std::fs::metadata(&mapper_path)
+        .map_err(|e| InitError::Luks(format!("stat {}: {e}", mapper_path.display())))?;
+    // Decode the raw dev_t with the same gnu encoding libc's major()/minor()
+    // use, so renamed or reordered dm minors resolve correctly.
+    let rdev = {
+        use std::os::unix::fs::MetadataExt;
+        meta.rdev()
+    };
+    let major = ((rdev >> 8) & 0xfff) | ((rdev >> 32) & !0xfffu64);
+    let minor = (rdev & 0xff) | ((rdev >> 12) & !0xfffu64);
+    let sys_dm = format!("/sys/dev/block/{major}:{minor}/dm");
+    let name = std::fs::read_to_string(format!("{sys_dm}/name"))
+        .map_err(|e| InitError::Luks(format!("read {sys_dm}/name: {e}")))?;
+    let name = name.trim();
+    if name != mapping_name {
         return Err(InitError::Luks(format!(
-            "dmsetup table --showkeys {mapping_name} exited with {}: {}",
-            output.status,
-            stderr.trim()
+            "dm device backing {mapping_name} reports name {name:?}; refusing to use it"
         )));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-/// Pull the `:64:logon:cryptsetup:<uuid>-d0` key description out of a dm
-/// crypt table line.
-fn parse_dm_key_description(table: &str) -> Option<String> {
-    let start = table.find(":logon:")?;
-    let rest = &table[start + ":logon:".len()..];
-    let end = rest.find(' ')?;
-    Some(rest[..end].to_string())
+    let uuid = std::fs::read_to_string(format!("{sys_dm}/uuid"))
+        .map_err(|e| InitError::Luks(format!("read {sys_dm}/uuid: {e}")))?;
+    let uuid = uuid.trim();
+    if uuid.is_empty() {
+        return Err(InitError::Luks(format!(
+            "dm device for mapper {mapping_name} has an empty kernel UUID; \
+             refusing to use it"
+        )));
+    }
+    Ok(uuid.to_string())
 }
 
 /// Format the device if it's not yet a LUKS2 volume, then activate it.
@@ -433,6 +541,24 @@ pub fn format_if_unformatted_then_open(
     device: &Path,
     mapping_name: &str,
     keys: &VolumeKeys,
+) -> Result<LuksOpened> {
+    format_if_unformatted_then_open_with_policy(
+        device,
+        mapping_name,
+        keys,
+        &LuksOpenPolicy::default(),
+    )
+}
+
+/// [`format_if_unformatted_then_open`] with an explicit rollout policy; see
+/// [`LuksOpenPolicy`]. A freshly formatted device is sealed before anyone
+/// reads it back, so the policy only governs how an *existing* header is
+/// opened.
+pub fn format_if_unformatted_then_open_with_policy(
+    device: &Path,
+    mapping_name: &str,
+    keys: &VolumeKeys,
+    policy: &LuksOpenPolicy,
 ) -> Result<LuksOpened> {
     let formatted = is_formatted(device)?;
     let has_keyslots = if formatted {
@@ -452,7 +578,7 @@ pub fn format_if_unformatted_then_open(
     if needs_mkfs {
         format(device, keys)?;
     }
-    let mut opened = open(device, mapping_name, keys)?;
+    let mut opened = open_with_policy(device, mapping_name, keys, policy)?;
     if needs_mkfs {
         mkfs_ext4(&opened.mapper_path)?;
         opened.formatted = true;
@@ -638,7 +764,16 @@ fn test_passphrase_detached(device: &Path, detached_path: &Path, key: &DerivedSe
     })
 }
 
-fn cryptsetup_status_device(mapping_name: &str) -> Result<Option<PathBuf>> {
+/// Selected `cryptsetup status <name>` fields for an active mapper.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CryptsetupStatus {
+    device: Option<PathBuf>,
+    cipher: Option<String>,
+    keysize_bits: Option<u64>,
+    offset_sectors: Option<u64>,
+}
+
+fn cryptsetup_status_full(mapping_name: &str) -> Result<CryptsetupStatus> {
     let output = std::process::Command::new("cryptsetup")
         .args(["status", mapping_name])
         .output()
@@ -654,17 +789,40 @@ fn cryptsetup_status_device(mapping_name: &str) -> Result<Option<PathBuf>> {
         )));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(parse_cryptsetup_status_device(&stdout))
+    Ok(parse_cryptsetup_status(&stdout))
 }
 
-fn parse_cryptsetup_status_device(output: &str) -> Option<PathBuf> {
-    output.lines().find_map(|line| {
-        line.trim_start()
-            .strip_prefix("device:")
+fn parse_cryptsetup_status(output: &str) -> CryptsetupStatus {
+    let mut status = CryptsetupStatus {
+        device: None,
+        cipher: None,
+        keysize_bits: None,
+        offset_sectors: None,
+    };
+    for line in output.lines() {
+        let line = line.trim_start();
+        if let Some(value) = line.strip_prefix("device:").map(str::trim) {
+            if !value.is_empty() {
+                status.device = Some(PathBuf::from(value));
+            }
+        } else if let Some(value) = line.strip_prefix("cipher:").map(str::trim) {
+            status.cipher = Some(value.to_string());
+        } else if let Some(first) = line
+            .strip_prefix("keysize:")
             .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-    })
+            .and_then(|v| v.split_whitespace().next())
+        {
+            // "512 bits" -> 512; bare "512" also accepted.
+            status.keysize_bits = first.strip_suffix("bits").unwrap_or(first).parse().ok();
+        } else if let Some(value) = line
+            .strip_prefix("offset:")
+            .map(str::trim)
+            .and_then(|v| v.split_whitespace().next())
+        {
+            status.offset_sectors = value.parse().ok();
+        }
+    }
+    status
 }
 
 fn paths_equivalent(left: &Path, right: &Path) -> bool {
@@ -995,22 +1153,35 @@ mod unit_tests {
     }
 
     #[test]
-    fn parses_cryptsetup_status_device_line() {
+    fn parses_cryptsetup_status_fields() {
         let output = r#"
-/dev/mapper/cap-state is active.
+/dev/mapper/cap-state is active and is in use.
   type:    LUKS2
+  cipher:  aes-xts-plain64
+  keysize: 512 bits
+  keyslot: 0
+  token:   --
   device:  /dev/vdb
+  sector size:  512
+  offset:  32768 sectors
+  size:    98304 sectors
+  mode:    read/write
 "#;
 
-        assert_eq!(
-            parse_cryptsetup_status_device(output),
-            Some(PathBuf::from("/dev/vdb"))
-        );
+        let status = parse_cryptsetup_status(output);
+        assert_eq!(status.device, Some(PathBuf::from("/dev/vdb")));
+        assert_eq!(status.cipher.as_deref(), Some("aes-xts-plain64"));
+        assert_eq!(status.keysize_bits, Some(512));
+        assert_eq!(status.offset_sectors, Some(32768));
     }
 
     #[test]
-    fn cryptsetup_status_device_parser_allows_missing_device_line() {
-        assert_eq!(parse_cryptsetup_status_device("inactive\n"), None);
+    fn cryptsetup_status_parser_missing_fields_yield_none() {
+        let status = parse_cryptsetup_status("inactive\n");
+        assert_eq!(status.device, None);
+        assert_eq!(status.cipher, None);
+        assert_eq!(status.keysize_bits, None);
+        assert_eq!(status.offset_sectors, None);
     }
 }
 
@@ -1376,5 +1547,96 @@ mod tests {
         close_mapper("enclava-init-test-mapper");
         detach_loop_device(&device);
         Ok(())
+    }
+    /// Rollout gate (cap#242 review): with the signed policy requiring the
+    /// seal, an unsealed header (host restored a pre-seal header / zeroed
+    /// both MAC slots) must be rejected instead of re-adopted.
+    #[test]
+    fn required_seal_rejects_unsealed_header_rollback() -> Result<()> {
+        if !can_write_run_enclava() {
+            eprintln!("skipping: cannot write /run/enclava (needs root)");
+            return Ok(());
+        }
+        let (_dir, img) = make_backing_file(64)?;
+        let device = attach_loop_device(&img);
+        let keys = volume_keys();
+        close_mapper("enclava-init-test-rollback");
+        let strict = LuksOpenPolicy {
+            allow_legacy_adoption: false,
+        };
+
+        // Simulate a legacy pre-seal volume: plain cryptsetup format, no seal.
+        with_key_file(&keys.passphrase, |key_file| {
+            let args = luks_format_args(&device, key_file);
+            run_command("cryptsetup", &args)
+        })?;
+
+        // Rollout window: adopted and sealed.
+        let opened = open_with_policy(
+            &device,
+            "enclava-init-test-rollback",
+            &keys,
+            &LuksOpenPolicy::default(),
+        )
+        .expect("legacy volume adopted during rollout window");
+        assert!(opened.mapper_path.exists());
+        close_mapper("enclava-init-test-rollback");
+
+        // Simulate the host restoring the pre-seal header (re-format without
+        // sealing), then demand the seal: must fail closed.
+        with_key_file(&keys.passphrase, |key_file| {
+            let args = luks_format_args(&device, key_file);
+            run_command("cryptsetup", &args)
+        })?;
+        let err = open_with_policy(&device, "enclava-init-test-rollback", &keys, &strict)
+            .expect_err("unsealed header must be rejected under required policy");
+        assert!(
+            err.to_string().contains("requires sealing"),
+            "expected rollback rejection, got: {err}"
+        );
+        detach_loop_device(&device);
+        Ok(())
+    }
+
+    /// A sealed volume opens normally under the strict policy.
+    #[test]
+    fn required_seal_still_opens_sealed_volume() -> Result<()> {
+        if !can_write_run_enclava() {
+            eprintln!("skipping: cannot write /run/enclava (needs root)");
+            return Ok(());
+        }
+        let (_dir, img) = make_backing_file(64)?;
+        let device = attach_loop_device(&img);
+        let keys = volume_keys();
+        close_mapper("enclava-init-test-strict-open");
+        format(&device, &keys).expect("format+seal");
+        let strict = LuksOpenPolicy {
+            allow_legacy_adoption: false,
+        };
+        let opened = open_with_policy(&device, "enclava-init-test-strict-open", &keys, &strict)
+            .expect("sealed volume opens under strict policy");
+        assert!(opened.mapper_path.exists());
+        close_mapper("enclava-init-test-strict-open");
+        detach_loop_device(&device);
+        Ok(())
+    }
+
+    fn luks_format_args(device: &Path, key_file: &Path) -> Vec<String> {
+        vec![
+            "--disable-locks".to_string(),
+            "luksFormat".to_string(),
+            path_arg(device).expect("utf8 path"),
+            "--key-file".to_string(),
+            path_arg(key_file).expect("utf8 path"),
+            "--type".to_string(),
+            "luks2".to_string(),
+            "--cipher".to_string(),
+            "aes-xts-plain64".to_string(),
+            "--key-size".to_string(),
+            "512".to_string(),
+            "--sector-size".to_string(),
+            "512".to_string(),
+            "--batch-mode".to_string(),
+        ]
     }
 }

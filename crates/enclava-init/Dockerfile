@@ -89,7 +89,19 @@ RUN set -eux; \
     rm -rf /tmp/cryptsetup-2.8.8 /tmp/cryptsetup-2.8.8.tar.xz; \
     apt-get purge -y build-essential libargon2-dev libblkid-dev libc6-dev libdevmapper-dev libjson-c-dev libpopt-dev libssl-dev pkg-config curl; \
     apt-get autoremove -y; \
-    rm -rf /var/lib/apt/lists/*
+    rm -rf /var/lib/apt/lists/*; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      libargon2-1 \
+      libblkid1 \
+      libdevmapper1.02.1 \
+      libjson-c5 \
+      libpopt0 \
+      libssl3 \
+      libuuid1; \
+    rm -rf /var/lib/apt/lists/*; \
+    ldd /usr/local/sbin/cryptsetup | tee /dev/stderr | grep -q "not found" && exit 1 || true; \
+    /usr/local/sbin/cryptsetup --version
 
 # cryptsetup 2.8.8 supersedes bookworm's cryptsetup-bin (2.6.x); only the
 # runtime library of the distro package is still needed (enclava-init links
@@ -103,5 +115,16 @@ RUN apt-get update && \
 COPY --from=builder /out/enclava-init /usr/local/bin/enclava-init
 COPY --from=builder /out/enclava-log-relay /usr/local/bin/enclava-log-relay
 COPY --from=builder /out/enclava-wait-exec /usr/local/bin/enclava-wait-exec
+
+# cap#244 review: prove every NEEDED library of the runtime binaries is
+# present in the final image; the build fails here rather than the guest
+# failing at boot with a missing .so.
+RUN set -eux; \
+    ldd /usr/local/bin/enclava-init; \
+    ldd /usr/local/bin/enclava-log-relay; \
+    ldd /usr/local/bin/enclava-wait-exec; \
+    ! ldd /usr/local/bin/enclava-init | grep -q "not found"; \
+    ! ldd /usr/local/bin/enclava-log-relay | grep -q "not found"; \
+    ! ldd /usr/local/bin/enclava-wait-exec | grep -q "not found"
 
 ENTRYPOINT ["/usr/local/bin/enclava-init"]

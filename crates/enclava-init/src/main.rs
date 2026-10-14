@@ -151,7 +151,12 @@ fn run() -> Result<()> {
     stats.record_tee_verify(phase);
 
     record_stage("opening luks volumes").ok();
-    open_luks_volumes(&cfg, &owner, &mut stats)?;
+    open_luks_volumes(
+        &cfg,
+        &owner,
+        &mut stats,
+        &luks_rollout_policy(cc_init_data.as_deref())?,
+    )?;
     record_stage("preparing mount ownership").ok();
     prepare_mount_ownership(&cfg)?;
 
@@ -505,6 +510,51 @@ fn read_cc_init_data(cfg: &Config) -> Result<Option<Vec<u8>>> {
         .ok_or_else(|| anyhow!("verification requires cc_init_data_path"))?;
     let bytes = std::fs::read(cc_path).with_context(|| format!("reading {cc_path}"))?;
     Ok(Some(bytes))
+}
+
+/// LUKS2 header-seal rollout policy from the signed cc_init_data (cap#242
+/// review: sealed volumes must not accept unsealed-header rollback).
+///
+/// The signed `luks2_header_seal` claim takes two values:
+/// - `"adopt"` (or claim absent — pre-claim signed artifacts): legacy
+///   pre-seal volumes are adopted through the strict-validation +
+///   passphrase gate. This is the rollout window.
+/// - `"required"`: every formatted volume must already carry a valid HMAC
+///   seal. An unsealed header is rejected as rollback/tampering instead of
+///   re-adopted. Operators flip the platform default to "required" once the
+///   fleet has migrated; the claim is signed, so the host cannot downgrade
+///   it per-guest.
+///
+/// Any other value fails the boot rather than guessing the intent.
+fn luks_rollout_policy(cc_init_data: Option<&[u8]>) -> Result<luks::LuksOpenPolicy> {
+    let Some(cc_bytes) = cc_init_data else {
+        // Non-prod path (trustee_policy_read_available=false, debug builds):
+        // same rollout-window default as a claim-less artifact.
+        return Ok(luks::LuksOpenPolicy::default());
+    };
+    // Fail closed on unreadable cc_init_data: these bytes were already
+    // parsed once by validate_configmap_transport_against_signed_cc_init_data
+    // this boot, so a parse failure here means the file changed underneath
+    // us (host tampering) and the boot must stop, not default to adopt
+    // (cap#244 self-review).
+    let cc_toml = std::str::from_utf8(cc_bytes).context("parsing cc_init_data as utf-8")?;
+    let parsed: toml::Value = toml::from_str(cc_toml).context("parsing cc_init_data")?;
+    // A missing claim keeps the rollout-window default (pre-claim signed
+    // artifacts); an unknown value fails the boot rather than guessing.
+    let claim = parsed
+        .get("data")
+        .and_then(|d| d.get("luks2_header_seal"))
+        .and_then(toml::Value::as_str);
+    match claim {
+        Some("required") => Ok(luks::LuksOpenPolicy {
+            allow_legacy_adoption: false,
+        }),
+        Some("adopt") | None => Ok(luks::LuksOpenPolicy::default()),
+        Some(other) => anyhow::bail!(
+            "signed cc_init_data carries unknown luks2_header_seal value {other:?} \
+             (expected \"adopt\" or \"required\")"
+        ),
+    }
 }
 
 fn validate_configmap_transport_against_signed_cc_init_data(
@@ -1174,6 +1224,7 @@ fn open_luks_volumes(
     cfg: &Config,
     owner: &OwnerSeed,
     stats: &mut init_stats::BootStats,
+    luks_policy: &luks::LuksOpenPolicy,
 ) -> Result<()> {
     if dev_no_luks_override() {
         tracing::warn!("ENCLAVA_INIT_DEV_NO_LUKS=true — skipping luks open (debug builds only)");
@@ -1191,6 +1242,7 @@ fn open_luks_volumes(
         // with a custom signed value must keep unlocking (cap#242 review).
         &cfg.state.hkdf_info,
         seeds::STATE_HEADER_MAC_INFO,
+        luks_policy,
     )
     .with_context(|| format!("opening state volume {}", cfg.state.device))?;
     stats.record_state_volume(state_phase, state_opened.formatted);
@@ -1200,6 +1252,7 @@ fn open_luks_volumes(
         owner,
         &cfg.tls_state.hkdf_info,
         seeds::TLS_STATE_HEADER_MAC_INFO,
+        luks_policy,
     )
     .with_context(|| format!("opening tls-state volume {}", cfg.tls_state.device))?;
     stats.record_tls_volume(tls_phase, tls_opened.formatted);
@@ -1218,6 +1271,7 @@ fn open_one_volume(
     // Header-MAC HKDF branch: pinned per volume kind, never configurable, so
     // the MAC key cannot be steered by config data.
     header_mac_info: &[u8],
+    policy: &luks::LuksOpenPolicy,
 ) -> Result<luks::LuksOpened> {
     // Distinct HKDF branches: the volume passphrase and the header MAC key
     // must never share material (cap#242).
@@ -1226,7 +1280,12 @@ fn open_one_volume(
         derive_volume_key(owner, header_mac_info)?,
     );
     let device = Path::new(&vol.device);
-    let opened = luks::format_if_unformatted_then_open(device, &vol.mapping_name, &keys)?;
+    let opened = luks::format_if_unformatted_then_open_with_policy(
+        device,
+        &vol.mapping_name,
+        &keys,
+        policy,
+    )?;
     luks::mount(&opened.mapper_path, Path::new(&vol.mount_path))?;
     tracing::info!(
         device = %vol.device,

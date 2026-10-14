@@ -172,7 +172,13 @@ pub fn build_volumes(app: &ConfidentialApp) -> Vec<Volume> {
             name: "unlock-socket".to_string(),
             empty_dir: Some(EmptyDirVolumeSource {
                 medium: Some("Memory".to_string()),
-                size_limit: Some(Quantity("16Mi".to_string())),
+                // cap#242: /run/enclava also holds the detached LUKS2 header
+                // copies (a full header region is 16MiB per volume, two
+                // volumes) alongside init-ready, containers, caddy-runtime
+                // and the ephemeral key files. 16Mi could not fit even one
+                // header; give the RAM-backed volume enough headroom that
+                // the sizeLimit never wedges boot where it is enforced.
+                size_limit: Some(Quantity("64Mi".to_string())),
             }),
             ..Default::default()
         });
