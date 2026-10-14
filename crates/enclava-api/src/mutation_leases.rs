@@ -33,6 +33,17 @@ const RENEW_TIMEOUT_SECONDS: u64 = 10;
 /// fail-closed: the fence is retained and revisited next cycle.
 const RETAINED_NAMESPACE_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Overall budget for one reconciliation pass over every expired retained
+/// namespace fence. Entries the deadline cannot absorb keep their fence and
+/// are revisited next pass (the loop is periodic), so the bound can never
+/// strand a fence — it only stops one slow namespace from delaying the
+/// release of unrelated apps' fences.
+const RETAINED_FENCE_BATCH_DEADLINE: Duration = Duration::from_secs(120);
+
+/// Concurrent retained-fence reconciles per pass: enough parallelism that
+/// slow entries overlap, small enough not to monopolize the API pool.
+const RETAINED_FENCE_RECONCILE_CONCURRENCY: usize = 4;
+
 /// Marker written to `external_resource_mutation_leases.operation_kind` when a
 /// failed deployment apply intentionally retains its `kubernetes_namespace`
 /// fence until reconciliation confirms the namespace is gone. The orphaned
@@ -1120,9 +1131,10 @@ async fn retry_retained_namespace_delete(
     namespace: &str,
     uid: String,
     resource_version: String,
+    batch_deadline: tokio::time::Instant,
 ) -> bool {
-    match tokio::time::timeout(
-        RETAINED_NAMESPACE_PROBE_TIMEOUT,
+    match tokio::time::timeout_at(
+        batch_deadline.min(tokio::time::Instant::now() + RETAINED_NAMESPACE_PROBE_TIMEOUT),
         api.delete(
             namespace,
             &kube::api::DeleteParams {
@@ -1160,7 +1172,12 @@ async fn retry_retained_namespace_delete(
     // The delete was accepted. Confirm absence within the probe budget;
     // a still-live object (Terminating under finalizers) retains the fence
     // and converges via the deletionTimestamp path on the next cycle.
-    match tokio::time::timeout(RETAINED_NAMESPACE_PROBE_TIMEOUT, api.get_opt(namespace)).await {
+    match tokio::time::timeout_at(
+        batch_deadline.min(tokio::time::Instant::now() + RETAINED_NAMESPACE_PROBE_TIMEOUT),
+        api.get_opt(namespace),
+    )
+    .await
+    {
         Ok(Ok(None)) => true,
         Ok(Ok(Some(_))) => {
             tracing::info!(
@@ -1198,15 +1215,74 @@ async fn release_retained_deployment_namespace_fences_with(
         return Ok(0);
     }
     let api: kube::Api<k8s_openapi::api::core::v1::Namespace> = kube::Api::all(client);
+    // Codex P2: bound the whole batch. A sequential loop let one slow
+    // namespace (probe + retry DELETE + confirmation, each up to 30 s)
+    // delay the release of every later fence — an unrelated app whose
+    // namespace is already absent stayed Busy behind entries it does not
+    // care about. Every request is capped by the remaining batch deadline
+    // and entries are reconciled with bounded concurrency; anything the
+    // deadline cannot absorb is simply retained and revisited next pass
+    // (the loop is periodic), never dropped.
+    let batch_deadline = tokio::time::Instant::now() + RETAINED_FENCE_BATCH_DEADLINE;
+    let results = {
+        use futures::StreamExt as _;
+        futures::stream::iter(retained)
+            .map(|(owner_token, namespace, operation_id, generation)| {
+                let api = api.clone();
+                let pool = pool.clone();
+                async move {
+                    reconcile_one_retained_namespace(
+                        &pool,
+                        &api,
+                        owner_token,
+                        namespace,
+                        operation_id,
+                        generation,
+                        batch_deadline,
+                    )
+                    .await
+                }
+            })
+            .buffer_unordered(RETAINED_FENCE_RECONCILE_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await
+    };
     let mut released = 0u64;
-    for (owner_token, namespace, operation_id, generation) in retained {
+    for result in results {
+        match result {
+            Ok(true) => released += 1,
+            Ok(false) => {}
+            Err(error) => tracing::warn!(
+                error = %error,
+                "retained-namespace fence reconciliation entry failed; retaining fence for the next cycle"
+            ),
+        }
+    }
+    Ok(released)
+}
+
+/// Reconcile a single expired retained-namespace fence: probe the live
+/// namespace, retry the pinned delete when it is still provably ours, and
+/// release the fence (plus the converged rows' stale evidence) only on
+/// positively observed absence. `batch_deadline` caps every Kubernetes
+/// request so one entry cannot stretch the caller's batch budget.
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_one_retained_namespace(
+    pool: &PgPool,
+    api: &kube::Api<k8s_openapi::api::core::v1::Namespace>,
+    owner_token: Uuid,
+    namespace: String,
+    operation_id: Uuid,
+    generation: i64,
+    batch_deadline: tokio::time::Instant,
+) -> Result<bool, MutationLeaseError> {
+    {
         // Bound each individual probe so one stalled Kubernetes GET cannot
-        // block this loop (and, because the loop runs on its own task, the
-        // orphan-repair loop) for the client's full 295 s read timeout. A
-        // timed-out probe is treated exactly like a GET error: retain the
-        // fence and revisit next cycle.
-        let live = match tokio::time::timeout(
-            RETAINED_NAMESPACE_PROBE_TIMEOUT,
+        // block this reconciliation beyond the batch budget. A timed-out
+        // probe is treated exactly like a GET error: retain the fence and
+        // revisit next cycle.
+        let live = match tokio::time::timeout_at(
+            batch_deadline.min(tokio::time::Instant::now() + RETAINED_NAMESPACE_PROBE_TIMEOUT),
             api.get_opt(&namespace),
         )
         .await
@@ -1219,14 +1295,14 @@ async fn release_retained_deployment_namespace_fences_with(
                     error = %error,
                     "retained-namespace fence reconciliation cannot inspect the namespace; retaining fence"
                 );
-                continue;
+                return Ok(false);
             }
             Err(_) => {
                 tracing::warn!(
                     namespace = %namespace,
-                    "retained-namespace fence reconciliation probe timed out; retaining fence"
+                    "retained-namespace fence reconciliation probe timed out (or the batch deadline passed); retaining fence"
                 );
-                continue;
+                return Ok(false);
             }
         };
         let absence = match live {
@@ -1236,7 +1312,7 @@ async fn release_retained_deployment_namespace_fences_with(
                     // A deletion is already converging (the original
                     // attempt's or an earlier retry's): the fence releases
                     // only on the observed 404.
-                    continue;
+                    return Ok(false);
                 }
                 // Still live and NOT deleting: the retained fence's own
                 // delete was lost or never landed, so waiting for a 404
@@ -1248,17 +1324,23 @@ async fn release_retained_deployment_namespace_fences_with(
                 // creation evidence): a rewritten or replaced namespace is
                 // never touched.
                 let Ok(generation_value) = MutationGeneration::new(generation) else {
-                    continue;
+                    return Ok(false);
                 };
                 match classify_initial_namespace_get(&Ok(live_namespace), generation_value) {
                     InitialNamespaceOwnership::Owned {
                         uid,
                         resource_version,
                     } => {
-                        if !retry_retained_namespace_delete(&api, &namespace, uid, resource_version)
-                            .await
+                        if !retry_retained_namespace_delete(
+                            api,
+                            &namespace,
+                            uid,
+                            resource_version,
+                            batch_deadline,
+                        )
+                        .await
                         {
-                            continue;
+                            return Ok(false);
                         }
                         true
                     }
@@ -1267,13 +1349,13 @@ async fn release_retained_deployment_namespace_fences_with(
                         // rewrite or same-named replacement): keep the
                         // conservative contract — only positive evidence of
                         // absence releases the fence.
-                        continue;
+                        return Ok(false);
                     }
                 }
             }
         };
         if !absence {
-            continue;
+            return Ok(false);
         }
         // Re-resolve the current app row inside the release transaction (the
         // Kubernetes GET may have blocked far past any earlier snapshot) and
@@ -1398,10 +1480,9 @@ async fn release_retained_deployment_namespace_fences_with(
                 namespace = %namespace,
                 "released retained deployment namespace fence after observed namespace deletion"
             );
-            released += 1;
         }
+        Ok(released_row)
     }
-    Ok(released)
 }
 
 async fn poison_resource_scope(
