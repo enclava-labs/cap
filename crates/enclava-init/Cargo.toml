@@ -33,7 +33,9 @@ tracing-subscriber = { workspace = true }
 hex = { version = "0.4", features = ["serde"] }
 base64 = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
-libcryptsetup-rs = "0.15"
+# mutex: enclava-init calls libcryptsetup from several OS threads; the
+# unmutexed binding rejects cross-thread calls.
+libcryptsetup-rs = { version = "0.15", features = ["mutex"] }
 enclava-common = { workspace = true }
 rcgen = "0.14"
 pem = "3"

@@ -82,14 +82,37 @@ When DNS-01 broker mode is configured, `enclava-init` generates the private key
 inside the TEE, submits a CSR to CAP's workload-attested broker endpoint, and
 writes the returned certificate chain into the shared Caddy runtime directory.
 
+## Volume Integrity
+
+Fresh LUKS2 volumes are formatted AES-256-XTS with `hmac(sha256)` integrity
+(dm-integrity), so ciphertext tampering turns into an I/O error at read time.
+Both format paths request it: `cryptsetup luksFormat --integrity hmac-sha256`
+and the libcryptsetup fallback, which then zero-writes the whole data area
+through an activated mapping to initialize every tag — expect first-boot
+formatting to take roughly as long as a full-device write.
+
+Volumes formatted before integrity support stay as they are: they are
+detected by their LUKS2 header and opened without reformatting.
+
+If first-boot initialization is interrupted after the LUKS header is
+committed (during the tag initialization or before mkfs), the volume is left
+formatted but never initialized and later boots open it and fail at mount.
+That fail-closed state is deliberate: no on-disk marker may authorize
+re-running wipe or mkfs, since a replayed marker over a populated volume
+would destroy data. Operator recovery is to delete and recreate the
+never-ready volume.
+
 ## Tests
 
 ```bash
 cargo test -p enclava-init --lib
 ```
 
-LUKS round-trip tests require loopback-device access:
+LUKS integration tests need root, `/dev/mapper` control, dm-crypt and
+dm-integrity kernel support, `cryptsetup`, and a writable `/run/enclava`.
+They use disposable backing files and random per-test mapper names and close
+their mappings even on failure:
 
 ```bash
-cargo test -p enclava-init --features luks-integration -- --ignored
+sudo cargo test -p enclava-init --features luks-integration
 ```
