@@ -506,6 +506,140 @@ fn signed_deploy_validation_precedes_atomic_candidate_commit() {
     );
 }
 
+/// #232: a customer-supplied signed policy artifact enters through
+/// resolve_signed_policy_artifact, but the global KBS signed-policy set must
+/// still converge for it — the acceptance that persists the artifact has to
+/// enqueue the global reconciliation generation in the same transaction, and
+/// every other production acceptance of a signed artifact (unlock transition,
+/// rollback, internal PaaS redeploy) must do the same. Convergence is
+/// level-triggered: the background reconciler drains any pending generation,
+/// so losing the enqueue is one way for the serving KBS policy set to lag
+/// the database artifact set.
+#[test]
+fn signed_artifact_acceptance_enqueues_global_policy_reconciliation() {
+    let deploy_source = include_str!("../../deployments.rs");
+    let deploy_body = deploy_source
+        .split("async fn deploy_app_candidate")
+        .nth(1)
+        .expect("deployment candidate function exists")
+        .split("/// GET /apps/{name}/deployments")
+        .next()
+        .expect("deployment candidate function body");
+    let deploy_begin = deploy_body
+        .find("let mut tx = state.db.begin()")
+        .expect("accepted deployment transaction");
+    let deploy_commit = deploy_body
+        .find("tx.commit()")
+        .expect("accepted deployment commit");
+    // The enqueue must live inside the signed persist branch itself, not
+    // merely somewhere before the first commit: the artifact row and the
+    // generation bump have to commit atomically, and an artifact accepted
+    // without the bump is exactly the #232 divergence.
+    let deploy_persist = deploy_body
+        .find("persist_workload_artifacts(")
+        .expect("signed artifact persist branch");
+    let deploy_revocation = deploy_body
+        .find("enqueue_signed_policy_revocation_if_active")
+        .expect("unsigned acceptance revocation branch");
+    let deploy_enqueue = deploy_body
+        .find("crate::kbs::enqueue_signed_policy_reconciliation(&mut tx)")
+        .expect("deploy acceptance enqueues signed-policy reconciliation");
+    assert!(
+        deploy_begin < deploy_persist
+            && deploy_persist < deploy_enqueue
+            && deploy_enqueue < deploy_revocation
+            && deploy_revocation < deploy_commit,
+        "the deploy acceptance that persists a signed artifact (customer-supplied \
+         or platform-signed) must bump the global reconciliation generation in \
+         the same transaction, inside the signed persist branch"
+    );
+
+    let unlock_source = include_str!("../../unlock.rs");
+    let unlock_body = unlock_source
+        .split("async fn commit_unlock_mode_transition")
+        .nth(1)
+        .expect("unlock transition commit function exists")
+        .split("/// GET /apps/{name}/unlock/status")
+        .next()
+        .expect("unlock transition commit function body");
+    let unlock_persist = unlock_body
+        .find("persist_workload_artifacts(")
+        .expect("unlock signed artifact persist branch");
+    let unlock_revocation = unlock_body
+        .find("enqueue_signed_policy_revocation_if_active")
+        .expect("unlock unsigned revocation branch");
+    let unlock_commit = unlock_body
+        .find("tx.commit()")
+        .expect("unlock transition commit");
+    let unlock_enqueue = unlock_body
+        .find("crate::kbs::enqueue_signed_policy_reconciliation(&mut tx)")
+        .expect("unlock acceptance enqueues signed-policy reconciliation");
+    assert!(
+        unlock_persist < unlock_enqueue
+            && unlock_enqueue < unlock_revocation
+            && unlock_revocation < unlock_commit,
+        "an unlock-mode redeployment that persists a signed artifact must bump \
+         the global reconciliation generation in the same transaction, inside \
+         the signed persist branch"
+    );
+
+    let rollback_source = include_str!("../rollback.rs");
+    let rollback_body = rollback_source
+        .split("pub async fn rollback")
+        .nth(1)
+        .expect("rollback function exists")
+        .split("#[cfg(test)]")
+        .next()
+        .expect("rollback function body");
+    let rollback_arm = rollback_body
+        .find("if rollback_artifacts.is_some() {")
+        .expect("rollback signed-restoration branch");
+    let rollback_revocation = rollback_body
+        .find("enqueue_signed_policy_revocation_if_active")
+        .expect("rollback unsigned revocation branch");
+    let rollback_commit = rollback_body
+        .find("tx.commit()")
+        .expect("rollback generation commit");
+    let rollback_enqueue = rollback_body
+        .find("crate::kbs::enqueue_signed_policy_reconciliation(&mut tx)")
+        .expect("rollback acceptance enqueues signed-policy reconciliation");
+    assert!(
+        rollback_arm < rollback_enqueue
+            && rollback_enqueue < rollback_revocation
+            && rollback_revocation < rollback_commit,
+        "a rollback that restores a signed artifact must bump the global \
+         reconciliation generation in the signed-restoration branch of the \
+         same transaction"
+    );
+
+    // The internal PaaS deploy route forwards its signed inputs into
+    // deployments::deploy unchanged, so the deploy-leg assertion above covers
+    // it; pin that forwarding so a future divergence cannot silently drop the
+    // reconciliation enqueue.
+    let internal_source = include_str!("../../internal.rs");
+    let forward_body = internal_source
+        .split("pub async fn deploy_paas_app")
+        .nth(1)
+        .expect("internal PaaS deploy route exists")
+        .split("\n}")
+        .next()
+        .expect("internal PaaS deploy route body");
+    let request_build = forward_body
+        .find("crate::routes::deployments::DeployRequest {")
+        .expect("internal PaaS deploy request construction");
+    let dispatch = forward_body
+        .find("crate::routes::deployments::deploy(")
+        .expect("internal PaaS deploy dispatch");
+    let artifact_forward = forward_body
+        .find("signed_policy_artifact: body.signed_policy_artifact")
+        .expect("internal PaaS deploy forwards the customer artifact");
+    assert!(
+        request_build < artifact_forward && artifact_forward < dispatch,
+        "the internal PaaS deploy route must forward the customer-supplied \
+         signed_policy_artifact into the deploy acceptance dispatch"
+    );
+}
+
 #[test]
 fn first_generic_deployment_setup_is_durable_and_compensated_before_error_returns() {
     let route_source = include_str!("../../deployments.rs");
