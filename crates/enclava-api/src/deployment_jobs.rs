@@ -288,8 +288,31 @@ const MAX_SUPPORTED_JOB_PAYLOAD_VERSION: i32 = JOB_PAYLOAD_VERSION;
 const LEASE_INTERVAL_SQL: &str = "90 seconds";
 const SETUP_RECOVERY_DELAY_SQL: &str = "5 seconds";
 const CLEANUP_RETRY_INTERVAL_SQL: &str = "30 seconds";
-const APPLY_RETRY_INTERVAL_SQL: &str = "5 seconds";
-const ROLLOUT_OBSERVATION_RETRY_INTERVAL_SQL: &str = "30 seconds";
+/// Base retry interval (seconds) for the transient-contention requeue class.
+const APPLY_RETRY_BASE_SECS: i64 = 5;
+/// Base retry interval (seconds) for nonterminal rollout observations.
+const ROLLOUT_OBSERVATION_RETRY_BASE_SECS: i64 = 30;
+/// Retry backoff grows exponentially with the job's attempt count so a job
+/// that keeps requeueing without reaching a terminal observation releases
+/// its apply worker instead of pinning one of the bounded worker slots at a
+/// fixed duty cycle (#231). The ceiling bounds recovery latency for
+/// genuinely transient contention.
+const APPLY_RETRY_BACKOFF_CEILING_SECS: i64 = 3600;
+/// Backoff stops doubling past this attempt count; the ceiling binds first.
+const APPLY_RETRY_BACKOFF_SHIFT_CAP: i32 = 16;
+/// Nonterminal rollout observations (password owner wait) deliberately keep
+/// observing past their rollout budget so a later unlock can still become
+/// healthy. This grace bounds that extension: once the observation anchor is
+/// this far past its persisted budget, the requeue loop terminalizes with
+/// `deployment_retry_exhausted` instead of retrying forever (#231).
+const NONTERMINAL_OBSERVATION_GRACE_SECS: i64 = 24 * 60 * 60;
+/// A job whose transient-contention requeues have spanned this long since
+/// the job row was created — without ever reaching a terminal observation —
+/// is wedged, not delayed: terminalize it instead of requeueing (#231).
+const APPLY_CONTENTION_HORIZON_SECS: i64 = 30 * 24 * 60 * 60;
+/// Bounded, operator-visible classification for a requeue-without-terminal
+/// loop that outlived every legitimate retry window (#231).
+pub const DEPLOYMENT_RETRY_EXHAUSTED_MESSAGE: &str = "deployment_retry_exhausted";
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const HEARTBEAT_RENEW_TIMEOUT: Duration = Duration::from_secs(5);
 const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -2003,10 +2026,11 @@ async fn process_apply_job(
             fail_apply_job_with_mutation(&state, &job, &error, Some(mutation)).await;
         }
         Ok(Err(error)) if error.should_requeue_without_terminal_failure() => {
-            if let Err(requeue_error) = requeue_apply_job(&state.db, &job, error.code()).await {
+            if let Err(retry_error) = requeue_or_exhaust_apply_job(&state.db, &job).await {
                 tracing::error!(
                     deployment_id = %deployment_id,
-                    error_code = requeue_error.code(),
+                    error_code = retry_error.code(),
+                    original_error_code = error.code(),
                     "failed to requeue durable deployment after transient contention"
                 );
             }
@@ -2024,29 +2048,31 @@ async fn process_apply_job(
     }
 }
 
-async fn requeue_apply_job(
-    pool: &PgPool,
-    job: &ClaimedJob,
-    _reason: &'static str,
-) -> Result<(), DeploymentJobError> {
+async fn requeue_apply_job(pool: &PgPool, job: &ClaimedJob) -> Result<(), DeploymentJobError> {
     let result = sqlx::query(
         "UPDATE deployment_apply_jobs
             SET state = 'pending',
                 lock_token = NULL,
                 locked_until = NULL,
-                next_attempt_at = clock_timestamp() + $1::interval,
+                next_attempt_at = clock_timestamp() + make_interval(secs =>
+                    LEAST(
+                        $1::bigint * (1::bigint << LEAST(attempts, $6::int)),
+                        $2::bigint
+                    )),
                 last_error_code = NULL,
                 updated_at = clock_timestamp()
-          WHERE deployment_id = $2
-            AND app_id = $3
-            AND org_id = $4
+          WHERE deployment_id = $3
+            AND app_id = $4
+            AND org_id = $5
             AND state = 'running'
-            AND lock_token = $5",
+            AND lock_token = $7",
     )
-    .bind(APPLY_RETRY_INTERVAL_SQL)
+    .bind(APPLY_RETRY_BASE_SECS)
+    .bind(APPLY_RETRY_BACKOFF_CEILING_SECS)
     .bind(job.deployment_id)
     .bind(job.app_id)
     .bind(job.org_id)
+    .bind(APPLY_RETRY_BACKOFF_SHIFT_CAP)
     .bind(job.lock_token)
     .execute(pool)
     .await?;
@@ -2054,6 +2080,64 @@ async fn requeue_apply_job(
         return Err(DeploymentJobError::LeaseLost);
     }
     Ok(())
+}
+
+/// Has this job's requeue-without-terminal loop outlived every legitimate
+/// retry window (#231)?
+///
+/// Two anchored horizons, both wall-clock so legitimately long rollout
+/// budgets (storage-scaled observation windows) are never terminalized
+/// early:
+///
+/// * a `watching` deployment whose observation anchor is past its persisted
+///   rollout budget plus the nonterminal grace — the password owner-wait
+///   class that deliberately keeps observing past its budget;
+/// * any job whose transient-contention requeues have spanned the
+///   contention horizon since the job row was created.
+async fn apply_job_retries_exhausted(
+    pool: &PgPool,
+    deployment_id: Uuid,
+) -> Result<bool, DeploymentJobError> {
+    let exhausted = sqlx::query_scalar::<_, bool>(
+        "SELECT (
+                d.status = 'watching'::deploy_status_enum
+                AND d.observing_since IS NOT NULL
+                AND clock_timestamp() > d.observing_since
+                    + make_interval(secs => d.rollout_timeout_millis / 1000)
+                    + make_interval(secs => $2)
+            )
+            OR clock_timestamp() > j.created_at + make_interval(secs => $3)
+           FROM deployments AS d
+           JOIN deployment_apply_jobs AS j ON j.deployment_id = d.id
+          WHERE d.id = $1",
+    )
+    .bind(deployment_id)
+    .bind(NONTERMINAL_OBSERVATION_GRACE_SECS)
+    .bind(APPLY_CONTENTION_HORIZON_SECS)
+    .fetch_optional(pool)
+    .await?
+    .unwrap_or(false);
+    Ok(exhausted)
+}
+
+/// Requeue a transiently contended apply job with attempt-scaled backoff —
+/// or, once the requeue loop has outlived every legitimate retry window,
+/// publish the terminal retry-exhausted failure so the deployment, app, and
+/// job rows surface the wedge instead of retrying forever (#231).
+async fn requeue_or_exhaust_apply_job(
+    pool: &PgPool,
+    job: &ClaimedJob,
+) -> Result<(), DeploymentJobError> {
+    if apply_job_retries_exhausted(pool, job.deployment_id).await? {
+        return publish_apply_failure_with_mutation(
+            pool,
+            job,
+            None,
+            DEPLOYMENT_RETRY_EXHAUSTED_MESSAGE,
+        )
+        .await;
+    }
+    requeue_apply_job(pool, job).await
 }
 
 async fn fail_unreadable_job(pool: &PgPool, claimed: &ClaimedJob, claimed_state: &str) {
@@ -3017,18 +3101,24 @@ async fn fail_apply_job_with_mutation(
     error: &DeploymentJobError,
     mut mutation: Option<crate::mutation_leases::AppMutationLease>,
 ) {
-    let published =
-        match publish_apply_failure_with_mutation(&state.db, job, mutation.as_mut()).await {
-            Ok(()) => true,
-            Err(db_error) => {
-                tracing::error!(
-                    deployment_id = %job.deployment_id,
-                    error_code = db_error.code(),
-                    "failed to atomically publish durable deployment failure"
-                );
-                false
-            }
-        };
+    let published = match publish_apply_failure_with_mutation(
+        &state.db,
+        job,
+        mutation.as_mut(),
+        DEPLOYMENT_APPLY_FAILED_MESSAGE,
+    )
+    .await
+    {
+        Ok(()) => true,
+        Err(db_error) => {
+            tracing::error!(
+                deployment_id = %job.deployment_id,
+                error_code = db_error.code(),
+                "failed to atomically publish durable deployment failure"
+            );
+            false
+        }
+    };
     if published && let Some(mutation) = mutation.as_mut() {
         if reconcile_pending_kbs_with_mutation(state, mutation)
             .await
@@ -3093,6 +3183,29 @@ async fn lock_owned_running_job(
     Ok(())
 }
 
+/// Deadline after which a nonterminal rollout observation is terminalized
+/// as retry-exhausted (#231). Anchored at the persisted observation window
+/// (`observing_since` + `rollout_timeout_millis` + grace) so legitimately
+/// long, storage-scaled rollout budgets are never cut short; rows without
+/// an observation anchor (legacy/hand-staged) fall back to the contention
+/// horizon over the deployment's creation time.
+fn nonterminal_observation_exhausted(
+    observing_since: Option<chrono::DateTime<chrono::Utc>>,
+    rollout_timeout_millis: i64,
+    deployment_created_at: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let deadline = observing_since
+        .map(|anchor| {
+            anchor
+                + chrono::Duration::milliseconds(rollout_timeout_millis)
+                + chrono::Duration::seconds(NONTERMINAL_OBSERVATION_GRACE_SECS)
+        })
+        .unwrap_or_else(|| {
+            deployment_created_at + chrono::Duration::seconds(APPLY_CONTENTION_HORIZON_SECS)
+        });
+    chrono::Utc::now() > deadline
+}
+
 async fn publish_rollout_outcome_with_mutation(
     pool: &PgPool,
     job: &ClaimedJob,
@@ -3104,8 +3217,20 @@ async fn publish_rollout_outcome_with_mutation(
     // app advisory lane -> job row -> deployment row -> app row.
     crate::deploy::lock_app_deployment_lane(&mut tx, job.app_id).await?;
     lock_owned_running_job(&mut tx, job).await?;
-    let deployment = sqlx::query_as::<_, (Uuid, Uuid, DeployStatus, Option<String>)>(
-        "SELECT app_id, org_id, status, manifest_hash
+    let deployment = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            Uuid,
+            DeployStatus,
+            Option<String>,
+            Option<chrono::DateTime<chrono::Utc>>,
+            i64,
+            chrono::DateTime<chrono::Utc>,
+        ),
+    >(
+        "SELECT app_id, org_id, status, manifest_hash,
+                observing_since, rollout_timeout_millis, created_at
            FROM deployments
           WHERE id = $1
           FOR UPDATE",
@@ -3122,6 +3247,31 @@ async fn publish_rollout_outcome_with_mutation(
     {
         return Err(DeploymentJobError::LeaseLost);
     }
+    // A nonterminal observation whose anchored window is this far past its
+    // persisted rollout budget has outlived the deliberately unbounded
+    // owner-wait extension: terminalize the requeue loop instead of
+    // scheduling another observation attempt (#231).
+    let exhausted_outcome;
+    let outcome = if !outcome.terminal
+        && nonterminal_observation_exhausted(deployment.4, deployment.5, deployment.6)
+    {
+        tracing::warn!(
+            deployment_id = %job.deployment_id,
+            app_id = %job.app_id,
+            error_code = DEPLOYMENT_RETRY_EXHAUSTED_MESSAGE,
+            "terminalizing nonterminal rollout observation requeue loop"
+        );
+        exhausted_outcome = DeploymentRolloutOutcome {
+            deploy_status: "failed",
+            app_status: "failed",
+            error_code: Some(DEPLOYMENT_RETRY_EXHAUSTED_MESSAGE),
+            terminal: true,
+            manifest_hash: outcome.manifest_hash.clone(),
+        };
+        &exhausted_outcome
+    } else {
+        outcome
+    };
 
     let deployment_result = sqlx::query(
         "UPDATE deployments
@@ -3184,7 +3334,11 @@ async fn publish_rollout_outcome_with_mutation(
                 locked_until = NULL,
                 next_attempt_at = CASE
                     WHEN $1 THEN next_attempt_at
-                    ELSE clock_timestamp() + $2::interval
+                    ELSE clock_timestamp() + make_interval(secs =>
+                        LEAST(
+                            $2::bigint * (1::bigint << LEAST(attempts, $5::int)),
+                            $6::bigint
+                        ))
                 END,
                 last_error_code = NULL,
                 updated_at = clock_timestamp()
@@ -3193,9 +3347,11 @@ async fn publish_rollout_outcome_with_mutation(
             AND lock_token = $4",
     )
     .bind(outcome.terminal)
-    .bind(ROLLOUT_OBSERVATION_RETRY_INTERVAL_SQL)
+    .bind(ROLLOUT_OBSERVATION_RETRY_BASE_SECS)
     .bind(job.deployment_id)
     .bind(job.lock_token)
+    .bind(APPLY_RETRY_BACKOFF_SHIFT_CAP)
+    .bind(APPLY_RETRY_BACKOFF_CEILING_SECS)
     .execute(&mut *tx)
     .await?;
     if job_result.rows_affected() != 1 {
@@ -3231,6 +3387,7 @@ async fn publish_apply_failure_with_mutation(
     pool: &PgPool,
     job: &ClaimedJob,
     mutation: Option<&mut crate::mutation_leases::AppMutationLease>,
+    failure_code: &'static str,
 ) -> Result<(), DeploymentJobError> {
     let mut tx = pool.begin().await?;
     crate::deploy::lock_app_deployment_lane(&mut tx, job.app_id).await?;
@@ -3265,7 +3422,7 @@ async fn publish_apply_failure_with_mutation(
             AND org_id = $4
             AND status IN ('pending', 'applying', 'watching')",
     )
-    .bind(DEPLOYMENT_APPLY_FAILED_MESSAGE)
+    .bind(failure_code)
     .bind(job.deployment_id)
     .bind(job.app_id)
     .bind(job.org_id)
@@ -3308,7 +3465,7 @@ async fn publish_apply_failure_with_mutation(
             AND state = 'running'
             AND lock_token = $3",
     )
-    .bind(DEPLOYMENT_APPLY_FAILED_MESSAGE)
+    .bind(failure_code)
     .bind(job.deployment_id)
     .bind(job.lock_token)
     .execute(&mut *tx)
@@ -3330,7 +3487,7 @@ async fn publish_apply_failure_with_mutation(
 
 #[cfg(test)]
 async fn publish_apply_failure(pool: &PgPool, job: &ClaimedJob) -> Result<(), DeploymentJobError> {
-    publish_apply_failure_with_mutation(pool, job, None).await
+    publish_apply_failure_with_mutation(pool, job, None, DEPLOYMENT_APPLY_FAILED_MESSAGE).await
 }
 
 async fn finish_job(
@@ -4704,6 +4861,291 @@ pub(crate) mod tests {
             .execute(&pool)
             .await
             .expect("delete nonterminal observation fixture");
+    }
+
+    #[tokio::test]
+    async fn apply_contention_requeue_scales_backoff_with_attempts() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
+        let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim setup")
+            .expect("setup exists");
+        mark_setup_accepted(&pool, deployment_id, setup.lock_token)
+            .await
+            .expect("accept setup");
+        let apply = claim_job(&pool, "pending", "running", Some(deployment_id))
+            .await
+            .expect("claim apply")
+            .expect("apply exists");
+
+        // A fresh contention requeue stays fast so transient outages recover
+        // quickly; the interval only doubles with the attempt count.
+        requeue_apply_job(&pool, &apply)
+            .await
+            .expect("requeue fresh contention");
+        let (job_state, fresh_delay_secs): (String, i64) = sqlx::query_as(
+            "SELECT state,
+                    EXTRACT(EPOCH FROM (next_attempt_at - clock_timestamp()))::bigint
+               FROM deployment_apply_jobs
+              WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load fresh requeue delay");
+        assert_eq!(job_state, "pending");
+        assert!(
+            (5..=120).contains(&fresh_delay_secs),
+            "fresh retry must stay fast, got {fresh_delay_secs}"
+        );
+
+        // A repeatedly requeued job backs off to the ceiling instead of
+        // pinning one of the bounded apply workers at a fixed duty cycle.
+        let apply = claim_job(&pool, "pending", "running", Some(deployment_id))
+            .await
+            .expect("reclaim aged apply")
+            .expect("aged apply exists");
+        sqlx::query("UPDATE deployment_apply_jobs SET attempts = 20 WHERE deployment_id = $1")
+            .bind(deployment_id)
+            .execute(&pool)
+            .await
+            .expect("age apply attempts");
+        requeue_apply_job(&pool, &apply)
+            .await
+            .expect("requeue aged contention");
+        let aged_delay_secs: i64 = sqlx::query_scalar(
+            "SELECT EXTRACT(EPOCH FROM (next_attempt_at - clock_timestamp()))::bigint
+               FROM deployment_apply_jobs
+              WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load aged requeue delay");
+        assert!(
+            (3500..=3600).contains(&aged_delay_secs),
+            "aged retry must hit the backoff ceiling, got {aged_delay_secs}"
+        );
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete backoff fixture");
+    }
+
+    #[tokio::test]
+    async fn exhausted_contention_requeue_terminalizes_the_apply_job() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
+        let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim setup")
+            .expect("setup exists");
+        mark_setup_accepted(&pool, deployment_id, setup.lock_token)
+            .await
+            .expect("accept setup");
+
+        // A fresh job requeues: nothing has outlived any retry window.
+        let apply = claim_job(&pool, "pending", "running", Some(deployment_id))
+            .await
+            .expect("claim fresh apply")
+            .expect("fresh apply exists");
+        requeue_or_exhaust_apply_job(&pool, &apply)
+            .await
+            .expect("requeue fresh contention");
+        let fresh_state: String =
+            sqlx::query_scalar("SELECT state FROM deployment_apply_jobs WHERE deployment_id = $1")
+                .bind(deployment_id)
+                .fetch_one(&pool)
+                .await
+                .expect("load fresh requeued state");
+        assert_eq!(fresh_state, "pending");
+
+        // A job whose transient-contention requeues have spanned the
+        // contention horizon without reaching a terminal observation is
+        // wedged: the requeue publishes a terminal retry-exhausted failure.
+        let apply = claim_job(&pool, "pending", "running", Some(deployment_id))
+            .await
+            .expect("reclaim exhausted apply")
+            .expect("exhausted apply exists");
+        sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET created_at = clock_timestamp() - '31 days'::interval
+              WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("age apply past the contention horizon");
+        requeue_or_exhaust_apply_job(&pool, &apply)
+            .await
+            .expect("terminalize exhausted contention");
+        let (deployment_status, deployment_error, app_status, job_state, job_error): (
+            String,
+            Option<String>,
+            String,
+            String,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT deployment.status::text, deployment.error_message,
+                    app.status::text, job.state, job.last_error_code
+               FROM deployments AS deployment
+               JOIN apps AS app ON app.id = deployment.app_id
+               JOIN deployment_apply_jobs AS job ON job.deployment_id = deployment.id
+              WHERE deployment.id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load terminalized exhaustion state");
+        assert_eq!(deployment_status, "failed");
+        assert_eq!(
+            deployment_error.as_deref(),
+            Some("deployment_retry_exhausted")
+        );
+        assert_eq!(app_status, "failed");
+        assert_eq!(job_state, "failed");
+        assert_eq!(job_error.as_deref(), Some("deployment_retry_exhausted"));
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete exhaustion fixture");
+    }
+
+    #[tokio::test]
+    async fn aged_nonterminal_observation_terminalizes_exhausted_rollout() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
+        let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim setup")
+            .expect("setup exists");
+        mark_setup_accepted(&pool, deployment_id, setup.lock_token)
+            .await
+            .expect("accept setup");
+        let manifest_hash = "exhausted-observation-manifest";
+
+        // A freshly anchored nonterminal observation (password owner wait)
+        // still requeues with a delayed retry: the grace window preserves
+        // the delayed-unlock semantics.
+        let apply = claim_job(&pool, "pending", "running", Some(deployment_id))
+            .await
+            .expect("claim fresh observation")
+            .expect("fresh observation exists");
+        sqlx::query(
+            "UPDATE deployments
+                SET status = 'watching'::deploy_status_enum,
+                    manifest_hash = $2,
+                    observing_since = clock_timestamp(),
+                    rollout_timeout_millis = 600000
+              WHERE id = $1",
+        )
+        .bind(deployment_id)
+        .bind(manifest_hash)
+        .execute(&pool)
+        .await
+        .expect("stage fresh watching anchor");
+        publish_rollout_outcome(
+            &pool,
+            &apply,
+            &DeploymentRolloutOutcome {
+                deploy_status: "watching",
+                app_status: "creating",
+                error_code: None,
+                terminal: false,
+                manifest_hash: manifest_hash.to_string(),
+            },
+        )
+        .await
+        .expect("publish fresh nonterminal observation");
+        let (job_state, delayed): (String, bool) = sqlx::query_as(
+            "SELECT state, next_attempt_at > clock_timestamp()
+               FROM deployment_apply_jobs
+              WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load fresh observation requeue");
+        assert_eq!(job_state, "pending");
+        assert!(
+            delayed,
+            "fresh nonterminal observation must stay requeueable"
+        );
+
+        // Once the observation anchor is past its persisted rollout budget
+        // plus the nonterminal grace, the same publish terminalizes the
+        // requeue loop instead of scheduling another observation attempt.
+        let apply = claim_job(&pool, "pending", "running", Some(deployment_id))
+            .await
+            .expect("reclaim aged observation")
+            .expect("aged observation exists");
+        sqlx::query(
+            "UPDATE deployments
+                SET status = 'watching'::deploy_status_enum,
+                    manifest_hash = $2,
+                    observing_since =
+                        clock_timestamp() - '25 hours'::interval,
+                    rollout_timeout_millis = 600000
+              WHERE id = $1",
+        )
+        .bind(deployment_id)
+        .bind(manifest_hash)
+        .execute(&pool)
+        .await
+        .expect("stage exhausted watching anchor");
+        publish_rollout_outcome(
+            &pool,
+            &apply,
+            &DeploymentRolloutOutcome {
+                deploy_status: "watching",
+                app_status: "creating",
+                error_code: None,
+                terminal: false,
+                manifest_hash: manifest_hash.to_string(),
+            },
+        )
+        .await
+        .expect("publish exhausted nonterminal observation");
+        let (deployment_status, deployment_error, completed_at, app_status, job_state): (
+            String,
+            Option<String>,
+            Option<chrono::DateTime<chrono::Utc>>,
+            String,
+            String,
+        ) = sqlx::query_as(
+            "SELECT deployment.status::text, deployment.error_message,
+                    deployment.completed_at, app.status::text, job.state
+               FROM deployments AS deployment
+               JOIN apps AS app ON app.id = deployment.app_id
+               JOIN deployment_apply_jobs AS job ON job.deployment_id = deployment.id
+              WHERE deployment.id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load terminalized observation state");
+        assert_eq!(deployment_status, "failed");
+        assert_eq!(
+            deployment_error.as_deref(),
+            Some("deployment_retry_exhausted")
+        );
+        assert!(
+            completed_at.is_some(),
+            "exhaustion must complete the rollout"
+        );
+        assert_eq!(app_status, "failed");
+        assert_eq!(job_state, "completed");
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete aged observation fixture");
     }
 
     #[tokio::test]
@@ -6166,9 +6608,7 @@ pub(crate) mod tests {
             DeploymentJobError::Mutation(crate::mutation_leases::MutationLeaseError::Busy)
         ));
         assert!(error.should_requeue_without_terminal_failure());
-        requeue_apply_job(&pool, &apply, error.code())
-            .await
-            .unwrap();
+        requeue_apply_job(&pool, &apply).await.unwrap();
 
         let (job_state, token, deployment_status, app_status): (
             String,
@@ -6958,10 +7398,10 @@ pub(crate) mod tests {
         payload.snapshot.resources.tls_data_size = "2Gi".to_string();
         let engine = volume_lookup_engine(503);
         let result = acquire_apply_permit_and_revalidate(&state, &job, &payload, &engine).await;
-        let Err(error @ DeploymentJobError::PreflightVolumeEvidenceUnavailable) = result else {
+        let Err(DeploymentJobError::PreflightVolumeEvidenceUnavailable) = result else {
             panic!("default-size transient inspection must requeue before provider mutation");
         };
-        requeue_apply_job(&pool, &job, error.code()).await.unwrap();
+        requeue_apply_job(&pool, &job).await.unwrap();
         let (job_state, lock_token, locked_until, delayed): (
             String,
             Option<Uuid>,
@@ -7143,7 +7583,7 @@ pub(crate) mod tests {
             panic!("a transient final read must requeue, got {result:?}");
         };
         assert!(error.should_requeue_without_terminal_failure());
-        requeue_apply_job(&pool, &job, error.code()).await.unwrap();
+        requeue_apply_job(&pool, &job).await.unwrap();
         let (job_state, lock_token): (String, Option<Uuid>) = sqlx::query_as(
             "SELECT state, lock_token FROM deployment_apply_jobs WHERE deployment_id = $1",
         )
