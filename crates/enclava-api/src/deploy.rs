@@ -9,7 +9,7 @@ use enclava_engine::apply::{
     namespace::apply_namespace,
     network_policy::apply_network_policy,
     orchestrator::{MANIFEST_HASH_ANNOTATION, manifest_hash},
-    resources::{apply_namespaced_resource, apply_standard_resources},
+    resources::apply_standard_resources,
     statefulset::apply_statefulset,
     types::{DeployPhase, DeployStatus as EngineDeployStatus},
     watch::watch_rollout,
@@ -1136,6 +1136,30 @@ async fn reconcile_managed_pull_secrets(
                             }
                             // Scope may have expanded since the removal intent was
                             // recorded. The desired secret wins over stale cleanup.
+                            // A UID-proven unlabeled pre-rotation secret is invisible
+                            // to discovery: refresh/adopt it before reattaching.
+                            let Some(expected) = settings.configured_secret_data.as_deref() else {
+                                converged = false;
+                                continue;
+                            };
+                            let refreshed = refresh_managed_pull_secret_credentials(
+                                engine, namespace, &live, expected,
+                            )
+                            .await;
+                            if let Err(error) = &refreshed {
+                                converged = false;
+                                tracing::warn!(%namespace, %error, "failed to refresh pending in-scope secret before restoring its reference");
+                                continue;
+                            }
+                            if matches!(refreshed, Ok(false))
+                                && !is_labeled_managed_pull_secret(&live)
+                                && let Err(error) =
+                                    adopt_managed_pull_secret(engine, namespace, &live).await
+                            {
+                                converged = false;
+                                tracing::warn!(%namespace, %error, "failed to adopt pending in-scope secret");
+                                continue;
+                            }
                             if let Err(error) = restore_pull_secret_reference_to_service_account(
                                 engine,
                                 namespace,
@@ -2371,6 +2395,79 @@ async fn forget_pending_reference_repair(
     }
 }
 
+async fn apply_scoped_pull_secret(
+    engine: &ApplyEngine,
+    namespace: &str,
+    config: &TenantImagePullSecretConfig,
+    generation: MutationGeneration,
+) -> Result<(), DeployError> {
+    use enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION;
+    let api: Api<Secret> = Api::namespaced(engine.client().clone(), namespace);
+    let mut desired = generate_tenant_image_pull_secret(namespace, config);
+    desired
+        .metadata
+        .annotations
+        .get_or_insert_with(Default::default)
+        .insert(
+            MUTATION_GENERATION_ANNOTATION.to_string(),
+            generation.get().to_string(),
+        );
+    for _ in 0..5 {
+        match api.get(&config.name).await {
+            Ok(live) => {
+                if newer_pull_secret_credentials(&live) {
+                    return Err(DeployError::Validation(format!(
+                        "refusing to overwrite newer pull-secret credential generation at {namespace}/{}",
+                        config.name
+                    )));
+                }
+                ensure_pull_secret_generation_not_stale(&live, generation, &config.name)?;
+                let Some(resource_version) = live.metadata.resource_version.as_deref() else {
+                    return Err(DeployError::Validation(
+                        "pull secret has no resourceVersion".to_string(),
+                    ));
+                };
+                let mut annotations = live.metadata.annotations.clone().unwrap_or_default();
+                annotations.extend(desired.metadata.annotations.clone().unwrap_or_default());
+                let patch = serde_json::json!({
+                    "metadata": {
+                        "resourceVersion": resource_version,
+                        "annotations": annotations,
+                        "labels": desired.metadata.labels,
+                    },
+                    "type": "kubernetes.io/dockerconfigjson",
+                    "stringData": desired.string_data,
+                });
+                match api
+                    .patch(&config.name, &PatchParams::default(), &Patch::Merge(&patch))
+                    .await
+                {
+                    Ok(_) => return Ok(()),
+                    Err(kube::Error::Api(error)) if error.code == 409 || error.code == 404 => {
+                        continue;
+                    }
+                    Err(error) => return Err(DeployError::Apply(error.into())),
+                }
+            }
+            Err(kube::Error::Api(error)) if error.code == 404 => {
+                match api
+                    .create(&kube::api::PostParams::default(), &desired)
+                    .await
+                {
+                    Ok(_) => return Ok(()),
+                    Err(kube::Error::Api(error)) if error.code == 409 => continue,
+                    Err(error) => return Err(DeployError::Apply(error.into())),
+                }
+            }
+            Err(error) => return Err(DeployError::Apply(error.into())),
+        }
+    }
+    Err(DeployError::PullSecretDeleteConflict(format!(
+        "{namespace}/{}",
+        config.name
+    )))
+}
+
 async fn apply_all_with_tenant_image_pull_secret(
     engine: &ApplyEngine,
     pool: &sqlx::PgPool,
@@ -2404,8 +2501,7 @@ async fn apply_all_with_tenant_image_pull_secret(
         .collect::<Vec<String>>();
 
     if let Some(config) = image_pull_secret_config {
-        let secret = generate_tenant_image_pull_secret(ns_name, config);
-        apply_namespaced_resource(engine, ns_name, &secret, generation).await?;
+        apply_scoped_pull_secret(engine, ns_name, config, generation).await?;
         // A previous out-of-scope sweep may still have a same-UID removal
         // intent. Once this deploy has applied the desired credential, restore
         // its reference and discharge that intent before any later step can
@@ -2419,7 +2515,13 @@ async fn apply_all_with_tenant_image_pull_secret(
             )
             .await?;
         }
-        discharge_reference_repair_intent_after_deploy(engine, ns_name, &service_accounts).await?;
+        discharge_reference_repair_intent_after_deploy(
+            engine,
+            ns_name,
+            &service_accounts,
+            &config.name,
+        )
+        .await?;
         tracing::info!(
             namespace = %ns_name,
             secret = %config.name,
@@ -2454,6 +2556,26 @@ async fn apply_all_with_tenant_image_pull_secret(
         }
     }
 
+    // Complete surviving UID-proven removals BEFORE SSA can prune their
+    // ServiceAccount annotation. The configured secret (if desired) was
+    // already applied and its own stale intent discharged above. In-scope
+    // residue and old renamed secrets must converge before further writes.
+    let repaired = reconcile_managed_pull_secrets(
+        engine,
+        ns_name,
+        &service_accounts,
+        &settings,
+        image_pull_secret_config.is_some(),
+        PullSecretDeleteMode::Unfenced {
+            namespace_generation: generation.get(),
+        },
+    )
+    .await?;
+    if !repaired {
+        return Err(DeployError::Validation(
+            "pending pull-secret repair did not converge before ServiceAccount apply".to_string(),
+        ));
+    }
     apply_standard_resources(engine, manifests, generation).await?;
     tracing::info!(namespace = %ns_name, "step 2/5: standard resources applied");
 
@@ -2599,15 +2721,9 @@ async fn apply_all_with_tenant_image_pull_secret(
         "step 5/5: StatefulSet applied"
     );
 
-    // Reviewer finding on #243 (Critical): this deploy's server-side apply of
-    // the generated ServiceAccount is the authoritative newest decision about
-    // its `imagePullSecrets` — an out-of-scope deploy prunes the field. Any
-    // pull-secret repair intent still recorded on the manifest's
-    // ServiceAccounts is therefore obsolete: leaving it would make the next
-    // sweep re-attach a reference this deploy just decided against, while the
-    // deploy's own reconcile never repairs (the repair pass is sweep-only).
-    // Discharge it now that the applies have re-decided the final state.
-    discharge_reference_repair_intent_after_deploy(engine, ns_name, &service_accounts).await?;
+    // Only the just-applied configured name was discharged above. Other
+    // pending UID-proven removals (including renamed, unlabeled old-PAT
+    // secrets) remain durable for the sweep to finish.
 
     tracing::info!(namespace = %ns_name, "apply_all complete");
     Ok(())
@@ -2641,15 +2757,13 @@ pub(crate) fn app_route_hosts(app: &App) -> Vec<(crate::edge::BackendTag, String
     hosts
 }
 
-/// Forget every pull-secret repair intent recorded on the given
-/// ServiceAccounts after a deploy has (re)applied them (reviewer finding on
-/// #243, Critical): the deploy's SSA is the authoritative decision about the
-/// generated ServiceAccount's `imagePullSecrets`, so intents recorded by
-/// earlier sweeps must not survive it.
+/// Forget only the configured name this deploy just applied. Other repair
+/// intents may be the last proof of ownership of renamed pre-label secrets.
 async fn discharge_reference_repair_intent_after_deploy(
     engine: &ApplyEngine,
     namespace: &str,
     service_accounts: &[String],
+    applied_secret_name: &str,
 ) -> Result<(), DeployError> {
     for service_account in service_accounts {
         let api: Api<ServiceAccount> = Api::namespaced(engine.client().clone(), namespace);
@@ -2658,7 +2772,10 @@ async fn discharge_reference_repair_intent_after_deploy(
             Err(kube::Error::Api(error)) if error.code == 404 => continue,
             Err(error) => return Err(DeployError::Apply(error.into())),
         };
-        for repair in pending_reference_repairs(&existing) {
+        for repair in pending_reference_repairs(&existing)
+            .into_iter()
+            .filter(|repair| repair.secret_name == applied_secret_name)
+        {
             forget_pending_reference_repair(
                 engine,
                 namespace,
@@ -5273,6 +5390,24 @@ mod tests {
                 else {
                     return not_found();
                 };
+                if let Some(rv) = patch
+                    .pointer("/metadata/resourceVersion")
+                    .and_then(|rv| rv.as_str())
+                    && secret.metadata.resource_version.as_deref() != Some(rv)
+                {
+                    return conflict();
+                }
+                if let Some(string_data) =
+                    patch.get("stringData").and_then(|value| value.as_object())
+                {
+                    let data = secret.data.get_or_insert_with(Default::default);
+                    for (key, value) in string_data {
+                        data.insert(
+                            key.clone(),
+                            k8s_openapi::ByteString(value.as_str().unwrap().as_bytes().to_vec()),
+                        );
+                    }
+                }
                 if let Some(labels) = patch
                     .pointer("/metadata/labels")
                     .and_then(|labels| labels.as_object())
@@ -6429,6 +6564,84 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn scoped_deploy_updates_existing_secret_with_version_fence() {
+        use std::sync::{Arc, Mutex};
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![fake_managed_secret(
+                "enclava-registry-auth",
+                true,
+                "cap-bot",
+                "ghp_old",
+            )],
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        let config = TenantImagePullSecretConfig {
+            name: "enclava-registry-auth".to_string(),
+            username: "cap-bot".to_string(),
+            token: "ghp_new".to_string(),
+            allowed_repositories: Vec::new(),
+        };
+        apply_scoped_pull_secret(
+            &engine,
+            "tenant-ns",
+            &config,
+            MutationGeneration::new(2).unwrap(),
+        )
+        .await
+        .unwrap();
+        let state = cluster.lock().unwrap();
+        assert_eq!(
+            state.secrets[0]
+                .data
+                .as_ref()
+                .unwrap()
+                .get(".dockerconfigjson")
+                .unwrap()
+                .0,
+            expected_dockerconfigjson("cap-bot", "ghp_new").into_bytes()
+        );
+        assert_eq!(secret_mutation_generation(&state.secrets[0]), Some(2));
+    }
+
+    #[tokio::test]
+    async fn old_replica_deploy_cannot_overwrite_newer_credential_epoch() {
+        use std::sync::{Arc, Mutex};
+        let mut live = fake_managed_secret("enclava-registry-auth", true, "cap-bot", "ghp_new");
+        live.metadata
+            .annotations
+            .get_or_insert_with(Default::default)
+            .insert(
+                PULL_SECRET_CREDENTIAL_GENERATION_ANNOTATION.to_string(),
+                u64::MAX.to_string(),
+            );
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![live],
+            ..Default::default()
+        }));
+        let before = cluster.lock().unwrap().secrets[0].data.clone();
+        let engine = reconcile_engine(cluster.clone());
+        let config = TenantImagePullSecretConfig {
+            name: "enclava-registry-auth".to_string(),
+            username: "cap-bot".to_string(),
+            token: "ghp_old".to_string(),
+            allowed_repositories: Vec::new(),
+        };
+        assert!(
+            apply_scoped_pull_secret(
+                &engine,
+                "tenant-ns",
+                &config,
+                MutationGeneration::new(2).unwrap(),
+            )
+            .await
+            .is_err()
+        );
+        let state = cluster.lock().unwrap();
+        assert_eq!(state.secrets[0].data, before);
+    }
+
     #[test]
     fn newer_rotation_generation_fences_stale_replica_refresh() {
         let mut secret = fake_managed_secret("enclava-registry-auth", true, "cap-bot", "new-token");
@@ -6912,6 +7125,63 @@ mod tests {
         assert!(pending_reference_repairs(&state.service_accounts[0]).is_empty());
     }
 
+    #[tokio::test]
+    async fn expanded_scope_refreshes_uid_proven_unlabeled_old_credential_before_reattaching() {
+        use std::sync::{Arc, Mutex};
+        let mut account = fake_service_account("cap-tenant-app", &[]);
+        account.metadata.annotations = Some(std::collections::BTreeMap::from([(
+            PENDING_PULL_SECRET_REFERENCE_REPAIRS_ANNOTATION.to_string(),
+            "enclava-registry-auth=uid-enclava-registry-auth".to_string(),
+        )]));
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![fake_managed_secret(
+                "enclava-registry-auth",
+                false,
+                "cap-bot",
+                "ghp_old",
+            )],
+            service_accounts: vec![account],
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        let settings = reconcile_settings();
+        let converged = reconcile_managed_pull_secrets(
+            &engine,
+            "tenant-ns",
+            &["cap-tenant-app".to_string()],
+            &settings,
+            true,
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 0,
+            },
+        )
+        .await
+        .unwrap();
+        let state = cluster.lock().unwrap();
+        assert_eq!(state.secrets.len(), 1);
+        assert!(is_labeled_managed_pull_secret(&state.secrets[0]));
+        assert_eq!(
+            state.secrets[0]
+                .data
+                .as_ref()
+                .unwrap()
+                .get(".dockerconfigjson")
+                .unwrap()
+                .0,
+            settings.configured_secret_data.unwrap().into_bytes(),
+        );
+        assert_eq!(
+            state.service_accounts[0]
+                .image_pull_secrets
+                .as_ref()
+                .unwrap()[0]
+                .name,
+            "enclava-registry-auth"
+        );
+        assert!(pending_reference_repairs(&state.service_accounts[0]).is_empty());
+        assert!(converged);
+    }
+
     /// Reviewer follow-up on #243 (Critical): the per-deploy reconcile (the
     /// Fenced path) must NOT run the repair pass — its own SSA of the
     /// generated ServiceAccount is about to re-decide `imagePullSecrets`, so
@@ -6966,19 +7236,21 @@ mod tests {
             );
         }
 
-        // After the deploy's applies, the intent is discharged: this deploy
-        // re-decided the ServiceAccount's imagePullSecrets.
+        // A deploy of a different configured name must not forget the UID
+        // ownership proof for a renamed pre-label secret.
         discharge_reference_repair_intent_after_deploy(
             &engine,
             "tenant-ns",
             &["cap-tenant-app".to_string()],
+            "different-configured-name",
         )
         .await
         .unwrap();
         let state = cluster.lock().unwrap();
-        assert!(
-            pending_reference_repairs(&state.service_accounts[0]).is_empty(),
-            "the deploy's post-apply discharge clears the stale intent"
+        assert_eq!(
+            pending_reference_repairs(&state.service_accounts[0]).len(),
+            1,
+            "the renamed secret's UID repair stays durable"
         );
         assert_eq!(
             state.service_accounts[0]
