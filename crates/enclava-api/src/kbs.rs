@@ -1277,7 +1277,7 @@ pub async fn teardown_unit_already_published(
     if unit.is_empty() {
         return Ok(true);
     }
-    let cm_api: Api<ConfigMap> = Api::namespaced(client, &config.namespace);
+    let cm_api: Api<ConfigMap> = Api::namespaced(client.clone(), &config.namespace);
     let configmap = cm_api.get(&config.configmap_name).await?;
     let current_policy = configmap
         .data
@@ -1285,7 +1285,46 @@ pub async fn teardown_unit_already_published(
         .and_then(|data| data.get(&config.policy_key))
         .map(String::as_str)
         .unwrap_or_default();
-    Ok(signed_policy_body_covers_artifacts(current_policy, &unit))
+    if !signed_policy_body_covers_artifacts(current_policy, &unit) {
+        return Ok(false);
+    }
+    // A ConfigMap write precedes Trustee rollout. Only an applied generation
+    // proves that this particular publication made it through rollout; the
+    // desired ConfigMap alone can be ahead of the serving policy.
+    let applied: Option<(i64, Vec<u8>)> = sqlx::query_as(
+        "SELECT applied_generation, applied_policy_sha256
+           FROM kbs_signed_policy_reconciliation
+          WHERE singleton AND applied_generation > 0",
+    )
+    .fetch_optional(db)
+    .await?;
+    let Some((generation, applied_hash)) = applied else {
+        return Ok(false);
+    };
+    let hash = hex::encode(Sha256::digest(current_policy.as_bytes()));
+    let annotations = configmap.metadata.annotations.as_ref();
+    if applied_hash != Sha256::digest(current_policy.as_bytes()).to_vec()
+        || annotated_policy_generation(annotations)? != Some((generation, hash.as_str()))
+    {
+        return Ok(false);
+    }
+    let token = annotations
+        .and_then(|a| a.get(POLICY_PUBLICATION_TOKEN_ANNOTATION))
+        .filter(|token| !token.is_empty());
+    let Some(token) = token else {
+        return Ok(false);
+    };
+    let deployment: Api<Deployment> = Api::namespaced(client, &config.namespace);
+    let trustee = deployment.get(&config.deployment_name).await?;
+    let template = trustee
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.template.metadata.as_ref())
+        .and_then(|metadata| metadata.annotations.as_ref());
+    Ok(
+        annotated_policy_generation(template)? == Some((generation, hash.as_str()))
+            && template.and_then(|a| a.get(POLICY_PUBLICATION_TOKEN_ANNOTATION)) == Some(token),
+    )
 }
 
 pub async fn reconcile_signed_policy_artifacts(
@@ -5251,25 +5290,36 @@ resource_bindings := {
             ]))
             .expect("serialize the partial policy body");
 
-        let configmap_for = |policy: String| {
-            serde_json::json!({
-                "apiVersion": "v1",
-                "kind": "ConfigMap",
-                "metadata": {
-                    "name": "resource-policy",
-                    "namespace": "cap-test",
-                    "resourceVersion": "3"
-                },
-                "data": {"resource-policy.rego": policy}
-            })
-        };
-        let client_for = |policy: String| {
+        let client_for = |policy: String, deployment_token: &'static str| {
             kube::Client::new(
-                tower::service_fn(move |_request: axum::http::Request<kube::client::Body>| {
-                    let configmap = configmap_for(policy.clone());
+                tower::service_fn(move |request: axum::http::Request<kube::client::Body>| {
+                    let hash = hex::encode(Sha256::digest(policy.as_bytes()));
+                    let annotations = serde_json::json!({
+                        (POLICY_GENERATION_ANNOTATION): "7",
+                        (POLICY_SHA256_ANNOTATION): hash,
+                        (POLICY_PUBLICATION_TOKEN_ANNOTATION): "published",
+                    });
+                    let object = if request.uri().path().contains("deployments") {
+                        serde_json::json!({
+                            "apiVersion": "apps/v1", "kind": "Deployment",
+                            "metadata": {"name": "trustee", "namespace": "cap-test"},
+                            "spec": {"template": {"metadata": {"annotations": {
+                                (POLICY_GENERATION_ANNOTATION): "7",
+                                (POLICY_SHA256_ANNOTATION): hash,
+                                (POLICY_PUBLICATION_TOKEN_ANNOTATION): deployment_token,
+                            }}}}
+                        })
+                    } else {
+                        serde_json::json!({
+                            "apiVersion": "v1", "kind": "ConfigMap",
+                            "metadata": {"name": "resource-policy", "namespace": "cap-test",
+                                         "resourceVersion": "3", "annotations": annotations},
+                            "data": {"resource-policy.rego": policy}
+                        })
+                    };
                     async move {
                         Ok::<_, std::io::Error>(axum::http::Response::new(
-                            kube::client::Body::from(serde_json::to_vec(&configmap).unwrap()),
+                            kube::client::Body::from(serde_json::to_vec(&object).unwrap()),
                         ))
                     }
                 }),
@@ -5277,27 +5327,63 @@ resource_bindings := {
             )
         };
 
-        let covers =
-            teardown_unit_already_published(&pool, &config, client_for(full_body.clone()), app_id)
-                .await
-                .expect("check the live policy body against the teardown unit");
+        let covers = teardown_unit_already_published(
+            &pool,
+            &config,
+            client_for(full_body.clone(), "published"),
+            app_id,
+        )
+        .await
+        .expect("check pending publication");
+        assert!(
+            !covers,
+            "ConfigMap publication alone must not authorize teardown"
+        );
+
+        let full_hash = Sha256::digest(full_body.as_bytes()).to_vec();
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                     SET desired_generation = 7, configmap_generation = 7,
+                         applied_generation = 7, configmap_policy_sha256 = $1,
+                         applied_policy_sha256 = $1, configmap_resource_version = '3'
+                   WHERE singleton",
+        )
+        .bind(&full_hash)
+        .execute(&pool)
+        .await
+        .expect("mark Trustee rollout applied");
+        let covers = teardown_unit_already_published(
+            &pool,
+            &config,
+            client_for(full_body.clone(), "published"),
+            app_id,
+        )
+        .await
+        .expect("check applied publication");
         assert!(
             covers,
-            "a live policy carrying the full teardown unit must let the delete proceed"
+            "applied full-unit policy must let the delete proceed"
         );
 
         let covers = teardown_unit_already_published(
             &pool,
             &config,
-            client_for(partial_body.clone()),
+            client_for(full_body.clone(), "stale"),
             app_id,
         )
         .await
-        .expect("check the partial policy body against the teardown unit");
-        assert!(
-            !covers,
-            "a live policy missing the legacy artifact must still fail the delete"
-        );
+        .expect("check deployment publication token");
+        assert!(!covers, "a different Trustee publication must fail closed");
+
+        let covers = teardown_unit_already_published(
+            &pool,
+            &config,
+            client_for(partial_body.clone(), "published"),
+            app_id,
+        )
+        .await
+        .expect("check partial policy body");
+        assert!(!covers, "partial unit must still fail the delete");
 
         // The exact live body also covers a single-artifact unit, proving the
         // pure predicate handles the single-artifact body shape too.
@@ -5311,6 +5397,16 @@ resource_bindings := {
         ));
         assert!(signed_policy_body_covers_artifacts("package authz", &[]));
 
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 0, configmap_generation = 0,
+                    applied_generation = 0, configmap_policy_sha256 = NULL,
+                    applied_policy_sha256 = NULL, configmap_resource_version = NULL
+              WHERE singleton",
+        )
+        .execute(&pool)
+        .await
+        .expect("restore signed policy reconciliation fixture");
         sqlx::query("DELETE FROM organizations WHERE id = $1")
             .bind(org_id)
             .execute(&pool)

@@ -715,6 +715,17 @@ fn app_delete_source_never_reads_or_formats_external_diagnostics() {
         deletion.contains("enqueue_signed_policy_revocation_if_active(&mut delete_lane)"),
         "the delete-tail revocation enqueue must ride the delete transaction — a post-commit enqueue can be lost to a transient transaction failure, and the periodic reconciler only advances committed generations"
     );
+    let restore = deletion
+        .split("if restored {")
+        .nth(1)
+        .expect("teardown failure has a restore branch")
+        .split("// Merely dropping the lease")
+        .next()
+        .expect("restore branch ends before lease release");
+    assert!(
+        restore.contains("enqueue_signed_policy_revocation_if_active(&mut delete_lane)"),
+        "restoring the app must enqueue a fresh content-bound policy generation in the same transaction"
+    );
     assert!(
         deletion
             .find("guard_provider(crate::kbs::reconcile_pending_signed_policy_artifacts")

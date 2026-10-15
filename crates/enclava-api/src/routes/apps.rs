@@ -1969,6 +1969,13 @@ pub(crate) async fn delete_app_before(
                 .execute(&mut *delete_lane)
                 .await
                 .map_err(|_| internal_server_error())?;
+                // The pre-teardown publication was content-bound to the
+                // deleting selector. Restoring the app changes that selector;
+                // enqueue a fresh generation in the same transaction so the
+                // periodic reconciler can revoke deletion-only authority.
+                crate::kbs::enqueue_signed_policy_revocation_if_active(&mut delete_lane)
+                    .await
+                    .map_err(|_| internal_server_error())?;
             }
             // Merely dropping the lease would hold the cluster-wide
             // edge_config and kbs_policy fences through reclaim quarantine
