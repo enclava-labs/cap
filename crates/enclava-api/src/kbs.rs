@@ -3372,7 +3372,6 @@ resource_bindings := {
     /// Stamp spec_snapshot.setup_state. Supersession never rewrites it.
     /// Setup acceptance indicates the apply phase was entered, but teardown
     /// authority does not treat 'accepted' as a published workload spec.
-
     async fn set_test_setup_state(pool: &PgPool, deployment_id: Uuid, state: &str) {
         sqlx::query(
             "UPDATE deployments
