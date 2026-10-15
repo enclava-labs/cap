@@ -56,6 +56,25 @@ const MANAGED_BY_VALUE: &str = "enclava-platform";
 /// shares the platform managed-by marker can never be swept.
 const TENANT_PULL_SECRET_LABEL: &str = "cap.enclava.dev/tenant-image-pull-secret";
 const TENANT_PULL_SECRET_LABEL_VALUE: &str = "true";
+const PULL_SECRET_CREDENTIAL_GENERATION_ANNOTATION: &str =
+    "cap.enclava.dev/pull-secret-credential-generation";
+
+fn pull_secret_credential_generation() -> u64 {
+    std::env::var("TENANT_IMAGE_PULL_CREDENTIAL_GENERATION")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
+}
+
+fn newer_pull_secret_credentials(secret: &Secret) -> bool {
+    secret
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(PULL_SECRET_CREDENTIAL_GENERATION_ANNOTATION))
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|generation| generation > pull_secret_credential_generation())
+}
 /// Durable repair intent on a generated ServiceAccount (Codex review on #243,
 /// P2 "persist failed pull-secret reference restorations"): a comma-separated
 /// list of pull-secret names whose `imagePullSecrets` references this cleanup
@@ -167,6 +186,13 @@ fn configured_tenant_image_pull_secret_name() -> Option<String> {
 /// explicit, valid `TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES` scope are refused.
 /// The platform GHCR PAT must never default into every tenant namespace.
 pub fn tenant_image_pull_secret_startup_error() -> Option<String> {
+    if let Ok(raw) = std::env::var("TENANT_IMAGE_PULL_CREDENTIAL_GENERATION")
+        && raw.parse::<u64>().is_err()
+    {
+        return Some(
+            "TENANT_IMAGE_PULL_CREDENTIAL_GENERATION must be an unsigned integer".to_string(),
+        );
+    }
     if tenant_image_pull_secret_config_from_env().is_some() {
         return None;
     }
@@ -552,11 +578,17 @@ fn generate_tenant_image_pull_secret(
         TENANT_PULL_SECRET_LABEL_VALUE.to_string(),
     );
 
+    let mut annotations = std::collections::BTreeMap::new();
+    annotations.insert(
+        PULL_SECRET_CREDENTIAL_GENERATION_ANNOTATION.to_string(),
+        pull_secret_credential_generation().to_string(),
+    );
     Secret {
         metadata: ObjectMeta {
             name: Some(config.name.clone()),
             namespace: Some(namespace.to_string()),
             labels: Some(labels),
+            annotations: Some(annotations),
             ..Default::default()
         },
         string_data: Some(string_data),
@@ -975,8 +1007,8 @@ async fn refresh_managed_pull_secret_credentials(
     let Some(name) = secret.metadata.name.as_deref() else {
         return Ok(false);
     };
-    if secret.metadata.deletion_timestamp.is_some() {
-        // Terminating under a finalizer: the delete path owns it from here.
+    if secret.metadata.deletion_timestamp.is_some() || newer_pull_secret_credentials(secret) {
+        // Do not let an older replica roll back a newer rollout's credential.
         return Ok(false);
     }
     let current = secret
@@ -993,12 +1025,17 @@ async fn refresh_managed_pull_secret_credentials(
         TENANT_PULL_SECRET_LABEL.to_string(),
         TENANT_PULL_SECRET_LABEL_VALUE.to_string(),
     );
+    let mut annotations = secret.metadata.annotations.clone().unwrap_or_default();
+    annotations.insert(
+        PULL_SECRET_CREDENTIAL_GENERATION_ANNOTATION.to_string(),
+        pull_secret_credential_generation().to_string(),
+    );
     let patch = serde_json::json!({
         "metadata": {
             "name": name,
             "resourceVersion": secret.metadata.resource_version,
             "labels": labels,
-            "annotations": secret.metadata.annotations.clone().unwrap_or_default(),
+            "annotations": annotations,
         },
         "type": "kubernetes.io/dockerconfigjson",
         "data": {
@@ -1020,7 +1057,9 @@ async fn refresh_managed_pull_secret_credentials(
             );
             Ok(true)
         }
-        Err(kube::Error::Api(error)) if error.code == 404 => Ok(false),
+        Err(kube::Error::Api(error)) if error.code == 404 => Err(DeployError::Validation(format!(
+            "desired tenant pull secret {namespace}/{name} disappeared during refresh"
+        ))),
         Err(error) => Err(DeployError::Apply(error.into())),
     }
 }
@@ -1088,6 +1127,28 @@ async fn reconcile_managed_pull_secrets(
                     .is_some_and(|uid| live_uid.as_deref() == Some(uid));
                 match live_result {
                     Ok(live) => {
+                        if namespace_in_scope && secret_name == settings.configured_name {
+                            if live.metadata.deletion_timestamp.is_some() {
+                                // An accepted old delete may still finish. Keep
+                                // the intent until 404, then recreate first.
+                                converged = false;
+                                continue;
+                            }
+                            // Scope may have expanded since the removal intent was
+                            // recorded. The desired secret wins over stale cleanup.
+                            if let Err(error) = restore_pull_secret_reference_to_service_account(
+                                engine,
+                                namespace,
+                                account_name,
+                                &secret_name,
+                            )
+                            .await
+                            {
+                                converged = false;
+                                tracing::warn!(%namespace, %error, "failed to restore newly in-scope pull secret reference");
+                            }
+                            continue;
+                        }
                         if cleared_uid_matches
                             && let Some(cleared_uid) = repair.cleared_uid.as_deref()
                         {
@@ -1193,6 +1254,40 @@ async fn reconcile_managed_pull_secrets(
                         }
                     }
                     Err(kube::Error::Api(error)) if error.code == 404 => {
+                        if namespace_in_scope && secret_name == settings.configured_name {
+                            // A previous delete finished after scope expanded. Recreate
+                            // before reattaching; never declare a missing desired
+                            // credential converged merely because refresh saw 404.
+                            if let Some(config) = tenant_image_pull_secret_config_from_env() {
+                                let desired = generate_tenant_image_pull_secret(namespace, &config);
+                                match api
+                                    .create(&kube::api::PostParams::default(), &desired)
+                                    .await
+                                {
+                                    Ok(_) => {
+                                        if let Err(error) =
+                                            restore_pull_secret_reference_to_service_account(
+                                                engine,
+                                                namespace,
+                                                account_name,
+                                                &secret_name,
+                                            )
+                                            .await
+                                        {
+                                            converged = false;
+                                            tracing::warn!(%namespace, %error, "failed to restore desired pull secret reference");
+                                        }
+                                    }
+                                    Err(error) => {
+                                        converged = false;
+                                        tracing::warn!(%namespace, %error, "failed to recreate newly in-scope pull secret");
+                                    }
+                                }
+                            } else {
+                                converged = false;
+                            }
+                            continue;
+                        }
                         // No object behind the name: the removal completed, so
                         // the intent is discharged.
                         if let Err(error) = forget_pending_reference_repair(
@@ -1440,10 +1535,10 @@ async fn reconcile_managed_pull_secrets(
                     %namespace,
                     secret = %name,
                     %error,
-                    "tenant image pull secret reconcile: failed to remove stale secret; \
-                     restoring the ServiceAccount references cleared above"
+                    "tenant image pull secret reconcile: delete outcome unknown; leaving references \
+                     cleared and repair intent durable until a follow-up read resolves it"
                 );
-                true
+                false
             }
         };
         if reverse_reference_clears {
@@ -1470,7 +1565,10 @@ async fn reconcile_managed_pull_secrets(
                     }
                 }
             }
-        } else {
+        } else if matches!(
+            removal,
+            Ok(PullSecretRemovalOutcome::Deleted | PullSecretRemovalOutcome::Missing)
+        ) {
             // The verified managed secret is provably gone (`Deleted` /
             // `Missing`): the cleared references are final, so their durable
             // repair intent is discharged (Codex review on #243, P2). A
@@ -1862,27 +1960,44 @@ async fn cleanup_stale_tenant_image_pull_secrets(pool: &PgPool) -> Result<bool, 
     // skipped by the reconcile pass, so the sweep can never erase a fresh
     // deploy's credentials; the next sweep (snapshot taken after that deploy)
     // decides. Read once for all namespaces — one extra query per sweep.
-    let lease_rows: std::collections::BTreeMap<String, i64> = sqlx::query_as(
-        "SELECT resource_key, generation FROM external_resource_mutation_leases \
-         WHERE resource_scope = 'kubernetes_namespace'",
+    // Bound both inventory queries together, separately from per-namespace
+    // reconciliation. A stalled DB must not block startup indefinitely.
+    let inventory = async {
+        let leases: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT resource_key, generation FROM external_resource_mutation_leases \
+             WHERE resource_scope = 'kubernetes_namespace'",
+        )
+        .fetch_all(pool)
+        .await?;
+        let rows: Vec<(Uuid, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT apps.id, apps.namespace, apps.service_account, \
+                    app_containers.image_ref \
+               FROM apps \
+               LEFT JOIN app_containers ON app_containers.app_id = apps.id",
+        )
+        .fetch_all(pool)
+        .await?;
+        Ok::<_, sqlx::Error>((leases, rows))
+    };
+    let (lease_rows, rows) = match tokio::time::timeout(
+        PULL_SECRET_NAMESPACE_RECONCILE_TIMEOUT,
+        inventory,
     )
-    .fetch_all(pool)
-    .await?
-    .into_iter()
-    .collect();
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => {
+            tracing::error!(
+                "tenant image pull secret inventory timed out; workload admission remains closed"
+            );
+            return Ok(false);
+        }
+    };
+    let lease_rows: std::collections::BTreeMap<String, i64> = lease_rows.into_iter().collect();
 
     // LEFT JOIN: an app with no container rows must still be inventoried
     // (as an app with no images), or its namespace is invisible to the sweep
     // and a stale secret can survive there (review finding).
-    let rows: Vec<(Uuid, String, String, Option<String>)> = sqlx::query_as(
-        "SELECT apps.id, apps.namespace, apps.service_account, \
-                app_containers.image_ref \
-           FROM apps \
-           LEFT JOIN app_containers ON app_containers.app_id = apps.id",
-    )
-    .fetch_all(pool)
-    .await?;
-
     // Per app: namespace, service account, and its images (None = a stored
     // image ref failed to parse, so the app cannot qualify for the secret).
     let mut apps: std::collections::BTreeMap<Uuid, (String, String, Option<Vec<ImageRef>>)> =
@@ -2291,6 +2406,20 @@ async fn apply_all_with_tenant_image_pull_secret(
     if let Some(config) = image_pull_secret_config {
         let secret = generate_tenant_image_pull_secret(ns_name, config);
         apply_namespaced_resource(engine, ns_name, &secret, generation).await?;
+        // A previous out-of-scope sweep may still have a same-UID removal
+        // intent. Once this deploy has applied the desired credential, restore
+        // its reference and discharge that intent before any later step can
+        // fail (or a concurrent sweep can replay the stale deletion).
+        for account in &service_accounts {
+            restore_pull_secret_reference_to_service_account(
+                engine,
+                ns_name,
+                account,
+                &config.name,
+            )
+            .await?;
+        }
+        discharge_reference_repair_intent_after_deploy(engine, ns_name, &service_accounts).await?;
         tracing::info!(
             namespace = %ns_name,
             secret = %config.name,
@@ -5957,8 +6086,12 @@ mod tests {
                 .image_pull_secrets
                 .as_ref()
                 .map(|references| references.len()),
-            Some(1),
-            "the cleared reference must be restored when removal does not converge"
+            None,
+            "ambiguous delete leaves the reference cleared until the next sweep"
+        );
+        assert_eq!(
+            pending_reference_repairs(&state.service_accounts[0]).len(),
+            1
         );
     }
 
@@ -6287,9 +6420,27 @@ mod tests {
                 .image_pull_secrets
                 .as_ref()
                 .map(|references| references.len()),
-            Some(1),
-            "the cleared reference is restored while the secret is still readable"
+            None,
+            "ambiguous finalizer delay leaves the reference cleared with repair intent"
         );
+        assert_eq!(
+            pending_reference_repairs(&state.service_accounts[0]).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn newer_rotation_generation_fences_stale_replica_refresh() {
+        let mut secret = fake_managed_secret("enclava-registry-auth", true, "cap-bot", "new-token");
+        secret
+            .metadata
+            .annotations
+            .get_or_insert_with(Default::default)
+            .insert(
+                PULL_SECRET_CREDENTIAL_GENERATION_ANNOTATION.to_string(),
+                "18446744073709551615".to_string(),
+            );
+        assert!(newer_pull_secret_credentials(&secret));
     }
 
     /// Codex review on #243 (P1, "refresh kept pull secrets after credential
@@ -6713,6 +6864,52 @@ mod tests {
                 "the completed removal discharges its intent"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn expanded_scope_cancels_pending_same_uid_removal() {
+        use std::sync::{Arc, Mutex};
+        let mut account = fake_service_account("cap-tenant-app", &[]);
+        account.metadata.annotations = Some(std::collections::BTreeMap::from([(
+            PENDING_PULL_SECRET_REFERENCE_REPAIRS_ANNOTATION.to_string(),
+            "enclava-registry-auth=uid-enclava-registry-auth".to_string(),
+        )]));
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![fake_managed_secret(
+                "enclava-registry-auth",
+                true,
+                "cap-bot",
+                "ghp_platform",
+            )],
+            service_accounts: vec![account],
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        assert!(
+            reconcile_managed_pull_secrets(
+                &engine,
+                "tenant-ns",
+                &["cap-tenant-app".to_string()],
+                &reconcile_settings(),
+                true,
+                PullSecretDeleteMode::Unfenced {
+                    namespace_generation: 0
+                },
+            )
+            .await
+            .unwrap()
+        );
+        let state = cluster.lock().unwrap();
+        assert_eq!(state.secrets.len(), 1);
+        assert_eq!(
+            state.service_accounts[0]
+                .image_pull_secrets
+                .as_ref()
+                .unwrap()[0]
+                .name,
+            "enclava-registry-auth"
+        );
+        assert!(pending_reference_repairs(&state.service_accounts[0]).is_empty());
     }
 
     /// Reviewer follow-up on #243 (Critical): the per-deploy reconcile (the

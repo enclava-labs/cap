@@ -284,6 +284,11 @@ fn cosign_registry_host_pattern_error(pattern: &str) -> Option<&'static str> {
         _ => pattern,
     };
     let base = host.strip_prefix("*.").unwrap_or(host);
+    // OCI treats bare single-label prefixes as Docker Hub namespaces, not
+    // registry endpoints; only localhost or an explicit port is addressable.
+    if !base.contains('.') && base != "localhost" && !pattern.contains(':') {
+        return Some("single-label registry hosts require an explicit port (except localhost)");
+    }
     if base.is_empty() || base.starts_with('.') || base.ends_with('.') || base.contains("..") {
         return Some("host must be a DNS name or IPv4 address without empty labels");
     }
@@ -1526,6 +1531,7 @@ mod tests {
             "*",
             "ghcr.io",
             "ghcr.io:5000",
+            "registry:5000",
             "localhost",
             "localhost:5000",
             "10.0.0.1:5000",
@@ -1551,6 +1557,8 @@ mod tests {
             ".ghcr.io",        // leading dot
             "ghcr.io.",        // trailing dot
             "ghcr.io/path",    // path, not a host
+            "registry",        // OCI interprets it as a Docker Hub namespace
+            "*.registry",      // wildcard base is not a registry endpoint
             "ghcr.io:",        // empty port
             "ghcr.io:0",       // port zero
             "ghcr.io:99999",   // port out of range
