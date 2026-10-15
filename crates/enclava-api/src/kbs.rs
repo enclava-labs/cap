@@ -74,6 +74,8 @@ pub enum KbsPolicyError {
     },
     #[error("signed KBS policy artifact is not current deployment authority")]
     ArtifactNotCurrent,
+    #[error("signed KBS policy publication deferred by an unreleased customer-config hold")]
+    PublicationDeferredByHold,
     #[error("signed KBS policy compare-and-swap retries were exhausted")]
     PolicyCasExhausted,
     #[error(
@@ -1669,7 +1671,12 @@ async fn reconcile_pending_signed_policy_artifacts_with_client(
                         policy_generation = generation,
                         "deferring signed KBS policy convergence until held deployments release"
                     );
-                    return Ok(());
+                    // The hold protects the running workload, but it does not
+                    // mean this generation reached Trustee. Callers that
+                    // require published withdrawal (notably signer rotation)
+                    // must retain their retry checkpoint instead of returning
+                    // success while the old authority remains live.
+                    return Err(KbsPolicyError::PublicationDeferredByHold);
                 }
             }
         }
@@ -7659,9 +7666,17 @@ resource_bindings := {
             signed_policy_max_bytes: 1024 * 1024,
         };
 
-        reconcile_pending_signed_policy_artifacts_with_client(&pool, &config, None, client.clone())
-            .await
-            .expect("the expired hold must defer the pending reconciliation");
+        let deferred = reconcile_pending_signed_policy_artifacts_with_client(
+            &pool,
+            &config,
+            None,
+            client.clone(),
+        )
+        .await;
+        assert!(
+            matches!(deferred, Err(KbsPolicyError::PublicationDeferredByHold)),
+            "a hold must preserve the running legacy workload without falsely reporting publication success"
+        );
         assert_eq!(
             writes.load(std::sync::atomic::Ordering::SeqCst),
             0,
