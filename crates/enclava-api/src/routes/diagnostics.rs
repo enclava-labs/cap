@@ -494,7 +494,13 @@ fn project_diagnostics(row: Option<DiagnosticsRow>) -> DeploymentDiagnostics {
         // retry DELETE: classify waiting rather than "retry now" while it
         // holds. A poisoned fence (never auto-reclaims) keeps the owner
         // waiting exactly like the API's own 409 semantics.
+        //
+        // IMPORTANT: The in-progress deletion's own namespace fence (armed by
+        // delete_app_before with app_delete operation kind) must NOT be treated
+        // as foreign. Only check for foreign fences - exclude the app_delete
+        // fence during active deletion since it's the deletion's own machinery.
         let fence_holds = row.fence_operation_kind.is_some()
+            && !matches!(row.fence_operation_kind.as_deref(), Some("app_delete"))
             && !is_own_operation(
                 row.fence_operation_kind.as_deref(),
                 row.fence_operation_id,

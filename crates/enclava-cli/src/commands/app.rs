@@ -1848,18 +1848,25 @@ pub async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> 
 /// One owner-facing sentence for the common lifecycle states (#90). The
 /// strings are fixed tokens from the API contract; only timing context is
 /// appended, never provider or workload text.
-fn deployment_condition_action(condition: &str, phase: Option<&str>) -> &'static str {
+fn deployment_condition_action(
+    condition: &str,
+    phase: Option<&str>,
+    reason: Option<&str>,
+) -> &'static str {
     if phase == Some("destroying") {
-        // Deletion has no durable background job: the API distinguishes a
-        // live teardown (progressing/waiting) from an abandoned one
-        // (blocked_by_operation — the delete lease fully lapsed and only
-        // a client DELETE resumes it).
-        return match condition {
-            "blocked_by_operation" => {
+        // Deletion has no durable background job: the API distinguishes
+        // finite lease quarantine (app_deleting) from poisoned fences
+        // (app_deletion_blocked_by_poisoned_fence). Use the reason to
+        // select the correct action.
+        return match (condition, reason) {
+            ("blocked_by_operation", _) => {
                 "deletion stalled after the delete request ended; run the delete again to resume teardown"
             }
-            "waiting_external" => {
+            ("waiting_external", Some("app_deletion_blocked_by_poisoned_fence")) => {
                 "deletion blocked by a poisoned resource fence; contact support to clear namespace finalizers"
+            }
+            ("waiting_external", _) => {
+                "deletion in progress; wait for teardown to complete before creating it again"
             }
             _ => "the app is being deleted; wait for teardown to complete before creating it again",
         };
@@ -1956,7 +1963,11 @@ fn print_deployment_diagnostics(deployment: &DeploymentDiagnostics) {
     }
     println!(
         "Action:   {}",
-        deployment_condition_action(&deployment.condition, Some(&deployment.phase))
+        deployment_condition_action(
+            &deployment.condition,
+            Some(&deployment.phase),
+            deployment.reason.as_deref()
+        )
     );
 }
 
