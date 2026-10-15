@@ -182,6 +182,26 @@ pub fn build_volumes(app: &ConfidentialApp) -> Vec<Volume> {
             }),
             ..Default::default()
         });
+        // cap#244 review: plaintext LUKS material (detached header copies,
+        // transient key files) must be isolated from the workload
+        // container. /run/enclava is mounted writable into the primary
+        // container, and rootful workload profiles share UID 0 with
+        // enclava-init, so uid/mode checks there provide no isolation.
+        // This RAM-backed volume is mounted into enclava-init ONLY
+        // (mount-level isolation) at the path enclava-init's
+        // PRIVATE_MATERIAL_DIR expects (/run/enclava-luks).
+        if !legacy {
+            v.push(Volume {
+                name: "luks-material".to_string(),
+                empty_dir: Some(EmptyDirVolumeSource {
+                    medium: Some("Memory".to_string()),
+                    // Two full header regions (state + tls-state, 16MiB
+                    // each) plus transient key files and headroom.
+                    size_limit: Some(Quantity("48Mi".to_string())),
+                }),
+                ..Default::default()
+            });
+        }
         v.push(Volume {
             name: "unlock-channel".to_string(),
             empty_dir: Some(EmptyDirVolumeSource {

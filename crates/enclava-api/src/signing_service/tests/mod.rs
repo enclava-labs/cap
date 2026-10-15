@@ -1774,3 +1774,59 @@ fn seal_claim_render_without_log_encryption_also_matches() {
     assert!(binding.omit_log_encryption_claim);
     assert!(binding.omit_luks2_header_seal_claim);
 }
+
+// --- claim-less artifacts once sealing is required (cap#244 review) ---
+
+#[test]
+fn required_seal_policy_rejects_claim_less_artifacts() {
+    // An artifact signed before the seal claim existed (claim-less render)
+    // must be REJECTED once the active signed release requires sealing —
+    // enclava-init would default the missing claim to `adopt`, letting a
+    // hostile host replay an unsealed header. The artifact must be
+    // re-signed instead.
+    let descriptor = descriptor();
+    let mut app = pinned_app_for_descriptor(&descriptor);
+    let mut pre_seal_app = app.clone();
+    pre_seal_app
+        .workload_artifact_binding
+        .as_mut()
+        .unwrap()
+        .omit_luks2_header_seal_claim = true;
+    let (_, pre_seal_hash) =
+        enclava_engine::manifest::cc_init_data::compute_cc_init_data(&pre_seal_app);
+    let err = crate::signing_service::pin_matching_cc_init_data_render(
+        &mut app,
+        &pre_seal_hash,
+        true, // active signed release: luks2_header_seal = required
+    )
+    .expect_err("claim-less artifact must be rejected under a required seal");
+    assert!(
+        matches!(err, SigningServiceError::Mismatch(ref msg) if msg.contains("requires sealing")),
+        "expected a re-sign diagnostic, got: {err:?}"
+    );
+    assert!(
+        !app.workload_artifact_binding
+            .as_ref()
+            .unwrap()
+            .omit_luks2_header_seal_claim,
+        "a rejected artifact must not keep any legacy pin"
+    );
+}
+
+#[test]
+fn required_seal_policy_still_accepts_modern_render() {
+    // Under a required seal, an artifact signed over the full modern render
+    // (with the claim) keeps validating.
+    let descriptor = descriptor();
+    let mut app = pinned_app_for_descriptor(&descriptor);
+    let (_, modern_hash) = enclava_engine::manifest::cc_init_data::compute_cc_init_data(&app);
+    crate::signing_service::pin_matching_cc_init_data_render(
+        &mut app,
+        &modern_hash,
+        true, // active signed release: luks2_header_seal = required
+    )
+    .expect("modern render must still validate under a required seal");
+    let binding = app.workload_artifact_binding.as_ref().unwrap();
+    assert!(!binding.omit_luks2_header_seal_claim);
+    assert!(!binding.omit_log_encryption_claim);
+}

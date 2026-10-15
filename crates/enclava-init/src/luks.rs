@@ -20,14 +20,8 @@
 //! wait-exec helpers first, then this mounter sidecar bind-mounts the decrypted
 //! paths into their mount namespaces and stays alive for the pod lifetime.
 //! Fresh LUKS2 volumes are formatted AES-256-XTS with hmac-sha256
-//! (dm-integrity) tags and then ext4 before the first mount, so the runtime
-//! image must include `mkfs.ext4`.
-//! Fresh LUKS2 volumes are formatted ext4 before the first mount, so
+//! (dm-integrity) tags (cap#248) and then ext4 before the first mount, so
 //! the runtime image must include `mkfs.ext4`.
-
-//! Fresh LUKS2 volumes are formatted AES-256-XTS with hmac-sha256
-//! (dm-integrity) tags and then ext4 before the first mount, so the runtime
-//! image must include `mkfs.ext4`.
 
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -38,11 +32,11 @@ use std::time::{Duration, Instant};
 
 use libcryptsetup_rs::{
     CryptInit, CryptParamsLuks2, CryptParamsLuks2Ref, consts::flags::CryptActivate,
-    consts::vals::EncryptionFormat,
+    consts::flags::CryptDeactivate, consts::vals::EncryptionFormat,
 };
 
 use crate::errors::{InitError, Result};
-use crate::luks2_seal::{self, HeaderSeal, Luks2Region, validate_region};
+use crate::luks2_seal::{self, HeaderSeal, Luks2Region, VolumeIntegrity, validate_region};
 use crate::secrets::DerivedSeed;
 
 const LUKS2_SECTOR_SIZE: u32 = 512;
@@ -58,6 +52,16 @@ const MIN_VOLUME_BYTES: u64 = 32 * 1024 * 1024;
 static KEY_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 static DETACHED_HEADER_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Total LUKS2 volume-key bytes: 64 cipher key (AES-256-XTS) + 32 integrity
+/// key (hmac-sha256). The library takes the total; 64 silently downgrades to
+/// a non-integrity volume (cap#248).
+const VOLUME_KEY_BYTES: usize = 96;
+/// Library spelling of the integrity algorithm (the CLI spells it
+/// `hmac-sha256`; see [`INTEGRITY_CLI`]).
+const INTEGRITY_LIB: &str = "hmac(sha256)";
+/// Zero-write chunk for integrity-tag initialization through the wipe
+/// mapper (4 MiB keeps write amplification bounded on large volumes).
+const INTEGRITY_WIPE_CHUNK: usize = 4 * 1024 * 1024;
 /// CLI spelling of the integrity algorithm.
 const INTEGRITY_CLI: &str = "hmac-sha256";
 
@@ -149,9 +153,18 @@ pub fn format(device: &Path, keys: &VolumeKeys) -> Result<()> {
 
     // Read back what cryptsetup actually wrote and validate it strictly
     // before sealing — never trust that the formatter produced the exact
-    // shape we asked for.
+    // shape we asked for. Both the CLI and the libcryptsetup fallback must
+    // produce the dm-integrity layout; a non-integrity result here means
+    // the fallback silently downgraded and is refused (cap#244 review).
     let region = luks2_seal::read_header_region(device)?;
-    validate_region(&region)?;
+    let integrity = validate_region(&region)?;
+    if integrity != VolumeIntegrity::HmacSha256 {
+        return Err(InitError::Luks(format!(
+            "fresh format of {} produced a non-integrity LUKS2 header; refusing to seal \
+             a volume without hmac(sha256) tags",
+            device.display()
+        )));
+    }
     luks2_seal::seal_on_disk(device, &region, &keys.header_mac_key)?;
     tracing::info!(
         device = %device.display(),
@@ -188,7 +201,9 @@ pub fn open_with_policy(
 
     luks2_seal::read_header_region(device)
         .and_then(|region| {
-            validate_region(&region)?;
+            // The integrity layout decides which dm stack a legitimate
+            // activation produces; strict validation reports it.
+            let _integrity = validate_region(&region)?;
             authenticated_open(device, &region, mapping_name, keys, policy)
         })
         .map(|_| LuksOpened {
@@ -353,33 +368,94 @@ fn validate_existing_mapper(
             device.display()
         )));
     }
-    if status.cipher.as_deref() != Some("aes-xts-plain64") {
-        return Err(InitError::Luks(format!(
-            "existing mapper {mapping_name} cipher is {:?}, expected \
-             aes-xts-plain64; refusing to reuse the mapper",
-            status.cipher
-        )));
-    }
-    if status.keysize_bits != Some(512) {
-        return Err(InitError::Luks(format!(
-            "existing mapper {mapping_name} keysize is {:?} bits, expected 512; \
-             refusing to reuse the mapper",
-            status.keysize_bits
-        )));
-    }
     // The mapper may predate this boot's seal; re-verify the on-disk header
-    // before trusting the existing activation.
+    // before trusting the existing activation. Strict validation also
+    // reports the volume's integrity layout, which decides the exact dm
+    // stack a legitimate activation of this header produces.
     let region = luks2_seal::read_header_region(device)?;
-    validate_region(&region)?;
-    // The offset must match the MAC-verified header's data_offset (sector
-    // size 512 is pinned by strict validation).
-    let expected_offset = region.layout.data_offset / 512;
-    if status.offset_sectors != Some(expected_offset) {
-        return Err(InitError::Luks(format!(
-            "existing mapper {mapping_name} offset is {:?} sectors, expected {} \
-             (data_offset of the authenticated header); refusing to reuse the mapper",
-            status.offset_sectors, expected_offset
-        )));
+    let integrity = validate_region(&region)?;
+    // Bind the live mapper to the MAC-verified header via its kernel dm
+    // UUID (CRYPT-LUKS2-<luks-uuid>-<name>) before comparing per-layout
+    // status fields.
+    verify_active_mapper_volume_key(device, &region, mapping_name, keys)?;
+    match integrity {
+        VolumeIntegrity::HmacSha256 => {
+            // Stacked dm-integrity activation (cap#248): cryptsetup loads a
+            // dm-crypt table over a `<name>_dif` dm-integrity sub-mapper.
+            // `cryptsetup status <name>` reports the TOP table's view:
+            // keysize 768 bits (64 AES-XTS + 32 HMAC key bits... reported
+            // as the volume-key size), an `integrity:` line naming
+            // hmac(sha256), and offset 0 — the top table starts at sector
+            // 0 of the integrity device, NOT the LUKS JSON payload offset
+            // (which lives in the lower table, offset 32768). Comparing
+            // that 0 to data_offset/512 wrongly rejected every retained
+            // integrity mapper (cap#244 review). The integrity pairing is
+            // instead proven from kernel sysfs truth in
+            // verify_stacked_integrity_mapper below, plus the status
+            // fields cryptsetup derives from the loaded header.
+            if status.cipher.as_deref() != Some("aes-xts-plain64") {
+                return Err(InitError::Luks(format!(
+                    "existing mapper {mapping_name} cipher is {:?}, expected \
+                     aes-xts-plain64; refusing to reuse the mapper",
+                    status.cipher
+                )));
+            }
+            if status.keysize_bits != Some(768) {
+                return Err(InitError::Luks(format!(
+                    "existing mapper {mapping_name} keysize is {:?} bits, expected 768 \
+                     (512 cipher + 256 integrity); refusing to reuse the mapper",
+                    status.keysize_bits
+                )));
+            }
+            if !status
+                .integrity
+                .as_deref()
+                .is_some_and(|value| value == INTEGRITY_LIB)
+            {
+                return Err(InitError::Luks(format!(
+                    "existing mapper {mapping_name} reports integrity {:?}, expected \
+                     {INTEGRITY_LIB}; refusing to reuse the mapper",
+                    status.integrity
+                )));
+            }
+            if status.offset_sectors != Some(0) {
+                return Err(InitError::Luks(format!(
+                    "existing mapper {mapping_name} offset is {:?} sectors, expected 0 \
+                     (dm-crypt table over the integrity device); refusing to reuse the mapper",
+                    status.offset_sectors
+                )));
+            }
+            verify_stacked_integrity_mapper(device, &region, mapping_name)?;
+        }
+        VolumeIntegrity::None => {
+            // Legacy plain dm-crypt activation: the single table maps
+            // directly over the backing device at the LUKS JSON payload
+            // offset, and the volume key is the bare 64-byte AES-XTS key.
+            if status.cipher.as_deref() != Some("aes-xts-plain64") {
+                return Err(InitError::Luks(format!(
+                    "existing mapper {mapping_name} cipher is {:?}, expected \
+                     aes-xts-plain64; refusing to reuse the mapper",
+                    status.cipher
+                )));
+            }
+            if status.keysize_bits != Some(512) {
+                return Err(InitError::Luks(format!(
+                    "existing mapper {mapping_name} keysize is {:?} bits, expected 512; \
+                     refusing to reuse the mapper",
+                    status.keysize_bits
+                )));
+            }
+            // The offset must match the MAC-verified header's data_offset
+            // (sector size 512 is pinned by strict validation).
+            let expected_offset = region.layout.data_offset / 512;
+            if status.offset_sectors != Some(expected_offset) {
+                return Err(InitError::Luks(format!(
+                    "existing mapper {mapping_name} offset is {:?} sectors, expected {} \
+                     (data_offset of the authenticated header); refusing to reuse the mapper",
+                    status.offset_sectors, expected_offset
+                )));
+            }
+        }
     }
     let mut seal = luks2_seal::verify_header_seal(&region, &keys.header_mac_key)?;
     if let HeaderSeal::Unsealed = seal {
@@ -413,12 +489,155 @@ fn validate_existing_mapper(
         // this exact payload under our key, so finish the interrupted seal.
         luks2_seal::seal_on_disk(device, &region, &keys.header_mac_key)?;
     }
-    // An existing mapper is dm-crypt state created by an earlier boot of this
-    // code, but the host controls the disk and could substitute a mapper we
-    // did not create. Bind the live mapper to the MAC-verified header via its
-    // kernel-held dm UUID before the caller mounts it.
-    verify_active_mapper_volume_key(device, &region, mapping_name, keys)?;
     Ok(())
+}
+
+/// Validate the stacked dm-integrity pairing of a retained integrity mapper
+/// using kernel sysfs truth (cap#244 review).
+///
+/// A legitimate `cryptsetup open` of a dm-integrity LUKS2 volume builds TWO
+/// stacked device-mapper tables: a lower `<name>_dif` dm-integrity device
+/// over the backing device (kernel uuid
+/// `CRYPT-INTEGRITY-<luks-uuid-hex>-<name>_dif`, table start offset
+/// `data_offset/512` sectors) and the top `<name>` dm-crypt device over that
+/// (uuid `CRYPT-LUKS2-<luks-uuid-hex>-<name>`). `cryptsetup status <name>`
+/// reports only the TOP table — offset 0 — so the header payload offset
+/// cannot be checked there; instead both mappers are resolved through sysfs
+/// (`/sys/block/dm-N/dm/{name,uuid}`, `/sys/block/dm-N/slaves`), which
+/// userspace cannot forge for active tables, and checked to form the exact
+/// expected stack for the MAC-verified header.
+fn verify_stacked_integrity_mapper(
+    device: &Path,
+    region: &Luks2Region,
+    mapping_name: &str,
+) -> Result<()> {
+    let expected_uuid: String = region_header_uuid(region)?
+        .chars()
+        .filter(|c| *c != '-')
+        .collect();
+    let dif_name = format!("{mapping_name}_dif");
+
+    let top = sysfs_dm_of_mapper(mapping_name)?;
+    let top_uuid = read_sysfs_trim(&format!("{}/uuid", top.display()))?;
+    let expected_top = format!("CRYPT-LUKS2-{expected_uuid}-{mapping_name}");
+    if top_uuid != expected_top {
+        return Err(InitError::Luks(format!(
+            "existing mapper {mapping_name} dm UUID {top_uuid:?} != expected \
+             {expected_top:?}; refusing to reuse the mapper"
+        )));
+    }
+
+    // The top dm-crypt table must sit over exactly the `_dif` sub-mapper.
+    // `slaves` entries are kernel block-device names (dm-N); resolve each
+    // to its kernel dm name for the comparison.
+    let top_slaves = dm_slave_names(&top)?;
+    if top_slaves != [dif_name.clone()] {
+        return Err(InitError::Luks(format!(
+            "existing mapper {mapping_name} is stacked over {top_slaves:?}, expected exactly \
+             [{dif_name:?}]; refusing to reuse the mapper"
+        )));
+    }
+
+    // The `_dif` dm-integrity device must carry the integrity uuid of the
+    // same LUKS header and sit directly over the backing device, with its
+    // table starting at the header's data_offset — this is where the LUKS
+    // JSON payload offset actually lives for the stacked layout.
+    let dif = sysfs_dm_by_name(&dif_name)?;
+    let dif_uuid = read_sysfs_trim(&format!("{}/uuid", dif.display()))?;
+    let expected_dif = format!("CRYPT-INTEGRITY-{expected_uuid}-{dif_name}");
+    if dif_uuid != expected_dif {
+        return Err(InitError::Luks(format!(
+            "integrity sub-mapper {dif_name} dm UUID {dif_uuid:?} != expected \
+             {expected_dif:?}; refusing to reuse the mapper"
+        )));
+    }
+    let dif_slaves = read_sysfs_dir(&format!("{}/../slaves", dif.display()))?;
+    if dif_slaves.len() != 1 {
+        return Err(InitError::Luks(format!(
+            "integrity sub-mapper {dif_name} is stacked over {dif_slaves:?}; expected exactly \
+             one backing device; refusing to reuse the mapper"
+        )));
+    }
+    let slave_path = PathBuf::from("/dev").join(&dif_slaves[0]);
+    if !paths_equivalent(&slave_path, device) {
+        return Err(InitError::Luks(format!(
+            "integrity sub-mapper {dif_name} is backed by {}, expected {}",
+            slave_path.display(),
+            device.display()
+        )));
+    }
+
+    tracing::info!(
+        mapping = mapping_name,
+        uuid = %expected_uuid,
+        "existing stacked integrity mapper bound to authenticated header via kernel dm state"
+    );
+    Ok(())
+}
+
+/// Resolve the sysfs `/sys/block/dm-N` directory of an active mapper by its
+/// `/dev/mapper/<name>` device number (same kernel-truth resolution as
+/// [`mapper_dm_uuid`]).
+fn sysfs_dm_of_mapper(mapping_name: &str) -> Result<PathBuf> {
+    dm_sysfs_dir(mapping_name).map(PathBuf::from)
+}
+
+/// Resolve the sysfs `/sys/block/dm-N` directory whose kernel dm name is
+/// exactly `name`. Scanning by name is safe here: `/sys/block/dm-*/dm/name`
+/// is kernel-written, and duplicate active dm names cannot exist.
+fn sysfs_dm_by_name(name: &str) -> Result<PathBuf> {
+    let entries = std::fs::read_dir("/sys/block")
+        .map_err(|e| InitError::Luks(format!("read /sys/block: {e}")))?;
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(dm_name) = file_name.to_str() else {
+            continue;
+        };
+        if !dm_name.starts_with("dm-") {
+            continue;
+        }
+        let dir = entry.path().join("dm");
+        if read_sysfs_trim(&dir.join("name").display().to_string()).is_ok_and(|n| n == name) {
+            return Ok(dir);
+        }
+    }
+    Err(InitError::Luks(format!(
+        "no active dm device named {name:?} found in sysfs; refusing to reuse the mapper"
+    )))
+}
+
+fn read_sysfs_trim(path: &str) -> Result<String> {
+    std::fs::read_to_string(path)
+        .map(|s| s.trim().to_string())
+        .map_err(|e| InitError::Luks(format!("read {path}: {e}")))
+}
+
+/// Kernel block-device names (e.g. `dm-0`) backing a dm device, resolved
+/// to their kernel dm names (`/sys/block/dm-N/dm/name`) when they are
+/// themselves dm devices; non-dm slaves (the raw backing device) are
+/// returned as-is.
+fn dm_slave_names(dm_sysfs: &Path) -> Result<Vec<String>> {
+    let slaves = read_sysfs_dir(&format!("{}/../slaves", dm_sysfs.display()))?;
+    slaves
+        .into_iter()
+        .map(|slave| {
+            let name_file = format!("/sys/block/{slave}/dm/name");
+            match std::fs::read_to_string(&name_file) {
+                Ok(name) => Ok(name.trim().to_string()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(slave),
+                Err(e) => Err(InitError::Luks(format!("read {name_file}: {e}"))),
+            }
+        })
+        .collect()
+}
+
+fn read_sysfs_dir(path: &str) -> Result<Vec<String>> {
+    let entries =
+        std::fs::read_dir(path).map_err(|e| InitError::Luks(format!("read {path}: {e}")))?;
+    Ok(entries
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect())
 }
 
 /// Bind the active mapper to the authenticated header.
@@ -512,6 +731,24 @@ fn region_header_uuid(region: &Luks2Region) -> Result<String> {
 /// (unexpected for a LUKS2 mapper). No `dmsetup` binary is required — the
 /// runtime image does not install one (cap#244 review).
 fn mapper_dm_uuid(mapping_name: &str) -> Result<String> {
+    let sys_dm = dm_sysfs_dir(mapping_name)?;
+    let uuid = std::fs::read_to_string(format!("{sys_dm}/uuid"))
+        .map_err(|e| InitError::Luks(format!("read {sys_dm}/uuid: {e}")))?;
+    let uuid = uuid.trim();
+    if uuid.is_empty() {
+        return Err(InitError::Luks(format!(
+            "dm device for mapper {mapping_name} has an empty kernel UUID; \
+             refusing to use it"
+        )));
+    }
+    Ok(uuid.to_string())
+}
+
+/// Resolve the kernel sysfs dm directory (`/sys/dev/block/<maj:min>/dm`) of
+/// the dm device backing `/dev/mapper/<mapping_name>`, verifying along the
+/// way that the kernel dm name equals the mapping name (same kernel-truth
+/// resolution `mapper_dm_uuid` uses).
+fn dm_sysfs_dir(mapping_name: &str) -> Result<String> {
     let mapper_path = PathBuf::from(format!("/dev/mapper/{mapping_name}"));
     let meta = std::fs::metadata(&mapper_path)
         .map_err(|e| InitError::Luks(format!("stat {}: {e}", mapper_path.display())))?;
@@ -535,16 +772,7 @@ fn mapper_dm_uuid(mapping_name: &str) -> Result<String> {
             "dm device backing {mapping_name} reports name {name:?}; refusing to use it"
         )));
     }
-    let uuid = std::fs::read_to_string(format!("{sys_dm}/uuid"))
-        .map_err(|e| InitError::Luks(format!("read {sys_dm}/uuid: {e}")))?;
-    let uuid = uuid.trim();
-    if uuid.is_empty() {
-        return Err(InitError::Luks(format!(
-            "dm device for mapper {mapping_name} has an empty kernel UUID; \
-             refusing to use it"
-        )));
-    }
-    Ok(uuid.to_string())
+    Ok(sys_dm)
 }
 
 /// Format the device if it's not yet a LUKS2 volume, then activate it.
@@ -640,16 +868,7 @@ fn mkfs_ext4(mapper_path: &Path) -> Result<()> {
 fn format_with_libcryptsetup(device: &Path, key: &DerivedSeed) -> Result<()> {
     let mut dev = CryptInit::init(device)
         .map_err(|e| InitError::Luks(format!("init {}: {e}", device.display())))?;
-    let params = CryptParamsLuks2 {
-        pbkdf: None,
-        integrity: None,
-        integrity_params: None,
-        data_alignment: 0,
-        data_device: None,
-        sector_size: LUKS2_SECTOR_SIZE,
-        label: None,
-        subsystem: None,
-    };
+    let params = luks2_format_params();
     let mut params: CryptParamsLuks2Ref<'_> = (&params)
         .try_into()
         .map_err(|e| InitError::Luks(format!("luks2 params: {e}")))?;
@@ -659,7 +878,12 @@ fn format_with_libcryptsetup(device: &Path, key: &DerivedSeed) -> Result<()> {
             EncryptionFormat::Luks2,
             ("aes", "xts-plain64"),
             None,
-            libcryptsetup_rs::Either::Right(64),
+            // The FULL 96-byte volume key (64 AES-XTS + 32 HMAC): passing 64
+            // here would silently produce a non-integrity volume that the
+            // strict post-format validation then refuses — failing the
+            // fallback loudly instead of downgrading (cap#248, cap#244
+            // review).
+            libcryptsetup_rs::Either::Right(VOLUME_KEY_BYTES),
             Some(&mut params),
         )
         .map_err(|e| InitError::Luks(format!("format: {e}")))?;
@@ -673,7 +897,101 @@ fn format_with_libcryptsetup(device: &Path, key: &DerivedSeed) -> Result<()> {
         )
         .map_err(|e| InitError::Luks(format!("add_by_key: {e}")))?;
 
-    Ok(())
+    initialize_integrity_tags(&mut dev, key)
+}
+
+fn luks2_format_params() -> CryptParamsLuks2 {
+    CryptParamsLuks2 {
+        pbkdf: None,
+        integrity: Some(INTEGRITY_LIB.to_string()),
+        // Let libcryptsetup derive dm-integrity defaults; the binding emits
+        // empty CStrings for CryptParamsIntegrity fields.
+        integrity_params: None,
+        data_alignment: 0,
+        data_device: None,
+        sector_size: LUKS2_SECTOR_SIZE,
+        label: None,
+        subsystem: None,
+    }
+}
+
+/// crypt_format does not initialize dm-integrity tags like `luksFormat` does,
+/// so reads of never-written sectors would fail. Writing zeros through the
+/// activated mapper tags the whole data area.
+fn initialize_integrity_tags(
+    dev: &mut libcryptsetup_rs::CryptDevice,
+    key: &DerivedSeed,
+) -> Result<()> {
+    let wipe_name = format!("enclava-init-wipe-{}", unguessable_suffix());
+
+    // Match cryptsetup's own integrity initialization (`_wipe_data_device`):
+    // activate the temporary mapper with NO_JOURNAL so the whole-area zero
+    // write goes directly to dm-integrity tags instead of through the
+    // journal, halving the write amplification of this already long wipe.
+    // PRIVATE skips global udev rules for the throwaway device, as upstream.
+    dev.activate_handle()
+        .activate_by_passphrase(
+            Some(&wipe_name),
+            None,
+            key.as_bytes(),
+            CryptActivate::PRIVATE | CryptActivate::NO_JOURNAL,
+        )
+        .map_err(|e| {
+            // Loading the dm-integrity target is the first kernel touch in
+            // this flow. A failure here most often means the guest kernel
+            // lacks CONFIG_DM_INTEGRITY (it is a Kconfig target separate
+            // from dm_mod/dm_crypt); name it so operators see the actual
+            // fix instead of a generic activation error.
+            InitError::Luks(format!(
+                "activate wipe mapper (does the guest kernel provide \
+                 dm-integrity, CONFIG_DM_INTEGRITY?): {e}"
+            ))
+        })?;
+
+    let result = write_zeros_through_mapper(&PathBuf::from(format!("/dev/mapper/{wipe_name}")));
+    let deactivate = dev
+        .activate_handle()
+        .deactivate(&wipe_name, CryptDeactivate::empty())
+        .map_err(|e| InitError::Luks(format!("deactivate {wipe_name}: {e}")));
+
+    result.and(deactivate)
+}
+
+fn unguessable_suffix() -> String {
+    let mut bytes = [0u8; 16];
+    let random = std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut bytes));
+    if random.is_ok() {
+        return bytes.iter().map(|b| format!("{b:02x}")).collect();
+    }
+    let counter = KEY_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    format!("{}-{counter}-{nanos:x}", std::process::id())
+}
+
+fn write_zeros_through_mapper(mapper_path: &Path) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .open(mapper_path)
+        .map_err(|e| InitError::Luks(format!("open {}: {e}", mapper_path.display())))?;
+    let len = file
+        .seek(SeekFrom::End(0))
+        .map_err(|e| InitError::Luks(format!("seek {}: {e}", mapper_path.display())))?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| InitError::Luks(format!("seek {}: {e}", mapper_path.display())))?;
+
+    let zeros = vec![0u8; INTEGRITY_WIPE_CHUNK];
+    let mut remaining = len;
+    while remaining > 0 {
+        let chunk = &zeros[..zeros.len().min(remaining as usize)];
+        file.write_all(chunk)
+            .map_err(|e| InitError::Luks(format!("zero {}: {e}", mapper_path.display())))?;
+        remaining -= chunk.len() as u64;
+    }
+    file.sync_all()
+        .map_err(|e| InitError::Luks(format!("sync {}: {e}", mapper_path.display())))
 }
 
 fn format_with_cryptsetup_cli(device: &Path, key: &DerivedSeed) -> Result<()> {
@@ -781,6 +1099,10 @@ struct CryptsetupStatus {
     device: Option<PathBuf>,
     cipher: Option<String>,
     keysize_bits: Option<u64>,
+    /// `integrity:` line (dm-integrity activations only), e.g.
+    /// `hmac(sha256)`. `None` for plain dm-crypt mappers AND for outputs
+    /// that do not carry the line at all.
+    integrity: Option<String>,
     offset_sectors: Option<u64>,
 }
 
@@ -808,6 +1130,7 @@ fn parse_cryptsetup_status(output: &str) -> CryptsetupStatus {
         device: None,
         cipher: None,
         keysize_bits: None,
+        integrity: None,
         offset_sectors: None,
     };
     for line in output.lines() {
@@ -825,6 +1148,10 @@ fn parse_cryptsetup_status(output: &str) -> CryptsetupStatus {
         {
             // "512 bits" -> 512; bare "512" also accepted.
             status.keysize_bits = first.strip_suffix("bits").unwrap_or(first).parse().ok();
+        } else if let Some(value) = line.strip_prefix("integrity:").map(str::trim) {
+            if !value.is_empty() {
+                status.integrity = Some(value.to_string());
+            }
         } else if let Some(value) = line
             .strip_prefix("offset:")
             .map(str::trim)
@@ -1260,7 +1587,37 @@ mod unit_tests {
         assert_eq!(status.device, Some(PathBuf::from("/dev/vdb")));
         assert_eq!(status.cipher.as_deref(), Some("aes-xts-plain64"));
         assert_eq!(status.keysize_bits, Some(512));
+        assert_eq!(status.integrity, None);
         assert_eq!(status.offset_sectors, Some(32768));
+    }
+
+    #[test]
+    fn parses_cryptsetup_status_stacked_integrity_fields() {
+        // Output captured from `cryptsetup status` on a dm-integrity LUKS2
+        // activation (cap#248 layout): the top dm-crypt table reports the
+        // combined 768-bit volume key, the integrity line, and offset 0.
+        let output = r#"
+/dev/mapper/cap-state is active.
+  type:    LUKS2
+  cipher:  aes-xts-plain64
+  keysize: 768 bits
+  key location: keyring
+  integrity: hmac(sha256)
+  integrity keysize: 256 bits
+  integrity tag size: 32 bytes
+  device:  /dev/vdb
+  sector size:  512
+  offset:  0 sectors
+  size:    91184 sectors
+  mode:    read/write
+"#;
+
+        let status = parse_cryptsetup_status(output);
+        assert_eq!(status.device, Some(PathBuf::from("/dev/vdb")));
+        assert_eq!(status.cipher.as_deref(), Some("aes-xts-plain64"));
+        assert_eq!(status.keysize_bits, Some(768));
+        assert_eq!(status.integrity.as_deref(), Some("hmac(sha256)"));
+        assert_eq!(status.offset_sectors, Some(0));
     }
 
     #[test]
@@ -1269,6 +1626,7 @@ mod unit_tests {
         assert_eq!(status.device, None);
         assert_eq!(status.cipher, None);
         assert_eq!(status.keysize_bits, None);
+        assert_eq!(status.integrity, None);
         assert_eq!(status.offset_sectors, None);
     }
 
@@ -1380,10 +1738,19 @@ mod tests {
 
     impl TestMapping {
         /// Activate `device` under a fresh random name; never reuse a name so
-        /// no test touches mappings owned by anything else.
-        fn activate(device: &Path, key: &DerivedSeed) -> Result<Self> {
+        /// no test touches mappings owned by anything else. The keys pair is
+        /// derived exactly like production `VolumeKeys` for the passphrase.
+        fn activate(device: &Path, passphrase: &DerivedSeed) -> Result<Self> {
             let name = Self::random_name();
-            open(device, &name, key)?;
+            let keys = VolumeKeys::new(
+                passphrase.clone(),
+                crate::seeds::derive(
+                    &crate::secrets::OwnerSeed(passphrase.0),
+                    crate::seeds::STATE_HEADER_MAC_INFO,
+                )
+                .expect("derive mac key"),
+            );
+            open(device, &name, &keys)?;
             Ok(Self { name, active: true })
         }
 
@@ -1440,10 +1807,10 @@ mod tests {
         }
     }
 
-    /// `with_key_file` writes to /run/enclava; make sure it exists so the CLI
-    /// formatter is the one under test.
+    /// `with_key_file` writes to the private-material dir; make sure it
+    /// exists so the CLI formatter is the one under test.
     fn ensure_run_dir() {
-        let _ = std::fs::create_dir_all("/run/enclava");
+        let _ = std::fs::create_dir_all(luks2_seal::PRIVATE_MATERIAL_DIR);
     }
 
     fn make_backing_file(size_mb: u64) -> Result<(tempfile::TempDir, PathBuf)> {
@@ -1507,19 +1874,20 @@ mod tests {
             .status();
     }
 
-    /// Detached-header plumbing writes under /run/enclava; without root or a
-    /// real /run/enclava the tmpfs copy cannot be created, so integration
-    /// tests run privileged (CI runs them compile-only; the SEV-SNP nightlies
-    /// run them for real). write_detached_copy also enforces tmpfs, so skip
-    /// on dev machines whose /run/enclava is not RAM-backed.
+    /// Detached-header plumbing writes under the private-material dir;
+    /// without root or a RAM-backed mount the tmpfs copy cannot be created,
+    /// so integration tests run privileged (CI runs them compile-only; the
+    /// SEV-SNP nightlies run them for real). write_detached_copy also
+    /// enforces tmpfs, so skip on dev machines whose mount is not RAM-backed.
     fn can_write_run_enclava() -> bool {
-        std::fs::create_dir_all("/run/enclava").is_ok()
-            && nix::sys::statfs::statfs("/run/enclava")
+        std::fs::create_dir_all(luks2_seal::PRIVATE_MATERIAL_DIR).is_ok()
+            && nix::sys::statfs::statfs(luks2_seal::PRIVATE_MATERIAL_DIR)
                 .map(|s| s.filesystem_type() == nix::sys::statfs::TMPFS_MAGIC)
                 .unwrap_or(false)
             && {
                 let probe = format!(
-                    "/run/enclava/.luks-integration-probe-{}-{}",
+                    "{}/.luks-integration-probe-{}-{}",
+                    luks2_seal::PRIVATE_MATERIAL_DIR,
                     std::process::id(),
                     DETACHED_HEADER_COUNTER.fetch_add(1, Ordering::Relaxed)
                 );
@@ -1813,5 +2181,65 @@ mod tests {
             "512".to_string(),
             "--batch-mode".to_string(),
         ]
+    }
+
+    /// cap#248 cross-version compatibility (cap#244 review): a volume
+    /// formatted by cap#248's implementation (now on main — CLI
+    /// `luksFormat --integrity hmac-sha256`, the 96-byte volume key)
+    /// must open under this PR's validator, adopt+seal its header, and —
+    /// critically for the restart path — be reusable through
+    /// `validate_existing_mapper` with the stacked `<name>`/`<name>_dif`
+    /// dm pair still active.
+    #[test]
+    fn cap248_formatted_volume_opens_and_reuses_stacked_mapper() -> Result<()> {
+        if !can_write_run_enclava() {
+            eprintln!("skipping: cannot write private material dir (needs root)");
+            return Ok(());
+        }
+        let (_dir, img) = make_backing_file(64)?;
+        let device = attach_loop_device(&img);
+        let keys = volume_keys();
+        let mapping = "enclava-init-test-cap248";
+        close_mapper(mapping);
+
+        // Format EXACTLY as cap#248 does (see format_with_cryptsetup_cli on
+        // main): integrity hmac-sha256, key-size 512 (the AES-XTS portion;
+        // cryptsetup expands the volume key to 96 bytes for the HMAC).
+        with_key_file(&keys.passphrase, |key_file| {
+            let mut args = luks_format_args(&device, key_file);
+            args.push("--integrity".to_string());
+            args.push(INTEGRITY_CLI.to_string());
+            run_command("cryptsetup", &args)
+        })?;
+
+        // Strict validation must recognize the dm-integrity layout.
+        let region = luks2_seal::read_header_region(&device)?;
+        assert_eq!(
+            validate_region(&region).expect("cap#248 header passes strict validation"),
+            VolumeIntegrity::HmacSha256,
+            "cap#248-formatted header must validate as the hmac(sha256) layout"
+        );
+
+        // Unsealed (cap#248 volumes carry no header MAC): adopted + sealed
+        // through the passphrase gate, then activated.
+        let opened = open(&device, mapping, &keys).expect("cap#248 volume is adopted and opened");
+        assert!(opened.mapper_path.exists());
+        let region = luks2_seal::read_header_region(&device)?;
+        assert_eq!(
+            luks2_seal::verify_header_seal(&region, &keys.header_mac_key)?,
+            HeaderSeal::Sealed,
+            "adoption must seal the cap#248 header"
+        );
+
+        // Restart simulation: the stacked integrity mapper stays active and
+        // must be revalidated (top dm-crypt over <name>_dif, kernel dm
+        // UUIDs, offset 0) and reused.
+        let reopened = open(&device, mapping, &keys)
+            .expect("active stacked integrity mapper is revalidated and reused");
+        assert_eq!(reopened.mapper_path, opened.mapper_path);
+
+        close_mapper(mapping);
+        detach_loop_device(&device);
+        Ok(())
     }
 }

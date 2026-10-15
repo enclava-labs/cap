@@ -51,20 +51,24 @@ use subtle::ConstantTimeEq;
 use crate::errors::{InitError, Result};
 use crate::secrets::DerivedSeed;
 
-/// Root-only directory holding every piece of plaintext LUKS material this
-/// process writes (detached header copies, temporary key files).
+/// Private LUKS material (detached header copies, transient passphrase
+/// files) lives under this directory.
 ///
-/// The shared `/run/enclava` unlock-socket emptyDir is writable by the
-/// workload container (pod `fsGroup` 10001), so a predictable file name
-/// directly in it can be unlinked and replaced between our write and
-/// cryptsetup's pathname re-resolution — substituting unauthenticated
-/// header metadata, or (via a symlink) turning a cleanup wipe into a
-/// root-owned zero-write to an arbitrary target. Material therefore lives
-/// in a 0700 root-owned subdirectory the workload cannot enter, replace,
-/// or empty (a permanent `.keep` entry keeps it non-empty, which is what
-/// blocks `rmdir`-and-swap of the directory entry itself), and every open
-/// of a material path refuses to follow symlinks (cap#244 review).
-pub const PRIVATE_MATERIAL_DIR: &str = "/run/enclava/luks-private";
+/// The shared `/run/enclava` unlock-socket emptyDir is mounted writable
+/// into the workload container, and rootful workload profiles
+/// (`RootfulSudo`, `PlatformManagedSshRelay`) additionally share UID 0
+/// with enclava-init, so uid/mode checks there provide no isolation
+/// (cap#244 review): a predictable file name directly in it can be read,
+/// unlinked and replaced between our write and cryptsetup's pathname
+/// re-resolution — substituting unauthenticated header metadata, or (via
+/// a symlink) turning a cleanup wipe into a root-owned zero-write to an
+/// arbitrary target. Material therefore lives in a dedicated RAM-backed
+/// volume (`/run/enclava-luks`) that the deployment manifest mounts into
+/// enclava-init ONLY — mount-level isolation from the primary container —
+/// kept as a 0700 root-owned directory with a permanent `.keep` entry
+/// (non-empty directories cannot be `rmdir`-ed and swapped), and every
+/// open of a material path refuses to follow symlinks.
+pub const PRIVATE_MATERIAL_DIR: &str = "/run/enclava-luks";
 
 /// Name of the permanent entry that keeps [`PRIVATE_MATERIAL_DIR`]
 /// non-empty forever, so a workload with write access to the parent
@@ -182,6 +186,25 @@ pub enum HeaderSeal {
     /// for legacy adoption. Any other single-slot-zero layout is an error
     /// (see [`verify_header_seal`]).
     InterruptedSeal,
+}
+
+/// Volume-integrity layout of a LUKS2 header (cap#248 interop).
+///
+/// cap#248 (now on main) formats every fresh volume with dm-integrity
+/// `hmac(sha256)` tags: the volume key grows to 96 bytes (64 AES-XTS + 32
+/// HMAC) and segment 0 carries an `integrity` object. Headers written by
+/// the pre-#248 implementation (and any pre-existing fleet volumes) have a
+/// 64-byte volume key and no integrity segment. Both are accepted by
+/// strict validation; which one was seen is reported to the caller so the
+/// live-mapper checks can validate the matching dm stack (cap#244 review).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VolumeIntegrity {
+    /// dm-integrity `hmac(sha256)` tags; 96-byte volume key (64 cipher +
+    /// 32 HMAC); activated as a stacked `<name>` over `<name>_dif` mapper.
+    HmacSha256,
+    /// Pre-#248 layout: no integrity segment, 64-byte volume key, plain
+    /// dm-crypt mapper directly over the backing device.
+    None,
 }
 
 /// The full authenticated header region `[0, data_offset)` read from disk.
@@ -323,14 +346,21 @@ pub fn parse_layout(json: &Value) -> Result<Luks2Layout> {
     })
 }
 
-/// Strict validation of LUKS2 metadata against the exact shape enclava-init
+/// Strict validation of LUKS2 metadata against the exact shapes enclava-init
 /// formats: single keyslot 0 (argon2id, raw `aes-xts-plain64` area), no
 /// tokens, single `aes-xts-plain64` crypt segment at 512-byte sectors, one
 /// sha256 digest binding keyslot 0 to segment 0.
 ///
+/// Two on-disk shapes are accepted (cap#248 interop, cap#244 review):
+/// the dm-integrity layout every current format produces (96-byte keyslot
+/// key = 64 AES-XTS + 32 HMAC, segment 0 `integrity: hmac(sha256)`) and
+/// the legacy pre-integrity layout (64-byte key, no integrity object).
+/// Anything else — a stripped integrity object, a different integrity
+/// algorithm, or a key size that matches neither layout — is refused.
+///
 /// This is the ToB-recommended fallback floor and the adoption gate: a
 /// `cipher_null`-swapped header fails here, before cryptsetup runs.
-pub fn validate_metadata_strict(json: &Value, layout: &Luks2Layout) -> Result<()> {
+pub fn validate_metadata_strict(json: &Value, layout: &Luks2Layout) -> Result<VolumeIntegrity> {
     let keyslots = json
         .get("keyslots")
         .and_then(|v| v.as_object())
@@ -342,7 +372,38 @@ pub fn validate_metadata_strict(json: &Value, layout: &Luks2Layout) -> Result<()
     }
     let ks = &keyslots["0"];
     expect_str(ks, "type", "luks2", "keyslot 0 type")?;
-    expect_u64(ks, "key_size", 64, "keyslot 0 key_size")?;
+    // Segment 0's integrity object decides the expected volume-key size
+    // (cap#248 interop): 96 bytes with hmac(sha256) tags, 64 for the
+    // legacy plain dm-crypt layout. Validated once here, then enforced
+    // on both the keyslot key size and the area key size below.
+    let seg = &json
+        .get("segments")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| luks_error("LUKS2 metadata missing segments".into()))?["0"];
+    let integrity = match seg.get("integrity") {
+        None => VolumeIntegrity::None,
+        Some(Value::Null) => VolumeIntegrity::None,
+        Some(obj @ Value::Object(_)) => {
+            expect_str(obj, "type", "hmac(sha256)", "segment 0 integrity type").map_err(|_| {
+                luks_error(
+                    "strict header validation: segment 0 integrity must be hmac(sha256) \
+                     (unknown or weakened integrity algorithm refused)"
+                        .into(),
+                )
+            })?;
+            VolumeIntegrity::HmacSha256
+        }
+        Some(_) => {
+            return Err(luks_error(
+                "strict header validation: segment 0 integrity must be an object or absent".into(),
+            ));
+        }
+    };
+    let expected_key_size = match integrity {
+        VolumeIntegrity::HmacSha256 => 96,
+        VolumeIntegrity::None => 64,
+    };
+    expect_u64(ks, "key_size", expected_key_size, "keyslot 0 key_size")?;
 
     let af = object_field(ks, "af", "keyslot 0 af")?;
     expect_str(af, "type", "luks1", "keyslot 0 af type")?;
@@ -364,6 +425,10 @@ pub fn validate_metadata_strict(json: &Value, layout: &Luks2Layout) -> Result<()
                 .into(),
         )
     })?;
+    // The keyslot AREA always holds the 64-byte cipher key (AF-stretched);
+    // the extra 32 HMAC bytes live only in the full volume key. cryptsetup
+    // writes key_size 64 here for both layouts (verified against headers
+    // produced by cap#248's formatter).
     expect_u64(area, "key_size", 64, "keyslot 0 area key_size")?;
     let area_offset = parse_json_u64_field(area, "offset")?;
     if area_offset != 2 * layout.hdr_size {
@@ -442,17 +507,19 @@ pub fn validate_metadata_strict(json: &Value, layout: &Luks2Layout) -> Result<()
     expect_str_list(digest, "keyslots", &["0"], "digest 0 keyslots")?;
     expect_str_list(digest, "segments", &["0"], "digest 0 segments")?;
 
-    Ok(())
+    Ok(integrity)
 }
 
 /// Region-level validation: both metadata copies must parse, carry the LUKS2
 /// magic (reversed in the secondary copy, as cryptsetup writes it), and be
-/// byte-identical in JSON; then strict shape validation runs.
+/// byte-identical in JSON; then strict shape validation runs. Returns the
+/// volume's integrity layout so callers can validate the matching live dm
+/// stack (cap#248 interop).
 ///
 /// Requiring copy equality removes cryptsetup's higher-seqid copy selection
 /// as an attacker-controlled degree of freedom during adoption; for sealed
 /// headers any divergence already breaks the MAC.
-pub fn validate_region(region: &Luks2Region) -> Result<()> {
+pub fn validate_region(region: &Luks2Region) -> Result<VolumeIntegrity> {
     let copy2 = &region.bytes[LUKS2_METADATA_COPY_SIZE..2 * LUKS2_METADATA_COPY_SIZE];
     if !has_luks2_magic(copy2, true) {
         return Err(luks_error(
@@ -910,9 +977,62 @@ mod tests {
     fn valid_metadata_passes_strict_validation() {
         let region = synth_region(VALID_JSON);
         let json = parse_json_copy(&region.bytes[..LUKS2_METADATA_COPY_SIZE]).unwrap();
-        validate_metadata_strict(&json, &region.layout).expect("valid header passes");
+        let integrity =
+            validate_metadata_strict(&json, &region.layout).expect("valid header passes");
+        assert_eq!(integrity, VolumeIntegrity::None);
         assert_eq!(region.layout.data_offset, 16777216);
         assert_eq!(region.layout.keyslots_size, 16744448);
+    }
+
+    #[test]
+    fn cap248_dm_integrity_header_passes_strict_validation() {
+        // Exact shape captured from `cryptsetup luksFormat --integrity
+        // hmac-sha256` (cap#248's formatter, now on main): 96-byte keyslot
+        // key, area key_size still 64, segment 0 integrity object. The
+        // fixture mirrors a real header produced by cryptsetup 2.7.0.
+        let json = edited_json(|v| {
+            v["keyslots"]["0"]["key_size"] = 96.into();
+            v["keyslots"]["0"]["area"]["size"] = "385024".into();
+            v["segments"]["0"]["integrity"] = serde_json::json!({
+                "type": "hmac(sha256)",
+                "journal_encryption": "none",
+                "journal_integrity": "none"
+            });
+        });
+        let region = synth_region(&json);
+        let parsed = parse_json_copy(&region.bytes[..LUKS2_METADATA_COPY_SIZE]).unwrap();
+        let integrity =
+            validate_metadata_strict(&parsed, &region.layout).expect("integrity header passes");
+        assert_eq!(integrity, VolumeIntegrity::HmacSha256);
+    }
+
+    #[test]
+    fn integrity_key_size_mismatch_is_refused() {
+        // integrity object present but a 64-byte key: neither layout.
+        assert_rejects(
+            &edited_json(|v| {
+                v["segments"]["0"]["integrity"] = serde_json::json!({"type": "hmac(sha256)"});
+            }),
+            "key_size",
+        );
+        // 96-byte key without an integrity object: neither layout.
+        assert_rejects(
+            &edited_json(|v| {
+                v["keyslots"]["0"]["key_size"] = 96.into();
+            }),
+            "key_size",
+        );
+    }
+
+    #[test]
+    fn weakened_integrity_algorithm_is_refused() {
+        assert_rejects(
+            &edited_json(|v| {
+                v["keyslots"]["0"]["key_size"] = 96.into();
+                v["segments"]["0"]["integrity"] = serde_json::json!({"type": "crc32c"});
+            }),
+            "integrity must be hmac(sha256)",
+        );
     }
 
     #[test]

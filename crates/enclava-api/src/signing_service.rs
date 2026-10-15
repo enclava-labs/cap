@@ -709,32 +709,17 @@ impl DeploymentSigningArtifacts {
         app: &mut enclava_engine::types::ConfidentialApp,
     ) -> Result<(), SigningServiceError> {
         let expected = hex::encode(self.descriptor.expected_cc_init_data_hash);
-        // Try the four render-compatibility combinations, newest layout
-        // first, and pin the exact one the artifact was signed over so every
-        // downstream consumer (statefulset, KBS policy, TLS binding,
-        // ConfigMap transport) renders identical bytes. The two legacy flags
-        // cover artifacts signed before the `log_encryption_json` claim
-        // (cap#204-era) and before the `luks2_header_seal` rollout claim
-        // (cap#242) existed; a claim-less seal render keeps the guest-side
-        // rollout-window ("adopt") default, so those artifacts boot exactly
-        // as they did pre-change.
-        for (omit_log, omit_seal) in [(false, false), (true, false), (false, true), (true, true)] {
-            if let Some(binding) = app.workload_artifact_binding.as_mut() {
-                binding.omit_log_encryption_claim = omit_log;
-                binding.omit_luks2_header_seal_claim = omit_seal;
-            }
-            let (_, hash) = enclava_engine::manifest::cc_init_data::compute_cc_init_data(app);
-            if hash == expected {
-                return Ok(());
-            }
-        }
-        if let Some(binding) = app.workload_artifact_binding.as_mut() {
-            binding.omit_log_encryption_claim = false;
-            binding.omit_luks2_header_seal_claim = false;
-        }
-        Err(SigningServiceError::Mismatch(
-            "expected_cc_init_data_hash".into(),
-        ))
+        // cap#244 review: the claim-less seal renders exist ONLY for
+        // artifacts signed before the `luks2_header_seal` claim existed,
+        // under the rollout-window ("adopt") policy. Once the ACTIVE
+        // signed platform release sets sealing to `required`, accepting a
+        // claim-less render would let enclava-init default the missing
+        // claim to `adopt` — a hostile host could replay an unsealed
+        // header and have it adopted despite the fleet-wide release
+        // rejecting that rollback. Affected artifacts must be re-signed.
+        let seal_required =
+            enclava_engine::manifest::cc_init_data::luks2_header_seal_claim() == "required";
+        pin_matching_cc_init_data_render(app, &expected, seal_required)
     }
 
     pub fn validate_signed_artifact(
@@ -1749,6 +1734,58 @@ impl LoadedWorkloadArtifacts {
         self.signing_artifacts
             .validate_and_pin_cc_init_data_render(app)
     }
+}
+
+/// Pure core of [`DeploymentSigningArtifacts::validate_and_pin_cc_init_data_render`]
+/// (cap#244 review): try the render-compatibility combinations, newest
+/// layout first, and pin the exact one the artifact was signed over so
+/// every downstream consumer (statefulset, KBS policy, TLS binding,
+/// ConfigMap transport) renders identical bytes. The two legacy flags
+/// cover artifacts signed before the `log_encryption_json` claim
+/// (cap#204-era) and before the `luks2_header_seal` rollout claim
+/// (cap#242) existed; a claim-less seal render keeps the guest-side
+/// rollout-window ("adopt") default, so those artifacts boot exactly
+/// as they did pre-change.
+///
+/// When `seal_required` (the ACTIVE signed release sets
+/// `luks2_header_seal: required`), the claim-less seal combinations are
+/// skipped entirely: enclava-init defaults a missing claim to `adopt`, so
+/// accepting one would let a hostile host replay an unsealed header and
+/// have it adopted despite the fleet-wide release rejecting that rollback.
+/// Affected artifacts must be re-signed against the current release.
+fn pin_matching_cc_init_data_render(
+    app: &mut enclava_engine::types::ConfidentialApp,
+    expected_hash_hex: &str,
+    seal_required: bool,
+) -> Result<(), SigningServiceError> {
+    for (omit_log, omit_seal) in [(false, false), (true, false), (false, true), (true, true)] {
+        if omit_seal && seal_required {
+            continue;
+        }
+        if let Some(binding) = app.workload_artifact_binding.as_mut() {
+            binding.omit_log_encryption_claim = omit_log;
+            binding.omit_luks2_header_seal_claim = omit_seal;
+        }
+        let (_, hash) = enclava_engine::manifest::cc_init_data::compute_cc_init_data(app);
+        if hash == expected_hash_hex {
+            return Ok(());
+        }
+    }
+    if let Some(binding) = app.workload_artifact_binding.as_mut() {
+        binding.omit_log_encryption_claim = false;
+        binding.omit_luks2_header_seal_claim = false;
+    }
+    if seal_required {
+        return Err(SigningServiceError::Mismatch(
+            "expected_cc_init_data_hash (artifact predates the luks2_header_seal \
+             claim while the active signed platform release requires sealing; \
+             re-sign the artifact against the current release)"
+                .into(),
+        ));
+    }
+    Err(SigningServiceError::Mismatch(
+        "expected_cc_init_data_hash".into(),
+    ))
 }
 
 #[derive(Debug, sqlx::FromRow)]
