@@ -542,7 +542,33 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
                 }
                 break; // never created, or already deleted
             };
-            if !is_cap_created_generation_leftover(&live, generation.get()) {
+            if !matches!(
+                classify_generation_leftover(&live, generation.get()),
+                GenerationLeftover::Leftover
+            ) {
+                // Codex P2: valid CAP creation evidence but a lost/unparseable
+                // generation marker (an admission webhook can drop or rewrite
+                // it on update; the update path's verify_applied_generation
+                // then fails without compensation) — ownership of the
+                // still-live object is UNRESOLVED: it may be another
+                // generation's adopted object, so never delete it; and
+                // skipping it silently would let the caller declare the sweep
+                // complete and clear evidence over a partially updated
+                // resource. Fail closed: count the failure, keep retrying.
+                if matches!(
+                    classify_generation_leftover(&live, generation.get()),
+                    GenerationLeftover::MarkerLost
+                ) {
+                    tracing::warn!(
+                        app_id = %app.id,
+                        namespace = %app.namespace,
+                        kind = target.kind,
+                        name = %target.name,
+                        "sweep found a CAP-created object with a lost mutation-generation marker; unresolved, keeping the sweep incomplete"
+                    );
+                    failures += 1;
+                    break;
+                }
                 // Foreign (no creation evidence — includes objects CAP
                 // merely SSA-patched), or a newer generation's publication:
                 // never delete on name alone.
@@ -810,7 +836,32 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
 /// proved no other deployment of this app retains provider state, so an
 /// older created object can only be a leftover of an earlier failed
 /// apply — exactly what must not survive generation after generation.
-pub(crate) fn is_cap_created_generation_leftover<K>(resource: &K, failed_generation: i64) -> bool
+/// Ownership of a live object relative to a failed generation's cleanup.
+pub(crate) enum GenerationLeftover {
+    /// CAP creation evidence plus a generation marker of this or an earlier
+    /// generation: a leftover of the failed generation's apply — a sweep may
+    /// remove it under its other gates.
+    Leftover,
+    /// No CAP creation evidence (objects CAP merely SSA-patched, tenant
+    /// artifacts), or the marker pins a NEWER generation's publication:
+    /// never delete on name alone.
+    Foreign,
+    /// Valid CAP creation evidence but the mutation-generation annotation is
+    /// absent or unparseable (Codex P2: an admission webhook can drop or
+    /// rewrite it on an update, and the update path's
+    /// `verify_applied_generation` then fails without compensation).
+    /// Ownership of the still-live object is UNRESOLVED — it may be another
+    /// generation's adopted object, so it is never deleted; and silently
+    /// skipping it as foreign would let the caller declare the sweep
+    /// complete and clear cleanup evidence over it, leaving a partially
+    /// updated resource with no later eligibility. Fail closed instead.
+    MarkerLost,
+}
+
+pub(crate) fn classify_generation_leftover<K>(
+    resource: &K,
+    failed_generation: i64,
+) -> GenerationLeftover
 where
     K: kube::Resource,
 {
@@ -825,10 +876,10 @@ where
     let Some(created_by) =
         annotation(enclava_engine::apply::generation::RESOURCE_CREATED_BY_ANNOTATION)
     else {
-        return false;
+        return GenerationLeftover::Foreign;
     };
     if !(created_by > 0) {
-        return false;
+        return GenerationLeftover::Foreign;
     }
     // Value alone is not proof: SSA omission cannot remove a marker a
     // tenant's field manager owns, so a pre-existing object carrying a
@@ -842,11 +893,29 @@ where
         enclava_engine::apply::generation::RESOURCE_CREATED_BY_ANNOTATION,
         &enclava_engine::apply::types::ApplyConfig::default().field_manager,
     ) {
-        return false;
+        return GenerationLeftover::Foreign;
     }
-    let live_generation =
-        annotation(enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION);
-    live_generation.is_some_and(|live| live > 0 && live <= failed_generation)
+    // Creation evidence is proven; only the generation marker is missing or
+    // garbled (Codex P2) or the marker settles the attribution.
+    let raw_generation = metadata.annotations.as_ref().and_then(|annotations| {
+        annotations.get(enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION)
+    });
+    let live_generation = raw_generation.and_then(|raw| raw.parse::<i64>().ok());
+    match live_generation {
+        Some(live) if live > 0 && live <= failed_generation => GenerationLeftover::Leftover,
+        Some(live) if live > failed_generation => GenerationLeftover::Foreign,
+        _ => GenerationLeftover::MarkerLost,
+    }
+}
+
+pub(crate) fn is_cap_created_generation_leftover<K>(resource: &K, failed_generation: i64) -> bool
+where
+    K: kube::Resource,
+{
+    matches!(
+        classify_generation_leftover(resource, failed_generation),
+        GenerationLeftover::Leftover
+    )
 }
 
 /// Codex P1 (legacy unmarked rows): a failed row that holds provider-state
@@ -3415,7 +3484,15 @@ mod tests {
     }
 
     fn unparseable_mutation_object() -> kube::api::DynamicObject {
-        let mut object = sweep_leftover_object(&[], true);
+        // Build WITH CAP managed-fields creation proof (the pairs carry the
+        // creation annotation), then garble the generation marker.
+        let mut object = sweep_leftover_object(
+            &[(
+                enclava_engine::apply::generation::RESOURCE_CREATED_BY_ANNOTATION,
+                7,
+            )],
+            true,
+        );
         object.metadata.annotations = Some(std::collections::BTreeMap::from([
             (
                 enclava_engine::apply::generation::RESOURCE_CREATED_BY_ANNOTATION.to_string(),
@@ -3484,10 +3561,73 @@ mod tests {
             7
         ));
         // Creation evidence alone with an unparseable mutation annotation:
-        // undecidable last-writer, skip.
+        // undecidable last-writer — never a leftover (no deletion), and the
+        // sweep treats it as UNRESOLVED (MarkerLost, fail closed), not
+        // foreign-skip.
         assert!(!is_cap_created_generation_leftover(
             &unparseable_mutation_object(),
             7
+        ));
+    }
+
+    /// Codex P2: valid CAP creation evidence paired with an absent or
+    /// unparseable mutation-generation marker is UNRESOLVED ownership —
+    /// an admission webhook can drop or rewrite the marker on update and
+    /// the update path's `verify_applied_generation` then fails without
+    /// compensation. The sweep must neither delete the still-live object
+    /// (it may be another generation's adopted object) nor silently skip
+    /// it as foreign (the caller would declare the sweep complete and
+    /// clear cleanup evidence over a partially updated resource).
+    #[test]
+    fn lost_generation_marker_is_unresolved_not_foreign() {
+        use enclava_engine::apply::generation as generation_annotations;
+        // Creation evidence, marker ABSENT: unresolved.
+        assert!(matches!(
+            classify_generation_leftover(
+                &sweep_leftover_object(
+                    &[(generation_annotations::RESOURCE_CREATED_BY_ANNOTATION, 7)],
+                    true
+                ),
+                7
+            ),
+            GenerationLeftover::MarkerLost
+        ));
+        // Creation evidence, marker present but UNPARSEABLE: unresolved.
+        assert!(matches!(
+            classify_generation_leftover(&unparseable_mutation_object(), 7),
+            GenerationLeftover::MarkerLost
+        ));
+        // Creation evidence, marker garbage-but-parseable (0): unresolved.
+        assert!(matches!(
+            classify_generation_leftover(
+                &object_meta_with_annotations(&[
+                    (generation_annotations::RESOURCE_CREATED_BY_ANNOTATION, 7),
+                    (generation_annotations::MUTATION_GENERATION_ANNOTATION, 0),
+                ]),
+                7
+            ),
+            GenerationLeftover::MarkerLost
+        ));
+        // The settled cases keep their attributions.
+        assert!(matches!(
+            classify_generation_leftover(
+                &object_meta_with_annotations(&[
+                    (generation_annotations::RESOURCE_CREATED_BY_ANNOTATION, 7),
+                    (generation_annotations::MUTATION_GENERATION_ANNOTATION, 7),
+                ]),
+                7
+            ),
+            GenerationLeftover::Leftover
+        ));
+        assert!(matches!(
+            classify_generation_leftover(
+                &object_meta_with_annotations(&[
+                    (generation_annotations::RESOURCE_CREATED_BY_ANNOTATION, 9),
+                    (generation_annotations::MUTATION_GENERATION_ANNOTATION, 9),
+                ]),
+                7
+            ),
+            GenerationLeftover::Foreign
         ));
     }
 

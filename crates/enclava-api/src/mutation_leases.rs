@@ -1150,12 +1150,17 @@ pub async fn reconcile_orphaned_deployment_apply_leases(
 /// rejected as `Busy` even after Kubernetes finishes the deletion.
 ///
 /// For every expired retained fence the Kubernetes API is asked whether the
-/// namespace still exists, and only an observed 404 authorizes the release:
-/// the exact owner/generation/marker row is cleared with a compare-and-swap
-/// that also requires the fence to still be expired, so a snapshot taken
-/// before the (potentially slow) GET cannot authorize the release. A GET
-/// error or a still-existing namespace retains the fence; only positive
-/// evidence of absence releases it. The app owner row — re-resolved inside
+/// namespace still exists. An observed 404 authorizes the release: the exact
+/// owner/generation/marker row is cleared with a compare-and-swap that also
+/// requires the fence to still be expired, so a snapshot taken before the
+/// (potentially slow) GET cannot authorize the release. A GET error or a
+/// still-deleting namespace retains the fence. A namespace that is live but
+/// no longer classifies as the retained generation's (external annotation
+/// rewrite, or a same-named replacement) is released on a FRESH bounded
+/// reclaim deadline instead — a 404 can never occur for it and the settle
+/// margin proves no deletion is in flight (see
+/// [`bound_stranded_foreign_namespace_fence`]); an operator can reclaim it
+/// after that quarantine. The app owner row — re-resolved inside
 /// the release transaction, after the GET — is cleared with the same
 /// generation/expiry/no-remaining-resource guard the documented operator
 /// path uses, and only when a live app row still owns the namespace name,
@@ -1353,23 +1358,32 @@ async fn release_retained_deployment_namespace_fences_with(
 /// Bound (never clear) a retained namespace fence whose namespace is live,
 /// not deleting, and no longer classifies as the retained generation's —
 /// the rewritten-namespace steady state that used to strand the marker
-/// until a 404 that can never occur. The marker is converted back to the
-/// ordinary bounded reclaim quarantine under the same exactly-once CAS and
+/// until a 404 that can never occur. The marker is converted back to a
+/// FRESH bounded reclaim quarantine under the same exactly-once CAS and
 /// lane locking as the release path, but only once it has settled:
 /// `locked_until` must be at least [`RETAINED_FENCE_SETTLE_SECONDS`] in the
 /// past, so any DELETE the dead owner still had in flight when its
 /// heartbeat lapsed has long reached the API server — and would have
 /// stamped `deletionTimestamp`, which the caller observes as the retaining
-/// case. Provider-state evidence is deliberately NOT cleared: the
-/// namespace (or its same-named replacement) is live. Returns true when the
-/// marker was bounded; a not-yet-settled marker or any error keeps it
-/// retained for the next cycle.
+/// case. Two further guards close the external-delete race (Devin round 8):
+/// the reclaim deadline is set fresh from now (the long-expired lease's
+/// `locked_until + quarantine` is usually already past and would make the
+/// name immediately claimable), and the namespace is re-observed AFTER the
+/// CAS but BEFORE the commit — a deletion that started after the caller's
+/// GET rolls the bounding back, so the marker stays retained until the
+/// deleting arm converges on its own safe resolution. Provider-state
+/// evidence is deliberately NOT cleared: the namespace (or its same-named
+/// replacement) is live. Returns true when the marker was bounded; a
+/// not-yet-settled marker, a losing CAS, a namespace that is now
+/// deleting/absent, or any error keeps it retained for the next cycle.
 async fn bound_stranded_foreign_namespace_fence(
     pool: &PgPool,
+    api: &kube::Api<k8s_openapi::api::core::v1::Namespace>,
     owner_token: &Uuid,
     namespace: &str,
     operation_id: Uuid,
     generation: i64,
+    batch_deadline: tokio::time::Instant,
 ) -> Result<bool, MutationLeaseError> {
     let mut tx = pool.begin().await?;
     let lane_app: Option<Uuid> = sqlx::query_scalar(
@@ -1386,10 +1400,11 @@ async fn bound_stranded_foreign_namespace_fence(
     // Exactly-once CAS on the marker we observed (token, generation,
     // operation id, operation kind), still infinite and still expired —
     // with the settle margin: a marker whose owner vanished moments ago
-    // may still have had a DELETE in flight.
+    // may still have had a DELETE in flight. The reclaim deadline is set
+    // FRESH from now, never derived from the long-expired lease.
     let result = sqlx::query(
         "UPDATE external_resource_mutation_leases
-            SET reclaim_after = locked_until
+            SET reclaim_after = clock_timestamp()
                     + ($6::bigint * interval '1 second'),
                 updated_at = clock_timestamp()
           WHERE resource_scope = 'kubernetes_namespace'
@@ -1411,15 +1426,50 @@ async fn bound_stranded_foreign_namespace_fence(
     .bind(RETAINED_FENCE_SETTLE_SECONDS)
     .execute(&mut *tx)
     .await?;
-    let bounded = result.rows_affected() == 1;
-    if bounded {
-        tracing::info!(
-            namespace = %namespace,
-            "retained-namespace fence reconciliation bounded a settled foreign namespace marker instead of stranding it"
-        );
+    if result.rows_affected() != 1 {
+        // Lost the race or not yet settled: nothing to bound, revisit later.
+        tx.rollback().await?;
+        return Ok(false);
     }
+    // Re-observe the namespace before committing (Devin round 8): an
+    // external DELETE may have started after the caller's GET. Anything
+    // but live-and-not-deleting rolls the bounding back — the marker stays
+    // retained and the deleting/absence arms converge on their own safe
+    // resolutions. GET errors and timeouts roll back too (fail closed).
+    let still_live_and_not_deleting = match tokio::time::timeout_at(
+        batch_deadline.min(tokio::time::Instant::now() + RETAINED_NAMESPACE_PROBE_TIMEOUT),
+        api.get_opt(namespace),
+    )
+    .await
+    {
+        Ok(Ok(Some(live))) => live.metadata.deletion_timestamp.is_none(),
+        Ok(Ok(None)) => false,
+        Ok(Err(error)) => {
+            tracing::warn!(
+                namespace = %namespace,
+                error = %error,
+                "retained-namespace fence bounding re-check failed; retaining fence for the next cycle"
+            );
+            false
+        }
+        Err(_) => {
+            tracing::warn!(
+                namespace = %namespace,
+                "retained-namespace fence bounding re-check timed out; retaining fence for the next cycle"
+            );
+            false
+        }
+    };
+    if !still_live_and_not_deleting {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    tracing::info!(
+        namespace = %namespace,
+        "retained-namespace fence reconciliation bounded a settled foreign namespace marker instead of stranding it"
+    );
     tx.commit().await?;
-    Ok(bounded)
+    Ok(true)
 }
 
 /// Reconcile a single expired retained-namespace fence: probe the live
@@ -1525,10 +1575,12 @@ async fn reconcile_one_retained_namespace(
                         // settled marker: the entry is revisited next cycle.
                         return bound_stranded_foreign_namespace_fence(
                             pool,
+                            api,
                             &owner_token,
                             &namespace,
                             operation_id,
                             generation,
+                            batch_deadline,
                         )
                         .await;
                     }
@@ -3347,8 +3399,12 @@ mod tests {
             released, 1,
             "a settled foreign marker must bound, not strand"
         );
-        let quarantine_seconds: Option<i64> = sqlx::query_scalar(
-            "SELECT (EXTRACT(EPOCH FROM (reclaim_after - locked_until)))::bigint
+        // The marker is now bounded on a FRESH full quarantine — never
+        // immediately reclaimable (Devin round 8: the long-expired lease's
+        // deadline would already be past).
+        let (is_future, within_quarantine): (bool, bool) = sqlx::query_as(
+            "SELECT reclaim_after > clock_timestamp(),
+                    reclaim_after <= clock_timestamp() + interval '361 seconds'
                FROM external_resource_mutation_leases
               WHERE resource_scope = 'kubernetes_namespace'
                 AND resource_key = $1",
@@ -3356,11 +3412,14 @@ mod tests {
         .bind(&namespace)
         .fetch_one(&pool)
         .await
-        .expect("load bounded marker quarantine");
-        assert_eq!(
-            quarantine_seconds.expect("bounded marker has a reclaim deadline"),
-            360,
-            "the marker bounds to the ordinary reclaim quarantine"
+        .expect("load bounded marker deadline");
+        assert!(
+            is_future,
+            "a bounded marker must never be immediately reclaimable"
+        );
+        assert!(
+            within_quarantine,
+            "a bounded marker gets one ordinary reclaim quarantine from now"
         );
         server.abort();
     }
