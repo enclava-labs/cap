@@ -540,6 +540,12 @@ async fn persist_workload_teardown_completed(
         .bind(app_id)
         .execute(&mut *tx)
         .await?;
+    // The completed marker removes teardown pins from the selector. Publish
+    // its new desired generation in this same commit so a process loss cannot
+    // strand the old body behind an already-applied generation.
+    crate::kbs::enqueue_signed_policy_revocation_if_active(&mut tx)
+        .await
+        .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
     tx.commit().await?;
     Ok(())
 }
@@ -1774,6 +1780,31 @@ pub(crate) async fn delete_app_before(
                 return Err(internal_server_error());
             }
         };
+    // The deleting selector and its desired generation must commit atomically.
+    // A crash between these writes would otherwise strand teardown authority
+    // behind an already-applied generation (same-generation body changes are
+    // rejected by the policy reconciler).
+    let publication_needed = if phase_app.status == AppStatus::Deleting {
+        let (required, completed): (bool, Option<chrono::DateTime<chrono::Utc>>) = sqlx::query_as(
+            "SELECT workload_teardown_required, workload_teardown_completed_at
+                   FROM apps WHERE id = $1",
+        )
+        .bind(phase_app.id)
+        .fetch_one(&mut *phase_tx)
+        .await
+        .map_err(|_| internal_server_error())?;
+        required && completed.is_none()
+    } else {
+        requires_workload_teardown(phase_app.status)
+    };
+    let publish_enqueued = if publication_needed {
+        crate::kbs::enqueue_signed_policy_revocation_if_active(&mut phase_tx)
+            .await
+            .map_err(|_| internal_server_error())?
+            .is_some()
+    } else {
+        false
+    };
     phase_tx
         .commit()
         .await
@@ -1835,32 +1866,16 @@ pub(crate) async fn delete_app_before(
         .map_err(|_| internal_server_error())?;
 
     // Publish the admitted teardown unit before any workload is asked to
-    // erase its owner seed (Codex review on 3b168c73): the phase transaction
-    // only flips the app to deleting, so with retention 1 or prior byte
-    // trimming one of the two artifacts the deleting-app selector now pins
-    // may still be absent from the live Trustee policy — teardown of a
-    // still-serving generation would then hit missing authorization. Enqueue
-    // the selector change and converge it here, while this delete holds the
-    // global kbs_policy fence, before the teardown request runs. A reconcile
+    // erase its owner seed (Codex review on 3b168c73): with retention 1 or
+    // prior byte trimming an artifact the deleting selector pins may still
+    // be absent from Trustee. The phase transaction atomically enqueued the
+    // selector change; converge it here under the global kbs_policy fence.
+    // A reconcile
     // failure flows into the same handling as a teardown failure below
     // (restore-or-keep disposition, lease released in the lane) — except a
     // budget failure whose full teardown unit is already live, which proceeds
     // to teardown instead of demanding an over-budget republication.
     let teardown = if teardown_required && teardown_completed_at.is_none() {
-        let mut publish_tx = state
-            .db
-            .begin()
-            .await
-            .map_err(|_| internal_server_error())?;
-        let publish_enqueued =
-            crate::kbs::enqueue_signed_policy_revocation_if_active(&mut publish_tx)
-                .await
-                .map_err(|_| internal_server_error())?
-                .is_some();
-        publish_tx
-            .commit()
-            .await
-            .map_err(|_| internal_server_error())?;
         if publish_enqueued {
             match delete_mutation
                 .guard_provider(crate::kbs::reconcile_pending_signed_policy_artifacts(
@@ -2064,6 +2079,11 @@ pub(crate) async fn delete_app_before(
         .execute(&mut *abandon_tx)
         .await
         .map_err(|_| internal_server_error())?;
+        // The override's completed marker removes this app from the selector.
+        // Do not leave that body change at the already-applied generation.
+        crate::kbs::enqueue_signed_policy_revocation_if_active(&mut abandon_tx)
+            .await
+            .map_err(|_| internal_server_error())?;
         abandon_tx
             .commit()
             .await

@@ -1274,6 +1274,24 @@ pub async fn teardown_unit_already_published(
     app_id: Uuid,
 ) -> Result<bool, KbsPolicyError> {
     let unit = dedup_signed_policy_artifacts_by_hash(load_teardown_policy_unit(db, app_id).await?);
+    let applied: Option<(i64, Vec<u8>)> = sqlx::query_as(
+        "SELECT applied_generation, applied_policy_sha256
+           FROM kbs_signed_policy_reconciliation
+          WHERE singleton AND applied_generation > 0",
+    )
+    .fetch_optional(db)
+    .await?;
+    teardown_unit_already_published_with_applied(config, client, &unit, applied).await
+}
+
+// Accept the applied snapshot explicitly so tests can check publication
+// without overwriting the shared database's global reconciliation singleton.
+async fn teardown_unit_already_published_with_applied(
+    config: &KbsPolicyConfig,
+    client: kube::Client,
+    unit: &[crate::signing_service::SignedPolicyArtifact],
+    applied: Option<(i64, Vec<u8>)>,
+) -> Result<bool, KbsPolicyError> {
     if unit.is_empty() {
         return Ok(true);
     }
@@ -1285,19 +1303,12 @@ pub async fn teardown_unit_already_published(
         .and_then(|data| data.get(&config.policy_key))
         .map(String::as_str)
         .unwrap_or_default();
-    if !signed_policy_body_covers_artifacts(current_policy, &unit) {
+    if !signed_policy_body_covers_artifacts(current_policy, unit) {
         return Ok(false);
     }
     // A ConfigMap write precedes Trustee rollout. Only an applied generation
     // proves that this particular publication made it through rollout; the
     // desired ConfigMap alone can be ahead of the serving policy.
-    let applied: Option<(i64, Vec<u8>)> = sqlx::query_as(
-        "SELECT applied_generation, applied_policy_sha256
-           FROM kbs_signed_policy_reconciliation
-          WHERE singleton AND applied_generation > 0",
-    )
-    .fetch_optional(db)
-    .await?;
     let Some((generation, applied_hash)) = applied else {
         return Ok(false);
     };
@@ -5327,11 +5338,40 @@ resource_bindings := {
             )
         };
 
-        let covers = teardown_unit_already_published(
+        // Exercise the production unit loader too: the publication predicate
+        // must not silently pass because the app's teardown set is empty.
+        let loaded_unit = dedup_signed_policy_artifacts_by_hash(
+            load_teardown_policy_unit(&pool, app_id)
+                .await
+                .expect("load teardown unit"),
+        );
+        assert_eq!(
+            loaded_unit.len(),
+            2,
+            "both teardown artifacts must be loaded"
+        );
+        assert!(signed_policy_body_covers_artifacts(
+            &signed_policy_artifact_policy_body(&loaded_unit).expect("serialize loaded unit"),
+            &[legacy_artifact.clone(), published_artifact.clone()],
+        ));
+        let unit = loaded_unit;
+        let production_covers = teardown_unit_already_published(
             &pool,
             &config,
-            client_for(full_body.clone(), "published"),
+            client_for(partial_body.clone(), "published"),
             app_id,
+        )
+        .await
+        .expect("check production loader against partial live policy");
+        assert!(
+            !production_covers,
+            "a missing teardown artifact must fail closed through the production entry point"
+        );
+        let covers = teardown_unit_already_published_with_applied(
+            &config,
+            client_for(full_body.clone(), "published"),
+            &unit,
+            None,
         )
         .await
         .expect("check pending publication");
@@ -5341,22 +5381,12 @@ resource_bindings := {
         );
 
         let full_hash = Sha256::digest(full_body.as_bytes()).to_vec();
-        sqlx::query(
-            "UPDATE kbs_signed_policy_reconciliation
-                     SET desired_generation = 7, configmap_generation = 7,
-                         applied_generation = 7, configmap_policy_sha256 = $1,
-                         applied_policy_sha256 = $1, configmap_resource_version = '3'
-                   WHERE singleton",
-        )
-        .bind(&full_hash)
-        .execute(&pool)
-        .await
-        .expect("mark Trustee rollout applied");
-        let covers = teardown_unit_already_published(
-            &pool,
+        let applied = Some((7, full_hash));
+        let covers = teardown_unit_already_published_with_applied(
             &config,
             client_for(full_body.clone(), "published"),
-            app_id,
+            &unit,
+            applied.clone(),
         )
         .await
         .expect("check applied publication");
@@ -5365,21 +5395,21 @@ resource_bindings := {
             "applied full-unit policy must let the delete proceed"
         );
 
-        let covers = teardown_unit_already_published(
-            &pool,
+        let covers = teardown_unit_already_published_with_applied(
             &config,
             client_for(full_body.clone(), "stale"),
-            app_id,
+            &unit,
+            applied.clone(),
         )
         .await
         .expect("check deployment publication token");
         assert!(!covers, "a different Trustee publication must fail closed");
 
-        let covers = teardown_unit_already_published(
-            &pool,
+        let covers = teardown_unit_already_published_with_applied(
             &config,
             client_for(partial_body.clone(), "published"),
-            app_id,
+            &unit,
+            applied,
         )
         .await
         .expect("check partial policy body");
@@ -5397,16 +5427,6 @@ resource_bindings := {
         ));
         assert!(signed_policy_body_covers_artifacts("package authz", &[]));
 
-        sqlx::query(
-            "UPDATE kbs_signed_policy_reconciliation
-                SET desired_generation = 0, configmap_generation = 0,
-                    applied_generation = 0, configmap_policy_sha256 = NULL,
-                    applied_policy_sha256 = NULL, configmap_resource_version = NULL
-              WHERE singleton",
-        )
-        .execute(&pool)
-        .await
-        .expect("restore signed policy reconciliation fixture");
         sqlx::query("DELETE FROM organizations WHERE id = $1")
             .bind(org_id)
             .execute(&pool)

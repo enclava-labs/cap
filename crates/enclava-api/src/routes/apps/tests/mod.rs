@@ -712,6 +712,22 @@ fn app_delete_source_never_reads_or_formats_external_diagnostics() {
         "app deletion must preserve KBS authorization until workload teardown completes"
     );
     assert!(
+        deletion.contains("enqueue_signed_policy_revocation_if_active(&mut phase_tx)"),
+        "the deleting transition and teardown publication intent must commit atomically"
+    );
+    assert!(
+        source.contains("enqueue_signed_policy_revocation_if_active(&mut tx)"),
+        "the successful teardown marker must enqueue its revocation in the same transaction"
+    );
+    assert!(
+        deletion.contains("enqueue_signed_policy_revocation_if_active(&mut abandon_tx)"),
+        "the abandoned teardown marker must enqueue its revocation in the same transaction"
+    );
+    assert!(
+        !deletion.contains("enqueue_signed_policy_revocation_if_active(&mut publish_tx)"),
+        "a post-phase publication transaction leaves an unrecoverable crash window"
+    );
+    assert!(
         deletion.contains("enqueue_signed_policy_revocation_if_active(&mut delete_lane)"),
         "the delete-tail revocation enqueue must ride the delete transaction — a post-commit enqueue can be lost to a transient transaction failure, and the periodic reconciler only advances committed generations"
     );
