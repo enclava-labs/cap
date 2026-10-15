@@ -1912,8 +1912,10 @@ pub async fn rotate_org_owner(
 
     // Phase 2: final lane transaction. The lane was released after the
     // receipt-only commit, so competing keyring changes may have landed;
-    // membership, keyring, service owner, and freshness are re-read and
-    // re-derived here. This phase never issues an upstream RPC (at most
+    // keyring, service owner, and freshness are re-read and re-derived here.
+    // The caller's phase-1 membership authorization remains valid after the
+    // upstream owner change; rechecking it could strand a completed rotation.
+    // This phase never issues an upstream RPC (at most
     // one per request, spent or deliberately skipped in phase 1): the
     // service must already hold the replacement owner before any CAP
     // write, so the stored keyring authority and the service stay pinned
@@ -1922,9 +1924,6 @@ pub async fn rotate_org_owner(
     let lane_now = crate::signing_service::lock_org_signing_authority_lane_now(&mut tx, org_id)
         .await
         .map_err(|_| db_error())?;
-    let current_role =
-        scopes::lock_and_read_active_membership_role_in_tx(&mut tx, org_id, auth.user_id).await?;
-    scopes::require_owner_role(current_role)?;
     let (latest, version_created_at_floor) = read_rotation_authority(&mut tx, org_id).await?;
     let rotation_path = derive_rotation_path(
         &mut tx,
@@ -7823,6 +7822,44 @@ mod tests {
             Utc::now(),
             "receipt-bound recovery by remaining owner",
         );
+        // Model the receipt-only commit of the lost first attempt. A mock
+        // service owner change alone is not durable proof of this directive.
+        let directive_digest = Sha256::digest(owner_rotation_directive_bytes(
+            org_id,
+            &current_key.verifying_key().to_bytes(),
+            &replacement_key.verifying_key().to_bytes(),
+            request.signed_at,
+            &request.reason,
+        ));
+        let keyring_digest = Sha256::digest(normalized_keyring_bytes(
+            org_id,
+            removed_user_id,
+            replacement_key.verifying_key().to_bytes(),
+            2,
+            2,
+        ));
+        let upstream_rotated_at = service.lock().expect("mock owner lock").changed_at;
+        seed_rotation_presentation(
+            &pool,
+            org_id,
+            directive_digest.as_slice(),
+            keyring_digest.as_slice(),
+            upstream_rotated_at,
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO org_rotation_upstream_receipts
+                 (org_id, directive_sha256, keyring_sha256, upstream_owner_version, upstream_rotated_at)
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(org_id)
+        .bind(directive_digest.as_slice())
+        .bind(keyring_digest.as_slice())
+        .bind(2_i64)
+        .bind(upstream_rotated_at)
+        .execute(&pool)
+        .await
+        .expect("seed receipt for the already-executed rotation");
         let remaining_auth = AuthContext {
             user_id: remaining_user_id,
             org_id,

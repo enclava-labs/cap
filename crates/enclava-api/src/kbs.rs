@@ -4285,6 +4285,7 @@ resource_bindings := {
         let pool = crate::test_support::database_test_pool().await;
         let now = Utc::now();
         let (org_id, app_id) = insert_test_app(&pool, "running").await;
+        insert_test_keyring_version(&pool, org_id, 1, &[&"bb".repeat(32)]).await;
         let legacy = Uuid::new_v4();
         insert_test_deployment(&pool, org_id, app_id, legacy, "healthy", now).await;
         let legacy_artifact = insert_test_artifact(&pool, app_id, legacy, "9a").await;
@@ -4443,6 +4444,7 @@ resource_bindings := {
         // A signed replacement released from its hold whose apply has not
         // completed.
         let (signed_org, signed_app) = insert_test_app(&pool, "running").await;
+        insert_test_keyring_version(&pool, signed_org, 1, &[&"bb".repeat(32)]).await;
         let signed_running = Uuid::new_v4();
         insert_test_deployment(
             &pool,
@@ -4505,6 +4507,7 @@ resource_bindings := {
         // An unsigned replacement: the running TEE is the only signed
         // authority for this app until the handoff completes.
         let (unsigned_org, unsigned_app) = insert_test_app(&pool, "running").await;
+        insert_test_keyring_version(&pool, unsigned_org, 1, &[&"bb".repeat(32)]).await;
         let unsigned_running = Uuid::new_v4();
         insert_test_deployment(
             &pool,
@@ -4565,6 +4568,7 @@ resource_bindings := {
         // A replacement whose hold expired without release: the running
         // workload must stay authoritative without applying.
         let (held_org, held_app) = insert_test_app(&pool, "running").await;
+        insert_test_keyring_version(&pool, held_org, 1, &[&"bb".repeat(32)]).await;
         let held_running = Uuid::new_v4();
         insert_test_deployment(&pool, held_org, held_app, held_running, "healthy", now).await;
         let held_running_artifact = insert_test_artifact(&pool, held_app, held_running, "3a").await;
@@ -4802,6 +4806,7 @@ resource_bindings := {
         // the publication marks the app failed while the prior healthy
         // deployment's TEE keeps running.
         let (org_id, app_id) = insert_test_app(&pool, "running").await;
+        insert_test_keyring_version(&pool, org_id, 1, &[&"bb".repeat(32)]).await;
         let running = Uuid::new_v4();
         insert_test_deployment(&pool, org_id, app_id, running, "healthy", now).await;
         let running_artifact = insert_test_artifact(&pool, app_id, running, "5c").await;
@@ -4852,6 +4857,7 @@ resource_bindings := {
 
         // The same failed replacement against a pre-job legacy workload.
         let (legacy_org, legacy_app) = insert_test_app(&pool, "running").await;
+        insert_test_keyring_version(&pool, legacy_org, 1, &[&"bb".repeat(32)]).await;
         let legacy = Uuid::new_v4();
         insert_test_deployment(&pool, legacy_org, legacy_app, legacy, "healthy", now).await;
         let legacy_artifact = insert_test_artifact(&pool, legacy_app, legacy, "7e").await;
@@ -6058,7 +6064,8 @@ resource_bindings := {
 
     #[tokio::test]
     async fn unreleased_signed_customer_config_hold_defers_an_empty_policy() {
-        let pool = crate::test_support::database_test_pool().await;
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap185_signed_hold").await;
         let (org_id, app_id) = insert_test_app(&pool, "running").await;
 
         // The hold protects a still-running legacy workload: a healthy
@@ -6315,11 +6322,13 @@ resource_bindings := {
             .execute(&pool)
             .await
             .expect("delete held fixture organization");
+        crate::test_support::drop_isolated_database("cap185_signed_hold", pool).await;
     }
 
     #[tokio::test]
     async fn unrelated_unsigned_hold_does_not_defer_an_empty_policy() {
-        let pool = crate::test_support::database_test_pool().await;
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap185_unsigned_hold").await;
         let (org_id, app_id) = insert_test_app(&pool, "running").await;
 
         // An unrelated app's hold on an UNSIGNED transition withholds no
@@ -6368,6 +6377,7 @@ resource_bindings := {
             .execute(&pool)
             .await
             .expect("delete unsigned held fixture organization");
+        crate::test_support::drop_isolated_database("cap185_unsigned_hold", pool).await;
     }
 
     #[tokio::test]
