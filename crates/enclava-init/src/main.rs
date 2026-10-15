@@ -1234,7 +1234,11 @@ fn wait_for_local_aa_token_endpoint(token_url: &str) {
     if !is_local {
         return;
     }
-    let wait_timeout = kbs_proxy_health_wait_timeout(token_url);
+    // Own default budget: the KBS-proxy helper's 300s default keys on the
+    // proxy's port 8081, while the AA token endpoint defaults to 8006 —
+    // reusing that helper gave this wait a zero default. Explicit env
+    // overrides still win (cap#244 review).
+    let wait_timeout = aa_token_wait_timeout();
     if wait_timeout.is_zero() {
         return;
     }
@@ -1253,17 +1257,39 @@ fn wait_for_local_aa_token_endpoint(token_url: &str) {
     );
     let deadline = std::time::Instant::now() + wait_timeout;
     while std::time::Instant::now() < deadline {
-        // Any HTTP response — even a 5xx — proves the listener is up; the
-        // real fetch then surfaces any genuine AA error verbatim.
-        if client.get(token_url).send().is_ok() {
-            return;
+        // A listener can accept connections before the token service is
+        // ready and answer 5xx during startup — keep polling those. Any
+        // non-5xx response means the endpoint is serving; the real fetch
+        // then surfaces any genuine AA error verbatim. Connection errors
+        // (agent not yet listening) also keep polling.
+        match client.get(token_url).send() {
+            Ok(resp) if resp.status().as_u16() >= 500 => {}
+            Ok(_) => return,
+            Err(_) => {}
         }
-        std::thread::sleep(poll.min(deadline - std::time::Instant::now()));
+        // A failed probe can outlast the remaining budget (5s request
+        // timeout); saturate so the sleep never underflows (cap#244 review).
+        std::thread::sleep(poll.min(deadline.saturating_duration_since(std::time::Instant::now())));
     }
     tracing::warn!(
         wait_seconds = wait_timeout.as_secs(),
-        "local attestation-agent token endpoint still unreachable; proceeding to the token fetch"
+        "local attestation-agent token endpoint still not serving; proceeding to the token fetch"
     );
+}
+
+/// Wait budget for the local AA token endpoint: explicit env override, else
+/// the same 300s default the KBS-proxy wait uses (independent of the URL's
+/// port).
+fn aa_token_wait_timeout() -> Duration {
+    let explicit = std::env::var("ENCLAVA_INIT_AA_TOKEN_WAIT_SECONDS")
+        .ok()
+        .or_else(|| std::env::var("AA_TOKEN_WAIT_SECONDS").ok());
+    if let Some(value) = explicit {
+        return parse_positive_seconds(&value)
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::ZERO);
+    }
+    Duration::from_secs(DEFAULT_KBS_PROXY_HEALTH_WAIT_SECONDS)
 }
 
 fn is_local_kbs_proxy_url(kbs_url: &str) -> bool {
