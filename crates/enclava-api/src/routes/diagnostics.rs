@@ -533,12 +533,28 @@ fn project_diagnostics(row: Option<DiagnosticsRow>) -> DeploymentDiagnostics {
         } else {
             DeploymentReason::AppDeleting
         };
+        // For an abandoned deletion waiting on a finite foreign fence,
+        // surface the fence's claim admission boundary (reclaim_after) as
+        // blocked_until: the retry DELETE stays Busy until then, and
+        // without this the owner has no indication of when the retry can
+        // succeed (the delete lease's own blocked_until was cleared
+        // above). The renewable locked_until is deliberately NOT used —
+        // a live holder extends it every heartbeat, and the claim
+        // predicate (claim_resource_rows) admits only at reclaim_after;
+        // reclaim_after may itself move for a live holder, but it is the
+        // honest lower bound. A poisoned fence keeps no deadline — it
+        // never auto-reclaims.
+        let blocked_until = if !delete_lease_live && fence_holds {
+            row.fence_reclaim_after.filter(|reclaim| reclaim > &now)
+        } else {
+            None
+        };
         return DeploymentDiagnostics {
             phase: DeploymentPhase::Destroying,
             condition,
             reason: Some(reason),
             next_retry_at: None,
-            blocked_until: None,
+            blocked_until,
             blocking_operation: None,
             ..base
         };
@@ -639,6 +655,14 @@ fn classify_reason(
             .or(Some(DeploymentReason::DeploymentRolloutFailed));
     }
     if deployment_status == "healthy" {
+        return None;
+    }
+    // A rolled-back deployment is terminal exactly like a healthy one:
+    // the retained row legitimately has no apply job (the rollback flow
+    // retires it), and `job_state = None` here is not a durability
+    // anomaly. Reporting one would print a support-worthy warning under
+    // a successful rollback.
+    if deployment_status == "rolled_back" {
         return None;
     }
     match job_state {
@@ -1414,6 +1438,78 @@ mod tests {
         );
         let blocked_until = diagnostics.blocked_until.expect("later fence deadline");
         assert!(blocked_until > Utc::now() + chrono::Duration::minutes(7));
+    }
+
+    #[test]
+    fn rolled_back_deployment_without_job_row_is_terminal_with_no_reason() {
+        // A retained rolled_back row legitimately has no apply job (the
+        // rollback flow retires it): terminal like healthy, and never a
+        // durability-anomaly reason.
+        let diagnostics = project_diagnostics(Some(row("rolled_back", None, None)));
+        assert_eq!(diagnostics.phase, DeploymentPhase::RolledBack);
+        assert_eq!(diagnostics.condition, DeploymentCondition::Terminal);
+        assert_eq!(diagnostics.reason, None);
+    }
+
+    #[test]
+    fn rolled_back_deployment_with_completed_job_is_terminal_with_no_reason() {
+        let diagnostics = project_diagnostics(Some(row("rolled_back", Some("completed"), None)));
+        assert_eq!(diagnostics.phase, DeploymentPhase::RolledBack);
+        assert_eq!(diagnostics.condition, DeploymentCondition::Terminal);
+        assert_eq!(diagnostics.reason, None);
+    }
+
+    #[test]
+    fn abandoned_deletion_on_finite_foreign_fence_promises_the_fence_deadline() {
+        // Delete lease fully lapsed, finite foreign fence still holding:
+        // the retry DELETE stays Busy until the fence's reclaim_after, so
+        // the projection must surface that boundary. The renewable
+        // locked_until (earlier, extended by every holder heartbeat)
+        // must NOT be promised: claim_resource_rows admits only at
+        // reclaim_after.
+        let mut input = row("applying", Some("running"), None);
+        input.app_deleting = true;
+        input.lease_locked_until = Some(Utc::now() - chrono::Duration::minutes(5));
+        input.lease_reclaim_after = Some(Utc::now() - chrono::Duration::minutes(2));
+        input.lease_operation_kind = Some("app_delete".to_string());
+        input.fence_locked_until = Some(Utc::now() + chrono::Duration::minutes(2));
+        input.fence_reclaim_after = Some(Utc::now() + chrono::Duration::minutes(9));
+        input.fence_operation_kind = Some("custom_domain_set".to_string());
+        let diagnostics = project_diagnostics(Some(input));
+        assert_eq!(diagnostics.phase, DeploymentPhase::Destroying);
+        assert_eq!(diagnostics.condition, DeploymentCondition::WaitingExternal);
+        assert_eq!(
+            diagnostics.reason,
+            Some(DeploymentReason::AppDeletionAbandonedWaitingOnForeignFence)
+        );
+        let blocked_until = diagnostics
+            .blocked_until
+            .expect("fence reclaim boundary must be surfaced");
+        assert!(
+            blocked_until > Utc::now() + chrono::Duration::minutes(8),
+            "must promise reclaim_after, not the renewable locked_until"
+        );
+    }
+
+    #[test]
+    fn abandoned_deletion_on_poisoned_fence_promises_no_deadline() {
+        // A poisoned fence never auto-reclaims: no blocked_until may be
+        // promised, and the support escalation reason applies.
+        let mut input = row("applying", Some("running"), None);
+        input.app_deleting = true;
+        input.lease_locked_until = Some(Utc::now() - chrono::Duration::minutes(5));
+        input.lease_reclaim_after = Some(Utc::now() - chrono::Duration::minutes(2));
+        input.lease_operation_kind = Some("app_delete".to_string());
+        input.fence_locked_until = Some(Utc::now() + chrono::Duration::minutes(2));
+        input.fence_reclaim_after = None;
+        input.fence_operation_kind = Some("app_delete".to_string());
+        let diagnostics = project_diagnostics(Some(input));
+        assert_eq!(diagnostics.phase, DeploymentPhase::Destroying);
+        assert_eq!(
+            diagnostics.reason,
+            Some(DeploymentReason::AppDeletionBlockedByPoisonedFence)
+        );
+        assert!(diagnostics.blocked_until.is_none());
     }
 
     #[test]
