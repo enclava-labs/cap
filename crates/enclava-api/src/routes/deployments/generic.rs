@@ -298,9 +298,27 @@ pub(crate) async fn create_generic_deployment_inner(
         && let Some((deployment, app)) =
             fetch_deployment_by_external_id(&state, auth.org_id, external_id).await?
     {
-        let open_hold = crate::deployment_jobs::customer_config_open_hold(&state.db, deployment.id)
-            .await
-            .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+        let open_hold = match crate::deployment_jobs::customer_config_hold_replay_state(
+            &state.db,
+            deployment.id,
+        )
+        .await
+        .map_err(|_| {
+            json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the customer-config hold state could not be re-read for replay; retry the deployment",
+            )
+        })? {
+            crate::deployment_jobs::CustomerConfigHoldReplay::Open(hold) => Some(hold),
+            crate::deployment_jobs::CustomerConfigHoldReplay::EndedUnreleased => {
+                return Err(json_error(
+                    StatusCode::GONE,
+                    "the customer-config roll hold ended without a release and the deployment failed without rolling; start a new deploy instead of retrying this one",
+                ));
+            }
+            crate::deployment_jobs::CustomerConfigHoldReplay::Released
+            | crate::deployment_jobs::CustomerConfigHoldReplay::NotHeld => None,
+        };
         if super::deployment_setup_incomplete(&deployment) && open_hold.is_none() {
             return Err(json_error(
                 StatusCode::CONFLICT,

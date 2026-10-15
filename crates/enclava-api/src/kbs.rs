@@ -632,22 +632,37 @@ async fn signed_policy_mode_active(db: &PgPool) -> Result<bool, KbsPolicyError> 
     .await?)
 }
 
-/// Apps whose live customer-config hold withholds a signed authority: the
-/// job is frozen at `setup_pending`, never released, the expiry sweeper has
-/// not failed it yet, and the held transition carries a signed artifact
-/// (`artifact_deployment_id`) whose authority the candidate query withholds.
-/// Only such a hold may defer policy convergence, and only for its own
-/// app's authority — see `hold_deferral_correlates`.
+/// An expired hold never replaced the legacy workload. Keep its policy
+/// until release, stop/deletion, or a newer non-held operation takes over.
+/// Published signed authority must still correlate with the held app.
 async fn unreleased_signed_customer_config_hold_apps(
     db: &PgPool,
 ) -> Result<Vec<String>, KbsPolicyError> {
     Ok(sqlx::query_scalar(
-        "SELECT app_id::text
-           FROM deployment_apply_jobs
-          WHERE customer_config_hold
-            AND customer_config_released_at IS NULL
-            AND state = 'setup_pending'
-            AND artifact_deployment_id IS NOT NULL",
+        "SELECT job.app_id::text
+           FROM deployment_apply_jobs AS job
+           JOIN apps AS app ON app.id = job.app_id
+          WHERE job.customer_config_hold
+            AND job.customer_config_released_at IS NULL
+            AND job.artifact_deployment_id IS NOT NULL
+            AND app.status::text IN ('creating', 'running', 'failed')
+            AND (
+                 job.state = 'setup_pending'
+                 OR (
+                     job.state = 'failed'
+                     AND job.last_error_code = 'customer_config_hold_expired'
+                     AND NOT EXISTS (
+                         SELECT 1
+                           FROM deployment_apply_jobs AS newer
+                          WHERE newer.app_id = job.app_id
+                            AND newer.generation > job.generation
+                            AND NOT (
+                                newer.customer_config_hold
+                                AND newer.customer_config_released_at IS NULL
+                            )
+                     )
+                 )
+            )",
     )
     .fetch_all(db)
     .await?)
@@ -1220,10 +1235,12 @@ async fn reconcile_pending_signed_policy_artifacts_with_client(
         // customer-config hold: publishing the empty body would flip a
         // legacy Rego install into fail-closed signed mode and revoke the
         // workload the hold deliberately left running. Defer this
-        // generation until release or hold expiry settles it — but only
-        // when the revocation converging would perform correlates with the
-        // held transition's own app: an unrelated hold must not retain
-        // another app's obsolete authority (see `hold_deferral_correlates`).
+        // generation until the held transition's lifecycle actually
+        // advances — release, replacement, stop, or delete; expiry alone
+        // leaves the workload running — but only when the revocation
+        // converging would perform correlates with the held transition's
+        // own app: an unrelated hold must not retain another app's
+        // obsolete authority (see `hold_deferral_correlates`).
         if candidates.is_empty() {
             let hold_apps = unreleased_signed_customer_config_hold_apps(db).await?;
             if !hold_apps.is_empty() {
@@ -5252,6 +5269,11 @@ resource_bindings := {
         let pool = crate::test_support::database_test_pool().await;
         let (org_id, app_id) = insert_test_app(&pool, "running").await;
 
+        // The hold protects a still-running legacy workload: a healthy
+        // job-less deployment that predates signed artifacts.
+        let legacy = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, legacy, "healthy", Utc::now()).await;
+
         assert!(
             unreleased_signed_customer_config_hold_apps(&pool)
                 .await
@@ -5332,6 +5354,26 @@ resource_bindings := {
             candidates.is_empty(),
             "the held artifact is withheld: converging here would publish {{artifacts: []}} and revoke the legacy workload"
         );
+        for status in ["stopped", "deleting"] {
+            sqlx::query("UPDATE apps SET status = $2::app_status_enum WHERE id = $1")
+                .bind(app_id)
+                .bind(status)
+                .execute(&pool)
+                .await
+                .unwrap();
+            assert!(
+                unreleased_signed_customer_config_hold_apps(&pool)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "{status} must clear even an unexpired hold's policy deferral"
+            );
+        }
+        sqlx::query("UPDATE apps SET status = 'running' WHERE id = $1")
+            .bind(app_id)
+            .execute(&pool)
+            .await
+            .unwrap();
 
         // Releasing the hold ends the deferral.
         sqlx::query(
@@ -5351,39 +5393,129 @@ resource_bindings := {
             "a released hold no longer defers the policy"
         );
 
-        // A hold that expired and failed is equally inert: it must not
-        // wedge revocation for unrelated apps. The sweeper terminalizes the
-        // job and deployment together.
-        // Both rows terminalize in one transaction so the deferred
-        // durable-job constraint sees the canonical deployment already
-        // failed at commit.
-        let mut expiry_tx = pool.begin().await.expect("begin expiry fixture");
+        // A second unreleased hold that the sweeper expires: the expiry
+        // deliberately leaves the legacy TEE running, so the app must keep
+        // deferring the empty publish after the job turns terminal.
+        let held2 = Uuid::new_v4();
+        let mut artifact2 = test_signed_policy_artifact("0b", 16);
+        artifact2.metadata.app_id = app_id.to_string();
+        artifact2.metadata.deploy_id = held2.to_string();
+        let artifact2_hash = hex::decode(&artifact2.metadata.descriptor_core_hash).unwrap();
+        let mut expiry_fixture = pool.begin().await.expect("begin expiring hold fixture");
         sqlx::query(
-            "UPDATE deployment_apply_jobs
-                SET customer_config_released_at = NULL,
-                    state = 'failed'
-              WHERE deployment_id = $1",
+            "INSERT INTO deployment_apply_jobs (
+                 deployment_id, app_id, org_id, source_deployment_id,
+                 payload_version, payload, payload_sha256,
+                 cleanup_app_on_setup_failure, signed_required,
+                 artifact_deployment_id, artifact_descriptor_core_hash,
+                 log_encryption, state, next_attempt_at,
+                 customer_config_hold, customer_config_hold_until
+             ) VALUES (
+                 $1, $2, $3, $1, 1,
+                 '{\"version\":1,\"log_encryption\":null}'::jsonb,
+                 $4, false, true, $1, $5, NULL, 'setup_pending',
+                 'infinity'::timestamptz,
+                 true, clock_timestamp() - interval '1 second'
+             )",
         )
-        .bind(held)
-        .execute(&mut *expiry_tx)
+        .bind(held2)
+        .bind(app_id)
+        .bind(org_id)
+        .bind(vec![7u8; 32])
+        .bind(&artifact2_hash)
+        .execute(&mut *expiry_fixture)
         .await
-        .expect("expire the hold job fixture");
+        .expect("insert expiring held apply job");
+        insert_test_deployment_in_tx(&mut expiry_fixture, org_id, app_id, held2, "pending").await;
         sqlx::query(
-            "UPDATE deployments
-                SET status = 'failed'::deploy_status_enum
-              WHERE id = $1",
+            "INSERT INTO workload_artifacts (
+                 descriptor_core_hash, app_id, deploy_id, descriptor_payload,
+                 descriptor_signature, descriptor_signing_key_id,
+                 org_keyring_payload, org_keyring_signature,
+                 signed_policy_artifact
+             ) VALUES ($1, $2, $3, '{}'::jsonb, $4, 'test-key',
+                       '{}'::jsonb, $5, $6)",
         )
-        .bind(held)
-        .execute(&mut *expiry_tx)
+        .bind(&artifact2_hash)
+        .bind(app_id)
+        .bind(held2)
+        .bind(vec![1u8; 64])
+        .bind(vec![2u8; 64])
+        .bind(serde_json::to_value(&artifact2).unwrap())
+        .execute(&mut *expiry_fixture)
         .await
-        .expect("expire the hold deployment fixture");
-        expiry_tx.commit().await.expect("commit expiry fixture");
+        .expect("insert expiring held signed artifact");
+        expiry_fixture
+            .commit()
+            .await
+            .expect("commit expiring hold fixture");
+
+        crate::deployment_jobs::expire_customer_config_holds(&pool)
+            .await
+            .expect("sweep the expired hold");
+        let swept_state: String =
+            sqlx::query_scalar("SELECT state FROM deployment_apply_jobs WHERE deployment_id = $1")
+                .bind(held2)
+                .fetch_one(&pool)
+                .await
+                .expect("read swept hold job state");
+        assert_eq!(swept_state, "failed", "the sweeper terminalizes the hold");
         assert!(
-            unreleased_signed_customer_config_hold_apps(&pool)
+            !unreleased_signed_customer_config_hold_apps(&pool)
                 .await
                 .expect("probe after hold expiry")
                 .is_empty(),
-            "a terminal failed hold must not defer the policy"
+            "an expired hold still defers while the legacy workload it preserved keeps running"
+        );
+
+        // Lifecycle exit clears the protection: once the app stops serving,
+        // an empty publish revokes nothing live.
+        sqlx::query("UPDATE apps SET status = 'stopped'::app_status_enum WHERE id = $1")
+            .bind(app_id)
+            .execute(&pool)
+            .await
+            .expect("stop the app");
+        assert!(
+            unreleased_signed_customer_config_hold_apps(&pool)
+                .await
+                .expect("probe after app stop")
+                .is_empty(),
+            "a stopped app has no workload left for the expired hold to protect"
+        );
+        sqlx::query("UPDATE apps SET status = 'running'::app_status_enum WHERE id = $1")
+            .bind(app_id)
+            .execute(&pool)
+            .await
+            .expect("restart the app fixture");
+        sqlx::query("UPDATE apps SET status = 'deleting'::app_status_enum WHERE id = $1")
+            .bind(app_id)
+            .execute(&pool)
+            .await
+            .expect("mark the app deleting");
+        assert!(
+            unreleased_signed_customer_config_hold_apps(&pool)
+                .await
+                .expect("probe while deleting")
+                .is_empty(),
+            "a deleting app cannot be protected by the expired hold"
+        );
+        sqlx::query("UPDATE apps SET status = 'running'::app_status_enum WHERE id = $1")
+            .bind(app_id)
+            .execute(&pool)
+            .await
+            .expect("restore the app fixture");
+
+        // A newer durable operation takes over: the expired hold is history
+        // and the replacement's own operation semantics govern the policy.
+        let replacement = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, replacement, "healthy", Utc::now()).await;
+        insert_test_job(&pool, org_id, app_id, replacement, legacy, None).await;
+        assert!(
+            unreleased_signed_customer_config_hold_apps(&pool)
+                .await
+                .expect("probe after replacement")
+                .is_empty(),
+            "a newer durable operation ends the expired hold's protection"
         );
 
         sqlx::query("DELETE FROM organizations WHERE id = $1")
@@ -5444,6 +5576,172 @@ resource_bindings := {
             .execute(&pool)
             .await
             .expect("delete unsigned held fixture organization");
+    }
+
+    #[tokio::test]
+    async fn expired_signed_hold_preserves_legacy_policy_until_lifecycle_advances() {
+        let pool = crate::test_support::database_test_pool().await;
+        let (org_id, app_id) = insert_test_app(&pool, "running").await;
+
+        // The still-running workload the hold preserved: a healthy legacy
+        // deployment with no signed artifact row.
+        let legacy = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, legacy, "healthy", Utc::now()).await;
+
+        // The first signed redeploy is held past its expiry so the sweeper
+        // terminalizes it without ever applying the workload.
+        let held = Uuid::new_v4();
+        let mut artifact = test_signed_policy_artifact("0d", 16);
+        artifact.metadata.app_id = app_id.to_string();
+        artifact.metadata.deploy_id = held.to_string();
+        let artifact_hash = hex::decode(&artifact.metadata.descriptor_core_hash).unwrap();
+        let mut tx = pool.begin().await.expect("begin expired hold fixture");
+        sqlx::query(
+            "INSERT INTO deployment_apply_jobs (
+                 deployment_id, app_id, org_id, source_deployment_id,
+                 payload_version, payload, payload_sha256,
+                 cleanup_app_on_setup_failure, signed_required,
+                 artifact_deployment_id, artifact_descriptor_core_hash,
+                 log_encryption, state, next_attempt_at,
+                 customer_config_hold, customer_config_hold_until
+             ) VALUES (
+                 $1, $2, $3, $1, 1,
+                 '{\"version\":1,\"log_encryption\":null}'::jsonb,
+                 $4, false, true, $1, $5, NULL, 'setup_pending',
+                 'infinity'::timestamptz,
+                 true, clock_timestamp() - interval '1 second'
+             )",
+        )
+        .bind(held)
+        .bind(app_id)
+        .bind(org_id)
+        .bind(vec![7u8; 32])
+        .bind(&artifact_hash)
+        .execute(&mut *tx)
+        .await
+        .expect("insert expired held apply job");
+        insert_test_deployment_in_tx(&mut tx, org_id, app_id, held, "pending").await;
+        sqlx::query(
+            "INSERT INTO workload_artifacts (
+                 descriptor_core_hash, app_id, deploy_id, descriptor_payload,
+                 descriptor_signature, descriptor_signing_key_id,
+                 org_keyring_payload, org_keyring_signature,
+                 signed_policy_artifact
+             ) VALUES ($1, $2, $3, '{}'::jsonb, $4, 'test-key',
+                       '{}'::jsonb, $5, $6)",
+        )
+        .bind(&artifact_hash)
+        .bind(app_id)
+        .bind(held)
+        .bind(vec![1u8; 64])
+        .bind(vec![2u8; 64])
+        .bind(serde_json::to_value(&artifact).unwrap())
+        .execute(&mut *tx)
+        .await
+        .expect("insert expired held signed artifact");
+        tx.commit().await.expect("commit expired hold fixture");
+
+        crate::deployment_jobs::expire_customer_config_holds(&pool)
+            .await
+            .expect("sweep the expired hold");
+        let swept_state: String =
+            sqlx::query_scalar("SELECT state FROM deployment_apply_jobs WHERE deployment_id = $1")
+                .bind(held)
+                .fetch_one(&pool)
+                .await
+                .expect("read swept hold job state");
+        assert_eq!(swept_state, "failed", "the sweeper terminalizes the hold");
+
+        // A pending reconciliation must keep the legacy Rego body: the
+        // expired hold still protects the running workload.
+        let mut gen_tx = pool.begin().await.expect("begin generation bump");
+        enqueue_signed_policy_reconciliation(&mut gen_tx)
+            .await
+            .expect("enqueue a pending policy generation");
+        gen_tx.commit().await.expect("commit generation bump");
+
+        let writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = writes.clone();
+        let client = kube::Client::new(
+            tower::service_fn(move |request: axum::http::Request<kube::client::Body>| {
+                let seen = seen.clone();
+                async move {
+                    if request.method() != axum::http::Method::GET {
+                        seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let status =
+                            kube::core::Status::failure("write rejected by fixture", "Forbidden")
+                                .with_code(403);
+                        return Ok::<_, std::io::Error>(
+                            axum::http::Response::builder()
+                                .status(axum::http::StatusCode::FORBIDDEN)
+                                .body(kube::client::Body::from(
+                                    serde_json::to_vec(&status).unwrap(),
+                                ))
+                                .unwrap(),
+                        );
+                    }
+                    let configmap = serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "ConfigMap",
+                        "metadata": {
+                            "name": "resource-policy",
+                            "namespace": "trustee-operator-system",
+                            "resourceVersion": "7"
+                        },
+                        "data": {"policy.rego": "package authz\n# legacy rego\n"}
+                    });
+                    Ok(axum::http::Response::new(kube::client::Body::from(
+                        serde_json::to_vec(&configmap).unwrap(),
+                    )))
+                }
+            }),
+            "default",
+        );
+        let config = KbsPolicyConfig {
+            namespace: "trustee-operator-system".to_string(),
+            configmap_name: "resource-policy".to_string(),
+            policy_key: "policy.rego".to_string(),
+            deployment_name: "trustee-deployment".to_string(),
+            required: false,
+            signed_policy_retention: 8,
+            signed_policy_max_bytes: 1024 * 1024,
+        };
+
+        reconcile_pending_signed_policy_artifacts_with_client(&pool, &config, None, client.clone())
+            .await
+            .expect("the expired hold must defer the pending reconciliation");
+        assert_eq!(
+            writes.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the reconciliation must not publish an empty policy over the running legacy workload"
+        );
+
+        // Lifecycle exit clears the deferral: with the app stopped there is
+        // no workload to protect, so the pending generation converges
+        // (the fixture's 403 write rejection proves the publish was
+        // attempted rather than deferred).
+        sqlx::query("UPDATE apps SET status = 'stopped'::app_status_enum WHERE id = $1")
+            .bind(app_id)
+            .execute(&pool)
+            .await
+            .expect("stop the app");
+        let converged =
+            reconcile_pending_signed_policy_artifacts_with_client(&pool, &config, None, client)
+                .await;
+        assert!(
+            converged.is_err(),
+            "the fixture rejects the write; only the attempt matters"
+        );
+        assert!(
+            writes.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "stopping the app must let the pending reconciliation publish"
+        );
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete expired hold fixture organization");
     }
 
     #[test]

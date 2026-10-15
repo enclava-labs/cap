@@ -389,6 +389,8 @@ pub struct ApplyDeploymentManifestsRequest {
     pub pool: PgPool,
     pub app: App,
     pub snapshot: DeploymentApplySnapshot,
+    pub engine: ApplyEngine,
+    pub fresh_volume_claims: enclava_engine::apply::orchestrator::FreshVolumeClaims,
     pub deployment_id: Uuid,
     pub attestation_config: Option<AttestationConfig>,
     pub kbs_policy_config: Option<crate::kbs::KbsPolicyConfig>,
@@ -867,10 +869,8 @@ pub(crate) async fn supersede_incomplete_deployments(
     tx: &mut Transaction<'_, Postgres>,
     app_id: Uuid,
 ) -> Result<u64, SupersedeDeploymentError> {
-    // Never revoke the relational owner of an external mutation while its DB
-    // lease is live. Queued work and expired owners are safe to terminalize;
-    // an active watcher is observation-only and publication remains fenced by
-    // its generation/token after supersession.
+    // Config tokens are app-scoped, so supersession cannot cancel a CLI's
+    // writes. Keep its live hold exclusive; deletion may still stop the app.
     let active_mutation: bool = sqlx::query_scalar(
         "SELECT EXISTS(
              SELECT 1
@@ -888,6 +888,16 @@ pub(crate) async fn supersede_incomplete_deployments(
                         )
                     )
                 )
+         ) OR EXISTS (
+             SELECT 1
+               FROM deployment_apply_jobs AS job
+               JOIN apps AS app ON app.id = job.app_id
+              WHERE job.app_id = $1
+                AND job.customer_config_hold
+                AND job.customer_config_released_at IS NULL
+                AND job.state = 'setup_pending'
+                AND job.customer_config_hold_until > clock_timestamp()
+                AND app.status <> 'deleting'::app_status_enum
          )",
     )
     .bind(app_id)
@@ -1739,6 +1749,41 @@ mod tests {
         )
     }
 
+    fn expired_rollout_anchor(budget: std::time::Duration) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now()
+            - chrono::Duration::from_std(budget).unwrap()
+            - chrono::Duration::seconds(1)
+    }
+
+    /// The base budget an initialized redeploy would carry: no fresh claim
+    /// contributes the first-boot allowance.
+    fn initialized_redeploy_budget() -> std::time::Duration {
+        rollout_test_engine()
+            .config()
+            .rollout_timeout_for_storage(
+                "2Ti",
+                "2Ti",
+                enclava_engine::apply::orchestrator::FreshVolumeClaims::NONE,
+            )
+            .expect("fixture rollout budget")
+    }
+
+    /// The budget a first render that must freshly initialize both volumes
+    /// would record with its watching marker.
+    fn fresh_initialization_budget(
+        app_data_size: &str,
+        tls_data_size: &str,
+    ) -> std::time::Duration {
+        rollout_test_engine()
+            .config()
+            .rollout_timeout_for_storage(
+                app_data_size,
+                tls_data_size,
+                enclava_engine::apply::orchestrator::FreshVolumeClaims::ALL,
+            )
+            .expect("fixture rollout budget")
+    }
+
     #[tokio::test]
     async fn rollout_watch_slice_returns_nonterminal_while_budget_remains() {
         // An owner-waiting workload must release its worker slot between
@@ -1749,7 +1794,9 @@ mod tests {
             rollout_test_engine(),
             "slice-manifest".to_string(),
             chrono::Utc::now(),
+            fresh_initialization_budget("32Mi", "32Mi"),
         )
+        .expect("valid rollout budget")
         .with_observation_slice(std::time::Duration::from_millis(50))
         .watch()
         .await;
@@ -1764,15 +1811,18 @@ mod tests {
         // A restarted observer anchors at `observing_since`: once the
         // cumulative rollout budget is spent, the slice ends immediately and
         // returns the engine timeout classification instead of restarting a
-        // fresh 600s wait.
+        // fresh initialization budget.
         let mut auto_app = queued_apply_app();
         auto_app.unlock_mode = crate::models::UnlockMode::Auto;
+        let budget = fresh_initialization_budget("32Mi", "32Mi");
         let outcome = DeploymentRollout::observe_only(
             auto_app,
             rollout_test_engine(),
             "deadline-manifest".to_string(),
-            chrono::Utc::now() - chrono::Duration::seconds(601),
+            expired_rollout_anchor(budget),
+            budget,
         )
+        .expect("valid rollout budget")
         .with_observation_slice(std::time::Duration::from_millis(50))
         .watch()
         .await;
@@ -1783,17 +1833,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn initialized_redeploy_expires_at_base_budget() {
+        // A redeploy whose volumes are already initialized carries only the
+        // base rollout budget. A 2 Ti manifest must NOT inherit a
+        // multi-hour first-boot allowance: once the recorded base budget is
+        // spent, the cumulative deadline ends the rollout normally.
+        let mut app = queued_apply_app();
+        app.unlock_mode = crate::models::UnlockMode::Auto;
+        let outcome = DeploymentRollout::observe_only(
+            app,
+            rollout_test_engine(),
+            "initialized-redeploy-manifest".to_string(),
+            expired_rollout_anchor(initialized_redeploy_budget()),
+            initialized_redeploy_budget(),
+        )
+        .expect("valid rollout budget")
+        .with_observation_slice(std::time::Duration::from_millis(50))
+        .watch()
+        .await;
+        assert_eq!(outcome.deploy_status, "failed");
+        assert_eq!(outcome.app_status, "failed");
+        assert!(outcome.terminal);
+        assert_eq!(outcome.error_code, Some("deployment_rollout_failed"));
+    }
+
+    #[tokio::test]
+    async fn resumed_observer_keeps_recorded_budget() {
+        // The budget persisted with the watching marker is the deadline.
+        // Simulating a restart where live pod/volume state has changed, the
+        // resumed observer must reuse the recorded value: a record smaller
+        // than any size-derived budget still expires, a record larger than
+        // one still keeps observing. Neither recomputes.
+        let mut expired_app = queued_apply_app();
+        expired_app.unlock_mode = crate::models::UnlockMode::Auto;
+        let recorded_small = std::time::Duration::from_secs(1);
+        let expired = DeploymentRollout::observe_only(
+            expired_app,
+            rollout_test_engine(),
+            "resumed-expired-manifest".to_string(),
+            expired_rollout_anchor(recorded_small),
+            recorded_small,
+        )
+        .expect("valid rollout budget")
+        .with_observation_slice(std::time::Duration::from_millis(50))
+        .watch()
+        .await;
+        assert_eq!(expired.deploy_status, "failed");
+        assert!(expired.terminal);
+
+        let mut waiting_app = queued_apply_app();
+        waiting_app.unlock_mode = crate::models::UnlockMode::Auto;
+        let waiting = DeploymentRollout::observe_only(
+            waiting_app,
+            rollout_test_engine(),
+            "resumed-waiting-manifest".to_string(),
+            chrono::Utc::now() - chrono::Duration::minutes(30),
+            fresh_initialization_budget("2Ti", "2Ti"),
+        )
+        .expect("valid rollout budget")
+        .with_observation_slice(std::time::Duration::from_millis(50))
+        .watch()
+        .await;
+        assert_eq!(waiting.deploy_status, "watching");
+        assert!(!waiting.terminal);
+        assert_eq!(waiting.error_code, None);
+    }
+
+    #[tokio::test]
     async fn rollout_watch_observes_late_owner_unlock_after_deadline() {
         let engine = ApplyEngine::new(
             rollout_client(true),
             enclava_engine::apply::types::ApplyConfig::default(),
         );
+        let budget = fresh_initialization_budget("32Mi", "32Mi");
         let outcome = DeploymentRollout::observe_only(
             queued_apply_app(),
             engine,
             "late-unlock-manifest".to_string(),
-            chrono::Utc::now() - chrono::Duration::seconds(601),
+            expired_rollout_anchor(budget),
+            budget,
         )
+        .expect("valid rollout budget")
         .with_observation_slice(std::time::Duration::from_millis(50))
         .watch()
         .await;
@@ -1807,12 +1927,15 @@ mod tests {
         // Password-mode creates classify an exhausted rollout budget as a
         // continuing owner wait, but the observation slice still returns
         // promptly so the worker slot is released between probes.
+        let budget = fresh_initialization_budget("32Mi", "32Mi");
         let outcome = DeploymentRollout::observe_only(
             queued_apply_app(),
             rollout_test_engine(),
             "password-manifest".to_string(),
-            chrono::Utc::now() - chrono::Duration::seconds(601),
+            expired_rollout_anchor(budget),
+            budget,
         )
+        .expect("valid rollout budget")
         .with_observation_slice(std::time::Duration::from_millis(50))
         .watch()
         .await;
@@ -1829,12 +1952,15 @@ mod tests {
         // snapshot must not terminalize a legitimate owner wait.
         let mut app = queued_apply_app();
         app.status = AppStatus::Failed;
+        let budget = fresh_initialization_budget("32Mi", "32Mi");
         let outcome = DeploymentRollout::observe_only(
             app,
             rollout_test_engine(),
             "password-redeploy-manifest".to_string(),
-            chrono::Utc::now() - chrono::Duration::seconds(601),
+            expired_rollout_anchor(budget),
+            budget,
         )
+        .expect("valid rollout budget")
         .with_observation_slice(std::time::Duration::from_millis(50))
         .watch()
         .await;
@@ -1894,27 +2020,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn supersession_serializes_customer_config_delivery() {
+        let pool = crate::test_support::database_test_pool().await;
+        let (app, deployment_id, _, _) =
+            crate::deployment_jobs::tests::insert_job_fixture(&pool).await;
+        sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET customer_config_hold = true,
+                    customer_config_hold_until = clock_timestamp() + interval '1 hour',
+                    next_attempt_at = 'infinity'
+              WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("arm config delivery hold");
+
+        for (scenario, blocked) in [
+            ("active", true),
+            ("expired", false),
+            ("released", false),
+            ("deleting", false),
+        ] {
+            let mut tx = pool.begin().await.expect("begin supersession scenario");
+            lock_app_deployment_lane(&mut tx, app.id).await.unwrap();
+            if scenario == "expired" {
+                sqlx::query(
+                    "UPDATE deployment_apply_jobs
+                        SET customer_config_hold_until = clock_timestamp() - interval '1 second'
+                      WHERE deployment_id = $1",
+                )
+                .bind(deployment_id)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            }
+            if scenario == "released" {
+                sqlx::query(
+                    "UPDATE deployment_apply_jobs
+                        SET customer_config_released_at = clock_timestamp(),
+                            next_attempt_at = clock_timestamp()
+                      WHERE deployment_id = $1",
+                )
+                .bind(deployment_id)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            }
+            if scenario == "deleting" {
+                sqlx::query("UPDATE apps SET status = 'deleting' WHERE id = $1")
+                    .bind(app.id)
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+            }
+            let result = supersede_incomplete_deployments(&mut tx, app.id).await;
+            if blocked {
+                assert!(matches!(result, Err(SupersedeDeploymentError::Busy)));
+                let state: String = sqlx::query_scalar(
+                    "SELECT state FROM deployment_apply_jobs WHERE deployment_id = $1",
+                )
+                .bind(deployment_id)
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+                assert_eq!(state, "setup_pending");
+            } else {
+                assert_eq!(result.expect(scenario), 1);
+            }
+            tx.rollback().await.unwrap();
+        }
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn workload_rollout_settled_reads_the_live_generation() {
         let converged = ApplyEngine::new(
             rollout_client(true),
             enclava_engine::apply::types::ApplyConfig::default(),
         );
-        assert!(
+        assert_eq!(
             workload_rollout_settled(&converged, "cap-queued-app", "queued-app")
                 .await
                 .expect("probe converged workload"),
-            "a converged workload leaves no rollout that could replace the TEE"
+            Some(true)
         );
 
         let converging = ApplyEngine::new(
             rollout_client(false),
             enclava_engine::apply::types::ApplyConfig::default(),
         );
-        assert!(
-            !workload_rollout_settled(&converging, "cap-queued-app", "queued-app")
+        assert_eq!(
+            workload_rollout_settled(&converging, "cap-queued-app", "queued-app")
                 .await
                 .expect("probe converging workload"),
-            "a workload without ready replicas is still replacing the TEE"
+            Some(false)
         );
     }
 
@@ -1928,16 +2132,16 @@ mod tests {
             rollout_client_with(3, 2, 1),
             enclava_engine::apply::types::ApplyConfig::default(),
         );
-        assert!(
-            !workload_rollout_settled(&lagging, "cap-queued-app", "queued-app")
+        assert_eq!(
+            workload_rollout_settled(&lagging, "cap-queued-app", "queued-app")
                 .await
                 .expect("probe lagging workload"),
-            "an unobserved generation is still being reconciled toward the TEE"
+            Some(false)
         );
     }
 
     #[tokio::test]
-    async fn workload_rollout_settled_treats_a_missing_workload_as_settled() {
+    async fn workload_rollout_settled_distinguishes_a_missing_workload() {
         use axum::http::{Request, Response};
         use http_body_util::BodyExt;
         use kube::client::Body;
@@ -1961,12 +2165,268 @@ mod tests {
             "default",
         );
         let engine = ApplyEngine::new(client, enclava_engine::apply::types::ApplyConfig::default());
-        assert!(
+        assert_eq!(
             workload_rollout_settled(&engine, "cap-absent-app", "absent-app")
                 .await
                 .expect("probe missing workload"),
-            "no workload exists that could replace a TEE"
+            None
         );
+    }
+
+    #[tokio::test]
+    async fn large_volume_initialization_keeps_observing_after_base_deadline() {
+        // The recorded first-boot budget extends past the base deadline: 30
+        // minutes into observation a fresh 2 Ti render is still watching.
+        let mut app = queued_apply_app();
+        app.unlock_mode = crate::models::UnlockMode::Auto;
+        let outcome = DeploymentRollout::observe_only(
+            app,
+            rollout_test_engine(),
+            "initializing-manifest".to_string(),
+            chrono::Utc::now() - chrono::Duration::minutes(30),
+            fresh_initialization_budget("2Ti", "2Gi"),
+        )
+        .expect("valid rollout budget")
+        .with_observation_slice(std::time::Duration::from_millis(50))
+        .watch()
+        .await;
+        assert_eq!(outcome.deploy_status, "watching");
+        assert_eq!(outcome.app_status, "creating");
+        assert!(!outcome.terminal);
+        assert_eq!(outcome.error_code, None);
+    }
+
+    /// Kubernetes API double for `ingress_restart_verdict`: exact-path GET
+    /// responses, 404 `Status` for anything absent — the same shape the real
+    /// API server returns to `get`/`get_opt`.
+    struct GateCluster {
+        responses: std::collections::HashMap<String, (u16, serde_json::Value)>,
+    }
+
+    impl GateCluster {
+        fn empty() -> Self {
+            Self {
+                responses: std::collections::HashMap::new(),
+            }
+        }
+
+        /// A live StatefulSet plus both claims created at a fixed timestamp.
+        fn deployed(namespace: &str, workload: &str) -> Self {
+            let mut cluster = Self::empty();
+            cluster.put(
+                format!("/apis/apps/v1/namespaces/{namespace}/statefulsets/{workload}"),
+                200,
+                serde_json::json!({
+                    "apiVersion": "apps/v1",
+                    "kind": "StatefulSet",
+                    "metadata": {"name": workload, "namespace": namespace},
+                }),
+            );
+            cluster.with_claims(namespace, workload, &["state", "tls-state"]);
+            cluster
+        }
+
+        fn with_claims(&mut self, namespace: &str, workload: &str, vcts: &[&str]) {
+            for vct in vcts {
+                let claim_name = format!("{vct}-{workload}-0");
+                self.put(
+                    format!("/api/v1/namespaces/{namespace}/persistentvolumeclaims/{claim_name}"),
+                    200,
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "PersistentVolumeClaim",
+                        "metadata": {
+                            "name": claim_name,
+                            "namespace": namespace,
+                            "creationTimestamp": "2025-01-01T00:00:00Z",
+                        },
+                    }),
+                );
+            }
+        }
+
+        /// Ordinal-0 pod created AFTER both claims (strict whole-second
+        /// ordering satisfied), mounting both claims, with configurable
+        /// readiness — a still-formatting initializer reports `ready=false`.
+        fn with_pod(&mut self, namespace: &str, workload: &str, ready: bool) {
+            let pod_name = format!("{workload}-0");
+            let state_claim = format!("state-{workload}-0");
+            let tls_claim = format!("tls-state-{workload}-0");
+            let ready_status = if ready { "True" } else { "False" };
+            self.put(
+                format!("/api/v1/namespaces/{namespace}/pods/{pod_name}"),
+                200,
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {
+                        "name": pod_name,
+                        "namespace": namespace,
+                        "creationTimestamp": "2025-01-01T00:01:00Z",
+                    },
+                    "spec": {
+                        "containers": [],
+                        "volumes": [
+                            {"name": "state",
+                             "persistentVolumeClaim": {"claimName": state_claim}},
+                            {"name": "tls-state",
+                             "persistentVolumeClaim": {"claimName": tls_claim}},
+                        ],
+                    },
+                    "status": {
+                        "conditions": [{
+                            "type": "Ready",
+                            "status": ready_status,
+                        }],
+                    },
+                }),
+            );
+        }
+
+        fn put(&mut self, path: String, status: u16, body: serde_json::Value) {
+            self.responses.insert(path, (status, body));
+        }
+
+        fn client(self) -> kube::Client {
+            use axum::http::{Request, Response};
+            use http_body_util::BodyExt;
+            use kube::client::Body;
+            use tower::service_fn;
+
+            kube::Client::new(
+                service_fn(move |request: Request<Body>| {
+                    let responses = self.responses.clone();
+                    async move {
+                        let path = request.uri().path().to_string();
+                        let _ = request.into_body().collect().await;
+                        let (status, body) = responses.get(&path).cloned().unwrap_or_else(|| {
+                            (
+                                404,
+                                serde_json::json!({
+                                    "apiVersion": "v1",
+                                    "kind": "Status",
+                                    "status": "Failure",
+                                    "reason": "NotFound",
+                                    "code": 404,
+                                    "message": format!("{path} not found"),
+                                }),
+                            )
+                        });
+                        Ok::<_, std::io::Error>(
+                            Response::builder()
+                                .status(status)
+                                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                                .unwrap(),
+                        )
+                    }
+                }),
+                "default",
+            )
+        }
+    }
+
+    fn gate_engine(cluster: GateCluster) -> ApplyEngine {
+        ApplyEngine::new(
+            cluster.client(),
+            enclava_engine::apply::types::ApplyConfig::default(),
+        )
+    }
+
+    #[tokio::test]
+    async fn ingress_restart_not_deployed_without_statefulset() {
+        // No StatefulSet: nothing to restart, so the predeploy verify keeps
+        // its DNS-only path. The probe must not provision or wait.
+        let engine = gate_engine(GateCluster::empty());
+        let verdict = ingress_restart_verdict(&engine, "cap-app", "app")
+            .await
+            .expect("404 StatefulSet lookup is a verdict, not an error");
+        assert_eq!(verdict, IngressRestartVerdict::NotDeployed);
+    }
+
+    #[tokio::test]
+    async fn ingress_restart_ready_when_live_pod_proves_both_claims() {
+        // Exact ordinal-0 Ready pod, created after both claims, mounting both:
+        // the restart only re-opens initialized volumes under the base budget.
+        let mut cluster = GateCluster::deployed("cap-app", "app");
+        cluster.with_pod("cap-app", "app", true);
+        let engine = gate_engine(cluster);
+        let verdict = ingress_restart_verdict(&engine, "cap-app", "app")
+            .await
+            .expect("live cluster proof must resolve");
+        assert_eq!(verdict, IngressRestartVerdict::Ready);
+    }
+
+    #[tokio::test]
+    async fn ingress_restart_unproven_when_claim_missing() {
+        // The tls-state claim is gone: a restart lands the replacement pod on
+        // a never-formatted device under the base deadline — refuse, never
+        // wait longer under the shared fences.
+        let mut cluster = GateCluster::deployed("cap-app", "app");
+        cluster.with_pod("cap-app", "app", true);
+        cluster
+            .responses
+            .remove("/api/v1/namespaces/cap-app/persistentvolumeclaims/tls-state-app-0");
+        let engine = gate_engine(cluster);
+        let verdict = ingress_restart_verdict(&engine, "cap-app", "app")
+            .await
+            .expect("live cluster proof must resolve");
+        assert_eq!(verdict, IngressRestartVerdict::Unproven);
+    }
+
+    #[tokio::test]
+    async fn ingress_restart_unproven_while_initializer_not_ready() {
+        // Live pod mounting both claims but not yet Ready: enclava-init may
+        // still be scanning/formatting — a restart now could strand a
+        // partially formatted volume.
+        let mut cluster = GateCluster::deployed("cap-app", "app");
+        cluster.with_pod("cap-app", "app", false);
+        let engine = gate_engine(cluster);
+        let verdict = ingress_restart_verdict(&engine, "cap-app", "app")
+            .await
+            .expect("live cluster proof must resolve");
+        assert_eq!(verdict, IngressRestartVerdict::Unproven);
+    }
+
+    #[tokio::test]
+    async fn ingress_restart_unproven_without_live_pod() {
+        // Claims exist but the ordinal-0 pod is absent (evicted/scaled): no
+        // live proof of completed initialization, fail closed.
+        let cluster = GateCluster::deployed("cap-app", "app");
+        let engine = gate_engine(cluster);
+        let verdict = ingress_restart_verdict(&engine, "cap-app", "app")
+            .await
+            .expect("live cluster proof must resolve");
+        assert_eq!(verdict, IngressRestartVerdict::Unproven);
+    }
+
+    #[tokio::test]
+    async fn terminal_failed_deployment_cannot_admit_restart_of_live_unready_pod() {
+        // A 'failed' deployment row is terminal — the DB guard passes it —
+        // but the pod it left behind is still mid first-boot. The verdict
+        // consults live cluster state only, so it must refuse regardless of
+        // the recorded status.
+        let pool = crate::test_support::database_test_pool().await;
+        let (app, deployment_id, _, _) =
+            crate::deployment_jobs::tests::insert_job_fixture(&pool).await;
+        sqlx::query("UPDATE deployments SET status = 'failed'::deploy_status_enum WHERE id = $1")
+            .bind(deployment_id)
+            .execute(&pool)
+            .await
+            .expect("record terminal deployment status");
+
+        let mut cluster = GateCluster::deployed(&app.namespace, &app.name);
+        cluster.with_pod(&app.namespace, &app.name, false);
+        let engine = gate_engine(cluster);
+        let verdict = ingress_restart_verdict(&engine, &app.namespace, &app.name)
+            .await
+            .expect("live cluster proof must resolve");
+        assert_eq!(verdict, IngressRestartVerdict::Unproven);
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("clean up fixture");
     }
 }
 
@@ -2014,6 +2474,54 @@ pub async fn set_app_status(pool: &PgPool, app_id: Uuid, status: &str) -> Result
     Ok(())
 }
 
+/// Whether a domain-triggered tenant-ingress restart may proceed.
+///
+/// `NotDeployed`: the workload StatefulSet does not exist yet, so there is
+/// nothing to restart — the caller keeps the DNS-only predeploy path.
+///
+/// `Ready`: a live StatefulSet exists and both persistent claims are proven
+/// initialized by the exact live Ready ordinal-0 pod, so the restart only
+/// re-opens finished volumes under the base rollout deadline.
+///
+/// `Unproven`: a live StatefulSet exists but at least one claim is missing,
+/// terminating, or not proven initialized — restarting could kill a still
+/// formatting first-boot pod or strand a fresh claim under the base wait,
+/// so the caller must conflict before any domain effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngressRestartVerdict {
+    NotDeployed,
+    Ready,
+    Unproven,
+}
+
+/// Probe live Kubernetes state before a domain mutation may restart the
+/// workload pod. Deployment-row status is NOT consulted: 'failed'/'healthy'
+/// rows cannot prove a first-boot formatter is finished, so only the shared
+/// live-proof inspector admits the restart. Lookup errors propagate (fail
+/// closed) and never admit.
+pub async fn ingress_restart_verdict(
+    engine: &ApplyEngine,
+    namespace: &str,
+    workload: &str,
+) -> Result<IngressRestartVerdict, DeployError> {
+    if !statefulset_exists(engine, namespace, workload).await? {
+        return Ok(IngressRestartVerdict::NotDeployed);
+    }
+    let fresh = enclava_engine::apply::orchestrator::inspect_fresh_volume_claims(
+        engine,
+        namespace,
+        workload,
+        enclava_engine::apply::orchestrator::FreshVolumeClaims::ALL,
+    )
+    .await
+    .map_err(DeployError::Apply)?;
+    if fresh.app_data || fresh.tls_data {
+        Ok(IngressRestartVerdict::Unproven)
+    } else {
+        Ok(IngressRestartVerdict::Ready)
+    }
+}
+
 /// Re-render and SSA-apply only the tenant-ingress ConfigMap for an app.
 ///
 /// Used when domain-only state changes (e.g. a custom-domain verification)
@@ -2021,6 +2529,11 @@ pub async fn set_app_status(pool: &PgPool, app_id: Uuid, status: &str) -> Result
 /// inside the pod runs `caddy run` with no live config-watch sidecar, so this
 /// function applies the new Caddyfile, triggers a StatefulSet rollout restart,
 /// and waits for the replacement pod to become ready before returning.
+///
+/// Callers MUST obtain `IngressRestartVerdict::Ready` (or `NotDeployed` for
+/// the DNS-only path) from [`ingress_restart_verdict`] before invoking this:
+/// it does not re-check initialization, and the rollout wait below assumes
+/// the restart only re-opens already-initialized volumes.
 ///
 /// Returns `DeployError::NotDeployed` when the app has no live StatefulSet yet.
 pub async fn reapply_tenant_ingress(
@@ -2052,6 +2565,10 @@ pub async fn reapply_tenant_ingress(
     let cm = enclava_engine::manifest::ingress::generate_ingress_configmap(&app_spec);
 
     let engine = ApplyEngine::try_default().await?;
+    // Domain-only reapply: the pod restart re-opens existing volumes, so the
+    // base rollout budget applies — the fresh-initialization allowance is
+    // reserved for renders that provision a new claim.
+    let rollout_timeout = engine.config().rollout_timeout;
     ensure_statefulset_exists(&engine, &app_spec.namespace, &app_spec.name).await?;
     let generation = MutationGeneration::new(kubernetes_mutation_generation)?;
     mutation
@@ -2067,7 +2584,13 @@ pub async fn reapply_tenant_ingress(
     restart_statefulset_for_ingress(&engine, &app_spec.namespace, &app_spec.name, generation)
         .await?;
 
-    let status = watch_rollout(&engine, &app_spec.namespace, &app_spec.name).await?;
+    let status = watch_rollout(
+        &engine,
+        &app_spec.namespace,
+        &app_spec.name,
+        rollout_timeout,
+    )
+    .await?;
     if status.phase != DeployPhase::Running {
         return Err(enclava_engine::apply::engine::ApplyError::RolloutFailed(
             status
@@ -2080,46 +2603,47 @@ pub async fn reapply_tenant_ingress(
     Ok(())
 }
 
-async fn ensure_statefulset_exists(
+async fn statefulset_exists(
     engine: &ApplyEngine,
     namespace: &str,
     name: &str,
-) -> Result<(), DeployError> {
-    use k8s_openapi::api::apps::v1::StatefulSet;
-    use kube::Api;
-
-    let api: Api<StatefulSet> = Api::namespaced(engine.client().clone(), namespace);
-    match api.get(name).await {
-        Ok(_) => Ok(()),
-        Err(kube::Error::Api(ae)) if ae.code == 404 => Err(DeployError::NotDeployed(format!(
-            "StatefulSet {namespace}/{name} not found"
-        ))),
-        Err(e) => Err(enclava_engine::apply::engine::ApplyError::Kube(e).into()),
-    }
-}
-
-/// One-shot evidence that the app's live workload has settled in the
-/// cluster: the StatefulSet controller has fully converged on the current
-/// desired state, so no earlier rollout can still replace the TEE behind a
-/// customer-config write. SQL rows alone cannot prove this — a terminally
-/// failed deployment row says nothing about a controller that keeps
-/// converging toward its already-applied spec past any settling window — so
-/// the customer-config roll hold verifies the live generation before it is
-/// armed. The convergence criterion is the same one rollout observation
-/// uses to declare a rollout complete (see `watch_rollout`). A missing
-/// StatefulSet is settled: there is no workload that could replace a TEE.
-pub async fn workload_rollout_settled(
-    engine: &ApplyEngine,
-    namespace: &str,
-    workload_name: &str,
 ) -> Result<bool, DeployError> {
     use k8s_openapi::api::apps::v1::StatefulSet;
     use kube::Api;
 
     let api: Api<StatefulSet> = Api::namespaced(engine.client().clone(), namespace);
+    match api.get(name).await {
+        Ok(_) => Ok(true),
+        Err(kube::Error::Api(ae)) if ae.code == 404 => Ok(false),
+        Err(e) => Err(enclava_engine::apply::engine::ApplyError::Kube(e).into()),
+    }
+}
+
+/// Probe under the app deployment lane: terminal SQL rows cannot prove a
+/// Kubernetes controller stopped replacing the TEE. `None` means no live
+/// workload exists, so recovery must not wait for config delivery to it.
+pub async fn workload_rollout_settled(
+    engine: &ApplyEngine,
+    namespace: &str,
+    workload_name: &str,
+) -> Result<Option<bool>, DeployError> {
+    use k8s_openapi::api::apps::v1::StatefulSet;
+    use kube::Api;
+
+    let api: Api<StatefulSet> = Api::namespaced(engine.client().clone(), namespace);
     match api.get(workload_name).await {
-        Ok(sts) => Ok(statefulset_rollout_settled(&sts)),
-        Err(kube::Error::Api(ae)) if ae.code == 404 => Ok(true),
+        Ok(sts)
+            if sts
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.replicas)
+                .unwrap_or(1)
+                <= 0 =>
+        {
+            Ok(None)
+        }
+        Ok(sts) => Ok(Some(statefulset_rollout_settled(&sts))),
+        Err(kube::Error::Api(ae)) if ae.code == 404 => Ok(None),
         Err(e) => Err(enclava_engine::apply::engine::ApplyError::Kube(e).into()),
     }
 }
@@ -2145,6 +2669,20 @@ pub fn statefulset_rollout_settled(sts: &k8s_openapi::api::apps::v1::StatefulSet
         && ready >= desired
         && current >= desired
         && updated >= desired
+}
+
+async fn ensure_statefulset_exists(
+    engine: &ApplyEngine,
+    namespace: &str,
+    name: &str,
+) -> Result<(), DeployError> {
+    if statefulset_exists(engine, namespace, name).await? {
+        Ok(())
+    } else {
+        Err(DeployError::NotDeployed(format!(
+            "StatefulSet {namespace}/{name} not found"
+        )))
+    }
 }
 
 async fn restart_statefulset_for_ingress(
@@ -2206,6 +2744,10 @@ pub struct DeploymentRollout {
     pub(crate) manifest_hash: String,
     observing_since: chrono::DateTime<chrono::Utc>,
     observation_slice: std::time::Duration,
+    /// Cumulative budget recorded by the watching transition. Resumed
+    /// observers reuse this value verbatim rather than recomputing it from
+    /// changing live cluster state.
+    pub(crate) rollout_timeout: std::time::Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2219,17 +2761,22 @@ pub struct DeploymentRolloutOutcome {
 
 impl DeploymentRollout {
     /// Read-only rollout observer for a generation whose durable deployment
-    /// row is already `watching`. It shares the recorded manifest hash and the
-    /// anchored observation window, and performs no provider mutation.
+    /// row is already `watching`. It shares the recorded manifest hash, the
+    /// anchored observation window, and the `rollout_timeout` budget that was
+    /// computed once before this generation's first provider apply and
+    /// persisted with the watching transition — resumed observation never
+    /// recomputes it from changing live pod or volume state. Performs no
+    /// provider mutation.
     pub(crate) fn observe_only(
         app: App,
         engine: ApplyEngine,
         manifest_hash: String,
         observing_since: chrono::DateTime<chrono::Utc>,
-    ) -> Self {
+        rollout_timeout: std::time::Duration,
+    ) -> Result<Self, DeployError> {
         let namespace = app.namespace.clone();
         let workload_name = app.name.clone();
-        Self {
+        Ok(Self {
             app,
             engine,
             namespace,
@@ -2237,7 +2784,8 @@ impl DeploymentRollout {
             manifest_hash,
             observing_since,
             observation_slice: ROLLOUT_OBSERVATION_SLICE,
-        }
+            rollout_timeout,
+        })
     }
 
     #[cfg(test)]
@@ -2265,7 +2813,7 @@ impl DeploymentRollout {
             status => status,
         };
         let unlock_mode = self.app.unlock_mode;
-        let total = self.engine.config().rollout_timeout;
+        let total = self.rollout_timeout;
         let elapsed = chrono::Utc::now()
             .signed_duration_since(self.observing_since)
             .to_std()
@@ -2282,7 +2830,7 @@ impl DeploymentRollout {
         };
         let result = match tokio::time::timeout(
             slice,
-            watch_rollout(&self.engine, &self.namespace, &self.workload_name),
+            watch_rollout(&self.engine, &self.namespace, &self.workload_name, total),
         )
         .await
         {
@@ -2334,6 +2882,8 @@ pub async fn apply_deployment_manifests(
         pool,
         app,
         snapshot,
+        engine,
+        fresh_volume_claims,
         deployment_id,
         attestation_config,
         kbs_policy_config,
@@ -2400,13 +2950,25 @@ pub async fn apply_deployment_manifests(
     enclava_engine::validate::validate_app(&app_spec)
         .map_err(|e| DeployError::Validation(e.to_string()))?;
 
+    // Reuse the under-fence verdict the worker reinspected immediately
+    // before this call: reading again here could terminalize a transient
+    // lookup failure after provider writes already began.
+    enclava_engine::apply::orchestrator::enforce_floor_on_claims(&app_spec, fresh_volume_claims)?;
+    let rollout_timeout = engine
+        .config()
+        .rollout_timeout_for_storage(
+            &app_spec.storage.app_data.size,
+            &app_spec.storage.tls_data.size,
+            fresh_volume_claims,
+        )
+        .map_err(DeployError::Validation)?;
+
     let tenant_image_pull_secret_config =
         tenant_image_pull_secret_config_for_containers(&app_spec.containers);
     let manifests = generate_all_manifests(&app_spec);
     let hash = manifest_hash(&manifests);
     set_deployment_status(&pool, deployment_id, "applying", Some(&hash), None, false).await?;
     set_app_status(&pool, app.id, "creating").await?;
-
     if signed_policy_artifact.is_some() {
         if should_reconcile_global_signed_policy_artifacts(true, &app_spec.attestation) {
             // Acceptance already advanced the durable desired generation in
@@ -2432,10 +2994,13 @@ pub async fn apply_deployment_manifests(
     }
 
     let generation = MutationGeneration::new(kubernetes_mutation_generation)?;
-    let engine = ApplyEngine::try_default().await?;
     mutation
         .arm_resource_scope_until_reconciled("kubernetes_namespace")
         .await?;
+    // The floor verdict was already derived from live PVC evidence before
+    // the first provider write above; provisioned sub-floor claims pass
+    // through unchanged.
+
     apply_all_with_tenant_image_pull_secret(
         &engine,
         &manifests,
@@ -2483,6 +3048,7 @@ pub async fn apply_deployment_manifests(
         manifest_hash: hash,
         observing_since: chrono::Utc::now(),
         observation_slice: ROLLOUT_OBSERVATION_SLICE,
+        rollout_timeout,
     }))
 }
 

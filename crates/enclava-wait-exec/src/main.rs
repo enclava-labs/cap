@@ -27,7 +27,7 @@ const DEFAULT_LOG_SPOOL_DIR: &str = "/run/enclava-logs";
 const STARTED_DIR_MODE: u32 = 0o2770;
 const O_NOFOLLOW: i32 = 0o400000;
 /// Soft cap on the encrypted log spool before rotation. The `logs` emptyDir
-/// is capped at 64 MiB by the engine manifest (see
+/// is capped at 4 GiB by the engine manifest (see
 /// `LOGS_EMPTY_DIR_SIZE_LIMIT`); rotating well below that (aligned to the
 /// relay's 2 MiB MAX_TAIL_BYTES tail window, with ample margin) keeps the
 /// volume from ever hitting ENOSPC, which would otherwise kill the forwarding
@@ -40,7 +40,7 @@ const LOG_SPOOL_KEEP_BYTES: u64 = 8 * 1024 * 1024;
 /// split at this boundary into consecutive frames (same stream, consecutive
 /// sequence numbers, order preserved) so a pathological writer cannot grow
 /// the wrapper's memory without bound or produce a frame larger than the
-/// rotation headroom below the 64 MiB volume cap. 256 KiB of plaintext
+/// rotation headroom below the 4 GiB volume cap. 256 KiB of plaintext
 /// encodes to well under 512 KiB of framed output.
 const MAX_LOG_RECORD_BYTES: usize = 256 * 1024;
 /// Cap on one spool line during the startup sequence scan. This MUST
@@ -57,7 +57,7 @@ const MAX_LOG_RECORD_BYTES: usize = 256 * 1024;
 /// writer-produced frame is `MAX_LOG_RECORD_BYTES` of plaintext "encoded
 /// to well under 512 KiB of framed output" (see `MAX_LOG_RECORD_BYTES`),
 /// and the round-15 review P2 hazard was `BufRead::lines()` turning one
-/// newline-free record — up to the whole 64 MiB volume — into a single
+/// newline-free record — up to the whole 4 GiB volume — into a single
 /// String allocation before the child spawned, OOM-looping a constrained
 /// container while the same spool remained.
 const MAX_SPOOL_LINE_BYTES: u64 = 2 * 1024 * 1024;
@@ -545,7 +545,7 @@ fn open_log_spool(path: &Path) -> Result<File, String> {
 /// `BufRead::lines()` buffers a complete record with no size limit, so a
 /// newline-free or malformed record left in the workload-writable spool
 /// before the container restarted became one String allocation as large as
-/// the whole volume (64 MiB) — before the child even spawned — and on a
+/// the whole volume (4 GiB) — before the child even spawned — and on a
 /// constrained app container that is a persistent wrapper OOM/restart loop
 /// while the same spool remains. Records are now read through a capped
 /// reader (MAX_SPOOL_LINE_BYTES) and oversized or incomplete records are
@@ -1057,7 +1057,7 @@ fn rotate_spool_if_needed(spool: &mut File, incoming: u64, path: &Path) -> std::
     // sampled `len`. The workload shares the group-writable logs volume and
     // can append directly to the spool inode while rotation runs; an
     // unbounded read_to_end would keep consuming those bytes (allocating
-    // up to the 64 MiB volume cap) while the spool mutex is held, starving
+    // up to the 4 GiB volume cap) while the spool mutex is held, starving
     // both forwarders and eventually blocking the child's stdout/stderr.
     // Only the snapshot that existed when `len` was sampled is retained.
     Read::by_ref(spool)
@@ -2256,7 +2256,7 @@ mod tests {
     /// accumulated a complete record with no size limit, so one
     /// newline-free (or gigantic) record left in the shared spool before
     /// the container restarted became a single String allocation up to the
-    /// whole 64 MiB volume — before the child spawned — and OOM-looped a
+    /// whole 4 GiB volume — before the child spawned — and OOM-looped a
     /// constrained container while the same spool remained. The scan now
     /// reads through a capped reader (MAX_SPOOL_LINE_BYTES) and
     /// consumes-and-SKIPS oversized and incomplete records without

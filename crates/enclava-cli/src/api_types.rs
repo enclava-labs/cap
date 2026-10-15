@@ -400,7 +400,9 @@ pub struct TemplateInstanceResponse {
     pub customer_config_hold: bool,
     /// The hold deadline CAP stored when it accepted the deployment. A
     /// replayed create response carries the original expiry, not a fresh
-    /// window, so retry deadlines must derive from it.
+    /// window. Diagnostic only — deadlines derive from
+    /// `customer_config_hold_remaining_ms` instead, since subtracting the
+    /// client wall clock from this timestamp is unsafe under clock skew.
     #[serde(default)]
     pub customer_config_hold_until: Option<String>,
     /// Milliseconds left on the stored hold, computed on CAP's database

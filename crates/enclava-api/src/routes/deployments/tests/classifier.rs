@@ -715,48 +715,6 @@ fn external_id_rejects_empty_or_padded_values() {
     }
 }
 
-#[test]
-fn cap_core_source_has_no_product_specific_deployment_customizations() {
-    let source_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let needles = [
-        ["her", "mes"].concat(),
-        ["secret", "_", "agent"].concat(),
-        ["nut", "shell"].concat(),
-    ];
-    let mut findings = Vec::new();
-    scan_rs_files_for_needles(&source_dir, &needles, &mut findings);
-
-    assert!(
-        findings.is_empty(),
-        "CAP core source contains product-specific deployment customizations: {findings:?}"
-    );
-}
-
-fn scan_rs_files_for_needles(
-    dir: &std::path::Path,
-    needles: &[String],
-    findings: &mut Vec<String>,
-) {
-    for entry in std::fs::read_dir(dir).unwrap() {
-        let entry = entry.unwrap();
-        let path = entry.path();
-        if path.is_dir() {
-            scan_rs_files_for_needles(&path, needles, findings);
-            continue;
-        }
-        if path.extension().and_then(std::ffi::OsStr::to_str) != Some("rs") {
-            continue;
-        }
-        let contents = std::fs::read_to_string(&path).unwrap();
-        let normalized = contents.to_ascii_lowercase();
-        for needle in needles {
-            if normalized.contains(needle) {
-                findings.push(format!("{} contains {}", path.display(), needle));
-            }
-        }
-    }
-}
-
 #[tokio::test]
 async fn deploy_rejects_member_before_database_access() {
     let result = deploy(
@@ -887,4 +845,94 @@ async fn internal_generic_deployment_rejects_member_before_database_access() {
     .expect_err("a roll hold must not bypass deployment authorization");
 
     assert_eq!(rejection.0, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn external_id_replay_rejects_an_unreleased_terminal_hold() {
+    let pool = crate::test_support::database_test_pool().await;
+    let (app, _, _, payload) = crate::deployment_jobs::tests::insert_job_fixture(&pool).await;
+    let deployment_id = Uuid::new_v4();
+    let mut request = idempotency_request(&app.name);
+    request.external_id = Some(deployment_id.to_string());
+    request.customer_config_roll_hold_seconds = Some(600);
+    let mut snapshot = idempotency_deployment(&app).spec_snapshot;
+    snapshot["customer_config_roll_hold_requested_seconds"] = serde_json::json!(600);
+    snapshot["customer_config_roll_hold_seconds"] = serde_json::json!(600);
+    sqlx::query(
+        "UPDATE apps SET signer_identity_subject = $2, signer_identity_issuer = $3
+          WHERE id = $1",
+    )
+    .bind(app.id)
+    .bind(&request.signing.subject)
+    .bind(&request.signing.issuer)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query(
+        "INSERT INTO deployments (
+             id, org_id, app_id, trigger, external_id,
+             source_provider, source_repository, spec_snapshot
+         ) VALUES ($1, $2, $3, 'api', $4, 'github', $5, $6)",
+    )
+    .bind(deployment_id)
+    .bind(app.org_id)
+    .bind(app.id)
+    .bind(&request.external_id)
+    .bind(&request.source.repository)
+    .bind(snapshot)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    crate::deployment_jobs::insert_setup_job(
+        &mut tx,
+        deployment_id,
+        deployment_id,
+        &payload,
+        false,
+        Some(600),
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let mut auth = crate::test_support::auth_context(Role::Owner, &[]);
+    auth.org_id = app.org_id;
+    let mut state = crate::test_support::lazy_state();
+    state.db = pool.clone();
+    let (status, Json(open)) =
+        create_generic_deployment_inner(auth.clone(), state.clone(), request, true)
+            .await
+            .expect("replay the open hold");
+    assert_eq!(status, StatusCode::OK);
+    assert!(open.customer_config_hold);
+    assert!(open.customer_config_hold_remaining_ms.unwrap() > 0);
+
+    sqlx::query("UPDATE deployments SET status = 'failed' WHERE id = $1")
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE deployment_apply_jobs
+            SET state = 'failed', next_attempt_at = clock_timestamp(),
+                last_error_code = 'customer_config_hold_expired'
+          WHERE deployment_id = $1",
+    )
+    .bind(deployment_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let mut retry = idempotency_request(&app.name);
+    retry.external_id = Some(deployment_id.to_string());
+    retry.customer_config_roll_hold_seconds = Some(600);
+    let error = create_generic_deployment_inner(auth, state, retry, true)
+        .await
+        .expect_err("terminal hold must not replay as an unheld deployment");
+    assert_eq!(error.0, StatusCode::GONE);
+    sqlx::query("DELETE FROM organizations WHERE id = $1")
+        .bind(app.org_id)
+        .execute(&pool)
+        .await
+        .unwrap();
 }

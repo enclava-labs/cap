@@ -78,6 +78,7 @@ pub(crate) async fn enforce_authoritative_entitlement(
     org_id: Uuid,
     resources: &AppResources,
     creating_app: bool,
+    fresh_volume_claims: enclava_engine::apply::orchestrator::FreshVolumeClaims,
 ) -> Result<crate::entitlements::AuthoritativeEntitlement, (StatusCode, Json<serde_json::Value>)> {
     let authority = crate::entitlements::authoritative_entitlement_in_tx(tx, org_id)
         .await
@@ -101,6 +102,30 @@ pub(crate) async fn enforce_authoritative_entitlement(
     })?;
     crate::entitlements::validate_resource_limits(resources, limits)
         .map_err(resource_limit_error_response)?;
+    // The 32 MiB LUKS2 fresh-format floor (shared with enclava-init's
+    // MIN_VOLUME_BYTES), enforced per claim: only sizes that would
+    // provision a NEW PVC are checked. Surviving sub-floor claims are
+    // grandfathered (they activate fine) — callers derive the flags from
+    // actual PVC evidence, never from render markers.
+    for (fresh, field, value) in [
+        (
+            fresh_volume_claims.app_data,
+            "storage",
+            resources.app_data_size.as_str(),
+        ),
+        (
+            fresh_volume_claims.tls_data,
+            "tls_storage",
+            resources.tls_data_size.as_str(),
+        ),
+    ] {
+        if fresh {
+            enclava_engine::validate::validate_persistent_volume_size_for_fresh_provisioning(
+                field, value,
+            )
+            .map_err(|message| json_error(StatusCode::BAD_REQUEST, message))?;
+        }
+    }
     if creating_app {
         let app_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM apps WHERE org_id = $1")
             .bind(org_id)
@@ -119,6 +144,49 @@ pub(crate) async fn enforce_authoritative_entitlement(
         }
     }
     Ok(authority)
+}
+
+/// Which of the app's persistent-volume claims a sub-floor size would
+/// provision FRESH — derived from POSITIVE initialization evidence, not
+/// claim existence or render markers. `manifest_hash`/`observing_since`
+/// only ever proved the StatefulSet was WRITTEN, and a surviving PVC alone
+/// only ever proved the object exists: a bound-but-unformatted claim must
+/// still be refused below the floor. Live Kubernetes state is the only
+/// admissible evidence: the exact ordinal-0 pod non-terminating, Ready,
+/// mounting the exact claim, and created in a later whole second than it.
+/// Deployment history is deliberately NOT consulted — independent database
+/// and Kubernetes clocks cannot order a row against a claim, and a
+/// password-timeout redeploy can publish healthy without opening storage.
+/// Conservative availability cost: an initialized legacy sub-floor claim
+/// with no live proof is refused until the workload regains live readiness.
+///
+/// Sizes at/above the floor and grammar-invalid values (rejected by
+/// `validate_resource_limits` upstream) short-circuit without any lookup —
+/// no Kubernetes I/O at all. The workload name is `app.name` — the same
+/// field `build_confidential_app_from_rows` renders into the StatefulSet —
+/// and the namespace is `app.namespace`. Fails closed: an unproven legacy
+/// claim keeps the floor (a refusal, never a destructive recovery), and
+/// lookup errors abort the request rather than granting the waiver.
+pub(crate) async fn fresh_volume_claims(
+    app: &App,
+    resources: &AppResources,
+) -> Result<enclava_engine::apply::orchestrator::FreshVolumeClaims, crate::deploy::DeployError> {
+    let claims_to_check = enclava_engine::apply::orchestrator::FreshVolumeClaims {
+        app_data: enclava_engine::validate::is_sub_floor_volume_size(&resources.app_data_size),
+        tls_data: enclava_engine::validate::is_sub_floor_volume_size(&resources.tls_data_size),
+    };
+    if !claims_to_check.app_data && !claims_to_check.tls_data {
+        return Ok(enclava_engine::apply::orchestrator::FreshVolumeClaims::NONE);
+    }
+    let engine = enclava_engine::apply::engine::ApplyEngine::try_default().await?;
+    enclava_engine::apply::orchestrator::inspect_fresh_volume_claims(
+        &engine,
+        &app.namespace,
+        &app.name,
+        claims_to_check,
+    )
+    .await
+    .map_err(crate::deploy::DeployError::Apply)
 }
 
 fn dns_error_response(error: crate::dns::DnsError) -> (StatusCode, Json<serde_json::Value>) {
@@ -609,18 +677,8 @@ async fn app_has_prior_healthy_deployment(
     .await
 }
 
-/// How long a *terminally failed* rollout still counts as in-flight
-/// evidence for the hold decision. A rollout that exhausted its
-/// observation budget has already applied its Kubernetes Deployment, and
-/// nothing in SQL cancels that apply — the cluster controller can still
-/// replace the old pod later. CAP cannot distinguish "controller gave up"
-/// from "controller still converging", so the failure is honored for one
-/// engine rollout budget (`ApplyConfig::rollout_timeout`, the same budget
-/// observation itself used) and then treated as settled: a permanent
-/// conflict would strand the app, because terminal rows never change and
-/// the hosted CLI always requests the hold. Past the window the residual
-/// race still fails closed — a config write into a swapped TEE fails, the
-/// CLI does not release, and the held deployment expires unrolled.
+/// Keep recent terminal applies as conservative SQL evidence; after this
+/// window the live Kubernetes probe still has to prove convergence.
 fn terminal_rollout_settling_window() -> std::time::Duration {
     enclava_engine::apply::types::ApplyConfig::default().rollout_timeout
 }
@@ -637,9 +695,8 @@ fn terminal_rollout_settling_window_sql() -> String {
 /// `pending`/`applying`) rollout may still replace or boot the TEE a held
 /// redeploy is trying to write customer config into. Callers must run this
 /// *before* `supersede_incomplete_deployments`, which rewrites exactly
-/// these statuses to `failed`. An unreleased customer-config hold is
-/// excluded: its roll is deliberately frozen and must not block the next
-/// deployment's own hold decision.
+/// these statuses to `failed`. A frozen hold has no controller rollout;
+/// the shared supersession guard separately protects its config delivery.
 ///
 /// A rollout that *terminalized on failure* (timeout or engine error) is
 /// equally capable of replacing the TEE — its Kubernetes Deployment was
@@ -1307,6 +1364,27 @@ async fn deploy_app_candidate(
         "setup_state": DEPLOYMENT_SETUP_DNS_PENDING,
     });
 
+    // Fresh-volume floor: which sub-floor claims lack positive
+    // initialization evidence and would provision FRESH. Derived from live
+    // cluster evidence BEFORE opening the acceptance transaction (no kube
+    // I/O under the authority lanes, no I/O at all for at/above-floor
+    // sizes). App INSERT always validates fresh without a lookup. A
+    // concurrent authority change invalidates this estimate, but the
+    // candidate tx's lane + authority checks catch that — the apply
+    // worker's under-fence reinspection is the backstop either way.
+    let fresh_volume_claims = if app_mutation == AppMutation::Insert {
+        enclava_engine::apply::orchestrator::FreshVolumeClaims::ALL
+    } else {
+        fresh_volume_claims(&app, &candidate_resources)
+            .await
+            .map_err(|_| {
+                json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "volume provisioning state could not be verified; retry the deployment",
+                )
+            })?
+    };
+
     // No requested app/container state has been persisted before this point.
     // Commit every accepted deployment row and its app/container changes as a
     // single unit so any database error rolls the candidate back completely.
@@ -1350,7 +1428,7 @@ async fn deploy_app_candidate(
     // that stale sample. Probe failures fail closed like an in-flight
     // rollout: the request is rejected with the retryable conflict instead
     // of arming a hold that cannot be trusted.
-    let mut cluster_workload_settled = true;
+    let mut cluster_workload_settled = Some(true);
     if honor_customer_config_roll_hold
         && body
             .customer_config_roll_hold_seconds
@@ -1381,7 +1459,7 @@ async fn deploy_app_candidate(
                             error = %error,
                             "could not verify live rollout settling; failing the roll hold closed"
                         );
-                        cluster_workload_settled = false;
+                        cluster_workload_settled = Some(false);
                     }
                     Err(elapsed) => {
                         tracing::warn!(
@@ -1389,7 +1467,7 @@ async fn deploy_app_candidate(
                             error = %elapsed,
                             "live rollout settling probe timed out; failing the roll hold closed"
                         );
-                        cluster_workload_settled = false;
+                        cluster_workload_settled = Some(false);
                     }
                 }
             }
@@ -1399,7 +1477,7 @@ async fn deploy_app_candidate(
                     error = %error,
                     "no Kubernetes client for the rollout settling probe; failing the roll hold closed"
                 );
-                cluster_workload_settled = false;
+                cluster_workload_settled = Some(false);
             }
         }
     }
@@ -1408,6 +1486,7 @@ async fn deploy_app_candidate(
         auth.org_id,
         &candidate_resources,
         app_mutation == AppMutation::Insert,
+        fresh_volume_claims,
     )
     .await?;
     if let Some(artifacts) = signing_artifacts.as_ref() {
@@ -1679,7 +1758,7 @@ async fn deploy_app_candidate(
     // here: a converged StatefulSet generation is the only proof that no
     // earlier rollout's controller is still replacing the TEE behind the
     // held write, and an unverifiable probe fails closed the same way.
-    let rollout_in_flight = !cluster_workload_settled
+    let rollout_in_flight = cluster_workload_settled == Some(false)
         || ((app_mutation != AppMutation::Insert)
             && app_has_rollout_in_flight(&mut tx, app.id)
                 .await
@@ -1711,7 +1790,7 @@ async fn deploy_app_candidate(
             .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
     let customer_config_hold_seconds =
         match crate::deployment_jobs::customer_config_roll_hold_decision(
-            customer_config_roll_hold_request,
+            customer_config_roll_hold_request.filter(|_| cluster_workload_settled.is_some()),
             app_mutation == AppMutation::Insert,
             live_app_status,
             prior_healthy_workload,
@@ -2144,6 +2223,107 @@ mod tests {
             validate_log_encryption_config(Some(config)).expect_err("algorithm rejected");
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body.0["error"], "unsupported log_encryption.algorithm");
+    }
+
+    #[tokio::test]
+    async fn fresh_volume_floor_rejects_sub_luks2_minimum_sizes_synchronously() {
+        let pool = database_test_pool().await;
+        let app = insert_setup_test_app(&pool).await;
+
+        // 24 Mi passed the old grammar-only checks (positive binary
+        // quantity, under every cap). It does not brick — sub-floor LUKS2
+        // volumes activate — but the fresh-format floor must reject it
+        // synchronously instead of accepting a deployment enclava-init
+        // refuses at first boot.
+        let mut tx = pool.begin().await.expect("begin floor test tx");
+        let sub_floor = crate::models::AppResources {
+            app_id: app.id,
+            cpu_limit: "1".to_string(),
+            memory_limit: "1Gi".to_string(),
+            app_data_size: "24Mi".to_string(),
+            tls_data_size: "2Gi".to_string(),
+        };
+        let rejected = super::enforce_authoritative_entitlement(
+            &mut tx,
+            app.org_id,
+            &sub_floor,
+            true,
+            enclava_engine::apply::orchestrator::FreshVolumeClaims::ALL,
+        )
+        .await
+        .expect_err("fresh sub-floor volume size must be rejected at admission");
+        assert_eq!(rejected.0, StatusCode::BAD_REQUEST);
+        assert!(
+            rejected.1.0["error"]
+                .as_str()
+                .expect("error message")
+                .contains("at least 32Mi"),
+            "error should name the floor: {}",
+            rejected.1.0["error"]
+        );
+        tx.rollback().await.expect("rollback floor test tx");
+
+        // Grandfathering: the same persisted size keeps operating when its
+        // claim has a surviving PVC (claims=NONE) — sub-floor LUKS2 volumes
+        // DO activate, so pre-floor apps are not locked out of
+        // redeploy/reapply/rollback.
+        let mut tx = pool.begin().await.expect("begin grandfather test tx");
+        super::enforce_authoritative_entitlement(
+            &mut tx,
+            app.org_id,
+            &sub_floor,
+            false,
+            enclava_engine::apply::orchestrator::FreshVolumeClaims::NONE,
+        )
+        .await
+        .expect("provisioned pre-floor size must keep operating on apply paths");
+        tx.rollback().await.expect("rollback grandfather test tx");
+
+        // Per-claim granularity: with only the state claim fresh, the
+        // sub-floor tls size is still waived.
+        let mut tx = pool.begin().await.expect("begin per-claim test tx");
+        let per_claim = crate::models::AppResources {
+            app_id: app.id,
+            cpu_limit: "1".to_string(),
+            memory_limit: "1Gi".to_string(),
+            app_data_size: "10Gi".to_string(),
+            tls_data_size: "24Mi".to_string(),
+        };
+        super::enforce_authoritative_entitlement(
+            &mut tx,
+            app.org_id,
+            &per_claim,
+            false,
+            enclava_engine::apply::orchestrator::FreshVolumeClaims {
+                app_data: true,
+                tls_data: false,
+            },
+        )
+        .await
+        .expect("a provisioned sub-floor tls claim must be waived");
+        tx.rollback().await.expect("rollback per-claim test tx");
+
+        // And the exact floor is accepted for fresh provisioning.
+        let mut tx = pool.begin().await.expect("begin boundary test tx");
+        let at_floor = crate::models::AppResources {
+            app_id: app.id,
+            cpu_limit: "1".to_string(),
+            memory_limit: "1Gi".to_string(),
+            app_data_size: "32Mi".to_string(),
+            tls_data_size: "32Mi".to_string(),
+        };
+        super::enforce_authoritative_entitlement(
+            &mut tx,
+            app.org_id,
+            &at_floor,
+            true,
+            enclava_engine::apply::orchestrator::FreshVolumeClaims::ALL,
+        )
+        .await
+        .expect("32Mi must be accepted for fresh provisioning");
+        tx.rollback().await.expect("rollback boundary test tx");
+
+        delete_setup_test_org(&pool, app.org_id).await;
     }
 
     #[tokio::test]
@@ -2743,7 +2923,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rollout_in_flight_evidence_skips_frozen_holds() {
+    async fn rollout_in_flight_evidence_distinguishes_frozen_holds() {
         let pool = database_test_pool().await;
         let app = insert_setup_test_app(&pool).await;
 
@@ -2814,8 +2994,8 @@ mod tests {
             "a watching earlier rollout means the workload is unstable"
         );
 
-        // An unreleased hold freezes its roll before apply: it must not
-        // block the next deployment's own hold decision.
+        // Frozen config delivery has no cluster rollout; the shared
+        // supersession guard protects it separately.
         sqlx::query("UPDATE deployments SET status = 'failed' WHERE id = $1")
             .bind(watching)
             .execute(&pool)

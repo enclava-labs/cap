@@ -485,12 +485,12 @@ async fn deploy_with_timings(
     // retry. CAP applies the hold only when a live workload is being
     // replaced and reports that in the response.
     let roll_hold_seconds = customer_config_roll_hold_seconds(args.ssh_timeout_seconds);
-    // CAP arms the hold when it accepts the request below. The fallback
-    // clock starts here, not at deploy_started, so preflight time above
+    // CAP arms the hold when it accepts the request below. The deadline
+    // anchor starts here, not at deploy_started, so preflight time above
     // (discovery, app creation, key preparation, signing) does not consume
-    // the hold. The response's `customer_config_hold_until` is the
-    // authoritative deadline — a replayed create returns the original
-    // expiry, never a fresh window from the retry.
+    // the hold. The server-quoted remainder is anchored at this instant:
+    // CAP measured it after the request was sent, so anchoring at send can
+    // only shorten the window, never extend it.
     let hold_armed_at = Instant::now();
     let response = match timings
         .run(
@@ -516,11 +516,7 @@ async fn deploy_with_timings(
         explicit_stable_endpoint.as_deref(),
     )?;
     let customer_config_hold = response.customer_config_hold;
-    let customer_config_hold_until = response.customer_config_hold_until.clone();
     let customer_config_hold_remaining_ms = response.customer_config_hold_remaining_ms;
-    // Measured at response receipt: the server-quoted remaining duration
-    // maps onto a monotonic deadline here, immune to wall-clock skew.
-    let hold_response_received_at = Instant::now();
     let deployment_id = response
         .deployment
         .cap_deployment_id
@@ -530,22 +526,18 @@ async fn deploy_with_timings(
     if customer_config_hold && deployment_id == "pending" {
         return Err("PaaS held the workload roll but did not return a deployment id".into());
     }
-    // The server-quoted remaining duration is the deadline authority: CAP
-    // computed it on the database clock at response time, so mapping it onto
-    // a monotonic instant here cannot abandon a live hold or release past
-    // expiry under client/server clock skew — transit delay only shortens
-    // the budget. The absolute `customer_config_hold_until` still identifies
-    // the original hold for older responses, and the local estimate remains
-    // only a last-resort fallback. Reserve release time inside the window.
-    let hold_expires_at = customer_config_hold.then(|| {
-        hold_expiry_instant(
-            customer_config_hold_remaining_ms,
-            customer_config_hold_until.as_deref(),
-            hold_response_received_at,
-            hold_armed_at,
-            roll_hold_seconds,
-        )
-    });
+    // Anchor CAP's server-clock remainder before transit; delayed replays
+    // must not extend the original hold.
+    let hold_expires_at = customer_config_hold
+        .then(|| {
+            hold_expiry_instant(
+                customer_config_hold_remaining_ms,
+                response.customer_config_hold_until.as_deref(),
+                hold_armed_at,
+                roll_hold_seconds,
+            )
+        })
+        .transpose()?;
     let pre_release_deadline = hold_expires_at.map(hold_pre_release_deadline);
     let phase_budget =
         |requested: u64| bounded_phase(pre_release_deadline, Duration::from_secs(requested));
@@ -1000,53 +992,30 @@ const CUSTOMER_CONFIG_ROLL_HOLD_MAX_SECONDS: u64 = 7_200;
 /// password-mode owner wait.
 const CUSTOMER_CONFIG_ROLL_HOLD_PREFIX_SECONDS: u64 = 240 + (121 * 2) + 60;
 
-/// The pre-request clock conservatively precedes CAP arming the hold, so a
-/// local estimate never outlives the stored deadline.
+/// Cap the budget for this request, not the authority of an older replay.
 fn hold_expiry(armed_at: Instant, hold_seconds: u32) -> Instant {
     armed_at + Duration::from_secs(u64::from(hold_seconds))
 }
 
-/// Resolve the hold expiry as a monotonic deadline. CAP quotes
-/// `customer_config_hold_remaining_ms` from its database clock at response
-/// time, so adding it to `received_at` is skew-safe; a zero or negative
-/// remainder is already expired, never a fresh window. That remainder is
-/// always bounded by the conservative local estimate anchored at the
-/// request send: CAP measured the remainder before the response travelled
-/// through PaaS, so `received_at + remaining` alone can grant work beyond
-/// the stored expiry when transit exceeds the release reserve. The local
-/// estimate uses the same requested budget as a fresh arm, so it can only
-/// shorten the window, never extend a replay's authority. Older responses
-/// fall back to the absolute `customer_config_hold_until`, then to the
-/// local estimate alone for a PaaS that predates both fields.
+/// Use only CAP's server-clock remainder: a client wall clock or a fresh
+/// local budget can extend an almost-expired replay.
 fn hold_expiry_instant(
     remaining_ms: Option<i64>,
     hold_until: Option<&str>,
-    received_at: Instant,
     armed_at: Instant,
     hold_seconds: u32,
-) -> Instant {
-    if let Some(remaining_ms) = remaining_ms {
-        // Saturate absurd remainders at the documented hold maximum, then
-        // bound transit extension with the pre-request estimate.
-        let bounded = remaining_ms.clamp(0, (CUSTOMER_CONFIG_ROLL_HOLD_MAX_SECONDS * 1_000) as i64);
-        return (received_at + Duration::from_millis(bounded as u64))
-            .min(hold_expiry(armed_at, hold_seconds));
-    }
-    if let Some(until) = hold_until
-        && let Ok(expiry) = chrono::DateTime::parse_from_rfc3339(until)
-    {
-        // Cross-version responses carry only the absolute expiry. Deriving
-        // authority by subtracting the client wall clock is unsafe under
-        // skew — a clock behind CAP's can extend the window past CAP's
-        // stored deadline — so the derived deadline is capped at the
-        // pre-request estimate, which never outlives the hold CAP armed
-        // for this request.
-        let remaining = expiry.timestamp_millis() - chrono::Utc::now().timestamp_millis();
-        return (Instant::now()
-            + Duration::from_millis(u64::try_from(remaining.max(0)).unwrap_or(0)))
-        .min(hold_expiry(armed_at, hold_seconds));
-    }
-    hold_expiry(armed_at, hold_seconds)
+) -> Result<Instant, Box<dyn std::error::Error>> {
+    let Some(remaining_ms) = remaining_ms else {
+        return Err(format!(
+            "PaaS held the workload roll (customer_config_hold_until: {}) but returned no customer_config_hold_remaining_ms; the hold deadline cannot be derived safely. Upgrade CAP and PaaS before retrying `template deploy`; the hold expires on its own and this CLI has not delivered customer config or released the roll.",
+            hold_until.unwrap_or("absent")
+        )
+        .into());
+    };
+    // Saturate absurd remainders at the documented hold maximum; the
+    // requested budget caps whatever remains.
+    let bounded = remaining_ms.clamp(0, (CUSTOMER_CONFIG_ROLL_HOLD_MAX_SECONDS * 1_000) as i64);
+    Ok((armed_at + Duration::from_millis(bounded as u64)).min(hold_expiry(armed_at, hold_seconds)))
 }
 
 /// Leave 30 seconds for release after config delivery.
@@ -5783,19 +5752,18 @@ mod tests {
     #[test]
     fn replayed_hold_deadline_comes_from_the_stored_expiry() {
         let armed_at = Instant::now();
-        let received_at = Instant::now();
-        // A replayed create carries the original expiry plus the remaining
-        // duration CAP computed on its database clock. The remaining-ms path
-        // is authoritative: a retry deep into a two-hour hold must see only
-        // the leftover window, and client clock skew cannot stretch it.
+        // A replayed create carries the remaining duration CAP computed on
+        // its database clock. Anchored at the request send, a retry deep
+        // into a two-hour hold sees only the leftover window, and client
+        // clock skew cannot stretch it.
         let expiry = hold_expiry_instant(
             Some(5_400_000), // 90 minutes left on the original hold
             Some("2099-01-01T00:00:00Z"),
-            received_at,
             armed_at,
             CUSTOMER_CONFIG_ROLL_HOLD_MAX_SECONDS as u32,
-        );
-        let expected = received_at + Duration::from_millis(5_400_000);
+        )
+        .unwrap();
+        let expected = armed_at + Duration::from_millis(5_400_000);
         let skew = expiry
             .checked_duration_since(expected)
             .or_else(|| expected.checked_duration_since(expiry))
@@ -5808,84 +5776,56 @@ mod tests {
         // Zero and negative remainders are already expired: the monotonic
         // deadline is now, never a fresh window.
         for expired in [0_i64, -1, -60_000] {
-            let deadline = hold_expiry_instant(
-                Some(expired),
-                Some("2099-01-01T00:00:00Z"),
-                received_at,
-                armed_at,
-                7_200,
-            );
+            let deadline =
+                hold_expiry_instant(Some(expired), Some("2099-01-01T00:00:00Z"), armed_at, 7_200)
+                    .unwrap();
             assert!(
                 deadline <= Instant::now() + Duration::from_millis(10),
                 "remaining_ms={expired} must be an expired hold"
             );
         }
 
-        // A response delayed in transit must not stretch the hold past the
-        // pre-request estimate: CAP measured the remainder before transit,
-        // so the local estimate bounds how far the quoted remainder can
-        // ride on the receipt clock.
+        // Transit consumes the quoted remainder: CAP measured it at
+        // response time, so a nearly expired replay whose response spent
+        // longer in transit than the remainder itself arrives with no
+        // delivery window — even when the request asked for the full
+        // hold budget.
         let late_armed = Instant::now()
-            .checked_sub(Duration::from_secs(7_000))
+            .checked_sub(Duration::from_secs(45))
             .unwrap_or_else(Instant::now);
-        let transit = hold_expiry_instant(Some(7_200_000), None, received_at, late_armed, 7_200);
+        for remainder in [0_i64, 15_000, 44_999] {
+            let deadline = hold_expiry_instant(
+                Some(remainder),
+                Some("2099-01-01T00:00:00Z"),
+                late_armed,
+                CUSTOMER_CONFIG_ROLL_HOLD_MAX_SECONDS as u32,
+            )
+            .unwrap();
+            assert!(
+                deadline <= Instant::now() + Duration::from_millis(10),
+                "a 45s transit over a {remainder}ms remainder must leave no window"
+            );
+        }
+
+        // Short of full consumption, transit still shrinks the window
+        // instead of re-granting the whole remainder at receipt.
+        let drifted = Instant::now()
+            .checked_sub(Duration::from_secs(10))
+            .unwrap_or_else(Instant::now);
+        let shrunk =
+            hold_expiry_instant(Some(15_000), Some("2099-01-01T00:00:00Z"), drifted, 7_200)
+                .unwrap();
         assert!(
-            transit <= Instant::now() + Duration::from_secs(201),
-            "a delayed response must not grant a fresh 2h window"
+            shrunk <= Instant::now() + Duration::from_secs(6),
+            "10s of transit must consume the quoted 15s remainder, got {shrunk:?}"
         );
 
-        // Without the integer field but with the absolute expiry, the
-        // wall-clock subtraction path still applies for older responses,
-        // but it can never grant more than the pre-request estimate: a
-        // client clock behind CAP's must not stretch the window past the
-        // deadline CAP armed for this request.
-        let until = chrono::DateTime::parse_from_rfc3339("2099-01-01T00:00:00Z").unwrap();
-        let expiry = hold_expiry_instant(
-            None,
-            Some(&until.to_rfc3339()),
-            received_at,
-            armed_at,
-            CUSTOMER_CONFIG_ROLL_HOLD_MAX_SECONDS as u32,
-        );
-        assert!(
-            expiry <= armed_at + Duration::from_secs(CUSTOMER_CONFIG_ROLL_HOLD_MAX_SECONDS),
-            "a skewed wall-clock expiry must not exceed the pre-request estimate"
-        );
-        // A near absolute expiry inside the local estimate still drives
-        // the deadline directly.
-        let soon = chrono::Utc::now() + chrono::Duration::seconds(30);
-        let soon_expiry = hold_expiry_instant(
-            None,
-            Some(&soon.to_rfc3339()),
-            received_at,
-            armed_at,
-            CUSTOMER_CONFIG_ROLL_HOLD_MAX_SECONDS as u32,
-        );
-        assert!(
-            soon_expiry <= Instant::now() + Duration::from_secs(35),
-            "a non-skewed absolute expiry must drive the deadline"
-        );
-
-        // Without either field (older PaaS), the local estimate stands in.
-        let fallback = hold_expiry_instant(None, None, received_at, armed_at, 120);
-        assert!(
-            fallback <= armed_at + Duration::from_secs(121)
-                && fallback >= armed_at + Duration::from_secs(119),
-            "fallback must be armed_at + hold_seconds"
-        );
-
-        // An unparseable or already-past expiry never extends the hold.
-        let past = hold_expiry_instant(
-            None,
-            Some("2020-01-01T00:00:00Z"),
-            received_at,
-            armed_at,
-            7_200,
-        );
-        assert!(past <= Instant::now() + Duration::from_secs(1));
-        let garbage =
-            hold_expiry_instant(None, Some("not-a-timestamp"), received_at, armed_at, 120);
-        assert_eq!(garbage, hold_expiry(armed_at, 120));
+        // A remainder quoting more than the requested budget is capped at
+        // the pre-request estimate, never at a fresh window.
+        let capped =
+            hold_expiry_instant(Some(7_200_000), Some("2099-01-01T00:00:00Z"), armed_at, 120)
+                .unwrap();
+        assert_eq!(capped, hold_expiry(armed_at, 120));
 
         // The pre-release deadline keeps the 30s release reserve inside the
         // stored window and never goes below now.
@@ -5895,6 +5835,25 @@ mod tests {
                 && reserve >= Instant::now() + Duration::from_secs(55),
             "pre-release deadline must be expiry - 30s"
         );
+    }
+
+    #[test]
+    fn held_response_without_server_remainder_fails_closed() {
+        let armed_at = Instant::now();
+        // A held response must never derive its deadline from the absolute
+        // timestamp or the local estimate: subtracting the client wall
+        // clock can extend a nearly expired replay. Whether or not
+        // `customer_config_hold_until` accompanies it, the missing
+        // remainder is an actionable error, not a fallback window.
+        for hold_until in [None, Some("2099-01-01T00:00:00Z")] {
+            let error = hold_expiry_instant(None, hold_until, armed_at, 7_200)
+                .expect_err("a held response without remaining_ms must not authorize writes");
+            let message = error.to_string();
+            assert!(
+                message.contains("customer_config_hold_remaining_ms"),
+                "the error must name the missing field: {message}"
+            );
+        }
     }
 
     #[test]
