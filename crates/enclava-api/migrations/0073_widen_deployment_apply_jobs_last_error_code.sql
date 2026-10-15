@@ -65,6 +65,8 @@ ALTER TABLE deployment_apply_jobs
             -- mutation-lease codes (MutationLeaseError)
             'app_mutation_busy',
             'app_mutation_lease_lost',
-            'app_mutation_unavailable'
+            'app_mutation_unavailable',
+            -- preflight volume-evidence codes (main; DeploymentJobError::code)
+            'volume_evidence_unavailable'
         )
     );
