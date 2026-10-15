@@ -1220,6 +1220,52 @@ fn kbs_proxy_health_url(kbs_url: &str) -> String {
     format!("{base}/health")
 }
 
+/// Bounded readiness wait for a LOCAL attestation-agent token endpoint
+/// (default http://127.0.0.1:8006/aa/token): poll with a short per-request
+/// timeout until the endpoint answers with any HTTP status (the server is
+/// up), then return so the real single-shot token fetch runs. Reuses the
+/// KBS-proxy wait budget (300s default, 2s poll); overridable via the same
+/// env knobs. Remote URLs return immediately (cap#244 review).
+fn wait_for_local_aa_token_endpoint(token_url: &str) {
+    let Ok(url) = reqwest::Url::parse(token_url) else {
+        return;
+    };
+    let is_local = matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1"));
+    if !is_local {
+        return;
+    }
+    let wait_timeout = kbs_proxy_health_wait_timeout(token_url);
+    if wait_timeout.is_zero() {
+        return;
+    }
+    let poll = kbs_proxy_health_poll_interval();
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return,
+    };
+    tracing::info!(
+        token_url_host = url.host_str().unwrap_or(""),
+        wait_seconds = wait_timeout.as_secs(),
+        "waiting for local attestation-agent token endpoint before TEE verification"
+    );
+    let deadline = std::time::Instant::now() + wait_timeout;
+    while std::time::Instant::now() < deadline {
+        // Any HTTP response — even a 5xx — proves the listener is up; the
+        // real fetch then surfaces any genuine AA error verbatim.
+        if client.get(token_url).send().is_ok() {
+            return;
+        }
+        std::thread::sleep(poll.min(deadline - std::time::Instant::now()));
+    }
+    tracing::warn!(
+        wait_seconds = wait_timeout.as_secs(),
+        "local attestation-agent token endpoint still unreachable; proceeding to the token fetch"
+    );
+}
+
 fn is_local_kbs_proxy_url(kbs_url: &str) -> bool {
     reqwest::Url::parse(kbs_url)
         .ok()
@@ -1592,6 +1638,20 @@ fn run_in_tee_verification(cfg: &Config, cc_init_data: Option<&[u8]>) -> Result<
         .map(parse_pubkey)
         .transpose()?;
 
+    // Verification now runs BEFORE owner-seed acquisition (verify before
+    // any header mutation), so it can no longer inherit the KBS-proxy
+    // readiness wait that the autounlock path performs. A local
+    // attestation-agent that is slow to start would otherwise fail this
+    // single token fetch and bounce the container through restart backoff
+    // (cap#244 review). Wait (bounded) for the local AA endpoint to accept
+    // connections first; remote token URLs skip the wait.
+    if enclava_init::env_override("KBS_ATTESTATION_TOKEN")
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+    {
+        wait_for_local_aa_token_endpoint(&cfg.kbs_attestation_token_url);
+    }
     let token = trustee_verify::resolve_kbs_attestation_token(
         enclava_init::env_override("KBS_ATTESTATION_TOKEN").as_deref(),
         &cfg.kbs_attestation_token_url,
