@@ -1843,7 +1843,9 @@ pub(crate) async fn delete_app_before(
     // the selector change and converge it here, while this delete holds the
     // global kbs_policy fence, before the teardown request runs. A reconcile
     // failure flows into the same handling as a teardown failure below
-    // (restore-or-keep disposition, lease released in the lane).
+    // (restore-or-keep disposition, lease released in the lane) — except a
+    // budget failure whose full teardown unit is already live, which proceeds
+    // to teardown instead of demanding an over-budget republication.
     let teardown = if teardown_required && teardown_completed_at.is_none() {
         let mut publish_tx = state
             .db
@@ -1869,11 +1871,50 @@ pub(crate) async fn delete_app_before(
                 .map_err(|_| internal_server_error())?
             {
                 Ok(()) => None,
-                Err(error) => Some(app_delete_failure(
-                    deleting_app.id,
-                    AppDeleteFailure::KbsPolicy,
-                    error,
-                )),
+                Err(error) => {
+                    // A delete admitted as non-growing (its teardown unit
+                    // does not grow the required set) must still reach
+                    // teardown when the required set is already over budget
+                    // (e.g. the byte limit was lowered below the published
+                    // set): republication of the still-over-budget unit
+                    // fail-closes, but the exact authority may already be
+                    // live — teardown authorization is evaluated against the
+                    // live policy, and the required set shrinks once
+                    // teardown completes. Any other reconcile failure keeps
+                    // failing the delete as before.
+                    let already_published = matches!(
+                        error,
+                        crate::kbs::KbsPolicyError::SignedPolicyBudgetExceeded { .. }
+                    ) && match (
+                        state.kbs_policy.as_ref(),
+                        kube::Client::try_default().await,
+                    ) {
+                        (Some(config), Ok(client)) => crate::kbs::teardown_unit_already_published(
+                            &state.db,
+                            config,
+                            client,
+                            deleting_app.id,
+                        )
+                        .await
+                        .unwrap_or(false),
+                        _ => false,
+                    };
+                    if already_published {
+                        tracing::warn!(
+                            app_id = %deleting_app.id,
+                            code = "kbs_teardown_unit_already_published",
+                            "skipping over-budget republication for a non-growing delete; \
+                             the live policy already carries this app's teardown unit"
+                        );
+                        None
+                    } else {
+                        Some(app_delete_failure(
+                            deleting_app.id,
+                            AppDeleteFailure::KbsPolicy,
+                            error,
+                        ))
+                    }
+                }
             }
         } else {
             None

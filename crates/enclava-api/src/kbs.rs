@@ -1043,10 +1043,12 @@ async fn load_signed_policy_candidates(
 /// completed workload plus the newest later generation that published a
 /// StatefulSet — the same two arms `load_signed_policy_candidates` admits for
 /// a deleting app with teardown still pending — or the newest healthy
-/// deployment's artifacts for a legacy app without apply jobs. The delete
-/// transition marks the app deleting and sets `workload_teardown_required`
-/// together, so this projection is exactly what the selector admits once that
-/// transition lands.
+/// deployment's artifacts for a legacy app whose authority no job-backed
+/// deployment has durably replaced (a failed job-backed replacement leaves the
+/// pre-job healthy workload required, mirroring the selector's legacy
+/// eligibility). The delete transition marks the app deleting and sets
+/// `workload_teardown_required` together, so this projection is exactly what
+/// the selector admits once that transition lands.
 async fn load_teardown_policy_unit(
     db: &PgPool,
     app_id: Uuid,
@@ -1059,6 +1061,7 @@ async fn load_teardown_policy_unit(
                 job.state AS job_state,
                 job.artifact_deployment_id,
                 job.artifact_descriptor_core_hash,
+                deployment.status::text AS deployment_status,
                 deployment.workload_spec_published_at
             FROM deployment_apply_jobs AS job
             JOIN deployments AS deployment
@@ -1107,10 +1110,21 @@ async fn load_teardown_policy_unit(
                 ) AS current_operation_rank
             FROM deployments AS deployment
             WHERE deployment.app_id = $1
+              -- Mirror the selector's legacy eligibility (Codex review on
+              -- 0c678f57): legacy authority is retired by a durable healthy
+              -- job-backed replacement, not by the existence of any apply
+              -- job. A failed job-backed replacement keeps the pre-job
+              -- healthy workload required, so its artifact belongs to this
+              -- app's teardown unit and must count in admission.
               AND NOT EXISTS (
                   SELECT 1
-                    FROM deployment_apply_jobs AS any_job
-                   WHERE any_job.app_id = deployment.app_id
+                    FROM ranked_job_operations AS operation
+                   WHERE operation.deployment_status = 'healthy'
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                    FROM deployment_apply_jobs AS own_job
+                   WHERE own_job.deployment_id = deployment.id
               )
         ),
         legacy_unit AS (
@@ -1209,6 +1223,69 @@ pub async fn teardown_unit_fits_signed_policy_budget(
     let current = dedup_signed_policy_artifacts_by_hash(current);
     let current_len = signed_policy_artifact_policy_body(&current)?.len();
     Ok(projected_len <= current_len)
+}
+
+/// Whether a published signed-policy body already carries every artifact of a
+/// projected teardown unit. Understands both body shapes (the artifact-set
+/// document and the legacy single-artifact document); a non-JSON legacy Rego
+/// body covers nothing.
+fn signed_policy_body_covers_artifacts(
+    policy: &str,
+    artifacts: &[crate::signing_service::SignedPolicyArtifact],
+) -> bool {
+    if artifacts.is_empty() {
+        return true;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(policy) else {
+        return false;
+    };
+    let hash = |artifact: &serde_json::Value| {
+        artifact
+            .get("metadata")?
+            .get("descriptor_core_hash")?
+            .as_str()
+            .map(str::to_owned)
+    };
+    let published: HashSet<String> = value
+        .get("artifacts")
+        .and_then(serde_json::Value::as_array)
+        .map(|artifacts| artifacts.iter().filter_map(hash).collect())
+        .unwrap_or_else(|| hash(&value).into_iter().collect());
+    artifacts
+        .iter()
+        .all(|artifact| published.contains(&artifact.metadata.descriptor_core_hash))
+}
+
+/// Whether the live signed policy already authorizes every artifact of the
+/// app's teardown unit (Codex review on 0c678f57: let non-growing deletes
+/// bypass over-budget republication). Admission deliberately admits a delete
+/// whose teardown unit does not grow the required set — an already-overflowed
+/// deployment (e.g. after `signed_policy_max_bytes` was lowered below the
+/// published required set) must be able to shrink its way back — but
+/// republication of that still-over-budget unit fail-closes in
+/// `select_signed_policy_artifacts_for_policy_body`. When the exact authority
+/// is already live, republication is unnecessary: teardown authorization is
+/// evaluated against the live policy, so the delete may proceed to teardown
+/// and the required set shrinks once teardown completes.
+pub async fn teardown_unit_already_published(
+    db: &PgPool,
+    config: &KbsPolicyConfig,
+    client: kube::Client,
+    app_id: Uuid,
+) -> Result<bool, KbsPolicyError> {
+    let unit = dedup_signed_policy_artifacts_by_hash(load_teardown_policy_unit(db, app_id).await?);
+    if unit.is_empty() {
+        return Ok(true);
+    }
+    let cm_api: Api<ConfigMap> = Api::namespaced(client, &config.namespace);
+    let configmap = cm_api.get(&config.configmap_name).await?;
+    let current_policy = configmap
+        .data
+        .as_ref()
+        .and_then(|data| data.get(&config.policy_key))
+        .map(String::as_str)
+        .unwrap_or_default();
+    Ok(signed_policy_body_covers_artifacts(current_policy, &unit))
 }
 
 pub async fn reconcile_signed_policy_artifacts(
@@ -5061,6 +5138,184 @@ resource_bindings := {
             .execute(&pool)
             .await
             .expect("delete completed-teardown fixture organization");
+    }
+
+    /// Codex review on 0c678f57 (mixed legacy authority): the app still runs a
+    /// pre-job healthy deployment while a later job-backed replacement failed
+    /// after publishing its workload spec. The selector keeps BOTH artifacts
+    /// required while deleting, so admission must project both — excluding
+    /// every legacy row merely because an apply job exists undercounts the
+    /// authority the delete will actually pin.
+    #[tokio::test]
+    async fn teardown_admission_counts_mixed_legacy_authority() {
+        let pool = crate::test_support::database_test_pool().await;
+        let now = Utc::now();
+
+        let (org_id, app_id) = insert_test_app(&pool, "running").await;
+        // The pre-job healthy workload: a deployment with no apply job rows.
+        let legacy = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, legacy, "healthy", now).await;
+        let legacy_artifact = insert_test_artifact(&pool, app_id, legacy, "ee").await;
+        // The failed job-backed replacement that still published its spec.
+        let published = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            org_id,
+            app_id,
+            published,
+            "failed",
+            now + chrono::Duration::seconds(1),
+        )
+        .await;
+        let published_artifact = insert_test_artifact(&pool, app_id, published, "0f").await;
+        insert_failed_apply_job(&pool, org_id, app_id, published, &published_artifact, 7).await;
+        mark_test_workload_published(&pool, published).await;
+
+        let unit_len =
+            signed_policy_artifact_policy_body(&dedup_signed_policy_artifacts_by_hash(vec![
+                legacy_artifact.clone(),
+                published_artifact.clone(),
+            ]))
+            .expect("serialize the projected mixed teardown unit")
+            .len();
+
+        let fits = teardown_unit_fits_signed_policy_budget(
+            &pool,
+            Some(&teardown_budget_config(unit_len)),
+            app_id,
+        )
+        .await
+        .expect("admit the full mixed legacy/job unit");
+        assert!(
+            fits,
+            "the full mixed legacy/job teardown unit fits the shared byte budget"
+        );
+
+        let fits = teardown_unit_fits_signed_policy_budget(
+            &pool,
+            Some(&teardown_budget_config(unit_len - 1)),
+            app_id,
+        )
+        .await
+        .expect("refuse a mixed unit that exceeds the shared budget");
+        assert!(
+            !fits,
+            "the legacy artifact must count against the projected teardown unit, \
+             not disappear merely because an apply job exists"
+        );
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete mixed legacy fixture organization");
+    }
+
+    /// Codex review on 0c678f57 (over-budget republication): when the required
+    /// set is already over budget but the live policy carries the app's full
+    /// teardown unit, the delete must be able to proceed to teardown without
+    /// demanding an impossible republication.
+    #[tokio::test]
+    async fn teardown_unit_already_published_checks_the_live_policy_body() {
+        let pool = crate::test_support::database_test_pool().await;
+        let now = Utc::now();
+
+        let (org_id, app_id) = insert_test_app(&pool, "running").await;
+        let legacy = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, legacy, "healthy", now).await;
+        let legacy_artifact = insert_test_artifact(&pool, app_id, legacy, "1e").await;
+        let published = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            org_id,
+            app_id,
+            published,
+            "failed",
+            now + chrono::Duration::seconds(1),
+        )
+        .await;
+        let published_artifact = insert_test_artifact(&pool, app_id, published, "2e").await;
+        insert_failed_apply_job(&pool, org_id, app_id, published, &published_artifact, 7).await;
+        mark_test_workload_published(&pool, published).await;
+
+        let config = teardown_budget_config(1024 * 1024);
+        let full_body =
+            signed_policy_artifact_policy_body(&dedup_signed_policy_artifacts_by_hash(vec![
+                legacy_artifact.clone(),
+                published_artifact.clone(),
+            ]))
+            .expect("serialize the live policy body");
+        let partial_body =
+            signed_policy_artifact_policy_body(&dedup_signed_policy_artifacts_by_hash(vec![
+                published_artifact.clone(),
+            ]))
+            .expect("serialize the partial policy body");
+
+        let configmap_for = |policy: String| {
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {
+                    "name": "resource-policy",
+                    "namespace": "cap-test",
+                    "resourceVersion": "3"
+                },
+                "data": {"resource-policy.rego": policy}
+            })
+        };
+        let client_for = |policy: String| {
+            kube::Client::new(
+                tower::service_fn(move |_request: axum::http::Request<kube::client::Body>| {
+                    let configmap = configmap_for(policy.clone());
+                    async move {
+                        Ok::<_, std::io::Error>(axum::http::Response::new(
+                            kube::client::Body::from(serde_json::to_vec(&configmap).unwrap()),
+                        ))
+                    }
+                }),
+                "default",
+            )
+        };
+
+        let covers =
+            teardown_unit_already_published(&pool, &config, client_for(full_body.clone()), app_id)
+                .await
+                .expect("check the live policy body against the teardown unit");
+        assert!(
+            covers,
+            "a live policy carrying the full teardown unit must let the delete proceed"
+        );
+
+        let covers = teardown_unit_already_published(
+            &pool,
+            &config,
+            client_for(partial_body.clone()),
+            app_id,
+        )
+        .await
+        .expect("check the partial policy body against the teardown unit");
+        assert!(
+            !covers,
+            "a live policy missing the legacy artifact must still fail the delete"
+        );
+
+        // The exact live body also covers a single-artifact unit, proving the
+        // pure predicate handles the single-artifact body shape too.
+        assert!(signed_policy_body_covers_artifacts(
+            &full_body,
+            std::slice::from_ref(&legacy_artifact),
+        ));
+        assert!(!signed_policy_body_covers_artifacts(
+            "package authz\n# legacy rego\n",
+            &[legacy_artifact],
+        ));
+        assert!(signed_policy_body_covers_artifacts("package authz", &[]));
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete already-published fixture organization");
     }
 
     #[tokio::test]
