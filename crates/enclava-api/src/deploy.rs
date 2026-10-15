@@ -1168,6 +1168,11 @@ async fn reconcile_managed_pull_secrets(
                     .is_some_and(|uid| live_uid.as_deref() == Some(uid));
                 match live_result {
                     Ok(live) => {
+                        if newer_pull_secret_scope(&live) {
+                            return Err(DeployError::PullSecretReconcileDeferred(format!(
+                                "newer repository-scope epoch owns {namespace}/{secret_name}"
+                            )));
+                        }
                         if namespace_in_scope && secret_name == settings.configured_name {
                             if live.metadata.deletion_timestamp.is_some() {
                                 // An accepted old delete may still finish. Keep
@@ -1431,6 +1436,11 @@ async fn reconcile_managed_pull_secrets(
                 converged = false;
                 continue;
             }
+            if newer_pull_secret_scope(&live) {
+                return Err(DeployError::PullSecretReconcileDeferred(format!(
+                    "newer repository-scope epoch owns {namespace}/{name}"
+                )));
+            }
             if !is_labeled_managed_pull_secret(&live)
                 && let Err(error) = adopt_managed_pull_secret(engine, namespace, &live).await
             {
@@ -1489,10 +1499,12 @@ async fn reconcile_managed_pull_secrets(
             }
         };
         if newer_pull_secret_scope(&live) {
-            kept += 1;
-            tracing::info!(%namespace, secret = %name,
-                "keeping secret from newer repository-scope rollout");
-            continue;
+            // An older replica cannot certify this namespace clean. Keeping
+            // the secret is necessary, but calling that convergence would open
+            // admission while an unknown newer policy owns the PAT.
+            return Err(DeployError::PullSecretReconcileDeferred(format!(
+                "newer repository-scope epoch owns {namespace}/{name}"
+            )));
         }
         if !is_managed_tenant_image_pull_secret(&live, settings.ghcr()) {
             tracing::warn!(
@@ -1793,7 +1805,9 @@ async fn delete_managed_pull_secret(
             return Ok(PullSecretRemovalOutcome::NotOurs);
         }
         if newer_pull_secret_scope(&existing) {
-            return Ok(PullSecretRemovalOutcome::Superseded);
+            return Err(DeployError::PullSecretReconcileDeferred(format!(
+                "newer repository-scope epoch owns {namespace}/{name}"
+            )));
         }
         if !uid_verified && !is_managed_tenant_image_pull_secret(&existing, ghcr_credentials) {
             tracing::warn!(
@@ -2497,7 +2511,13 @@ async fn apply_scoped_pull_secret(
     for _ in 0..5 {
         match api.get(&config.name).await {
             Ok(live) => {
-                if newer_pull_secret_credentials(&live) || newer_pull_secret_scope(&live) {
+                if newer_pull_secret_scope(&live) {
+                    return Err(DeployError::PullSecretReconcileDeferred(format!(
+                        "newer repository-scope epoch owns {namespace}/{}",
+                        config.name
+                    )));
+                }
+                if newer_pull_secret_credentials(&live) {
                     return Err(DeployError::Validation(format!(
                         "refusing to overwrite newer pull-secret credential generation at {namespace}/{}",
                         config.name
@@ -2573,7 +2593,7 @@ async fn reconcile_managed_pull_secrets_for_deploy(
     )
     .await
     .map_err(|_| {
-        DeployError::Validation(format!(
+        DeployError::PullSecretReconcileDeferred(format!(
             "pull secret reconciliation timed out in namespace {namespace}; retry deployment"
         ))
     })?
@@ -3079,6 +3099,8 @@ pub enum DeployError {
     EdgeRoute(#[from] crate::edge::EdgeRouteError),
     #[error("durable mutation fence error: {0}")]
     Mutation(#[from] crate::mutation_leases::MutationLeaseError),
+    #[error("pull-secret reconciliation deferred: {0}")]
+    PullSecretReconcileDeferred(String),
     #[error(
         "managed pull secret {0} keeps changing under the cleanup (conflicting updates); \
          removal did not converge"
@@ -3101,6 +3123,7 @@ impl DeployError {
             Self::KbsPolicy(_) => "kbs_policy_error",
             Self::EdgeRoute(_) => "edge_route_error",
             Self::Mutation(_) => "mutation_fence_error",
+            Self::PullSecretReconcileDeferred(_) => "pull_secret_reconcile_deferred",
             Self::PullSecretDeleteConflict(_) => "pull_secret_delete_conflict",
         }
     }
@@ -7307,6 +7330,28 @@ mod tests {
         assert!(converged);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn stalled_secret_list_defers_deployment_instead_of_holding_permit_forever() {
+        use std::sync::{Arc, Mutex};
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            stall_secrets_list: true,
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster);
+        assert!(matches!(
+            reconcile_managed_pull_secrets_for_deploy(
+                &engine,
+                "tenant-ns",
+                &[],
+                &reconcile_settings(),
+                false,
+                PullSecretDeleteMode::Fenced(MutationGeneration::new(1).unwrap()),
+            )
+            .await,
+            Err(DeployError::PullSecretReconcileDeferred(_))
+        ));
+    }
+
     #[tokio::test]
     async fn pending_reference_replacement_is_restored_without_platform_credentials() {
         use std::sync::{Arc, Mutex};
@@ -7348,6 +7393,53 @@ mod tests {
                 .name,
             "enclava-registry-auth"
         );
+    }
+
+    #[tokio::test]
+    async fn pending_repair_from_newer_scope_keeps_uid_proof_and_reference_cleared() {
+        use std::sync::{Arc, Mutex};
+        let mut secret =
+            fake_managed_secret("enclava-registry-auth", true, "cap-bot", "ghp_platform");
+        secret
+            .metadata
+            .annotations
+            .get_or_insert_with(Default::default)
+            .insert(
+                PULL_SECRET_SCOPE_GENERATION_ANNOTATION.to_string(),
+                u64::MAX.to_string(),
+            );
+        let mut account = fake_service_account("cap-tenant-app", &[]);
+        account.metadata.annotations = Some(std::collections::BTreeMap::from([(
+            PENDING_PULL_SECRET_REFERENCE_REPAIRS_ANNOTATION.to_string(),
+            "enclava-registry-auth=uid-enclava-registry-auth".to_string(),
+        )]));
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![secret],
+            service_accounts: vec![account],
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        assert!(matches!(
+            reconcile_managed_pull_secrets(
+                &engine,
+                "tenant-ns",
+                &["cap-tenant-app".to_string()],
+                &reconcile_settings(),
+                false,
+                PullSecretDeleteMode::Unfenced {
+                    namespace_generation: i64::MAX
+                },
+            )
+            .await,
+            Err(DeployError::PullSecretReconcileDeferred(_))
+        ));
+        let state = cluster.lock().unwrap();
+        assert!(state.service_accounts[0].image_pull_secrets.is_none());
+        assert_eq!(
+            pending_reference_repairs(&state.service_accounts[0]).len(),
+            1
+        );
+        assert_eq!(state.secrets.len(), 1);
     }
 
     #[tokio::test]
@@ -7407,7 +7499,7 @@ mod tests {
             ..Default::default()
         }));
         let engine = reconcile_engine(cluster.clone());
-        assert!(
+        assert!(matches!(
             reconcile_managed_pull_secrets(
                 &engine,
                 "tenant-ns",
@@ -7418,9 +7510,9 @@ mod tests {
                     namespace_generation: i64::MAX
                 },
             )
-            .await
-            .unwrap()
-        );
+            .await,
+            Err(DeployError::PullSecretReconcileDeferred(_))
+        ));
         let state = cluster.lock().unwrap();
         assert_eq!(state.secrets.len(), 1);
         assert_eq!(
