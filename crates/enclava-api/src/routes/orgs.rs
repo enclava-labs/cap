@@ -1913,9 +1913,12 @@ pub async fn rotate_org_owner(
     // Phase 2: final lane transaction. The lane was released after the
     // receipt-only commit, so competing keyring changes may have landed;
     // keyring, service owner, and freshness are re-read and re-derived here.
-    // The caller's phase-1 membership authorization remains valid after the
-    // upstream owner change; rechecking it could strand a completed rotation.
-    // This phase never issues an upstream RPC (at most
+    // Recheck and lock the caller's current membership before committing any
+    // successor keyring. A removal committed during the lane gap must win;
+    // a removal racing this lock waits until finalization commits. If the
+    // upstream owner already changed, the durable receipt lets a remaining
+    // owner recover the exact transition instead of granting a removed owner
+    // continued signing authority. This phase never issues an upstream RPC (at most
     // one per request, spent or deliberately skipped in phase 1): the
     // service must already hold the replacement owner before any CAP
     // write, so the stored keyring authority and the service stay pinned
@@ -1937,6 +1940,9 @@ pub async fn rotate_org_owner(
     .await?;
 
     let owner_status = read_live_service_owner(signing_service, org_id).await?;
+    let current_role =
+        scopes::lock_and_read_active_membership_role_in_tx(&mut tx, org_id, auth.user_id).await?;
+    scopes::require_owner_role(current_role)?;
     let service_owner = service_owner_pubkey(&owner_status);
     if service_owner.as_deref() != Some(replacement_owner.as_slice()) {
         return Err(crate::routes::deployments::signing_error_response(
@@ -7527,16 +7533,13 @@ mod tests {
         );
     }
 
-    /// Regression (PR #185 review, Codex "keep caller authorization stable
-    /// through rotation finalization", part 1): phase 2 must finalize the
-    /// rotation even when the caller's membership disappears between the
-    /// phases -- the upstream owner change already happened under the
-    /// caller's phase-1 authorization, and aborting is what left authority
-    /// drifted with no recoverable request. The mock deletes the caller's
-    /// membership during phase 2's owner read (its second GET), i.e. after
-    /// phase 1 has committed its receipt-only transaction.
+    /// Regression: removing the caller between phase 1's receipt commit and
+    /// phase 2's membership lock must prevent a successor keyring write.
+    /// The upstream change remains recoverable by an active owner using the
+    /// persisted receipt. The mock removes membership during phase 2's
+    /// second owner-status GET, before the phase-2 membership lock.
     #[tokio::test]
-    async fn owner_rotation_finalizes_after_caller_membership_removal_mid_request() {
+    async fn owner_rotation_rejects_removed_caller_mid_request() {
         let pool = database_test_pool().await;
         let org_id = Uuid::new_v4();
         let user_id = Uuid::new_v4();
@@ -7676,6 +7679,9 @@ mod tests {
         )
         .await
         .expect("insert v1 keyring");
+        // PUT's authority fence also reads owner status; count only the
+        // rotation's phase-1 and phase-2 reads for this removal hook.
+        calls.store(0, std::sync::atomic::Ordering::SeqCst);
 
         let request = rotation_request(
             org_id,
@@ -7687,15 +7693,15 @@ mod tests {
             Utc::now(),
             "mid-request membership removal",
         );
-        let response = rotate_org_owner(
+        let rejection = rotate_org_owner(
             auth,
             State(state.clone()),
             Path(org_name.clone()),
             Json(request),
         )
         .await
-        .expect("rotation must finalize even when the caller is removed between the phases");
-        assert_eq!(response.0.keyring_version, 2);
+        .expect_err("removed caller must not finalize a successor keyring");
+        assert_eq!(rejection.0, StatusCode::FORBIDDEN);
         let membership_count: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM memberships WHERE org_id = $1 AND user_id = $2",
         )
@@ -7715,7 +7721,15 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("count v2 keyring");
-        assert_eq!(stored, 1, "the successor keyring must be finalized");
+        assert_eq!(stored, 0, "removed owner must not write successor keyring");
+        let receipts: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM org_rotation_upstream_receipts WHERE org_id = $1",
+        )
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count recovery receipts");
+        assert_eq!(receipts, 1, "upstream change must remain recoverable");
     }
 
     /// Regression (PR #185 review, Codex "keep caller authorization stable",
