@@ -950,6 +950,63 @@ fn wait_loop_requests_use_the_finite_per_attempt_budget() {
 }
 
 #[test]
+fn managed_config_cut_reads_retry_until_the_wait_deadline() {
+    // cap#220 review follow-up: `bounded_wait_attempt`'s `None` covers both
+    // a passed wait deadline and a read cut at the 60s per-attempt budget.
+    // Only the first is a timeout: a cut read with wait time remaining must
+    // retry on the next tick, not fail the whole managed-config wait.
+    let template = include_str!("../../template.rs").replace("\r\n", "\n");
+    let wait_start = template
+        .find("async fn wait_for_paas_managed_config_keys")
+        .expect("the managed-config wait must exist");
+    let wait_end = template[wait_start..]
+        .find("\n/// One poll of this call's managed-config delivery receipt.")
+        .expect("the delivery-receipt poll doc must follow the wait")
+        + wait_start;
+    let wait = &template[wait_start..wait_end];
+    assert!(
+        wait.contains("None if Instant::now() < deadline =>"),
+        "a read cut at the per-attempt budget must retry on the next tick while the wait deadline is open (cap#220 review follow-up)"
+    );
+    // The retry arm must come before the terminal `None =>` expiry arm so a
+    // cut read can never take the deadline-reached error.
+    let retry_arm = wait
+        .find("None if Instant::now() < deadline =>")
+        .expect("the cut-read retry arm must exist");
+    let expiry_arm = wait[retry_arm..]
+        .find("None =>")
+        .expect("the terminal None arm must exist")
+        + retry_arm;
+    assert!(retry_arm < expiry_arm);
+    // The delivery-receipt poll has the same two-faced `None`: a cut read
+    // reports pending while the wait is open, so a stalled delivery-status
+    // request cannot abort the wait through the poll's Err. It must also run
+    // under `bounded_wait_attempt` (the 60s per-attempt budget), not plain
+    // `bounded_request` (deadline-only), so one stalled read cannot hold the
+    // loop until the client's 900s request timeout.
+    let dense = |text: &str| -> String {
+        text.chars()
+            .filter(|c| !c.is_whitespace() && *c != ',')
+            .collect()
+    };
+    let poll_start = template[wait_end..]
+        .find("async fn poll_managed_delivery_status")
+        .expect("the delivery-receipt poll must exist")
+        + wait_end;
+    let poll = &template[poll_start..];
+    assert!(
+        dense(poll).contains(
+            "bounded_wait_attempt(deadlineapi.managed_config_delivery_status(instance_namedelivery_id))"
+        ),
+        "poll_managed_delivery_status must bound its read per attempt, not only by the deadline (cap#220 review follow-up)"
+    );
+    assert!(
+        poll.contains("None if Instant::now() < deadline =>"),
+        "poll_managed_delivery_status must treat a cut read as pending while the wait deadline is open (cap#220 review follow-up)"
+    );
+}
+
+#[test]
 fn deploy_wait_success_exits_reconcile_deployment_state_first() {
     // cap#220 review follow-up: readiness alone must not end a wait that
     // polls deployment history -- a failed deployment would proceed to

@@ -2608,7 +2608,7 @@ async fn wait_for_paas_managed_config_keys(
         // Poll this call's delivery receipt first: a matching `delivered`
         // satisfies every expected key regardless of metadata timestamps.
         if !delivered_receipt && let Some(receipt) = delivery_id {
-            match poll_managed_delivery_status(api, instance_name, receipt, read_deadline).await? {
+            match poll_managed_delivery_status(api, instance_name, receipt, deadline).await? {
                 ManagedDeliveryPoll::Delivered => delivered_receipt = true,
                 ManagedDeliveryPoll::Pending => {}
                 ManagedDeliveryPoll::Failed(status) => {
@@ -2691,6 +2691,17 @@ async fn wait_for_paas_managed_config_keys(
                 }
             }
             Some(Err(error)) => return Err(error.into()),
+            None if Instant::now() < deadline => {
+                // The read was cut at the per-attempt budget with wait time
+                // remaining (cap#220 review follow-up): a single stalled
+                // read must not fail the whole wait, so retry on the next
+                // tick exactly like a retryable transport error.
+                progress.set_message(timed_progress(
+                    "Platform config: status check retrying",
+                    start.elapsed(),
+                    timeout,
+                ));
+            }
             None => {
                 return Err(format!(
                     "platform config status for app {instance_name} did not become available within {}: this wait's deadline was reached with the status read still in flight; this command did not deliver customer config; retry `enclava config get --app {instance_name}`",
@@ -2717,15 +2728,20 @@ enum ManagedDeliveryPoll {
 /// Read this call's delivery receipt once. Unknown or not-yet-observed
 /// receipts are treated as still pending so a replica lag cannot stall the
 /// wait, while retryable transport failures keep waiting under the normal
-/// deadline handling. `deadline` bounds this read — the caller passes the
-/// wait's own read deadline so a stalled request cannot outlive the phase.
+/// deadline handling. `deadline` bounds this read like every other
+/// synchronous request in the wait: cut at the 60s per-attempt budget and
+/// never beyond the wait's remaining time (cap#220 review follow-up — a
+/// stalled delivery-status read must not hold the loop until the client's
+/// 900s request timeout). A read cut at the per-attempt budget with wait
+/// time remaining is reported as pending: the caller's loop deadline
+/// reports the timeout, not one stalled read.
 async fn poll_managed_delivery_status(
     api: &ApiClient,
     instance_name: &str,
     delivery_id: &str,
-    deadline: Option<Instant>,
+    deadline: Instant,
 ) -> Result<ManagedDeliveryPoll, Box<dyn std::error::Error>> {
-    match bounded_request(
+    match bounded_wait_attempt(
         deadline,
         api.managed_config_delivery_status(instance_name, delivery_id),
     )
@@ -2755,6 +2771,11 @@ async fn poll_managed_delivery_status(
             Ok(ManagedDeliveryPoll::Pending)
         }
         Some(Err(error)) => Err(error.into()),
+        None if Instant::now() < deadline => {
+            // Cut at the per-attempt budget with the wait still open: treat
+            // as pending and let the caller's deadline check decide expiry.
+            Ok(ManagedDeliveryPoll::Pending)
+        }
         None => Err(
             "this wait's deadline was reached with the delivery status read still in flight".into(),
         ),
