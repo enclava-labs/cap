@@ -4285,6 +4285,12 @@ resource_bindings := {
         let pool = crate::test_support::database_test_pool().await;
         let now = Utc::now();
         let (org_id, app_id) = insert_test_app(&pool, "running").await;
+        // The candidates query filters artifacts by current keyring
+        // membership (issue #130), so the fixture org needs a keyring whose
+        // member set still contains the fixture signer pubkey (test_signed_
+        // policy_artifact signs with bb repeated 32 times) for its artifacts
+        // to stay authorized.
+        insert_test_keyring_version(&pool, org_id, 1, &["bb".repeat(32).as_str()]).await;
         let legacy = Uuid::new_v4();
         insert_test_deployment(&pool, org_id, app_id, legacy, "healthy", now).await;
         let legacy_artifact = insert_test_artifact(&pool, app_id, legacy, "9a").await;
@@ -4443,6 +4449,12 @@ resource_bindings := {
         // A signed replacement released from its hold whose apply has not
         // completed.
         let (signed_org, signed_app) = insert_test_app(&pool, "running").await;
+        // The candidates query filters artifacts by current keyring
+        // membership (issue #130), so the fixture org needs a keyring whose
+        // member set still contains the fixture signer pubkey (test_signed_
+        // policy_artifact signs with bb repeated 32 times) for its artifacts
+        // to stay authorized.
+        insert_test_keyring_version(&pool, signed_org, 1, &["bb".repeat(32).as_str()]).await;
         let signed_running = Uuid::new_v4();
         insert_test_deployment(
             &pool,
@@ -4505,6 +4517,12 @@ resource_bindings := {
         // An unsigned replacement: the running TEE is the only signed
         // authority for this app until the handoff completes.
         let (unsigned_org, unsigned_app) = insert_test_app(&pool, "running").await;
+        // The candidates query filters artifacts by current keyring
+        // membership (issue #130), so the fixture org needs a keyring whose
+        // member set still contains the fixture signer pubkey (test_signed_
+        // policy_artifact signs with bb repeated 32 times) for its artifacts
+        // to stay authorized.
+        insert_test_keyring_version(&pool, unsigned_org, 1, &["bb".repeat(32).as_str()]).await;
         let unsigned_running = Uuid::new_v4();
         insert_test_deployment(
             &pool,
@@ -4565,6 +4583,12 @@ resource_bindings := {
         // A replacement whose hold expired without release: the running
         // workload must stay authoritative without applying.
         let (held_org, held_app) = insert_test_app(&pool, "running").await;
+        // The candidates query filters artifacts by current keyring
+        // membership (issue #130), so the fixture org needs a keyring whose
+        // member set still contains the fixture signer pubkey (test_signed_
+        // policy_artifact signs with bb repeated 32 times) for its artifacts
+        // to stay authorized.
+        insert_test_keyring_version(&pool, held_org, 1, &["bb".repeat(32).as_str()]).await;
         let held_running = Uuid::new_v4();
         insert_test_deployment(&pool, held_org, held_app, held_running, "healthy", now).await;
         let held_running_artifact = insert_test_artifact(&pool, held_app, held_running, "3a").await;
@@ -4802,6 +4826,12 @@ resource_bindings := {
         // the publication marks the app failed while the prior healthy
         // deployment's TEE keeps running.
         let (org_id, app_id) = insert_test_app(&pool, "running").await;
+        // The candidates query filters artifacts by current keyring
+        // membership (issue #130), so the fixture org needs a keyring whose
+        // member set still contains the fixture signer pubkey (test_signed_
+        // policy_artifact signs with bb repeated 32 times) for its artifacts
+        // to stay authorized.
+        insert_test_keyring_version(&pool, org_id, 1, &["bb".repeat(32).as_str()]).await;
         let running = Uuid::new_v4();
         insert_test_deployment(&pool, org_id, app_id, running, "healthy", now).await;
         let running_artifact = insert_test_artifact(&pool, app_id, running, "5c").await;
@@ -4852,6 +4882,12 @@ resource_bindings := {
 
         // The same failed replacement against a pre-job legacy workload.
         let (legacy_org, legacy_app) = insert_test_app(&pool, "running").await;
+        // The candidates query filters artifacts by current keyring
+        // membership (issue #130), so the fixture org needs a keyring whose
+        // member set still contains the fixture signer pubkey (test_signed_
+        // policy_artifact signs with bb repeated 32 times) for its artifacts
+        // to stay authorized.
+        insert_test_keyring_version(&pool, legacy_org, 1, &["bb".repeat(32).as_str()]).await;
         let legacy = Uuid::new_v4();
         insert_test_deployment(&pool, legacy_org, legacy_app, legacy, "healthy", now).await;
         let legacy_artifact = insert_test_artifact(&pool, legacy_app, legacy, "7e").await;
@@ -4895,6 +4931,12 @@ resource_bindings := {
         // Explicit stop and deletion override the preservation even though
         // the prior deployment stays healthy.
         let (stopped_org, stopped_app) = insert_test_app(&pool, "stopped").await;
+        // The candidates query filters artifacts by current keyring
+        // membership (issue #130), so the fixture org needs a keyring whose
+        // member set still contains the fixture signer pubkey (test_signed_
+        // policy_artifact signs with bb repeated 32 times) for its artifacts
+        // to stay authorized.
+        insert_test_keyring_version(&pool, stopped_org, 1, &["bb".repeat(32).as_str()]).await;
         let stopped_running = Uuid::new_v4();
         insert_test_deployment(
             &pool,
@@ -4939,6 +4981,12 @@ resource_bindings := {
         fail_replacement_in_apply(&pool, stopped_org, stopped_app, stopped_replacement).await;
 
         let (deleting_org, deleting_app) = insert_test_app(&pool, "deleting").await;
+        // The candidates query filters artifacts by current keyring
+        // membership (issue #130), so the fixture org needs a keyring whose
+        // member set still contains the fixture signer pubkey (test_signed_
+        // policy_artifact signs with bb repeated 32 times) for its artifacts
+        // to stay authorized.
+        insert_test_keyring_version(&pool, deleting_org, 1, &["bb".repeat(32).as_str()]).await;
         let deleting_running = Uuid::new_v4();
         insert_test_deployment(
             &pool,
