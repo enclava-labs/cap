@@ -1103,4 +1103,3 @@ async fn every_emitter_error_code_is_persistable_and_public() {
         );
     }
 }
-

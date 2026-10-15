@@ -15,8 +15,9 @@ use sha2::{Digest, Sha256};
 use enclava_cli::{
     api_client::{ApiClient, ApiError, read_bounded_body},
     api_types::{
-        AppResponse, CreateAppRequest, CreateTemplateInstanceRequest, DeploymentEntry, HostedTemplate,
-        HostedTemplateConfigKey, ServiceSpec, SshCommandResponse, TemplateInstanceResponse,
+        AppResponse, CreateAppRequest, CreateTemplateInstanceRequest, DeploymentEntry,
+        HostedTemplate, HostedTemplateConfigKey, ServiceSpec, SshCommandResponse,
+        TemplateInstanceResponse,
     },
     app_config::{
         AppConfig, AppSection, HealthSection, ResourcesSection, StorageSection, UnlockSection,
@@ -28,16 +29,16 @@ use enclava_cli::{
 use enclava_engine::types::WorkloadSecurityProfile;
 
 use crate::commands::app::{
-    BootstrapEndpointStatusDecision, DeploymentHistoryProbe, DeploymentWait, SignedDeployBlobParams, StoragePasswordInput, SuccessGate,
-    bootstrap_endpoint_status_decision, bounded_request, bounded_wait_attempt, build_signed_deploy_blobs,
-    claim_initial_ownership, deploy_preflight_needs_claim, deployment_bound_tee_status,
+    BootstrapEndpointStatusDecision, DeploymentHistoryProbe, DeploymentWait,
+    SignedDeployBlobParams, StoragePasswordInput, SuccessGate, bootstrap_endpoint_status_decision,
+    bounded_request, bounded_wait_attempt, build_signed_deploy_blobs, claim_initial_ownership,
+    deploy_preflight_needs_claim, deployment_bound_tee_status,
     deployment_bound_terminal_bootstrap_error,
     deployment_bound_terminal_bootstrap_error_on_channel, ensure_manual_deploy_keyring,
     fetch_verified_platform_release, generate_log_key_for_app,
-    reconcile_success_with_deployment_history,
-    tee_supplemental_fields_are_consistent, tee_terminal_diagnostic_probe_due, tee_unlock_state,
-    terminal_bootstrap_failure_message, terminal_diagnostic_budget,
-    terminal_diagnostic_probe_with_budget,
+    reconcile_success_with_deployment_history, tee_supplemental_fields_are_consistent,
+    tee_terminal_diagnostic_probe_due, tee_unlock_state, terminal_bootstrap_failure_message,
+    terminal_diagnostic_budget, terminal_diagnostic_probe_with_budget,
 };
 use crate::commands::config::CONFIG_APPLICATION_NOTE;
 use crate::commands::ownership::{MnemonicCapture, mnemonic_capture_from_flags};
@@ -1571,7 +1572,8 @@ async fn wait_for_template_bootstrap_endpoint(
         // (#18). Every request in this loop is cut at the finite per-attempt
         // budget, so a stalled response can never consume the wait (cap#220
         // review).
-        fail_if_template_deployment_failed(api, app_name, deployment_id, Some(wait_deadline)).await?;
+        fail_if_template_deployment_failed(api, app_name, deployment_id, Some(wait_deadline))
+            .await?;
 
         pb.set_message(timed_progress(
             "TEE ownership: waiting for attested endpoint",
@@ -1617,7 +1619,6 @@ async fn wait_for_template_bootstrap_endpoint(
                         .await;
                     continue;
                 }
-
             }
         }
 
@@ -2574,8 +2575,8 @@ async fn wait_for_paas_managed_config_keys(
         }
         // Bounded by the wait's remaining budget (cap#220 review); the loop
         // deadline above already guarantees the budget is positive here.
-        fail_if_template_deployment_failed(api, instance_name, deployment_id, read_deadline).await?;
-
+        fail_if_template_deployment_failed(api, instance_name, deployment_id, read_deadline)
+            .await?;
 
         // TLS provisioning starts around the claim, so a terminal bootstrap
         // diagnostic must stop this post-claim wait promptly. The probe is
@@ -2608,7 +2609,6 @@ async fn wait_for_paas_managed_config_keys(
         match bounded_request(read_deadline, api.list_config_keys(instance_name)).await {
             Some(Ok(response)) => {
                 let observed = response
-
                     .keys
                     .into_iter()
                     .map(|entry| (entry.key, entry.updated_at))
@@ -2685,7 +2685,6 @@ async fn wait_for_paas_managed_config_keys(
                 )
                 .into());
             }
-
         }
         progress.tick();
         template_config_sleep_until_retry(read_deadline).await;
@@ -3512,7 +3511,8 @@ async fn wait_for_paas_ssh_command(
         ));
         // Post-release on the deploy flow and unheld on the standalone
         // resumption: the wait budget still bounds the history request.
-        fail_if_template_deployment_failed(api, app_name, deployment_id, Some(start + timeout)).await?;
+        fail_if_template_deployment_failed(api, app_name, deployment_id, Some(start + timeout))
+            .await?;
         // Post-claim wait: one deployment-bound attested status read covers
         // both stop conditions -- a terminal bootstrap diagnostic, and a
         // password-mode relock (the pod rolled, the TEE came back locked, and

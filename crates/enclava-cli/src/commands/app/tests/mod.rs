@@ -3881,7 +3881,6 @@ mod terminal_diagnostics {
         );
     }
 
-
     #[tokio::test]
     async fn healthy_exit_reasks_history_instead_of_dropping_a_newer_failure() {
         // cap#220 self-check: the health wait's "healthy" answer may be
@@ -4058,5 +4057,4 @@ mod terminal_diagnostics {
         assert!(runtime.contains("bounded_status_json_within"));
         assert!(source.contains("bootstrap_status_within(terminal_diagnostic_budget"));
     }
-
 }
