@@ -694,8 +694,56 @@ enum PullSecretDeleteMode {
     Fenced(MutationGeneration),
     /// Startup sweep and background retry, outside any mutation lease:
     /// deleted on the observed UID/resourceVersion preconditions instead of
-    /// the mutation-generation fence.
-    Unfenced,
+    /// the mutation-generation fence. The sweep snapshots the namespace's
+    /// kubernetes mutation generation BEFORE reading its app inventory
+    /// (review findings on #243, Devin SEC + Codex P1): any discovered secret
+    /// carrying a NEWER mutation-generation annotation was applied by a
+    /// deploy that postdates the inventory snapshot — a workload entering
+    /// scope mid-sweep — and is skipped together with its ServiceAccount
+    /// references instead of being erased.
+    Unfenced {
+        /// The `kubernetes_namespace` lease generation observed before the
+        /// sweep's app-inventory query; `0` when the namespace has no lease
+        /// row yet (only unannotated legacy secrets can predate it).
+        namespace_generation: i64,
+    },
+}
+
+/// Same-object delete conflicts are retried with the engine's bounded but
+/// patient budget (see `enclava_engine::apply::generation`, staging incident
+/// 2026-09-13): three immediate attempts terminally failed live cleanup
+/// against ordinary concurrent writers (Devin review on #243). Worst-case
+/// total wait ≈ 60 s, matching `delete_resource`.
+const PULL_SECRET_DELETE_CONFLICT_RETRIES: usize = 64;
+
+/// Exponential backoff between same-object 409 retries, doubling from 25 ms
+/// and capped at 800 ms — the engine's `conflict_retry_delay` formula.
+fn pull_secret_conflict_retry_delay(attempt: usize) -> std::time::Duration {
+    std::time::Duration::from_millis((25 * (1 << attempt.min(5))).min(1000))
+}
+
+/// A successful Kubernetes DELETE is only acceptance: a finalizer can keep
+/// the Secret present and readable with a deletion timestamp (Codex review
+/// on #243, P2). Poll for the 404 that proves the platform PAT is gone.
+const PULL_SECRET_DELETION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+const PULL_SECRET_DELETION_POLL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Hard bound on one full cleanup sweep (Codex review on #243, P1): the
+/// sweep's Kubernetes calls are not individually time-bounded, so a stalled
+/// API server must degrade to "not converged, retried with backoff" instead
+/// of hanging the pre-listen startup (or the background reconciler) forever.
+const PULL_SECRET_SWEEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// The mutation generation a live Secret carries, if any (`None` covers both
+/// unannotated legacy secrets and unparsable annotation values).
+fn secret_mutation_generation(secret: &Secret) -> Option<i64> {
+    use enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION;
+    secret
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(MUTATION_GENERATION_ANNOTATION))
+        .and_then(|raw| raw.parse::<i64>().ok())
 }
 
 /// Keep/remove decision for one discovered managed pull secret (review
@@ -927,10 +975,43 @@ async fn reconcile_managed_pull_secrets(
             );
             continue;
         }
+        // Sweep runs must never erase a secret a NEWER deploy applied (Devin
+        // SEC + Codex P1 review findings on #243): the sweep's app inventory
+        // is a DB snapshot taken BEFORE this generation was observed, so a
+        // secret carrying a newer mutation-generation annotation was applied
+        // by a deploy the snapshot never saw — typically a workload entering
+        // the repository scope mid-sweep. Skip it and its references; the
+        // next sweep (whose snapshot includes that deploy) decides. Checked
+        // on the live object so an annotation that landed after discovery is
+        // honored too.
+        if let PullSecretDeleteMode::Unfenced {
+            namespace_generation,
+        } = delete_mode
+            && secret_mutation_generation(&live).is_some_and(|actual| actual > namespace_generation)
+        {
+            kept += 1;
+            tracing::info!(
+                %namespace,
+                secret = %name,
+                "tenant image pull secret reconcile: skipped — a mutation generation newer \
+                 than the sweep's inventory snapshot wrote it (concurrent deploy); leaving it \
+                 and its ServiceAccount references for the next sweep"
+            );
+            continue;
+        }
         // Only proven CAP-managed names are ever cleared from
         // ServiceAccounts (review finding): a tenant-owned secret under the
         // same name keeps both itself and its references.
         let mut cleared_references: Vec<String> = Vec::new();
+        // Defer the delete while any reference clear failed (Codex review on
+        // #243, P2 "defer secret deletion when reference cleanup fails"):
+        // deleting the Secret after a failed ServiceAccount patch strands a
+        // dangling imagePullSecrets reference the next sweep can no longer
+        // discover (its discovery marker — the Secret — is gone), so it
+        // would report convergence without ever retrying the cleanup. Keep
+        // the secret for now; a later pass retries the reference clear and
+        // the delete together.
+        let mut reference_cleanup_failed = false;
         for service_account in service_accounts {
             match clear_pull_secret_reference_from_service_account(
                 engine,
@@ -944,16 +1025,44 @@ async fn reconcile_managed_pull_secrets(
                 Ok(false) => {}
                 Err(error) => {
                     converged = false;
+                    reference_cleanup_failed = true;
                     tracing::warn!(
                         %namespace,
                         service_account = %service_account,
                         secret = %name,
                         %error,
                         "tenant image pull secret reconcile: failed to clear stale \
-                         ServiceAccount reference"
+                         ServiceAccount reference — deferring the secret delete so the \
+                         reference cleanup can be retried on a later pass"
                     );
                 }
             }
+        }
+        if reference_cleanup_failed {
+            // Nothing was deleted, so nothing must be reversed: the secret
+            // keeps its name, and the references that WERE cleared are
+            // restored so the (still-present) secret stays attached.
+            for service_account in &cleared_references {
+                if let Err(error) = restore_pull_secret_reference_to_service_account(
+                    engine,
+                    namespace,
+                    service_account,
+                    name,
+                )
+                .await
+                {
+                    converged = false;
+                    tracing::warn!(
+                        %namespace,
+                        service_account = %service_account,
+                        secret = %name,
+                        %error,
+                        "tenant image pull secret reconcile: failed to restore the \
+                         ServiceAccount reference after a deferred delete"
+                    );
+                }
+            }
+            continue;
         }
         // The delete is the final ownership decision (review finding on
         // #243): it re-reads the live secret, re-verifies CAP ownership, and
@@ -1076,6 +1185,7 @@ async fn delete_managed_pull_secret(
     ghcr_credentials: Option<(&str, &str)>,
     delete_mode: PullSecretDeleteMode,
 ) -> Result<PullSecretRemovalOutcome, DeployError> {
+    use enclava_engine::apply::engine::ApplyError;
     let api: Api<Secret> = Api::namespaced(engine.client().clone(), namespace);
     // Kubernetes reports 409 both for a replaced object (different UID) and
     // for the SAME managed object merely updated (resourceVersion moved)
@@ -1083,9 +1193,11 @@ async fn delete_managed_pull_secret(
     // same-object update is still the managed secret, and reporting it as a
     // clean removal would let the sweep converge while the platform PAT stays
     // in the namespace. Every attempt re-reads and re-verifies the live
-    // object; a bounded retry absorbs transient writers, and once exhausted
-    // the error keeps the caller's gate closed.
-    for _ in 0..3 {
+    // object; a bounded, patient retry with backoff absorbs transient writers
+    // (Devin review on #243: three immediate attempts terminally failed
+    // deploys against ordinary concurrent writers), and once exhausted the
+    // error keeps the caller's gate closed.
+    for attempt in 0..PULL_SECRET_DELETE_CONFLICT_RETRIES {
         let existing = match api.get(name).await {
             Ok(existing) => existing,
             Err(kube::Error::Api(error)) if error.code == 404 => {
@@ -1117,19 +1229,19 @@ async fn delete_managed_pull_secret(
             }),
             ..Default::default()
         };
-        match api.delete(name, &delete_params).await {
+        match enclava_engine::apply::bounded_kube_write(api.delete(name, &delete_params)).await {
             Ok(_) => {
-                tracing::info!(
-                    namespace = %namespace,
-                    secret = %name,
-                    "stale tenant image pull secret removed (not kept under the configured repository scope)"
-                );
-                return Ok(PullSecretRemovalOutcome::Deleted);
+                // Acceptance is not removal (Codex review on #243, P2): a
+                // finalizer can keep the Secret present and readable with a
+                // deletionTimestamp while the platform PAT is still exposed.
+                // Poll for the 404 that proves the object is gone — like the
+                // namespace deletion path — and only then report Deleted.
+                return wait_for_secret_removal(&api, namespace, name).await;
             }
-            Err(kube::Error::Api(error)) if error.code == 404 => {
+            Err(ApplyError::Kube(kube::Error::Api(error))) if error.code == 404 => {
                 return Ok(PullSecretRemovalOutcome::Missing);
             }
-            Err(kube::Error::Api(error)) if error.code == 409 => {
+            Err(ApplyError::Kube(kube::Error::Api(error))) if error.code == 409 => {
                 // The next attempt's read decides (review finding on #243):
                 // an unmanaged live object is a replacement and is kept
                 // (NotOurs), a still-managed one is the same secret updated
@@ -1138,16 +1250,62 @@ async fn delete_managed_pull_secret(
                 tracing::warn!(
                     namespace = %namespace,
                     secret = %name,
-                    "tenant image pull secret delete conflicted; re-reading before retry"
+                    attempt,
+                    "tenant image pull secret delete conflicted; backing off before re-reading"
                 );
+                tokio::time::sleep(pull_secret_conflict_retry_delay(attempt)).await;
                 continue;
             }
-            Err(error) => return Err(DeployError::Apply(error.into())),
+            Err(error) => return Err(DeployError::Apply(error)),
         }
     }
     Err(DeployError::PullSecretDeleteConflict(format!(
         "{namespace}/{name}"
     )))
+}
+
+/// Wait until an accepted Secret delete has actually removed the object
+/// (Codex review on #243, P2): with a finalizer the Secret lingers, still
+/// readable, with a deletionTimestamp — reporting `Deleted` then would let
+/// the sweep converge and open workload admission while the platform PAT is
+/// exposed. Bounded poll; a still-present object at the deadline is an error
+/// so the caller stays unconverged and retries.
+async fn wait_for_secret_removal(
+    api: &Api<Secret>,
+    namespace: &str,
+    name: &str,
+) -> Result<PullSecretRemovalOutcome, DeployError> {
+    let deadline = tokio::time::Instant::now() + PULL_SECRET_DELETION_POLL_DEADLINE;
+    loop {
+        match api.get(name).await {
+            Err(kube::Error::Api(error)) if error.code == 404 => {
+                return Ok(PullSecretRemovalOutcome::Deleted);
+            }
+            Err(error) => return Err(DeployError::Apply(error.into())),
+            Ok(secret) => {
+                let terminating = secret.metadata.deletion_timestamp.is_some();
+                if tokio::time::Instant::now() >= deadline {
+                    tracing::warn!(
+                        namespace = %namespace,
+                        secret = %name,
+                        terminating,
+                        "tenant image pull secret still present after the accepted delete \
+                         (finalizer?); reporting non-convergence so the sweep stays closed"
+                    );
+                    return Err(DeployError::PullSecretDeleteConflict(format!(
+                        "{namespace}/{name}"
+                    )));
+                }
+                tracing::debug!(
+                    namespace = %namespace,
+                    secret = %name,
+                    terminating,
+                    "waiting for the accepted tenant image pull secret delete to converge"
+                );
+            }
+        }
+        tokio::time::sleep(PULL_SECRET_DELETION_POLL_INTERVAL).await;
+    }
 }
 
 /// The mutation-generation fence [`enclava_engine::apply::generation::delete_resource`]
@@ -1205,20 +1363,34 @@ fn ensure_pull_secret_generation_not_stale(
 /// stale platform token is still exposed. The per-deploy cleanup in
 /// [`apply_all_with_tenant_image_pull_secret`] remains the hard gate.
 pub async fn cleanup_stale_tenant_image_pull_secrets_at_startup(pool: &PgPool) -> bool {
-    match cleanup_stale_tenant_image_pull_secrets(pool).await {
-        Ok(true) => true,
-        Ok(false) => {
+    // Bound the whole sweep (Codex review on #243, P1): its Kubernetes calls
+    // are not individually time-bounded everywhere, and an API server that
+    // accepts a connection and then stalls would hang the pre-listen startup
+    // (and the background reconciler) for the process lifetime. Degrade to
+    // "not converged" and let the bounded-backoff retry path take over.
+    let sweep = cleanup_stale_tenant_image_pull_secrets(pool);
+    match tokio::time::timeout(PULL_SECRET_SWEEP_TIMEOUT, sweep).await {
+        Ok(Ok(true)) => true,
+        Ok(Ok(false)) => {
             tracing::error!(
                 "tenant image pull secret cleanup did not converge: stale secrets may remain \
                  and workload admission stays closed until a clean sweep converges"
             );
             false
         }
-        Err(error) => {
+        Ok(Err(error)) => {
             tracing::error!(
                 %error,
                 "tenant image pull secret cleanup failed; stale secrets may remain and \
                  workload admission stays closed until a clean sweep converges"
+            );
+            false
+        }
+        Err(_) => {
+            tracing::error!(
+                sweep_timeout_secs = PULL_SECRET_SWEEP_TIMEOUT.as_secs(),
+                "tenant image pull secret cleanup timed out (stalled Kubernetes API?); \
+                 treating the sweep as not converged and retrying with bounded backoff"
             );
             false
         }
@@ -1235,6 +1407,23 @@ type NamespacePullSecretInventory =
 async fn cleanup_stale_tenant_image_pull_secrets(pool: &PgPool) -> Result<bool, DeployError> {
     let settings = PullSecretSettings::from_env();
     let config = tenant_image_pull_secret_config_from_env();
+
+    // Snapshot the namespaces' kubernetes mutation generations BEFORE the
+    // app-inventory read (Devin SEC + Codex P1 review findings on #243): the
+    // inventory is a DB snapshot, and a deploy that enters scope after it was
+    // taken applies a pull secret the snapshot classifies as out of scope.
+    // Any secret annotated with a generation NEWER than this snapshot is
+    // skipped by the reconcile pass, so the sweep can never erase a fresh
+    // deploy's credentials; the next sweep (snapshot taken after that deploy)
+    // decides. Read once for all namespaces — one extra query per sweep.
+    let lease_rows: std::collections::BTreeMap<String, i64> = sqlx::query_as(
+        "SELECT resource_key, generation FROM external_resource_mutation_leases \
+         WHERE resource_scope = 'kubernetes_namespace'",
+    )
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .collect();
 
     // LEFT JOIN: an app with no container rows must still be inventoried
     // (as an app with no images), or its namespace is invisible to the sweep
@@ -1303,7 +1492,9 @@ async fn cleanup_stale_tenant_image_pull_secrets(pool: &PgPool) -> Result<bool, 
             service_accounts,
             &settings,
             namespace_in_scope,
-            PullSecretDeleteMode::Unfenced,
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: lease_rows.get(namespace).copied().unwrap_or(0),
+            },
         )
         .await
         {
@@ -4034,6 +4225,19 @@ mod tests {
         /// secret's `resourceVersion` (same UID) this many times, forcing a
         /// 409 precondition conflict without replacing the object.
         rv_bumps_on_delete: u8,
+        /// Fail ServiceAccount patches with a 500: the reference cleanup
+        /// fails and the secret delete must be deferred (Codex review on
+        /// #243, P2).
+        sa_patch_fails: bool,
+        /// Simulate a finalizer on the managed Secret: the accepted DELETE
+        /// leaves the object present with a `deletionTimestamp` for this many
+        /// subsequent GETs before it actually disappears (`u8::MAX` keeps it
+        /// stuck forever). Acceptance is not removal (Codex review on #243,
+        /// P2).
+        delete_lingering_polls: u8,
+        /// Scratch counter for `delete_lingering_polls` — GETs remaining
+        /// before the finalizer releases the terminating Secret.
+        lingering_polls_left: u8,
     }
 
     fn fake_managed_secret(name: &str, labeled: bool, username: &str, token: &str) -> Secret {
@@ -4212,14 +4416,27 @@ mod tests {
                     }),
                 )
             }
-            ("secrets", "GET") => match state
-                .secrets
-                .iter()
-                .find(|secret| secret.metadata.name.as_deref() == name)
-            {
-                Some(secret) => (200, serde_json::to_value(secret).unwrap()),
-                None => not_found(),
-            },
+            ("secrets", "GET") => {
+                let index = state
+                    .secrets
+                    .iter()
+                    .position(|secret| secret.metadata.name.as_deref() == name);
+                let Some(index) = index else {
+                    return not_found();
+                };
+                // Finalizer simulation (Codex review on #243, P2): the
+                // accepted delete left the object terminating; it stays
+                // readable until the simulated finalizer releases it.
+                if state.secrets[index].metadata.deletion_timestamp.is_some() {
+                    if state.lingering_polls_left > 0 {
+                        state.lingering_polls_left -= 1;
+                    } else {
+                        state.secrets.remove(index);
+                        return not_found();
+                    }
+                }
+                (200, serde_json::to_value(&state.secrets[index]).unwrap())
+            }
             ("secrets", "PATCH") => {
                 let patch: serde_json::Value = serde_json::from_slice(body).unwrap();
                 let Some(secret) = state
@@ -4286,7 +4503,20 @@ mod tests {
                         return conflict();
                     }
                 }
-                state.secrets.remove(index);
+                if state.lingering_polls_left == 0 && state.delete_lingering_polls == 0 {
+                    state.secrets.remove(index);
+                } else {
+                    // Finalizer simulation: the delete is accepted but the
+                    // object lingers, terminating, until the poll budget in
+                    // the GET handler releases it.
+                    if state.lingering_polls_left == 0 {
+                        state.lingering_polls_left = state.delete_lingering_polls;
+                    }
+                    state.secrets[index].metadata.deletion_timestamp =
+                        Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                            k8s_openapi::jiff::Timestamp::now(),
+                        ));
+                }
                 (
                     200,
                     serde_json::json!({
@@ -4303,6 +4533,18 @@ mod tests {
                 None => not_found(),
             },
             ("serviceaccounts", "PATCH") => {
+                if state.sa_patch_fails {
+                    // Codex review on #243 (P2): the ServiceAccount patch
+                    // transiently fails, so the reference cleanup fails and
+                    // the secret delete must be deferred.
+                    return (
+                        500,
+                        serde_json::json!({
+                            "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                            "reason": "InternalError", "code": 500,
+                        }),
+                    );
+                }
                 if let Some(replacement) = state.replace_on_sa_patch.take() {
                     // The tenant replaces the secret between the cleanup's
                     // ownership read and its ServiceAccount patch — the exact
@@ -4393,7 +4635,9 @@ mod tests {
             &["cap-tenant-app".to_string()],
             &reconcile_settings(),
             false,
-            PullSecretDeleteMode::Unfenced,
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 0,
+            },
         )
         .await
         .unwrap();
@@ -4444,7 +4688,9 @@ mod tests {
             &["cap-tenant-app".to_string()],
             &reconcile_settings(),
             true,
-            PullSecretDeleteMode::Unfenced,
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 0,
+            },
         )
         .await
         .unwrap();
@@ -4470,7 +4716,9 @@ mod tests {
             &["cap-tenant-app".to_string()],
             &reconcile_settings(),
             true,
-            PullSecretDeleteMode::Unfenced,
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 0,
+            },
         )
         .await
         .unwrap();
@@ -4506,7 +4754,9 @@ mod tests {
             &["cap-tenant-app".to_string()],
             &reconcile_settings(),
             false,
-            PullSecretDeleteMode::Unfenced,
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 0,
+            },
         )
         .await
         .unwrap();
@@ -4549,7 +4799,9 @@ mod tests {
             &["cap-tenant-app".to_string()],
             &reconcile_settings(),
             true,
-            PullSecretDeleteMode::Unfenced,
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 0,
+            },
         )
         .await
         .unwrap();
@@ -4723,7 +4975,9 @@ mod tests {
             &["cap-tenant-app".to_string()],
             &reconcile_settings(),
             false,
-            PullSecretDeleteMode::Unfenced,
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 0,
+            },
         )
         .await
         .unwrap();
@@ -4768,7 +5022,9 @@ mod tests {
             &["cap-tenant-app".to_string()],
             &reconcile_settings(),
             false,
-            PullSecretDeleteMode::Unfenced,
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 0,
+            },
         )
         .await
         .unwrap();
@@ -4784,7 +5040,7 @@ mod tests {
     /// the pinned delete. A same-object conflict must be retried — the secret
     /// is still CAP's — and the sweep must still converge and remove the
     /// token once the concurrent writer settles.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn delete_retries_same_object_conflicts_until_the_writer_settles() {
         use std::sync::{Arc, Mutex};
 
@@ -4841,7 +5097,7 @@ mod tests {
     /// sweep must NOT report a clean removal (that is what let admission open
     /// while the platform PAT stayed out), the error path must restore the
     /// cleared references, and the live object must survive untouched.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn persistent_same_object_conflicts_stay_closed_and_restore_references() {
         use std::sync::{Arc, Mutex};
 
@@ -4856,8 +5112,9 @@ mod tests {
                 "cap-tenant-app",
                 &["enclava-registry-auth"],
             )],
-            // The writer never settles: every delete attempt conflicts.
-            rv_bumps_on_delete: 5,
+            // The writer never settles: every one of the bounded retry
+            // budget's attempts conflicts (u8::MAX outlasts the budget).
+            rv_bumps_on_delete: u8::MAX,
             ..Default::default()
         }));
         let engine = reconcile_engine(cluster.clone());
@@ -4867,7 +5124,9 @@ mod tests {
             &["cap-tenant-app".to_string()],
             &reconcile_settings(),
             false,
-            PullSecretDeleteMode::Unfenced,
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 0,
+            },
         )
         .await
         .unwrap();
@@ -4894,6 +5153,263 @@ mod tests {
                 .map(|references| references.len()),
             Some(1),
             "the cleared reference must be restored when removal does not converge"
+        );
+    }
+
+    /// Codex review on #243 (P2, "defer secret deletion when reference
+    /// cleanup fails"): a failed ServiceAccount patch must defer the Secret
+    /// delete — deleting it anyway would strand a dangling
+    /// `imagePullSecrets` reference the next sweep can no longer discover.
+    /// The pass reports non-convergence, the secret survives, and its
+    /// reference stays attached.
+    #[tokio::test]
+    async fn reconcile_defers_delete_when_reference_cleanup_fails() {
+        use std::sync::{Arc, Mutex};
+
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![fake_managed_secret(
+                "enclava-registry-auth",
+                true,
+                "cap-bot",
+                "ghp_platform",
+            )],
+            service_accounts: vec![fake_service_account(
+                "cap-tenant-app",
+                &["enclava-registry-auth"],
+            )],
+            sa_patch_fails: true,
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        let converged = reconcile_managed_pull_secrets(
+            &engine,
+            "tenant-ns",
+            &["cap-tenant-app".to_string()],
+            &reconcile_settings(),
+            false,
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 0,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            !converged,
+            "a failed reference cleanup must keep the pass unconverged"
+        );
+
+        let state = cluster.lock().unwrap();
+        assert_eq!(
+            state.secrets.len(),
+            1,
+            "the secret must survive so the reference cleanup can be retried"
+        );
+        assert_eq!(
+            state.service_accounts[0]
+                .image_pull_secrets
+                .as_ref()
+                .map(|references| references.len()),
+            Some(1),
+            "no dangling reference: the failed patch left the reference in place"
+        );
+    }
+
+    /// Codex review on #243 (P1, Devin SEC — "fence background cleanup
+    /// against concurrent deploys"): a sweep whose app-inventory snapshot
+    /// predates a deploy must not delete the pull secret that deploy applied.
+    /// The secret carries a mutation-generation annotation newer than the
+    /// generation the sweep snapshotted before its inventory read; the
+    /// reconcile pass skips it together with its ServiceAccount references.
+    #[tokio::test]
+    async fn sweep_skips_secrets_from_newer_mutation_generations() {
+        use std::sync::{Arc, Mutex};
+
+        let mut secret =
+            fake_managed_secret("enclava-registry-auth", true, "cap-bot", "ghp_platform");
+        secret.metadata.annotations = Some(std::collections::BTreeMap::from([(
+            enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION.to_string(),
+            "7".to_string(),
+        )]));
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![secret],
+            service_accounts: vec![fake_service_account(
+                "cap-tenant-app",
+                &["enclava-registry-auth"],
+            )],
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        // The sweep snapshotted generation 5; the live secret carries 7 — a
+        // deploy the sweep's inventory never saw. Out-of-scope inventory, but
+        // the newer generation wins.
+        let converged = reconcile_managed_pull_secrets(
+            &engine,
+            "tenant-ns",
+            &["cap-tenant-app".to_string()],
+            &reconcile_settings(),
+            false,
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 5,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(converged, "skipping a newer-generation secret is converged");
+
+        {
+            let state = cluster.lock().unwrap();
+            assert_eq!(
+                state.secrets.len(),
+                1,
+                "a secret applied by a newer mutation generation must survive the stale sweep"
+            );
+            assert_eq!(
+                state.service_accounts[0]
+                    .image_pull_secrets
+                    .as_ref()
+                    .map(|references| references.len()),
+                Some(1),
+                "its ServiceAccount reference must survive with it"
+            );
+        }
+
+        // A sweep whose snapshot INCLUDES that generation (snapshot >= 7)
+        // proceeds with the removal — the fence only protects secrets newer
+        // than the snapshot.
+        let converged = reconcile_managed_pull_secrets(
+            &engine,
+            "tenant-ns",
+            &["cap-tenant-app".to_string()],
+            &reconcile_settings(),
+            false,
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 7,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(converged);
+        let state = cluster.lock().unwrap();
+        assert!(
+            state.secrets.is_empty(),
+            "once the snapshot includes the generation, the stale secret is removed"
+        );
+    }
+
+    /// Codex review on #243 (P2, "wait for Secret deletion to converge"): an
+    /// accepted DELETE with a finalizer keeps the Secret readable with a
+    /// deletionTimestamp. The removal must wait for the actual 404 (bounded),
+    /// and only then report Deleted — the ServiceAccount references stay
+    /// cleared because the token is provably gone.
+    #[tokio::test(start_paused = true)]
+    async fn delete_waits_for_finalizer_to_release_the_secret() {
+        use std::sync::{Arc, Mutex};
+
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![fake_managed_secret(
+                "enclava-registry-auth",
+                true,
+                "cap-bot",
+                "ghp_platform",
+            )],
+            service_accounts: vec![fake_service_account(
+                "cap-tenant-app",
+                &["enclava-registry-auth"],
+            )],
+            // The finalizer holds the terminating secret for two polls, then
+            // releases it.
+            delete_lingering_polls: 2,
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        let converged = reconcile_managed_pull_secrets(
+            &engine,
+            "tenant-ns",
+            &["cap-tenant-app".to_string()],
+            &reconcile_settings(),
+            false,
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 0,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            converged,
+            "a finalizer that releases within the poll budget converges"
+        );
+
+        let state = cluster.lock().unwrap();
+        assert!(
+            state.secrets.is_empty(),
+            "Deleted may only be reported once the secret is actually gone"
+        );
+        assert_eq!(
+            state.service_accounts[0]
+                .image_pull_secrets
+                .as_ref()
+                .map(|references| references.len())
+                .unwrap_or(0),
+            0,
+            "references stay cleared once removal provably converged"
+        );
+    }
+
+    /// Codex review on #243 (P2), stuck-finalizer complement: when the
+    /// terminating Secret never disappears within the bounded poll deadline,
+    /// the removal must report failure (not Deleted), the pass stays
+    /// unconverged, and the cleared ServiceAccount references are restored so
+    /// the still-readable secret stays attached while the sweep retries.
+    #[tokio::test(start_paused = true)]
+    async fn stuck_finalizer_keeps_the_sweep_unconverged_and_restores_references() {
+        use std::sync::{Arc, Mutex};
+
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![fake_managed_secret(
+                "enclava-registry-auth",
+                true,
+                "cap-bot",
+                "ghp_platform",
+            )],
+            service_accounts: vec![fake_service_account(
+                "cap-tenant-app",
+                &["enclava-registry-auth"],
+            )],
+            // The finalizer never releases the terminating secret.
+            delete_lingering_polls: u8::MAX,
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        let converged = reconcile_managed_pull_secrets(
+            &engine,
+            "tenant-ns",
+            &["cap-tenant-app".to_string()],
+            &reconcile_settings(),
+            false,
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 0,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            !converged,
+            "a stuck finalizer must keep the sweep unconverged (PAT still readable)"
+        );
+
+        let state = cluster.lock().unwrap();
+        assert_eq!(
+            state.secrets.len(),
+            1,
+            "the terminating-but-present secret is still in the fake cluster"
+        );
+        assert_eq!(
+            state.service_accounts[0]
+                .image_pull_secrets
+                .as_ref()
+                .map(|references| references.len()),
+            Some(1),
+            "the cleared reference is restored while the secret is still readable"
         );
     }
 }
