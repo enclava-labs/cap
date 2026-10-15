@@ -78,6 +78,7 @@ pub(crate) async fn enforce_authoritative_entitlement(
     org_id: Uuid,
     resources: &AppResources,
     creating_app: bool,
+    fresh_volume_claims: enclava_engine::apply::orchestrator::FreshVolumeClaims,
 ) -> Result<crate::entitlements::AuthoritativeEntitlement, (StatusCode, Json<serde_json::Value>)> {
     let authority = crate::entitlements::authoritative_entitlement_in_tx(tx, org_id)
         .await
@@ -101,6 +102,30 @@ pub(crate) async fn enforce_authoritative_entitlement(
     })?;
     crate::entitlements::validate_resource_limits(resources, limits)
         .map_err(resource_limit_error_response)?;
+    // The 32 MiB LUKS2 fresh-format floor (shared with enclava-init's
+    // MIN_VOLUME_BYTES), enforced per claim: only sizes that would
+    // provision a NEW PVC are checked. Surviving sub-floor claims are
+    // grandfathered (they activate fine) — callers derive the flags from
+    // actual PVC evidence, never from render markers.
+    for (fresh, field, value) in [
+        (
+            fresh_volume_claims.app_data,
+            "storage",
+            resources.app_data_size.as_str(),
+        ),
+        (
+            fresh_volume_claims.tls_data,
+            "tls_storage",
+            resources.tls_data_size.as_str(),
+        ),
+    ] {
+        if fresh {
+            enclava_engine::validate::validate_persistent_volume_size_for_fresh_provisioning(
+                field, value,
+            )
+            .map_err(|message| json_error(StatusCode::BAD_REQUEST, message))?;
+        }
+    }
     if creating_app {
         let app_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM apps WHERE org_id = $1")
             .bind(org_id)
@@ -119,6 +144,49 @@ pub(crate) async fn enforce_authoritative_entitlement(
         }
     }
     Ok(authority)
+}
+
+/// Which of the app's persistent-volume claims a sub-floor size would
+/// provision FRESH — derived from POSITIVE initialization evidence, not
+/// claim existence or render markers. `manifest_hash`/`observing_since`
+/// only ever proved the StatefulSet was WRITTEN, and a surviving PVC alone
+/// only ever proved the object exists: a bound-but-unformatted claim must
+/// still be refused below the floor. Live Kubernetes state is the only
+/// admissible evidence: the exact ordinal-0 pod non-terminating, Ready,
+/// mounting the exact claim, and created in a later whole second than it.
+/// Deployment history is deliberately NOT consulted — independent database
+/// and Kubernetes clocks cannot order a row against a claim, and a
+/// password-timeout redeploy can publish healthy without opening storage.
+/// Conservative availability cost: an initialized legacy sub-floor claim
+/// with no live proof is refused until the workload regains live readiness.
+///
+/// Sizes at/above the floor and grammar-invalid values (rejected by
+/// `validate_resource_limits` upstream) short-circuit without any lookup —
+/// no Kubernetes I/O at all. The workload name is `app.name` — the same
+/// field `build_confidential_app_from_rows` renders into the StatefulSet —
+/// and the namespace is `app.namespace`. Fails closed: an unproven legacy
+/// claim keeps the floor (a refusal, never a destructive recovery), and
+/// lookup errors abort the request rather than granting the waiver.
+pub(crate) async fn fresh_volume_claims(
+    app: &App,
+    resources: &AppResources,
+) -> Result<enclava_engine::apply::orchestrator::FreshVolumeClaims, crate::deploy::DeployError> {
+    let claims_to_check = enclava_engine::apply::orchestrator::FreshVolumeClaims {
+        app_data: enclava_engine::validate::is_sub_floor_volume_size(&resources.app_data_size),
+        tls_data: enclava_engine::validate::is_sub_floor_volume_size(&resources.tls_data_size),
+    };
+    if !claims_to_check.app_data && !claims_to_check.tls_data {
+        return Ok(enclava_engine::apply::orchestrator::FreshVolumeClaims::NONE);
+    }
+    let engine = enclava_engine::apply::engine::ApplyEngine::try_default().await?;
+    enclava_engine::apply::orchestrator::inspect_fresh_volume_claims(
+        &engine,
+        &app.namespace,
+        &app.name,
+        claims_to_check,
+    )
+    .await
+    .map_err(crate::deploy::DeployError::Apply)
 }
 
 fn dns_error_response(error: crate::dns::DnsError) -> (StatusCode, Json<serde_json::Value>) {
@@ -1136,6 +1204,27 @@ async fn deploy_app_candidate(
         "setup_state": DEPLOYMENT_SETUP_DNS_PENDING,
     });
 
+    // Fresh-volume floor: which sub-floor claims lack positive
+    // initialization evidence and would provision FRESH. Derived from live
+    // cluster evidence BEFORE opening the acceptance transaction (no kube
+    // I/O under the authority lanes, no I/O at all for at/above-floor
+    // sizes). App INSERT always validates fresh without a lookup. A
+    // concurrent authority change invalidates this estimate, but the
+    // candidate tx's lane + authority checks catch that — the apply
+    // worker's under-fence reinspection is the backstop either way.
+    let fresh_volume_claims = if app_mutation == AppMutation::Insert {
+        enclava_engine::apply::orchestrator::FreshVolumeClaims::ALL
+    } else {
+        fresh_volume_claims(&app, &candidate_resources)
+            .await
+            .map_err(|_| {
+                json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "volume provisioning state could not be verified; retry the deployment",
+                )
+            })?
+    };
+
     // No requested app/container state has been persisted before this point.
     // Commit every accepted deployment row and its app/container changes as a
     // single unit so any database error rolls the candidate back completely.
@@ -1168,6 +1257,7 @@ async fn deploy_app_candidate(
         auth.org_id,
         &candidate_resources,
         app_mutation == AppMutation::Insert,
+        fresh_volume_claims,
     )
     .await?;
     if let Some(artifacts) = signing_artifacts.as_ref() {
@@ -1823,6 +1913,107 @@ mod tests {
             validate_log_encryption_config(Some(config)).expect_err("algorithm rejected");
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body.0["error"], "unsupported log_encryption.algorithm");
+    }
+
+    #[tokio::test]
+    async fn fresh_volume_floor_rejects_sub_luks2_minimum_sizes_synchronously() {
+        let pool = database_test_pool().await;
+        let app = insert_setup_test_app(&pool).await;
+
+        // 24 Mi passed the old grammar-only checks (positive binary
+        // quantity, under every cap). It does not brick — sub-floor LUKS2
+        // volumes activate — but the fresh-format floor must reject it
+        // synchronously instead of accepting a deployment enclava-init
+        // refuses at first boot.
+        let mut tx = pool.begin().await.expect("begin floor test tx");
+        let sub_floor = crate::models::AppResources {
+            app_id: app.id,
+            cpu_limit: "1".to_string(),
+            memory_limit: "1Gi".to_string(),
+            app_data_size: "24Mi".to_string(),
+            tls_data_size: "2Gi".to_string(),
+        };
+        let rejected = super::enforce_authoritative_entitlement(
+            &mut tx,
+            app.org_id,
+            &sub_floor,
+            true,
+            enclava_engine::apply::orchestrator::FreshVolumeClaims::ALL,
+        )
+        .await
+        .expect_err("fresh sub-floor volume size must be rejected at admission");
+        assert_eq!(rejected.0, StatusCode::BAD_REQUEST);
+        assert!(
+            rejected.1.0["error"]
+                .as_str()
+                .expect("error message")
+                .contains("at least 32Mi"),
+            "error should name the floor: {}",
+            rejected.1.0["error"]
+        );
+        tx.rollback().await.expect("rollback floor test tx");
+
+        // Grandfathering: the same persisted size keeps operating when its
+        // claim has a surviving PVC (claims=NONE) — sub-floor LUKS2 volumes
+        // DO activate, so pre-floor apps are not locked out of
+        // redeploy/reapply/rollback.
+        let mut tx = pool.begin().await.expect("begin grandfather test tx");
+        super::enforce_authoritative_entitlement(
+            &mut tx,
+            app.org_id,
+            &sub_floor,
+            false,
+            enclava_engine::apply::orchestrator::FreshVolumeClaims::NONE,
+        )
+        .await
+        .expect("provisioned pre-floor size must keep operating on apply paths");
+        tx.rollback().await.expect("rollback grandfather test tx");
+
+        // Per-claim granularity: with only the state claim fresh, the
+        // sub-floor tls size is still waived.
+        let mut tx = pool.begin().await.expect("begin per-claim test tx");
+        let per_claim = crate::models::AppResources {
+            app_id: app.id,
+            cpu_limit: "1".to_string(),
+            memory_limit: "1Gi".to_string(),
+            app_data_size: "10Gi".to_string(),
+            tls_data_size: "24Mi".to_string(),
+        };
+        super::enforce_authoritative_entitlement(
+            &mut tx,
+            app.org_id,
+            &per_claim,
+            false,
+            enclava_engine::apply::orchestrator::FreshVolumeClaims {
+                app_data: true,
+                tls_data: false,
+            },
+        )
+        .await
+        .expect("a provisioned sub-floor tls claim must be waived");
+        tx.rollback().await.expect("rollback per-claim test tx");
+
+        // And the exact floor is accepted for fresh provisioning.
+        let mut tx = pool.begin().await.expect("begin boundary test tx");
+        let at_floor = crate::models::AppResources {
+            app_id: app.id,
+            cpu_limit: "1".to_string(),
+            memory_limit: "1Gi".to_string(),
+            app_data_size: "32Mi".to_string(),
+            tls_data_size: "32Mi".to_string(),
+        };
+        super::enforce_authoritative_entitlement(
+            &mut tx,
+            app.org_id,
+            &at_floor,
+            true,
+            enclava_engine::apply::orchestrator::FreshVolumeClaims::ALL,
+        )
+        .await
+        .expect("32Mi must be accepted for fresh provisioning");
+        tx.rollback().await.expect("rollback boundary test tx");
+
+        delete_setup_test_org(&pool, app.org_id).await;
     }
 
     #[tokio::test]

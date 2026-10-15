@@ -149,6 +149,12 @@ pub fn validate_app(app: &ConfidentialApp) -> Result<(), ValidationError> {
             detail: format!("memory uses binary Mi/Gi/Ti units: {detail}"),
         }
     })?;
+    // Grammar only (positive binary quantity): the 32 MiB fresh-format
+    // floor is deliberately NOT here — validate_app runs on every apply
+    // path and the spec carries no provisioning state, so a floor would
+    // break reapplies of apps whose volumes predate it. Callers enforce
+    // validate_persistent_volume_size_for_fresh_provisioning when the size
+    // governs a fresh volume (API admission; apply_and_watch's PVC check).
     validate_storage_size("storage.app_data.size", &app.storage.app_data.size).map_err(
         |detail| ValidationError::InvalidStorageSize {
             field: "storage.app_data.size",
@@ -218,6 +224,7 @@ fn validate_resource_quantity(field: &'static str, value: &str) -> Result<(), St
     }
     let numeric = trimmed.strip_suffix('m').unwrap_or(trimmed);
     validate_scaled_decimal(numeric, 1)
+        .map(|_| ())
         .map_err(|_| format!("{field} must be a positive number or millicpu quantity"))
 }
 
@@ -231,7 +238,50 @@ fn validate_storage_size(field: &'static str, value: &str) -> Result<(), String>
     if trimmed.is_empty() || trimmed != value {
         return Err(format!("{field} must be a non-empty binary quantity"));
     }
-    // (suffix, multiplier-in-Mi) pairs mirroring the API's parse_binary_mib.
+    let Some((number, multiplier)) = binary_quantity_parts(trimmed) else {
+        return Err(format!("{field} must use Mi, Gi, or Ti binary units"));
+    };
+    validate_scaled_decimal(number, multiplier)
+        .map(|_| ())
+        .map_err(|_| format!("{field} must be a positive binary quantity"))
+}
+
+/// Fresh-provisioning floor for the LUKS-formatted state/tls-state volumes.
+/// The LUKS2 header occupies the first 16 MiB and `luksFormat` succeeds on
+/// devices that end inside it — activation then has no data area and the
+/// volume is bricked. The floor adds 16 MiB of payload headroom. It is a
+/// FRESH-format policy, not an activation bound: sub-floor volumes that
+/// already exist activate and keep operating, so `validate_app` must not
+/// enforce it (see its comment). Enforced in lockstep with enclava-init
+/// `MIN_VOLUME_BYTES` — keep the two bounds identical.
+pub const MIN_VOLUME_SIZE_MIB: u128 = 32;
+
+/// Validate that a persistent-volume size is a positive binary quantity of
+/// at least [`MIN_VOLUME_SIZE_MIB`]. Shared by API admission paths; exact
+/// rational compare (numerator / 10^scale Mi) — no float rounding.
+pub fn validate_persistent_volume_size_for_fresh_provisioning(
+    field: &'static str,
+    value: &str,
+) -> Result<(), String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed != value {
+        return Err(format!("{field} must be a non-empty binary quantity"));
+    }
+    let Some((number, multiplier)) = binary_quantity_parts(trimmed) else {
+        return Err(format!("{field} must use Mi, Gi, or Ti binary units"));
+    };
+    let (numerator, scale) = validate_scaled_decimal(number, multiplier)
+        .map_err(|_| format!("{field} must be a positive binary quantity"))?;
+    if numerator < MIN_VOLUME_SIZE_MIB * 10u128.pow(scale) {
+        return Err(format!(
+            "{field} must be at least {MIN_VOLUME_SIZE_MIB}Mi — the fresh-format floor: a LUKS2 volume needs its 16 MiB header plus enough data-area headroom to stay usable"
+        ));
+    }
+    Ok(())
+}
+
+/// (suffix, multiplier-in-Mi) pairs mirroring the API's parse_binary_mib.
+fn binary_quantity_parts(trimmed: &str) -> Option<(&str, u128)> {
     const BINARY_UNITS: [(&str, u128); 6] = [
         ("TiB", 1024 * 1024),
         ("Ti", 1024 * 1024),
@@ -240,22 +290,58 @@ fn validate_storage_size(field: &'static str, value: &str) -> Result<(), String>
         ("MiB", 1),
         ("Mi", 1),
     ];
-    let Some((number, multiplier)) = BINARY_UNITS
+    BINARY_UNITS
         .iter()
         .find_map(|(suffix, multiplier)| trimmed.strip_suffix(*suffix).map(|n| (n, *multiplier)))
-    else {
-        return Err(format!("{field} must use Mi, Gi, or Ti binary units"));
+}
+
+/// Whether a persistent-volume size parses as a valid binary quantity that
+/// is strictly below [`MIN_VOLUME_SIZE_MIB`]. Only these sizes can need the
+/// fresh-format floor's cluster check; callers must still run
+/// `validate_persistent_volume_size_for_fresh_provisioning` for the actual
+/// admission error, and grammar-invalid values return false here (they are
+/// rejected by the validator/limits path, not waived by claim evidence).
+pub fn is_sub_floor_volume_size(value: &str) -> bool {
+    let Some((number, multiplier)) = binary_quantity_parts(value) else {
+        return false;
     };
-    validate_scaled_decimal(number, multiplier)
-        .map_err(|_| format!("{field} must be a positive binary quantity"))
+    let Ok((numerator, scale)) = validate_scaled_decimal(number, multiplier) else {
+        return false;
+    };
+    numerator < MIN_VOLUME_SIZE_MIB * 10u128.pow(scale)
+}
+
+/// Exact MiB value of a binary quantity, rounded UP. Used where a
+/// quantity-derived budget must never underestimate the configured size
+/// (e.g. rollout windows sized by volume bytes). Reuses the same grammar
+/// and overflow bounds as `validate_storage_size`; errors bubble as plain
+/// strings for the caller to wrap.
+pub fn storage_quantity_mib_ceil(value: &str) -> Result<u128, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed != value {
+        return Err(format!(
+            "storage quantity {value:?} must be a non-empty binary quantity"
+        ));
+    }
+    let Some((number, multiplier)) = binary_quantity_parts(trimmed) else {
+        return Err(format!(
+            "storage quantity {value:?} must use Mi, Gi, or Ti binary units"
+        ));
+    };
+    let (numerator, scale) = validate_scaled_decimal(number, multiplier)
+        .map_err(|e| format!("storage quantity {value:?} is invalid: {e}"))?;
+    Ok(numerator.div_ceil(10u128.pow(scale)))
 }
 
 /// Digit, scale, and overflow bounds mirroring the API's
 /// `ScaledDecimal::parse` + `checked_mul` (entitlements.rs): plain decimal
 /// grammar, at most 38 total digits, at most 24 fractional digits, non-zero
 /// coefficient, and an exact-Mi conversion (`multiplier`) that must not
-/// overflow u128. f64 parsing would silently admit all of those.
-fn validate_scaled_decimal(number: &str, multiplier: u128) -> Result<(), String> {
+/// overflow u128. f64 parsing would silently admit all of those. Returns the
+/// normalized exact value as `(numerator, scale)` with
+/// `value_mib = numerator / 10^scale`, so callers can do exact bounds
+/// compares without floats.
+fn validate_scaled_decimal(number: &str, multiplier: u128) -> Result<(u128, u32), String> {
     if !is_plain_decimal(number) {
         return Err("must be a positive decimal quantity".to_string());
     }
@@ -282,10 +368,10 @@ fn validate_scaled_decimal(number: &str, multiplier: u128) -> Result<(), String>
         coefficient /= 10;
         scale -= 1;
     }
-    coefficient
+    let numerator = coefficient
         .checked_mul(multiplier)
         .ok_or_else(|| "is too large".to_string())?;
-    Ok(())
+    Ok((numerator, scale as u32))
 }
 
 /// True for plain decimal digits with at most one interior `.` — the grammar

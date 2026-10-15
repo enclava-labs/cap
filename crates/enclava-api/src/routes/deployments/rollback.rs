@@ -310,6 +310,20 @@ pub async fn rollback(
         authority_containers,
         authority_resources.clone(),
     );
+    // Live claim evidence for the rollback target's resource sizes, computed
+    // before the lanes so no kube I/O runs under them (and none at all for
+    // at/above-floor sizes): a proven-initialized sub-floor claim keeps
+    // operating; a missing/terminating/unproven one is a fresh format and
+    // must meet the floor.
+    let fresh_volume_claims = super::fresh_volume_claims(&app, &target_resources)
+        .await
+        .map_err(|_| {
+            json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "volume provisioning state could not be verified; retry the rollback",
+            )
+        })?;
+
     let mut tx = state.db.begin().await.map_err(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -433,8 +447,17 @@ pub async fn rollback(
             "rollback target authority changed; retry the rollback",
         ));
     }
-    super::enforce_authoritative_entitlement(&mut tx, auth.org_id, &target_resources, false)
-        .await?;
+    super::enforce_authoritative_entitlement(
+        &mut tx,
+        auth.org_id,
+        &target_resources,
+        false,
+        // Rollback re-applies an accepted snapshot's resources against live
+        // claim evidence: surviving sub-floor claims keep operating, missing
+        // or terminating ones are fresh formats and must meet the floor.
+        fresh_volume_claims,
+    )
+    .await?;
     if let Some(artifacts) = rollback_artifacts.as_ref() {
         let signing_service_pubkey_hex = state
             .attestation
