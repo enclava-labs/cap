@@ -362,6 +362,15 @@ async fn watch_rollout_times_out_on_missing_statefulset() {
     };
     let engine = ApplyEngine::try_with_config(config).await.unwrap();
 
-    let result = watch_rollout(&engine, "nonexistent-ns", "nonexistent-sts").await;
-    assert!(result.is_err());
+    let result = watch_rollout(
+        &engine,
+        "nonexistent-ns",
+        "nonexistent-sts",
+        engine.config().rollout_timeout,
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(enclava_engine::apply::engine::ApplyError::RolloutFailed(_))
+    ));
 }

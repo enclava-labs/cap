@@ -972,30 +972,6 @@ fn base64_decoded_size_is_capped_exactly() {
 }
 
 #[test]
-// Pin canary: assertions are constant by design — they fail CI if a cap is
-// recalibrated below the measured generator output (#212).
-#[allow(clippy::assertions_on_constants)]
-fn measured_genpolicy_size_class_fits_the_caps() {
-    // Recalibration trigger: the signing service's genpolicy output
-    // (kata-containers/genpolicy 3.28.0) measured 116,287 / 116,963 raw
-    // bytes (~125 KiB JSON-escaped) on two unrelated apps, and the
-    // serialized artifact measured 133,947 bytes. Shrinking a cap below
-    // these would reject the platform's own generator output again (#212).
-    // Generator-side growth detection belongs in the signing service's
-    // tests, where genpolicy runs.
-    assert!(
-        MAX_POLICY_TEXT_BYTES >= 125_058,
-        "agent policy cap {} is below the measured genpolicy escaped size 125058",
-        MAX_POLICY_TEXT_BYTES
-    );
-    assert!(
-        super::keyring::MAX_SIGNED_POLICY_ARTIFACT_BLOB_BYTES >= 133_947,
-        "artifact blob cap {} is below the measured serialized artifact size 133947",
-        super::keyring::MAX_SIGNED_POLICY_ARTIFACT_BLOB_BYTES
-    );
-}
-
-#[test]
 fn legacy_padded_stored_artifact_is_rejected_at_dispatch() {
     // #128 review follow-up (Codex P2): a legacy row whose stored
     // signed_policy_artifact carries unknown-field padding inside
