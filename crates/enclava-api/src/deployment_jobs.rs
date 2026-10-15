@@ -2565,6 +2565,32 @@ async fn fail_apply_job_with_mutation(
                 false
             }
         };
+    // devin 🔴 round 9: when the terminal publication itself failed, the
+    // structured `CreationEvidenceLost` classification dies with this
+    // call — a retried apply's precondition GET observes the
+    // already-unmarked object, so `preserved_creation_evidence` yields an
+    // empty expectation and the loss is undetectable forever after. A
+    // later adopted-namespace sweep could then classify the live
+    // CAP-created object as foreign and clear cleanup evidence over it.
+    // Persist the app-level marker directly from the in-memory
+    // classification; the published path persists it inside
+    // `cleanup_after_terminal_apply_failure`.
+    if !published
+        && matches!(
+            error,
+            DeploymentJobError::Apply(crate::deploy::DeployError::Apply(
+                enclava_engine::apply::engine::ApplyError::CreationEvidenceLost { .. }
+            ))
+        )
+        && !crate::deployment_failure_cleanup::persist_creation_evidence_loss(&state.db, job.app_id)
+            .await
+    {
+        tracing::error!(
+            deployment_id = %job.deployment_id,
+            app_id = %job.app_id,
+            "creation-evidence-loss marker could not be persisted after a failed publication; a retried apply can no longer detect the loss"
+        );
+    }
     // Compensating provider cleanup for the partial state this apply may have
     // published (HAProxy routes, namespace objects). Runs while the mutation
     // lease still owns the edge/namespace fences, before any fence release.

@@ -479,33 +479,69 @@ where
 /// persisted, so unlike the create path (which deletes its object) the
 /// only safe compensation is to re-stamp the exact evidence pairs the
 /// preconditioned object proved were ours. Only the same-UID object — the
-/// one this failed update was preconditioned on — is ever touched, each
-/// restore patch is resourceVersion-fenced, and the apply still fails
-/// closed with `CreationEvidenceLost`: a transient one-shot webhook leaves
-/// a properly attributable object for the failure sweep, while a
-/// deterministic one leaves the object explicitly unresolved instead of
-/// silently succeeding.
+/// one this failed update was preconditioned on — is ever touched, and
+/// each restore patch is resourceVersion-fenced.
+///
+/// Every read AND write is bounded by the shared compensation budget
+/// (devin 🔴 round 9): this runs while the apply worker still holds its
+/// mutation lease and shared provider fences, so a stalled API server
+/// must not stretch a raw GET to the client's ~295 s read timeout and
+/// block unrelated deployments. A read that exhausts the budget is
+/// treated as unresolved evidence, not an infinite wait.
+///
+/// Returns the live object when every expected evidence pair is
+/// verifiably present — restored by this loop's patch or already
+/// re-stamped by another CAP writer. A restored same-UID object is
+/// attributable again, so the caller reports SUCCESS instead of
+/// `CreationEvidenceLost` (devin 🔴/Codex P2 round 9): that error makes
+/// the API layer persist the permanent, app-wide `creation_evidence_lost`
+/// marker, which has no automatic clearing path and would keep unrelated
+/// unmarked sweep targets unresolved until operator intervention.
+/// Returns `None` when the loss stays unresolved: the caller fails
+/// closed and the adopted-namespace sweep counts unmarked live targets
+/// as unresolved.
 async fn compensate_stripped_evidence<K>(
     api: &Api<K>,
     name: &str,
     preconditioned: &K,
     expected: &[(&'static str, String)],
     field_manager: &str,
-) where
+) -> Option<K>
+where
     K: Resource + Clone + Debug + DeserializeOwned,
 {
     const RESTORE_ATTEMPTS: usize = 3;
+    // Same budget rationale as the create-compensation path: the whole
+    // restore, reads included, must release the worker's shared fences
+    // well before the 180 s mutation lease reclaim.
+    let deadline = tokio::time::Instant::now() + COMPENSATE_TOTAL_TIMEOUT;
     for attempt in 0..RESTORE_ATTEMPTS {
-        let live = match api.get(name).await {
+        let live = match bounded_compensation(deadline, api.get(name)).await {
             Ok(live) => live,
-            Err(error) => {
+            Err(CompensationError::Gone) => {
+                tracing::warn!(
+                    kind = kind::<K>(),
+                    name,
+                    "object vanished before its webhook-stripped creation evidence could be restored"
+                );
+                return None;
+            }
+            Err(CompensationError::Timeout) => {
+                tracing::warn!(
+                    kind = kind::<K>(),
+                    name,
+                    "re-read to restore webhook-stripped creation evidence timed out; treating the loss as unresolved instead of holding shared fences"
+                );
+                return None;
+            }
+            Err(CompensationError::Kube(error)) => {
                 tracing::warn!(
                     kind = kind::<K>(),
                     name,
                     error = %error,
                     "cannot re-read object to restore webhook-stripped creation evidence"
                 );
-                return;
+                return None;
             }
         };
         // Never restore onto a same-named replacement: only the exact
@@ -516,7 +552,7 @@ async fn compensate_stripped_evidence<K>(
                 name,
                 "live object no longer matches the failed update's UID; not restoring creation evidence"
             );
-            return;
+            return None;
         }
         let restored = |object: &K| {
             expected.iter().all(|(key, value)| {
@@ -531,7 +567,7 @@ async fn compensate_stripped_evidence<K>(
         if restored(&live) {
             // Someone (an earlier restore attempt that raced the response,
             // or another CAP writer) already re-stamped it.
-            return;
+            return Some(live);
         }
         let mut annotations = serde_json::Map::new();
         for (key, value) in expected {
@@ -552,9 +588,9 @@ async fn compensate_stripped_evidence<K>(
                 tracing::info!(
                     kind = kind::<K>(),
                     name,
-                    "restored creation evidence a webhook stripped from an accepted update; the apply still fails closed"
+                    "restored creation evidence a webhook stripped from an accepted update; the restored object is attributable again, so the apply succeeds"
                 );
-                return;
+                return Some(patched);
             }
             Ok(_) => {}
             Err(error) => {
@@ -566,7 +602,13 @@ async fn compensate_stripped_evidence<K>(
                 );
             }
         }
-        tokio::time::sleep(conflict_retry_delay(attempt)).await;
+        // Keep the retry backoff inside the total budget: never sleep
+        // past the deadline the shared fences are held under.
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        tokio::time::sleep(conflict_retry_delay(attempt).min(deadline - now)).await;
     }
     tracing::error!(
         kind = kind::<K>(),
@@ -574,6 +616,7 @@ async fn compensate_stripped_evidence<K>(
         error_code = "creation_evidence_restore_unresolved",
         "could not restore webhook-stripped creation evidence; object stays unresolved for the failure sweep"
     );
+    None
 }
 
 /// True when a managed-fields entry authored by `field_manager` (non-status)
@@ -842,31 +885,45 @@ where
             };
             match applied {
                 Ok(applied) => {
-                    verify_applied_generation(&applied, generation)?;
-                    // Codex P2: a mutating admission webhook can drop or
-                    // rewrite creation evidence on this update while leaving
-                    // the generation annotation intact. Verify the evidence
-                    // preserved from the preconditioned object survived the
-                    // response; its loss is unresolved and must fail closed
-                    // (a later sweep would otherwise classify the still-live
-                    // CAP-created object as foreign and clear cleanup
-                    // evidence over it). The write is already persisted, so
-                    // first try to re-stamp the stripped evidence on the
-                    // same UID (grok Critical): a restored object is again
-                    // classifiable, and a later sweep cleans it up.
-                    if let Err(error) =
+                    // Codex P2 round 9: verify the preserved creation
+                    // evidence INDEPENDENTLY of the generation marker. A
+                    // webhook that strips BOTH annotations must still be
+                    // classified as evidence loss — returning the
+                    // generation error first would skip compensation and
+                    // leave an unattributable CAP-created object that a
+                    // later adopted-namespace sweep could classify as
+                    // foreign and clear cleanup evidence over.
+                    if let Err(evidence_error) =
                         verify_preserved_creation_evidence(&applied, &expected_evidence)
                     {
-                        compensate_stripped_evidence(
+                        // The write is already persisted, so first try to
+                        // re-stamp the stripped evidence on the same UID.
+                        if let Some(restored) = compensate_stripped_evidence(
                             api,
                             name,
                             &current,
                             &expected_evidence,
                             &engine.config().field_manager,
                         )
-                        .await;
-                        return Err(error);
+                        .await
+                        {
+                            // devin 🔴/Codex P2 round 9: a VERIFIED restore
+                            // makes the same-UID object attributable again,
+                            // so this must not surface as
+                            // `CreationEvidenceLost` — the API layer would
+                            // persist the permanent, app-wide marker and
+                            // keep unrelated unmarked sweep targets
+                            // unresolved until operator intervention.
+                            // Report success with the object actually live;
+                            // the restore patch cannot repair a stripped
+                            // generation marker, so that (non-permanent)
+                            // failure still surfaces here.
+                            verify_applied_generation(&restored, generation)?;
+                            return Ok(restored);
+                        }
+                        return Err(evidence_error);
                     }
+                    verify_applied_generation(&applied, generation)?;
                     return Ok(applied);
                 }
                 Err(ApplyError::Kube(kube::Error::Api(error))) if error.code == 409 => {
@@ -1063,23 +1120,31 @@ where
             .await
         {
             Ok(applied) => {
-                verify_applied_generation(&applied, generation)?;
                 // Same fail-closed rule as the SSA update path: creation
                 // evidence preserved from the preconditioned object must
-                // survive the response. On loss, first try the bounded
-                // same-UID compensating restore (grok-4.7 Critical).
-                if let Err(error) = verify_preserved_creation_evidence(&applied, &expected_evidence)
+                // survive the response — checked INDEPENDENTLY of the
+                // generation marker (Codex P2 round 9), with the bounded
+                // same-UID compensating restore first on loss. A verified
+                // restore reports success instead of the permanent
+                // `CreationEvidenceLost` classification.
+                if let Err(evidence_error) =
+                    verify_preserved_creation_evidence(&applied, &expected_evidence)
                 {
-                    compensate_stripped_evidence(
+                    if let Some(restored) = compensate_stripped_evidence(
                         api,
                         name,
                         &current,
                         &expected_evidence,
                         field_manager,
                     )
-                    .await;
-                    return Err(error);
+                    .await
+                    {
+                        verify_applied_generation(&restored, generation)?;
+                        return Ok(restored);
+                    }
+                    return Err(evidence_error);
                 }
+                verify_applied_generation(&applied, generation)?;
                 return Ok(applied);
             }
             Err(ApplyError::Kube(kube::Error::Api(error))) if error.code == 409 => {
@@ -1407,17 +1472,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_response_losing_creation_evidence_fails_closed() {
-        // Codex P2: a mutating admission webhook can drop
-        // RESOURCE_CREATED_BY_ANNOTATION from an accepted update while
-        // leaving the mutation-generation annotation intact. Accepting
-        // that response would let a later failed-apply sweep classify the
-        // still-live CAP-created object as Foreign (no evidence) and
-        // silently clear cleanup evidence over a partially updated
-        // resource. The update must fail closed with a distinct error —
-        // and, because the write already persisted, first try to re-stamp
-        // the stripped evidence on the same UID so the object stays
-        // classifiable for the failure sweep (grok Critical).
+    async fn update_response_losing_creation_evidence_is_restored_and_succeeds() {
+        // Codex P2 / devin 🔴 round 9: a mutating admission webhook can
+        // drop RESOURCE_CREATED_BY_ANNOTATION from an accepted update while
+        // leaving the mutation-generation annotation intact. Accepting the
+        // stripped response verbatim would let a later failed-apply sweep
+        // classify the still-live CAP-created object as Foreign (no
+        // evidence) and silently clear cleanup evidence over it — but a
+        // VERIFIED compensating restore makes the same-UID object
+        // attributable again, so the apply must NOT surface the permanent,
+        // app-wide `CreationEvidenceLost` classification (whose marker has
+        // no automatic clearing path); it reports success with the
+        // restored live object.
         let mut state = FakeState::with_generation(1, "old");
         state.resource = Some(cap_created_configmap());
         // One-shot webhook: strips the update itself, spares the
@@ -1427,7 +1493,7 @@ mod tests {
         let engine = ApplyEngine::new(fake_client(Arc::clone(&state)), Default::default());
         let api: Api<ConfigMap> = Api::namespaced(engine.client().clone(), "fence-test");
 
-        let error = apply_resource(
+        let restored = apply_resource(
             &engine,
             &api,
             &desired("new"),
@@ -1436,15 +1502,20 @@ mod tests {
             true,
         )
         .await
-        .expect_err("an update whose response lost creation evidence must fail closed");
-        match error {
-            ApplyError::CreationEvidenceLost { kind, name, key } => {
-                assert_eq!(kind, "ConfigMap");
-                assert_eq!(name, "fenced");
-                assert_eq!(key, RESOURCE_CREATED_BY_ANNOTATION);
-            }
-            other => panic!("expected CreationEvidenceLost, got: {other:?}"),
-        }
+        .expect("a verified evidence restore must not fail the apply nor set the permanent marker");
+        // The returned object is the live one carrying the restored
+        // evidence AND the accepted update's generation stamp.
+        let annotations = restored.meta().annotations.as_ref().expect("annotations");
+        assert_eq!(
+            annotations.get(RESOURCE_CREATED_BY_ANNOTATION),
+            Some(&"1".to_string()),
+            "the restored object handed back carries the re-stamped evidence"
+        );
+        assert_eq!(
+            annotations.get(MUTATION_GENERATION_ANNOTATION),
+            Some(&"2".to_string()),
+            "the restored object handed back carries the new generation"
+        );
         // The compensating restore re-stamped the evidence onto the same
         // UID: a later failure sweep can classify the object again.
         let live = state.lock().unwrap().resource.clone().expect("stored");
@@ -1491,12 +1562,87 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partial_apply_response_losing_creation_evidence_fails_closed() {
-        // Codex P2 (grok round 3): the merge-patch path
-        // (apply_existing_partial — replica resets, ingress restarts)
-        // must enforce the same evidence verification as the SSA update
-        // path: a webhook that strips the creation annotation from the
-        // accepted patch must not yield a silent success.
+    async fn webhook_stripping_generation_and_evidence_classifies_evidence_loss() {
+        // Codex P2 round 9: a webhook that rewrites BOTH the
+        // mutation-generation annotation and the creation evidence in
+        // the same accepted update must still be classified as
+        // `CreationEvidenceLost` — returning the generation error first
+        // would skip compensation and never set the app-level marker,
+        // leaving an unattributable object a later sweep could classify
+        // as foreign and clear cleanup evidence over.
+        let mut state = FakeState::with_generation(1, "old");
+        state.resource = Some(cap_created_configmap());
+        state.webhook_strips_evidence_writes = usize::MAX;
+        state.webhook_strips_generation_writes = usize::MAX;
+        let engine = ApplyEngine::new(fake_client(Arc::new(Mutex::new(state))), Default::default());
+        let api: Api<ConfigMap> = Api::namespaced(engine.client().clone(), "fence-test");
+
+        let error = apply_resource(
+            &engine,
+            &api,
+            &desired("new"),
+            MutationGeneration::new(2).unwrap(),
+            false,
+            true,
+        )
+        .await
+        .expect_err("a both-markers-stripping webhook must fail closed");
+        assert!(
+            matches!(error, ApplyError::CreationEvidenceLost { .. }),
+            "evidence loss must outrank the generation error, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn restored_evidence_with_stripped_generation_reports_generation_error() {
+        // The complementary half of Codex P2 round 9: a ONE-SHOT webhook
+        // strips both markers; the compensating restore re-stamps the
+        // evidence (attributable again) but cannot repair the stripped
+        // generation annotation. The apply then fails with the
+        // NON-permanent generation error — never `CreationEvidenceLost`,
+        // so the app-level unresolved marker is not set for an object
+        // whose evidence was verified back onto it.
+        let mut state = FakeState::with_generation(1, "old");
+        state.resource = Some(cap_created_configmap());
+        state.webhook_strips_evidence_writes = 1;
+        state.webhook_strips_generation_writes = 1;
+        let state = Arc::new(Mutex::new(state));
+        let engine = ApplyEngine::new(fake_client(Arc::clone(&state)), Default::default());
+        let api: Api<ConfigMap> = Api::namespaced(engine.client().clone(), "fence-test");
+
+        let error = apply_resource(
+            &engine,
+            &api,
+            &desired("new"),
+            MutationGeneration::new(2).unwrap(),
+            false,
+            true,
+        )
+        .await
+        .expect_err("a stripped generation marker must still fail the apply");
+        assert!(
+            matches!(error, ApplyError::ProviderGenerationNotApplied { .. }),
+            "an evidence-restored object must not be classified creation_evidence_lost, got: {error:?}"
+        );
+        // The evidence was restored onto the same UID before failing.
+        let live = state.lock().unwrap().resource.clone().expect("stored");
+        assert_eq!(
+            live.pointer("/metadata/annotations")
+                .and_then(Value::as_object)
+                .and_then(|annotations| annotations.get(RESOURCE_CREATED_BY_ANNOTATION)),
+            Some(&json!("1")),
+            "compensation restores the stripped creation evidence even when the generation marker was stripped too"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_apply_response_losing_creation_evidence_is_restored_and_succeeds() {
+        // Codex P2 round 9: the merge-patch path (apply_existing_partial —
+        // replica resets, ingress restarts) enforces the same evidence
+        // verification as the SSA update path, and a VERIFIED restore
+        // there reports success too — the permanent app-level
+        // `creation_evidence_lost` marker must only be set when the loss
+        // stays unresolved.
         let mut state = FakeState::with_generation(1, "old");
         state.resource = Some(cap_created_configmap());
         state.webhook_strips_evidence_writes = 1;
@@ -1504,7 +1650,7 @@ mod tests {
         let engine = ApplyEngine::new(fake_client(Arc::clone(&state)), Default::default());
         let api: Api<ConfigMap> = Api::namespaced(engine.client().clone(), "fence-test");
 
-        let error = apply_existing_partial(
+        let restored = apply_existing_partial(
             &api,
             "fenced",
             &serde_json::json!({"data": {"value": "partial"}}),
@@ -1512,8 +1658,16 @@ mod tests {
             "enclava-platform",
         )
         .await
-        .expect_err("a partial apply whose response lost creation evidence must fail closed");
-        assert!(matches!(error, ApplyError::CreationEvidenceLost { .. }));
+        .expect("a verified evidence restore after a partial apply must not fail the apply");
+        assert_eq!(
+            restored
+                .meta()
+                .annotations
+                .as_ref()
+                .and_then(|a| a.get(RESOURCE_CREATED_BY_ANNOTATION)),
+            Some(&"1".to_string()),
+            "the restored object handed back carries the re-stamped evidence"
+        );
         // The compensating restore re-stamped the evidence on the same UID.
         let live = state.lock().unwrap().resource.clone().expect("stored");
         assert_eq!(
@@ -1617,6 +1771,12 @@ mod tests {
         /// webhook that drops `RESOURCE_CREATED_BY_ANNOTATION` on updates
         /// (a countdown models one-shot vs deterministic webhooks).
         webhook_strips_evidence_writes: usize,
+        /// When nonzero, the same webhook strikes ALSO drop the
+        /// mutation-generation annotation — modeling a webhook that
+        /// rewrites both markers in one accepted update (Codex P2
+        /// round 9). An independent countdown; when both counters are
+        /// armed, one write consumes a strike from each.
+        webhook_strips_generation_writes: usize,
     }
 
     impl FakeState {
@@ -1634,6 +1794,7 @@ mod tests {
                 replace_attempts: 0,
                 churn_until: None,
                 webhook_strips_evidence_writes: 0,
+                webhook_strips_generation_writes: 0,
             }
         }
 
@@ -1651,6 +1812,7 @@ mod tests {
                 replace_attempts: 0,
                 churn_until: None,
                 webhook_strips_evidence_writes: 0,
+                webhook_strips_generation_writes: 0,
             }
         }
 
@@ -1705,6 +1867,7 @@ mod tests {
                 replace_attempts: 0,
                 churn_until: None,
                 webhook_strips_evidence_writes: 0,
+                webhook_strips_generation_writes: 0,
             }
         }
 
@@ -1793,6 +1956,7 @@ mod tests {
                 replace_attempts: 0,
                 churn_until: None,
                 webhook_strips_evidence_writes: 0,
+                webhook_strips_generation_writes: 0,
             }
         }
     }
@@ -2299,25 +2463,29 @@ mod tests {
         json_response(StatusCode::OK, updated)
     }
 
-    /// Consume one webhook strike (when armed) and strip the
-    /// creation-evidence annotation from an accepted write: both the
-    /// persisted object and the returned response lack it.
+    /// Consume webhook strikes (when armed) and strip the armed
+    /// annotations from an accepted write: both the persisted object and
+    /// the returned response lack them.
     fn maybe_webhook_strip(state: &mut FakeState, resource: &mut Value) {
         if state.webhook_strips_evidence_writes > 0 {
             state.webhook_strips_evidence_writes -= 1;
-            webhook_strip_creation_evidence(resource);
+            webhook_strip_annotation(resource, RESOURCE_CREATED_BY_ANNOTATION);
+        }
+        if state.webhook_strips_generation_writes > 0 {
+            state.webhook_strips_generation_writes -= 1;
+            webhook_strip_annotation(resource, MUTATION_GENERATION_ANNOTATION);
         }
     }
 
-    /// Model a mutating admission webhook that drops the creation-evidence
-    /// annotation from an accepted write: both the persisted object and the
-    /// returned response lack it.
-    fn webhook_strip_creation_evidence(resource: &mut Value) {
+    /// Model a mutating admission webhook that drops an annotation from
+    /// an accepted write: both the persisted object and the returned
+    /// response lack it.
+    fn webhook_strip_annotation(resource: &mut Value, key: &str) {
         if let Some(annotations) = resource
             .pointer_mut("/metadata/annotations")
             .and_then(Value::as_object_mut)
         {
-            annotations.remove(RESOURCE_CREATED_BY_ANNOTATION);
+            annotations.remove(key);
         }
     }
 
