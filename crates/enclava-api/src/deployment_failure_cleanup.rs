@@ -340,10 +340,11 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
                 Option<String>,
                 Option<chrono::DateTime<chrono::Utc>>,
                 chrono::DateTime<chrono::Utc>,
+                Option<Vec<String>>,
             ),
         >(
             "SELECT sts_uid, sts_created_at, sts_observed_deleted_at, sts_apply_started_at,
-                manifest_hash, apply_started_at, created_at
+                manifest_hash, apply_started_at, created_at, sts_proven_uids
            FROM deployments
           WHERE app_id = $1
             AND (id = $2 OR cleanup_sweep_incomplete)",
@@ -355,11 +356,17 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
         {
             Ok(rows) => (
                 rows.iter()
-                    .filter_map(|(uid, created_at, _, _, _, _, _)| {
+                    .flat_map(|(uid, created_at, _, _, _, _, _, proven_uids)| {
                         // A row counts as a proven lineage record when the
                         // apply response (or a prior sweep) persisted the
-                        // server-reported sts provenance.
-                        created_at.map(|_| StsProvenanceWindow { uid: uid.clone() })
+                        // server-reported sts provenance. Every proven UID
+                        // stays matchable (a recreated set has a NEW uid —
+                        // Codex P2).
+                        proven_windows_for_row(
+                            uid.as_deref(),
+                            *created_at,
+                            proven_uids.as_deref().unwrap_or_default(),
+                        )
                     })
                     .collect::<Vec<_>>(),
                 // A row that reached the StatefulSet step but recorded no
@@ -368,11 +375,11 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
                 // matching claim may still be that row's, so "foreign" skips
                 // must not let the sweep complete over it.
                 rows.iter()
-                    .any(|(_, created_at, _, apply_started, _, _, _)| {
+                    .any(|(_, created_at, _, apply_started, _, _, _, _)| {
                         apply_started.is_some() && created_at.is_none()
                     }),
                 earliest_legacy_row_started_at(rows.iter().map(
-                    |(_, _, _, _, manifest_hash, apply_started, row_created_at)| {
+                    |(_, _, _, _, manifest_hash, apply_started, row_created_at, _)| {
                         (manifest_hash.as_deref(), *apply_started, *row_created_at)
                     },
                 )),
@@ -649,19 +656,14 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
                 let deleted_edge = chrono::Utc::now();
                 if let (Some(uid), Some(created)) =
                     (live.metadata.uid.as_deref(), observed_created_at)
-                    && let Err(error) = sqlx::query(
-                        "UPDATE deployments
-                            SET sts_uid = COALESCE(sts_uid, $3),
-                                sts_created_at = COALESCE(sts_created_at, $4),
-                                sts_observed_deleted_at = COALESCE(sts_observed_deleted_at, $5)
-                          WHERE app_id = $1 AND id = $2",
+                    && let Err(error) = persist_sts_provenance(
+                        &state.db,
+                        Some(app.id),
+                        failed_deployment_id,
+                        uid,
+                        created,
+                        Some(deleted_edge),
                     )
-                    .bind(app.id)
-                    .bind(failed_deployment_id)
-                    .bind(uid)
-                    .bind(created)
-                    .bind(deleted_edge)
-                    .execute(&state.db)
                     .await
                 {
                     tracing::warn!(
@@ -946,6 +948,68 @@ fn classify_claim_lineage(
         Some(uid) if windows.iter().any(|w| w.uid.as_deref() == Some(uid)) => ClaimLineage::Proven,
         _ => ClaimLineage::Unproven,
     }
+}
+
+/// Durably record a server-reported StatefulSet provenance (uid +
+/// creationTimestamp) for a deployment row. Every proven UID accumulates in
+/// `sts_proven_uids` (Codex P2 — a reclaimed deployment can re-create the
+/// set under a NEW UID, and losing that UID would leave its claims
+/// unprovable once the set is gone, stranding the cleanup marker and the
+/// storage guard); `sts_uid`/`sts_created_at` keep first-writer-wins as the
+/// primary lineage record, `observed_deleted_at` (sweep path) records the
+/// deletion edge. Callers gate WHAT is proven (CAP creation evidence) —
+/// this only records it.
+pub(crate) async fn persist_sts_provenance(
+    pool: &sqlx::PgPool,
+    app_id: Option<uuid::Uuid>,
+    deployment_id: uuid::Uuid,
+    uid: &str,
+    created_at: chrono::DateTime<chrono::Utc>,
+    observed_deleted_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE deployments
+            SET sts_uid = COALESCE(sts_uid, $3),
+                sts_created_at = COALESCE(sts_created_at, $4),
+                sts_observed_deleted_at = COALESCE(sts_observed_deleted_at, $5),
+                sts_proven_uids = CASE
+                    WHEN $3 = ANY(sts_proven_uids) THEN sts_proven_uids
+                    ELSE array_append(COALESCE(sts_proven_uids, '{}'), $3)
+                END
+          WHERE id = $2
+            AND ($1::uuid IS NULL OR app_id = $1)",
+    )
+    .bind(app_id)
+    .bind(deployment_id)
+    .bind(uid)
+    .bind(created_at)
+    .bind(observed_deleted_at)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+/// One window per durably proven StatefulSet UID of a row: a recreated set
+/// has a NEW uid and every incarnation must stay matchable for the
+/// ownerReference proof (Codex P2). A row only counts as a proven lineage
+/// record when it carries `sts_created_at` — the paired primary record.
+fn proven_windows_for_row(
+    first_uid: Option<&str>,
+    created_at: Option<chrono::DateTime<chrono::Utc>>,
+    proven_uids: &[String],
+) -> Vec<StsProvenanceWindow> {
+    if created_at.is_none() {
+        return Vec::new();
+    }
+    let mut uids: Vec<String> = proven_uids.to_vec();
+    if let Some(first) = first_uid
+        && !uids.iter().any(|uid| uid == first)
+    {
+        uids.push(first.to_string());
+    }
+    uids.into_iter()
+        .map(|uid| StsProvenanceWindow { uid: Some(uid) })
+        .collect()
 }
 
 /// Count the name-matching claims of a StatefulSet the sweep REFUSED to
@@ -2860,6 +2924,99 @@ mod tests {
         assert!(
             allowed,
             "with no other generation, the row gate must allow provider cleanup"
+        );
+
+        delete_cleanup_fixture(&pool, app_id).await;
+    }
+
+    /// Codex P2 regression: a reclaimed deployment can re-create its
+    /// StatefulSet under a NEW UID. Every proven UID must accumulate and
+    /// stay matchable for the claim ownerReference proof — retaining only
+    /// the first would leave the recreated incarnation's claims unprovable
+    /// once its set is deleted, stranding the cleanup marker and the
+    /// storage guard. First-writer-wins still applies to the primary
+    /// sts_uid/sts_created_at record.
+    #[tokio::test]
+    async fn recreated_statefulset_uids_all_remain_proven() {
+        let pool = cleanup_test_pool().await;
+        let app_id = insert_cleanup_app_fixture(&pool).await;
+        let failed_id = Uuid::new_v4();
+        insert_cleanup_deployment(&pool, app_id, failed_id, "failed", Some("abc123"), false).await;
+
+        let first = "2026-01-01T00:00:00Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .expect("parse fixed timestamp");
+        let second = "2026-01-01T00:05:00Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .expect("parse fixed timestamp");
+        persist_sts_provenance(&pool, Some(app_id), failed_id, "uid-a", first, None)
+            .await
+            .expect("persist first set provenance");
+        persist_sts_provenance(
+            &pool,
+            Some(app_id),
+            failed_id,
+            "uid-b",
+            second,
+            Some(second),
+        )
+        .await
+        .expect("persist recreated set provenance");
+        // Idempotent: re-persisting a known UID must not duplicate it.
+        persist_sts_provenance(
+            &pool,
+            Some(app_id),
+            failed_id,
+            "uid-b",
+            second,
+            Some(second),
+        )
+        .await
+        .expect("re-persist recreated set provenance");
+
+        let (first_uid, first_created, proven_uids): (
+            Option<String>,
+            Option<chrono::DateTime<chrono::Utc>>,
+            Vec<String>,
+        ) = sqlx::query_as(
+            "SELECT sts_uid, sts_created_at, sts_proven_uids
+               FROM deployments WHERE id = $1",
+        )
+        .bind(failed_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load recorded lineage");
+        assert_eq!(
+            first_uid.as_deref(),
+            Some("uid-a"),
+            "the primary record keeps first-writer-wins"
+        );
+        assert_eq!(
+            first_created,
+            Some(first),
+            "the primary creation record keeps first-writer-wins"
+        );
+        assert_eq!(
+            proven_uids,
+            vec!["uid-a".to_string(), "uid-b".to_string()],
+            "every proven UID accumulates exactly once"
+        );
+
+        let windows = proven_windows_for_row(first_uid.as_deref(), first_created, &proven_uids);
+        assert_eq!(
+            classify_claim_lineage(Some("uid-b"), &windows),
+            ClaimLineage::Proven,
+            "the recreated incarnation's claims must stay provable after its set is gone"
+        );
+        assert_eq!(
+            classify_claim_lineage(Some("uid-a"), &windows),
+            ClaimLineage::Proven,
+            "the first incarnation's claims must stay provable too"
+        );
+        assert_eq!(
+            classify_claim_lineage(Some("uid-foreign"), &windows),
+            ClaimLineage::Unproven,
+            "an unknown UID stays unproven"
         );
 
         delete_cleanup_fixture(&pool, app_id).await;

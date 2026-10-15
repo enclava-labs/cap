@@ -405,16 +405,14 @@ async fn apply_all_with_tenant_image_pull_secret(
                 .as_ref()
                 .map(|ts| ts.0.to_string())
                 .and_then(|raw| raw.parse::<chrono::DateTime<chrono::Utc>>().ok()),
-        ) && let Err(error) = sqlx::query(
-            "UPDATE deployments
-            SET sts_uid = COALESCE(sts_uid, $2),
-                sts_created_at = COALESCE(sts_created_at, $3)
-          WHERE id = $1",
+        ) && let Err(error) = crate::deployment_failure_cleanup::persist_sts_provenance(
+            pool,
+            None,
+            deployment_id,
+            uid,
+            created,
+            None,
         )
-        .bind(deployment_id)
-        .bind(uid)
-        .bind(created)
-        .execute(pool)
         .await
         {
             tracing::warn!(
