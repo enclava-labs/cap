@@ -31,6 +31,17 @@ fn internal_server_error() -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
+/// Publication failures must not disguise an already-committed rotation as an
+/// uncertain mutation failure.
+pub(crate) const SIGNER_ROTATION_PUBLICATION_PENDING_CODE: &str =
+    "signer_rotation_publication_pending";
+
+/// Terminal disposition for a committed rotation whose identity a later
+/// authority replaced before publication was confirmed: the app's live
+/// signer identity is authoritative, so callers must not receive the
+/// superseded rotation's saved response.
+pub(crate) const SIGNER_ROTATION_SUPERSEDED_CODE: &str = "signer_rotation_superseded";
+
 /// Lease-window columns the busy hint derives from: the holding operation's
 /// kind, its renewable lock expiry, and the reclaim-quarantine deadline.
 /// Poisoned/parked fences carry `reclaim_after = infinity` (never claimable),
@@ -128,30 +139,6 @@ fn lease_retry_after_seconds(
     let seconds = (deadline - now).num_seconds();
     (seconds > 0).then(|| seconds.min(crate::routes::internal::IDEMPOTENCY_RETRY_HINT_MAX_SECONDS))
 }
-
-/// The signer-rotation transaction has committed, but fenced KBS convergence
-/// could not be confirmed before responding (Codex P1, #187 review): the
-/// apps identity row, the consumed rotation-token jti, the trigger's
-/// withdrawal rows, and the owed generation bump are durable, and the
-/// periodic reconciler keeps retrying the publication.
-///
-/// A plain 500 here would be dishonest twice over -- it invites an unsafe
-/// client retry of a committed mutation (the consumed jti refuses the token
-/// replay, so even a fresh token + idempotency key cannot re-run the
-/// operation), and the internal PaaS idempotency ledger would terminalize
-/// the intent as outcome-unknown.  The explicit 503 body names the state so
-/// wrappers can defer the receipt and the SAME idempotency key can retry
-/// reconciliation only: the replay path in [`rotate_signer`] confirms the
-/// committed rotation without a token and re-drives KBS convergence before
-/// reporting success.
-pub(crate) const SIGNER_ROTATION_PUBLICATION_PENDING_CODE: &str =
-    "signer_rotation_publication_pending";
-
-/// Terminal disposition for a committed rotation whose identity a later
-/// authority replaced before publication was confirmed: the app's live
-/// signer identity is authoritative, so callers must not receive the
-/// superseded rotation's saved response.
-pub(crate) const SIGNER_ROTATION_SUPERSEDED_CODE: &str = "signer_rotation_superseded";
 
 /// Bounded diagnostics for app deletion failures.
 ///
@@ -1164,12 +1151,12 @@ pub async fn create_app(
          unlock_mode, domain, tee_domain,
          signer_identity_subject, signer_identity_issuer, signer_identity_set_at,
          signer_rotation_generation,
-        source_provider, source_repository, egress_allowlist, egress_mode)
-         SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10::unlock_enum, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20
-         WHERE NOT EXISTS (
-             SELECT 1 FROM kbs_owner_seed_waivers
-              WHERE binding_key = $21
-         )",
+         source_provider, source_repository, egress_allowlist, egress_mode)
+          SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10::unlock_enum, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20
+          WHERE NOT EXISTS (
+              SELECT 1 FROM kbs_owner_seed_waivers
+               WHERE binding_key = $21
+          )",
     )
     .bind(app_id)
     .bind(app_candidate.org_id)
@@ -2431,18 +2418,16 @@ pub async fn issue_signer_rotation_token_route(
     }))
 }
 
-/// The signer identity is already committed when KBS publication fails, so
-/// the failure is committed-but-pending, never a rolled-back success.
-/// Mirrors the keyring pending DTO so operator tooling sees one shape.
-pub(crate) const SIGNER_POLICY_RECONCILIATION_PENDING_CODE: &str =
-    "signer_policy_reconciliation_pending";
-
 fn signer_publication_pending_error() -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::SERVICE_UNAVAILABLE,
         Json(serde_json::json!({
-            "error": "signer rotation committed; KBS policy reconciliation pending",
-            "code": SIGNER_POLICY_RECONCILIATION_PENDING_CODE,
+            "error": "signer_rotation_publication_pending",
+            "code": SIGNER_ROTATION_PUBLICATION_PENDING_CODE,
+            "message": "the signer rotation committed but its KBS policy publication is still pending; retry with the same parameters to complete publication",
+            "context": "rotate_signer",
+            "committed": true,
+            "retryable": true,
         })),
     )
 }
@@ -2461,11 +2446,12 @@ fn signer_rotation_superseded_error() -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
-// Release authority lanes before external KBS work; reacquire to detect supersession.
-// The comparison uses the rotation generation captured with the committed
-// response in addition to subject/issuer: a rotate-back (A -> B -> C -> B)
-// restores the same identity pair through a NEW authority event, and only
-// the generation distinguishes the two occurrences (PR #187 review).
+// Release authority lanes before external KBS work; reacquire to detect
+// supersession. The generation comparison catches a rotate-back (A -> B ->
+// C -> B): the same identity pair returns through a NEW authority event, and
+// only the generation captured with the commit distinguishes the two
+// occurrences. A DB failure keeps the committed rotation pending, never
+// reported as supersession.
 async fn confirm_committed_signer_identity(
     state: &AppState,
     app_id: Uuid,
@@ -2577,7 +2563,7 @@ pub(crate) async fn reconcile_signer_publication(
             tracing::warn!(
                 app_id = %app_id,
                 %error,
-                error_code = SIGNER_POLICY_RECONCILIATION_PENDING_CODE,
+                error_code = SIGNER_ROTATION_PUBLICATION_PENDING_CODE,
                 "signer rotation committed; KBS policy reconciliation pending"
             );
             return Err(signer_publication_pending_error());
@@ -2874,13 +2860,13 @@ pub(crate) async fn rotate_signer_commit(
 
     // A current-identity confirmation cannot mutate authority or consume a
     // token. Release the lanes before the caller takes the global publication
-    // fence. The generation was captured in the same transaction as the
-    // commit, so the confirmation fences rotations that commit after it.
+    // fence; the generation still comes from the row read under the lanes so
+    // the confirmation fences rotations that commit after it.
     if previous_subject.as_deref() == Some(subject.as_str())
         && previous_issuer.as_deref() == Some(issuer.as_str())
     {
-        tx.rollback().await.map_err(|_| internal_server_error())?;
         let signer_rotation_generation = app.signer_rotation_generation;
+        tx.rollback().await.map_err(|_| internal_server_error())?;
         return Ok((app.into(), signer_rotation_generation));
     }
 

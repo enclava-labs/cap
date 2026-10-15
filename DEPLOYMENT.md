@@ -402,6 +402,7 @@ Roll out and recover as follows:
    treating the rollout as accepted. CI alone does not establish runtime
    compatibility.
 
+
 ## Keyring Revocation Completion
 
 In signed-policy mode, keyring uploads and owner rotations confirm success only
@@ -449,21 +450,26 @@ retains the committed response and retries publication only; it does not consume
 the rotation token or apply the mutation again. Unrelated, uncertain failures
 remain fail-closed and require recovery rather than automatic mutation replay.
 
-CAP checks the committed signer and its consumed-token count under authority
-lanes before and after publication. The count is captured inside the authority
-transaction and stored only as private checkpoint metadata, never in the
-successful app response. A later rotation, including a rotation away and back
-to the same identity, app deletion, or deletion in progress ends the old operation
-with HTTP `409` and `signer_rotation_superseded`; internal callers receive a
-terminal `completed` disposition. Repeating that key returns the same terminal
-result, not a stale signer response or another token consumption.
+CAP checks the committed signer and its database-maintained generation under
+authority lanes before and after publication. The generation is captured inside
+the authority transaction and stored only as private checkpoint metadata, never
+in the successful app response. A later rotation, including a rotation away and
+back to the same identity, app deletion, or deletion in progress terminates a
+still-pending operation with HTTP `409` and `signer_rotation_superseded`. Internal
+callers receive a terminal `completed` disposition; repeating that key returns
+the same conflict without another token consumption. Already completed receipts
+continue to replay their recorded historical result.
 
-Older checkpoints with no count retain identity-only confirmation; they cannot
-detect a rotation away and back. Embedded-count checkpoints retain count fencing
-without returning that metadata to callers. Preserve the consumed-token ledger:
-its app-scoped count is meaningful only while committed token records remain.
-Drain old API replicas before relying on these semantics; mixed-version writers
-and rollback to an older checkpoint reader are not supported.
+Older or malformed publication checkpoints without a verifiable generation fail closed with
+a terminal `idempotency_recovery_required` / `reconcile_then_retry_with_new_key`
+disposition. Repeating that key replays the same terminal result; it does not
+re-execute the mutation or retry indefinitely. Reconcile the app's current signer
+and policy publication before choosing a recovery request with a new key.
+
+The database trigger tracks identity updates from older SQL writers as well.
+Drain old API replicas before relying on these semantics: older checkpoint
+readers do not understand the new generation, so mixed-version operation and
+reader rollback are unsupported.
 
 A currently authorized org owner may confirm an already committed signer
 identity without a new rotation token. The stateless public endpoint confirms
@@ -489,12 +495,8 @@ Trustee when the policy content and publication event are unchanged.
 A failed Deployment update is retried. If the template token was already
 stored, retries wait for that rollout without creating another generation.
 Both legacy and signed publication wait for old replicas to leave and all
-updated replicas to become available. A changed ConfigMap or signed-authority
+updated replicas to become available. Changed policy content or a signed-authority
 handoff during confirmation must be reconciled before success is returned.
-Apply canonical signed-content keyring replay handling before this CLI
-update: historical payload encodings must not turn an exact signed replay
-into a conflict.
-
 
 ## Smoke Checks
 
