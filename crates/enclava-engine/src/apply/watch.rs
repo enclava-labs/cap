@@ -344,16 +344,16 @@ pub fn stale_terminating_pod_needs_force_delete(pod: &Pod, now: Timestamp) -> bo
 /// Terminal states:
 /// - Running: all pods ready
 /// - Failed: pod in failed/crashloop state
-/// - TimedOut: exceeded `config.rollout_timeout`
+/// - TimedOut: exceeded the supplied rollout budget
 pub async fn watch_rollout(
     engine: &ApplyEngine,
     namespace: &str,
     statefulset_name: &str,
+    deadline: std::time::Duration,
 ) -> Result<DeployStatus, ApplyError> {
     let sts_api: Api<StatefulSet> = Api::namespaced(engine.client().clone(), namespace);
     let pod_api: Api<Pod> = Api::namespaced(engine.client().clone(), namespace);
 
-    let deadline = engine.config().rollout_timeout;
     let poll = engine.config().poll_interval;
     let start = Instant::now();
 

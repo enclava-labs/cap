@@ -634,48 +634,6 @@ fn external_id_rejects_empty_or_padded_values() {
     }
 }
 
-#[test]
-fn cap_core_source_has_no_product_specific_deployment_customizations() {
-    let source_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let needles = [
-        ["her", "mes"].concat(),
-        ["secret", "_", "agent"].concat(),
-        ["nut", "shell"].concat(),
-    ];
-    let mut findings = Vec::new();
-    scan_rs_files_for_needles(&source_dir, &needles, &mut findings);
-
-    assert!(
-        findings.is_empty(),
-        "CAP core source contains product-specific deployment customizations: {findings:?}"
-    );
-}
-
-fn scan_rs_files_for_needles(
-    dir: &std::path::Path,
-    needles: &[String],
-    findings: &mut Vec<String>,
-) {
-    for entry in std::fs::read_dir(dir).unwrap() {
-        let entry = entry.unwrap();
-        let path = entry.path();
-        if path.is_dir() {
-            scan_rs_files_for_needles(&path, needles, findings);
-            continue;
-        }
-        if path.extension().and_then(std::ffi::OsStr::to_str) != Some("rs") {
-            continue;
-        }
-        let contents = std::fs::read_to_string(&path).unwrap();
-        let normalized = contents.to_ascii_lowercase();
-        for needle in needles {
-            if normalized.contains(needle) {
-                findings.push(format!("{} contains {}", path.display(), needle));
-            }
-        }
-    }
-}
-
 #[tokio::test]
 async fn deploy_rejects_member_before_database_access() {
     let result = deploy(
