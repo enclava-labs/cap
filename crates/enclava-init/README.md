@@ -62,6 +62,50 @@ Auto-unlock mode:
 - uses the configured owner resource path;
 - still runs the same runtime verification path before seed release.
 
+## Volume Initialization
+
+`state` and `tls-state` devices are LUKS2 volumes. On every boot the sidecar
+checks for a LUKS2 header; if one exists it opens the volume and no probe or
+scan runs — already-provisioned volumes (including sub-floor ones from
+before the 32 MiB minimum, which activate fine) are never re-scanned.
+
+When no header is found, `blank=true` would authorize `luksFormat`, so the
+device must be proven all-zero before the first format: the entire device is
+read in 1 MiB chunks (a short or failed read never counts as blank).
+The scan is O(device size). Progress is logged every 30 s with scanned/total
+bytes and a completion duration. Initialization time depends on actual guest
+and Longhorn throughput; do not infer it from the raw volume's zero contents.
+this fresh-format floor for unproven claims. Existing ordinal-zero claims are
+grandfathered per volume only with positive LIVE initialization evidence: the
+exact ordinal-0 pod non-terminating, Ready, mounting the exact claim, and
+created in a later whole second than it — the workload observably running on
+the initialized device. Deployment history is deliberately not consulted:
+database and Kubernetes clocks cannot order a row against a claim, and a
+password-timeout redeploy can publish healthy without opening storage, so no
+historical status is proof. The availability cost is deliberate: a genuinely
+initialized legacy sub-floor volume with no live proof is refused until the
+workload regains readiness (or the volume is resized above the floor), never
+formatted. Missing or terminating claims, wrong ordinals, same-second pairs,
+and bare PVC existence cannot grant the exemption. External Kubernetes-admin
+claim deletions are outside CAP's mutation-fence serialization and read as
+fresh — the in-guest blank-scan still refuses to format a non-zero device, and
+CAP does not offer atomic cross-resource guarantees. Existing LUKS2 volumes
+are opened without reformatting; orchestration evidence never authorizes
+formatting.
+
+The rollout budget adds two sequential passes to the configured base
+timeout only for claims that lack positive initialization evidence —
+already-initialized volumes only open, so ordinary redeploys and
+domain-only reapplies keep the base deadline. The allowance assumes at
+least 32 MiB/s per pass for scanning and integrity-tag initialization.
+This is a bounded estimate, not a throughput guarantee: qualify the
+intended storage sizes and lower that assumption if measurements are
+slower. The API computes the budget once, before the first provider
+apply, and persists it next to the observation anchor; durable observers
+resume that recorded deadline verbatim across restarts and release worker
+slots after each 90-second observation slice. Password owner wait remains
+separately nonterminal.
+
 ## Verification Chain
 
 When policy-read mode is enabled, `enclava-init` verifies:

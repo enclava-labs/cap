@@ -20,6 +20,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use libcryptsetup_rs::{
     CryptDevice, CryptInit, CryptParamsLuks2, CryptParamsLuks2Ref,
@@ -31,6 +32,15 @@ use crate::errors::{InitError, Result};
 use crate::secrets::DerivedSeed;
 
 const LUKS2_SECTOR_SIZE: u32 = 512;
+/// Minimum size for a FRESH format. The LUKS2 header occupies the first
+/// 16 MiB and luksFormat succeeds even when the device ends inside it —
+/// activation then has no data area and the volume is bricked. The floor
+/// adds 16 MiB of payload headroom; it is a fresh-provisioning policy, not
+/// an activation bound (17–31 MiB volumes DO activate and keep operating —
+/// the scan never runs once a header exists). Keep in lockstep with
+/// `enclava-engine` `validate.rs` `MIN_VOLUME_SIZE_MIB`, which refuses
+/// undersized fresh volumes at admission.
+const MIN_VOLUME_BYTES: u64 = 32 * 1024 * 1024;
 static KEY_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Total LUKS2 volume-key bytes: 64 cipher key (AES-256-XTS) + 32 integrity
@@ -534,17 +544,78 @@ fn buffer_has_luks2_header_magic(buf: &[u8]) -> bool {
     buf.len() >= 8 && &buf[..6] == LUKS_MAGIC && u16::from_be_bytes([buf[6], buf[7]]) == 2
 }
 
+// Full-device zero scan: blank=true authorizes luksFormat, so every byte is
+// checked — sampling cannot prove blank, and a 0-byte/short read must never
+// count as blank (the original bug). Runs only when no LUKS2 header exists;
+// the O(device size) cost is paid once at first boot. Progress tracing keeps
+// a slow first deploy diagnosable instead of looking hung.
 fn device_appears_blank(device: &Path) -> Result<bool> {
-    const PROBE_BYTES: usize = 4096;
+    const CHUNK: usize = 1024 * 1024;
+    // Progress heartbeat for long scans; short scans only log begin/complete.
+    const PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
     let mut file = OpenOptions::new()
         .read(true)
         .open(device)
         .map_err(|e| InitError::Luks(format!("open {} for blank probe: {e}", device.display())))?;
-    let mut buf = [0u8; PROBE_BYTES];
-    let read = file
-        .read(&mut buf)
-        .map_err(|e| InitError::Luks(format!("read {} blank probe: {e}", device.display())))?;
-    Ok(buf[..read].iter().all(|byte| *byte == 0))
+    // SeekFrom::End works on block devices; metadata().len() reports 0 for them.
+    let len = file
+        .seek(SeekFrom::End(0))
+        .map_err(|e| InitError::Luks(format!("seek {} for blank probe: {e}", device.display())))?;
+    if len < MIN_VOLUME_BYTES {
+        // Fresh-format floor: at or under 16 MiB the header would consume
+        // the device and the volume bricks; up to the floor the payload is
+        // too thin for a viable fs. Refusing the format is recoverable —
+        // formatting is not.
+        return Err(InitError::Luks(format!(
+            "device {} is only {len} bytes — below the {} MiB minimum (16 MiB LUKS2 header + 16 MiB payload floor); refusing to treat it as blank",
+            device.display(),
+            MIN_VOLUME_BYTES / (1024 * 1024),
+        )));
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| InitError::Luks(format!("seek {} for blank probe: {e}", device.display())))?;
+    tracing::info!(
+        device = %device.display(),
+        bytes = len,
+        "no LUKS2 header found; scanning device for zero-only content before first format"
+    );
+    let started = Instant::now();
+    let mut last_progress = started;
+    let mut buf = vec![0u8; CHUNK];
+    let mut remaining = len;
+    while remaining > 0 {
+        let take = remaining.min(CHUNK as u64) as usize;
+        // read_exact: EOF before len is an error, not "blank".
+        file.read_exact(&mut buf[..take])
+            .map_err(|e| InitError::Luks(format!("read {} blank probe: {e}", device.display())))?;
+        if let Some(pos) = buf[..take].iter().position(|byte| *byte != 0) {
+            let offset = len - remaining + pos as u64;
+            tracing::info!(
+                device = %device.display(),
+                non_zero_offset = offset,
+                "device is not blank: found non-zero data"
+            );
+            return Ok(false);
+        }
+        remaining -= take as u64;
+        if last_progress.elapsed() >= PROGRESS_INTERVAL {
+            tracing::info!(
+                device = %device.display(),
+                scanned_bytes = len - remaining,
+                total_bytes = len,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "blank scan still in progress"
+            );
+            last_progress = Instant::now();
+        }
+    }
+    tracing::info!(
+        device = %device.display(),
+        bytes = len,
+        duration_ms = started.elapsed().as_millis() as u64,
+        "blank scan complete: device is all zeros"
+    );
+    Ok(true)
 }
 
 fn with_key_file<F>(key: &DerivedSeed, f: F) -> Result<()>
@@ -684,16 +755,44 @@ mod unit_tests {
     }
 
     #[test]
+    fn blank_probe_refuses_devices_below_minimum_size() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let device = dir.path().join("device");
+
+        // 16 MiB (the bricking size from self-check) and anything below the
+        // 32 MiB floor must error rather than read as blank.
+        for size in [0u64, 1024, 16 * 1024 * 1024, MIN_VOLUME_BYTES - 1] {
+            std::fs::File::create(&device)
+                .expect("create device")
+                .set_len(size)
+                .expect("size device");
+            device_appears_blank(&device).expect_err("undersized device must not read as blank");
+        }
+    }
+
+    #[test]
     fn blank_probe_distinguishes_fresh_and_nonempty_devices() {
         let dir = tempfile::tempdir().expect("temporary directory");
         let device = dir.path().join("device");
-        std::fs::write(&device, [0u8; 4096]).expect("write blank device");
-        assert!(device_appears_blank(&device).expect("probe blank device"));
 
-        let mut nonempty = [0u8; 4096];
-        nonempty[512] = 1;
-        std::fs::write(&device, nonempty).expect("write nonempty device");
-        assert!(!device_appears_blank(&device).expect("probe nonempty device"));
+        // Exact lower bound: scanned like any larger device, not refused.
+        std::fs::File::create(&device)
+            .expect("create sparse device")
+            .set_len(MIN_VOLUME_BYTES)
+            .expect("size sparse device");
+        assert!(device_appears_blank(&device).expect("probe boundary-size device"));
+
+        for offset in [24 * 1024 * 1024, 32 * 1024 * 1024 - 4096] {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&device)
+                .expect("open sparse device");
+            file.seek(SeekFrom::Start(offset)).expect("seek");
+            file.write_all(&[1]).expect("write non-zero byte");
+            assert!(!device_appears_blank(&device).expect("probe dirty device"));
+            file.seek(SeekFrom::Start(offset)).expect("seek back");
+            file.write_all(&[0]).expect("restore zero byte");
+        }
     }
 
     #[test]

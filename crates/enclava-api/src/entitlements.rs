@@ -169,7 +169,7 @@ pub async fn authoritative_entitlement_in_tx(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ScaledDecimal {
+struct ScaledDecimal {
     coefficient: u128,
     scale: u32,
 }
@@ -229,16 +229,6 @@ impl ScaledDecimal {
         .normalized())
     }
 
-    /// Ceiling of `value * numerator / denominator` in whole units,
-    /// saturating on overflow. Exact u128 arithmetic: no float rounding for
-    /// fractional quantities.
-    pub(crate) fn ceil_mul_div(&self, numerator: u128, denominator: u128) -> u128 {
-        let scale_div = 10u128.saturating_pow(self.scale);
-        let num = self.coefficient.saturating_mul(numerator);
-        let den = scale_div.saturating_mul(denominator);
-        num.saturating_add(den - 1) / den
-    }
-
     fn checked_scale(self, extra: u32, field: &'static str) -> Result<Self, String> {
         let scale = self
             .scale
@@ -296,7 +286,7 @@ fn parse_cpu_cores(value: &str) -> Result<ScaledDecimal, String> {
 /// Parse a binary quantity into exact Mi units. `resources.storage` maps to
 /// app data storage; TLS storage is a separate field and is intentionally not
 /// charged against the app-data `max_storage` limit.
-pub(crate) fn parse_binary_mib(value: &str, field: &'static str) -> Result<ScaledDecimal, String> {
+fn parse_binary_mib(value: &str, field: &'static str) -> Result<ScaledDecimal, String> {
     let trimmed = value.trim();
     if trimmed != value || trimmed.is_empty() {
         return Err(format!("{field} must be a positive binary quantity"));
