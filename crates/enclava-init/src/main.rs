@@ -143,17 +143,17 @@ fn run() -> Result<()> {
     stats.record_owner_seed(phase);
     clear_error_file(&error_file_path());
 
-    record_stage("opening luks volumes").ok();
-    open_luks_volumes(&cfg, &owner, &mut stats)?;
-    record_stage("preparing mount ownership").ok();
-    prepare_mount_ownership(&cfg)?;
-
     record_stage("verifying trustee policy").ok();
     // Fail-closed: any verification gap (missing inputs, missing policy-read
     // availability) returns Err and aborts before seed release.
     let phase = stats.elapsed_ms();
     run_in_tee_verification(&cfg, cc_init_data.as_deref())?;
     stats.record_tee_verify(phase);
+
+    record_stage("opening luks volumes").ok();
+    open_luks_volumes(&cfg, &owner, &mut stats)?;
+    record_stage("preparing mount ownership").ok();
+    prepare_mount_ownership(&cfg)?;
 
     record_stage("provisioning static tls certificate").ok();
     provision_static_tls_certificate(&cfg).context("provisioning static TLS certificate")?;
