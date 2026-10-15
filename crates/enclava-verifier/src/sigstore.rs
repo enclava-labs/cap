@@ -519,14 +519,13 @@ fn verify_provenance(
             "sha256:{}",
             hex::encode(Sha256::digest(source_record.value))
         ) == expected_image_digest;
+    // A digest-derived .att tag is NOT part of a single-image manifest. Its
+    // name can be reassigned independently of the signed source image, so a
+    // manifest/blob fetched through that tag is not provenance evidence.
+    // Only index descriptors cryptographically bind attestation manifests to
+    // the source digest; reject unbound single-image provenance fail-closed.
     if source.get("manifests").is_none() {
-        referenced.push(expected_image_digest.to_string());
-        attestation_manifests.extend(
-            records
-                .iter()
-                .filter(|record| record.label == "provenance_manifest")
-                .map(|record| format!("sha256:{}", hex::encode(Sha256::digest(record.value)))),
-        );
+        return Err(SigstoreError::InvalidProvenance);
     }
     if !image_bound || referenced.is_empty() || attestation_manifests.is_empty() {
         return Err(SigstoreError::InvalidProvenance);
@@ -966,7 +965,7 @@ mod tests {
     }
 
     #[test]
-    fn provenance_supports_single_image_manifests() {
+    fn provenance_rejects_unsigned_single_image_attestation_tag() {
         let policy = crate::TrustPolicy::parse(include_bytes!(
             "../tests/fixtures/prove-it-live.policy.json"
         ))
@@ -997,7 +996,11 @@ mod tests {
             ("provenance_blob", &blob),
         ]);
 
-        verify_provenance(&material, &expected, &policy).unwrap();
+        assert_eq!(
+            verify_provenance(&material, &expected, &policy),
+            Err(SigstoreError::InvalidProvenance),
+            "a valid-looking statement under a mutable .att tag is not signed evidence"
+        );
 
         let mut statement: Value = serde_json::from_slice(&blob).unwrap();
         statement.as_object_mut().unwrap().remove("predicateType");

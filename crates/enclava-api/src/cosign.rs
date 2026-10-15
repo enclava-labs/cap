@@ -714,11 +714,16 @@ async fn pull_provenance_objects(
                 )
             })
             .collect::<Vec<_>>(),
-        OciManifest::Image(_) => vec![oci_client::Reference::with_tag(
-            registry.to_string(),
-            repository.to_string(),
-            digest_to_cosign_tag(image_digest, "att"),
-        )],
+        // A single-image manifest cannot bind an external digest-derived .att
+        // tag. A registry (or an attacker with tag-write access) may replace
+        // it without changing the already signed image digest. Until signed
+        // single-image attestations are verified against the app's policy,
+        // never collect such bytes as portable provenance evidence.
+        OciManifest::Image(_) => {
+            return Err(CosignError::VerificationFailed(
+                "single-image provenance tag is not signed or bound to the source manifest".into(),
+            ));
+        }
     };
     if references.is_empty() {
         return Err(CosignError::VerificationFailed(
