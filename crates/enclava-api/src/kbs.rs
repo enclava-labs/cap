@@ -71,6 +71,8 @@ pub enum KbsPolicyError {
         desired_generation: i64,
         desired_hash: String,
     },
+    #[error("keyring's signed KBS policy generation has not been applied")]
+    KeyringPolicyPending,
     #[error("signed KBS policy artifact is not current deployment authority")]
     ArtifactNotCurrent,
     #[error("signed KBS policy compare-and-swap retries were exhausted")]
@@ -1252,7 +1254,20 @@ pub async fn confirm_keyring_kbs_publication(
     if state.kbs_policy.is_none() {
         return Err(KbsPolicyError::NotConfigured.into());
     }
-    reconcile_signed_policy_once(state).await
+    // A held deployment may make candidate selection empty. In that case
+    // reconciliation intentionally returns Ok without consuming selector debt
+    // or changing Trustee; Ok alone cannot confirm a keyring revocation.
+    let target = load_signed_policy_reconciliation(&state.db).await?;
+    let target_generation = target.desired_generation + target.selector_bumps_owed;
+    reconcile_signed_policy_once(state).await?;
+    let applied = load_signed_policy_reconciliation(&state.db).await?;
+    if applied.applied_generation < target_generation
+        || applied.selector_bumps_owed != 0
+        || applied.applied_generation < applied.desired_generation
+    {
+        return Err(KbsPolicyError::KeyringPolicyPending.into());
+    }
+    Ok(())
 }
 
 /// Converge KBS authority before readiness or deployment dispatch.
@@ -6555,6 +6570,37 @@ resource_bindings := {
             0,
             "the reconciliation must not publish an empty policy over the running legacy workload"
         );
+
+        // A keyring rotation that removed the last eligible signer owes a
+        // selector bump. The held workload keeps Trustee's old authority
+        // live, so the API must report pending rather than success even
+        // though the background reconciler treats the deferral as normal.
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET selector_bumps_owed = selector_bumps_owed + 1
+              WHERE singleton",
+        )
+        .execute(&pool)
+        .await
+        .expect("owe the keyring selector bump");
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.kbs_policy = Some(config.clone());
+        let pending = TEST_KUBE_CLIENT
+            .scope(client.clone(), confirm_keyring_kbs_publication(&state))
+            .await;
+        assert!(matches!(
+            pending,
+            Err(KbsPolicyReconciliationError::Policy(
+                KbsPolicyError::KeyringPolicyPending
+            ))
+        ));
+        let debt = load_signed_policy_reconciliation(&pool)
+            .await
+            .expect("read held keyring debt");
+        assert_eq!(debt.selector_bumps_owed, 1);
+        assert!(debt.applied_generation < debt.desired_generation + debt.selector_bumps_owed);
+        assert_eq!(writes.load(std::sync::atomic::Ordering::SeqCst), 0);
 
         // Lifecycle exit clears the deferral: with the app stopped there is
         // no workload to protect, so the pending generation converges
