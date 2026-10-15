@@ -3866,6 +3866,28 @@ pub async fn put_paas_app_desired_state(
                 outcome = error.public_code(),
                 "application desired-state convergence failed"
             );
+            // Codex P2: a replicas/desired-state write whose accepted
+            // response lost CAP creation evidence must durably mark the
+            // app — this path has no deployment job, so without the marker
+            // a later failed apply's sweep would treat the stripped object
+            // as foreign and clear cleanup evidence over it.
+            if matches!(
+                error,
+                enclava_engine::apply::engine::ApplyError::CreationEvidenceLost { .. }
+            ) && !crate::deployment_failure_cleanup::persist_creation_evidence_loss(
+                &state.db,
+                app_id,
+            )
+            .await
+            {
+                // The marker is the only durable signal for later sweeps;
+                // surface its loss distinctly instead of silently
+                // continuing (the request already failed).
+                tracing::error!(
+                    cap_app_id = %app_id,
+                    "creation-evidence-loss marker could not be persisted; later sweeps will not know unmarked targets may be CAP-created"
+                );
+            }
             // The failure path deliberately does NOT re-take the lane: the
             // lease is dropped and stays owned through its reclaim
             // quarantine, which is the documented safe outcome after an

@@ -2578,11 +2578,21 @@ async fn fail_apply_job_with_mutation(
     let mut retain_namespace_fence = false;
     if published
         && let (Some(mutation), Some(app)) = (mutation.as_mut(), failed_app)
+        // Codex P2: a `creation_evidence_lost` terminal failure must reach
+        // the adopted-namespace sweep so it counts unmarked live targets
+        // as unresolved instead of silently clearing cleanup evidence
+        // over a webhook-stripped CAP-created object.
         && crate::deployment_failure_cleanup::cleanup_after_terminal_apply_failure(
             state,
             app,
             job.deployment_id,
             mutation,
+            matches!(
+                error,
+                DeploymentJobError::Apply(crate::deploy::DeployError::Apply(
+                    enclava_engine::apply::engine::ApplyError::CreationEvidenceLost { .. }
+                ))
+            ),
         )
         .await
             == crate::deployment_failure_cleanup::CleanupFenceOutcome::RetainNamespaceFence

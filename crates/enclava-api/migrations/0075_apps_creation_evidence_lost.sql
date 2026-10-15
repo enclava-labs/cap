@@ -1,0 +1,22 @@
+-- Codex P2 (webhook-stripped creation evidence): a mutating admission
+-- webhook can drop RESOURCE_CREATED_BY_ANNOTATION from an ACCEPTED update
+-- (SSA, replace, or merge patch) while leaving the mutation-generation
+-- annotation intact, and a deterministic webhook also strips every
+-- compensating restore. The object then carries no creation evidence, so a
+-- failed-apply sweep would classify the still-live CAP-created object as
+-- foreign, skip it, and clear cleanup evidence over a partially updated
+-- resource with no later cleanup eligibility.
+--
+-- The apply paths fail closed with ApplyError::CreationEvidenceLost and
+-- first attempt a bounded same-UID compensating re-stamp; when that restore
+-- is also stripped (or the loss surfaced on a non-job control-plane write
+-- such as a replicas change or ingress restart), this durable app-level
+-- marker records the loss. While it is set, the adopted-namespace sweep
+-- counts live unmarked targets as UNRESOLVED instead of foreign: sweeps
+-- stay incomplete and cleanup evidence is retained.
+--
+-- The marker is cleared only by operator remediation (fix the webhook,
+-- restore or delete the affected object, then clear the flag): no automatic
+-- path can ever prove the stripped object was not CAP-created.
+ALTER TABLE apps
+    ADD COLUMN creation_evidence_lost boolean NOT NULL DEFAULT false;

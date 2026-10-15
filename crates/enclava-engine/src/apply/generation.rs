@@ -372,6 +372,48 @@ where
         );
 }
 
+const CREATION_EVIDENCE_KEYS: [&str; 2] = [
+    RESOURCE_CREATED_BY_ANNOTATION,
+    NAMESPACE_CREATED_BY_ANNOTATION,
+];
+
+/// The creation-evidence pairs `preserve_creation_evidence` stamps for this
+/// live object: only keys whose annotation the CAP field manager owns on
+/// `current` (see the provenance note there). The update path re-checks
+/// these pairs against the write response so a mutating admission webhook
+/// that drops or rewrites them cannot turn a CAP-created object into an
+/// unattributable one while the apply still reports success.
+fn preserved_creation_evidence<K>(current: &K, field_manager: &str) -> Vec<(&'static str, String)>
+where
+    K: Resource,
+{
+    CREATION_EVIDENCE_KEYS
+        .iter()
+        .filter_map(|&key| {
+            let evidence = current
+                .meta()
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.get(key))?
+                .clone();
+            // Provenance: only evidence whose annotation key is OWNED by this
+            // control plane's field manager is preserved. Tenant manifests can
+            // set arbitrary annotations on pre-existing objects; without this
+            // check a forged stamp would be preserved, stamped with the
+            // current mutation generation, and later deleted by compensating
+            // cleanup as though CAP had created the object.
+            if !annotation_owned_by_manager(current, key, field_manager) {
+                tracing::warn!(
+                    key,
+                    "live creation evidence lacks CAP field-manager provenance; refusing to preserve it"
+                );
+                return None;
+            }
+            Some((key, evidence))
+        })
+        .collect()
+}
+
 /// Copy the live object's creation evidence (if any) onto the desired
 /// write. Re-applying an object CAP created must not silently drop the
 /// evidence: an apply omitting a map key it owns can prune it, which would
@@ -387,39 +429,151 @@ fn preserve_creation_evidence<K>(desired: &mut K, current: &K, field_manager: &s
 where
     K: Resource,
 {
-    const EVIDENCE_KEYS: [&str; 2] = [
-        RESOURCE_CREATED_BY_ANNOTATION,
-        NAMESPACE_CREATED_BY_ANNOTATION,
-    ];
-    for key in EVIDENCE_KEYS {
-        let Some(evidence) = current
-            .meta()
-            .annotations
-            .as_ref()
-            .and_then(|annotations| annotations.get(key))
-            .cloned()
-        else {
-            continue;
-        };
-        // Provenance: only evidence whose annotation key is OWNED by this
-        // control plane's field manager is preserved. Tenant manifests can
-        // set arbitrary annotations on pre-existing objects; without this
-        // check a forged stamp would be preserved, stamped with the
-        // current mutation generation, and later deleted by compensating
-        // cleanup as though CAP had created the object.
-        if !annotation_owned_by_manager(current, key, field_manager) {
-            tracing::warn!(
-                key,
-                "live creation evidence lacks CAP field-manager provenance; refusing to preserve it"
-            );
-            continue;
-        }
+    for (key, evidence) in preserved_creation_evidence(current, field_manager) {
         desired
             .meta_mut()
             .annotations
             .get_or_insert_with(Default::default)
             .insert(key.to_string(), evidence);
     }
+}
+
+/// Confirm the write response still carries every creation-evidence pair
+/// that was preserved from the preconditioned live object. A mutating
+/// admission webhook can drop or rewrite the annotation while leaving the
+/// mutation-generation annotation intact; accepting that response would
+/// let a later failed-apply sweep classify the still-live CAP-created
+/// object as `Foreign` (no evidence) and silently clear cleanup evidence
+/// over a partially updated resource. Fail closed instead: the loss is
+/// unresolved and must surface as a distinct apply failure.
+fn verify_preserved_creation_evidence<K>(
+    applied: &K,
+    expected: &[(&'static str, String)],
+) -> Result<(), ApplyError>
+where
+    K: Resource,
+{
+    for (key, expected_value) in expected {
+        let actual = applied
+            .meta()
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get(*key));
+        if actual != Some(expected_value) {
+            return Err(ApplyError::CreationEvidenceLost {
+                kind: kind::<K>(),
+                name: applied
+                    .meta()
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| "<unnamed>".to_string()),
+                key: key.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Best-effort, bounded restore of creation evidence a mutating admission
+/// webhook stripped from an ACCEPTED update: the write is already
+/// persisted, so unlike the create path (which deletes its object) the
+/// only safe compensation is to re-stamp the exact evidence pairs the
+/// preconditioned object proved were ours. Only the same-UID object — the
+/// one this failed update was preconditioned on — is ever touched, each
+/// restore patch is resourceVersion-fenced, and the apply still fails
+/// closed with `CreationEvidenceLost`: a transient one-shot webhook leaves
+/// a properly attributable object for the failure sweep, while a
+/// deterministic one leaves the object explicitly unresolved instead of
+/// silently succeeding.
+async fn compensate_stripped_evidence<K>(
+    api: &Api<K>,
+    name: &str,
+    preconditioned: &K,
+    expected: &[(&'static str, String)],
+    field_manager: &str,
+) where
+    K: Resource + Clone + Debug + DeserializeOwned,
+{
+    const RESTORE_ATTEMPTS: usize = 3;
+    for attempt in 0..RESTORE_ATTEMPTS {
+        let live = match api.get(name).await {
+            Ok(live) => live,
+            Err(error) => {
+                tracing::warn!(
+                    kind = kind::<K>(),
+                    name,
+                    error = %error,
+                    "cannot re-read object to restore webhook-stripped creation evidence"
+                );
+                return;
+            }
+        };
+        // Never restore onto a same-named replacement: only the exact
+        // object whose evidence the failed update carried.
+        if live.meta().uid != preconditioned.meta().uid {
+            tracing::warn!(
+                kind = kind::<K>(),
+                name,
+                "live object no longer matches the failed update's UID; not restoring creation evidence"
+            );
+            return;
+        }
+        let restored = |object: &K| {
+            expected.iter().all(|(key, value)| {
+                object
+                    .meta()
+                    .annotations
+                    .as_ref()
+                    .and_then(|annotations| annotations.get(*key))
+                    == Some(value)
+            })
+        };
+        if restored(&live) {
+            // Someone (an earlier restore attempt that raced the response,
+            // or another CAP writer) already re-stamped it.
+            return;
+        }
+        let mut annotations = serde_json::Map::new();
+        for (key, value) in expected {
+            annotations.insert(key.to_string(), serde_json::json!(value));
+        }
+        let mut patch = serde_json::json!({"metadata": {"annotations": annotations}});
+        // Fence the restore onto the exact version just read so a foreign
+        // write landing mid-restore cannot be overwritten.
+        if let Some(resource_version) = live.meta().resource_version.clone() {
+            patch["metadata"]["resourceVersion"] = serde_json::json!(resource_version);
+        }
+        let params = PatchParams {
+            field_manager: Some(field_manager.to_string()),
+            ..PatchParams::default()
+        };
+        match super::bounded_kube_write(api.patch(name, &params, &Patch::Merge(&patch))).await {
+            Ok(patched) if restored(&patched) => {
+                tracing::info!(
+                    kind = kind::<K>(),
+                    name,
+                    "restored creation evidence a webhook stripped from an accepted update; the apply still fails closed"
+                );
+                return;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    kind = kind::<K>(),
+                    name,
+                    error = %error,
+                    "creation-evidence restore patch rejected; retrying within the restore budget"
+                );
+            }
+        }
+        tokio::time::sleep(conflict_retry_delay(attempt)).await;
+    }
+    tracing::error!(
+        kind = kind::<K>(),
+        name,
+        error_code = "creation_evidence_restore_unresolved",
+        "could not restore webhook-stripped creation evidence; object stays unresolved for the failure sweep"
+    );
 }
 
 /// True when a managed-fields entry authored by `field_manager` (non-status)
@@ -677,6 +831,8 @@ where
             // fabricated evidence. Only evidence read from THIS live object
             // — the one the write is preconditioned on — survives.
             strip_creation_evidence(&mut desired);
+            let expected_evidence =
+                preserved_creation_evidence(&current, &engine.config().field_manager);
             preserve_creation_evidence(&mut desired, &current, &engine.config().field_manager);
             let applied = if exact_when_trusted && trusted {
                 super::bounded_kube_write(api.replace(name, &post_params, &desired)).await
@@ -687,6 +843,30 @@ where
             match applied {
                 Ok(applied) => {
                     verify_applied_generation(&applied, generation)?;
+                    // Codex P2: a mutating admission webhook can drop or
+                    // rewrite creation evidence on this update while leaving
+                    // the generation annotation intact. Verify the evidence
+                    // preserved from the preconditioned object survived the
+                    // response; its loss is unresolved and must fail closed
+                    // (a later sweep would otherwise classify the still-live
+                    // CAP-created object as foreign and clear cleanup
+                    // evidence over it). The write is already persisted, so
+                    // first try to re-stamp the stripped evidence on the
+                    // same UID (grok Critical): a restored object is again
+                    // classifiable, and a later sweep cleans it up.
+                    if let Err(error) =
+                        verify_preserved_creation_evidence(&applied, &expected_evidence)
+                    {
+                        compensate_stripped_evidence(
+                            api,
+                            name,
+                            &current,
+                            &expected_evidence,
+                            &engine.config().field_manager,
+                        )
+                        .await;
+                        return Err(error);
+                    }
                     return Ok(applied);
                 }
                 Err(ApplyError::Kube(kube::Error::Api(error))) if error.code == 409 => {
@@ -839,6 +1019,11 @@ where
             Err(error) => return Err(error.into()),
         };
         ensure_not_stale(&current, generation)?;
+        // Codex P2: this merge patch updates a live object that may carry
+        // CAP creation evidence; capture the manager-owned pairs now so the
+        // write response can be verified for their survival (a webhook that
+        // strips them must not yield a silent success on this path either).
+        let expected_evidence = preserved_creation_evidence(&current, field_manager);
         let resource_version = current
             .meta()
             .resource_version
@@ -879,6 +1064,22 @@ where
         {
             Ok(applied) => {
                 verify_applied_generation(&applied, generation)?;
+                // Same fail-closed rule as the SSA update path: creation
+                // evidence preserved from the preconditioned object must
+                // survive the response. On loss, first try the bounded
+                // same-UID compensating restore (grok-4.7 Critical).
+                if let Err(error) = verify_preserved_creation_evidence(&applied, &expected_evidence)
+                {
+                    compensate_stripped_evidence(
+                        api,
+                        name,
+                        &current,
+                        &expected_evidence,
+                        field_manager,
+                    )
+                    .await;
+                    return Err(error);
+                }
                 return Ok(applied);
             }
             Err(ApplyError::Kube(kube::Error::Api(error))) if error.code == 409 => {
@@ -1175,6 +1376,210 @@ mod tests {
         );
     }
 
+    /// A live ConfigMap this control plane created: CAP field-manager
+    /// ownership of the creation-evidence annotation (the create POST's
+    /// Update attribution) plus both annotations.
+    fn cap_created_configmap() -> Value {
+        json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "fenced",
+                "namespace": "fence-test",
+                "uid": "11111111-1111-1111-1111-111111111111",
+                "resourceVersion": "1",
+                "managedFields": [{
+                    "manager": "enclava-platform",
+                    "operation": "Update",
+                    "apiVersion": "v1",
+                    "fieldsType": "FieldsV1",
+                    "fieldsV1": {"f:metadata": {"f:annotations": {
+                        ("f:".to_string() + RESOURCE_CREATED_BY_ANNOTATION): {},
+                    }}},
+                }],
+                "annotations": {
+                    MUTATION_GENERATION_ANNOTATION: "1",
+                    RESOURCE_CREATED_BY_ANNOTATION: "1",
+                },
+            },
+            "data": {"value": "old"},
+        })
+    }
+
+    #[tokio::test]
+    async fn update_response_losing_creation_evidence_fails_closed() {
+        // Codex P2: a mutating admission webhook can drop
+        // RESOURCE_CREATED_BY_ANNOTATION from an accepted update while
+        // leaving the mutation-generation annotation intact. Accepting
+        // that response would let a later failed-apply sweep classify the
+        // still-live CAP-created object as Foreign (no evidence) and
+        // silently clear cleanup evidence over a partially updated
+        // resource. The update must fail closed with a distinct error —
+        // and, because the write already persisted, first try to re-stamp
+        // the stripped evidence on the same UID so the object stays
+        // classifiable for the failure sweep (grok Critical).
+        let mut state = FakeState::with_generation(1, "old");
+        state.resource = Some(cap_created_configmap());
+        // One-shot webhook: strips the update itself, spares the
+        // compensating restore patch.
+        state.webhook_strips_evidence_writes = 1;
+        let state = Arc::new(Mutex::new(state));
+        let engine = ApplyEngine::new(fake_client(Arc::clone(&state)), Default::default());
+        let api: Api<ConfigMap> = Api::namespaced(engine.client().clone(), "fence-test");
+
+        let error = apply_resource(
+            &engine,
+            &api,
+            &desired("new"),
+            MutationGeneration::new(2).unwrap(),
+            false,
+            true,
+        )
+        .await
+        .expect_err("an update whose response lost creation evidence must fail closed");
+        match error {
+            ApplyError::CreationEvidenceLost { kind, name, key } => {
+                assert_eq!(kind, "ConfigMap");
+                assert_eq!(name, "fenced");
+                assert_eq!(key, RESOURCE_CREATED_BY_ANNOTATION);
+            }
+            other => panic!("expected CreationEvidenceLost, got: {other:?}"),
+        }
+        // The compensating restore re-stamped the evidence onto the same
+        // UID: a later failure sweep can classify the object again.
+        let live = state.lock().unwrap().resource.clone().expect("stored");
+        assert_eq!(
+            live.pointer("/metadata/annotations")
+                .and_then(Value::as_object)
+                .and_then(|annotations| annotations.get(RESOURCE_CREATED_BY_ANNOTATION)),
+            Some(&json!("1")),
+            "compensation restores the stripped creation evidence"
+        );
+    }
+
+    #[tokio::test]
+    async fn deterministic_webhook_stripping_evidence_stays_unresolved() {
+        // A webhook that strips the annotation from EVERY write also
+        // defeats the compensating restore. The apply still fails closed
+        // with the distinct error — never a silent success — and the
+        // restore budget is bounded, not an infinite loop.
+        let mut state = FakeState::with_generation(1, "old");
+        state.resource = Some(cap_created_configmap());
+        state.webhook_strips_evidence_writes = usize::MAX;
+        let engine = ApplyEngine::new(fake_client(Arc::new(Mutex::new(state))), Default::default());
+        let api: Api<ConfigMap> = Api::namespaced(engine.client().clone(), "fence-test");
+
+        let error = apply_resource(
+            &engine,
+            &api,
+            &desired("new"),
+            MutationGeneration::new(2).unwrap(),
+            false,
+            true,
+        )
+        .await
+        .expect_err("a deterministically stripping webhook must never yield a silent success");
+        assert!(matches!(error, ApplyError::CreationEvidenceLost { .. }));
+        // The compensating restore merge patch is stripped too (the fake
+        // arms the webhook on merge patches as well), so the live object
+        // stays evidence-less and the bounded restore budget is what keeps
+        // this terminating. Nothing is silently accepted: the distinct
+        // failure code persists on the deployment row, and the
+        // adopted-namespace sweep counts unmarked live targets as
+        // unresolved while a `creation_evidence_lost` row is in its row
+        // set (see unmarked_target_is_unresolved in enclava-api).
+    }
+
+    #[tokio::test]
+    async fn partial_apply_response_losing_creation_evidence_fails_closed() {
+        // Codex P2 (grok round 3): the merge-patch path
+        // (apply_existing_partial — replica resets, ingress restarts)
+        // must enforce the same evidence verification as the SSA update
+        // path: a webhook that strips the creation annotation from the
+        // accepted patch must not yield a silent success.
+        let mut state = FakeState::with_generation(1, "old");
+        state.resource = Some(cap_created_configmap());
+        state.webhook_strips_evidence_writes = 1;
+        let state = Arc::new(Mutex::new(state));
+        let engine = ApplyEngine::new(fake_client(Arc::clone(&state)), Default::default());
+        let api: Api<ConfigMap> = Api::namespaced(engine.client().clone(), "fence-test");
+
+        let error = apply_existing_partial(
+            &api,
+            "fenced",
+            &serde_json::json!({"data": {"value": "partial"}}),
+            MutationGeneration::new(2).unwrap(),
+            "enclava-platform",
+        )
+        .await
+        .expect_err("a partial apply whose response lost creation evidence must fail closed");
+        assert!(matches!(error, ApplyError::CreationEvidenceLost { .. }));
+        // The compensating restore re-stamped the evidence on the same UID.
+        let live = state.lock().unwrap().resource.clone().expect("stored");
+        assert_eq!(
+            live.pointer("/metadata/annotations")
+                .and_then(Value::as_object)
+                .and_then(|annotations| annotations.get(RESOURCE_CREATED_BY_ANNOTATION)),
+            Some(&json!("1")),
+            "compensation restores the stripped creation evidence after a partial apply"
+        );
+    }
+
+    #[tokio::test]
+    async fn accepted_update_keeps_preserved_creation_evidence() {
+        // The same CAP-created object WITHOUT a hostile webhook: the apply
+        // succeeds and both the response and the stored object keep the
+        // preserved evidence verbatim (guards against the verification
+        // above rejecting well-behaved updates).
+        let mut state = FakeState::with_generation(1, "old");
+        state.resource = Some(cap_created_configmap());
+        let state = Arc::new(Mutex::new(state));
+        let engine = ApplyEngine::new(fake_client(Arc::clone(&state)), Default::default());
+        let api: Api<ConfigMap> = Api::namespaced(engine.client().clone(), "fence-test");
+
+        let applied = apply_resource(
+            &engine,
+            &api,
+            &desired("new"),
+            MutationGeneration::new(2).unwrap(),
+            false,
+            true,
+        )
+        .await
+        .expect("a well-behaved update of a CAP-created object succeeds");
+
+        let annotations = applied
+            .meta()
+            .annotations
+            .as_ref()
+            .expect("applied object carries annotations");
+        assert_eq!(
+            annotations.get(RESOURCE_CREATED_BY_ANNOTATION),
+            Some(&"1".to_string()),
+            "creation evidence survives the accepted response verbatim"
+        );
+        assert_eq!(
+            annotations.get(MUTATION_GENERATION_ANNOTATION),
+            Some(&"2".to_string()),
+            "the update still stamps the new generation"
+        );
+        let live = state
+            .lock()
+            .unwrap()
+            .resource
+            .clone()
+            .expect("stored object");
+        let live_annotations = live
+            .pointer("/metadata/annotations")
+            .and_then(Value::as_object)
+            .expect("stored object carries annotations");
+        assert_eq!(
+            live_annotations.get(RESOURCE_CREATED_BY_ANNOTATION),
+            Some(&json!("1")),
+            "creation evidence survives in the stored object verbatim"
+        );
+    }
+
     #[derive(Default)]
     struct Pause {
         next: bool,
@@ -1206,6 +1611,12 @@ mod tests {
         /// bumps its resourceVersion — a controller-style concurrent writer
         /// landing inside each read-modify-write window.
         churn_until: Option<std::time::Instant>,
+        /// When nonzero, the next N accepted PATCH/PUT writes of the fenced
+        /// resource have the creation-evidence annotation stripped from the
+        /// persisted object and their response — a mutating admission
+        /// webhook that drops `RESOURCE_CREATED_BY_ANNOTATION` on updates
+        /// (a countdown models one-shot vs deterministic webhooks).
+        webhook_strips_evidence_writes: usize,
     }
 
     impl FakeState {
@@ -1222,6 +1633,7 @@ mod tests {
                 hijack_next_conflict: None,
                 replace_attempts: 0,
                 churn_until: None,
+                webhook_strips_evidence_writes: 0,
             }
         }
 
@@ -1238,6 +1650,7 @@ mod tests {
                 hijack_next_conflict: None,
                 replace_attempts: 0,
                 churn_until: None,
+                webhook_strips_evidence_writes: 0,
             }
         }
 
@@ -1291,6 +1704,7 @@ mod tests {
                 hijack_next_conflict: None,
                 replace_attempts: 0,
                 churn_until: None,
+                webhook_strips_evidence_writes: 0,
             }
         }
 
@@ -1378,6 +1792,7 @@ mod tests {
                 hijack_next_conflict: None,
                 replace_attempts: 0,
                 churn_until: None,
+                webhook_strips_evidence_writes: 0,
             }
         }
     }
@@ -1452,7 +1867,7 @@ mod tests {
             let mut locked = state.lock().expect("fake state poisoned");
             let pause = match (method.clone(), path.as_str()) {
                 (Method::PATCH, RESOURCE_PATH | STATEFULSET_PATH)
-                | (Method::PUT, STATEFULSET_PATH) => &mut locked.pause_patch,
+                | (Method::PUT, RESOURCE_PATH | STATEFULSET_PATH) => &mut locked.pause_patch,
                 (Method::DELETE, RESOURCE_PATH) => &mut locked.pause_delete,
                 (Method::POST, COLLECTION_PATH) => &mut locked.pause_create,
                 _ => {
@@ -1527,6 +1942,7 @@ mod tests {
                 let manager = query_param(query, "fieldManager").unwrap_or("fake-unknown");
                 let owned = document_leaf_paths(&updated);
                 record_update_ownership(&mut updated, &owned, manager, false);
+                maybe_webhook_strip(&mut locked, &mut updated);
                 locked.replace_attempts += 1;
                 locked.next_resource_version += 1;
                 locked.resource = Some(updated);
@@ -1606,6 +2022,7 @@ mod tests {
                 updated["metadata"]["resourceVersion"] = json!(resource_version);
                 let manager = query_param(query, "fieldManager").unwrap_or("kubectl-patch");
                 record_update_ownership(&mut updated, &owned, manager, true);
+                maybe_webhook_strip(&mut locked, &mut updated);
                 locked.resource = Some(updated);
                 Ok(json_response(
                     StatusCode::OK,
@@ -1877,8 +2294,31 @@ mod tests {
             upsert_apply_entry(managed, manager, &owned_paths);
         }
         updated["metadata"]["resourceVersion"] = json!(resource_version);
+        maybe_webhook_strip(state, &mut updated);
         state.resource = Some(updated.clone());
         json_response(StatusCode::OK, updated)
+    }
+
+    /// Consume one webhook strike (when armed) and strip the
+    /// creation-evidence annotation from an accepted write: both the
+    /// persisted object and the returned response lack it.
+    fn maybe_webhook_strip(state: &mut FakeState, resource: &mut Value) {
+        if state.webhook_strips_evidence_writes > 0 {
+            state.webhook_strips_evidence_writes -= 1;
+            webhook_strip_creation_evidence(resource);
+        }
+    }
+
+    /// Model a mutating admission webhook that drops the creation-evidence
+    /// annotation from an accepted write: both the persisted object and the
+    /// returned response lack it.
+    fn webhook_strip_creation_evidence(resource: &mut Value) {
+        if let Some(annotations) = resource
+            .pointer_mut("/metadata/annotations")
+            .and_then(Value::as_object_mut)
+        {
+            annotations.remove(RESOURCE_CREATED_BY_ANNOTATION);
+        }
     }
 
     /// Record Update ownership for a PUT/POST/merge-PATCH writer. Merge

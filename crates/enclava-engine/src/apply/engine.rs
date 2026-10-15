@@ -42,6 +42,13 @@ pub enum ApplyError {
         actual: i64,
     },
 
+    #[error("{kind} '{name}' lost CAP creation evidence annotation '{key}' in the update response")]
+    CreationEvidenceLost {
+        kind: String,
+        name: String,
+        key: String,
+    },
+
     #[error("{0} is missing the UID, name, or resourceVersion required for a fenced mutation")]
     MissingResourceIdentity(String),
 
@@ -83,6 +90,7 @@ impl ApplyError {
             Self::InvalidLiveMutationGeneration { .. } => "invalid_live_mutation_generation",
             Self::StaleMutationGeneration { .. } => "stale_mutation_generation",
             Self::ProviderGenerationNotApplied { .. } => "provider_generation_not_applied",
+            Self::CreationEvidenceLost { .. } => "creation_evidence_lost",
             Self::MissingResourceIdentity(_) => "missing_resource_identity",
             Self::ResourceNotFound { .. } => "resource_not_found",
             Self::MutationConflictExhausted { .. } => "mutation_conflict_exhausted",
@@ -174,6 +182,14 @@ mod public_code_tests {
                     actual: 1,
                 },
                 "provider_generation_not_applied",
+            ),
+            (
+                ApplyError::CreationEvidenceLost {
+                    kind: SECRET.to_string(),
+                    name: SECRET.to_string(),
+                    key: SECRET.to_string(),
+                },
+                "creation_evidence_lost",
             ),
             (
                 ApplyError::MissingResourceIdentity(SECRET.to_string()),

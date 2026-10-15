@@ -297,12 +297,70 @@ where
 /// non-zero means the sweep is incomplete and must be retried (the caller
 /// retains provider-state evidence so later failed generations stay
 /// cleanup-eligible).
+/// Durably record that a mutating webhook stripped CAP creation evidence
+/// from an accepted write of this app (and from its compensating restores):
+/// sets the app-level `creation_evidence_lost` marker consumed by the
+/// adopted-namespace sweep. Called from the terminal-apply-failure cleanup
+/// and from the non-job control-plane write paths (replicas changes, ingress
+/// restarts) that surface `ApplyError::CreationEvidenceLost`. The marker is
+/// cleared only by operator remediation — no automatic path can prove the
+/// stripped object was not CAP-created.
+pub(crate) async fn persist_creation_evidence_loss(pool: &sqlx::PgPool, app_id: Uuid) -> bool {
+    match sqlx::query(
+        "UPDATE apps SET creation_evidence_lost = true, updated_at = now() WHERE id = $1",
+    )
+    .bind(app_id)
+    .execute(pool)
+    .await
+    {
+        Ok(_) => true,
+        Err(error) => {
+            tracing::error!(
+                app_id = %app_id,
+                error = %error,
+                "cannot persist the creation-evidence-loss marker; sweeps will not know unmarked targets may be CAP-created"
+            );
+            false
+        }
+    }
+}
+
+/// Whether this app carries the durable creation-evidence-loss marker.
+/// Fails closed: a database error counts as marker-present so the sweep
+/// stays incomplete rather than silently clearing evidence.
+async fn app_creation_evidence_lost(state: &crate::state::AppState, app_id: Uuid) -> bool {
+    match sqlx::query_scalar::<_, bool>("SELECT creation_evidence_lost FROM apps WHERE id = $1")
+        .bind(app_id)
+        .fetch_optional(&state.db)
+        .await
+    {
+        Ok(Some(true)) => true,
+        Ok(_) => false,
+        Err(error) => {
+            tracing::warn!(
+                app_id = %app_id,
+                error = %error,
+                "cannot read the creation-evidence-loss marker; treating the app as marked (fail closed)"
+            );
+            true
+        }
+    }
+}
+
 pub(crate) async fn sweep_published_objects_from_adopted_namespace(
     state: &crate::state::AppState,
     app: &App,
     failed_deployment_id: Uuid,
     generation: enclava_engine::apply::generation::MutationGeneration,
-    _apply_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    // Codex P2 (webhook-stripped evidence): the terminal apply failure of
+    // `failed_deployment_id` was `creation_evidence_lost` — a mutating
+    // webhook stripped the creation annotation from an accepted update and
+    // from every compensating restore, so a live unmarked target may be a
+    // CAP-created object whose evidence is unrecoverable. Passed by the
+    // caller from the in-memory terminal error (deployment rows persist
+    // only a coarse error message; the structured codes live on
+    // deployment_apply_jobs behind a CHECK that cannot hold this one).
+    evidence_loss_unresolved: bool,
 ) -> usize {
     let client = match kube::Client::try_default().await {
         Ok(client) => client,
@@ -394,6 +452,11 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
                 return usize::MAX;
             }
         };
+    // Codex P2: the in-memory flag covers THIS failure; the durable
+    // app-level marker covers earlier losses (a later sweep of a different
+    // failed generation, or a loss surfaced on a non-job write path).
+    let evidence_loss_unresolved =
+        evidence_loss_unresolved || app_creation_evidence_lost(state, app.id).await;
     let mut failures = 0usize;
     let mut targets = adopted_namespace_sweep_targets(app);
     // Codex P2 (renamed pull secrets): candidate Secret discovery must not
@@ -440,8 +503,12 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
                 // UNRESOLVED — keeping the sweep incomplete — unless it
                 // provably predates every legacy row (then it is a foreign
                 // pre-existing Secret and is skipped).
+                // Codex P2 (webhook-stripped evidence): the same
+                // discovery gap applies to a CAP pull secret whose creation
+                // annotation a webhook stripped — trigger on the durable
+                // marker exactly like the legacy-row case.
                 let plausible_legacy_pull_secret = !has_creation_evidence
-                    && legacy_row_started_at.is_some()
+                    && (legacy_row_started_at.is_some() || evidence_loss_unresolved)
                     && secret.type_.as_deref() == Some("kubernetes.io/dockerconfigjson");
                 if (has_creation_evidence || plausible_legacy_pull_secret)
                     && !targets
@@ -605,13 +672,19 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
                     .is_some_and(|(object_created, legacy_started)| {
                         object_created < legacy_started
                     });
-                if legacy_row_started_at.is_some() && !provably_predates_legacy_rows {
+                if unmarked_target_is_unresolved(
+                    legacy_row_started_at.is_some(),
+                    provably_predates_legacy_rows,
+                    evidence_loss_unresolved,
+                ) {
                     tracing::warn!(
                         app_id = %app.id,
                         namespace = %app.namespace,
                         kind = target.kind,
                         name = %target.name,
-                        "adopted-namespace sweep cannot attribute live unmarked object (legacy evidence row in scope); counting the sweep incomplete"
+                        evidence_loss_unresolved,
+                        legacy_row_in_scope = legacy_row_started_at.is_some(),
+                        "adopted-namespace sweep cannot attribute live unmarked object; counting the sweep incomplete"
                     );
                     failures += 1;
                 } else {
@@ -955,6 +1028,35 @@ fn earliest_legacy_row_started_at<'a>(
     })
     .map(|(_, _, row_created_at)| row_created_at)
     .min()
+}
+
+/// Whether a live sweep target WITHOUT creation evidence is UNRESOLVED
+/// rather than foreign. Two independent reasons:
+///
+/// 1. Codex P1 (legacy unmarked rows): a legacy evidence row is in the
+///    sweep's row set and the object does not provably predate it — see
+///    `earliest_legacy_row_started_at`.
+/// 2. Codex P2 (webhook-stripped evidence): this apply failed with
+///    `creation_evidence_lost`, or the app carries the durable
+///    `creation_evidence_lost` marker — a mutating admission webhook
+///    stripped the creation annotation from an ACCEPTED update and from
+///    every compensating restore (a deterministic webhook strips every
+///    write, so no write can ever re-stamp it). A live
+///    unmarked target may then be a CAP-created object whose evidence is
+///    unrecoverable: deleting it is unproven, and skipping it silently
+///    would let the sweep complete and clear cleanup evidence over a
+///    partially updated resource with no later eligibility. Fail closed
+///    instead — the sweep stays incomplete and the rows keep their
+///    evidence. The legacy temporal carve-out deliberately does NOT apply
+///    to this arm: the at-risk object is typically OLD (created by an
+///    earlier generation, updated by the failed one), so predating the
+///    failing row proves nothing.
+fn unmarked_target_is_unresolved(
+    legacy_row_in_scope: bool,
+    provably_predates_legacy_rows: bool,
+    evidence_loss_unresolved: bool,
+) -> bool {
+    (legacy_row_in_scope && !provably_predates_legacy_rows) || evidence_loss_unresolved
 }
 
 /// Bounded re-read retry budget for preconditioned sweep deletes.
@@ -1613,7 +1715,46 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
     app: &App,
     failed_deployment_id: Uuid,
     mutation: &mut AppMutationLease,
+    // The terminal apply failure was `creation_evidence_lost` (Codex P2:
+    // a webhook stripped creation evidence from an accepted update and
+    // its compensating restores) — forwarded to the adopted-namespace
+    // sweep so unmarked live targets count as unresolved there.
+    evidence_loss_unresolved: bool,
 ) -> CleanupFenceOutcome {
+    // Durably record the evidence loss BEFORE any later step: even if this
+    // process dies mid-cleanup, a later sweep of any failed generation of
+    // this app must still see the marker and count unmarked live targets as
+    // unresolved instead of clearing cleanup evidence over them.
+    if evidence_loss_unresolved && !persist_creation_evidence_loss(&state.db, app.id).await {
+        // The durable marker is the only signal a LATER generation's sweep
+        // will have; without it this failure's knowledge dies with this
+        // call. Failing to persist is a database outage: skip the sweep
+        // entirely (nothing is cleared) and mark the row incomplete so a
+        // later cleanup retries from the top.
+        tracing::error!(
+            app_id = %app.id,
+            deployment_id = %failed_deployment_id,
+            "creation-evidence-loss marker could not be persisted; skipping the compensating sweep for a later retry"
+        );
+        if let Err(mark_error) = sqlx::query(
+            "UPDATE deployments
+             SET cleanup_sweep_incomplete = true
+             WHERE id = $1 AND app_id = $2 AND status = 'failed'",
+        )
+        .bind(failed_deployment_id)
+        .bind(app.id)
+        .execute(&state.db)
+        .await
+        {
+            tracing::warn!(
+                app_id = %app.id,
+                deployment_id = %failed_deployment_id,
+                error = %mark_error,
+                "failed-apply cleanup could not mark the row's sweep incomplete"
+            );
+        }
+        return CleanupFenceOutcome::ReleaseNormally;
+    }
     // Row-level gate: no other generation of this app may carry ANY
     // provider-state evidence, and the app must not be deleting. Whether THIS
     // generation published anything is proven separately against the live
@@ -1907,7 +2048,12 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
             // the StatefulSet step (NULL sts stamp, incl. legacy rows
             // predating the column) fall back to apply_started_at /
             // observing_since / created_at.
-            let apply_started_at = match sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
+            // The claim-bound query stays solely for its fail-closed
+            // error handling: a database failure here marks the sweep
+            // incomplete for a later retry instead of letting it run
+            // without the PVC ownership bound it has to re-derive from
+            // the row set.
+            if let Err(error) = sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
                 "SELECT MIN(COALESCE(sts_apply_started_at, apply_started_at, observing_since, created_at)) FROM deployments WHERE app_id = $1 AND (id = $2 OR cleanup_sweep_incomplete)",
             )
             .bind(app.id)
@@ -1915,8 +2061,6 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
             .fetch_one(&state.db)
             .await
             {
-                Ok(bound) => Some(bound),
-                Err(error) => {
                     // The PVC ownership bound is load-bearing, not optional:
                     // treating a transient query failure as "no bound"
                     // would make sweep_statefulset_pvcs skip every claim
@@ -1947,16 +2091,15 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
                             "failed-apply cleanup could not mark the row's sweep incomplete"
                         );
                     }
-                    return CleanupFenceOutcome::ReleaseNormally;
-                }
-            };
+                return CleanupFenceOutcome::ReleaseNormally;
+            }
             match mutation
                 .guard_provider(sweep_published_objects_from_adopted_namespace(
                     state,
                     app,
                     failed_deployment_id,
                     namespace_generation,
-                    apply_started_at,
+                    evidence_loss_unresolved,
                 ))
                 .await
             {
@@ -3678,6 +3821,22 @@ mod tests {
     /// NULL — both written by the same atomic UPDATE) can only be pre-release
     /// rows; their objects can never carry creation evidence, so live
     /// unmarked targets under them must count as sweep failures, not skips.
+    #[test]
+    fn unmarked_target_is_unresolved_covers_both_arms() {
+        // Plain case: no legacy rows, no evidence loss — unmarked is foreign.
+        assert!(!unmarked_target_is_unresolved(false, false, false));
+        // Legacy arm: a legacy evidence row is in scope.
+        assert!(unmarked_target_is_unresolved(true, false, false));
+        // ...unless the object provably predates every legacy row.
+        assert!(!unmarked_target_is_unresolved(true, true, false));
+        // Codex P2 arm: a creation_evidence_lost row is in scope. The
+        // legacy temporal carve-out must NOT neutralize it — the
+        // webhook-stripped object is typically old (created by an earlier
+        // generation, updated by the failed one).
+        assert!(unmarked_target_is_unresolved(false, false, true));
+        assert!(unmarked_target_is_unresolved(true, true, true));
+    }
+
     #[test]
     fn earliest_legacy_row_started_at_selects_earliest_legacy_row() {
         let t0 = chrono_time("2026-10-14T10:00:00Z");
