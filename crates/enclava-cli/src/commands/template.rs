@@ -12,12 +12,13 @@ use ed25519_dalek::SigningKey;
 use indicatif::{ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
+use enclava_cli::api_types::DeploymentEntry;
 use enclava_cli::{
     api_client::{ApiClient, ApiError, read_bounded_body},
     api_types::{
-        AppResponse, CreateAppRequest, CreateTemplateInstanceRequest, DeploymentEntry,
-        HostedTemplate, HostedTemplateConfigKey, ServiceSpec, SshCommandResponse,
-        TemplateInstanceResponse,
+        AppResponse, CreateAppRequest, CreateTemplateInstanceRequest, HostedTemplate,
+        HostedTemplateConfigKey, ServiceSpec, SshCommandResponse, TemplateInstanceResponse,
     },
     app_config::{
         AppConfig, AppSection, HealthSection, ResourcesSection, StorageSection, UnlockSection,
@@ -35,7 +36,7 @@ use crate::commands::app::{
     deploy_preflight_needs_claim, deployment_bound_tee_status,
     deployment_bound_terminal_bootstrap_error,
     deployment_bound_terminal_bootstrap_error_on_channel, ensure_manual_deploy_keyring,
-    fetch_verified_platform_release, generate_log_key_for_app,
+    fail_if_template_deployment_failed, fetch_verified_platform_release, generate_log_key_for_app,
     reconcile_success_with_deployment_history, tee_supplemental_fields_are_consistent,
     tee_terminal_diagnostic_probe_due, tee_unlock_state, terminal_bootstrap_failure_message,
     terminal_diagnostic_budget, terminal_diagnostic_probe_with_budget,
@@ -1572,8 +1573,14 @@ async fn wait_for_template_bootstrap_endpoint(
         // (#18). Every request in this loop is cut at the finite per-attempt
         // budget, so a stalled response can never consume the wait (cap#220
         // review).
-        fail_if_template_deployment_failed(api, app_name, deployment_id, Some(wait_deadline))
-            .await?;
+        fail_if_template_deployment_failed(
+            api,
+            app_name,
+            deployment_id,
+            wait_deadline,
+            &mut history,
+        )
+        .await?;
 
         pb.set_message(timed_progress(
             "TEE ownership: waiting for attested endpoint",
@@ -2575,8 +2582,14 @@ async fn wait_for_paas_managed_config_keys(
         }
         // Bounded by the wait's remaining budget (cap#220 review); the loop
         // deadline above already guarantees the budget is positive here.
-        fail_if_template_deployment_failed(api, instance_name, deployment_id, read_deadline)
-            .await?;
+        fail_if_template_deployment_failed(
+            api,
+            instance_name,
+            deployment_id,
+            deadline,
+            &mut history,
+        )
+        .await?;
 
         // TLS provisioning starts around the claim, so a terminal bootstrap
         // diagnostic must stop this post-claim wait promptly. The probe is
@@ -3511,8 +3524,14 @@ async fn wait_for_paas_ssh_command(
         ));
         // Post-release on the deploy flow and unheld on the standalone
         // resumption: the wait budget still bounds the history request.
-        fail_if_template_deployment_failed(api, app_name, deployment_id, Some(start + timeout))
-            .await?;
+        fail_if_template_deployment_failed(
+            api,
+            app_name,
+            deployment_id,
+            start + timeout,
+            &mut history,
+        )
+        .await?;
         // Post-claim wait: one deployment-bound attested status read covers
         // both stop conditions -- a terminal bootstrap diagnostic, and a
         // password-mode relock (the pod rolled, the TEE came back locked, and
@@ -3615,11 +3634,11 @@ async fn latest_deployment_id(api: &ApiClient, app_name: &str) -> Result<Option<
         .map(|deployment| deployment.id))
 }
 
-/// Stop a wait when CAP reports the deployment failed. A held deploy's
-/// pre-release deadline bounds the status read: a cut is an unreadable
-/// status -- never a guessed failure -- so the enclosing wait's own expiry
-/// governs. Unheld callers pass `None` and keep the unbounded read.
-async fn fail_if_template_deployment_failed(
+/// Test fixture for the legacy synchronous history read. Production template
+/// waits use the shared detached `DeploymentHistoryProbe`; the held wait's
+/// deadline also bounds its readiness requests.
+#[cfg(test)]
+async fn fail_if_held_template_deployment_failed(
     api: &ApiClient,
     app_name: &str,
     deployment_id: &str,
@@ -3642,6 +3661,7 @@ async fn fail_if_template_deployment_failed(
     }
 }
 
+#[cfg(test)]
 async fn template_deployment_failure(
     api: &ApiClient,
     app_name: &str,
@@ -3658,6 +3678,7 @@ async fn template_deployment_failure(
         .map(|deployment| template_deployment_failure_message(deployment, deployment_id)))
 }
 
+#[cfg(test)]
 fn template_deployment_failure_message(
     deployment: &DeploymentEntry,
     deployment_id: &str,
@@ -3669,6 +3690,7 @@ fn template_deployment_failure_message(
     format!("deployment {deployment_id} failed: {detail}")
 }
 
+#[cfg(test)]
 fn should_retry_template_deployment_status_error(error: &ApiError) -> bool {
     match error {
         ApiError::Http(error) => should_retry_api_transport_error(error),
@@ -5647,7 +5669,7 @@ mod tests {
         let started = Instant::now();
         tokio::time::timeout(
             Duration::from_secs(2),
-            fail_if_template_deployment_failed(&api, "shell", "deploy-1", Some(deadline)),
+            fail_if_held_template_deployment_failed(&api, "shell", "deploy-1", Some(deadline)),
         )
         .await
         .expect("deployment status must respect the hold deadline")
