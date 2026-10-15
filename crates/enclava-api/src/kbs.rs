@@ -2986,7 +2986,7 @@ resource_bindings := {
 
     #[test]
     fn signed_policy_budget_exceeded_maps_to_its_own_public_code() {
-        // cap#220: the bounded code that migration 0058, the public-code
+        // cap#220: the bounded code that migration 0073, the public-code
         // allowlist, and the error emitter all pin must stay mapped through
         // the type -- the tests writing the string literal themselves would
         // not notice this arm collapsing back to `kbs_policy_error`.

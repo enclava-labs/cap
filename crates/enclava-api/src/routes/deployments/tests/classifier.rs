@@ -1011,7 +1011,7 @@ async fn public_error_codes_are_persistable_job_codes() {
             constraint_def.contains(&needle),
             "PUBLIC_DEPLOYMENT_ERROR_CODES entry `{code}` is rejected by the \
              deployment_apply_jobs_last_error_code_check constraint; widen \
-             migrations/0058_widen_deployment_apply_jobs_last_error_code.sql",
+             migrations/0073_widen_deployment_apply_jobs_last_error_code.sql",
         );
     }
 }
@@ -1094,7 +1094,7 @@ async fn every_emitter_error_code_is_persistable_and_public() {
             constraint_def.contains(&needle),
             "emitter code `{code}` is rejected by the \
              deployment_apply_jobs_last_error_code_check constraint; widen \
-             migrations/0058_widen_deployment_apply_jobs_last_error_code.sql",
+             migrations/0073_widen_deployment_apply_jobs_last_error_code.sql",
         );
         assert!(
             PUBLIC_DEPLOYMENT_ERROR_CODES.contains(&code),
