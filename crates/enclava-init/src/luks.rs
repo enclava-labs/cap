@@ -558,11 +558,17 @@ fn verify_stacked_integrity_mapper(
              one backing device; refusing to reuse the mapper"
         )));
     }
-    let slave_path = PathBuf::from("/dev").join(&dif_slaves[0]);
-    if !paths_equivalent(&slave_path, device) {
+    // The backing-device identity check must compare KERNEL device
+    // identity, not path strings: sysfs `slaves` reports the kernel block
+    // name (e.g. vdb), while the device enclava-init was given may be a
+    // container-local bind mount of the same node (e.g. /dev/csi0). Both
+    // resolve to the same major:minor in sysfs, which is the identity the
+    // kernel actually uses (cap#244 review).
+    if !same_block_device(&dif_slaves[0], device) {
         return Err(InitError::Luks(format!(
-            "integrity sub-mapper {dif_name} is backed by {}, expected {}",
-            slave_path.display(),
+            "integrity sub-mapper {dif_name} is backed by kernel device {}, which is not \
+             the device opened as {} (major/minor mismatch)",
+            dif_slaves[0],
             device.display()
         )));
     }
@@ -1161,6 +1167,31 @@ fn parse_cryptsetup_status(output: &str) -> CryptsetupStatus {
         }
     }
     status
+}
+
+/// Kernel-identity block-device comparison: two paths name the same device
+/// when their `stat` device numbers (major:minor) match — independent of
+/// the path spelling (kernel name vs container-local bind mount).
+fn same_block_device(kernel_name: &str, device: &Path) -> bool {
+    fn dev_number(path: &Path) -> Option<(u64, u64)> {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        let meta = std::fs::metadata(path).ok()?;
+        if !meta.file_type().is_block_device() {
+            return None;
+        }
+        // glibc-compatible dev_t decoding (same masks as dm_sysfs_dir).
+        let rdev = meta.rdev();
+        let major = ((rdev & 0x0000_0000_000f_ff00) >> 8) | ((rdev & 0xffff_f000_0000_0000) >> 32);
+        let minor = (rdev & 0x0000_0000_0000_00ff) | ((rdev & 0x00000ffffff00000) >> 12);
+        Some((major, minor))
+    }
+    let slave = PathBuf::from("/dev").join(kernel_name);
+    match (dev_number(&slave), dev_number(device)) {
+        (Some(a), Some(b)) => a == b,
+        // If either side cannot be stat'ed as a block device (unexpected),
+        // fall back to path equivalence rather than silently passing.
+        _ => paths_equivalent(&slave, device),
+    }
 }
 
 fn paths_equivalent(left: &Path, right: &Path) -> bool {
@@ -1880,7 +1911,10 @@ mod tests {
     /// SEV-SNP nightlies run them for real). write_detached_copy also
     /// enforces tmpfs, so skip on dev machines whose mount is not RAM-backed.
     fn can_write_run_enclava() -> bool {
-        std::fs::create_dir_all(luks2_seal::PRIVATE_MATERIAL_DIR).is_ok()
+        // Create the private dir the way production does (0700, euid-owned);
+        // a bare create_dir_all would leave umask-default permissions that
+        // ensure_private_material_dir correctly refuses.
+        luks2_seal::ensure_private_material_dir(Path::new(luks2_seal::PRIVATE_MATERIAL_DIR)).is_ok()
             && nix::sys::statfs::statfs(luks2_seal::PRIVATE_MATERIAL_DIR)
                 .map(|s| s.filesystem_type() == nix::sys::statfs::TMPFS_MAGIC)
                 .unwrap_or(false)

@@ -68,7 +68,12 @@ use crate::secrets::DerivedSeed;
 /// kept as a 0700 root-owned directory with a permanent `.keep` entry
 /// (non-empty directories cannot be `rmdir`-ed and swapped), and every
 /// open of a material path refuses to follow symlinks.
-pub const PRIVATE_MATERIAL_DIR: &str = "/run/enclava-luks";
+/// Material lives in a SUBDIRECTORY enclava-init creates itself: the
+/// `/run/enclava-luks` mount root is chgrp-ed group-accessible by
+/// Kubernetes `fsGroup` (pod security context), which the 0700 validation
+/// below must reject — so the root is only a mount point; the runtime
+/// owns `luks-private/` inside it (cap#244 review).
+pub const PRIVATE_MATERIAL_DIR: &str = "/run/enclava-luks/luks-private";
 
 /// Name of the permanent entry that keeps [`PRIVATE_MATERIAL_DIR`]
 /// non-empty forever, so a workload with write access to the parent
