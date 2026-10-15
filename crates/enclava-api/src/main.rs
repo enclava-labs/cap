@@ -923,25 +923,11 @@ async fn main() {
         build_trustee_http_client().expect("failed to build Trustee HTTP client");
 
     let side_effect_admission = enclava_api::state::side_effect_admission_for_pool(&pool);
-    // Converge stale tenant image pull secrets BEFORE the router is built
-    // (review finding on #243): the dispatch-freeze middleware must see the
-    // workload-admission decision from its very first request. If the sweep
-    // cannot converge (a failed delete leaves the platform token exposed),
-    // workload admission stays closed and a background reconciler retries the
-    // sweep with bounded backoff — admission and the deployment dispatcher
-    // open together only once a sweep converges. The API must not accept
-    // workload mutations while a stale token is out, but a transient
-    // Kubernetes outage at startup must not freeze deployments for the
-    // process lifetime either (review finding).
-    let pull_secret_sweep_converged =
-        enclava_api::deploy::cleanup_stale_tenant_image_pull_secrets_at_startup(&pool).await;
-    let dispatch_admission = deployment_dispatch_enabled && pull_secret_sweep_converged;
-    if deployment_dispatch_enabled && !pull_secret_sweep_converged {
-        tracing::error!(
-            "workload admission closed: tenant image pull secret cleanup sweep did not converge; \
-             the sweep will retry with bounded backoff and open admission as soon as it converges"
-        );
-    }
+    // Construct the router with workload admission CLOSED. Bind liveness
+    // before the potentially serial, per-namespace Kubernetes sweep: a stalled
+    // cluster must not make startup probes restart us before /livez exists.
+    // The shared atomic is opened only after the initial sweep converges.
+    let mut dispatch_admission = false;
     let state = AppState {
         db: pool,
         management_mode,
@@ -1005,6 +991,16 @@ async fn main() {
         .await
     });
 
+    let pull_secret_sweep_converged =
+        enclava_api::deploy::cleanup_stale_tenant_image_pull_secrets_at_startup(&state.db).await;
+    dispatch_admission = deployment_dispatch_enabled && pull_secret_sweep_converged;
+    if dispatch_admission {
+        state.set_deployment_dispatch_enabled(true);
+    } else if deployment_dispatch_enabled {
+        tracing::error!(
+            "workload admission closed: pull secret cleanup did not converge; background retry scheduled"
+        );
+    }
     if let Err(error) = enclava_api::kbs::reconcile_signed_policy_at_startup(&state).await {
         eprintln!("startup refused: KBS policy reconciliation failed: {error}");
         std::process::exit(1);
