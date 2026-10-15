@@ -29,7 +29,7 @@
 //! (dm-integrity) tags and then ext4 before the first mount, so the runtime
 //! image must include `mkfs.ext4`.
 
-use std::fs::{File, OpenOptions, remove_file};
+use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -37,8 +37,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use libcryptsetup_rs::{
-    CryptDevice, CryptInit, CryptParamsLuks2, CryptParamsLuks2Ref,
-    consts::flags::{CryptActivate, CryptDeactivate},
+    CryptInit, CryptParamsLuks2, CryptParamsLuks2Ref, consts::flags::CryptActivate,
     consts::vals::EncryptionFormat,
 };
 
@@ -59,15 +58,8 @@ const MIN_VOLUME_BYTES: u64 = 32 * 1024 * 1024;
 static KEY_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 static DETACHED_HEADER_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Total LUKS2 volume-key bytes: 64 cipher key (AES-256-XTS) + 32 integrity
-/// key (hmac-sha256). The library takes the total; 64 silently downgrades to
-/// AES-128-XTS.
-const VOLUME_KEY_BYTES: usize = 96;
 /// CLI spelling of the integrity algorithm.
 const INTEGRITY_CLI: &str = "hmac-sha256";
-/// Kernel spelling the libcryptsetup API expects.
-const INTEGRITY_LIB: &str = "hmac(sha256)";
-const INTEGRITY_WIPE_CHUNK: usize = 4 * 1024 * 1024;
 
 /// Path to the activated mapper device.
 #[derive(Debug, Clone)]
