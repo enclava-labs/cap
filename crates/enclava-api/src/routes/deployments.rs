@@ -607,6 +607,9 @@ const PUBLIC_DEPLOYMENT_ERROR_CODES: &[&str] = &[
     "lease_lost",
     "apply_limiter_closed",
     "side_effect_admission_closed",
+    // preflight volume-evidence code (main): requeue-only today, listed so
+    // the widening invariant holds if it ever terminalizes
+    "volume_evidence_unavailable",
     // DNS setup codes
     "dns_not_configured",
     "dns_outside_managed_zone",
