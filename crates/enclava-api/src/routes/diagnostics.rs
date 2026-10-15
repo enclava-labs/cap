@@ -78,6 +78,8 @@ pub enum DeploymentPhase {
     Failed,
     /// The deployment was ended by supersession, not by its own outcome.
     Cancelled,
+    /// The deployment was rolled back to a previous version.
+    RolledBack,
     /// The app is being destroyed; the deployment underneath is being torn
     /// down and no deployment action is available until deletion finishes.
     Destroying,
@@ -137,7 +139,6 @@ pub struct DeploymentDiagnostics {
     pub reason: Option<DeploymentReason>,
     /// The deployment this projection describes. Null when no deployment
     /// row exists for the app.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub deployment_id: Option<Uuid>,
     /// Deployment creation time (phase start anchor).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -600,6 +601,7 @@ fn classify_phase(deployment_status: &str, job_state: Option<&str>) -> Deploymen
         // deployment row alone distinguishes success from failure.
         ("failed", _) => DeploymentPhase::Failed,
         ("healthy", _) => DeploymentPhase::Healthy,
+        ("rolled_back", _) => DeploymentPhase::RolledBack,
         // A deployment is inserted at status `pending` and only moves to
         // `applying` after setup finished, so live setup work rides on a
         // `pending` deployment with a setup job (the `applying` arm is
@@ -691,6 +693,7 @@ fn classify_condition_and_retry(
 ) -> (DeploymentCondition, Option<DateTime<Utc>>) {
     match phase {
         DeploymentPhase::Healthy => (DeploymentCondition::Terminal, None),
+        DeploymentPhase::RolledBack => (DeploymentCondition::Terminal, None),
         DeploymentPhase::Failed => {
             // A failed deployment with a cleanup job still rolling back
             // is not finished: cleanup holds the lane (redeploy 409s on

@@ -1886,6 +1886,7 @@ fn deployment_condition_action(
         "terminal" => match phase {
             Some("healthy") => "the deployment completed successfully",
             Some("cancelled") => "the deployment was superseded by a newer deployment",
+            Some("rolled_back") => "the deployment was rolled back to a previous version",
             Some("failed") => {
                 "the deployment failed; wait for any rollback to finish, then redeploy to try again"
             }
