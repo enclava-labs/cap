@@ -11,6 +11,11 @@ pub struct GenericDeploymentRequest {
     pub signing: GenericDeploymentSigning,
     #[serde(default)]
     pub security: GenericDeploymentSecurity,
+    /// Holds the workload roll until customer config is released. Only the
+    /// internal PaaS route may send it; the public route rejects it, and CAP
+    /// applies it only for a redeploy of an app with a live TEE.
+    #[serde(default)]
+    pub customer_config_roll_hold_seconds: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -87,6 +92,21 @@ pub struct GenericDeploymentResponse {
     pub error_message: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// True when this deployment's roll is waiting for the customer-config
+    /// handshake. Absent when the roll was not held.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub customer_config_hold: bool,
+    /// The hold's stored expiry. A lost-response retry replays this same
+    /// deadline, so a retried create must not budget a fresh window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub customer_config_hold_until: Option<chrono::DateTime<chrono::Utc>>,
+    /// Milliseconds until the stored expiry, computed from the database
+    /// clock at response time. Clients must derive monotonic deadlines from
+    /// this duration rather than subtracting wall clocks, so clock skew
+    /// cannot abandon a valid hold or push a release past expiry. Negative
+    /// means the hold already expired; it is never a fresh window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub customer_config_hold_remaining_ms: Option<i64>,
     /// Explicit live evidence. The lifecycle fields above remain database
     /// projections; consumers must use this observation to decide whether a
     /// healthy/running projection is current.
@@ -140,6 +160,9 @@ impl GenericDeploymentResponse {
             error_message,
             created_at: deployment.created_at,
             completed_at: deployment.completed_at,
+            customer_config_hold: false,
+            customer_config_hold_until: None,
+            customer_config_hold_remaining_ms: None,
             observation: LiveObservation::not_observed(),
         }
     }
@@ -148,6 +171,10 @@ impl GenericDeploymentResponse {
         self.observation = observation;
         self
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 pub(super) fn json_error(
@@ -226,10 +253,33 @@ pub async fn generate_agent_policy(
 }
 
 /// POST /deployments -- generic provider-aware deployment entrypoint.
+///
+/// Public callers have no route to release a customer-config hold (only the
+/// internal PaaS path proxies one), so a request that asks for a hold is
+/// rejected here instead of arming a roll nothing outside PaaS can release.
 pub async fn create_generic_deployment(
     auth: AuthContext,
     State(state): State<AppState>,
     Json(body): Json<GenericDeploymentRequest>,
+) -> Result<(StatusCode, Json<GenericDeploymentResponse>), (StatusCode, Json<serde_json::Value>)> {
+    scopes::require_app_write(&auth)?;
+    if body.customer_config_roll_hold_seconds.is_some() {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "customer_config_roll_hold_seconds is only accepted on the internal PaaS deployment route",
+        ));
+    }
+    create_generic_deployment_inner(auth, state, body, false).await
+}
+
+/// Shared body of the generic deployment entrypoint. The internal PaaS
+/// route is the only caller that may honor a customer-config hold, because
+/// it is the only path paired with a release route.
+pub(crate) async fn create_generic_deployment_inner(
+    auth: AuthContext,
+    state: AppState,
+    body: GenericDeploymentRequest,
+    honor_customer_config_roll_hold: bool,
 ) -> Result<(StatusCode, Json<GenericDeploymentResponse>), (StatusCode, Json<serde_json::Value>)> {
     scopes::require_app_write(&auth)?;
     crate::routes::apps::ensure_management_write_allowed(&state, &auth).await?;
@@ -248,17 +298,42 @@ pub async fn create_generic_deployment(
         && let Some((deployment, app)) =
             fetch_deployment_by_external_id(&state, auth.org_id, external_id).await?
     {
-        if super::deployment_setup_incomplete(&deployment) {
+        let open_hold = match crate::deployment_jobs::customer_config_hold_replay_state(
+            &state.db,
+            deployment.id,
+        )
+        .await
+        .map_err(|_| {
+            json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the customer-config hold state could not be re-read for replay; retry the deployment",
+            )
+        })? {
+            crate::deployment_jobs::CustomerConfigHoldReplay::Open(hold) => Some(hold),
+            crate::deployment_jobs::CustomerConfigHoldReplay::EndedUnreleased => {
+                return Err(json_error(
+                    StatusCode::GONE,
+                    "the customer-config roll hold ended without a release and the deployment failed without rolling; start a new deploy instead of retrying this one",
+                ));
+            }
+            crate::deployment_jobs::CustomerConfigHoldReplay::Released
+            | crate::deployment_jobs::CustomerConfigHoldReplay::NotHeld => None,
+        };
+        if super::deployment_setup_incomplete(&deployment) && open_hold.is_none() {
             return Err(json_error(
                 StatusCode::CONFLICT,
                 "external_id belongs to a deployment whose setup did not complete",
             ));
         }
         ensure_idempotent_retry_matches(&deployment, &app, &body)?;
-        return Ok((
-            StatusCode::OK,
-            Json(GenericDeploymentResponse::from_deployment(deployment, &app)),
-        ));
+        let mut response = GenericDeploymentResponse::from_deployment(deployment, &app);
+        // Replay the stored expiry and the database-clock remainder so a
+        // lost-response retry keeps the original deadline instead of a
+        // fresh hold window.
+        response.customer_config_hold = open_hold.is_some();
+        response.customer_config_hold_until = open_hold.map(|hold| hold.until);
+        response.customer_config_hold_remaining_ms = open_hold.map(|hold| hold.remaining_ms);
+        return Ok((StatusCode::OK, Json(response)));
     }
 
     let normalized_egress_allowlist =
@@ -319,18 +394,30 @@ pub async fn create_generic_deployment(
         signed_policy_artifact: body.security.signed_policy_artifact,
         workload_security_profile: body.security.workload_security_profile,
         log_encryption: body.security.log_encryption.clone(),
+        customer_config_roll_hold_seconds: body.customer_config_roll_hold_seconds,
     };
     let org_id = auth.org_id;
-    let (status, Json(deployed)) =
-        super::deploy_app_candidate(auth, state.clone(), app, deploy_request, app_mutation).await?;
+    let (status, Json(deployed)) = super::deploy_app_candidate(
+        auth,
+        state.clone(),
+        app,
+        deploy_request,
+        app_mutation,
+        honor_customer_config_roll_hold,
+    )
+    .await?;
     let (deployment, app) = fetch_deployment_with_app(&state, org_id, deployed.deployment_id)
         .await?
         .ok_or_else(|| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+    let open_hold = crate::deployment_jobs::customer_config_open_hold(&state.db, deployment.id)
+        .await
+        .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+    let mut response = GenericDeploymentResponse::from_deployment(deployment, &app);
+    response.customer_config_hold = open_hold.is_some();
+    response.customer_config_hold_until = open_hold.map(|hold| hold.until);
+    response.customer_config_hold_remaining_ms = open_hold.map(|hold| hold.remaining_ms);
 
-    Ok((
-        status,
-        Json(GenericDeploymentResponse::from_deployment(deployment, &app)),
-    ))
+    Ok((status, Json(response)))
 }
 
 /// GET /deployments/{deployment_id} -- generic deployment status/details.
@@ -357,6 +444,12 @@ pub async fn get_generic_deployment(
         response.app_status = "failed".to_string();
         response.error_message = Some(runtime_failure);
     }
+    let open_hold = crate::deployment_jobs::customer_config_open_hold(&state.db, deployment_id)
+        .await
+        .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+    response.customer_config_hold = open_hold.is_some();
+    response.customer_config_hold_until = open_hold.map(|hold| hold.until);
+    response.customer_config_hold_remaining_ms = open_hold.map(|hold| hold.remaining_ms);
     Ok(Json(response))
 }
 
@@ -603,7 +696,45 @@ pub(super) fn ensure_idempotent_retry_matches(
     if existing_log_encryption != requested_log_encryption {
         return Err(idempotency_conflict("security.log_encryption"));
     }
+    if !customer_config_roll_hold_idempotency_matches(
+        &deployment.spec_snapshot,
+        body.customer_config_roll_hold_seconds,
+    ) {
+        return Err(idempotency_conflict("customer_config_roll_hold_seconds"));
+    }
     Ok(())
+}
+
+/// Compare the caller's requested hold, not a duration recomputed from the
+/// app's current status. Apply moves a running app to `creating` before a
+/// lost response is retried, and that later status would turn the same
+/// request into a conflict.
+fn customer_config_roll_hold_idempotency_matches(
+    spec_snapshot: &serde_json::Value,
+    requested_seconds: Option<u32>,
+) -> bool {
+    let requested = serde_json::json!(requested_seconds);
+    if let Some(stored_requested) = spec_snapshot.get("customer_config_roll_hold_requested_seconds")
+    {
+        return stored_requested == &requested;
+    }
+    // Rows accepted before the requested seconds were stored. A recorded
+    // duration means the hold applied, so clamp without reading app status.
+    // A missing duration only matches a retry that does not ask for a hold.
+    let stored_hold = spec_snapshot
+        .get("customer_config_roll_hold_seconds")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    if stored_hold.is_number() {
+        let requested_hold = serde_json::json!(
+            crate::deployment_jobs::normalize_customer_config_roll_hold_seconds(
+                requested_seconds,
+                true,
+            )
+        );
+        return stored_hold == requested_hold;
+    }
+    requested_seconds.is_none_or(|seconds| seconds == 0)
 }
 
 fn idempotency_conflict(field: &'static str) -> (StatusCode, Json<serde_json::Value>) {

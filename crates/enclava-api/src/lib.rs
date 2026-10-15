@@ -458,6 +458,10 @@ fn internal_routes() -> Router<AppState> {
             axum::routing::post(routes::internal::issue_paas_generic_config_token),
         )
         .route(
+            "/internal/paas/orgs/{paas_org_id}/deployments/{deployment_id}/customer-config-released",
+            axum::routing::post(routes::internal::release_paas_customer_config_roll),
+        )
+        .route(
             "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/unlock/status",
             axum::routing::get(routes::internal::get_paas_unlock_status),
         )
@@ -1232,6 +1236,10 @@ mod runtime_gate_tests {
                 &[("POST", MUTATION)],
             ),
             (
+                "/internal/paas/orgs/{paas_org_id}/deployments/{deployment_id}/customer-config-released",
+                &[("POST", MUTATION)],
+            ),
+            (
                 "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/unlock/status",
                 &[("GET", ALLOW)],
             ),
@@ -1487,6 +1495,32 @@ mod runtime_gate_tests {
             out
         }
 
+        // Replace {param}s in a pattern positionally: the parameter at
+        // `poison_at` (0-based) takes `poison`, every other parameter takes
+        // the ordinary value "org-1".
+        fn instantiate_mixed(pattern: &str, poison: &str, poison_at: usize) -> String {
+            let mut out = String::new();
+            let mut rest = pattern;
+            let mut position = 0usize;
+            while let Some(open) = rest.find('{') {
+                out.push_str(&rest[..open]);
+                let close = rest[open..].find('}').expect("unclosed param") + open;
+                out.push_str(if position == poison_at {
+                    poison
+                } else {
+                    "org-1"
+                });
+                position += 1;
+                rest = &rest[close + 1..];
+            }
+            out.push_str(rest);
+            out
+        }
+
+        fn parameter_count(pattern: &str) -> usize {
+            pattern.matches('{').count()
+        }
+
         // (3) Exhaustive per-pattern poison instantiation.
         let poison_values = [
             "demo",
@@ -1547,6 +1581,61 @@ mod runtime_gate_tests {
                             trailing_empty,
                             "{path} instantiated from {pattern} must dispatch"
                         );
+                    }
+                }
+            }
+        }
+
+        // (3b) Mixed parameters: poison each parameter position on every
+        // multi-parameter pattern while the others stay ordinary. A
+        // poisoned segment beside plain segments (for example a poisoned
+        // `{paas_org_id}` next to an ordinary `{deployment_id}` on the
+        // `customer-config-released` route) must still dispatch to its own
+        // pattern with the same gate classification — uniform-poison runs
+        // alone would miss a matcher or gate that only misbehaves on mixed
+        // input.
+        for (index, (pattern, served)) in route_table.iter().enumerate() {
+            if parameter_count(pattern) < 2 {
+                continue;
+            }
+            for poison_at in 0..parameter_count(pattern) {
+                for poison in poison_values {
+                    let path = instantiate_mixed(pattern, poison, poison_at);
+                    let trailing_empty = poison.is_empty()
+                        && poison_at == parameter_count(pattern) - 1
+                        && pattern.ends_with('}');
+                    match mirror.at(&path) {
+                        Ok(matched) => {
+                            assert!(
+                                !trailing_empty,
+                                "{path}: matchit must not match a trailing '/' \
+                                 (no pattern serves it; pattern {pattern})"
+                            );
+                            assert_eq!(
+                                *matched.value, index,
+                                "{path} (param {poison_at} of {pattern} = {poison:?}) \
+                                 dispatched to {}",
+                                route_table[*matched.value].0
+                            );
+                            for (method_name, is_allow) in served.iter() {
+                                let method = Method::from_bytes(method_name.as_bytes()).unwrap();
+                                let gate = is_workload_authority_mutation(&method, &path);
+                                assert_eq!(
+                                    gate,
+                                    !*is_allow,
+                                    "{method} {path} (from {pattern}): gate says {}, \
+                                     annotation says {}",
+                                    if gate { "mutation" } else { "allowed" },
+                                    if *is_allow { "allow" } else { "mutation" },
+                                );
+                            }
+                        }
+                        Err(_) => {
+                            assert!(
+                                trailing_empty,
+                                "{path} instantiated from {pattern} must dispatch"
+                            );
+                        }
                     }
                 }
             }
@@ -1700,6 +1789,10 @@ mod runtime_gate_tests {
 
         for (method, path) in [
             (Method::POST, "/apps/demo/deploy"),
+            (
+                Method::POST,
+                "/internal/paas/orgs/org-1/deployments/deployment-1/customer-config-released",
+            ),
             (Method::POST, "/apps%2Fdemo/deploy"),
             (Method::POST, "//apps//demo//deploy"),
             (Method::POST, "/apps/demo/deploy/"),
@@ -1864,6 +1957,7 @@ mod runtime_gate_tests {
         let mut state = crate::test_support::lazy_state();
         state.management_mode = crate::state::CapManagementMode::PaasManaged;
         state.deployment_dispatch_enabled = false;
+        state.mark_startup_ready();
         let app = build_router_inner(state, true);
 
         for uri in [
@@ -1880,6 +1974,10 @@ mod runtime_gate_tests {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "unregistered write to {uri} must be fail-closed by the dispatch gate, not 404"
             );
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"], "deploy_blocked");
+            assert_eq!(body["reason"], "deployment_dispatch_disabled");
         }
     }
 
