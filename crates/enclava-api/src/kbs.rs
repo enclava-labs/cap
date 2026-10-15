@@ -3115,6 +3115,307 @@ resource_bindings := {
         tx.rollback().await.unwrap();
     }
 
+    /// A stateful in-memory Kubernetes stand-in for the signed-policy
+    /// reconciler: serves ConfigMap get/replace and Deployment get/replace,
+    /// advancing resourceVersion on every write like a real API server. The
+    /// state is shared between the client and the handle so the test can
+    /// assert on what the reconciler actually wrote.
+    #[derive(Clone, Default)]
+    struct FakeKubeInner {
+        configmap: Option<ConfigMap>,
+        deployment: Option<Deployment>,
+        next_resource_version: u64,
+    }
+
+    #[derive(Clone)]
+    struct FakeKubeState(std::sync::Arc<tokio::sync::Mutex<FakeKubeInner>>);
+
+    impl FakeKubeState {
+        fn new() -> Self {
+            Self(std::sync::Arc::new(tokio::sync::Mutex::new(
+                FakeKubeInner {
+                    configmap: Some(ConfigMap {
+                        metadata: kube::core::ObjectMeta {
+                            name: Some("resource-policy".to_string()),
+                            resource_version: Some("1".to_string()),
+                            ..Default::default()
+                        },
+                        data: Some(BTreeMap::from([(
+                            "resource-policy".to_string(),
+                            "package policy\n\ndefault allow := false\n".to_string(),
+                        )])),
+                        ..Default::default()
+                    }),
+                    deployment: Some(Deployment {
+                        metadata: kube::core::ObjectMeta {
+                            name: Some("trustee".to_string()),
+                            resource_version: Some("1".to_string()),
+                            generation: Some(1),
+                            ..Default::default()
+                        },
+                        spec: Some(k8s_openapi::api::apps::v1::DeploymentSpec {
+                            replicas: Some(1),
+                            selector:
+                                k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector {
+                                    match_labels: Some(BTreeMap::from([(
+                                        "app".to_string(),
+                                        "trustee".to_string(),
+                                    )])),
+                                    ..Default::default()
+                                },
+                            template: k8s_openapi::api::core::v1::PodTemplateSpec {
+                                metadata: Some(kube::core::ObjectMeta {
+                                    labels: Some(BTreeMap::from([(
+                                        "app".to_string(),
+                                        "trustee".to_string(),
+                                    )])),
+                                    ..Default::default()
+                                }),
+                                spec: Some(k8s_openapi::api::core::v1::PodSpec {
+                                    containers: vec![k8s_openapi::api::core::v1::Container {
+                                        name: "trustee".to_string(),
+                                        image: Some("trustee:test".to_string()),
+                                        ..Default::default()
+                                    }],
+                                    ..Default::default()
+                                }),
+                            },
+                            ..Default::default()
+                        }),
+                        status: Some(k8s_openapi::api::apps::v1::DeploymentStatus {
+                            observed_generation: Some(1),
+                            updated_replicas: Some(1),
+                            available_replicas: Some(1),
+                            ..Default::default()
+                        }),
+                    }),
+                    next_resource_version: 2,
+                },
+            )))
+        }
+
+        fn client(&self) -> kube::Client {
+            let state = self.0.clone();
+            kube::Client::new(
+                tower::service_fn(move |request: axum::http::Request<kube::client::Body>| {
+                    let state = state.clone();
+                    async move {
+                        let mut state = state.lock().await;
+                        let (method, path) =
+                            (request.method().clone(), request.uri().path().to_string());
+                        use http_body_util::BodyExt;
+                        let body = request
+                            .into_body()
+                            .collect()
+                            .await
+                            .map_err(std::io::Error::other)?
+                            .to_bytes();
+                        let is_configmap = path.contains("/configmaps/");
+                        let is_deployment = path.contains("/deployments/");
+                        let resource_version = state.next_resource_version.to_string();
+                        let response_json: serde_json::Value = if method == axum::http::Method::GET
+                        {
+                            if is_configmap {
+                                serde_json::to_value(state.configmap.clone().unwrap_or_default())
+                                    .map_err(std::io::Error::other)?
+                            } else if is_deployment {
+                                serde_json::to_value(state.deployment.clone().unwrap_or_default())
+                                    .map_err(std::io::Error::other)?
+                            } else {
+                                unreachable!("unexpected GET {path}")
+                            }
+                        } else if method == axum::http::Method::PUT {
+                            let mut value: serde_json::Value =
+                                serde_json::from_slice(&body).map_err(std::io::Error::other)?;
+                            value["metadata"]["resourceVersion"] =
+                                serde_json::json!(resource_version);
+                            state.next_resource_version += 1;
+                            if is_configmap {
+                                let updated: ConfigMap = serde_json::from_value(value.clone())
+                                    .map_err(std::io::Error::other)?;
+                                state.configmap = Some(updated);
+                            } else if is_deployment {
+                                let mut updated: Deployment = serde_json::from_value(value.clone())
+                                    .map_err(std::io::Error::other)?;
+                                // The fake API server reports the rollout done
+                                // immediately: observedGeneration catches up to
+                                // metadata.generation and every replica is
+                                // updated and available.
+                                let generation = updated.metadata.generation.unwrap_or(1);
+                                updated.status =
+                                    Some(k8s_openapi::api::apps::v1::DeploymentStatus {
+                                        observed_generation: Some(generation),
+                                        updated_replicas: Some(1),
+                                        available_replicas: Some(1),
+                                        ..Default::default()
+                                    });
+                                state.deployment = Some(updated);
+                            } else {
+                                unreachable!("unexpected PUT {path}")
+                            }
+                            value
+                        } else {
+                            unreachable!("unexpected {method} {path}")
+                        };
+                        Ok::<_, std::io::Error>(
+                            axum::http::Response::builder()
+                                .status(200)
+                                .body(kube::client::Body::from(
+                                    serde_json::to_vec(&response_json).unwrap(),
+                                ))
+                                .unwrap(),
+                        )
+                    }
+                }),
+                "default",
+            )
+        }
+
+        async fn configmap_policy(&self) -> Option<String> {
+            self.0
+                .lock()
+                .await
+                .configmap
+                .as_ref()
+                .and_then(|configmap| configmap.data.as_ref())
+                .and_then(|data| data.get("resource-policy"))
+                .cloned()
+        }
+    }
+
+    /// #232: a pending generation must cause the reconciler to publish an
+    /// eligible signed artifact, without another deployment. This uses the
+    /// real database and reconciler with an in-memory Kubernetes API stand-in.
+    /// It exercises the reconciler after a fixture insert, not the HTTP
+    /// acceptance or customer-signature verification path. Assert both states:
+    ///
+    /// - No pending generation: the artifact exists but the reconciler
+    ///   leaves the serving policy untouched.
+    /// - Pending generation: the reconciler publishes the eligible artifact
+    ///   into the serving ConfigMap policy.
+    #[tokio::test]
+    async fn pending_generation_publishes_eligible_artifact_to_kbs_policy() {
+        let pool = crate::test_support::database_test_pool().await;
+        let (org_id, app_id) = insert_test_app(&pool, "creating").await;
+        let deployment_id = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, deployment_id, "healthy", Utc::now()).await;
+        set_test_setup_state(&pool, deployment_id, "accepted").await;
+        let stored = insert_test_artifact(&pool, app_id, deployment_id, "9c").await;
+        insert_test_job(
+            &pool,
+            org_id,
+            app_id,
+            deployment_id,
+            deployment_id,
+            Some((deployment_id, &stored)),
+        )
+        .await;
+
+        // Reset the reconciliation singleton to a pristine unsigned
+        // installation, as a cluster with no prior signed deploy would have.
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 0, configmap_generation = 0,
+                    applied_generation = 0, configmap_policy_sha256 = NULL,
+                    applied_policy_sha256 = NULL, configmap_resource_version = NULL
+              WHERE singleton",
+        )
+        .execute(&pool)
+        .await
+        .expect("reset reconciliation singleton");
+
+        let config = KbsPolicyConfig {
+            namespace: "trustee".to_string(),
+            configmap_name: "resource-policy".to_string(),
+            policy_key: "resource-policy".to_string(),
+            deployment_name: "trustee".to_string(),
+            required: true,
+            signed_policy_retention: 1,
+            signed_policy_max_bytes: 900 * 1024,
+        };
+
+        // The fixture has an eligible artifact but no pending generation. The
+        // mode guard leaves the existing ConfigMap unchanged.
+        let fake = FakeKubeState::new();
+        reconcile_pending_signed_policy_artifacts_with_client(&pool, &config, None, fake.client())
+            .await
+            .expect("reconcile is a no-op on a skipped enqueue");
+        assert_eq!(
+            fake.configmap_policy().await,
+            Some("package policy\n\ndefault allow := false\n".to_string()),
+            "without a pending generation, the serving KBS policy remains unchanged"
+        );
+        let desired: i64 = sqlx::query_scalar(
+            "SELECT desired_generation FROM kbs_signed_policy_reconciliation WHERE singleton",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("load desired generation");
+        assert_eq!(
+            desired, 0,
+            "the no-op reconcile must not activate signed mode"
+        );
+
+        // Enqueue the generation, as the production acceptance branches do
+        // inside their own transactions. This does not exercise acceptance.
+        let mut tx = pool.begin().await.expect("begin acceptance transaction");
+        enqueue_signed_policy_reconciliation(&mut tx)
+            .await
+            .expect("enqueue signed-policy reconciliation");
+        tx.commit().await.expect("commit acceptance");
+
+        // Convergence: with a pending generation, the same reconciler now
+        // publishes the customer artifact into the serving ConfigMap policy.
+        let fake = FakeKubeState::new();
+        reconcile_pending_signed_policy_artifacts_with_client(&pool, &config, None, fake.client())
+            .await
+            .expect("reconcile the accepted customer artifact");
+        let published = fake
+            .configmap_policy()
+            .await
+            .expect("published policy body");
+        assert!(
+            is_signed_policy_artifact_body(&published),
+            "the serving ConfigMap policy must be a signed artifact set, got: {published}"
+        );
+        assert!(
+            published.contains(&stored.metadata.descriptor_core_hash),
+            "the eligible artifact must reach the serving KBS policy set after enqueue"
+        );
+        let applied: (i64, i64) = sqlx::query_as(
+            "SELECT desired_generation, applied_generation
+               FROM kbs_signed_policy_reconciliation WHERE singleton",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("load reconciliation state");
+        assert_eq!(
+            applied,
+            (1, 1),
+            "the reconciler must durably converge applied_generation to desired"
+        );
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete convergence fixture");
+
+        // Restore the reconciliation singleton to its pristine unsigned
+        // state so parallel or later tests cannot observe this test's
+        // bumped generation (the singleton is process-wide shared state).
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 0, configmap_generation = 0,
+                    applied_generation = 0, configmap_policy_sha256 = NULL,
+                    applied_policy_sha256 = NULL, configmap_resource_version = NULL
+              WHERE singleton",
+        )
+        .execute(&pool)
+        .await
+        .expect("reset reconciliation singleton");
+    }
+
     async fn insert_test_app(pool: &PgPool, status: &str) -> (Uuid, Uuid) {
         let org_id = Uuid::new_v4();
         let app_id = Uuid::new_v4();
