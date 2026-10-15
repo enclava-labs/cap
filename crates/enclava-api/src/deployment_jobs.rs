@@ -2441,12 +2441,16 @@ async fn fail_apply_job_with_mutation(
     // Compensating provider cleanup for the partial state this apply may have
     // published (HAProxy routes, namespace objects). Runs while the mutation
     // lease still owns the edge/namespace fences, before any fence release.
-    // When the namespace delete is not confirmed complete, cleanup asks us to
-    // retain the pre-armed namespace fence (fail closed, like app delete)
-    // instead of converting it to the bounded reclaim quarantine.
+    // Cleanup persists the retained-namespace marker itself — BEFORE it
+    // issues the namespace DELETE — and asks us to retain the pre-armed
+    // namespace fence (fail closed, like app delete) only when the delete
+    // is not confirmed complete. RetainNamespaceFence therefore implies the
+    // marker is already durable; every other outcome releases through the
+    // bounded reclaim quarantine, which also re-bounds any pre-armed marker
+    // where retention proved unnecessary.
     let mut retain_namespace_fence = false;
     if published
-        && let (Some(mutation), Some(app)) = (mutation.as_ref(), failed_app)
+        && let (Some(mutation), Some(app)) = (mutation.as_mut(), failed_app)
         && crate::deployment_failure_cleanup::cleanup_after_terminal_apply_failure(
             state,
             app,
@@ -2458,112 +2462,14 @@ async fn fail_apply_job_with_mutation(
     {
         retain_namespace_fence = true;
     }
-    // Persist the retained-namespace marker IMMEDIATELY after the teardown
-    // outcome, before the unrelated KBS reconciliation below: the namespace
-    // DELETE may already be in flight or stuck on finalizers, and a process
-    // exit during that reconciliation window would otherwise leave the row
-    // labeled `deployment_apply`, letting
-    // `reconcile_orphaned_deployment_apply_leases` convert the intentional
-    // infinite retention into the ordinary finite quarantine and permit
-    // namespace reuse while the old deletion is still unresolved. The
-    // marker method keeps the heartbeat running so the lease stays
-    // renewable (and guard_provider stays armed) for the KBS work; renewal
-    // never extends a `reclaim_after = infinity` row, and the reconciler's
-    // release CAS simply waits for the last `locked_until` to elapse.
-    let mut retain_marker_persisted = false;
-    if published
-        && retain_namespace_fence
-        && let Some(mutation) = mutation.as_mut()
-    {
-        // Codex P1: the retained marker is the ONLY durable distinction
-        // between this intentional infinite retain and a crashed worker's
-        // pre-armed fence (which
-        // `reconcile_orphaned_deployment_apply_leases` repairs into the
-        // bounded 360 s reclaim window). Losing it to a transient database
-        // error would silently convert the pre-armed infinite namespace
-        // fence into finite quarantine while the namespace DELETE is still
-        // in flight — a finalizer-stuck deletion can outlive that window
-        // and another deployment could reclaim the name. Retry the write
-        // before accepting the bounded fallback.
-        let mut retain_attempt = 0usize;
-        loop {
-            match mutation
-                .retain_resource_scope_under_marker(
-                    "kubernetes_namespace",
-                    crate::mutation_leases::RETAINED_DEPLOYMENT_NAMESPACE_OPERATION,
-                )
-                .await
-            {
-                Ok(()) => {
-                    retain_marker_persisted = true;
-                    break;
-                }
-                Err(crate::mutation_leases::MutationLeaseError::Lost) => {
-                    // The lease itself is gone — no retry can help.
-                    tracing::error!(
-                        deployment_id = %job.deployment_id,
-                        "namespace-fence lease lost while persisting the retained marker; falling back to bounded quarantine"
-                    );
-                    break;
-                }
-                Err(retain_error) if retain_attempt < 2 => {
-                    retain_attempt += 1;
-                    tracing::warn!(
-                        deployment_id = %job.deployment_id,
-                        error_code = DeploymentJobError::from(retain_error).code(),
-                        retain_attempt,
-                        "transient failure persisting the retained namespace-fence marker; retrying"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        250 * retain_attempt as u64,
-                    ))
-                    .await;
-                }
-                Err(retain_error) => {
-                    // Codex P1 (relabel on failure): the durable label is
-                    // what keeps `reconcile_orphaned_deployment_apply_leases`
-                    // from re-bounding the pre-armed infinite fence into the
-                    // 360 s reclaim window. Retry a lane-lock-free relabel
-                    // before giving up: it persists the same fail-closed
-                    // marker state the full write would have.
-                    let mut relabeled = false;
-                    for relabel_attempt in 0..2 {
-                        match mutation
-                            .relabel_namespace_fence_fail_closed(
-                                "kubernetes_namespace",
-                                crate::mutation_leases::RETAINED_DEPLOYMENT_NAMESPACE_OPERATION,
-                            )
-                            .await
-                        {
-                            Ok(()) => {
-                                relabeled = true;
-                                break;
-                            }
-                            Err(relabel_error) => {
-                                tracing::warn!(
-                                    deployment_id = %job.deployment_id,
-                                    error_code = DeploymentJobError::from(relabel_error).code(),
-                                    relabel_attempt,
-                                    "fail-closed namespace fence relabel failed; retrying"
-                                );
-                                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                            }
-                        }
-                    }
-                    if relabeled {
-                        retain_marker_persisted = true;
-                    } else {
-                        tracing::error!(
-                            deployment_id = %job.deployment_id,
-                            error_code = DeploymentJobError::from(retain_error).code(),
-                            "failed to persist the retained namespace fence marker AND its fail-closed relabel; the orphan reconciler may re-bound the fence"
-                        );
-                    }
-                    break;
-                }
-            }
-        }
-    }
+    // The retained-namespace marker is no longer written here: cleanup
+    // persists it BEFORE issuing the namespace DELETE (Codex P1 — a process
+    // exit between Kubernetes accepting the DELETE and this post-teardown
+    // write used to leave the terminal job labeled `deployment_apply`, so
+    // `reconcile_orphaned_deployment_apply_leases` would convert the
+    // intentional infinite fence into the 360-second quarantine while the
+    // deletion was still unresolved). RetainNamespaceFence now always
+    // implies the marker is already durable.
     if published && let Some(mutation) = mutation.as_mut() {
         if reconcile_pending_kbs_with_mutation(state, mutation)
             .await
@@ -2584,28 +2490,21 @@ async fn fail_apply_job_with_mutation(
             );
         }
     }
-    // retain_marker_persisted = false means either:
-    // 1. we never tried to retain (retain_namespace_fence = false), OR
-    // 2. we tried but the marker persistence failed (retain_namespace_fence = true)
-    // In case 2, we MUST NOT convert to bounded quarantine - the delete is in flight
-    // and we need the infinite fence to stay armed until reconciliation confirms gone.
+    // RetainNamespaceFence implies the marker was already persisted before
+    // the DELETE was issued: the namespace scope stays armed under the
+    // retained-namespace marker operation until reconciliation confirms the
+    // namespace is gone — mirroring the app-delete fail-closed teardown
+    // contract. Every other outcome releases through the bounded reclaim
+    // quarantine, which also re-bounds a pre-armed marker where retention
+    // proved unnecessary (confirmed absence, no delete issued, rewritten
+    // namespace); dropping the lease stops renewal so the reconciler's
+    // expiry CAS becomes eligible.
     if published && let Some(mutation) = mutation {
-        if retain_namespace_fence && !retain_marker_persisted {
-            // Codex P1: we asked to retain the infinite fence but couldn't persist
-            // the marker. Fail closed: do NOT convert to bounded quarantine.
-            // The infinite fence stays armed; reconciliation will eventually
-            // confirm the namespace is gone or the lease expires.
-            tracing::error!(
+        if retain_namespace_fence {
+            tracing::info!(
                 deployment_id = %job.deployment_id,
-                "failed to persist namespace fence marker; keeping infinite fence armed until reconciliation"
+                "retained-namespace marker persisted before the delete; keeping the namespace fence armed until reconciliation"
             );
-        } else if retain_marker_persisted {
-            // The namespace scope stays armed under the retained-namespace
-            // marker operation until reconciliation confirms the namespace
-            // is gone — mirroring the app-delete fail-closed teardown
-            // contract. Every other scope already carries its bounded
-            // claim-time quarantine, and dropping the lease stops renewal
-            // so the reconciler's expiry CAS becomes eligible.
         } else if let Err(release_error) = mutation.release_after_provider_quarantine().await {
             tracing::error!(
                 deployment_id = %job.deployment_id,

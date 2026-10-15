@@ -1279,6 +1279,107 @@ pub(crate) enum CleanupFenceOutcome {
     RetainNamespaceFence,
 }
 
+/// Persist the retained-namespace marker durably BEFORE an ambiguous
+/// namespace DELETE is issued (Codex P1). The marker is the ONLY durable
+/// distinction between an intentional infinite retain and a crashed
+/// worker's pre-armed fence (which
+/// `reconcile_orphaned_deployment_apply_leases` repairs into the bounded
+/// 360 s reclaim window); writing it only after the awaited teardown
+/// returns leaves the exact window Codex describes: a process exit after
+/// Kubernetes accepts the DELETE — or during the convergence wait — would
+/// leave the terminal job labeled `deployment_apply`, so after the
+/// heartbeat expires the orphan repair converts the infinite fence to the
+/// 360-second quarantine while the deletion (possibly stuck on finalizers)
+/// is still unresolved. The write is retried before accepting the bounded
+/// fallback: losing it to a transient database error would silently convert
+/// the pre-armed infinite namespace fence into finite quarantine.
+///
+/// Returns true when the marker is durable (full write or the fail-closed
+/// relabel fallback). On false the caller must NOT issue the delete.
+async fn persist_retained_namespace_marker(
+    mutation: &mut AppMutationLease,
+    app_id: Uuid,
+    failed_deployment_id: Uuid,
+) -> bool {
+    let mut retain_attempt = 0usize;
+    loop {
+        match mutation
+            .retain_resource_scope_under_marker(
+                "kubernetes_namespace",
+                crate::mutation_leases::RETAINED_DEPLOYMENT_NAMESPACE_OPERATION,
+            )
+            .await
+        {
+            Ok(()) => return true,
+            Err(crate::mutation_leases::MutationLeaseError::Lost) => {
+                // The lease itself is gone — no retry can help.
+                tracing::error!(
+                    app_id = %app_id,
+                    deployment_id = %failed_deployment_id,
+                    "namespace-fence lease lost while persisting the retained marker"
+                );
+                return false;
+            }
+            Err(retain_error) if retain_attempt < 2 => {
+                retain_attempt += 1;
+                tracing::warn!(
+                    app_id = %app_id,
+                    deployment_id = %failed_deployment_id,
+                    error = %retain_error,
+                    retain_attempt,
+                    "transient failure persisting the retained namespace-fence marker; retrying"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    250 * retain_attempt as u64,
+                ))
+                .await;
+            }
+            Err(retain_error) => {
+                // Codex P1 (relabel on failure): the durable label is what
+                // keeps `reconcile_orphaned_deployment_apply_leases` from
+                // re-bounding the pre-armed infinite fence into the 360 s
+                // reclaim window. Retry a lane-lock-free relabel before
+                // giving up: it persists the same fail-closed marker state
+                // the full write would have.
+                let mut relabeled = false;
+                for relabel_attempt in 0..2 {
+                    match mutation
+                        .relabel_namespace_fence_fail_closed(
+                            "kubernetes_namespace",
+                            crate::mutation_leases::RETAINED_DEPLOYMENT_NAMESPACE_OPERATION,
+                        )
+                        .await
+                    {
+                        Ok(()) => {
+                            relabeled = true;
+                            break;
+                        }
+                        Err(relabel_error) => {
+                            tracing::warn!(
+                                app_id = %app_id,
+                                deployment_id = %failed_deployment_id,
+                                error = %relabel_error,
+                                relabel_attempt,
+                                "fail-closed namespace fence relabel failed; retrying"
+                            );
+                            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        }
+                    }
+                }
+                if !relabeled {
+                    tracing::error!(
+                        app_id = %app_id,
+                        deployment_id = %failed_deployment_id,
+                        error = %retain_error,
+                        "failed to persist the retained namespace fence marker AND its fail-closed relabel"
+                    );
+                }
+                return relabeled;
+            }
+        }
+    }
+}
+
 /// Best-effort compensating cleanup for a deployment whose apply failed
 /// terminally. `app` is the immutable payload snapshot of the failed
 /// generation; `mutation` still owns that generation's provider fences.
@@ -1286,7 +1387,7 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
     state: &AppState,
     app: &App,
     failed_deployment_id: Uuid,
-    mutation: &AppMutationLease,
+    mutation: &mut AppMutationLease,
 ) -> CleanupFenceOutcome {
     // Row-level gate: no other generation of this app may carry ANY
     // provider-state evidence, and the app must not be deleting. Whether THIS
@@ -1386,22 +1487,7 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
         // probe. The row-level gate above already proved no OTHER
         // generation owns provider state, so removing this app's routes
         // here is exactly as safe as in the confirmed-absence path below.
-        if let Some(edge_config_generation) =
-            mutation.resource_generation(&ResourceFence::edge_config())
-            && let Err(error) = mutation
-                .guard_provider(remove_failed_generation_edge_routes(
-                    state,
-                    app,
-                    edge_config_generation,
-                ))
-                .await
-        {
-            tracing::warn!(
-                app_id = %app.id,
-                error = %error,
-                "failed-apply HAProxy route cleanup did not complete under the mutation lease; periodic edge reconciliation will converge"
-            );
-        }
+        compensate_failed_generation_routes(state, app, mutation).await;
         // A confirmed 404 proves this generation published nothing: every
         // object the apply creates is namespaced and died with the
         // namespace. Clearing the row's provider-state evidence unblocks
@@ -1445,6 +1531,15 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
             expected_generation = namespace_generation.get(),
             "failed-apply cleanup skips namespace: it does not carry this generation's mutation annotation; marking row for a later sweep to converge older leftovers"
         );
+        // Codex P2: the row-level gate above already proved no OTHER
+        // generation owns provider state, so the app-specific routes this
+        // apply may have published are exactly as safe to compensate as in
+        // the absent path — an external writer rewriting the namespace
+        // annotation cannot make this generation's stale routes safe to
+        // keep. Leaving them would forward traffic to a terminally failed
+        // deployment until periodic edge reconciliation runs. The foreign
+        // namespace itself stays untouched.
+        compensate_failed_generation_routes(state, app, mutation).await;
         // The live namespace may retain an older generation's leftovers
         // (e.g. a prior incomplete sweep that failed before reaching the
         // namespace). This row's evidence would otherwise permanently
@@ -1478,6 +1573,12 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
             namespace = %app.namespace,
             "failed-apply cleanup cannot inspect the namespace; skipping deletion"
         );
+        // Same argument as the Foreign path: the row-level gate proved no
+        // other generation owns provider state, so the app-specific routes
+        // this apply may have published are safe to compensate now — an
+        // unprobeable namespace cannot prove the routes were never
+        // published. The namespace itself is untouched.
+        compensate_failed_generation_routes(state, app, mutation).await;
         // An undecidable probe is a retryable outcome, not proof this row
         // owns no provider state: the row keeps its evidence (storage
         // guard) but is marked cleanup_sweep_incomplete so it cannot veto
@@ -1507,28 +1608,57 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
         InitialNamespaceOwnership::Owned {
             uid,
             resource_version,
-        } => match mutation
-            .guard_provider(delete_owned_namespace(
-                app,
-                namespace_generation,
-                uid,
-                resource_version,
-            ))
-            .await
-        {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                // Lease heartbeat lost with a namespace delete possibly in
-                // flight: fail closed on the namespace fence.
-                tracing::warn!(
+        } => {
+            // Codex P1: relabel the pre-armed namespace fence to the
+            // retained-namespace marker BEFORE issuing the DELETE. The
+            // DELETE is the ambiguous step — Kubernetes may accept it and
+            // the deletion can then stick on finalizers while the process
+            // exits or the convergence wait runs; the marker must already
+            // be durable by then so the orphaned-lease repair can never
+            // convert the infinite fence into the 360-second quarantine
+            // and let the namespace name be reclaimed while the old
+            // deletion is unresolved. Outcomes where retention proves
+            // unnecessary (confirmed absence, no delete issued, rewritten
+            // namespace) release through the ordinary bounded quarantine
+            // below.
+            if !persist_retained_namespace_marker(mutation, app.id, failed_deployment_id).await {
+                // Fail closed: without the durable marker, issuing the
+                // delete would recreate exactly the window this fixes.
+                // Nothing was sent; the row is marked retryable and the
+                // fences release like any no-delete outcome.
+                tracing::error!(
                     app_id = %app.id,
                     namespace = %app.namespace,
-                    error = %error,
-                    "failed-apply namespace cleanup lost its mutation lease; retaining the namespace fence for reconciliation"
+                    deployment_id = %failed_deployment_id,
+                    "failed-apply cleanup could not persist the retained-namespace marker; skipping the namespace delete"
                 );
-                return CleanupFenceOutcome::RetainNamespaceFence;
+                NamespaceTeardown::DeleteNotIssued
+            } else {
+                match mutation
+                    .guard_provider(delete_owned_namespace(
+                        app,
+                        namespace_generation,
+                        uid,
+                        resource_version,
+                    ))
+                    .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        // Lease heartbeat lost with a namespace delete possibly in
+                        // flight: fail closed on the namespace fence. The
+                        // retained marker is already durable.
+                        tracing::warn!(
+                            app_id = %app.id,
+                            namespace = %app.namespace,
+                            error = %error,
+                            "failed-apply namespace cleanup lost its mutation lease; retaining the namespace fence for reconciliation"
+                        );
+                        return CleanupFenceOutcome::RetainNamespaceFence;
+                    }
+                }
             }
-        },
+        }
         InitialNamespaceOwnership::Adopted => {
             // Pre-existing namespace this apply adopted: not CAP's to
             // destroy. Delete only the objects this generation created
@@ -1807,6 +1937,19 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
 /// `supersede_incomplete_deployments` terminalizing a watching/applying row
 /// to `failed`), or any non-failed status including `rolled_back`. The app
 /// must not be `deleting`.
+///
+/// The failed row itself is exempt from the OTHER-row evidence clause — its
+/// stale `manifest_hash` (written before any provider call) is exactly what
+/// its own compensating cleanup exists to clear — but NEVER from the
+/// observation veto (Codex P1): a row that carries `observing_since` backed
+/// a WATCHED generation and may still back its live workload (the legacy
+/// re-apply path stamps `observing_since` at its watching->applying
+/// demotion precisely to record that history). Such a generation must not
+/// compensate itself: cleanup would treat the namespace as adopted, remove
+/// the routes of the still-live historical workload, and clear its provider
+/// evidence. The unconditional self-veto cannot block a retryable sweep:
+/// `cleanup_sweep_incomplete` is only ever armed for rows with NULL
+/// `observing_since`, and a failed row can never reach watching again.
 async fn no_other_generation_owns_provider_state(
     pool: &sqlx::PgPool,
     app_id: Uuid,
@@ -1820,6 +1963,10 @@ async fn no_other_generation_owns_provider_state(
         // so the later generation's sweep converges the same leftovers.
         // Its marker and evidence clear when any sweep completes.
         "SELECT NOT EXISTS (
+             SELECT 1 FROM deployments
+              WHERE id = $2
+                AND observing_since IS NOT NULL
+         ) AND NOT EXISTS (
              SELECT 1 FROM deployments
               WHERE app_id = $1
                 AND id <> $2
@@ -1839,6 +1986,36 @@ async fn no_other_generation_owns_provider_state(
     .bind(failed_deployment_id)
     .fetch_one(pool)
     .await
+}
+
+/// Compensate this generation's SNI routes under the mutation lease, for
+/// every probe outcome where the row-level gate already proved no other
+/// generation owns provider state but the namespace itself does not prove
+/// the routes were never published (initial 404, an externally rewritten
+/// namespace annotation, an unprobeable namespace). Route removal is
+/// idempotent and covered by the periodic edge reconciler, so a lost lease
+/// or failed removal retains nothing.
+async fn compensate_failed_generation_routes(
+    state: &AppState,
+    app: &App,
+    mutation: &AppMutationLease,
+) {
+    if let Some(edge_config_generation) =
+        mutation.resource_generation(&ResourceFence::edge_config())
+        && let Err(error) = mutation
+            .guard_provider(remove_failed_generation_edge_routes(
+                state,
+                app,
+                edge_config_generation,
+            ))
+            .await
+    {
+        tracing::warn!(
+            app_id = %app.id,
+            error = %error,
+            "failed-apply HAProxy route cleanup did not complete under the mutation lease; periodic edge reconciliation will converge"
+        );
+    }
 }
 
 /// Remove the SNI routes this failed generation's domains route through.
@@ -2590,6 +2767,47 @@ mod tests {
         assert!(
             allowed,
             "with no other generation, the row gate must allow provider cleanup"
+        );
+
+        delete_cleanup_fixture(&pool, app_id).await;
+    }
+
+    /// Codex P1 regression: a failed row that carries `observing_since`
+    /// backed a WATCHED generation (the legacy re-apply path stamps it at
+    /// its watching->applying demotion) and may still back its live
+    /// workload. Even as the sole generation it must NOT pass the gate —
+    /// `id <> $2` used to exempt the row itself, letting cleanup treat the
+    /// namespace as adopted, remove the routes of the still-live historical
+    /// workload, and clear its provider evidence.
+    #[tokio::test]
+    async fn observed_failed_generation_cannot_compensate_itself() {
+        let pool = cleanup_test_pool().await;
+        let app_id = insert_cleanup_app_fixture(&pool).await;
+        let failed_id = Uuid::new_v4();
+        insert_cleanup_deployment(&pool, app_id, failed_id, "failed", Some("abc123"), true).await;
+
+        let allowed = no_other_generation_owns_provider_state(&pool, app_id, failed_id)
+            .await
+            .expect("check cleanup precondition");
+        assert!(
+            !allowed,
+            "a previously watched generation must never compensate itself"
+        );
+
+        // The same row with cleanup_sweep_incomplete marked still vetoes:
+        // the observation veto is unconditional (armed sweeps only ever
+        // target rows with NULL observing_since).
+        sqlx::query("UPDATE deployments SET cleanup_sweep_incomplete = true WHERE id = $1")
+            .bind(failed_id)
+            .execute(&pool)
+            .await
+            .expect("mark sweep incomplete");
+        let allowed = no_other_generation_owns_provider_state(&pool, app_id, failed_id)
+            .await
+            .expect("check cleanup precondition");
+        assert!(
+            !allowed,
+            "marking the sweep incomplete must not unblock a watched generation"
         );
 
         delete_cleanup_fixture(&pool, app_id).await;
