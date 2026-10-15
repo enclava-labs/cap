@@ -1680,7 +1680,7 @@ async fn wait_for_template_bootstrap_endpoint(
                             return Ok(true);
                         }
                     }
-                    Some(Err(_)) | None => {
+                    Some(Err(_)) => {
                         // One safe status read decides the challenge-failure
                         // fallback: a terminal diagnostic is never masked by a
                         // claimed ownership state.

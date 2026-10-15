@@ -16,6 +16,7 @@ ALTER TABLE deployment_apply_jobs
         OR last_error_code IN (
             -- control-plane codes
             'deployment_superseded',
+            'customer_config_hold_expired',
             'deployment_setup_failed',
             'deployment_apply_failed',
             'deployment_rollout_failed',
