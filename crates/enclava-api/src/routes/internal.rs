@@ -105,6 +105,7 @@ struct IdempotencyLease {
     operation_id: Uuid,
     reclaimed: bool,
     regenerate: bool,
+    committed_keyring_checkpoint: bool,
     config_token_receipt: Option<ConfigTokenReceipt>,
     heartbeat: Option<tokio::task::JoinHandle<()>>,
 }
@@ -113,6 +114,7 @@ struct IdempotencyLeaseClaim {
     operation_id: Uuid,
     reclaimed: bool,
     regenerate: bool,
+    committed_keyring_checkpoint: bool,
     config_token_receipt: Option<ConfigTokenReceipt>,
 }
 
@@ -217,6 +219,7 @@ impl IdempotencyLease {
             operation_id: claim.operation_id,
             reclaimed: claim.reclaimed,
             regenerate: claim.regenerate,
+            committed_keyring_checkpoint: claim.committed_keyring_checkpoint,
             config_token_receipt: claim.config_token_receipt,
             heartbeat,
         }
@@ -1125,6 +1128,7 @@ async fn begin_idempotent_request_with_recovery_and_binding(
                 operation_id,
                 reclaimed: false,
                 regenerate: false,
+                committed_keyring_checkpoint: false,
                 config_token_receipt,
             },
             recovery,
@@ -1252,6 +1256,7 @@ async fn begin_idempotent_request_with_recovery_and_binding(
                     operation_id: receipt.operation_id,
                     reclaimed: false,
                     regenerate: true,
+                    committed_keyring_checkpoint: false,
                     config_token_receipt: Some(receipt),
                 },
                 recovery,
@@ -1409,6 +1414,7 @@ async fn begin_idempotent_request_with_recovery_and_binding(
             operation_id: row.operation_id.unwrap_or(operation_id),
             reclaimed: true,
             regenerate: false,
+            committed_keyring_checkpoint: keyring_publication_pending,
             config_token_receipt: (recovery
                 == IdempotencyRecovery::DeterministicExpiringCapability)
                 .then(|| {
@@ -1761,19 +1767,21 @@ async fn complete_app_delete_result(
 
 const KEYRING_POLICY_RECONCILIATION_PENDING_CODE: &str = "keyring_policy_reconciliation_pending";
 
-/// Only a known committed keyring may retain a nonterminal publication
-/// checkpoint; unrelated failures keep the generic fail-closed disposition.
+/// A confirmed pending checkpoint also survives an unrelated transient 5xx on
+/// a reclaimed retry: the keyring mutation is already known to have committed.
+/// Fresh requests without that evidence still use the generic fail-closed path.
 async fn complete_keyring_result(
     lease: IdempotencyLease,
     result: Result<IdempotencyResponse, InternalRouteError>,
 ) -> Result<IdempotencyResponse, InternalRouteError> {
     if let Err((status, body)) = &result
-        && *status == StatusCode::SERVICE_UNAVAILABLE
-        && body.get("code").and_then(serde_json::Value::as_str)
-            == Some(KEYRING_POLICY_RECONCILIATION_PENDING_CODE)
+        && ((*status == StatusCode::SERVICE_UNAVAILABLE
+            && body.get("code").and_then(serde_json::Value::as_str)
+                == Some(KEYRING_POLICY_RECONCILIATION_PENDING_CODE))
+            || (lease.committed_keyring_checkpoint && status.is_server_error()))
     {
         let checkpoint = (
-            *status,
+            StatusCode::SERVICE_UNAVAILABLE,
             serde_json::json!({"code": KEYRING_POLICY_RECONCILIATION_PENDING_CODE}),
         );
         let (deferred_status, Json(mut deferred_body)) =
@@ -3691,6 +3699,7 @@ async fn begin_app_delete_request(
                             operation_id,
                             reclaimed: true,
                             regenerate: false,
+                            committed_keyring_checkpoint: false,
                             config_token_receipt: None,
                         },
                         IdempotencyRecovery::RetrySafe,
@@ -6899,6 +6908,7 @@ mod tests {
             operation_id,
             reclaimed: false,
             regenerate: false,
+            committed_keyring_checkpoint: false,
             config_token_receipt: None,
             heartbeat: None,
         };
@@ -12298,6 +12308,79 @@ mod tests {
         .execute(pool)
         .await
         .expect("seed keyring v1");
+    }
+
+    #[tokio::test]
+    async fn reclaimed_keyring_checkpoint_survives_unrelated_five_xx() {
+        let (_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_keyring_checkpoint_retry").await;
+        let state = idempotency_test_state(pool.clone());
+        let key = format!("keyring-checkpoint-{}", Uuid::new_v4());
+        let path = "/internal/paas/orgs/test/keyring";
+        let hash = Sha256::digest(b"keyring-checkpoint-request").to_vec();
+        let begin = || {
+            begin_idempotent_request_with_recovery(
+                &state,
+                &key,
+                "PUT",
+                path,
+                &hash,
+                IdempotencyRecovery::FailClosed,
+            )
+        };
+        let initial = expect_idempotency_execution(begin().await.expect("reserve keyring"));
+        let pending = json_error(StatusCode::SERVICE_UNAVAILABLE, "publication pending");
+        let mut pending = pending;
+        pending.1.0["code"] = serde_json::json!(KEYRING_POLICY_RECONCILIATION_PENDING_CODE);
+        let deferred = complete_keyring_result(initial, Err(pending))
+            .await
+            .expect_err("committed keyring defers");
+        assert_eq!(deferred.1.0["idempotency_disposition"], "deferred");
+
+        for _ in 0..2 {
+            expire_idempotency_lease(&pool, &key).await;
+            let reclaimed =
+                expect_idempotency_execution(begin().await.expect("reclaim checkpoint"));
+            assert!(reclaimed.committed_keyring_checkpoint);
+            let transient = complete_keyring_result(
+                reclaimed,
+                Err(json_error(
+                    StatusCode::BAD_GATEWAY,
+                    "unrelated database failure",
+                )),
+            )
+            .await
+            .expect_err("transient retry failure must defer");
+            assert_eq!(transient.1.0["idempotency_disposition"], "deferred");
+            assert_eq!(
+                transient.1.0["cause"],
+                KEYRING_POLICY_RECONCILIATION_PENDING_CODE
+            );
+            let receipt: (Option<i32>, Option<serde_json::Value>, bool) = sqlx::query_as(
+                "SELECT response_status, response_body, completed_at IS NULL
+                   FROM cap_internal_idempotency WHERE idempotency_key = $1",
+            )
+            .bind(&key)
+            .fetch_one(&pool)
+            .await
+            .expect("inspect retained checkpoint");
+            assert_eq!(receipt.0, Some(503));
+            assert_eq!(
+                receipt.1.unwrap()["code"],
+                KEYRING_POLICY_RECONCILIATION_PENDING_CODE
+            );
+            assert!(receipt.2);
+        }
+        expire_idempotency_lease(&pool, &key).await;
+        let confirmed = expect_idempotency_execution(begin().await.expect("reclaim after failure"));
+        complete_keyring_result(
+            confirmed,
+            Ok((StatusCode::OK, serde_json::json!({"version": 1}))),
+        )
+        .await
+        .expect("confirmed publication completes same key");
+        let replay = expect_idempotency_replay(begin().await.expect("replay confirmation"));
+        assert_eq!(replay.0, StatusCode::OK);
     }
 
     #[tokio::test]
