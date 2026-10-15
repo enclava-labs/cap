@@ -40,13 +40,13 @@ pub fn provisioned_pod_name(statefulset: &str) -> String {
     format!("{statefulset}-0")
 }
 
-/// Disk-backed bound for the workload log spool emptyDir. The relay tails at
-/// most MAX_TAIL_BYTES per container (2 MiB today), so 64 MiB leaves generous
-/// headroom while bounding node-disk exhaustion from a runaway writer.
-/// enclava-wait-exec additionally rotates its spool at 32 MiB (retaining the
-/// newest 8 MiB), so a chatty workload cannot hit the volume cap and die by
-/// ENOSPC/SIGPIPE — the sizeLimit is the outer fence, rotation the inner one.
-const LOGS_EMPTY_DIR_SIZE_LIMIT: &str = "64Mi";
+/// Disk-backed bound for the shared workload log spool AND Kata's
+/// direct-assigned-volume staging. The spool rotates at 32 MiB, but staging
+/// has used ~2.3–2.4 GiB of real blocks on first boot (#223). A 64Mi bound
+/// evicts the pod before readiness and each restart repeats staging from zero.
+/// Keep the 4Gi outer fence until staging moves off this volume or a smaller
+/// bound is justified by boot-time measurements; monitor for growth beyond 4Gi.
+const LOGS_EMPTY_DIR_SIZE_LIMIT: &str = "4Gi";
 
 pub fn build_volumes(app: &ConfidentialApp) -> Vec<Volume> {
     let legacy = legacy_bootstrap_enabled();

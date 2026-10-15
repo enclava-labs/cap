@@ -116,13 +116,16 @@ fn volumes_decrypted_mountpoints_use_memory_medium_and_1mi_limit() {
 
 #[test]
 fn volumes_logs_emptydir_is_disk_backed_and_bounded() {
-    let vols = build_volumes(&memory_app());
-    let v = vols.iter().find(|v| v.name == "logs").unwrap();
-    let ed = v.empty_dir.as_ref().unwrap();
-    // #138: disk medium with an explicit node-side bound (relay tails at most
-    // 2 MiB per container; 64 MiB bounds runaway writers).
-    assert!(ed.medium.is_none());
-    assert_eq!(ed.size_limit.as_ref().map(|q| q.0.as_str()), Some("64Mi"));
+    // Both bootstrap layouts share this disk-backed volume with Kata staging.
+    // #223 observed ~2.4 GiB of real blocks before readiness; 64Mi evicted
+    // first deployments. Retain at least 4Gi until staging is relocated.
+    for app in [sample_app(), memory_app()] {
+        let vols = build_volumes(&app);
+        let v = vols.iter().find(|v| v.name == "logs").unwrap();
+        let ed = v.empty_dir.as_ref().unwrap();
+        assert!(ed.medium.is_none());
+        assert_eq!(ed.size_limit.as_ref().map(|q| q.0.as_str()), Some("4Gi"));
+    }
 }
 
 #[test]
