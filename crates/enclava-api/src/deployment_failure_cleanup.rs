@@ -1963,12 +1963,13 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
         NamespaceTeardown::AdoptedIncomplete => CleanupFenceOutcome::ReleaseNormally,
         NamespaceTeardown::DeleteNotIssued | NamespaceTeardown::OwnedRewritten => {
             // Evidence kept (storage guard + ownership gates), fences
-            // release: the retained-fence reconciler requires a namespace
-            // 404 — which never happens for an adopted namespace, nor for
-            // a proven-owned one no delete was issued against (and this
-            // generation is no longer authorized to delete). Marking the
-            // row cleanup_sweep_incomplete keeps later failed generations
-            // cleanup-eligible so their sweeps converge the leftovers.
+            // release: nothing was deleted, so there is no 404 to converge
+            // — and even a crash-stranded marker now settles (the
+            // retained-fence reconciler bounds a settled marker whose live
+            // namespace no longer classifies as ours; Devin, round 7).
+            // Marking the row cleanup_sweep_incomplete keeps later failed
+            // generations cleanup-eligible so their sweeps converge the
+            // leftovers.
             if let Err(error) = sqlx::query(
                 "UPDATE deployments
                  SET cleanup_sweep_incomplete = true
