@@ -1583,8 +1583,8 @@ async fn wait_for_template_bootstrap_endpoint(
         if tee.is_none() {
             // A deadline cut is indistinguishable from a transient failure:
             // the loop's own expiry check reports the wait timeout.
-            let acquired = match bounded_request(
-                Some(wait_deadline),
+            let acquired = match bounded_wait_attempt(
+                wait_deadline,
                 timings.run(
                     DeployPhase::BootstrapEndpointAcquisition,
                     api.get_unlock_endpoint(app_name),
@@ -1625,15 +1625,15 @@ async fn wait_for_template_bootstrap_endpoint(
         let tee = tee
             .as_ref()
             .expect("TEE client must exist after endpoint acquisition");
-        match bounded_request(
-            Some(wait_deadline),
+        match bounded_wait_attempt(
+            wait_deadline,
             timings.run(DeployPhase::BootstrapAttestation, tee.attest_receipt_key()),
         )
         .await
         {
             Some(Ok((_attestation, attested_tee))) => {
-                match bounded_request(
-                    Some(wait_deadline),
+                match bounded_wait_attempt(
+                    wait_deadline,
                     timings.run(
                         DeployPhase::BootstrapChallenge,
                         attested_tee.bootstrap_challenge(),
@@ -2606,7 +2606,7 @@ async fn wait_for_paas_managed_config_keys(
                 }
             }
         }
-        match bounded_request(read_deadline, api.list_config_keys(instance_name)).await {
+        match bounded_wait_attempt(deadline, api.list_config_keys(instance_name)).await {
             Some(Ok(response)) => {
                 let observed = response
                     .keys
@@ -4244,6 +4244,7 @@ mod tests {
     use super::*;
     use crate::commands::app::should_retry_template_deployment_status_error;
     use std::io::{Read, Write};
+    use terminal_delivery_support::deployment_entry_json;
 
     #[tokio::test]
     async fn bootstrap_subphase_timings_are_nested_fixed_and_opt_in() {
@@ -6199,6 +6200,10 @@ mod tests {
                         "updated_at": "2026-10-12T10:00:01Z"
                     }]
                 }))
+            } else if path.ends_with("/deployments") {
+                Some(serde_json::json!([deployment_entry_json(
+                    "deploy-1", "healthy"
+                )]))
             } else {
                 None
             }
@@ -6238,6 +6243,10 @@ mod tests {
                         "updated_at": "2026-10-12T10:00:00Z"
                     }]
                 }))
+            } else if path.ends_with("/deployments") {
+                Some(serde_json::json!([deployment_entry_json(
+                    "deploy-1", "healthy"
+                )]))
             } else {
                 None
             }
@@ -6283,6 +6292,10 @@ mod tests {
                         "updated_at": "2026-10-12T10:00:00Z"
                     }]
                 }))
+            } else if path.ends_with("/deployments") {
+                Some(serde_json::json!([deployment_entry_json(
+                    "deploy-1", "healthy"
+                )]))
             } else {
                 None
             }

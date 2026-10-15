@@ -909,7 +909,7 @@ fn wait_loop_requests_use_the_finite_per_attempt_budget() {
     );
     assert!(
         template.contains(
-            "bounded_wait_attempt(start+max_waittimings.run(DeployPhase::BootstrapEndpointAcquisitionapi.get_unlock_endpoint(app_name)))"
+            "bounded_wait_attempt(wait_deadlinetimings.run(DeployPhase::BootstrapEndpointAcquisitionapi.get_unlock_endpoint(app_name)))"
         ),
         "wait_for_template_bootstrap_endpoint must bound its endpoint fetch per attempt (cap#220 review follow-up)"
     );
@@ -928,13 +928,13 @@ fn wait_loop_requests_use_the_finite_per_attempt_budget() {
     );
     assert!(
         template.contains(
-            "bounded_wait_attempt(start+max_waittimings.run(DeployPhase::BootstrapAttestationtee.attest_receipt_key()))"
+            "bounded_wait_attempt(wait_deadlinetimings.run(DeployPhase::BootstrapAttestationtee.attest_receipt_key()))"
         ),
         "wait_for_template_bootstrap_endpoint must bound its attest per attempt (cap#220 review follow-up #3)"
     );
     assert!(
         template.contains(
-            "bounded_wait_attempt(start+max_waittimings.run(DeployPhase::BootstrapChallengeattested_tee.bootstrap_challenge()))"
+            "bounded_wait_attempt(wait_deadlinetimings.run(DeployPhase::BootstrapChallengeattested_tee.bootstrap_challenge()))"
         ),
         "wait_for_template_bootstrap_endpoint must bound its bootstrap challenge per attempt (cap#220 review follow-up #3)"
     );
