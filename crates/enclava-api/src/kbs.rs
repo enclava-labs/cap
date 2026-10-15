@@ -3293,9 +3293,11 @@ resource_bindings := {
     ///   leaves the serving policy untouched.
     /// - Pending generation: the reconciler publishes the eligible artifact
     ///   into the serving ConfigMap policy.
-    #[tokio::test]
-    async fn pending_generation_publishes_eligible_artifact_to_kbs_policy() {
-        let pool = crate::test_support::database_test_pool().await;
+    // SQLx provisions a separate migrated database for this test. The
+    // reconciliation singleton is shared within a database, so neither the
+    // zero-generation setup nor an assertion failure can clobber other tests.
+    #[sqlx::test(migrator = "crate::db::pool::MIGRATOR")]
+    async fn pending_generation_publishes_eligible_artifact_to_kbs_policy(pool: PgPool) {
         let (org_id, app_id) = insert_test_app(&pool, "creating").await;
         let deployment_id = Uuid::new_v4();
         insert_test_deployment(&pool, org_id, app_id, deployment_id, "healthy", Utc::now()).await;
@@ -3395,25 +3397,8 @@ resource_bindings := {
             "the reconciler must durably converge applied_generation to desired"
         );
 
-        sqlx::query("DELETE FROM organizations WHERE id = $1")
-            .bind(org_id)
-            .execute(&pool)
-            .await
-            .expect("delete convergence fixture");
-
-        // Restore the reconciliation singleton to its pristine unsigned
-        // state so parallel or later tests cannot observe this test's
-        // bumped generation (the singleton is process-wide shared state).
-        sqlx::query(
-            "UPDATE kbs_signed_policy_reconciliation
-                SET desired_generation = 0, configmap_generation = 0,
-                    applied_generation = 0, configmap_policy_sha256 = NULL,
-                    applied_policy_sha256 = NULL, configmap_resource_version = NULL
-              WHERE singleton",
-        )
-        .execute(&pool)
-        .await
-        .expect("reset reconciliation singleton");
+        // SQLx drops the isolated database after this test, including its
+        // fixture and reconciliation state even if an assertion fails.
     }
 
     async fn insert_test_app(pool: &PgPool, status: &str) -> (Uuid, Uuid) {
