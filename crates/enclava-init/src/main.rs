@@ -1222,10 +1222,14 @@ fn kbs_proxy_health_url(kbs_url: &str) -> String {
 
 /// Bounded readiness wait for a LOCAL attestation-agent token endpoint
 /// (default http://127.0.0.1:8006/aa/token): poll with a short per-request
-/// timeout until the endpoint answers with any HTTP status (the server is
-/// up), then return so the real single-shot token fetch runs. Reuses the
-/// KBS-proxy wait budget (300s default, 2s poll); overridable via the same
-/// env knobs. Remote URLs return immediately (cap#244 review).
+/// timeout until the endpoint answers with a NON-5xx HTTP status — a
+/// listener can accept connections and answer 5xx while the token service
+/// is still starting, so those keep polling, as do connection errors —
+/// then return so the real single-shot token fetch runs and surfaces any
+/// genuine AA error verbatim. Uses its own 300s default budget
+/// ([`aa_token_wait_timeout`], env-overridable via
+/// ENCLAVA_INIT_AA_TOKEN_WAIT_SECONDS) and the shared 2s poll interval.
+/// Remote URLs return immediately (cap#244 review).
 fn wait_for_local_aa_token_endpoint(token_url: &str) {
     let Ok(url) = reqwest::Url::parse(token_url) else {
         return;
