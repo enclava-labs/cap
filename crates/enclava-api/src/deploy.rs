@@ -215,6 +215,11 @@ pub fn tenant_image_pull_secret_startup_error() -> Option<String> {
             "TENANT_IMAGE_PULL_CREDENTIAL_GENERATION must be an unsigned integer".to_string(),
         );
     }
+    if let Ok(raw) = std::env::var("TENANT_IMAGE_PULL_SCOPE_GENERATION")
+        && raw.parse::<u64>().is_err()
+    {
+        return Some("TENANT_IMAGE_PULL_SCOPE_GENERATION must be an unsigned integer".to_string());
+    }
     if tenant_image_pull_secret_config_from_env().is_some() {
         return None;
     }
@@ -2518,8 +2523,8 @@ async fn apply_scoped_pull_secret(
                     )));
                 }
                 if newer_pull_secret_credentials(&live) {
-                    return Err(DeployError::Validation(format!(
-                        "refusing to overwrite newer pull-secret credential generation at {namespace}/{}",
+                    return Err(DeployError::PullSecretReconcileDeferred(format!(
+                        "newer pull-secret credential generation owns {namespace}/{}",
                         config.name
                     )));
                 }
