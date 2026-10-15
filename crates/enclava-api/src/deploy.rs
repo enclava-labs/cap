@@ -1076,6 +1076,16 @@ async fn reconcile_managed_pull_secrets(
             delete_managed_pull_secret(engine, namespace, name, settings.ghcr(), delete_mode).await;
         let reverse_reference_clears = match &removal {
             Ok(PullSecretRemovalOutcome::Deleted | PullSecretRemovalOutcome::Missing) => false,
+            Ok(PullSecretRemovalOutcome::Superseded) => {
+                tracing::info!(
+                    %namespace,
+                    secret = %name,
+                    "tenant image pull secret reconcile: a concurrent deploy rewrote the secret \
+                     mid-cleanup (newer mutation generation) — keeping it and restoring its \
+                     ServiceAccount references; the next sweep decides"
+                );
+                true
+            }
             Ok(PullSecretRemovalOutcome::NotOurs) => {
                 tracing::warn!(
                     %namespace,
@@ -1164,6 +1174,13 @@ enum PullSecretRemovalOutcome {
     /// merely moved `resourceVersion` is NOT this outcome: it is retried and,
     /// if it never settles, reported as an error so the caller stays closed.
     NotOurs,
+    /// The live object still passes the ownership check, but carries a
+    /// mutation generation NEWER than the sweep's pre-inventory snapshot
+    /// (self-check on #243): a concurrent deploy rewrote the secret after the
+    /// reconcile-time check. Treated exactly like `NotOurs` — the secret is
+    /// kept and the already-cleared ServiceAccount references are restored —
+    /// but with distinct telemetry so the race is visible in logs.
+    Superseded,
 }
 
 /// Delete one proven managed pull secret, fenced by the deploy's mutation
@@ -1218,6 +1235,27 @@ async fn delete_managed_pull_secret(
             // against the object this cleanup verified, not against a fresh read
             // that could already be a replacement.
             ensure_pull_secret_generation_not_stale(&existing, generation, name)?;
+        }
+        if let PullSecretDeleteMode::Unfenced {
+            namespace_generation,
+        } = delete_mode
+            && secret_mutation_generation(&existing)
+                .is_some_and(|actual| actual > namespace_generation)
+        {
+            // Self-check on #243: the reconcile-time skip can race a deploy
+            // that claims the namespace lease and rewrites the secret after
+            // it — including the rewrite that caused a 409 on a previous
+            // attempt of this very loop. The re-read object passes the
+            // ownership check but belongs to a deploy the sweep's inventory
+            // never saw, so it must be kept, exactly like the reconcile-time
+            // skip above.
+            tracing::info!(
+                namespace = %namespace,
+                secret = %name,
+                "tenant image pull secret delete skipped: a mutation generation newer \
+                 than the sweep's inventory snapshot rewrote it mid-cleanup (concurrent deploy)"
+            );
+            return Ok(PullSecretRemovalOutcome::Superseded);
         }
         // Pin the delete to the verified object's identity: a replacement that
         // lands after the ownership check conflicts (409) instead of being
@@ -4238,6 +4276,11 @@ mod tests {
         /// Scratch counter for `delete_lingering_polls` — GETs remaining
         /// before the finalizer releases the terminating Secret.
         lingering_polls_left: u8,
+        /// Simulate a concurrent deploy rewriting the managed secret mid-
+        /// cleanup: the first delete request annotates the live object (same
+        /// UID) with a NEWER mutation generation — the self-check race on
+        /// #243, where the rewrite that causes the 409 must not be deleted.
+        annotate_generation_on_delete: Option<i64>,
     }
 
     fn fake_managed_secret(name: &str, labeled: bool, username: &str, token: &str) -> Secret {
@@ -4462,6 +4505,29 @@ mod tests {
                     // The tenant replaces the secret between the cleanup's
                     // ownership check and its delete (review finding on #243).
                     swap_secret(&mut state.secrets, replacement);
+                }
+                if let Some(generation) = state.annotate_generation_on_delete.take() {
+                    // A concurrent deploy rewrites the managed secret (same
+                    // UID) under a NEWER mutation generation mid-cleanup —
+                    // the self-check race on #243: the re-read after the 409
+                    // must keep it instead of deleting.
+                    if let Some(secret) = state
+                        .secrets
+                        .iter_mut()
+                        .find(|secret| secret.metadata.name.as_deref() == name)
+                    {
+                        secret
+                            .metadata
+                            .annotations
+                            .get_or_insert_with(Default::default)
+                            .insert(
+                                enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION
+                                    .to_string(),
+                                generation.to_string(),
+                            );
+                        secret.metadata.resource_version =
+                            Some(format!("rv-rewritten-{}", generation));
+                    }
                 }
                 if state.rv_bumps_on_delete > 0 {
                     // A concurrent writer updates the SAME managed secret
@@ -5293,6 +5359,79 @@ mod tests {
         assert!(
             state.secrets.is_empty(),
             "once the snapshot includes the generation, the stale secret is removed"
+        );
+    }
+
+    /// Self-check on #243: a deploy rewrites the managed secret under a NEWER
+    /// mutation generation AFTER the reconcile-time skip check — the rewrite
+    /// that causes the delete's 409. The delete-loop re-read must keep the
+    /// rewritten secret and restore the already-cleared ServiceAccount
+    /// reference instead of deleting it.
+    #[tokio::test(start_paused = true)]
+    async fn delete_keeps_secret_rewritten_under_newer_generation_mid_cleanup() {
+        use std::sync::{Arc, Mutex};
+
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![fake_managed_secret(
+                "enclava-registry-auth",
+                true,
+                "cap-bot",
+                "ghp_platform",
+            )],
+            service_accounts: vec![fake_service_account(
+                "cap-tenant-app",
+                &["enclava-registry-auth"],
+            )],
+            // The rewrite lands on the FIRST delete attempt: the pinned
+            // delete conflicts, and the retry's re-read sees generation 9 —
+            // newer than the sweep's snapshot of 5.
+            annotate_generation_on_delete: Some(9),
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        let converged = reconcile_managed_pull_secrets(
+            &engine,
+            "tenant-ns",
+            &["cap-tenant-app".to_string()],
+            &reconcile_settings(),
+            false,
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 5,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            converged,
+            "keeping a concurrently rewritten secret is a converged skip"
+        );
+
+        let state = cluster.lock().unwrap();
+        assert_eq!(
+            state.secrets.len(),
+            1,
+            "a secret rewritten under a newer mutation generation mid-cleanup must survive"
+        );
+        assert_eq!(
+            state.secrets[0]
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|annotations| {
+                    annotations
+                        .get(enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION)
+                })
+                .map(String::as_str),
+            Some("9"),
+            "the surviving object is the deploy's rewrite, not the original"
+        );
+        assert_eq!(
+            state.service_accounts[0]
+                .image_pull_secrets
+                .as_ref()
+                .map(|references| references.len()),
+            Some(1),
+            "the cleared ServiceAccount reference must be restored for the rewrite"
         );
     }
 
