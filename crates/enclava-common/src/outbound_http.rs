@@ -70,7 +70,7 @@ impl BlockedNetworks {
         match addr {
             IpAddr::V4(ip) => self.v4.iter().any(|(net, bits)| in_v4(ip, *net, *bits)),
             IpAddr::V6(ip) => {
-                if let Some(v4) = ip.to_ipv4_mapped()
+                if let Some(v4) = ip.to_ipv4()
                     && self.v4.iter().any(|(net, bits)| in_v4(v4, *net, *bits))
                 {
                     return true;
@@ -196,13 +196,16 @@ mod tests {
     }
 
     #[test]
-    fn ipv4_mapped_v6_checked_against_v4_ranges() {
+    fn embedded_ipv4_v6_checked_against_v4_ranges() {
         let blocked = BlockedNetworks::defaults();
-        // ::ffff:10.x and ::ffff:127.x are v4-mapped forms of blocked v4
-        // addresses; a bare v6-range check would miss them.
+        // IPv4-compatible and mapped forms must obey the same IPv4 policy.
         assert!(blocked.contains("::ffff:10.1.2.3".parse().unwrap()));
         assert!(blocked.contains("::ffff:127.0.0.1".parse().unwrap()));
+        assert!(blocked.contains("::10.1.2.3".parse().unwrap()));
+        assert!(blocked.contains("::127.0.0.1".parse().unwrap()));
+        assert!(blocked.contains("::169.254.169.254".parse().unwrap()));
         assert!(!blocked.contains("::ffff:8.8.8.8".parse().unwrap()));
+        assert!(!blocked.contains("::8.8.8.8".parse().unwrap()));
     }
 
     #[test]
@@ -221,6 +224,7 @@ mod tests {
         assert!(!blocked.contains("2001:db8:1235::".parse().unwrap()));
         // A v4-mapped literal inside a configured public v4 range is blocked.
         assert!(blocked.contains("::ffff:203.0.113.7".parse().unwrap()));
+        assert!(blocked.contains("::203.0.113.7".parse().unwrap()));
     }
 
     #[test]

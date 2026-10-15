@@ -212,6 +212,8 @@ fn destination_guard_blocks_literal_ips_including_url_normalization() {
         "[fd00::1]",
         "[::ffff:127.0.0.1]",
         "[::ffff:169.254.169.254]",
+        "[::127.0.0.1]",
+        "[::169.254.169.254]",
         "203.0.113.7",
         "[2001:db8:1234::1]",
     ] {
@@ -358,6 +360,38 @@ async fn bearer_private_literals_and_dns_with_custom_ports_are_rejected_before_c
                 .is_err()
         );
         assert_eq!(target.connections.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn bearer_failures_do_not_disclose_realm_urls_or_credentials() {
+    let blocked = Arc::new(BlockedNetworks::defaults());
+    let client = registry_client_builder(Arc::clone(&blocked))
+        .build()
+        .unwrap();
+    for (base, realm) in [
+        (
+            "https://registry.example",
+            "http://registry.example/token?credential=REALM_SECRET",
+        ),
+        (
+            "https://localhost.:9",
+            "https://localhost.:9/token?credential=REALM_SECRET",
+        ),
+    ] {
+        let challenge = enclava_common::registry::BearerChallenge {
+            realm: realm.to_string(),
+            service: None,
+            scope: None,
+        };
+        let error = fetch_bearer_token(&client, challenge, base, "victim/repo", &blocked)
+            .await
+            .unwrap_err();
+        assert!(!error.contains(realm), "realm URL disclosed: {error}");
+        assert!(
+            !error.contains("REALM_SECRET"),
+            "credential disclosed: {error}"
+        );
     }
 }
 

@@ -73,10 +73,11 @@ GitHub Actions keyless cosign subject.
 CLI tag resolution uses direct HTTPS requests with TLS verification and no
 redirects or system HTTP proxies. Registry and permitted bearer-auth endpoints
 cannot resolve to loopback, private, link-local, metadata, or CGNAT addresses,
-including IPv4-mapped IPv6 addresses. `CLUSTER_POD_CIDR` and
+including IPv4-compatible and IPv4-mapped IPv6 addresses. `CLUSTER_POD_CIDR` and
 `CLUSTER_SERVICE_CIDR` add comma-separated IPv4/IPv6 CIDRs to the blocklist.
 Literal IP destinations are checked against the same ranges. Digest-pinned
-references skip the CLI registry lookup.
+references skip the CLI registry lookup, including when registry access requires
+an HTTP proxy. Bearer-auth failures do not print realm URLs or query credentials.
 
 The CLI also contains hosted-template commands used by Enclava-hosted API mode:
 

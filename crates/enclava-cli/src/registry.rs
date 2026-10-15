@@ -116,7 +116,7 @@ async fn resolve_tag(
 
 fn validate_destination(url: &reqwest::Url, blocked: &BlockedNetworks) -> Result<(), String> {
     if url.scheme() != "https" {
-        return Err(format!("registry URL {url} is not https"));
+        return Err("registry URL must use https".to_string());
     }
     let host = url
         .host_str()
@@ -171,7 +171,7 @@ async fn fetch_bearer_token(
         .get(url.as_str())
         .send()
         .await
-        .map_err(|e| format!("registry token request failed: {e}"))?;
+        .map_err(|e| format!("registry token request failed: {}", e.without_url()))?;
     if !response.status().is_success() {
         return Err(format!(
             "registry token endpoint returned status {}",
