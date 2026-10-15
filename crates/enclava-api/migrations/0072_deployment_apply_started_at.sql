@@ -21,16 +21,19 @@ ALTER TABLE deployments
 -- provenance for it must fail closed on unproven claims.
 --
 -- sts_uid / sts_created_at / sts_observed_deleted_at record the PROVEN
--- lineage window of the StatefulSet this row's apply created: the
--- server-reported UID and creationTimestamp (from the apply response, or
--- a sweep's live observation), and the time a sweep stamped BEFORE
--- issuing the sts delete. A claim is deletable by a retry sweep (sts
--- gone) only on claim-specific evidence: a controller ownerReference
--- pinning the proven UID, or creation strictly INSIDE the closed window
--- [sts_created_at, sts_observed_deleted_at] — the creation time alone is
--- only a lower bound, and a tenant claim created after the sts deletion
--- must never be swept. NULL sts_observed_deleted_at = open window =
--- fail closed.
+-- lineage of the StatefulSet this row's apply created: the server-reported
+-- UID and creationTimestamp (from the apply response, or a sweep's live
+-- observation), and the time a sweep stamped BEFORE issuing the sts
+-- delete. A claim is deletable by a retry sweep (sts gone) ONLY on the
+-- claim-specific ownerReference proof — a controller ownerReference
+-- pinning the proven UID (see `classify_claim_lineage`). Creation
+-- timestamps NEVER authorize deletion (doc trap corrected: the classifier
+-- no longer accepts creation inside the recorded window — a tenant can
+-- create the predictable ownerless `<vct>-<sts>-<ordinal>` name at any
+-- moment, and a claim created after the sts deletion must never be
+-- swept); the window columns are kept for observability and retry
+-- accounting. Unproven claims are retained and keep the sweep
+-- incomplete.
 
 -- Legacy terminal rows: historical apply failures commonly retain
 -- manifest_hash evidence. Without the marker they would make

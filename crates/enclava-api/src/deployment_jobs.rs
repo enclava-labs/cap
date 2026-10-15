@@ -2841,6 +2841,20 @@ async fn publish_apply_failure_with_mutation(
             SET status = 'failed'::deploy_status_enum,
                 error_message = $1,
                 completed_at = clock_timestamp(),
+                -- self-check: a row STILL 'watching' at terminal publish
+                -- backed a WATCHED generation — possibly a live historical
+                -- workload. Record that history NOW: the pre-0047
+                -- population has NULL observing_since (the column shipped
+                -- without a backfill) and would otherwise pass the
+                -- self-veto in no_other_generation_owns_provider_state,
+                -- letting this very row's compensating cleanup treat the
+                -- namespace as adopted, remove the routes of the live
+                -- workload, and clear its provider evidence. COALESCE
+                -- keeps the real watch start where one exists.
+                observing_since = CASE
+                    WHEN status = 'watching' THEN COALESCE(observing_since, clock_timestamp())
+                    ELSE observing_since
+                END,
                 -- Codex P2: arm the retryable-cleanup marker atomically with
                 -- terminal failure publication. If the process exits after
                 -- this commit but before/during the awaited compensating
@@ -7191,6 +7205,75 @@ pub(crate) mod tests {
             .execute(&pool)
             .await
             .expect("delete stale failure fixture");
+    }
+
+    /// self-check regression: a row STILL 'watching' when the failure is
+    /// published backed a WATCHED generation (possibly a live historical
+    /// workload). The publish must stamp `observing_since` so the self-veto
+    /// in `no_other_generation_owns_provider_state` fires before any
+    /// provider call — without it a pre-0047 watching row (NULL marker,
+    /// the column shipped without a backfill) would pass the gate and its
+    /// own compensating cleanup would remove the live workload's routes
+    /// and clear its evidence. The retryable marker stays un-armed for
+    /// such rows (they keep the full ownership veto).
+    #[tokio::test]
+    async fn failure_publish_stamps_observation_for_watching_rows() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
+        let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim setup")
+            .expect("setup exists");
+        mark_setup_accepted(&pool, deployment_id, setup.lock_token)
+            .await
+            .expect("accept setup");
+        let job = claim_job(&pool, "pending", "running", Some(deployment_id))
+            .await
+            .expect("claim apply")
+            .expect("apply job exists");
+        // Simulate the pre-0047 population: the row reached `watching`
+        // under code that never stamped observing_since.
+        sqlx::query(
+            "UPDATE deployments
+                SET status = 'watching', observing_since = NULL
+              WHERE id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("mark row watching without observation marker");
+
+        publish_apply_failure(&pool, &job)
+            .await
+            .expect("failure publishes from watching");
+
+        let (status, observing_since, sweep_armed): (
+            String,
+            Option<chrono::DateTime<chrono::Utc>>,
+            bool,
+        ) = sqlx::query_as(
+            "SELECT status::text, observing_since, cleanup_sweep_incomplete
+               FROM deployments WHERE id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load published failure row");
+        assert_eq!(status, "failed");
+        assert!(
+            observing_since.is_some(),
+            "terminal publish from watching must record the observation so the row can never compensate itself"
+        );
+        assert!(
+            !sweep_armed,
+            "a watched generation keeps its full ownership veto; the retryable marker must stay un-armed"
+        );
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete watching failure fixture");
     }
 
     #[tokio::test]

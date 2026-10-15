@@ -190,6 +190,37 @@ where
     }
 }
 
+/// List ALL pages of a namespaced collection. kube 3.1's `Api::list`
+/// returns whatever single page the server sent and does NOT follow
+/// `continue` tokens; a truncated first page that misses a target-shaped
+/// object would look like a complete listing and let the sweep report
+/// completion over live objects (self-check P2 — the Secret discovery
+/// list and the PVC sweep list both depended on a single page). Follow
+/// the tokens until exhausted; every page is one bounded read.
+async fn bounded_sweep_list_all<K>(
+    api: &kube::Api<K>,
+    sweep_deadline: tokio::time::Instant,
+) -> Result<Vec<K>, kube::Error>
+where
+    K: kube::Resource<DynamicType = ()> + serde::de::DeserializeOwned + Clone + std::fmt::Debug,
+{
+    let mut items = Vec::new();
+    let mut continue_token: Option<String> = None;
+    loop {
+        let mut params = kube::api::ListParams::default();
+        if let Some(token) = continue_token.take() {
+            params = params.continue_token(&token);
+        }
+        let page = bounded_sweep_read(sweep_deadline, api.list(&params)).await?;
+        items.extend(page.items);
+        match page.metadata.continue_ {
+            Some(token) if !token.is_empty() => continue_token = Some(token),
+            _ => break,
+        }
+    }
+    Ok(items)
+}
+
 /// Per-object budget for confirming a DELETE's absence (codex P2: poll
 /// foreground deletions before marking the sweep incomplete). A foreground
 /// delete of a StatefulSet with Pods keeps the set visible — a
@@ -369,14 +400,9 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
     // deletion stays evidence-gated below).
     let secrets_api: kube::Api<k8s_openapi::api::core::v1::Secret> =
         kube::Api::namespaced(client.clone(), &app.namespace);
-    match bounded_sweep_read(
-        sweep_deadline,
-        secrets_api.list(&kube::api::ListParams::default()),
-    )
-    .await
-    {
+    match bounded_sweep_list_all(&secrets_api, sweep_deadline).await {
         Ok(list) => {
-            for secret in list.items {
+            for secret in list {
                 let Some(name) = secret.metadata.name.clone() else {
                     continue;
                 };
@@ -563,6 +589,34 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
                         name = %target.name,
                         "adopted-namespace sweep skips object not created by a CAP failed apply"
                     );
+                    // self-check: a StatefulSet we refuse to delete may
+                    // still be backing live data — but its name-matching
+                    // claims remain adoptable at their old size by a later
+                    // resized deployment once this sweep reports
+                    // completion and the caller clears manifest evidence
+                    // (the storage-size guard). List them (deleting
+                    // NOTHING: the set we refused owns them) and count
+                    // each as a sweep failure so completion is never
+                    // reported over an uninspected claim set.
+                    if target.kind == "StatefulSet" {
+                        let retained_claims = count_name_matching_claims(
+                            &client,
+                            &app.namespace,
+                            &target.name,
+                            sweep_deadline,
+                        )
+                        .await;
+                        if retained_claims > 0 {
+                            tracing::warn!(
+                                app_id = %app.id,
+                                namespace = %app.namespace,
+                                statefulset = %target.name,
+                                claims = retained_claims,
+                                "adopted-namespace sweep refused a live StatefulSet but its name-matching claims remain; counting them as failures so manifest evidence (and the storage-size guard) survives"
+                            );
+                            failures += retained_claims;
+                        }
+                    }
                 }
                 break;
             }
@@ -894,6 +948,47 @@ fn classify_claim_lineage(
     }
 }
 
+/// Count the name-matching claims of a StatefulSet the sweep REFUSED to
+/// delete (still live, not a CAP failed-apply leftover). Nothing may be
+/// deleted on this path — the set we refused may be backing live data and
+/// its claims with it — but the claims remain and a later resized
+/// deployment would silently adopt them at their old size once this sweep
+/// reports completion and the caller clears manifest evidence (the
+/// storage-size guard is `status <> 'failed' OR manifest_hash IS NOT
+/// NULL`). Counting each claim as a failure keeps the sweep INCOMPLETE,
+/// matching the claim policy of `sweep_statefulset_pvcs`. Fails closed
+/// (one failure) when the listing itself fails: an uninspected claim set
+/// must never look swept.
+async fn count_name_matching_claims(
+    client: &kube::Client,
+    namespace: &str,
+    statefulset: &str,
+    sweep_deadline: tokio::time::Instant,
+) -> usize {
+    let api: kube::Api<k8s_openapi::api::core::v1::PersistentVolumeClaim> =
+        kube::Api::namespaced(client.clone(), namespace);
+    match bounded_sweep_list_all(&api, sweep_deadline).await {
+        Ok(claims) => claims
+            .iter()
+            .filter(|pvc| {
+                pvc.metadata
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| is_cap_claim_name(name, statefulset, &CAP_VCT_NAMES))
+            })
+            .count(),
+        Err(error) => {
+            tracing::warn!(
+                namespace = %namespace,
+                statefulset = %statefulset,
+                error = %error,
+                "adopted-namespace sweep cannot list claims of a refused StatefulSet; failing closed"
+            );
+            1
+        }
+    }
+}
+
 /// Bounded window for the StatefulSet controller to reconcile claim
 /// ownerReferences after the retention-policy flip, and the poll interval
 /// while waiting. The flip is an ordinary mutable-field patch; the
@@ -953,9 +1048,7 @@ pub(crate) async fn sweep_statefulset_pvcs(
     }
     let api: kube::Api<k8s_openapi::api::core::v1::PersistentVolumeClaim> =
         kube::Api::namespaced(client.clone(), namespace);
-    let list = match bounded_sweep_read(sweep_deadline, api.list(&kube::api::ListParams::default()))
-        .await
-    {
+    let list = match bounded_sweep_list_all(&api, sweep_deadline).await {
         Ok(list) => list,
         Err(error) => {
             tracing::warn!(
@@ -971,7 +1064,6 @@ pub(crate) async fn sweep_statefulset_pvcs(
     // from what is actually retained rather than up front: an empty match
     // set is a complete sweep even with no provenance.
     let matching_claims: Vec<_> = list
-        .items
         .into_iter()
         .filter(|pvc| {
             pvc.metadata
