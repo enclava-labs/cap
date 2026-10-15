@@ -117,6 +117,9 @@ pub enum DeploymentReason {
     /// The app deletion was interrupted by a poisoned resource fence that
     /// must be cleared manually (namespace finalizers, orphaned resources).
     AppDeletionBlockedByPoisonedFence,
+    /// The app deletion was abandoned (lease expired) while waiting on a
+    /// foreign finite fence — no background worker will resume it.
+    AppDeletionAbandonedWaitingOnForeignFence,
     AppDeleting,
     NoApplyJobRecorded,
 }
@@ -497,16 +500,21 @@ fn project_diagnostics(row: Option<DiagnosticsRow>) -> DeploymentDiagnostics {
         //
         // IMPORTANT: The in-progress deletion's own namespace fence (armed by
         // delete_app_before with app_delete operation kind) must NOT be treated
-        // as foreign. Only check for foreign fences - exclude the app_delete
-        // fence during active deletion since it's the deletion's own machinery.
+        // as foreign while the delete lease is still live. Once it expires, the
+        // app_delete fence may be poisoned (never auto-reclaims) and blocks
+        // forever — treat it as foreign to get proper diagnostics.
         let fence_holds = row.fence_operation_kind.is_some()
-            && !matches!(row.fence_operation_kind.as_deref(), Some("app_delete"))
+            && !(delete_lease_live
+                && matches!(row.fence_operation_kind.as_deref(), Some("app_delete")))
             && !is_own_operation(
                 row.fence_operation_kind.as_deref(),
                 row.fence_operation_id,
                 row.deployment_id,
             );
         let condition = if fence_holds && condition == DeploymentCondition::BlockedByOperation {
+            // Delete lease expired but foreign fence still holds: the deletion
+            // is abandoned (no worker will resume). Don't say "retry DELETE" —
+            // nothing will pick it up. Tell owner to wait for the fence.
             DeploymentCondition::WaitingExternal
         } else {
             condition
@@ -515,6 +523,12 @@ fn project_diagnostics(row: Option<DiagnosticsRow>) -> DeploymentDiagnostics {
         // to a distinct reason that tells the CLI to prompt operator action.
         let reason = if fence_holds && row.fence_reclaim_after.is_none() {
             DeploymentReason::AppDeletionBlockedByPoisonedFence
+        } else if !delete_lease_live && fence_holds {
+            // Delete lease expired while waiting on foreign finite fence: the
+            // deletion is abandoned, nothing will resume it. Give a reason
+            // that tells CLI to prompt for action rather than "wait for
+            // teardown" which implies automatic completion.
+            DeploymentReason::AppDeletionAbandonedWaitingOnForeignFence
         } else {
             DeploymentReason::AppDeleting
         };

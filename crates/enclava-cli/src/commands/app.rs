@@ -1865,6 +1865,9 @@ fn deployment_condition_action(
             ("waiting_external", Some("app_deletion_blocked_by_poisoned_fence")) => {
                 "deletion blocked by a poisoned resource fence; contact support to clear namespace finalizers"
             }
+            ("waiting_external", Some("app_deletion_abandoned_waiting_on_foreign_fence")) => {
+                "deletion request expired while waiting on external teardown; re-run delete to resume"
+            }
             ("waiting_external", _) => {
                 "deletion in progress; wait for teardown to complete before creating it again"
             }
