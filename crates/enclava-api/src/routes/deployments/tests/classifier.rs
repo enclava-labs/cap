@@ -541,13 +541,23 @@ fn signed_artifact_acceptance_enqueues_global_policy_reconciliation() {
     let deploy_revocation = deploy_body
         .find("enqueue_signed_policy_revocation_if_active")
         .expect("unsigned acceptance revocation branch");
-    let deploy_enqueue = deploy_body
+    let deploy_signed_arm = deploy_body
+        .split("if let (Some(artifacts), Some(signed)) =")
+        .nth(1)
+        .expect("deploy signed persist arm")
+        .split("} else {")
+        .next()
+        .unwrap();
+    let deploy_enqueue = deploy_signed_arm
         .find("crate::kbs::enqueue_signed_policy_reconciliation(&mut tx)")
-        .expect("deploy acceptance enqueues signed-policy reconciliation");
+        .expect("deploy signed arm enqueues reconciliation");
     assert!(
         deploy_begin < deploy_persist
-            && deploy_persist < deploy_enqueue
-            && deploy_enqueue < deploy_revocation
+            && deploy_signed_arm
+                .find("persist_workload_artifacts(")
+                .unwrap()
+                < deploy_enqueue
+            && deploy_persist < deploy_revocation
             && deploy_revocation < deploy_commit,
         "the deploy acceptance that persists a signed artifact (customer-supplied \
          or platform-signed) must bump the global reconciliation generation in \
@@ -571,12 +581,16 @@ fn signed_artifact_acceptance_enqueues_global_policy_reconciliation() {
     let unlock_commit = unlock_body
         .find("tx.commit()")
         .expect("unlock transition commit");
-    let unlock_enqueue = unlock_body
-        .find("crate::kbs::enqueue_signed_policy_reconciliation(&mut tx)")
-        .expect("unlock acceptance enqueues signed-policy reconciliation");
+    let unlock_signed_arm = unlock_body
+        .split("persist_workload_artifacts(")
+        .nth(1)
+        .expect("unlock signed persist arm")
+        .split("} else {")
+        .next()
+        .unwrap();
     assert!(
-        unlock_persist < unlock_enqueue
-            && unlock_enqueue < unlock_revocation
+        unlock_signed_arm.contains("crate::kbs::enqueue_signed_policy_reconciliation(&mut tx)")
+            && unlock_persist < unlock_revocation
             && unlock_revocation < unlock_commit,
         "an unlock-mode redeployment that persists a signed artifact must bump \
          the global reconciliation generation in the same transaction, inside \
@@ -600,12 +614,16 @@ fn signed_artifact_acceptance_enqueues_global_policy_reconciliation() {
     let rollback_commit = rollback_body
         .find("tx.commit()")
         .expect("rollback generation commit");
-    let rollback_enqueue = rollback_body
-        .find("crate::kbs::enqueue_signed_policy_reconciliation(&mut tx)")
-        .expect("rollback acceptance enqueues signed-policy reconciliation");
+    let rollback_signed_arm = rollback_body
+        .split("if rollback_artifacts.is_some() {")
+        .last()
+        .expect("rollback signed enqueue arm")
+        .split("} else {")
+        .next()
+        .unwrap();
     assert!(
-        rollback_arm < rollback_enqueue
-            && rollback_enqueue < rollback_revocation
+        rollback_signed_arm.contains("crate::kbs::enqueue_signed_policy_reconciliation(&mut tx)")
+            && rollback_arm < rollback_revocation
             && rollback_revocation < rollback_commit,
         "a rollback that restores a signed artifact must bump the global \
          reconciliation generation in the signed-restoration branch of the \
