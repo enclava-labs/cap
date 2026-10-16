@@ -166,19 +166,34 @@ impl StoragePasswordInput {
     fn initial_claim_password(&self) -> Result<String, Box<dyn std::error::Error>> {
         match &self.value {
             Some(value) => Ok(value.clone()),
-            None => Ok(dialoguer::Password::new()
-                .with_prompt("Set initial storage password")
-                .with_confirmation("Confirm initial storage password", "Passwords don't match")
-                .interact()?),
+            None => {
+                // A pty with no stdin feeder blocks here forever (nohup
+                // script-class runs), so name the non-interactive path in
+                // whatever log the operator will eventually read.
+                eprintln!(
+                    "Reading the initial storage password from the terminal; \
+                     unattended runs must pass --storage-password-file <PATH>."
+                );
+                Ok(dialoguer::Password::new()
+                    .with_prompt("Set initial storage password")
+                    .with_confirmation("Confirm initial storage password", "Passwords don't match")
+                    .interact()?)
+            }
         }
     }
 
     fn unlock_password(&self) -> Result<String, Box<dyn std::error::Error>> {
         match &self.value {
             Some(value) => Ok(value.clone()),
-            None => Ok(dialoguer::Password::new()
-                .with_prompt("Unlock password")
-                .interact()?),
+            None => {
+                eprintln!(
+                    "Reading the unlock password from the terminal; \
+                     unattended runs must pass --storage-password-file <PATH>."
+                );
+                Ok(dialoguer::Password::new()
+                    .with_prompt("Unlock password")
+                    .interact()?)
+            }
         }
     }
 }
