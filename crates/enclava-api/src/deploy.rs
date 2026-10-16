@@ -28,6 +28,14 @@ use uuid::Uuid;
 use crate::models::{App, AppContainer, AppResources, AppStatus};
 
 const DEFAULT_TENANT_IMAGE_PULL_SECRET_NAME: &str = "enclava-registry-auth";
+
+/// The tenant image-pull secret name the cleanup sweep must delete from
+/// adopted namespaces. Re-uses `configured_tenant_image_pull_secret_name`'s
+/// env-derived value so the sweep always matches what apply published.
+pub(crate) fn default_tenant_image_pull_secret_name_for_cleanup() -> String {
+    configured_tenant_image_pull_secret_name()
+        .unwrap_or_else(|| DEFAULT_TENANT_IMAGE_PULL_SECRET_NAME.to_string())
+}
 const TENANT_IMAGE_PULL_SECRET_NAME_ENV: &str = "TENANT_IMAGE_PULL_SECRET_NAME";
 const TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES_ENV: &str = "TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES";
 const PUBLIC_INTERNET_EGRESS_EXCLUDED_CIDRS_ENV: &str = "CAP_PUBLIC_INTERNET_EGRESS_EXCLUDED_CIDRS";
@@ -300,12 +308,12 @@ fn generate_tenant_image_pull_secret(
 
 async fn apply_all_with_tenant_image_pull_secret(
     engine: &ApplyEngine,
+    pool: &sqlx::PgPool,
+    deployment_id: Uuid,
     manifests: &enclava_engine::manifest::GeneratedManifests,
     manifest_hash: &str,
     image_pull_secret_config: Option<&TenantImagePullSecretConfig>,
     generation: MutationGeneration,
-    pool: &PgPool,
-    deployment_id: Uuid,
 ) -> Result<(), DeployError> {
     let ns_name = manifests
         .namespace
@@ -358,6 +366,23 @@ async fn apply_all_with_tenant_image_pull_secret(
             manifest_hash.to_string(),
         );
 
+    // Codex P1: creation-specific evidence for the PVC sweep. Stamped
+    // immediately before the StatefulSet step is attempted (the final
+    // apply phase). Under Retain/Retain the controller attaches no PVC
+    // ownerReferences, so this stamp — not apply_started_at (which
+    // precedes KBS reconciliation and every Kubernetes write) — is the
+    // earliest point a claim of this workload's lineage could exist: a
+    // tenant-created same-named claim predates it and is never swept.
+    // First-writer-wins (COALESCE) so a retry of a partially-failed apply
+    // does not advance the bound past claims the first attempt created.
+    sqlx::query(
+        "UPDATE deployments
+            SET sts_apply_started_at = COALESCE(sts_apply_started_at, clock_timestamp())
+          WHERE id = $1",
+    )
+    .bind(deployment_id)
+    .execute(pool)
+    .await?;
     // Conservative workload-apply evidence. The StatefulSet write is the
     // first operation that can replace the TEE, so the settling guard's
     // marker is stamped at ITS entry -- not at the multi-resource apply's
@@ -374,7 +399,55 @@ async fn apply_all_with_tenant_image_pull_secret(
     .bind(deployment_id)
     .execute(pool)
     .await?;
-    apply_statefulset(engine, ns_name, &sts, generation).await?;
+    let sts_live = apply_statefulset(engine, ns_name, &sts, generation).await?;
+    // Persist the server-reported UID and creationTimestamp of the
+    // StatefulSet object this apply produced (the POST/SSA response — not
+    // a pre-call stamp). This is the identity the claim sweep matches
+    // ownerReferences against. Grok P2: only persist when the RESPONSE
+    // itself carries CAP creation evidence (the same gate the sweep uses):
+    // an SSA patch of a PRE-EXISTING StatefulSet returns that set's UID,
+    // and recording it would let the claim sweep treat a tenant's set as
+    // proven CAP lineage. First-writer-wins keeps a retry from advancing
+    // the record past claims the first attempt created.
+    if crate::deployment_failure_cleanup::is_cap_created_generation_leftover(
+        &sts_live,
+        generation.get(),
+    ) {
+        if let (Some(uid), Some(created)) = (
+            sts_live.metadata.uid.as_deref(),
+            sts_live
+                .metadata
+                .creation_timestamp
+                .as_ref()
+                .map(|ts| ts.0.to_string())
+                .and_then(|raw| raw.parse::<chrono::DateTime<chrono::Utc>>().ok()),
+        ) && let Err(error) = crate::deployment_failure_cleanup::persist_sts_provenance(
+            pool,
+            None,
+            deployment_id,
+            uid,
+            created,
+            None,
+        )
+        .await
+        {
+            tracing::warn!(
+                deployment_id = %deployment_id,
+                error = %error,
+                "could not persist StatefulSet provenance; PVC sweep will require a live sts observation (fail closed)"
+            );
+        }
+    } else {
+        // No CAP creation evidence on the response (e.g. an SSA patch of a
+        // pre-existing set, or a mutating admission rewrote the creation
+        // annotation): recording this UID would forge claim-deletion
+        // authority. The sweep's no-window path stays fail-closed.
+        tracing::warn!(
+            deployment_id = %deployment_id,
+            namespace = %ns_name,
+            "StatefulSet apply response lacks CAP creation evidence; not recording provenance"
+        );
+    }
     tracing::info!(
         namespace = %ns_name,
         manifest_hash = %manifest_hash,
@@ -383,6 +456,34 @@ async fn apply_all_with_tenant_image_pull_secret(
 
     tracing::info!(namespace = %ns_name, "apply_all complete");
     Ok(())
+}
+
+/// The SNI (backend-tag, host) pairs a deployment of this app publishes,
+/// derived from the authoritative app row exactly as
+/// `build_confidential_app_from_rows` derives its `DomainSpec`: the TEE host
+/// falls back to the platform domain when `tee_domain` is null, and an empty
+/// custom domain is skipped. Apply and failed-apply cleanup both build their
+/// route lists from this helper so they can never diverge.
+pub(crate) fn app_route_hosts(app: &App) -> Vec<(crate::edge::BackendTag, String)> {
+    let mut hosts = vec![
+        (crate::edge::BackendTag::App, app.domain.clone()),
+        (
+            crate::edge::BackendTag::Tee,
+            match app.tee_domain.as_deref() {
+                Some(tee_domain) if !tee_domain.is_empty() => tee_domain.to_string(),
+                // build_confidential_app_from_rows falls back to the platform
+                // domain when tee_domain is null, and apply publishes that
+                // route unconditionally.
+                _ => app.domain.clone(),
+            },
+        ),
+    ];
+    if let Some(custom_domain) = app.custom_domain.as_deref()
+        && !custom_domain.is_empty()
+    {
+        hosts.push((crate::edge::BackendTag::App, custom_domain.to_string()));
+    }
+    hosts
 }
 
 pub struct ApplyDeploymentManifestsRequest {
@@ -2430,6 +2531,16 @@ mod tests {
     }
 }
 
+/// Project a worker's deployment status transition. Two evidence-preserving
+/// quirks (devin 🔴 round-6 follow-up): the `watching` transition stamps
+/// `observing_since` as the observation anchor, AND a transition AWAY from a
+/// `watching` row keeps that stamp — the legacy re-apply path (a pre-0047
+/// watched row has NULL `observing_since`; `claim_rollout_observation` cannot
+/// resume it and re-applies) demotes `watching` -> `applying` here, and that
+/// demotion is the moment the row proves it already served a watched
+/// generation. Without the stamp the later failure publisher would see a
+/// NULL-`observing_since` partial apply and arm retryable cleanup whose sweep
+/// can then remove the routes and namespace under the still-live workload.
 pub async fn set_deployment_status(
     pool: &PgPool,
     deployment_id: Uuid,
@@ -2445,8 +2556,13 @@ pub async fn set_deployment_status(
              error_message = $3,
              completed_at = CASE WHEN $4 THEN now() ELSE completed_at END,
              observing_since = CASE
-                 WHEN $1 = 'watching' THEN COALESCE(observing_since, clock_timestamp())
+                 WHEN $1 = 'watching' OR status = 'watching'
+                     THEN COALESCE(observing_since, clock_timestamp())
                  ELSE observing_since
+             END,
+             apply_started_at = CASE
+                 WHEN $1 = 'applying' THEN COALESCE(apply_started_at, clock_timestamp())
+                 ELSE apply_started_at
              END
          WHERE id = $5",
     )
@@ -3003,12 +3119,12 @@ pub async fn apply_deployment_manifests(
 
     apply_all_with_tenant_image_pull_secret(
         &engine,
+        &pool,
+        deployment_id,
         &manifests,
         &hash,
         tenant_image_pull_secret_config.as_ref(),
         generation,
-        &pool,
-        deployment_id,
     )
     .await?;
     let edge_config = crate::edge::EdgeRouteConfig::from_env();
@@ -3016,26 +3132,21 @@ pub async fn apply_deployment_manifests(
         .bind(app.org_id)
         .fetch_one(&pool)
         .await?;
+    // Host list shared with failed-apply cleanup
+    // (`crate::deployment_failure_cleanup`) so publication and removal can
+    // never diverge.
     let app_target =
         crate::edge::resolve_backend_target(&app_spec.name, &app_spec.namespace, 443).await?;
     let tee_target =
         crate::edge::resolve_backend_target(&app_spec.name, &app_spec.namespace, 8081).await?;
-    let app_backend =
-        crate::edge::backend_name_for(&org_slug, &app_spec.name, crate::edge::BackendTag::App)?;
-    let tee_backend =
-        crate::edge::backend_name_for(&org_slug, &app_spec.name, crate::edge::BackendTag::Tee)?;
-    let mut routes = vec![
-        crate::edge::SniRoute::new(&app_spec.domain.platform_domain, &app_backend, &app_target)?,
-        crate::edge::SniRoute::new(&app_spec.domain.tee_domain, &tee_backend, &tee_target)?,
-    ];
-    if let Some(custom) = app_spec.domain.custom_domain.as_deref()
-        && !custom.is_empty()
-    {
-        routes.push(crate::edge::SniRoute::new(
-            custom,
-            &app_backend,
-            &app_target,
-        )?);
+    let mut routes = Vec::with_capacity(3);
+    for (tag, host) in crate::deploy::app_route_hosts(&app) {
+        let backend = crate::edge::backend_name_for(&org_slug, &app_spec.name, tag)?;
+        let target = match tag {
+            crate::edge::BackendTag::App => &app_target,
+            crate::edge::BackendTag::Tee => &tee_target,
+        };
+        routes.push(crate::edge::SniRoute::new(&host, &backend, target)?);
     }
     crate::edge::ensure_haproxy_routes(&pool, &edge_config, Some(edge_config_generation), &routes)
         .await?;

@@ -602,6 +602,29 @@ pub async fn verify_challenge(
             false
         }
         Err(e) => {
+            // Codex P2: an ingress reapply whose accepted write lost CAP
+            // creation evidence must durably mark the app — this path has
+            // no deployment job, so without the marker a later failed
+            // apply's sweep would treat the stripped object as foreign and
+            // clear cleanup evidence over it.
+            if matches!(
+                e,
+                crate::deploy::DeployError::Apply(
+                    enclava_engine::apply::engine::ApplyError::CreationEvidenceLost { .. }
+                )
+            ) && !crate::deployment_failure_cleanup::persist_creation_evidence_loss(
+                &state.db, app.id,
+            )
+            .await
+            {
+                // The marker is the only durable signal for later sweeps;
+                // surface its loss distinctly instead of silently
+                // continuing (the request already failed).
+                tracing::error!(
+                    app_id = %app.id,
+                    "creation-evidence-loss marker could not be persisted; later sweeps will not know unmarked targets may be CAP-created"
+                );
+            }
             tracing::error!(
                 app_id = %app.id,
                 %domain,
