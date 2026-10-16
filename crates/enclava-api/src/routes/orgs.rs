@@ -1735,7 +1735,7 @@ pub async fn rotate_org_owner(
         .await;
     }
 
-    if service_owner.as_deref() == Some(current_owner.as_slice()) {
+    let committed_own_receipt = if service_owner.as_deref() == Some(current_owner.as_slice()) {
         let rotated = rotate_service_owner(
             signing_service,
             org_id,
@@ -1795,19 +1795,21 @@ pub async fn rotate_org_owner(
             }
         }
         tx.commit().await.map_err(|_| db_error())?;
+        true
     } else if service_owner.as_deref() == Some(replacement_owner.as_slice()) {
         // The service already holds the replacement (a prior attempt or
         // a concurrent retry pinned it): no RPC, and no receipt -- only
         // a response-validated RPC can mint one. Committing ends the
         // read-only phase.
         tx.commit().await.map_err(|_| db_error())?;
+        false
     } else {
         return Err(crate::routes::deployments::signing_error_response(
             crate::signing_service::SigningServiceError::AuthorityStatus(
                 "signing service owner matches neither rotation key".to_string(),
             ),
         ));
-    }
+    };
 
     // Phase 2: final lane transaction. The lane was released after the
     // receipt-only commit, so competing keyring changes may have landed;
@@ -1821,9 +1823,6 @@ pub async fn rotate_org_owner(
     let lane_now = crate::signing_service::lock_org_signing_authority_lane_now(&mut tx, org_id)
         .await
         .map_err(|_| db_error())?;
-    let current_role =
-        scopes::lock_and_read_active_membership_role_in_tx(&mut tx, org_id, auth.user_id).await?;
-    scopes::require_owner_role(current_role)?;
     let (latest, version_created_at_floor) = read_rotation_authority(&mut tx, org_id).await?;
     let rotation_path = derive_rotation_path(
         &mut tx,
@@ -1838,6 +1837,27 @@ pub async fn rotate_org_owner(
 
     let owner_status = read_live_service_owner(signing_service, org_id).await?;
     let service_owner = service_owner_pubkey(&owner_status);
+    // A response-validated RPC performed by this request already passed the
+    // phase-one membership lock before the irreversible owner switch. Once
+    // its exact receipt is committed and still matches the live service,
+    // a subsequent membership demotion must not strand CAP on the old owner.
+    // Requests merely recovering an earlier receipt still need a live owner.
+    let own_receipt_still_live = committed_own_receipt
+        && upstream_receipt_matches_live_service(
+            &mut tx,
+            org_id,
+            directive_digest.as_slice(),
+            intent_digest.as_slice(),
+            &owner_status,
+            &replacement_owner,
+        )
+        .await?;
+    if !own_receipt_still_live {
+        let current_role =
+            scopes::lock_and_read_active_membership_role_in_tx(&mut tx, org_id, auth.user_id)
+                .await?;
+        scopes::require_owner_role(current_role)?;
+    }
     if service_owner.as_deref() != Some(replacement_owner.as_slice()) {
         return Err(crate::routes::deployments::signing_error_response(
             crate::signing_service::SigningServiceError::AuthorityStatus(
@@ -1916,9 +1936,11 @@ pub async fn rotate_org_owner(
             })),
         ));
     }
-    // Revalidate recovery provenance after the lane gap. Fresh requests keep
-    // caller-bound registration checks even if their RPC just minted a receipt.
-    let receipt_bound_recovery = receipt_bound_recovery
+    // Revalidate recovery provenance after the lane gap. A request that
+    // performed the RPC itself was authorized under the phase-one lock;
+    // allow that exact committed receipt to preserve its successor-key
+    // registration if the initiator was removed before finalization.
+    let receipt_bound_recovery = (receipt_bound_recovery || own_receipt_still_live)
         && upstream_receipt_matches_live_service(
             &mut tx,
             org_id,
@@ -6164,6 +6186,67 @@ mod tests {
             "the denied fresh rotation must not reach the upstream service"
         );
 
+        // Deterministic lane-gap regression: the receipt INSERT runs after
+        // phase-one authorization but before its commit. Demote the caller in
+        // that same transaction; phase two must honor this request's own
+        // durable, live-service-bound receipt instead of stranding CAP.
+        sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2)")
+            .bind(remaining_owner_id)
+            .bind(third_key.verifying_key().to_bytes().to_vec())
+            .execute(&pool)
+            .await
+            .expect("register successor for remaining owner");
+        sqlx::query(
+            "CREATE FUNCTION cap185_demote_after_receipt() RETURNS trigger
+             LANGUAGE plpgsql AS $$
+             BEGIN
+                 UPDATE memberships SET role = 'admin'
+                  WHERE org_id = NEW.org_id AND user_id = TG_ARGV[0]::uuid;
+                 RETURN NEW;
+             END $$",
+        )
+        .execute(&pool)
+        .await
+        .expect("create receipt interleave trigger");
+        let trigger_sql = format!(
+            "CREATE TRIGGER cap185_demote_after_receipt_trigger
+             AFTER INSERT ON org_rotation_upstream_receipts
+             FOR EACH ROW EXECUTE FUNCTION cap185_demote_after_receipt('{}')",
+            remaining_owner_id
+        );
+        sqlx::query(&trigger_sql)
+            .execute(&pool)
+            .await
+            .expect("install receipt interleave trigger");
+        let gap_request = rotation_request(
+            org_id,
+            initiator_id,
+            &replacement_key,
+            &third_key,
+            3,
+            3,
+            Utc::now(),
+            "membership-changes-after-upstream",
+        );
+        let gap_result = rotate_org_owner(
+            remaining_auth,
+            State(state),
+            Path(org_name),
+            Json(gap_request),
+        )
+        .await
+        .expect("phase-one-authorized RPC completes despite later demotion");
+        assert_eq!(gap_result.keyring_version, 3);
+        let role_after: String = sqlx::query_scalar(
+            "SELECT role::text FROM memberships WHERE org_id = $1 AND user_id = $2",
+        )
+        .bind(org_id)
+        .bind(remaining_owner_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read role after receipt");
+        assert_eq!(role_after, "admin");
+        assert_eq!(mock.lock().expect("mock owner lock").rotate_calls, 2);
         crate::test_support::drop_isolated_database("cap185_receipt_handoff", pool).await;
     }
 
