@@ -13,8 +13,8 @@ use enclava_init::config::{
 use enclava_init::safe_diagnostics::SafeBootstrapDiagnostic;
 use enclava_init::secrets::{DerivedSeed, OwnerSeed, Password};
 use enclava_init::{
-    dev_no_luks_override, env_override, kbs_fetch, log_relay, luks, seeds, socket, tls_certificate,
-    trustee_verify, unlock, writes,
+    dev_no_luks_override, env_override, kbs_fetch, log_relay, luks, luks2_seal, seeds, socket,
+    tls_certificate, trustee_verify, unlock, writes,
 };
 use serde::Deserialize;
 
@@ -134,6 +134,20 @@ fn run() -> Result<()> {
             .with_context(|| format!("clearing stale ready file {}", ready_file.display()))?;
     }
 
+    record_stage("verifying trustee policy").ok();
+    // Fail-closed: any verification gap (missing inputs, missing policy-read
+    // availability) returns Err and aborts before seed release. This must
+    // run BEFORE the volume open path: open_luks_volumes may mutate the
+    // on-disk header (seal adoption), and the claim it enforces has to be
+    // pinned to the in-TEE-verified cc_init_data bytes first — otherwise a
+    // host could present a downgraded/stripped claim for exactly one
+    // adoption, keep the disk mutation after verification fails, and hand
+    // the next boot a rolled-back header that now carries a valid MAC
+    // (cap#244 self-review).
+    let phase = stats.elapsed_ms();
+    run_in_tee_verification(&cfg, cc_init_data.as_deref())?;
+    stats.record_tee_verify(phase);
+
     record_stage("waiting for owner seed").ok();
     let phase = stats.elapsed_ms();
     let owner = match cfg.mode {
@@ -143,15 +157,13 @@ fn run() -> Result<()> {
     stats.record_owner_seed(phase);
     clear_error_file(&error_file_path());
 
-    record_stage("verifying trustee policy").ok();
-    // Fail-closed: any verification gap (missing inputs, missing policy-read
-    // availability) returns Err and aborts before seed release.
-    let phase = stats.elapsed_ms();
-    run_in_tee_verification(&cfg, cc_init_data.as_deref())?;
-    stats.record_tee_verify(phase);
-
     record_stage("opening luks volumes").ok();
-    open_luks_volumes(&cfg, &owner, &mut stats)?;
+    open_luks_volumes(
+        &cfg,
+        &owner,
+        &mut stats,
+        &luks_rollout_policy(cc_init_data.as_deref())?,
+    )?;
     record_stage("preparing mount ownership").ok();
     prepare_mount_ownership(&cfg)?;
 
@@ -505,6 +517,60 @@ fn read_cc_init_data(cfg: &Config) -> Result<Option<Vec<u8>>> {
         .ok_or_else(|| anyhow!("verification requires cc_init_data_path"))?;
     let bytes = std::fs::read(cc_path).with_context(|| format!("reading {cc_path}"))?;
     Ok(Some(bytes))
+}
+
+/// LUKS2 header-seal rollout policy from the signed cc_init_data (cap#242
+/// review: sealed volumes must not accept unsealed-header rollback).
+///
+/// The signed `luks2_header_seal` claim takes two values:
+/// - `"adopt"` (or claim absent — pre-claim signed artifacts): legacy
+///   pre-seal volumes are adopted through the strict-validation +
+///   passphrase gate. This is the rollout window.
+/// - `"required"`: every formatted volume must already carry a valid HMAC
+///   seal. An unsealed header is rejected as rollback/tampering instead of
+///   re-adopted. Operators flip the platform default to "required" once the
+///   fleet has migrated; the claim is signed and its cc_init_data bytes are
+///   pinned by the in-TEE chain verification that now runs BEFORE the open
+///   path can mutate any header, so the host cannot downgrade it per-guest
+///   (a presented downgrade fails verification first, before adoption).
+///
+/// Do not flip the signed release value to `"required"` until the crash
+/// window between `luksFormat` and the first MAC-slot write is recoverable
+/// (or formally accepted as a manual-reset case): an interrupted format
+/// leaves a valid unsealed header that `"required"` rejects on every later
+/// boot, wedging the volume. `"adopt"` still recovers from that state
+/// (cap#244 self-review).
+///
+/// Any other value fails the boot rather than guessing the intent.
+fn luks_rollout_policy(cc_init_data: Option<&[u8]>) -> Result<luks::LuksOpenPolicy> {
+    let Some(cc_bytes) = cc_init_data else {
+        // Non-prod path (trustee_policy_read_available=false, debug builds):
+        // same rollout-window default as a claim-less artifact.
+        return Ok(luks::LuksOpenPolicy::default());
+    };
+    // Fail closed on unreadable cc_init_data: these bytes were already
+    // parsed once by validate_configmap_transport_against_signed_cc_init_data
+    // this boot, so a parse failure here means the file changed underneath
+    // us (host tampering) and the boot must stop, not default to adopt
+    // (cap#244 self-review).
+    let cc_toml = std::str::from_utf8(cc_bytes).context("parsing cc_init_data as utf-8")?;
+    let parsed: toml::Value = toml::from_str(cc_toml).context("parsing cc_init_data")?;
+    // A missing claim keeps the rollout-window default (pre-claim signed
+    // artifacts); an unknown value fails the boot rather than guessing.
+    let claim = parsed
+        .get("data")
+        .and_then(|d| d.get("luks2_header_seal"))
+        .and_then(toml::Value::as_str);
+    match claim {
+        Some("required") => Ok(luks::LuksOpenPolicy {
+            allow_legacy_adoption: false,
+        }),
+        Some("adopt") | None => Ok(luks::LuksOpenPolicy::default()),
+        Some(other) => anyhow::bail!(
+            "signed cc_init_data carries unknown luks2_header_seal value {other:?} \
+             (expected \"adopt\" or \"required\")"
+        ),
+    }
 }
 
 fn validate_configmap_transport_against_signed_cc_init_data(
@@ -1154,6 +1220,82 @@ fn kbs_proxy_health_url(kbs_url: &str) -> String {
     format!("{base}/health")
 }
 
+/// Bounded readiness wait for a LOCAL attestation-agent token endpoint
+/// (default http://127.0.0.1:8006/aa/token): poll with a short per-request
+/// timeout until the endpoint answers with a NON-5xx HTTP status — a
+/// listener can accept connections and answer 5xx while the token service
+/// is still starting, so those keep polling, as do connection errors —
+/// then return so the real single-shot token fetch runs and surfaces any
+/// genuine AA error verbatim. Uses its own 300s default budget
+/// ([`aa_token_wait_timeout`], env-overridable via
+/// ENCLAVA_INIT_AA_TOKEN_WAIT_SECONDS) and the shared 2s poll interval.
+/// Remote URLs return immediately (cap#244 review).
+fn wait_for_local_aa_token_endpoint(token_url: &str) {
+    let Ok(url) = reqwest::Url::parse(token_url) else {
+        return;
+    };
+    let is_local = matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1"));
+    if !is_local {
+        return;
+    }
+    // Own default budget: the KBS-proxy helper's 300s default keys on the
+    // proxy's port 8081, while the AA token endpoint defaults to 8006 —
+    // reusing that helper gave this wait a zero default. Explicit env
+    // overrides still win (cap#244 review).
+    let wait_timeout = aa_token_wait_timeout();
+    if wait_timeout.is_zero() {
+        return;
+    }
+    let poll = kbs_proxy_health_poll_interval();
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return,
+    };
+    tracing::info!(
+        token_url_host = url.host_str().unwrap_or(""),
+        wait_seconds = wait_timeout.as_secs(),
+        "waiting for local attestation-agent token endpoint before TEE verification"
+    );
+    let deadline = std::time::Instant::now() + wait_timeout;
+    while std::time::Instant::now() < deadline {
+        // A listener can accept connections before the token service is
+        // ready and answer 5xx during startup — keep polling those. Any
+        // non-5xx response means the endpoint is serving; the real fetch
+        // then surfaces any genuine AA error verbatim. Connection errors
+        // (agent not yet listening) also keep polling.
+        match client.get(token_url).send() {
+            Ok(resp) if resp.status().as_u16() >= 500 => {}
+            Ok(_) => return,
+            Err(_) => {}
+        }
+        // A failed probe can outlast the remaining budget (5s request
+        // timeout); saturate so the sleep never underflows (cap#244 review).
+        std::thread::sleep(poll.min(deadline.saturating_duration_since(std::time::Instant::now())));
+    }
+    tracing::warn!(
+        wait_seconds = wait_timeout.as_secs(),
+        "local attestation-agent token endpoint still not serving; proceeding to the token fetch"
+    );
+}
+
+/// Wait budget for the local AA token endpoint: explicit env override, else
+/// the same 300s default the KBS-proxy wait uses (independent of the URL's
+/// port).
+fn aa_token_wait_timeout() -> Duration {
+    let explicit = std::env::var("ENCLAVA_INIT_AA_TOKEN_WAIT_SECONDS")
+        .ok()
+        .or_else(|| std::env::var("AA_TOKEN_WAIT_SECONDS").ok());
+    if let Some(value) = explicit {
+        return parse_positive_seconds(&value)
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::ZERO);
+    }
+    Duration::from_secs(DEFAULT_KBS_PROXY_HEALTH_WAIT_SECONDS)
+}
+
 fn is_local_kbs_proxy_url(kbs_url: &str) -> bool {
     reqwest::Url::parse(kbs_url)
         .ok()
@@ -1174,27 +1316,68 @@ fn open_luks_volumes(
     cfg: &Config,
     owner: &OwnerSeed,
     stats: &mut init_stats::BootStats,
+    luks_policy: &luks::LuksOpenPolicy,
 ) -> Result<()> {
     if dev_no_luks_override() {
         tracing::warn!("ENCLAVA_INIT_DEV_NO_LUKS=true — skipping luks open (debug builds only)");
         return Ok(());
     }
+    // cap#242: reject cryptsetup releases below the null-cipher keyslot
+    // hardening floor before touching any volume.
+    luks2_seal::ensure_cryptsetup_floor()?;
     let state_phase = stats.elapsed_ms();
-    let state_opened = open_one_volume(&cfg.state, owner)
-        .with_context(|| format!("opening state volume {}", cfg.state.device))?;
+    let state_opened = open_one_volume(
+        &cfg.state,
+        owner,
+        // The passphrase stays derived from the signed per-volume
+        // `hkdf_info` exactly as before this change: volumes provisioned
+        // with a custom signed value must keep unlocking (cap#242 review).
+        &cfg.state.hkdf_info,
+        seeds::STATE_HEADER_MAC_INFO,
+        luks_policy,
+    )
+    .with_context(|| format!("opening state volume {}", cfg.state.device))?;
     stats.record_state_volume(state_phase, state_opened.formatted);
     let tls_phase = stats.elapsed_ms();
-    let tls_opened = open_one_volume(&cfg.tls_state, owner)
-        .with_context(|| format!("opening tls-state volume {}", cfg.tls_state.device))?;
+    let tls_opened = open_one_volume(
+        &cfg.tls_state,
+        owner,
+        &cfg.tls_state.hkdf_info,
+        seeds::TLS_STATE_HEADER_MAC_INFO,
+        luks_policy,
+    )
+    .with_context(|| format!("opening tls-state volume {}", cfg.tls_state.device))?;
     stats.record_tls_volume(tls_phase, tls_opened.formatted);
     stats.record_post_luks_memory();
     Ok(())
 }
 
-fn open_one_volume(vol: &VolumeConfig, owner: &OwnerSeed) -> Result<luks::LuksOpened> {
-    let key = derive_volume_key(owner, &vol.hkdf_info)?;
+fn open_one_volume(
+    vol: &VolumeConfig,
+    owner: &OwnerSeed,
+    // Passphrase HKDF info: the signed per-volume value (validated against
+    // the signed cc-init-data by
+    // `validate_configmap_transport_against_signed_cc_init_data` before boot
+    // proceeds).
+    passphrase_info: &str,
+    // Header-MAC HKDF branch: pinned per volume kind, never configurable, so
+    // the MAC key cannot be steered by config data.
+    header_mac_info: &[u8],
+    policy: &luks::LuksOpenPolicy,
+) -> Result<luks::LuksOpened> {
+    // Distinct HKDF branches: the volume passphrase and the header MAC key
+    // must never share material (cap#242).
+    let keys = luks::VolumeKeys::new(
+        derive_volume_key(owner, passphrase_info.as_bytes())?,
+        derive_volume_key(owner, header_mac_info)?,
+    );
     let device = Path::new(&vol.device);
-    let opened = luks::format_if_unformatted_then_open(device, &vol.mapping_name, &key)?;
+    let opened = luks::format_if_unformatted_then_open_with_policy(
+        device,
+        &vol.mapping_name,
+        &keys,
+        policy,
+    )?;
     luks::mount(&opened.mapper_path, Path::new(&vol.mount_path))?;
     tracing::info!(
         device = %vol.device,
@@ -1450,8 +1633,8 @@ fn numeric_identity(uid: u32, gid: u32) -> ExecIdentity {
     }
 }
 
-fn derive_volume_key(owner: &OwnerSeed, info: &str) -> Result<DerivedSeed> {
-    let derived = seeds::derive(owner, info.as_bytes())?;
+fn derive_volume_key(owner: &OwnerSeed, info: &[u8]) -> Result<DerivedSeed> {
+    let derived = seeds::derive(owner, info)?;
     Ok(derived)
 }
 
@@ -1485,6 +1668,20 @@ fn run_in_tee_verification(cfg: &Config, cc_init_data: Option<&[u8]>) -> Result<
         .map(parse_pubkey)
         .transpose()?;
 
+    // Verification now runs BEFORE owner-seed acquisition (verify before
+    // any header mutation), so it can no longer inherit the KBS-proxy
+    // readiness wait that the autounlock path performs. A local
+    // attestation-agent that is slow to start would otherwise fail this
+    // single token fetch and bounce the container through restart backoff
+    // (cap#244 review). Wait (bounded) for the local AA endpoint to accept
+    // connections first; remote token URLs skip the wait.
+    if enclava_init::env_override("KBS_ATTESTATION_TOKEN")
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+    {
+        wait_for_local_aa_token_endpoint(&cfg.kbs_attestation_token_url);
+    }
     let token = trustee_verify::resolve_kbs_attestation_token(
         enclava_init::env_override("KBS_ATTESTATION_TOKEN").as_deref(),
         &cfg.kbs_attestation_token_url,

@@ -726,11 +726,19 @@ pub(crate) async fn build_signed_deploy_blobs(
     });
 
     let descriptor_core_hash = enclava_cli::descriptor::descriptor_core_hash(&descriptor);
+    // cap#244 review (version-skew): when the VERIFIED release predates the
+    // `luks2_header_seal` field (empty), the still-pre-change API this CLI
+    // may deploy against can only render claim-less cc_init_data TOML. Pin
+    // the binding to the claim-less render so both producers hash identical
+    // bytes; the guest side defaults a missing claim to the rollout-window
+    // ("adopt") semantics. Releases carrying the field sign the full render.
+    let release_carries_seal_claim = !release.luks2_header_seal.is_empty();
     let workload_artifact_binding = WorkloadArtifactBinding {
         descriptor_core_hash,
         descriptor_signing_pubkey: deployer_key.public.to_bytes(),
         org_keyring_fingerprint,
         omit_log_encryption_claim: false,
+        omit_luks2_header_seal_claim: !release_carries_seal_claim,
     };
     let (generated_agent_policy, log_encryption) =
         fetch_generated_agent_policy(api, &release, &descriptor).await?;
@@ -761,6 +769,11 @@ pub(crate) async fn build_signed_deploy_blobs(
             &app_config.resources.memory,
             &cc_init_data::runtime_class(),
         ),
+        // Sourced from the VERIFIED release (cap#244 review), never from
+        // this process's environment: the API re-renders from the same
+        // signed value, so the signed expected_cc_init_data_hash can only
+        // match when both producers agree by construction.
+        luks2_header_seal: release.luks2_header_seal_claim(),
     };
     let cc_init_data_hash: [u8; 32] =
         Sha256::digest(cc_init_data::build_toml_with_options(&cc_app, &cc_init_options).as_bytes())
