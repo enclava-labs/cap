@@ -307,7 +307,7 @@ const APPLY_RETRY_BACKOFF_SHIFT_CAP: i32 = 16;
 /// `deployment_retry_exhausted` instead of retrying forever (#231).
 const NONTERMINAL_OBSERVATION_GRACE_SECS: i64 = 24 * 60 * 60;
 /// A job whose transient-contention requeues have spanned this long since
-/// the job row was created — without ever reaching a terminal observation —
+/// its first contention retry — without ever reaching a terminal observation —
 /// is wedged, not delayed: terminalize it instead of requeueing (#231).
 const APPLY_CONTENTION_HORIZON_SECS: i64 = 30 * 24 * 60 * 60;
 /// Bounded, operator-visible classification for a requeue-without-terminal
@@ -1995,7 +1995,7 @@ async fn process_apply_job(
                         "failed to publish durable deployment rollout outcome"
                     );
                 }
-                Ok(()) if outcome.deploy_status == "failed" => {
+                Ok(true) => {
                     // The publish transaction already enqueued the signed-policy
                     // revocation. Converge it under a freshly claimed global
                     // fence; the periodic reconciler covers a lost race.
@@ -2008,7 +2008,7 @@ async fn process_apply_job(
                         );
                     }
                 }
-                Ok(()) => {}
+                Ok(false) => {}
             }
         }
         Ok(Ok(JobApplyOutcome::AlreadyTerminal)) => {
@@ -2026,13 +2026,35 @@ async fn process_apply_job(
             fail_apply_job_with_mutation(&state, &job, &error, Some(mutation)).await;
         }
         Ok(Err(error)) if error.should_requeue_without_terminal_failure() => {
-            if let Err(retry_error) = requeue_or_exhaust_apply_job(&state.db, &job).await {
-                tracing::error!(
-                    deployment_id = %deployment_id,
-                    error_code = retry_error.code(),
-                    original_error_code = error.code(),
-                    "failed to requeue durable deployment after transient contention"
-                );
+            match requeue_or_exhaust_apply_job(&state.db, &job).await {
+                Ok(true) => {
+                    tracing::warn!(
+                        deployment_id = %deployment_id,
+                        original_error_code = error.code(),
+                        error_code = DEPLOYMENT_RETRY_EXHAUSTED_MESSAGE,
+                        "terminalized transient contention retries"
+                    );
+                    // The terminal publisher enqueued signed-policy revocation;
+                    // converge it immediately rather than waiting for the poller.
+                    if let Err(reconcile_error) =
+                        reconcile_pending_kbs_for_apply(&state, deployment_id).await
+                    {
+                        tracing::error!(
+                            deployment_id = %deployment_id,
+                            error_code = reconcile_error.code(),
+                            "contention exhaustion revocation remains durably pending"
+                        );
+                    }
+                }
+                Ok(false) => {}
+                Err(retry_error) => {
+                    tracing::error!(
+                        deployment_id = %deployment_id,
+                        error_code = retry_error.code(),
+                        original_error_code = error.code(),
+                        "failed to requeue durable deployment after transient contention"
+                    );
+                }
             }
         }
         Ok(Err(error)) => {
@@ -2059,6 +2081,7 @@ async fn requeue_apply_job(pool: &PgPool, job: &ClaimedJob) -> Result<(), Deploy
                         $1::bigint * (1::bigint << LEAST(attempts, $6::int)),
                         $2::bigint
                     )),
+                contention_started_at = COALESCE(contention_started_at, clock_timestamp()),
                 last_error_code = NULL,
                 updated_at = clock_timestamp()
           WHERE deployment_id = $3
@@ -2092,8 +2115,8 @@ async fn requeue_apply_job(pool: &PgPool, job: &ClaimedJob) -> Result<(), Deploy
 /// * a `watching` deployment whose observation anchor is past its persisted
 ///   rollout budget plus the nonterminal grace — the password owner-wait
 ///   class that deliberately keeps observing past its budget;
-/// * any job whose transient-contention requeues have spanned the
-///   contention horizon since the job row was created.
+/// * otherwise, a job whose transient-contention requeues have spanned the
+///   contention horizon since its first contention retry.
 async fn apply_job_retries_exhausted(
     pool: &PgPool,
     deployment_id: Uuid,
@@ -2103,10 +2126,14 @@ async fn apply_job_retries_exhausted(
                 d.status = 'watching'::deploy_status_enum
                 AND d.observing_since IS NOT NULL
                 AND clock_timestamp() > d.observing_since
-                    + make_interval(secs => d.rollout_timeout_millis / 1000)
+                    + make_interval(secs => d.rollout_timeout_millis / 1000.0)
                     + make_interval(secs => $2)
             )
-            OR clock_timestamp() > j.created_at + make_interval(secs => $3)
+            OR (
+                (d.status <> 'watching'::deploy_status_enum OR d.observing_since IS NULL)
+                AND j.contention_started_at IS NOT NULL
+                AND clock_timestamp() > j.contention_started_at + make_interval(secs => $3)
+            )
            FROM deployments AS d
            JOIN deployment_apply_jobs AS j ON j.deployment_id = d.id
           WHERE d.id = $1",
@@ -2127,17 +2154,14 @@ async fn apply_job_retries_exhausted(
 async fn requeue_or_exhaust_apply_job(
     pool: &PgPool,
     job: &ClaimedJob,
-) -> Result<(), DeploymentJobError> {
+) -> Result<bool, DeploymentJobError> {
     if apply_job_retries_exhausted(pool, job.deployment_id).await? {
-        return publish_apply_failure_with_mutation(
-            pool,
-            job,
-            None,
-            DEPLOYMENT_RETRY_EXHAUSTED_MESSAGE,
-        )
-        .await;
+        publish_apply_failure_with_mutation(pool, job, None, DEPLOYMENT_RETRY_EXHAUSTED_MESSAGE)
+            .await?;
+        return Ok(true);
     }
-    requeue_apply_job(pool, job).await
+    requeue_apply_job(pool, job).await?;
+    Ok(false)
 }
 
 async fn fail_unreadable_job(pool: &PgPool, claimed: &ClaimedJob, claimed_state: &str) {
@@ -3211,7 +3235,7 @@ async fn publish_rollout_outcome_with_mutation(
     job: &ClaimedJob,
     outcome: &DeploymentRolloutOutcome,
     mutation: Option<&mut crate::mutation_leases::AppMutationLease>,
-) -> Result<(), DeploymentJobError> {
+) -> Result<bool, DeploymentJobError> {
     let mut tx = pool.begin().await?;
     // Canonical order shared with acceptance/delete/rollback/unlock:
     // app advisory lane -> job row -> deployment row -> app row.
@@ -3251,10 +3275,10 @@ async fn publish_rollout_outcome_with_mutation(
     // persisted rollout budget has outlived the deliberately unbounded
     // owner-wait extension: terminalize the requeue loop instead of
     // scheduling another observation attempt (#231).
+    let exhausted = !outcome.terminal
+        && nonterminal_observation_exhausted(deployment.4, deployment.5, deployment.6);
     let exhausted_outcome;
-    let outcome = if !outcome.terminal
-        && nonterminal_observation_exhausted(deployment.4, deployment.5, deployment.6)
-    {
+    let outcome = if exhausted {
         tracing::warn!(
             deployment_id = %job.deployment_id,
             app_id = %job.app_id,
@@ -3329,7 +3353,8 @@ async fn publish_rollout_outcome_with_mutation(
     }
     let job_result = sqlx::query(
         "UPDATE deployment_apply_jobs
-            SET state = CASE WHEN $1 THEN 'completed' ELSE 'pending' END,
+            SET state = CASE WHEN $7 THEN 'failed'
+                             WHEN $1 THEN 'completed' ELSE 'pending' END,
                 lock_token = NULL,
                 locked_until = NULL,
                 next_attempt_at = CASE
@@ -3340,7 +3365,7 @@ async fn publish_rollout_outcome_with_mutation(
                             $6::bigint
                         ))
                 END,
-                last_error_code = NULL,
+                last_error_code = CASE WHEN $7 THEN $8 ELSE NULL END,
                 updated_at = clock_timestamp()
           WHERE deployment_id = $3
             AND state = 'running'
@@ -3352,6 +3377,8 @@ async fn publish_rollout_outcome_with_mutation(
     .bind(job.lock_token)
     .bind(APPLY_RETRY_BACKOFF_SHIFT_CAP)
     .bind(APPLY_RETRY_BACKOFF_CEILING_SECS)
+    .bind(exhausted)
+    .bind(DEPLOYMENT_RETRY_EXHAUSTED_MESSAGE)
     .execute(&mut *tx)
     .await?;
     if job_result.rows_affected() != 1 {
@@ -3371,7 +3398,7 @@ async fn publish_rollout_outcome_with_mutation(
         }
     }
     tx.commit().await?;
-    Ok(())
+    Ok(failed)
 }
 
 #[cfg(test)]
@@ -3380,7 +3407,9 @@ async fn publish_rollout_outcome(
     job: &ClaimedJob,
     outcome: &DeploymentRolloutOutcome,
 ) -> Result<(), DeploymentJobError> {
-    publish_rollout_outcome_with_mutation(pool, job, outcome, None).await
+    publish_rollout_outcome_with_mutation(pool, job, outcome, None)
+        .await
+        .map(|_| ())
 }
 
 async fn publish_apply_failure_with_mutation(
@@ -4952,16 +4981,30 @@ pub(crate) mod tests {
             .await
             .expect("claim fresh apply")
             .expect("fresh apply exists");
+        // An old job's first contention failure must not exhaust it merely
+        // because dispatch was unavailable before any retries began.
+        sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET created_at = clock_timestamp() - '31 days'::interval
+              WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("age job before first contention retry");
         requeue_or_exhaust_apply_job(&pool, &apply)
             .await
-            .expect("requeue fresh contention");
-        let fresh_state: String =
-            sqlx::query_scalar("SELECT state FROM deployment_apply_jobs WHERE deployment_id = $1")
-                .bind(deployment_id)
-                .fetch_one(&pool)
-                .await
-                .expect("load fresh requeued state");
-        assert_eq!(fresh_state, "pending");
+            .expect("requeue aged job's first contention");
+        let (job_state, contention_started): (String, Option<chrono::DateTime<chrono::Utc>>) =
+            sqlx::query_as(
+                "SELECT state, contention_started_at FROM deployment_apply_jobs WHERE deployment_id = $1",
+            )
+            .bind(deployment_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load first contention retry");
+        assert_eq!(job_state, "pending");
+        assert!(contention_started.is_some());
 
         // A job whose transient-contention requeues have spanned the
         // contention horizon without reaching a terminal observation is
@@ -4972,16 +5015,46 @@ pub(crate) mod tests {
             .expect("exhausted apply exists");
         sqlx::query(
             "UPDATE deployment_apply_jobs
-                SET created_at = clock_timestamp() - '31 days'::interval
+                SET contention_started_at = clock_timestamp() - '31 days'::interval
               WHERE deployment_id = $1",
         )
         .bind(deployment_id)
         .execute(&pool)
         .await
-        .expect("age apply past the contention horizon");
-        requeue_or_exhaust_apply_job(&pool, &apply)
+        .expect("age contention past the horizon");
+        // A live rollout observation owns its longer budget even if earlier
+        // contention retries crossed the independent contention horizon.
+        let original_status: String =
+            sqlx::query_scalar("SELECT status::text FROM deployments WHERE id = $1")
+                .bind(deployment_id)
+                .fetch_one(&pool)
+                .await
+                .expect("load status before watching test");
+        sqlx::query(
+            "UPDATE deployments SET status = 'watching'::deploy_status_enum,
+                    observing_since = clock_timestamp(), rollout_timeout_millis = 600000
+              WHERE id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("stage fresh observation");
+        assert!(
+            !apply_job_retries_exhausted(&pool, deployment_id)
+                .await
+                .expect("check active observation budget")
+        );
+        sqlx::query("UPDATE deployments SET status = $2::deploy_status_enum WHERE id = $1")
+            .bind(deployment_id)
+            .bind(original_status)
+            .execute(&pool)
             .await
-            .expect("terminalize exhausted contention");
+            .expect("restore status for contention exhaustion");
+        assert!(
+            requeue_or_exhaust_apply_job(&pool, &apply)
+                .await
+                .expect("terminalize exhausted contention")
+        );
         let (deployment_status, deployment_error, app_status, job_state, job_error): (
             String,
             Option<String>,
@@ -5098,7 +5171,7 @@ pub(crate) mod tests {
         .execute(&pool)
         .await
         .expect("stage exhausted watching anchor");
-        publish_rollout_outcome(
+        let effective_failed = publish_rollout_outcome_with_mutation(
             &pool,
             &apply,
             &DeploymentRolloutOutcome {
@@ -5108,18 +5181,26 @@ pub(crate) mod tests {
                 terminal: false,
                 manifest_hash: manifest_hash.to_string(),
             },
+            None,
         )
         .await
         .expect("publish exhausted nonterminal observation");
-        let (deployment_status, deployment_error, completed_at, app_status, job_state): (
+        assert!(
+            effective_failed,
+            "caller must reconcile synthesized failure"
+        );
+        type ExhaustedRolloutRow = (
             String,
             Option<String>,
             Option<chrono::DateTime<chrono::Utc>>,
             String,
             String,
-        ) = sqlx::query_as(
+            Option<String>,
+        );
+        let (deployment_status, deployment_error, completed_at, app_status, job_state, job_error):
+            ExhaustedRolloutRow = sqlx::query_as(
             "SELECT deployment.status::text, deployment.error_message,
-                    deployment.completed_at, app.status::text, job.state
+                    deployment.completed_at, app.status::text, job.state, job.last_error_code
                FROM deployments AS deployment
                JOIN apps AS app ON app.id = deployment.app_id
                JOIN deployment_apply_jobs AS job ON job.deployment_id = deployment.id
@@ -5139,7 +5220,8 @@ pub(crate) mod tests {
             "exhaustion must complete the rollout"
         );
         assert_eq!(app_status, "failed");
-        assert_eq!(job_state, "completed");
+        assert_eq!(job_state, "failed");
+        assert_eq!(job_error.as_deref(), Some("deployment_retry_exhausted"));
 
         sqlx::query("DELETE FROM organizations WHERE id = $1")
             .bind(app.org_id)
