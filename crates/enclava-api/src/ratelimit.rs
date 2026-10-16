@@ -37,8 +37,6 @@ use std::net::SocketAddr;
 use tower_governor::GovernorError;
 use tower_governor::key_extractor::KeyExtractor;
 
-use crate::clients::BlockedNetworks; // re-uses the CIDR matcher logic only
-
 #[derive(Debug, Clone)]
 pub struct TrustedProxyKeyExtractor {
     trusted: Arc<TrustedProxyMatcher>,
@@ -269,13 +267,6 @@ impl KeyExtractor for TrustedProxyKeyExtractor {
             .ok_or(GovernorError::UnableToExtractKey)
     }
 }
-
-// `BlockedNetworks` is a small re-export touchpoint to keep the crate's
-// internal API surface from drifting. The trusted-proxy code does not depend
-// on it at runtime, but downstream code that builds both modules together
-// expects the symbol path to remain stable.
-#[allow(dead_code)]
-fn _link_blocked_networks(_: &BlockedNetworks) {}
 
 #[cfg(test)]
 mod tests {

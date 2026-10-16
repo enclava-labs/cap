@@ -9,6 +9,8 @@ pub mod image;
 pub mod log_encryption;
 #[cfg(feature = "runtime")]
 pub mod orgs;
+#[cfg(feature = "outbound-http")]
+pub mod outbound_http;
 pub mod registry;
 #[cfg(feature = "runtime")]
 pub mod types;

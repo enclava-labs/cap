@@ -13,7 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
-enclava-common = { workspace = true }
+enclava-common = { workspace = true, features = ["outbound-http"] }
 enclava-verifier = { path = "../enclava-verifier" }
 enclava-engine = { path = "../enclava-engine" }
 tokio = { workspace = true }

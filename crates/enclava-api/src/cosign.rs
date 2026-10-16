@@ -1101,7 +1101,8 @@ mod tests {
     use crate::clients::EgressGuard;
 
     fn hermetic_egress_guard() -> EgressGuard {
-        let blocked = std::sync::Arc::new(crate::clients::BlockedNetworks::defaults());
+        let blocked =
+            std::sync::Arc::new(enclava_common::outbound_http::BlockedNetworks::defaults());
         EgressGuard {
             proxy: crate::egress_proxy::EgressProxy::new(std::sync::Arc::clone(&blocked)),
             blocked,

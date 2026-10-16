@@ -13,11 +13,11 @@
 //! through `EgressGuard` (issue #224): https-only, registry allowlist,
 //! literal-IP blocklist, and a one-shot DNS resolution for names.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use reqwest::dns::{Addrs, Name, Resolve, Resolving};
+use enclava_common::outbound_http::{BlockedNetworks, GuardedResolver};
 
 const DEFAULT_REGISTRY_ALLOWLIST: &[&str] = &[
     "ghcr.io",
@@ -53,201 +53,6 @@ pub enum ClientError {
     DnsLookupFailed(String),
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
-}
-
-/// CIDR ranges that outbound HTTP must never touch.
-#[derive(Debug, Clone)]
-pub struct BlockedNetworks {
-    v4: Vec<(Ipv4Addr, u8)>,
-    v6: Vec<(Ipv6Addr, u8)>,
-    /// Fail closed on the RFC 8215 local-use NAT64 prefix
-    /// `64:ff9b:1::/48`: the prefix is a container for operator-chosen
-    /// longer prefixes, so the embedded IPv4 position cannot be decoded
-    /// from the address alone and any fixed-offset decode can be evaded.
-    /// True for every guarded list — `defaults()` and any list extended
-    /// with explicit CIDRs. False only for `empty()`, whose documented
-    /// contract is "every destination allowed" for explicitly unguarded
-    /// paths (cap#241 review).
-    block_local_use_nat64: bool,
-}
-
-impl BlockedNetworks {
-    pub fn defaults() -> Self {
-        let mut v4 = vec![
-            (Ipv4Addr::new(127, 0, 0, 0), 8),
-            (Ipv4Addr::new(169, 254, 0, 0), 16),
-            (Ipv4Addr::new(10, 0, 0, 0), 8),
-            (Ipv4Addr::new(172, 16, 0, 0), 12),
-            (Ipv4Addr::new(192, 168, 0, 0), 16),
-            (Ipv4Addr::new(0, 0, 0, 0), 8),
-            (Ipv4Addr::new(100, 64, 0, 0), 10), // CGNAT
-        ];
-        let v6 = vec![
-            (Ipv6Addr::LOCALHOST, 128),
-            (Ipv6Addr::UNSPECIFIED, 128),
-            (Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0), 10),
-            (Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0), 7), // ULA
-        ];
-        // CGNAT is not strictly required, but blocking it is consistent with
-        // the rest of the SSRF-defence list and is cheap.
-        let _ = &mut v4;
-        Self {
-            v4,
-            v6,
-            block_local_use_nat64: true,
-        }
-    }
-
-    /// Add CIDR strings of the form `10.0.0.0/8`. Invalid entries are skipped
-    /// with a warning so config typos don't take down the API process.
-    pub fn extend_from_cidrs<I: IntoIterator<Item = S>, S: AsRef<str>>(&mut self, cidrs: I) {
-        for cidr in cidrs {
-            match parse_cidr(cidr.as_ref()) {
-                Some(Cidr::V4(net, bits)) => self.v4.push((net, bits)),
-                Some(Cidr::V6(net, bits)) => self.v6.push((net, bits)),
-                None => tracing::warn!(
-                    "ignoring invalid CIDR in cluster blocklist: {}",
-                    cidr.as_ref()
-                ),
-            }
-        }
-        // An explicitly extended list is a guarded list: fail closed on the
-        // undecodable RFC 8215 local-use NAT64 prefix (cap#241 review).
-        self.block_local_use_nat64 = true;
-    }
-
-    /// An empty blocklist — every destination allowed. For tests and for
-    /// explicitly unguarded internal paths only.
-    pub fn empty() -> Self {
-        Self {
-            v4: Vec::new(),
-            v6: Vec::new(),
-            block_local_use_nat64: false,
-        }
-    }
-
-    pub fn contains(&self, addr: IpAddr) -> bool {
-        match addr {
-            IpAddr::V4(ip) => self.v4.iter().any(|(net, bits)| in_v4(ip, *net, *bits)),
-            IpAddr::V6(ip) => {
-                // Several IPv6 spellings are an IPv4 destination in disguise
-                // and must be checked against the v4 ranges, or they fall
-                // through to a v6 list with no covering entry (issue #224,
-                // cap#241 review):
-                //   - IPv4-mapped ::ffff:0:0/96 and IPv4-compatible ::/96
-                //     (to_ipv4() covers both and returns None for any address
-                //     with nonzero upper bits),
-                //   - RFC 6052 NAT64: on a NAT64-enabled network the kernel
-                //     translator routes e.g. 64:ff9b::a00:507 to 10.0.5.7, so
-                //     the embedded IPv4 address is the real dial destination
-                //     and must pass the v4 blocklist. The well-known /96
-                //     embeds IPv4 unambiguously in the low 32 bits; the RFC
-                //     8215 local-use /48 is a container for operator-chosen
-                //     longer prefixes, so its addresses are blocked whole —
-                //     but only on guarded lists; empty() must honor its
-                //     allow-everything contract (cap#241 review).
-                if self.block_local_use_nat64 && nat64_local_use_prefix(ip) {
-                    return true;
-                }
-                if let Some(v4) = ip.to_ipv4().or_else(|| nat64_embedded_ipv4(ip))
-                    && self.v4.iter().any(|(net, bits)| in_v4(v4, *net, *bits))
-                {
-                    return true;
-                }
-                self.v6.iter().any(|(net, bits)| in_v6(ip, *net, *bits))
-            }
-        }
-    }
-}
-
-/// Decode the IPv4 destination embedded in an RFC 6052 well-known-prefix
-/// NAT64 address `64:ff9b::/96` (IPv4 in the low 32 bits, bits 32..96
-/// zero). Returns None for anything else, so ordinary global unicast IPv6
-/// is unaffected.
-fn nat64_embedded_ipv4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
-    let o = ip.octets();
-    if o[..4] == [0x00, 0x64, 0xff, 0x9b] && o[4..12].iter().all(|&b| b == 0) {
-        return Some(Ipv4Addr::new(o[12], o[13], o[14], o[15]));
-    }
-    None
-}
-
-/// RFC 8215 local-use NAT64 prefix `64:ff9b:1::/48`. Unlike the well-known
-/// /96, this prefix is a container from which operators pick longer
-/// network-specific prefixes (RFC 6052 permits /64, /96, ... embedding
-/// layouts), so the position of the embedded IPv4 address cannot be known
-/// from the address alone (cap#241 review). Every address inside it is a
-/// translator-mediated IPv4 destination, so the guard fails closed and
-/// blocks the whole prefix.
-fn nat64_local_use_prefix(ip: Ipv6Addr) -> bool {
-    let o = ip.octets();
-    o[..6] == [0x00, 0x64, 0xff, 0x9b, 0x00, 0x01]
-}
-
-enum Cidr {
-    V4(Ipv4Addr, u8),
-    V6(Ipv6Addr, u8),
-}
-
-fn parse_cidr(s: &str) -> Option<Cidr> {
-    let (addr, bits) = s.split_once('/')?;
-    let bits: u8 = bits.trim().parse().ok()?;
-    let ip: IpAddr = addr.trim().parse().ok()?;
-    match ip {
-        IpAddr::V4(v4) if bits <= 32 => Some(Cidr::V4(v4, bits)),
-        IpAddr::V6(v6) if bits <= 128 => Some(Cidr::V6(v6, bits)),
-        _ => None,
-    }
-}
-
-fn in_v4(ip: Ipv4Addr, net: Ipv4Addr, bits: u8) -> bool {
-    if bits == 0 {
-        return true;
-    }
-    let mask: u32 = !0u32 << (32 - bits);
-    (u32::from(ip) & mask) == (u32::from(net) & mask)
-}
-
-fn in_v6(ip: Ipv6Addr, net: Ipv6Addr, bits: u8) -> bool {
-    if bits == 0 {
-        return true;
-    }
-    let ip_bits = u128::from(ip);
-    let net_bits = u128::from(net);
-    let mask: u128 = !0u128 << (128 - bits);
-    (ip_bits & mask) == (net_bits & mask)
-}
-
-/// Custom DNS resolver that rejects any name resolving to a blocked IP.
-struct GuardedResolver {
-    blocked: Arc<BlockedNetworks>,
-}
-
-impl Resolve for GuardedResolver {
-    fn resolve(&self, name: Name) -> Resolving {
-        let host = name.as_str().to_string();
-        let blocked = Arc::clone(&self.blocked);
-        Box::pin(async move {
-            let lookup = format!("{host}:0");
-            let addrs: Vec<SocketAddr> = tokio::net::lookup_host(lookup.as_str())
-                .await
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
-                .collect();
-
-            for addr in &addrs {
-                if blocked.contains(addr.ip()) {
-                    return Err(format!(
-                        "refused to resolve `{host}` to blocked address {}",
-                        addr.ip()
-                    )
-                    .into());
-                }
-            }
-
-            let iter: Addrs = Box::new(addrs.into_iter());
-            Ok(iter)
-        })
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -317,13 +122,7 @@ pub struct ClientConfig {
 
 impl ClientConfig {
     pub fn from_env() -> Self {
-        let mut blocked = BlockedNetworks::defaults();
-        if let Ok(pod) = std::env::var("CLUSTER_POD_CIDR") {
-            blocked.extend_from_cidrs(pod.split(','));
-        }
-        if let Ok(svc) = std::env::var("CLUSTER_SERVICE_CIDR") {
-            blocked.extend_from_cidrs(svc.split(','));
-        }
+        let blocked = BlockedNetworks::from_env();
         Self {
             blocked: Arc::new(blocked),
             body_limit_bytes: std::env::var("OUTBOUND_HTTP_BODY_LIMIT_BYTES")
@@ -344,9 +143,7 @@ pub fn build_guarded_client(config: &ClientConfig) -> Result<reqwest::Client, Cl
 }
 
 fn build_inner(config: &ClientConfig) -> Result<reqwest::Client, ClientError> {
-    let resolver = Arc::new(GuardedResolver {
-        blocked: Arc::clone(&config.blocked),
-    });
+    let resolver = Arc::new(GuardedResolver::new(Arc::clone(&config.blocked)));
     Ok(reqwest::Client::builder()
         .https_only(true)
         .redirect(reqwest::redirect::Policy::none())
@@ -686,172 +483,6 @@ mod tests {
             .check_url("https://8.8.8.8/v2/team/app/manifests/latest")
             .unwrap();
     }
-
-    #[test]
-    fn blocked_networks_reject_private_v4() {
-        let blocked = BlockedNetworks::defaults();
-        for ip in [
-            "127.0.0.1",
-            "10.1.2.3",
-            "172.16.5.6",
-            "172.31.255.255",
-            "192.168.1.1",
-            "169.254.169.254", // IMDS
-            "0.0.0.0",
-        ] {
-            let parsed: IpAddr = ip.parse().unwrap();
-            assert!(blocked.contains(parsed), "{ip} should be blocked");
-        }
-    }
-
-    #[test]
-    fn blocked_networks_accept_public_v4() {
-        let blocked = BlockedNetworks::defaults();
-        for ip in ["140.82.121.4", "1.1.1.1", "8.8.8.8"] {
-            let parsed: IpAddr = ip.parse().unwrap();
-            assert!(!blocked.contains(parsed), "{ip} should be permitted");
-        }
-    }
-
-    #[test]
-    fn blocked_networks_reject_loopback_v6_and_link_local() {
-        let blocked = BlockedNetworks::defaults();
-        for ip in ["::1", "fe80::1", "fd00::1"] {
-            let parsed: IpAddr = ip.parse().unwrap();
-            assert!(blocked.contains(parsed), "{ip} should be blocked");
-        }
-    }
-
-    #[test]
-    fn blocked_networks_reject_ipv4_compatible_v6_literals() {
-        // The ::/96 fall-through (issue #224): an IPv4-compatible IPv6
-        // literal is an IPv4 destination and must be checked against the v4
-        // ranges, not fall through to a v6 list with no covering entry.
-        let blocked = BlockedNetworks::defaults();
-        for ip in [
-            "::127.0.0.1",
-            "::10.0.5.7",
-            "::169.254.169.254",
-            "::192.168.1.1",
-            "::172.16.0.9",
-            "::0.0.0.0",
-        ] {
-            let parsed: IpAddr = ip.parse().unwrap();
-            assert!(blocked.contains(parsed), "{ip} should be blocked");
-        }
-    }
-
-    #[test]
-    fn blocked_networks_reject_ipv4_mapped_v6_literals() {
-        // ::ffff:0:0/96 was already covered via to_ipv4_mapped; keep it
-        // pinned so the ::/96 closure cannot regress it.
-        let blocked = BlockedNetworks::defaults();
-        for ip in [
-            "::ffff:127.0.0.1",
-            "::ffff:10.0.5.7",
-            "::ffff:169.254.169.254",
-        ] {
-            let parsed: IpAddr = ip.parse().unwrap();
-            assert!(blocked.contains(parsed), "{ip} should be blocked");
-        }
-    }
-
-    #[test]
-    fn blocked_networks_reject_nat64_literals_with_private_v4() {
-        // RFC 6052 well-known prefix 64:ff9b::/96: on a NAT64-enabled host
-        // the translator dials the embedded IPv4 address, so the v4
-        // blocklist must apply (cap#241 review).
-        let blocked = BlockedNetworks::defaults();
-        for ip in [
-            "64:ff9b::a00:507",   // -> 10.0.5.7
-            "64:ff9b::7f00:1",    // -> 127.0.0.1
-            "64:ff9b::a9fe:a9fe", // -> 169.254.169.254
-            "64:ff9b::c0a8:101",  // -> 192.168.1.1
-        ] {
-            let parsed: IpAddr = ip.parse().unwrap();
-            assert!(blocked.contains(parsed), "{ip} should be blocked");
-        }
-    }
-
-    #[test]
-    fn blocked_networks_fail_closed_on_rfc8215_local_use_nat64() {
-        // RFC 8215's 64:ff9b:1::/48 is a container for operator-chosen
-        // longer prefixes (/64, /96, ... layouts per RFC 6052), so the
-        // embedded IPv4 position is not derivable from the address alone.
-        // A /96 instance inside the prefix can bury 169.254.169.254 in
-        // bits a fixed-offset decode never reads; the guard therefore
-        // blocks the whole /48 (cap#241 review).
-        let blocked = BlockedNetworks::defaults();
-        for ip in [
-            "64:ff9b:1::a00:507",
-            "64:ff9b:1::a9fe:a9fe",
-            // /96 instance at subnet id 0x0102: translator dials
-            // 169.254.169.254 via 64:ff9b:1:102::a9fe:a9fe.
-            "64:ff9b:1:102::a9fe:a9fe",
-            // /64 instance at subnet id 0x0100: translator dials
-            // 169.254.169.254 via 64:ff9b:1:100:a9:fea9:fe00::.
-            "64:ff9b:1:100:a9:fea9:fe00::",
-        ] {
-            let parsed: IpAddr = ip.parse().unwrap();
-            assert!(blocked.contains(parsed), "{ip} should be blocked");
-        }
-    }
-
-    #[test]
-    fn blocked_networks_empty_allows_every_destination() {
-        // empty()'s documented contract is "every destination allowed" —
-        // including NAT64 spellings. It is reserved for explicitly
-        // unguarded paths, where the caller takes responsibility for the
-        // destination, so no heuristics may reject anything (cap#241
-        // review).
-        let blocked = BlockedNetworks::empty();
-        for ip in [
-            "10.0.5.7",
-            "127.0.0.1",
-            "169.254.169.254",
-            "::1",
-            "64:ff9b::a00:507",
-            "64:ff9b:1::a00:507",
-            "64:ff9b:1:102::a9fe:a9fe",
-        ] {
-            let parsed: IpAddr = ip.parse().unwrap();
-            assert!(!blocked.contains(parsed), "{ip} should be allowed");
-        }
-    }
-
-    #[test]
-    fn extended_empty_blocklist_still_fails_closed_on_local_use_nat64() {
-        // extend_from_cidrs marks the list as explicitly guarded: even if
-        // the added CIDRs cover nothing inside 64:ff9b:1::/48, the
-        // undecodable local-use NAT64 prefix keeps being blocked whole
-        // (cap#241 review).
-        let mut blocked = BlockedNetworks::empty();
-        blocked.extend_from_cidrs(["203.0.113.0/24"]);
-        let nat64: IpAddr = "64:ff9b:1::a9fe:a9fe".parse().unwrap();
-        assert!(
-            blocked.contains(nat64),
-            "extended list must fail closed on local-use NAT64"
-        );
-    }
-
-    #[test]
-    fn blocked_networks_still_allow_ordinary_public_v6() {
-        // The ::/96 and NAT64 decodings must not over-block ordinary global
-        // unicast v6: to_ipv4 returns None for any address with nonzero
-        // upper bits, and NAT64 literals with a public embedded IPv4
-        // address (e.g. 64:ff9b::8.8.8.8) are legitimate destinations.
-        let blocked = BlockedNetworks::defaults();
-        for ip in [
-            "2600::1",
-            "2001:db8::1",
-            "64:ff9b::8.8.8.8",
-            "64:ff9b::808:808",
-        ] {
-            let parsed: IpAddr = ip.parse().unwrap();
-            assert!(!blocked.contains(parsed), "{ip} should not be blocked");
-        }
-    }
-
     #[tokio::test]
     async fn egress_guard_rejects_literal_ip_registry_hosts() {
         // reqwest bypasses its custom DNS resolver for literal-IP hosts, so
@@ -921,17 +552,6 @@ mod tests {
             Err(other) => panic!("ghcr.io must not be blocked: {other:?}"),
         }
     }
-
-    #[test]
-    fn cluster_cidrs_extend_blocklist() {
-        let mut blocked = BlockedNetworks::defaults();
-        blocked.extend_from_cidrs(["10.244.0.0/16", "10.96.0.0/12"]);
-        let pod_ip: IpAddr = "10.244.5.7".parse().unwrap();
-        let svc_ip: IpAddr = "10.96.0.10".parse().unwrap();
-        assert!(blocked.contains(pod_ip));
-        assert!(blocked.contains(svc_ip));
-    }
-
     #[test]
     fn redirect_policy_disabled_on_built_clients() {
         // Smoke check: builders shouldn't fail. The redirect ban is enforced
@@ -949,7 +569,6 @@ mod tests {
         let client = RegistryClient::new(cfg(), AllowList::from_env_or_default(None)).unwrap();
         assert_eq!(client.body_limit(), 1024);
     }
-
     #[tokio::test]
     async fn body_limit_is_enforced_mid_stream_when_content_length_is_absent() {
         // A hostile server can omit Content-Length and stream an unbounded
