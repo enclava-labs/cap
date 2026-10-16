@@ -1,11 +1,10 @@
-//! Outbound HTTP clients hardened against SSRF (C12).
+//! Outbound HTTP client hardened against SSRF (C12).
 //!
-//! Provides two narrow `reqwest` clients:
+//! Provides one narrow `reqwest` client:
 //! - `RegistryClient` — talks to OCI registries on a hostname allowlist.
-//! - `WebhookClient`  — talks to the configured BTCPay Server.
 //!
-//! Both clients refuse redirects, force HTTPS, cap response body size, and
-//! resolve DNS through a custom resolver that rejects loopback, link-local,
+//! The client refuses redirects, forces HTTPS, caps response body size, and
+//! resolves DNS through a custom resolver that rejects loopback, link-local,
 //! RFC1918, IMDS-style metadata addresses, IPv4-compatible/mapped IPv6
 //! spellings of all of the above, and configured cluster CIDRs. Because
 //! reqwest never consults a custom resolver for literal-IP hosts, the
@@ -542,36 +541,6 @@ impl EgressGuard {
         check_egress_destination(url, &self.blocked, Some(&self.allowlist)).await
     }
 }
-
-/// Outbound client for BTCPay webhook callbacks (admin-controlled host, no
-/// allowlist — but still SSRF-defended through the resolver and redirect ban).
-#[derive(Clone)]
-pub struct WebhookClient {
-    inner: reqwest::Client,
-    body_limit: u64,
-}
-
-impl WebhookClient {
-    pub fn from_env() -> Result<Self, ClientError> {
-        Self::new(ClientConfig::from_env())
-    }
-
-    pub fn new(config: ClientConfig) -> Result<Self, ClientError> {
-        Ok(Self {
-            inner: build_inner(&config)?,
-            body_limit: config.body_limit_bytes,
-        })
-    }
-
-    pub fn inner(&self) -> &reqwest::Client {
-        &self.inner
-    }
-
-    pub fn body_limit(&self) -> u64 {
-        self.body_limit
-    }
-}
-
 /// Read a response body into memory while enforcing `limit` against the
 /// bytes actually received, not just the advertised Content-Length: a
 /// hostile server can omit the header or lie about it, so bodies are
@@ -968,7 +937,6 @@ mod tests {
         // Smoke check: builders shouldn't fail. The redirect ban is enforced
         // at request time by reqwest; check_url additionally guards the URL.
         RegistryClient::new(cfg(), AllowList::from_env_or_default(None)).unwrap();
-        WebhookClient::new(cfg()).unwrap();
     }
 
     #[tokio::test]
