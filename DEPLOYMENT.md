@@ -85,7 +85,8 @@ For production deploys with policy-read mode enabled:
 | `TRUSTEE_ATTESTATION_VERIFY_URL` | Trustee callback endpoint used by CAP workload artifact and TLS broker routes. Must be an `https://` URL: release builds reject `http://` verify URLs at startup (the verify bearer token must never transit cleartext), and the trustee client refuses cleartext requests in all builds. |
 | `TRUSTEE_ATTESTATION_VERIFY_BEARER_TOKEN` | Bearer token CAP sends to the Trustee verification endpoint. Required when `TRUSTEE_ATTESTATION_VERIFY_URL` is set. |
 | `PLATFORM_SIGNING_SERVICE_URL` | Policy signing service endpoint, unless supplied by the platform release. |
-| `SIGNING_SERVICE_PUBKEY_HEX` or `PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX` | Ed25519 public key used to verify signed policy artifacts, unless supplied by the platform release. |
+| `PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX` | Ed25519 public key of the platform trustee policy authority (in-TEE policy verification), unless supplied by the platform release. |
+| `SIGNING_SERVICE_PUBKEY_HEX` | Ed25519 public key of the off-cluster signing service that produces signed policy artifacts (`/sign`); policy acceptance verifies against this key. Distinct from `PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX`: they are two trust domains, and setting both to the same key fails startup. Never load the trustee policy private key into the signing service — that would collapse the two domains again. |
 
 ## Optional Integrations
 
@@ -166,6 +167,9 @@ The API and CLI load the bundled
 Release verification checks:
 
 - envelope signature against `ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX`;
+- `platform_trustee_policy_pubkey_hex` is present and distinct from
+  `signing_service_pubkey_hex` (the in-TEE policy authority and the
+  off-cluster signing service are separate trust domains);
 - digest pins for platform sidecar images;
 - HTTPS Trustee KBS URL;
 - HTTPS tenant Caddy ACME CA URL;
@@ -187,6 +191,26 @@ accept a rollback.
 When the signed release supplies a value, an explicit environment override must
 match it exactly or startup fails.
 
+### Upgrading across the policy-key split (cap#118)
+
+Signed deployment artifacts pin the exact hash of their rendered
+`cc_init_data`, which includes the policy-key claims. Artifacts signed
+before the platform trustee policy key was split from the signing-service
+key were rendered with the collapsed layout (trustee slot = signing-service
+key). Such artifacts — rollback targets, unlock transitions, queued-job
+replays — still validate after the upgrade: when only the collapsed render
+matches the signed hash, the API pins the artifact to that layout and every
+consumer (statefulset, enclava-init ConfigMap, KBS policy/TLS bindings)
+renders the exact signed bytes, so the workload boots exactly as it did
+before the upgrade. No workload-artifact re-signing is required before
+rollout; re-deploying (re-signing) an app moves it to the split layout. The
+same render-pin mechanism covers artifacts signed before the
+`log_encryption_json` claim existed (`omit_log_encryption_claim`). The
+production platform-release envelope is the exception: the new
+`platform_trustee_policy_pubkey_hex` field is required with no default, so
+re-sign the production envelope with a distinct trustee key before
+deploying this binary — an old envelope will not load.
+
 ### Rotating the production root
 
 The committed `platform-release.json` is signed by a well-known dev fixture
@@ -198,14 +222,24 @@ together:
 1. Generate the production root offline:
    `openssl genpkey -algorithm ed25519 -out root.pem`
    (`openssl pkey -in root.pem -noout -text` shows the seed and pubkey hex.)
-2. Sign the payload with the repository's canonical encoding. Keep the seed
+2. Prepare `payload.json`: a copy of the current release payload with the
+   fields you are rotating. It MUST include a `platform_trustee_policy_pubkey_hex`
+   distinct from `signing_service_pubkey_hex` — releases that omit the field or
+   collapse the two keys onto one key are rejected (the in-TEE policy authority
+   and the signing service are separate trust domains). The committed payload
+   pins the public dev-fixture trustee key: REPLACE that pin with a freshly
+   generated trustee key — keeping the committed value is rejected at signing
+   and verification time (its seed is public, so anyone with the repo could
+   forge policy envelopes). Generate the trustee policy keypair with its own
+   offline seed, never reused as the signing-service or root key.
+3. Sign the payload with the repository's canonical encoding. Keep the seed
    in a protected file and redirect it into the helper — it never appears in
    argv or shell history:
    `cargo run --locked -p enclava-cli --example platform-release -- sign \
    payload.json < root-seed.hex > platform-release.json`
-3. Sanity-check it: `cargo run --locked -p enclava-cli --example \
+4. Sanity-check it: `cargo run --locked -p enclava-cli --example \
    platform-release -- verify platform-release.json <root-pubkey-hex>`
-4. Set both repository secrets in one sitting:
+5. Set both repository secrets in one sitting:
    `ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX` (pubkey hex) and
    `ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON` (the signed envelope contents).
 

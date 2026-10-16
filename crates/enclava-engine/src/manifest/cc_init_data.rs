@@ -259,7 +259,11 @@ pub fn build_toml_with_options(app: &ConfidentialApp, options: &CcInitDataOption
         {
             push_toml_string(&mut toml, "trustee_policy_url", url);
         }
-        if let Some(pubkey) = &app.attestation.platform_trustee_policy_pubkey_hex {
+        // Pre-cap#118 artifacts pinned to the legacy collapsed render carry
+        // the signing-service key in the trustee slot (see
+        // WorkloadArtifactBinding::legacy_collapsed_trustee_key); both this
+        // TOML and the enclava-init ConfigMap must render the same value.
+        if let Some(pubkey) = app.rendered_platform_trustee_policy_pubkey_hex() {
             push_toml_string(&mut toml, "platform_trustee_policy_pubkey_hex", pubkey);
         }
         if let Some(pubkey) = &app.attestation.signing_service_pubkey_hex {

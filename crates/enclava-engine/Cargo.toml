@@ -15,6 +15,7 @@ base64 = { workspace = true }
 flate2 = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+ed25519-dalek = { workspace = true }
 kube = { workspace = true }
 futures = { workspace = true }
 reqwest = { workspace = true }

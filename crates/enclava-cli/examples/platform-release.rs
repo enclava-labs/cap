@@ -73,6 +73,21 @@ fn sign(payload_path: Option<&String>) -> Result<(), String> {
         .map_err(|err| format!("read {payload_path}: {err}"))?;
     let payload: PlatformRelease = serde_json::from_str(&raw)
         .map_err(|err| format!("parse {payload_path} as platform-release payload: {err}"))?;
+    // Fail before signing or writing anything when the payload itself is
+    // invalid (e.g. a platform_trustee_policy_pubkey_hex that collapses onto
+    // the signing-service key): signing a bad envelope just moves the
+    // failure to whoever verifies it first.
+    enclava_cli::platform_release::validate_release_payload(&payload)
+        .map_err(|err| format!("payload: {err}"))?;
+    // Same root-aware fixture-key gate verify_envelope enforces (cap#218):
+    // refuse to sign an envelope every verifier would reject under a
+    // production root.
+    let verifying_key = key.verifying_key();
+    enclava_cli::platform_release::refuse_fixture_keys_outside_fixture_root(
+        &payload,
+        verifying_key.as_bytes(),
+    )
+    .map_err(|err| format!("payload: {err}"))?;
     let canonical =
         canonical_platform_release_bytes(&payload).map_err(|err| format!("payload: {err}"))?;
     let signature = key.sign(&canonical);

@@ -114,10 +114,16 @@ pub struct VerifyInputs<'a> {
     pub artifacts: &'a ArtifactsBundle,
     pub cc_init_data_claims: &'a CcInitDataClaims,
     pub local_cc_init_data_toml: &'a [u8],
-    /// Preferred policy producer keys. When a signing-service key is pinned in
-    /// signed cc_init_data it is authoritative; descriptor-key policy signing is
-    /// only a legacy fallback for older releases with no configured platform
-    /// policy key.
+    /// Policy producer keys. cap#118: the platform trustee policy key and
+    /// the signing-service key are pinned as two distinct trust domains,
+    /// and a release that collapses them onto one key is rejected before it
+    /// reaches cc_init_data. Policy artifacts are produced by the signing
+    /// service today, so its key remains the policy authority when pinned;
+    /// the dedicated trustee key authorizes when it is the only pinned
+    /// platform key, and becomes the sole authority once the signing
+    /// service signs policies with it (coordinated producer rollout).
+    /// Descriptor-key policy signing is a legacy fallback for older
+    /// releases with no configured platform policy key.
     pub platform_trustee_policy_pubkey: Option<&'a VerifyingKey>,
     pub signing_service_pubkey: Option<&'a VerifyingKey>,
 }
@@ -502,6 +508,13 @@ fn verify_policy_envelope_signature(
     let msg = ce_v1_policy_envelope_message(env)?;
     let sig = Signature::from_bytes(&env.signature);
 
+    // cap#118: policy artifacts are signed by the off-cluster signing
+    // service, so its key is the policy authority when pinned. The trustee
+    // policy key (a distinct trust domain, rejection-enforced upstream)
+    // authorizes when it is the only pinned platform key; making it
+    // authoritative while the signing service is still the producer would
+    // require the service to hold the trustee private key — collapsing the
+    // domains instead of separating them.
     if let Some(signing_service_key) = signing_service_pubkey {
         return signing_service_key.verify(&msg, &sig).map_err(|_| {
             InitError::TrusteePolicy(

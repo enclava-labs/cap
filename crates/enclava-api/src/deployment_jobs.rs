@@ -4202,6 +4202,7 @@ pub(crate) mod tests {
             descriptor_signing_pubkey: binding.descriptor_signing_pubkey,
             org_keyring_fingerprint: binding.org_keyring_fingerprint,
             omit_log_encryption_claim: false,
+            legacy_collapsed_trustee_key: false,
         });
         crate::routes::deployments::select_local_signed_artifact_delivery(
             &mut app_spec.attestation,

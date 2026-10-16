@@ -76,6 +76,7 @@ fn test_release() -> PlatformRelease {
             platform_release_version: "test".to_string(),
             signing_service_url: "https://signing.example.test".to_string(),
             signing_service_pubkey_hex: "11".repeat(32),
+            platform_trustee_policy_pubkey_hex: "33".repeat(32),
             policy_template_id: "trustee-resource-policy-v1".to_string(),
             policy_template_sha256: "22".repeat(32),
             policy_template_text: "package policy\n".to_string(),
@@ -321,6 +322,7 @@ fn signed_cc_hash_app_uses_local_artifact_urls_like_live_apply() {
                     descriptor_signing_pubkey: [2; 32],
                     org_keyring_fingerprint: [3; 32],
                     omit_log_encryption_claim: false,
+                    legacy_collapsed_trustee_key: false,
                 },
                 generated_agent_policy: GeneratedAgentPolicy {
                     policy_text: "package agent_policy\n".to_string(),
@@ -388,6 +390,7 @@ fn signed_cc_hash_app_uses_api_deployment_context_without_env_exports() {
                     descriptor_signing_pubkey: [2; 32],
                     org_keyring_fingerprint: [3; 32],
                     omit_log_encryption_claim: false,
+                    legacy_collapsed_trustee_key: false,
                 },
                 generated_agent_policy: GeneratedAgentPolicy {
                     policy_text: "package agent_policy\n".to_string(),
