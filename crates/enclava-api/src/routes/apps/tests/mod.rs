@@ -1436,6 +1436,82 @@ async fn signer_rotation_token_is_single_use_and_owes_a_deferred_withdrawal_bump
 }
 
 #[tokio::test]
+async fn initial_signer_set_with_unsigned_legacy_binding_without_kbs_fails_closed() {
+    let (_cleanup, pool) =
+        crate::test_support::isolated_database_test_pool("cap119_initial_legacy_binding").await;
+    let (org_id, user_id, app_id) = insert_signer_rotation_app(&pool, None, None).await;
+    let suffix = app_id.simple().to_string();
+    sqlx::query(
+        "INSERT INTO kbs_tls_bindings
+            (app_id, binding_key, repository, tag, namespace, service_account,
+             tenant_instance_identity_hash)
+         VALUES ($1, $2, 'default', 'workload-secret-seed', $3, $4, $5)",
+    )
+    .bind(app_id)
+    .bind(format!("tls-{}", &suffix[..12]))
+    .bind(format!("cap-{}", &suffix[..12]))
+    .bind(format!("cap-{}-sa", &suffix[..12]))
+    .bind("33".repeat(32))
+    .execute(&pool)
+    .await
+    .expect("seed unsigned legacy binding");
+    assert!(
+        !crate::kbs::read_legacy_publication_obligation(&pool)
+            .await
+            .expect("read legacy obligation"),
+        "the regression requires an unsigned binding without a signer-bearing marker"
+    );
+    let app_name: String = sqlx::query_scalar("SELECT name FROM apps WHERE id = $1")
+        .bind(app_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read app name");
+    let mut state = crate::test_support::lazy_state();
+    state.db = pool.clone();
+    let auth = AuthContext {
+        user_id,
+        org_id,
+        org_name: "initial-legacy-binding-test".to_string(),
+        role: Role::Owner,
+        api_key: None,
+        management_origin: crate::auth::middleware::ManagementOrigin::Public,
+    };
+    let refused = rotate_signer(
+        auth,
+        State(state),
+        Path(app_name),
+        Json(RotateSignerRequest {
+            subject: "new-subject".to_string(),
+            issuer: "new-issuer".to_string(),
+            email_confirmation_token: None,
+        }),
+    )
+    .await
+    .expect_err("a live unsigned binding requires KBS to publish its new signer");
+    assert_eq!(refused.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(refused.1.0["code"], "kbs_publication_not_configured");
+    let (subject, binding_subject): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT app.signer_identity_subject, binding.signer_identity_subject
+           FROM apps AS app JOIN kbs_tls_bindings AS binding ON binding.app_id = app.id
+          WHERE app.id = $1",
+    )
+    .bind(app_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read unchanged identities");
+    assert_eq!((subject, binding_subject), (None, None));
+    let audits: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_log WHERE app_id = $1 AND action = 'app.signer.set'",
+    )
+    .bind(app_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read audits");
+    assert_eq!(audits, 0);
+    crate::test_support::drop_isolated_database("cap119_initial_legacy_binding", pool).await;
+}
+
+#[tokio::test]
 async fn initial_signer_set_in_signed_mode_without_kbs_config_fails_closed() {
     let (_db_cleanup, pool) =
         crate::test_support::isolated_database_test_pool("cap119_initial_set_pending").await;

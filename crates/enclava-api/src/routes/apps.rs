@@ -2829,10 +2829,30 @@ pub(crate) async fn rotate_signer_commit(
         let sentinel_present = crate::kbs::lock_legacy_publication_sentinel(&mut *tx)
             .await
             .map_err(|_| internal_server_error())?;
+        // Even without a signer-bearing publication marker, an unsigned
+        // legacy binding may already be live. Initializing its signer changes
+        // the Rego render source but owes no withdrawal generation, so an
+        // unconfigured reconciler would incorrectly confirm success. Read
+        // under the app lane and publication sentinel, before the identity
+        // update, to exclude that unpublishable transition.
+        let unsigned_binding_would_change =
+            if app.signer_identity_subject.is_none() && app.signer_identity_issuer.is_none() {
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS (SELECT 1 FROM kbs_tls_bindings
+                                WHERE app_id = $1 AND deleted_at IS NULL)",
+                )
+                .bind(app.id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|_| internal_server_error())?
+            } else {
+                false
+            };
         if !sentinel_present
             || crate::kbs::read_legacy_publication_obligation(&mut *tx)
                 .await
                 .map_err(|_| internal_server_error())?
+            || unsigned_binding_would_change
         {
             let error = crate::kbs::KbsPolicyError::NotConfigured;
             tracing::warn!(
