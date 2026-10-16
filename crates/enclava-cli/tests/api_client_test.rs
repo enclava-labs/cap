@@ -8,7 +8,6 @@ use std::net::TcpListener;
 #[test]
 fn client_without_auth_returns_not_authenticated() {
     let client = ApiClient::new("https://api.enclava.dev", None);
-    // Verify construction works without auth token.
     let _ = client;
 }
 

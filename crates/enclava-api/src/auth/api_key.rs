@@ -155,7 +155,6 @@ pub async fn validate_api_key(
     .fetch_all(pool)
     .await?;
 
-    // Filter expired keys first
     let valid_candidates: Vec<(Uuid, Uuid, Uuid, String, String, Vec<String>)> = candidates
         .into_iter()
         .filter_map(

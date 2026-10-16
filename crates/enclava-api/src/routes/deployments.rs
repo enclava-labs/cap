@@ -967,7 +967,6 @@ async fn deploy_app_candidate(
         ));
     }
 
-    // Resolve image tag to digest
     let image_ref = enclava_common::image::ImageRef::parse(&body.image).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
@@ -1366,7 +1365,6 @@ async fn deploy_app_candidate(
         )
     })?;
 
-    // Fetch provenance attestation and SBOM if available (non-fatal if missing).
     let (provenance, sbom) = crate::cosign::fetch_attestations(
         &state.cosign_egress,
         &state.http_client,

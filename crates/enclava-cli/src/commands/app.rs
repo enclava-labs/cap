@@ -636,7 +636,6 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
         pb.set_position(4);
         pb.set_message(counted_progress("Customer config", 0, config_pairs.len()));
 
-        // Get config token from API
         let token_resp = api.get_config_token(&app_name).await?;
         let tee = token_resp
             .tee_url
@@ -2507,7 +2506,6 @@ pub async fn rollback(args: RollbackArgs) -> Result<(), Box<dyn std::error::Erro
     let deployment_id = if let Some(id) = args.to.clone() {
         id
     } else {
-        // Show recent deployments and let user pick
         let deployments = api.list_deployments(&app_name).await?;
         if deployments.len() < 2 {
             return Err("no previous deployment to roll back to".into());

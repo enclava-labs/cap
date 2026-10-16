@@ -109,7 +109,6 @@ pub async fn run(cmd: OrgCommand) -> Result<(), Box<dyn std::error::Error>> {
         OrgCommand::Switch { name } => {
             let (api, paths, mut cli_config) = build_api_client_with_paths()?;
 
-            // Verify the org exists and user is a member
             let orgs = api.list_orgs().await?;
             let found = orgs.iter().any(|o| o.name == name);
             if !found {

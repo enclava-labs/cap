@@ -229,7 +229,6 @@ pub async fn signup() -> Result<(), Box<dyn std::error::Error>> {
 
     let resp = client.signup(&req).await?;
 
-    // Save credentials
     let creds = Credentials {
         session_token: Some(resp.token),
         api_key: None,
@@ -239,7 +238,6 @@ pub async fn signup() -> Result<(), Box<dyn std::error::Error>> {
     };
     config::save_credentials(&paths, &creds)?;
 
-    // Save org
     let mut updated_config = cli_config;
     updated_config.api_url = auth_api_url;
     updated_config.org = Some(resp.org_name.clone());
@@ -258,7 +256,6 @@ pub async fn login(args: LoginArgs) -> Result<(), Box<dyn std::error::Error>> {
         config::save_config(&paths, &cli_config)?;
     }
 
-    // Check for existing session
     let existing_creds = config::load_credentials(&paths)?;
     if existing_creds.session_token.is_some() {
         let confirm = dialoguer::Confirm::new()
@@ -316,12 +313,10 @@ pub async fn login(args: LoginArgs) -> Result<(), Box<dyn std::error::Error>> {
             .with_prompt("Nostr private key (nsec1...)")
             .interact()?;
 
-        // Parse the secret key from nsec bech32
         let secret_key =
             nostr::SecretKey::parse(&nsec_str).map_err(|e| format!("invalid nsec key: {e}"))?;
         let keys = nostr::Keys::new(secret_key);
 
-        // Verify the npub matches the nsec
         let expected_pubkey = keys.public_key();
         let provided_pubkey =
             nostr::PublicKey::parse(&npub).map_err(|e| format!("invalid npub: {e}"))?;
@@ -329,7 +324,6 @@ pub async fn login(args: LoginArgs) -> Result<(), Box<dyn std::error::Error>> {
             return Err("npub does not match nsec".into());
         }
 
-        // Construct NIP-98 HTTP Auth event (kind 27235)
         let api_url = client.auth_login_url();
         let event = build_nip98_login_event(&keys, &api_url, nostr::Timestamp::now())?;
 
@@ -357,7 +351,6 @@ pub async fn login(args: LoginArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let resp = client.login(&req).await?;
 
-    // Save credentials
     let creds = Credentials {
         session_token: Some(resp.token),
         api_key: None,
@@ -367,7 +360,6 @@ pub async fn login(args: LoginArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
     config::save_credentials(&paths, &creds)?;
 
-    // Save org
     let mut updated_config = cli_config;
     updated_config.api_url = auth_api_url;
     updated_config.org = Some(resp.org_name.clone());

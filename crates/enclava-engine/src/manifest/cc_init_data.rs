@@ -325,7 +325,6 @@ pub fn build_toml_with_options(app: &ConfidentialApp, options: &CcInitDataOption
     }
     toml.push('\n');
 
-    // policy.rego
     if let Some(agent_policy) = &app.generated_agent_policy {
         let actual_hash: [u8; 32] = Sha256::digest(agent_policy.policy_text.as_bytes()).into();
         assert_eq!(
@@ -351,7 +350,6 @@ pub fn build_toml_with_options(app: &ConfidentialApp, options: &CcInitDataOption
     }
     toml.push('\n');
 
-    // aa.toml
     let mut aa_toml = String::new();
     aa_toml.push_str("[token_configs]\n");
     aa_toml.push_str("[token_configs.kbs]\n");
@@ -362,7 +360,6 @@ pub fn build_toml_with_options(app: &ConfidentialApp, options: &CcInitDataOption
     push_toml_multiline_string(&mut toml, "\"aa.toml\"", &aa_toml);
     toml.push('\n');
 
-    // cdh.toml
     let mut cdh_toml = String::new();
     cdh_toml.push_str("[kbc]\n");
     cdh_toml.push_str("name = \"cc_kbc\"\n");
