@@ -5,9 +5,14 @@
 -- nonterminal observations, the contention horizon for transient errors).
 -- Persist that exhaustion with its own bounded, operator-visible
 -- classification so the job row carries why it stopped retrying. Retain
--- the full bounded classification set from #220's 0073 (plus this code):
--- previously legal rows must stay legal when #220 has landed first. If #220
--- lands afterward, its migration must retain deployment_retry_exhausted.
+-- every code any earlier constraint allowed: the full bounded
+-- classification set from #220's 0073, plus the two engine classifications
+-- the target parent can already persist through
+-- `ApplyError::public_code` (`creation_evidence_lost` from main's 0075
+-- work, and `resource_vanished`) — previously legal rows must stay legal
+-- under every merge order. If #220 lands afterward, its migration must
+-- retain `deployment_retry_exhausted` (and the two engine codes above):
+-- both sides converge to this same allowlist.
 ALTER TABLE deployment_apply_jobs
     DROP CONSTRAINT deployment_apply_jobs_last_error_code_check;
 
@@ -28,8 +33,10 @@ ALTER TABLE deployment_apply_jobs
             'invalid_live_mutation_generation',
             'stale_mutation_generation',
             'provider_generation_not_applied',
+            'creation_evidence_lost',
             'missing_resource_identity',
             'resource_not_found',
+            'resource_vanished',
             'mutation_conflict_exhausted',
             'namespace_not_ready',
             'rollout_timeout',

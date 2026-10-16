@@ -2062,17 +2062,14 @@ async fn process_apply_job(
                         error_code = DEPLOYMENT_RETRY_EXHAUSTED_MESSAGE,
                         "terminalized transient contention retries"
                     );
-                    // The terminal publisher enqueued signed-policy revocation;
-                    // converge it immediately rather than waiting for the poller.
-                    if let Err(reconcile_error) =
-                        reconcile_pending_kbs_for_apply(&state, deployment_id).await
-                    {
-                        tracing::error!(
-                            deployment_id = %deployment_id,
-                            error_code = reconcile_error.code(),
-                            "contention exhaustion revocation remains durably pending"
-                        );
-                    }
+                    // The transient failures that fed this requeue loop may
+                    // have left partial provider state (namespace objects,
+                    // routes) behind, and the bare terminal publisher above
+                    // does not compensate. Reacquire this generation's
+                    // fences and run the same compensating cleanup an
+                    // immediate terminal apply failure runs, then converge
+                    // the signed-policy revocation that publication enqueued.
+                    compensate_after_retry_exhaustion(&state, &job, &payload.app).await;
                 }
                 Ok(false) => {}
                 Err(retry_error) => {
@@ -2190,6 +2187,119 @@ async fn requeue_or_exhaust_apply_job(
     }
     requeue_apply_job(pool, job).await?;
     Ok(false)
+}
+
+/// Reacquire this generation's provider fences and run the compensating
+/// cleanup that an immediate terminal apply failure runs through
+/// `fail_apply_job_with_mutation` (Codex P2, #260 review): the exhaustion
+/// path publishes through the bare publisher because the transient error
+/// released — or lost — the mutation lease before the horizon tripped, yet
+/// the failed attempts may still have left partial namespace or route state
+/// behind. Publication arms the durable `cleanup_sweep_incomplete` marker,
+/// so a crash between publication and this compensation leaves the sweep
+/// retryable for a later failed generation instead of wedging the app.
+/// Best effort throughout: a Busy reacquisition means another live
+/// generation owns the lanes (its own terminal path owns compensation), and
+/// the periodic reconcilers retain convergence for every skipped step.
+async fn compensate_after_retry_exhaustion(state: &AppState, job: &ClaimedJob, app: &App) {
+    let mut resources = vec![
+        crate::mutation_leases::ResourceFence::new("kubernetes_namespace", &app.namespace),
+        crate::mutation_leases::ResourceFence::kbs_policy(),
+        crate::mutation_leases::ResourceFence::edge_config(),
+        crate::mutation_leases::ResourceFence::edge(&app.domain),
+    ];
+    if let Some(tee_domain) = app.tee_domain.as_deref() {
+        resources.push(crate::mutation_leases::ResourceFence::edge(tee_domain));
+    }
+    if let Some(custom_domain) = app.custom_domain.as_deref() {
+        resources.push(crate::mutation_leases::ResourceFence::edge(custom_domain));
+    }
+    let mut mutation = match crate::mutation_leases::claim(
+        state,
+        job.app_id,
+        "deployment_apply",
+        job.deployment_id,
+        false,
+        resources,
+    )
+    .await
+    {
+        Ok(mutation) => mutation,
+        Err(claim_error) => {
+            // Busy: another live generation of this app owns the lanes —
+            // its own terminal path owns compensation for the provider
+            // state, and the row-level gate in
+            // cleanup_after_terminal_apply_failure would skip this
+            // generation anyway. AppUnavailable: the delete flow tears the
+            // provider state down itself. Either way the sweep stays durably
+            // armed; converge only the enqueued revocation under an
+            // independent global fence.
+            tracing::warn!(
+                deployment_id = %job.deployment_id,
+                app_id = %job.app_id,
+                error_code = DeploymentJobError::from(claim_error).code(),
+                "retry-exhaustion compensating cleanup skipped: provider fences unavailable"
+            );
+            if let Err(reconcile_error) =
+                reconcile_pending_kbs_for_apply(state, job.deployment_id).await
+            {
+                tracing::error!(
+                    deployment_id = %job.deployment_id,
+                    error_code = reconcile_error.code(),
+                    "retry-exhaustion revocation remains durably pending"
+                );
+            }
+            return;
+        }
+    };
+    let cleanup_outcome = crate::deployment_failure_cleanup::cleanup_after_terminal_apply_failure(
+        state,
+        app,
+        job.deployment_id,
+        &mut mutation,
+        false,
+    )
+    .await;
+    // The terminal publisher enqueued signed-policy revocation; converge it
+    // under the same lease rather than waiting for the poller.
+    if reconcile_pending_kbs_with_mutation(state, &mutation)
+        .await
+        .is_ok()
+    {
+        if let Err(release_error) = release_kbs_resource(&state.db, &mut mutation).await {
+            tracing::error!(
+                deployment_id = %job.deployment_id,
+                error_code = release_error.code(),
+                "failed to release reconciled global KBS mutation fence"
+            );
+        }
+    } else {
+        tracing::error!(
+            deployment_id = %job.deployment_id,
+            error_code = "kbs_policy_reconciliation_failed",
+            "retry-exhaustion revocation remains durably pending"
+        );
+    }
+    // RetainNamespaceFence implies the retained-namespace marker was already
+    // persisted before the namespace DELETE: keep the namespace fence armed
+    // until reconciliation confirms absence, mirroring the immediate
+    // terminal-failure path. Every other outcome releases through the
+    // bounded reclaim quarantine.
+    if matches!(
+        cleanup_outcome,
+        crate::deployment_failure_cleanup::CleanupFenceOutcome::RetainNamespaceFence
+    ) {
+        tracing::info!(
+            deployment_id = %job.deployment_id,
+            "retry-exhaustion cleanup retained the namespace fence until reconciliation"
+        );
+    } else if let Err(release_error) = mutation.release_after_provider_quarantine().await {
+        tracing::error!(
+            deployment_id = %job.deployment_id,
+            error_code = DeploymentJobError::from(release_error).code(),
+            "failed to bound retry-exhausted deployment mutation leases"
+        );
+    }
 }
 
 async fn fail_unreadable_job(pool: &PgPool, claimed: &ClaimedJob, claimed_state: &str) {
@@ -5241,6 +5351,223 @@ pub(crate) mod tests {
             .execute(&pool)
             .await
             .expect("delete exhaustion fixture");
+    }
+
+    #[test]
+    fn every_apply_error_public_code_is_persistable_by_the_exhaustion_migration() {
+        let migration = include_str!("../migrations/0076_apply_job_retry_exhausted_code.sql");
+        // Each allowlist entry sits on its own quoted line inside the
+        // CHECK's IN (...); the exhaustive-match guard below makes this test
+        // fail to compile when an ApplyError variant is added without
+        // extending the migration's allowlist.
+        let allowed: std::collections::HashSet<&str> = migration
+            .lines()
+            .filter_map(|line| {
+                let trimmed = line.trim().trim_end_matches(',');
+                trimmed
+                    .strip_prefix('\'')
+                    .and_then(|quoted| quoted.strip_suffix('\''))
+            })
+            .collect();
+        assert!(
+            allowed.contains("deployment_retry_exhausted"),
+            "the exhaustion code itself must be persistable"
+        );
+        assert!(
+            allowed.contains("creation_evidence_lost") && allowed.contains("resource_vanished"),
+            "the engine classifications the target parent can already persist must stay legal"
+        );
+        use enclava_engine::apply::engine::ApplyError;
+        let samples: Vec<ApplyError> = vec![
+            ApplyError::Kube(kube::Error::Service("allowlist probe".into())),
+            ApplyError::ProviderWriteTimeout,
+            ApplyError::InvalidMutationGeneration(0),
+            ApplyError::InvalidLiveMutationGeneration {
+                kind: "Deployment".to_string(),
+                name: "app".to_string(),
+            },
+            ApplyError::StaleMutationGeneration {
+                kind: "Deployment".to_string(),
+                name: "app".to_string(),
+                desired: 2,
+                actual: 1,
+            },
+            ApplyError::VanishedResource {
+                kind: "Deployment".to_string(),
+                name: "app".to_string(),
+            },
+            ApplyError::ProviderGenerationNotApplied {
+                kind: "Deployment".to_string(),
+                name: "app".to_string(),
+                expected: 2,
+                actual: 1,
+            },
+            ApplyError::CreationEvidenceLost {
+                kind: "Deployment".to_string(),
+                name: "app".to_string(),
+                key: "cap.enclava.dev/created-by".to_string(),
+            },
+            ApplyError::MissingResourceIdentity("object".to_string()),
+            ApplyError::ResourceNotFound {
+                kind: "Deployment".to_string(),
+                name: "app".to_string(),
+            },
+            ApplyError::MutationConflictExhausted {
+                kind: "Deployment".to_string(),
+                name: "app".to_string(),
+            },
+            ApplyError::NamespaceNotReady("namespace".to_string()),
+            ApplyError::RolloutTimeout(Duration::from_secs(1), "budget elapsed".to_string()),
+            ApplyError::RolloutFailed("rollout failed".to_string()),
+            ApplyError::CleanupStepFailed {
+                step: "route".to_string(),
+                detail: "route cleanup failed".to_string(),
+            },
+            ApplyError::ManifestGeneration("manifest generation failed".to_string()),
+            ApplyError::Serialization(
+                serde_json::from_str::<serde_json::Value>("not json").expect_err("serde error"),
+            ),
+        ];
+        for error in &samples {
+            // Exhaustiveness guard: a new ApplyError variant that is not
+            // listed here fails to compile, forcing the sample list (and
+            // the migration allowlist) to grow with it.
+            let code = match error {
+                ApplyError::Kube(_)
+                | ApplyError::ProviderWriteTimeout
+                | ApplyError::InvalidMutationGeneration(_)
+                | ApplyError::InvalidLiveMutationGeneration { .. }
+                | ApplyError::StaleMutationGeneration { .. }
+                | ApplyError::ProviderGenerationNotApplied { .. }
+                | ApplyError::CreationEvidenceLost { .. }
+                | ApplyError::MissingResourceIdentity(_)
+                | ApplyError::ResourceNotFound { .. }
+                | ApplyError::MutationConflictExhausted { .. }
+                | ApplyError::VanishedResource { .. }
+                | ApplyError::NamespaceNotReady(_)
+                | ApplyError::RolloutTimeout(_, _)
+                | ApplyError::RolloutFailed(_)
+                | ApplyError::CleanupStepFailed { .. }
+                | ApplyError::ManifestGeneration(_)
+                | ApplyError::Serialization(_) => error.public_code(),
+            };
+            assert!(
+                allowed.contains(code),
+                "ApplyError::public_code {code:?} is missing from the final \
+                 last_error_code CHECK allowlist in \
+                 0076_apply_job_retry_exhausted_code.sql"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_exhaustion_runs_compensating_cleanup_and_frees_the_fences() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _setup_handle, payload) = insert_job_fixture(&pool).await;
+        let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim setup")
+            .expect("setup exists");
+        mark_setup_accepted(&pool, deployment_id, setup.lock_token)
+            .await
+            .expect("accept setup");
+        let apply = claim_job(&pool, "pending", "running", Some(deployment_id))
+            .await
+            .expect("claim apply")
+            .expect("apply exists");
+        sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET contention_started_at = clock_timestamp() - '31 days'::interval
+              WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("age contention past the horizon");
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.side_effect_admission = Arc::new(tokio::sync::Semaphore::new(2));
+        assert!(
+            requeue_or_exhaust_apply_job(&state.db, &apply)
+                .await
+                .expect("terminalize exhausted contention")
+        );
+        // The exhaustion terminalization must reacquire this generation's
+        // fences and run the compensating cleanup instead of returning from
+        // the bare publisher. No Kubernetes API server is reachable from
+        // tests, so the cleanup fails closed and keeps the durable
+        // retryable-sweep marker armed — the observable contract is that
+        // compensation ran, converged, and left the lanes claimable again
+        // instead of wedging every later generation of this app.
+        compensate_after_retry_exhaustion(&state, &apply, &payload.app).await;
+        let (job_error, sweep_armed): (Option<String>, bool) = sqlx::query_as(
+            "SELECT job.last_error_code, deployment.cleanup_sweep_incomplete
+               FROM deployment_apply_jobs AS job
+               JOIN deployments AS deployment ON deployment.id = job.deployment_id
+              WHERE job.deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load compensated exhaustion state");
+        assert_eq!(job_error.as_deref(), Some("deployment_retry_exhausted"));
+        assert!(
+            sweep_armed,
+            "an uninspectable namespace must keep the retryable-sweep marker armed"
+        );
+        // The reacquired fences must be released through the bounded reclaim
+        // quarantine — finite horizons, never the infinite retained-namespace
+        // marker — so a later generation of this app reclaims them without
+        // operator action instead of wedging on permanent Busy.
+        let (app_lane_bounded, namespace_fence_bounded): (Option<bool>, Option<bool>) =
+            sqlx::query_as(
+                "SELECT
+                    (SELECT locked_until < 'infinity'::timestamptz
+                            AND reclaim_after < 'infinity'::timestamptz
+                       FROM app_mutation_leases
+                      WHERE app_id = $1),
+                    (SELECT reclaim_after < 'infinity'::timestamptz
+                       FROM external_resource_mutation_leases
+                      WHERE resource_scope = 'kubernetes_namespace'
+                        AND resource_key = $2)",
+            )
+            .bind(app.id)
+            .bind(&app.namespace)
+            .fetch_one(&pool)
+            .await
+            .expect("load post-compensation lease horizons");
+        assert_eq!(
+            app_lane_bounded,
+            Some(true),
+            "the reacquired app lane must keep a finite reclaim horizon"
+        );
+        assert_eq!(
+            namespace_fence_bounded,
+            Some(true),
+            "the namespace fence must be bounded for reclaim, not retained forever"
+        );
+        // The bounded reclaim quarantine deliberately keeps the reacquired
+        // fences held until the reclaim sweeper frees them. No sweeper runs
+        // between tests, and the quarantined global kbs_policy/edge_config
+        // fences would return Busy to every later test claiming them on the
+        // shared test database — so remove this test's fences explicitly,
+        // mirroring the teardown the other fence-holding tests perform.
+        sqlx::query(
+            "DELETE FROM external_resource_mutation_leases
+              WHERE resource_key IN ('global', $1, $2, $3, $4)",
+        )
+        .bind(&app.namespace)
+        .bind(&app.domain)
+        .bind(app.tee_domain.as_deref())
+        .bind(app.custom_domain.as_deref())
+        .execute(&pool)
+        .await
+        .expect("remove quarantined exhaustion fences");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete compensation fixture");
     }
 
     #[tokio::test]
