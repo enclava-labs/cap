@@ -304,6 +304,19 @@ fn cosign_registry_host_pattern_error(pattern: &str) -> Option<&'static str> {
     None
 }
 
+/// Codex review on #243, P2: only one of
+/// `COSIGN_REGISTRY_USERNAME`/`COSIGN_REGISTRY_PASSWORD` being set attaches no
+/// credential at all (`is_configured` stays false), so every private-registry
+/// verification silently runs anonymously — fail fast at startup instead.
+fn incomplete_basic_pair_error(username: Option<&str>, password: Option<&str>) -> Option<String> {
+    (username.is_some() != password.is_some()).then(|| {
+        "COSIGN_REGISTRY_USERNAME and COSIGN_REGISTRY_PASSWORD must be set together: an \
+         incomplete pair attaches no registry credential, so every private-registry \
+         verification would silently run anonymously"
+            .to_string()
+    })
+}
+
 /// Startup validation (issue #225): platform `COSIGN_*` registry credentials
 /// without an explicit `COSIGN_REGISTRY_ALLOWED_HOSTS` scope are refused —
 /// silently downgrading every registry to anonymous would break private-
@@ -328,6 +341,16 @@ pub fn cosign_registry_credentials_startup_error() -> Option<String> {
                 invalid.join(", ")
             ));
         }
+    }
+    // Codex review on #243, P2: an incomplete basic pair attaches no
+    // credential at all (every private-registry verification would silently
+    // run anonymously), so it must surface as the fail-fast configuration
+    // error this gate exists for — not as "no credential configured".
+    if let Some(error) = incomplete_basic_pair_error(
+        env_nonempty("COSIGN_REGISTRY_USERNAME").as_deref(),
+        env_nonempty("COSIGN_REGISTRY_PASSWORD").as_deref(),
+    ) {
+        return Some(error);
     }
     if patterns.iter().any(|pattern| pattern == "*") {
         tracing::warn!(
@@ -1796,6 +1819,18 @@ mod tests {
             auth,
             Auth::Basic(username, password) if username == "cap-bot" && password == "ghp_example"
         ));
+    }
+
+    /// Codex review on #243, P2: only one of USERNAME/PASSWORD being set
+    /// attaches no credential at all (`is_configured` stays false), so every
+    /// private-registry verification would silently run anonymously — the
+    /// startup gate must refuse the incomplete pair instead.
+    #[test]
+    fn incomplete_basic_credentials_are_a_startup_error() {
+        assert!(incomplete_basic_pair_error(Some("cap-bot"), None).is_some());
+        assert!(incomplete_basic_pair_error(None, Some("ghp_example")).is_some());
+        assert!(incomplete_basic_pair_error(None, None).is_none());
+        assert!(incomplete_basic_pair_error(Some("cap-bot"), Some("ghp_example")).is_none());
     }
 
     /// Issue #225: platform COSIGN_* credentials must never be forwarded to a

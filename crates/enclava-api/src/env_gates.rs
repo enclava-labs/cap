@@ -159,11 +159,21 @@ fn enforce_with(
         // exact #225 leak as an explicit opt-in. Same bar as
         // CAP_ALLOW_PRODUCTION_INTERNAL_EGRESS: it must never ride into a
         // release build implicitly, so it requires a second explicit
-        // production acknowledgment.
+        // production acknowledgment. The gate only matters when a credential
+        // exists to forward (Codex review on #243, P2): with no
+        // COSIGN_REGISTRY_* credential configured the wildcard is inert —
+        // nothing is ever attached — so deployments that stage the allowlist
+        // before enabling credentials must not be startup-fatal.
         let production_all_hosts_allowed =
             lookup("COSIGN_REGISTRY_ALLOW_ALL_HOSTS").is_some_and(|value| flag_is_truthy(&value));
+        let cosign_credential = |name: &str| lookup(name).filter(|value| !value.trim().is_empty());
+        let registry_credentials_configured = cosign_credential("COSIGN_REGISTRY_BEARER_TOKEN")
+            .is_some()
+            || (cosign_credential("COSIGN_REGISTRY_USERNAME").is_some()
+                && cosign_credential("COSIGN_REGISTRY_PASSWORD").is_some());
         if lookup("COSIGN_REGISTRY_ALLOWED_HOSTS")
             .is_some_and(|raw| raw.split(',').any(|pattern| pattern.trim() == "*"))
+            && registry_credentials_configured
             && !production_all_hosts_allowed
         {
             return Err(EnvGateError::AllHostsCosignRegistryWithoutExplicitAllow(
@@ -637,9 +647,13 @@ mod tests {
         // A bare `*` sends the platform registry credentials to every
         // tenant-chosen registry host (the #225 leak as an opt-in); same
         // second-acknowledgment bar as CAP_ALLOW_PRODUCTION_INTERNAL_EGRESS.
+        // Credentials present (Codex review on #243, P2): only then can the
+        // wildcard forward anything.
         for value in ["*", "ghcr.io, *", " * "] {
             let mut env = ok_required();
             env.insert("COSIGN_REGISTRY_ALLOWED_HOSTS", value);
+            env.insert("COSIGN_REGISTRY_USERNAME", "cap-bot");
+            env.insert("COSIGN_REGISTRY_PASSWORD", "ghp_example");
             let err = run(env, false).unwrap_err();
             assert!(
                 matches!(
@@ -651,6 +665,28 @@ mod tests {
                 "{value:?} must require the production opt-in"
             );
         }
+    }
+
+    #[test]
+    fn release_allows_bare_wildcard_cosign_hosts_without_credentials() {
+        // Codex review on #243, P2: with no COSIGN_REGISTRY_* credential
+        // configured the wildcard is inert — nothing is ever forwarded — so
+        // staging the allowlist before enabling credentials must not demand
+        // the production acknowledgment.
+        let mut env = ok_required();
+        env.insert("COSIGN_REGISTRY_ALLOWED_HOSTS", "*");
+        run(env, false).expect("inert wildcard must not trip the production gate");
+    }
+
+    #[test]
+    fn release_allows_bare_wildcard_with_incomplete_basic_credentials() {
+        // An incomplete basic pair attaches no credential (see
+        // `incomplete_basic_pair_error` in cosign.rs), so the wildcard stays
+        // inert for this gate; the pair itself is a separate startup error.
+        let mut env = ok_required();
+        env.insert("COSIGN_REGISTRY_ALLOWED_HOSTS", "*");
+        env.insert("COSIGN_REGISTRY_USERNAME", "cap-bot");
+        run(env, false).expect("incomplete pair forwards nothing; wildcard is inert");
     }
 
     #[test]
