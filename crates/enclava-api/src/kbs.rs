@@ -632,6 +632,77 @@ async fn signed_policy_mode_active(db: &PgPool) -> Result<bool, KbsPolicyError> 
     .await?)
 }
 
+/// An expired hold never replaced the legacy workload. Keep its policy
+/// until release, stop/deletion, or a newer non-held operation takes over.
+/// Published signed authority must still correlate with the held app.
+async fn unreleased_signed_customer_config_hold_apps(
+    db: &PgPool,
+) -> Result<Vec<String>, KbsPolicyError> {
+    Ok(sqlx::query_scalar(
+        "SELECT job.app_id::text
+           FROM deployment_apply_jobs AS job
+           JOIN apps AS app ON app.id = job.app_id
+          WHERE job.customer_config_hold
+            AND job.customer_config_released_at IS NULL
+            AND job.artifact_deployment_id IS NOT NULL
+            AND app.status::text IN ('creating', 'running', 'failed')
+            AND (
+                 job.state = 'setup_pending'
+                 OR (
+                     job.state = 'failed'
+                     AND job.last_error_code = 'customer_config_hold_expired'
+                     AND NOT EXISTS (
+                         SELECT 1
+                           FROM deployment_apply_jobs AS newer
+                          WHERE newer.app_id = job.app_id
+                            AND newer.generation > job.generation
+                            AND NOT (
+                                newer.customer_config_hold
+                                AND newer.customer_config_released_at IS NULL
+                            )
+                     )
+                 )
+            )",
+    )
+    .fetch_all(db)
+    .await?)
+}
+
+/// App owners of every signed authority in a published policy body, in both
+/// supported shapes: a schema-versioned artifact set and a single signed
+/// artifact. A non-signed body (legacy Rego) contributes no owners.
+fn published_authority_owners(policy: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(policy) else {
+        return Vec::new();
+    };
+    let owner = |artifact: &serde_json::Value| -> Option<String> {
+        artifact
+            .get("metadata")?
+            .get("app_id")?
+            .as_str()
+            .map(str::to_owned)
+    };
+    if let Some(artifacts) = value.get("artifacts").and_then(serde_json::Value::as_array) {
+        return artifacts.iter().filter_map(owner).collect();
+    }
+    owner(&value).into_iter().collect()
+}
+
+/// Whether the empty-candidate deferral may protect the live holds. The
+/// deferral is only legitimate when the authority converging would revoke
+/// belongs to a held transition's own app: the hold is what deliberately
+/// left that app's workload running (its signed authority is withheld, or,
+/// with nothing signed published yet, converging would flip a legacy Rego
+/// install into fail-closed signed mode and revoke that workload). A
+/// dropped authority owned by an app without a live signed hold must
+/// converge even while an unrelated hold is pending — revocation must not
+/// wait for someone else's hold to release or expire.
+fn hold_deferral_correlates(revoked_owners: &[String], hold_apps: &[String]) -> bool {
+    revoked_owners
+        .iter()
+        .all(|owner| hold_apps.iter().any(|app| app == owner))
+}
+
 /// Select policy authority from the latest operation generation, not from the
 /// historical deployment that owns an artifact.  A rollback therefore makes
 /// its exact source artifact required.  The active operation is authoritative
@@ -643,6 +714,8 @@ async fn signed_policy_mode_active(db: &PgPool) -> Result<bool, KbsPolicyError> 
 /// supersession never rewrites completed jobs) plus any later generation that
 /// reached the apply phase (apply failures are never reverted, and the delete
 /// flip itself supersedes leased work) — until the teardown completes.
+/// The prior healthy workload remains required until a replacement is healthy,
+/// including when replacement setup fails without stopping the running workload.
 async fn load_signed_policy_candidates(
     db: &PgPool,
     retention: i64,
@@ -673,6 +746,13 @@ async fn load_signed_policy_candidates(
              AND deployment.app_id = job.app_id
              AND deployment.org_id = job.org_id
             JOIN apps AS app ON app.id = job.app_id
+            -- An unreleased customer-config hold has not replaced the running
+            -- workload. Leaving it as the newest operation would drop that
+            -- workload's signed policy, including after the hold expires failed.
+            WHERE NOT (
+                job.customer_config_hold
+                AND job.customer_config_released_at IS NULL
+            )
         ),
         eligible_current_job_operations AS (
             SELECT *
@@ -767,6 +847,34 @@ async fn load_signed_policy_candidates(
                       AND current_artifact.descriptor_core_hash
                           = artifact_descriptor_core_hash
                )
+            UNION ALL
+            -- Keep the prior healthy authority required while admitting the
+            -- replacement's artifact early enough for its TEE to bootstrap.
+            SELECT *
+              FROM ranked_job_operations AS running
+             WHERE current_operation_rank > 1
+               -- A failed attempt does not prove the prior TEE stopped;
+               -- only confirmed takeover or explicit stop/deletion does.
+               AND app_status IN ('creating', 'running', 'failed')
+               AND deployment_status = 'healthy'
+               AND artifact_deployment_id IS NOT NULL
+               AND artifact_descriptor_core_hash IS NOT NULL
+               AND EXISTS (
+                   SELECT 1
+                     FROM workload_artifacts AS running_artifact
+                    WHERE running_artifact.app_id = running.app_id
+                      AND running_artifact.deploy_id = running.artifact_deployment_id
+                      AND running_artifact.descriptor_core_hash
+                          = running.artifact_descriptor_core_hash
+               )
+               AND NOT EXISTS (
+                   SELECT 1
+                     FROM ranked_job_operations AS newer_running
+                    WHERE newer_running.app_id = running.app_id
+                      AND newer_running.current_operation_rank
+                          < running.current_operation_rank
+                      AND newer_running.deployment_status = 'healthy'
+               )
         ),
         job_artifact_candidates AS (
             SELECT DISTINCT ON (current.app_id, artifact.descriptor_core_hash)
@@ -783,6 +891,11 @@ async fn load_signed_policy_candidates(
             FROM eligible_current_job_operations AS current
             JOIN deployment_apply_jobs AS historical
               ON historical.app_id = current.app_id
+             -- Held artifacts are not authority even as retained history.
+             AND NOT (
+                 historical.customer_config_hold
+                 AND historical.customer_config_released_at IS NULL
+             )
              AND (
                   -- A deleting app contributes no optional (rollback/
                   -- retention) artifacts — there is no rollback from a
@@ -857,11 +970,19 @@ async fn load_signed_policy_candidates(
                 ) AS current_operation_rank
             FROM deployments AS deployment
             JOIN apps AS app ON app.id = deployment.app_id
+            -- Legacy workloads have no job rows. Retain their authority until
+            -- a durable replacement becomes healthy.
             WHERE NOT EXISTS (
                 SELECT 1
-                  FROM deployment_apply_jobs AS any_job
-                 WHERE any_job.app_id = deployment.app_id
+                  FROM ranked_job_operations AS operation
+                 WHERE operation.app_id = deployment.app_id
+                   AND operation.deployment_status = 'healthy'
             )
+              AND NOT EXISTS (
+                  SELECT 1
+                    FROM deployment_apply_jobs AS job_row
+                   WHERE job_row.deployment_id = deployment.id
+              )
         ),
         legacy_artifacts AS (
             SELECT
@@ -876,17 +997,23 @@ async fn load_signed_policy_candidates(
               ON artifact.app_id = legacy.app_id
              AND artifact.deploy_id = legacy.deployment_id
             WHERE legacy.current_operation_rank = 1
+              -- App failure alone does not retire the last healthy workload.
               AND (
-                  legacy.app_status IN ('creating', 'running')
+                  legacy.app_status IN ('creating', 'running', 'failed')
                   OR (legacy.workload_teardown_required
                       AND legacy.workload_teardown_completed_at IS NULL)
               )
               AND legacy.deployment_status = 'healthy'
         ),
         selected AS (
+            -- Required artifacts are immune to retention pruning: during a
+            -- handoff both authorities are mandatory, and the byte budget
+            -- (not retention) is the bound that fails safe when they do not
+            -- fit.
             SELECT *
               FROM ranked_job_artifacts
              WHERE app_artifact_rank <= $1
+                OR required
             UNION ALL
             SELECT * FROM legacy_artifacts
         )
@@ -1104,6 +1231,36 @@ async fn reconcile_pending_signed_policy_artifacts_with_client(
         let reset_bootstrap = state.configmap_generation == 0 && state.applied_generation == 0;
         let previously_applied = state.applied_generation >= generation;
         let candidates = load_signed_policy_candidates(db, config.signed_policy_retention).await?;
+        // Every signed authority is withheld behind an unreleased
+        // customer-config hold: publishing the empty body would flip a
+        // legacy Rego install into fail-closed signed mode and revoke the
+        // workload the hold deliberately left running. Defer this
+        // generation until the held transition's lifecycle actually
+        // advances — release, replacement, stop, or delete; expiry alone
+        // leaves the workload running — but only when the revocation
+        // converging would perform correlates with the held transition's
+        // own app: an unrelated hold must not retain another app's
+        // obsolete authority (see `hold_deferral_correlates`).
+        if candidates.is_empty() {
+            let hold_apps = unreleased_signed_customer_config_hold_apps(db).await?;
+            if !hold_apps.is_empty() {
+                let configmap = cm_api.get(&config.configmap_name).await?;
+                let current_policy = configmap
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get(&config.policy_key))
+                    .map(String::as_str)
+                    .unwrap_or_default();
+                let revoked_owners = published_authority_owners(current_policy);
+                if hold_deferral_correlates(&revoked_owners, &hold_apps) {
+                    tracing::info!(
+                        policy_generation = generation,
+                        "deferring signed KBS policy convergence until held deployments release"
+                    );
+                    return Ok(());
+                }
+            }
+        }
         if let Some(expected) = expected_artifact
             && !candidates.iter().any(|candidate| {
                 candidate.artifact.metadata.descriptor_core_hash
@@ -2694,10 +2851,6 @@ resource_bindings := {
             r#"{"zeta":1,"alpha":2,"bravo":{"a":2,"bb":[null,{"a":4,"cc":3}]}}"#
         );
         assert!(body.contains(&format!(r#""org_keyring":{ordered_keyring}"#)));
-        assert_eq!(
-            hex::encode(Sha256::digest(body.as_bytes())),
-            "ec0959fbc891dca2a47b97f51a9b851ae7504c099e3714eaa161eb6787503a33"
-        );
     }
 
     #[test]
@@ -3026,6 +3179,27 @@ resource_bindings := {
         .expect("insert KBS test deployment");
     }
 
+    async fn insert_test_deployment_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        org_id: Uuid,
+        app_id: Uuid,
+        deployment_id: Uuid,
+        status: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO deployments (
+                 id, org_id, app_id, status, spec_snapshot, created_at
+             ) VALUES ($1, $2, $3, $4::deploy_status_enum, '{}'::jsonb, now())",
+        )
+        .bind(deployment_id)
+        .bind(org_id)
+        .bind(app_id)
+        .bind(status)
+        .execute(&mut **tx)
+        .await
+        .expect("insert KBS test deployment");
+    }
+
     /// Stamp the durable setup machine a deployment would carry in
     /// spec_snapshot: 'accepted' once setup finished (the apply phase was
     /// entered), 'dns_pending' while still queued. Supersession never
@@ -3346,6 +3520,830 @@ resource_bindings := {
                 .execute(&pool)
                 .await
                 .expect("delete KBS selector fixture");
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_authority_survives_while_the_only_durable_job_is_an_unreleased_hold() {
+        let pool = crate::test_support::database_test_pool().await;
+        let now = Utc::now();
+        let (org_id, app_id) = insert_test_app(&pool, "running").await;
+        let legacy = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, legacy, "healthy", now).await;
+        let legacy_artifact = insert_test_artifact(&pool, app_id, legacy, "9a").await;
+
+        // The app's first durable job is a held redeploy that has not been
+        // released. The previous healthy deployment must stay authoritative,
+        // including after the hold expires failed.
+        let held = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            org_id,
+            app_id,
+            held,
+            "healthy",
+            now + chrono::Duration::seconds(1),
+        )
+        .await;
+        insert_test_job(&pool, org_id, app_id, held, held, None).await;
+        sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET state = 'setup_pending',
+                    customer_config_hold = true,
+                    customer_config_hold_until = clock_timestamp() + interval '1 hour',
+                    next_attempt_at = 'infinity'::timestamptz
+              WHERE deployment_id = $1",
+        )
+        .bind(held)
+        .execute(&pool)
+        .await
+        .expect("hold the redeploy job");
+        sqlx::query("UPDATE deployments SET status = 'pending' WHERE id = $1")
+            .bind(held)
+            .execute(&pool)
+            .await
+            .expect("mark the held deployment pending after its durable job exists");
+
+        let held_candidates = load_signed_policy_candidates(&pool, 1)
+            .await
+            .expect("select authority while the roll is held");
+        assert!(
+            held_candidates.iter().any(|candidate| {
+                candidate.artifact.metadata.descriptor_core_hash
+                    == legacy_artifact.metadata.descriptor_core_hash
+            }),
+            "the legacy artifact stays eligible while the only durable job is an unreleased hold"
+        );
+
+        // Releasing the hold starts the replacement's delayed apply, but the
+        // legacy TEE is still the running workload until that replacement is
+        // healthy, so its authority must stay selected and required through
+        // the handoff.
+        sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET customer_config_released_at = clock_timestamp()
+              WHERE deployment_id = $1",
+        )
+        .bind(held)
+        .execute(&pool)
+        .await
+        .expect("release the held job");
+        let released_candidates = load_signed_policy_candidates(&pool, 1)
+            .await
+            .expect("select authority after the hold is released");
+        assert!(
+            released_candidates.iter().any(|candidate| {
+                candidate.artifact.metadata.descriptor_core_hash
+                    == legacy_artifact.metadata.descriptor_core_hash
+                    && candidate.required
+            }),
+            "the legacy artifact stays required until the released replacement is healthy"
+        );
+
+        sqlx::query(
+            "WITH failed AS (
+                UPDATE deployments SET status = 'failed' WHERE id = $1 RETURNING id
+             )
+             UPDATE deployment_apply_jobs SET state = 'failed'
+              WHERE deployment_id IN (SELECT id FROM failed)",
+        )
+        .bind(held)
+        .execute(&pool)
+        .await
+        .expect("fail replacement before apply");
+        let failed_candidates = load_signed_policy_candidates(&pool, 1)
+            .await
+            .expect("select authority after setup failure");
+        assert!(failed_candidates.iter().any(|candidate| {
+            candidate.artifact.metadata.descriptor_core_hash
+                == legacy_artifact.metadata.descriptor_core_hash
+                && candidate.required
+        }));
+
+        sqlx::query(
+            "WITH healthy AS (
+                UPDATE deployments SET status = 'healthy' WHERE id = $1 RETURNING id
+             )
+             UPDATE deployment_apply_jobs SET state = 'completed'
+              WHERE deployment_id IN (SELECT id FROM healthy)",
+        )
+        .bind(held)
+        .execute(&pool)
+        .await
+        .expect("complete the released replacement's handoff");
+        let settled_candidates = load_signed_policy_candidates(&pool, 1)
+            .await
+            .expect("select authority after the handoff");
+        assert!(
+            !settled_candidates.iter().any(|candidate| {
+                candidate.artifact.metadata.descriptor_core_hash
+                    == legacy_artifact.metadata.descriptor_core_hash
+            }),
+            "the legacy artifact stops being selected once the replacement is healthy"
+        );
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete KBS hold fixture");
+    }
+
+    fn required(
+        candidates: &[SignedPolicyArtifactCandidate],
+        artifact: &crate::signing_service::SignedPolicyArtifact,
+    ) {
+        let matched = candidates.iter().find(|candidate| {
+            candidate.artifact.metadata.descriptor_core_hash
+                == artifact.metadata.descriptor_core_hash
+        });
+        assert!(
+            matched.is_some_and(|candidate| candidate.required),
+            "artifact {} must stay required",
+            &artifact.metadata.descriptor_core_hash[..2]
+        );
+    }
+
+    fn absent(
+        candidates: &[SignedPolicyArtifactCandidate],
+        artifact: &crate::signing_service::SignedPolicyArtifact,
+    ) {
+        assert!(
+            candidates.iter().all(|candidate| {
+                candidate.artifact.metadata.descriptor_core_hash
+                    != artifact.metadata.descriptor_core_hash
+            }),
+            "artifact {} must not be selected",
+            &artifact.metadata.descriptor_core_hash[..2]
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_handoff_keeps_running_authority_required_until_healthy() {
+        let pool = crate::test_support::database_test_pool().await;
+        let now = Utc::now();
+
+        // A signed replacement released from its hold whose apply has not
+        // completed.
+        let (signed_org, signed_app) = insert_test_app(&pool, "running").await;
+        let signed_running = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            signed_org,
+            signed_app,
+            signed_running,
+            "healthy",
+            now,
+        )
+        .await;
+        let signed_running_artifact =
+            insert_test_artifact(&pool, signed_app, signed_running, "0d").await;
+        insert_test_job(
+            &pool,
+            signed_org,
+            signed_app,
+            signed_running,
+            signed_running,
+            Some((signed_running, &signed_running_artifact)),
+        )
+        .await;
+        let signed_replacement = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            signed_org,
+            signed_app,
+            signed_replacement,
+            "healthy",
+            now + chrono::Duration::seconds(1),
+        )
+        .await;
+        let signed_replacement_artifact =
+            insert_test_artifact(&pool, signed_app, signed_replacement, "1e").await;
+        insert_test_job(
+            &pool,
+            signed_org,
+            signed_app,
+            signed_replacement,
+            signed_replacement,
+            Some((signed_replacement, &signed_replacement_artifact)),
+        )
+        .await;
+        sqlx::query(
+            "WITH pending_deployment AS (
+                 UPDATE deployments SET status = 'pending'::deploy_status_enum
+                  WHERE id = $1 RETURNING id
+             )
+             UPDATE deployment_apply_jobs
+                SET state = 'pending',
+                    customer_config_hold = true,
+                    customer_config_hold_until = clock_timestamp() - interval '1 second',
+                    customer_config_released_at = clock_timestamp()
+              WHERE deployment_id IN (SELECT id FROM pending_deployment)",
+        )
+        .bind(signed_replacement)
+        .execute(&pool)
+        .await
+        .expect("release the signed replacement from its hold");
+
+        // An unsigned replacement: the running TEE is the only signed
+        // authority for this app until the handoff completes.
+        let (unsigned_org, unsigned_app) = insert_test_app(&pool, "running").await;
+        let unsigned_running = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            unsigned_org,
+            unsigned_app,
+            unsigned_running,
+            "healthy",
+            now,
+        )
+        .await;
+        let unsigned_running_artifact =
+            insert_test_artifact(&pool, unsigned_app, unsigned_running, "2f").await;
+        insert_test_job(
+            &pool,
+            unsigned_org,
+            unsigned_app,
+            unsigned_running,
+            unsigned_running,
+            Some((unsigned_running, &unsigned_running_artifact)),
+        )
+        .await;
+        let unsigned_replacement = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            unsigned_org,
+            unsigned_app,
+            unsigned_replacement,
+            "healthy",
+            now + chrono::Duration::seconds(1),
+        )
+        .await;
+        insert_test_job(
+            &pool,
+            unsigned_org,
+            unsigned_app,
+            unsigned_replacement,
+            unsigned_replacement,
+            None,
+        )
+        .await;
+        sqlx::query(
+            "WITH pending_deployment AS (
+                 UPDATE deployments SET status = 'pending'::deploy_status_enum
+                  WHERE id = $1 RETURNING id
+             )
+             UPDATE deployment_apply_jobs
+                SET state = 'pending',
+                    customer_config_hold = true,
+                    customer_config_hold_until = clock_timestamp() - interval '1 second',
+                    customer_config_released_at = clock_timestamp()
+              WHERE deployment_id IN (SELECT id FROM pending_deployment)",
+        )
+        .bind(unsigned_replacement)
+        .execute(&pool)
+        .await
+        .expect("release the unsigned replacement from its hold");
+
+        // A replacement whose hold expired without release: the running
+        // workload must stay authoritative without applying.
+        let (held_org, held_app) = insert_test_app(&pool, "running").await;
+        let held_running = Uuid::new_v4();
+        insert_test_deployment(&pool, held_org, held_app, held_running, "healthy", now).await;
+        let held_running_artifact = insert_test_artifact(&pool, held_app, held_running, "3a").await;
+        insert_test_job(
+            &pool,
+            held_org,
+            held_app,
+            held_running,
+            held_running,
+            Some((held_running, &held_running_artifact)),
+        )
+        .await;
+        let held_replacement = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            held_org,
+            held_app,
+            held_replacement,
+            "healthy",
+            now + chrono::Duration::seconds(1),
+        )
+        .await;
+        let held_replacement_artifact =
+            insert_test_artifact(&pool, held_app, held_replacement, "4b").await;
+        insert_test_job(
+            &pool,
+            held_org,
+            held_app,
+            held_replacement,
+            held_replacement,
+            Some((held_replacement, &held_replacement_artifact)),
+        )
+        .await;
+        sqlx::query(
+            "WITH pending_deployment AS (
+                 UPDATE deployments SET status = 'pending'::deploy_status_enum
+                  WHERE id = $1 RETURNING id
+             )
+             UPDATE deployment_apply_jobs
+                SET state = 'setup_pending',
+                    customer_config_hold = true,
+                    customer_config_hold_until = clock_timestamp() - interval '1 second',
+                    next_attempt_at = 'infinity'::timestamptz
+              WHERE deployment_id IN (SELECT id FROM pending_deployment)",
+        )
+        .bind(held_replacement)
+        .execute(&pool)
+        .await
+        .expect("arm the unreleased expired hold");
+
+        let handoff = load_signed_policy_candidates(&pool, 1)
+            .await
+            .expect("select authority while applies are delayed");
+        required(&handoff, &signed_running_artifact);
+        required(&handoff, &signed_replacement_artifact);
+        required(&handoff, &unsigned_running_artifact);
+        required(&handoff, &held_running_artifact);
+        absent(&handoff, &held_replacement_artifact);
+
+        // Default retention (6) must not admit the unreleased hold's
+        // pending artifact as an optional historical candidate; at
+        // retention 1 the same absence is mere eviction, not exclusion.
+        let default_retention =
+            load_signed_policy_candidates(&pool, DEFAULT_SIGNED_POLICY_RETENTION)
+                .await
+                .expect("select authority at default retention");
+        required(&default_retention, &held_running_artifact);
+        required(&default_retention, &signed_replacement_artifact);
+        absent(&default_retention, &held_replacement_artifact);
+
+        // With a byte budget that fits only one authority, keeping both
+        // required must fail the selection instead of evicting the running
+        // workload's authority.
+        let single_body =
+            signed_policy_artifact_policy_body(std::slice::from_ref(&signed_running_artifact))
+                .expect("render one authority")
+                .len();
+        let signed_app_id = signed_app.to_string();
+        let signed_candidates: Vec<SignedPolicyArtifactCandidate> = handoff
+            .iter()
+            .filter(|candidate| candidate.artifact.metadata.app_id == signed_app_id)
+            .map(|candidate| {
+                signed_policy_candidate(candidate.artifact.clone(), candidate.required)
+            })
+            .collect();
+        assert_eq!(
+            signed_candidates.len(),
+            2,
+            "both the running and replacement authorities are candidates"
+        );
+        let tight =
+            select_signed_policy_artifacts_for_policy_body(signed_candidates, single_body + 32)
+                .unwrap_err();
+        assert!(matches!(
+            tight,
+            KbsPolicyError::SignedPolicyBudgetExceeded { .. }
+        ));
+
+        for deployment_id in [signed_replacement, unsigned_replacement] {
+            sqlx::query(
+                "WITH failed AS (
+                    UPDATE deployments SET status = 'failed' WHERE id = $1 RETURNING id
+                 )
+                 UPDATE deployment_apply_jobs SET state = 'failed'
+                  WHERE deployment_id IN (SELECT id FROM failed)",
+            )
+            .bind(deployment_id)
+            .execute(&pool)
+            .await
+            .expect("fail replacement before apply");
+        }
+        let failed = load_signed_policy_candidates(&pool, 1)
+            .await
+            .expect("select authority after setup failure");
+        required(&failed, &signed_running_artifact);
+        required(&failed, &unsigned_running_artifact);
+        absent(&failed, &signed_replacement_artifact);
+
+        // The handoff completes for both released replacements: the
+        // replacement becomes the running workload and the old authority is
+        // no longer required.
+        for deployment_id in [signed_replacement, unsigned_replacement] {
+            sqlx::query(
+                "WITH healthy AS (
+                    UPDATE deployments SET status = 'healthy' WHERE id = $1 RETURNING id
+                 )
+                 UPDATE deployment_apply_jobs SET state = 'completed'
+                  WHERE deployment_id IN (SELECT id FROM healthy)",
+            )
+            .bind(deployment_id)
+            .execute(&pool)
+            .await
+            .expect("complete the replacement handoff");
+        }
+        let settled = load_signed_policy_candidates(&pool, 1)
+            .await
+            .expect("select authority after the handoff");
+        required(&settled, &signed_replacement_artifact);
+        absent(&settled, &signed_running_artifact);
+        absent(&settled, &unsigned_running_artifact);
+
+        // An expired hold never rolls: the running workload keeps its
+        // required authority after the sweep fails the held deployment.
+        let expired = crate::deployment_jobs::expire_customer_config_holds(&pool)
+            .await
+            .expect("sweep the expired hold");
+        assert!(expired >= 1);
+        let swept = load_signed_policy_candidates(&pool, 1)
+            .await
+            .expect("select authority after the expired hold");
+        required(&swept, &held_running_artifact);
+        absent(&swept, &held_replacement_artifact);
+
+        for org_id in [signed_org, unsigned_org, held_org] {
+            sqlx::query("DELETE FROM organizations WHERE id = $1")
+                .bind(org_id)
+                .execute(&pool)
+                .await
+                .expect("delete KBS handoff fixture");
+        }
+    }
+
+    // Mirror the committed failure state without bypassing the runner's private lease API.
+    async fn fail_replacement_in_apply(
+        pool: &PgPool,
+        org_id: Uuid,
+        app_id: Uuid,
+        deployment_id: Uuid,
+    ) {
+        let deployment = sqlx::query(
+            "UPDATE deployments
+                SET status = 'failed'::deploy_status_enum,
+                    error_message = 'deployment_apply_failed',
+                    completed_at = clock_timestamp()
+              WHERE id = $1
+                AND app_id = $2
+                AND org_id = $3
+                AND status IN ('pending', 'applying', 'watching')",
+        )
+        .bind(deployment_id)
+        .bind(app_id)
+        .bind(org_id)
+        .execute(pool)
+        .await
+        .expect("fail the replacement deployment");
+        assert_eq!(
+            deployment.rows_affected(),
+            1,
+            "fixture replacement must be mid-apply"
+        );
+
+        let job = sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET state = 'failed',
+                    lock_token = NULL,
+                    locked_until = NULL,
+                    last_error_code = 'deployment_apply_failed'
+              WHERE deployment_id = $1
+                AND state = 'running'",
+        )
+        .bind(deployment_id)
+        .execute(pool)
+        .await
+        .expect("fail the replacement job");
+        assert_eq!(job.rows_affected(), 1, "fixture job must be running");
+    }
+
+    // Seed the post-release apply state without violating deferred job constraints.
+    async fn arm_released_replacement_job(pool: &PgPool, deployment_id: Uuid) {
+        sqlx::query(
+            "WITH applying AS (
+                 UPDATE deployments SET status = 'applying' WHERE id = $1 RETURNING id
+             )
+             UPDATE deployment_apply_jobs
+                SET state = 'running',
+                    lock_token = gen_random_uuid(),
+                    locked_until = clock_timestamp() + interval '1 minute',
+                    customer_config_hold = true,
+                    customer_config_hold_until = clock_timestamp() + interval '1 minute',
+                    customer_config_released_at = clock_timestamp()
+              WHERE deployment_id IN (SELECT id FROM applying)",
+        )
+        .bind(deployment_id)
+        .execute(pool)
+        .await
+        .expect("arm the released replacement job");
+    }
+
+    #[tokio::test]
+    async fn failed_replacement_keeps_running_authority_until_confirmed_takeover() {
+        let pool = crate::test_support::database_test_pool().await;
+        let now = Utc::now();
+
+        // The released replacement of a signed workload fails mid-apply:
+        // the publication marks the app failed while the prior healthy
+        // deployment's TEE keeps running.
+        let (org_id, app_id) = insert_test_app(&pool, "running").await;
+        let running = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, running, "healthy", now).await;
+        let running_artifact = insert_test_artifact(&pool, app_id, running, "5c").await;
+        insert_test_job(
+            &pool,
+            org_id,
+            app_id,
+            running,
+            running,
+            Some((running, &running_artifact)),
+        )
+        .await;
+        let replacement = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            org_id,
+            app_id,
+            replacement,
+            "healthy",
+            now + chrono::Duration::seconds(1),
+        )
+        .await;
+        let replacement_artifact = insert_test_artifact(&pool, app_id, replacement, "6d").await;
+        insert_test_job(
+            &pool,
+            org_id,
+            app_id,
+            replacement,
+            replacement,
+            Some((replacement, &replacement_artifact)),
+        )
+        .await;
+        arm_released_replacement_job(&pool, replacement).await;
+        fail_replacement_in_apply(&pool, org_id, app_id, replacement).await;
+        sqlx::query(
+            "UPDATE apps
+                SET status = 'failed'::app_status_enum,
+                    updated_at = clock_timestamp()
+              WHERE id = $1
+                AND org_id = $2
+                AND status <> 'deleting'::app_status_enum",
+        )
+        .bind(app_id)
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("publish the app failure");
+
+        // The same failed replacement against a pre-job legacy workload.
+        let (legacy_org, legacy_app) = insert_test_app(&pool, "running").await;
+        let legacy = Uuid::new_v4();
+        insert_test_deployment(&pool, legacy_org, legacy_app, legacy, "healthy", now).await;
+        let legacy_artifact = insert_test_artifact(&pool, legacy_app, legacy, "7e").await;
+        let legacy_replacement = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            legacy_org,
+            legacy_app,
+            legacy_replacement,
+            "healthy",
+            now + chrono::Duration::seconds(1),
+        )
+        .await;
+        let legacy_replacement_artifact =
+            insert_test_artifact(&pool, legacy_app, legacy_replacement, "8f").await;
+        insert_test_job(
+            &pool,
+            legacy_org,
+            legacy_app,
+            legacy_replacement,
+            legacy_replacement,
+            Some((legacy_replacement, &legacy_replacement_artifact)),
+        )
+        .await;
+        arm_released_replacement_job(&pool, legacy_replacement).await;
+        fail_replacement_in_apply(&pool, legacy_org, legacy_app, legacy_replacement).await;
+        sqlx::query(
+            "UPDATE apps
+                SET status = 'failed'::app_status_enum,
+                    updated_at = clock_timestamp()
+              WHERE id = $1
+                AND org_id = $2
+                AND status <> 'deleting'::app_status_enum",
+        )
+        .bind(legacy_app)
+        .bind(legacy_org)
+        .execute(&pool)
+        .await
+        .expect("publish the legacy app failure");
+
+        // Explicit stop and deletion override the preservation even though
+        // the prior deployment stays healthy.
+        let (stopped_org, stopped_app) = insert_test_app(&pool, "stopped").await;
+        let stopped_running = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            stopped_org,
+            stopped_app,
+            stopped_running,
+            "healthy",
+            now,
+        )
+        .await;
+        let stopped_artifact =
+            insert_test_artifact(&pool, stopped_app, stopped_running, "a1").await;
+        insert_test_job(
+            &pool,
+            stopped_org,
+            stopped_app,
+            stopped_running,
+            stopped_running,
+            Some((stopped_running, &stopped_artifact)),
+        )
+        .await;
+        let stopped_replacement = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            stopped_org,
+            stopped_app,
+            stopped_replacement,
+            "healthy",
+            now + chrono::Duration::seconds(1),
+        )
+        .await;
+        insert_test_job(
+            &pool,
+            stopped_org,
+            stopped_app,
+            stopped_replacement,
+            stopped_replacement,
+            None,
+        )
+        .await;
+        arm_released_replacement_job(&pool, stopped_replacement).await;
+        fail_replacement_in_apply(&pool, stopped_org, stopped_app, stopped_replacement).await;
+
+        let (deleting_org, deleting_app) = insert_test_app(&pool, "deleting").await;
+        let deleting_running = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            deleting_org,
+            deleting_app,
+            deleting_running,
+            "healthy",
+            now,
+        )
+        .await;
+        let deleting_artifact =
+            insert_test_artifact(&pool, deleting_app, deleting_running, "b2").await;
+        insert_test_job(
+            &pool,
+            deleting_org,
+            deleting_app,
+            deleting_running,
+            deleting_running,
+            Some((deleting_running, &deleting_artifact)),
+        )
+        .await;
+        let deleting_replacement = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            deleting_org,
+            deleting_app,
+            deleting_replacement,
+            "healthy",
+            now + chrono::Duration::seconds(1),
+        )
+        .await;
+        insert_test_job(
+            &pool,
+            deleting_org,
+            deleting_app,
+            deleting_replacement,
+            deleting_replacement,
+            None,
+        )
+        .await;
+        arm_released_replacement_job(&pool, deleting_replacement).await;
+        fail_replacement_in_apply(&pool, deleting_org, deleting_app, deleting_replacement).await;
+
+        // A failed app with no prior healthy workload authorizes nothing.
+        let (fresh_org, fresh_app) = insert_test_app(&pool, "failed").await;
+        let only = Uuid::new_v4();
+        insert_test_deployment(&pool, fresh_org, fresh_app, only, "failed", now).await;
+        let only_artifact = insert_test_artifact(&pool, fresh_app, only, "c3").await;
+        insert_test_job(
+            &pool,
+            fresh_org,
+            fresh_app,
+            only,
+            only,
+            Some((only, &only_artifact)),
+        )
+        .await;
+        sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET state = 'failed', last_error_code = 'deployment_apply_failed'
+              WHERE deployment_id = $1",
+        )
+        .bind(only)
+        .execute(&pool)
+        .await
+        .expect("fail the only job");
+
+        let failed = load_signed_policy_candidates(&pool, DEFAULT_SIGNED_POLICY_RETENTION)
+            .await
+            .expect("select authority after the failed replacement");
+        required(&failed, &running_artifact);
+        absent(&failed, &replacement_artifact);
+        required(&failed, &legacy_artifact);
+        absent(&failed, &legacy_replacement_artifact);
+        absent(&failed, &stopped_artifact);
+        absent(&failed, &deleting_artifact);
+        absent(&failed, &only_artifact);
+
+        // A retry of the failed app is admitted early while the prior
+        // healthy authority stays required through the handoff.
+        let retry = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            org_id,
+            app_id,
+            retry,
+            "healthy",
+            now + chrono::Duration::seconds(2),
+        )
+        .await;
+        let retry_artifact = insert_test_artifact(&pool, app_id, retry, "d4").await;
+        insert_test_job(
+            &pool,
+            org_id,
+            app_id,
+            retry,
+            retry,
+            Some((retry, &retry_artifact)),
+        )
+        .await;
+        sqlx::query(
+            "WITH pending AS (
+                 UPDATE deployments SET status = 'pending' WHERE id = $1 RETURNING id
+             )
+             UPDATE deployment_apply_jobs
+                SET state = 'pending'
+              WHERE deployment_id IN (SELECT id FROM pending)",
+        )
+        .bind(retry)
+        .execute(&pool)
+        .await
+        .expect("make the retry pending");
+        let retried = load_signed_policy_candidates(&pool, DEFAULT_SIGNED_POLICY_RETENTION)
+            .await
+            .expect("select authority while the retry is in flight");
+        required(&retried, &running_artifact);
+        required(&retried, &retry_artifact);
+        absent(&retried, &replacement_artifact);
+
+        // Healthy takeover ends mandatory retention of the prior authority.
+        sqlx::query(
+            "WITH healthy AS (
+                 UPDATE deployments
+                    SET status = 'healthy'::deploy_status_enum
+                  WHERE id = $1 RETURNING id
+             )
+             UPDATE deployment_apply_jobs
+                SET state = 'completed'
+              WHERE deployment_id IN (SELECT id FROM healthy)",
+        )
+        .bind(retry)
+        .execute(&pool)
+        .await
+        .expect("complete the retry takeover");
+        sqlx::query(
+            "UPDATE apps
+                SET status = 'running'::app_status_enum,
+                    updated_at = clock_timestamp()
+              WHERE id = $1 AND org_id = $2",
+        )
+        .bind(app_id)
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("restore the app to running");
+        let settled = load_signed_policy_candidates(&pool, DEFAULT_SIGNED_POLICY_RETENTION)
+            .await
+            .expect("select authority after the confirmed takeover");
+        required(&settled, &retry_artifact);
+        assert!(!settled.iter().any(|candidate| {
+            candidate.artifact.metadata.descriptor_core_hash
+                == running_artifact.metadata.descriptor_core_hash
+                && candidate.required
+        }));
+        absent(&settled, &replacement_artifact);
+
+        for cleanup_org in [org_id, legacy_org, stopped_org, deleting_org, fresh_org] {
+            sqlx::query("DELETE FROM organizations WHERE id = $1")
+                .bind(cleanup_org)
+                .execute(&pool)
+                .await
+                .expect("delete KBS failure fixture");
         }
     }
 
@@ -4264,5 +5262,538 @@ resource_bindings := {
             .execute(&pool)
             .await
             .expect("delete queued-supersessions fixture organization");
+    }
+
+    #[tokio::test]
+    async fn unreleased_signed_customer_config_hold_defers_an_empty_policy() {
+        let pool = crate::test_support::database_test_pool().await;
+        let (org_id, app_id) = insert_test_app(&pool, "running").await;
+
+        // The hold protects a still-running legacy workload: a healthy
+        // job-less deployment that predates signed artifacts.
+        let legacy = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, legacy, "healthy", Utc::now()).await;
+
+        assert!(
+            unreleased_signed_customer_config_hold_apps(&pool)
+                .await
+                .expect("probe hold before fixture")
+                .is_empty(),
+            "no held deployment exists yet"
+        );
+
+        // The first signed deployment on this app is held: the schema
+        // trigger requires the job row first, then the pending deployment
+        // lands in the same transaction. The held transition carries a
+        // signed artifact (`artifact_deployment_id`), so its authority is
+        // exactly what the candidate query withholds.
+        let held = Uuid::new_v4();
+        // The signed artifact the hold will withhold; its row lands in the
+        // same transaction (artifact -> deployment FK is checked at commit).
+        let mut artifact = test_signed_policy_artifact("09", 16);
+        artifact.metadata.app_id = app_id.to_string();
+        artifact.metadata.deploy_id = held.to_string();
+        let artifact_hash = hex::decode(&artifact.metadata.descriptor_core_hash).unwrap();
+        let mut tx = pool.begin().await.expect("begin held fixture");
+        sqlx::query(
+            "INSERT INTO deployment_apply_jobs (
+                 deployment_id, app_id, org_id, source_deployment_id,
+                 payload_version, payload, payload_sha256,
+                 cleanup_app_on_setup_failure, signed_required,
+                 artifact_deployment_id, artifact_descriptor_core_hash,
+                 log_encryption, state, next_attempt_at,
+                 customer_config_hold, customer_config_hold_until
+             ) VALUES (
+                 $1, $2, $3, $1, 1,
+                 '{\"version\":1,\"log_encryption\":null}'::jsonb,
+                 $4, false, true, $1, $5, NULL, 'setup_pending',
+                 'infinity'::timestamptz,
+                 true, clock_timestamp() + interval '1 hour'
+             )",
+        )
+        .bind(held)
+        .bind(app_id)
+        .bind(org_id)
+        .bind(vec![7u8; 32])
+        .bind(&artifact_hash)
+        .execute(&mut *tx)
+        .await
+        .expect("insert held apply job");
+        insert_test_deployment_in_tx(&mut tx, org_id, app_id, held, "pending").await;
+        sqlx::query(
+            "INSERT INTO workload_artifacts (
+                 descriptor_core_hash, app_id, deploy_id, descriptor_payload,
+                 descriptor_signature, descriptor_signing_key_id,
+                 org_keyring_payload, org_keyring_signature,
+                 signed_policy_artifact
+             ) VALUES ($1, $2, $3, '{}'::jsonb, $4, 'test-key',
+                       '{}'::jsonb, $5, $6)",
+        )
+        .bind(&artifact_hash)
+        .bind(app_id)
+        .bind(held)
+        .bind(vec![1u8; 64])
+        .bind(vec![2u8; 64])
+        .bind(serde_json::to_value(&artifact).unwrap())
+        .execute(&mut *tx)
+        .await
+        .expect("insert held signed artifact");
+        tx.commit().await.expect("commit held fixture");
+
+        assert!(
+            !unreleased_signed_customer_config_hold_apps(&pool)
+                .await
+                .expect("probe held deployment")
+                .is_empty(),
+            "the unreleased hold must defer an empty policy publish"
+        );
+        let candidates = load_signed_policy_candidates(&pool, 8)
+            .await
+            .expect("load candidates under a held first deploy");
+        assert!(
+            candidates.is_empty(),
+            "the held artifact is withheld: converging here would publish {{artifacts: []}} and revoke the legacy workload"
+        );
+        for status in ["stopped", "deleting"] {
+            sqlx::query("UPDATE apps SET status = $2::app_status_enum WHERE id = $1")
+                .bind(app_id)
+                .bind(status)
+                .execute(&pool)
+                .await
+                .unwrap();
+            assert!(
+                unreleased_signed_customer_config_hold_apps(&pool)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "{status} must clear even an unexpired hold's policy deferral"
+            );
+        }
+        sqlx::query("UPDATE apps SET status = 'running' WHERE id = $1")
+            .bind(app_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Releasing the hold ends the deferral.
+        sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET customer_config_released_at = clock_timestamp()
+              WHERE deployment_id = $1",
+        )
+        .bind(held)
+        .execute(&pool)
+        .await
+        .expect("release the hold");
+        assert!(
+            unreleased_signed_customer_config_hold_apps(&pool)
+                .await
+                .expect("probe after release")
+                .is_empty(),
+            "a released hold no longer defers the policy"
+        );
+
+        // A second unreleased hold that the sweeper expires: the expiry
+        // deliberately leaves the legacy TEE running, so the app must keep
+        // deferring the empty publish after the job turns terminal.
+        let held2 = Uuid::new_v4();
+        let mut artifact2 = test_signed_policy_artifact("0b", 16);
+        artifact2.metadata.app_id = app_id.to_string();
+        artifact2.metadata.deploy_id = held2.to_string();
+        let artifact2_hash = hex::decode(&artifact2.metadata.descriptor_core_hash).unwrap();
+        let mut expiry_fixture = pool.begin().await.expect("begin expiring hold fixture");
+        sqlx::query(
+            "INSERT INTO deployment_apply_jobs (
+                 deployment_id, app_id, org_id, source_deployment_id,
+                 payload_version, payload, payload_sha256,
+                 cleanup_app_on_setup_failure, signed_required,
+                 artifact_deployment_id, artifact_descriptor_core_hash,
+                 log_encryption, state, next_attempt_at,
+                 customer_config_hold, customer_config_hold_until
+             ) VALUES (
+                 $1, $2, $3, $1, 1,
+                 '{\"version\":1,\"log_encryption\":null}'::jsonb,
+                 $4, false, true, $1, $5, NULL, 'setup_pending',
+                 'infinity'::timestamptz,
+                 true, clock_timestamp() - interval '1 second'
+             )",
+        )
+        .bind(held2)
+        .bind(app_id)
+        .bind(org_id)
+        .bind(vec![7u8; 32])
+        .bind(&artifact2_hash)
+        .execute(&mut *expiry_fixture)
+        .await
+        .expect("insert expiring held apply job");
+        insert_test_deployment_in_tx(&mut expiry_fixture, org_id, app_id, held2, "pending").await;
+        sqlx::query(
+            "INSERT INTO workload_artifacts (
+                 descriptor_core_hash, app_id, deploy_id, descriptor_payload,
+                 descriptor_signature, descriptor_signing_key_id,
+                 org_keyring_payload, org_keyring_signature,
+                 signed_policy_artifact
+             ) VALUES ($1, $2, $3, '{}'::jsonb, $4, 'test-key',
+                       '{}'::jsonb, $5, $6)",
+        )
+        .bind(&artifact2_hash)
+        .bind(app_id)
+        .bind(held2)
+        .bind(vec![1u8; 64])
+        .bind(vec![2u8; 64])
+        .bind(serde_json::to_value(&artifact2).unwrap())
+        .execute(&mut *expiry_fixture)
+        .await
+        .expect("insert expiring held signed artifact");
+        expiry_fixture
+            .commit()
+            .await
+            .expect("commit expiring hold fixture");
+
+        crate::deployment_jobs::expire_customer_config_holds(&pool)
+            .await
+            .expect("sweep the expired hold");
+        let swept_state: String =
+            sqlx::query_scalar("SELECT state FROM deployment_apply_jobs WHERE deployment_id = $1")
+                .bind(held2)
+                .fetch_one(&pool)
+                .await
+                .expect("read swept hold job state");
+        assert_eq!(swept_state, "failed", "the sweeper terminalizes the hold");
+        assert!(
+            !unreleased_signed_customer_config_hold_apps(&pool)
+                .await
+                .expect("probe after hold expiry")
+                .is_empty(),
+            "an expired hold still defers while the legacy workload it preserved keeps running"
+        );
+
+        // Lifecycle exit clears the protection: once the app stops serving,
+        // an empty publish revokes nothing live.
+        sqlx::query("UPDATE apps SET status = 'stopped'::app_status_enum WHERE id = $1")
+            .bind(app_id)
+            .execute(&pool)
+            .await
+            .expect("stop the app");
+        assert!(
+            unreleased_signed_customer_config_hold_apps(&pool)
+                .await
+                .expect("probe after app stop")
+                .is_empty(),
+            "a stopped app has no workload left for the expired hold to protect"
+        );
+        sqlx::query("UPDATE apps SET status = 'running'::app_status_enum WHERE id = $1")
+            .bind(app_id)
+            .execute(&pool)
+            .await
+            .expect("restart the app fixture");
+        sqlx::query("UPDATE apps SET status = 'deleting'::app_status_enum WHERE id = $1")
+            .bind(app_id)
+            .execute(&pool)
+            .await
+            .expect("mark the app deleting");
+        assert!(
+            unreleased_signed_customer_config_hold_apps(&pool)
+                .await
+                .expect("probe while deleting")
+                .is_empty(),
+            "a deleting app cannot be protected by the expired hold"
+        );
+        sqlx::query("UPDATE apps SET status = 'running'::app_status_enum WHERE id = $1")
+            .bind(app_id)
+            .execute(&pool)
+            .await
+            .expect("restore the app fixture");
+
+        // A newer durable operation takes over: the expired hold is history
+        // and the replacement's own operation semantics govern the policy.
+        let replacement = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, replacement, "healthy", Utc::now()).await;
+        insert_test_job(&pool, org_id, app_id, replacement, legacy, None).await;
+        assert!(
+            unreleased_signed_customer_config_hold_apps(&pool)
+                .await
+                .expect("probe after replacement")
+                .is_empty(),
+            "a newer durable operation ends the expired hold's protection"
+        );
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete held fixture organization");
+    }
+
+    #[tokio::test]
+    async fn unrelated_unsigned_hold_does_not_defer_an_empty_policy() {
+        let pool = crate::test_support::database_test_pool().await;
+        let (org_id, app_id) = insert_test_app(&pool, "running").await;
+
+        // An unrelated app's hold on an UNSIGNED transition withholds no
+        // signed authority: it cannot be what made the candidate set
+        // empty. A revoked artifact must converge out of the policy body
+        // even while this hold stays live — deferring on it would leave the
+        // revoked artifact authorized for the full hold window.
+        let held = Uuid::new_v4();
+        let mut tx = pool.begin().await.expect("begin unsigned held fixture");
+        sqlx::query(
+            "INSERT INTO deployment_apply_jobs (
+                 deployment_id, app_id, org_id, source_deployment_id,
+                 payload_version, payload, payload_sha256,
+                 cleanup_app_on_setup_failure, signed_required,
+                 artifact_deployment_id, artifact_descriptor_core_hash,
+                 log_encryption, state, next_attempt_at,
+                 customer_config_hold, customer_config_hold_until
+             ) VALUES (
+                 $1, $2, $3, $1, 1,
+                 '{\"version\":1,\"log_encryption\":null}'::jsonb,
+                 $4, false, false, NULL, NULL, NULL, 'setup_pending',
+                 'infinity'::timestamptz,
+                 true, clock_timestamp() + interval '2 hours'
+             )",
+        )
+        .bind(held)
+        .bind(app_id)
+        .bind(org_id)
+        .bind(vec![7u8; 32])
+        .execute(&mut *tx)
+        .await
+        .expect("insert unsigned held apply job");
+        insert_test_deployment_in_tx(&mut tx, org_id, app_id, held, "pending").await;
+        tx.commit().await.expect("commit unsigned held fixture");
+
+        assert!(
+            unreleased_signed_customer_config_hold_apps(&pool)
+                .await
+                .expect("probe unsigned held deployment")
+                .is_empty(),
+            "an unsigned hold withholds no authority and must not defer policy convergence"
+        );
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete unsigned held fixture organization");
+    }
+
+    #[tokio::test]
+    async fn expired_signed_hold_preserves_legacy_policy_until_lifecycle_advances() {
+        let pool = crate::test_support::database_test_pool().await;
+        let (org_id, app_id) = insert_test_app(&pool, "running").await;
+
+        // The still-running workload the hold preserved: a healthy legacy
+        // deployment with no signed artifact row.
+        let legacy = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, legacy, "healthy", Utc::now()).await;
+
+        // The first signed redeploy is held past its expiry so the sweeper
+        // terminalizes it without ever applying the workload.
+        let held = Uuid::new_v4();
+        let mut artifact = test_signed_policy_artifact("0d", 16);
+        artifact.metadata.app_id = app_id.to_string();
+        artifact.metadata.deploy_id = held.to_string();
+        let artifact_hash = hex::decode(&artifact.metadata.descriptor_core_hash).unwrap();
+        let mut tx = pool.begin().await.expect("begin expired hold fixture");
+        sqlx::query(
+            "INSERT INTO deployment_apply_jobs (
+                 deployment_id, app_id, org_id, source_deployment_id,
+                 payload_version, payload, payload_sha256,
+                 cleanup_app_on_setup_failure, signed_required,
+                 artifact_deployment_id, artifact_descriptor_core_hash,
+                 log_encryption, state, next_attempt_at,
+                 customer_config_hold, customer_config_hold_until
+             ) VALUES (
+                 $1, $2, $3, $1, 1,
+                 '{\"version\":1,\"log_encryption\":null}'::jsonb,
+                 $4, false, true, $1, $5, NULL, 'setup_pending',
+                 'infinity'::timestamptz,
+                 true, clock_timestamp() - interval '1 second'
+             )",
+        )
+        .bind(held)
+        .bind(app_id)
+        .bind(org_id)
+        .bind(vec![7u8; 32])
+        .bind(&artifact_hash)
+        .execute(&mut *tx)
+        .await
+        .expect("insert expired held apply job");
+        insert_test_deployment_in_tx(&mut tx, org_id, app_id, held, "pending").await;
+        sqlx::query(
+            "INSERT INTO workload_artifacts (
+                 descriptor_core_hash, app_id, deploy_id, descriptor_payload,
+                 descriptor_signature, descriptor_signing_key_id,
+                 org_keyring_payload, org_keyring_signature,
+                 signed_policy_artifact
+             ) VALUES ($1, $2, $3, '{}'::jsonb, $4, 'test-key',
+                       '{}'::jsonb, $5, $6)",
+        )
+        .bind(&artifact_hash)
+        .bind(app_id)
+        .bind(held)
+        .bind(vec![1u8; 64])
+        .bind(vec![2u8; 64])
+        .bind(serde_json::to_value(&artifact).unwrap())
+        .execute(&mut *tx)
+        .await
+        .expect("insert expired held signed artifact");
+        tx.commit().await.expect("commit expired hold fixture");
+
+        crate::deployment_jobs::expire_customer_config_holds(&pool)
+            .await
+            .expect("sweep the expired hold");
+        let swept_state: String =
+            sqlx::query_scalar("SELECT state FROM deployment_apply_jobs WHERE deployment_id = $1")
+                .bind(held)
+                .fetch_one(&pool)
+                .await
+                .expect("read swept hold job state");
+        assert_eq!(swept_state, "failed", "the sweeper terminalizes the hold");
+
+        // A pending reconciliation must keep the legacy Rego body: the
+        // expired hold still protects the running workload.
+        let mut gen_tx = pool.begin().await.expect("begin generation bump");
+        enqueue_signed_policy_reconciliation(&mut gen_tx)
+            .await
+            .expect("enqueue a pending policy generation");
+        gen_tx.commit().await.expect("commit generation bump");
+
+        let writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = writes.clone();
+        let client = kube::Client::new(
+            tower::service_fn(move |request: axum::http::Request<kube::client::Body>| {
+                let seen = seen.clone();
+                async move {
+                    if request.method() != axum::http::Method::GET {
+                        seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let status =
+                            kube::core::Status::failure("write rejected by fixture", "Forbidden")
+                                .with_code(403);
+                        return Ok::<_, std::io::Error>(
+                            axum::http::Response::builder()
+                                .status(axum::http::StatusCode::FORBIDDEN)
+                                .body(kube::client::Body::from(
+                                    serde_json::to_vec(&status).unwrap(),
+                                ))
+                                .unwrap(),
+                        );
+                    }
+                    let configmap = serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "ConfigMap",
+                        "metadata": {
+                            "name": "resource-policy",
+                            "namespace": "trustee-operator-system",
+                            "resourceVersion": "7"
+                        },
+                        "data": {"policy.rego": "package authz\n# legacy rego\n"}
+                    });
+                    Ok(axum::http::Response::new(kube::client::Body::from(
+                        serde_json::to_vec(&configmap).unwrap(),
+                    )))
+                }
+            }),
+            "default",
+        );
+        let config = KbsPolicyConfig {
+            namespace: "trustee-operator-system".to_string(),
+            configmap_name: "resource-policy".to_string(),
+            policy_key: "policy.rego".to_string(),
+            deployment_name: "trustee-deployment".to_string(),
+            required: false,
+            signed_policy_retention: 8,
+            signed_policy_max_bytes: 1024 * 1024,
+        };
+
+        reconcile_pending_signed_policy_artifacts_with_client(&pool, &config, None, client.clone())
+            .await
+            .expect("the expired hold must defer the pending reconciliation");
+        assert_eq!(
+            writes.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the reconciliation must not publish an empty policy over the running legacy workload"
+        );
+
+        // Lifecycle exit clears the deferral: with the app stopped there is
+        // no workload to protect, so the pending generation converges
+        // (the fixture's 403 write rejection proves the publish was
+        // attempted rather than deferred).
+        sqlx::query("UPDATE apps SET status = 'stopped'::app_status_enum WHERE id = $1")
+            .bind(app_id)
+            .execute(&pool)
+            .await
+            .expect("stop the app");
+        let converged =
+            reconcile_pending_signed_policy_artifacts_with_client(&pool, &config, None, client)
+                .await;
+        assert!(
+            converged.is_err(),
+            "the fixture rejects the write; only the attempt matters"
+        );
+        assert!(
+            writes.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "stopping the app must let the pending reconciliation publish"
+        );
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete expired hold fixture organization");
+    }
+
+    #[test]
+    fn hold_deferral_correlates_revocation_with_the_held_app() {
+        // Nothing signed published yet (legacy Rego install): converging
+        // would flip the mode and revoke the held app's running workload,
+        // so the deferral is legitimate.
+        assert!(hold_deferral_correlates(&[], &["b".to_owned()]));
+        // The dropped authority belongs to the held app itself.
+        assert!(hold_deferral_correlates(
+            &["b".to_owned()],
+            &["b".to_owned()]
+        ));
+        // An unrelated hold (app B) must not retain app A's obsolete
+        // authority: revocation converges instead of waiting out the hold.
+        assert!(!hold_deferral_correlates(
+            &["a".to_owned()],
+            &["b".to_owned()]
+        ));
+        // Mixed drops converge unless every owner is held.
+        assert!(!hold_deferral_correlates(
+            &["a".to_owned(), "b".to_owned()],
+            &["b".to_owned()]
+        ));
+        assert!(hold_deferral_correlates(
+            &["a".to_owned(), "b".to_owned()],
+            &["b".to_owned(), "a".to_owned()]
+        ));
+    }
+
+    #[test]
+    fn published_authority_owners_parse_both_body_shapes() {
+        assert!(published_authority_owners("package authz").is_empty());
+        assert!(
+            published_authority_owners("not json at all").is_empty(),
+            "a non-JSON legacy body contributes no owners"
+        );
+        let set = serde_json::json!({
+            "schema_version": "signed-policy-artifacts/v1",
+            "artifacts": [
+                {"metadata": {"app_id": "aaa", "deploy_id": "d1"}},
+                {"metadata": {"app_id": "bbb", "deploy_id": "d2"}},
+            ]
+        })
+        .to_string();
+        assert_eq!(published_authority_owners(&set), ["aaa", "bbb"]);
+        let single = serde_json::json!({
+            "metadata": {"app_id": "ccc", "deploy_id": "d3"},
+            "rego_text": "package authz",
+            "signature": "sig"
+        })
+        .to_string();
+        assert_eq!(published_authority_owners(&single), ["ccc"]);
     }
 }

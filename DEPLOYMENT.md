@@ -246,6 +246,33 @@ Before using it outside local experimentation:
   registry metadata, DNS, and tenant TEE callbacks;
 - decide whether CAP-managed DNS and KBS policy management are required.
 
+## Customer-config roll holds
+
+Internal PaaS redeploys may request `customer_config_roll_hold_seconds`
+(30–7200 seconds). CAP freezes setup only when a settled live TEE exists;
+a missing or scaled-down workload starts recovery without a hold. An
+unreadable or converging workload fails closed with a retryable conflict.
+
+The CLI stores customer config directly in the TEE, then PaaS proxies
+`POST /internal/paas/orgs/{org}/deployments/{id}/customer-config-released`.
+While an unreleased hold is active, another deploy or rollback cannot
+supersede its delivery. Release or expiry permits the next operation;
+explicit deletion remains available. Expiry never applies the replacement
+and preserves the running workload's signed or legacy KBS authority.
+
+Deploy the PaaS response contract first: every held response, including a
+replay, must carry a fresh CAP database-clock
+`customer_config_hold_remaining_ms`. The CLI anchors it before sending
+the create request and rejects held responses without it. The absolute
+`customer_config_hold_until` is diagnostic, not client clock authority.
+
+Apply migrations `0060_customer_config_roll_hold.sql` and
+`0071_deployment_apply_committed_at.sql` before the API cutover. Drain old
+workers with the existing `Recreate` deployment strategy: the old-worker
+claim fence does not make mixed-binary policy writers safe. Public
+login, config delivery, release, replacement HTTPS, and persistence must
+pass on the explicitly selected environment before rollout acceptance.
+
 ## Rollout Compatibility: initdata uid/gid claims
 
 `cc_init_data` uid/gid claims (`app_uid`, `app_gid`, `caddy_uid`,

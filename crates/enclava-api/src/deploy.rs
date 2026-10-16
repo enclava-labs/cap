@@ -314,6 +314,8 @@ async fn apply_all_with_tenant_image_pull_secret(
     manifest_hash: &str,
     image_pull_secret_config: Option<&TenantImagePullSecretConfig>,
     generation: MutationGeneration,
+    pool: &PgPool,
+    deployment_id: Uuid,
 ) -> Result<(), DeployError> {
     let ns_name = manifests
         .namespace
@@ -378,6 +380,22 @@ async fn apply_all_with_tenant_image_pull_secret(
     sqlx::query(
         "UPDATE deployments
             SET sts_apply_started_at = COALESCE(sts_apply_started_at, clock_timestamp())
+          WHERE id = $1",
+    )
+    .bind(deployment_id)
+    .execute(pool)
+    .await?;
+    // Conservative workload-apply evidence. The StatefulSet write is the
+    // first operation that can replace the TEE, so the settling guard's
+    // marker is stamped at ITS entry -- not at the multi-resource apply's
+    // entry (a namespace/standard-resource/gateway failure never touched
+    // the workload and must not count as a rollout) and not after the SSA
+    // response (a request Kubernetes accepted but whose response was lost
+    // to a timeout or connection error must still count). Idempotent
+    // re-applies keep the first stamp time.
+    sqlx::query(
+        "UPDATE deployments
+            SET apply_committed_at = COALESCE(apply_committed_at, clock_timestamp())
           WHERE id = $1",
     )
     .bind(deployment_id)
@@ -954,10 +972,8 @@ pub(crate) async fn supersede_incomplete_deployments(
     tx: &mut Transaction<'_, Postgres>,
     app_id: Uuid,
 ) -> Result<u64, SupersedeDeploymentError> {
-    // Never revoke the relational owner of an external mutation while its DB
-    // lease is live. Queued work and expired owners are safe to terminalize;
-    // an active watcher is observation-only and publication remains fenced by
-    // its generation/token after supersession.
+    // Config tokens are app-scoped, so supersession cannot cancel a CLI's
+    // writes. Keep its live hold exclusive; deletion may still stop the app.
     let active_mutation: bool = sqlx::query_scalar(
         "SELECT EXISTS(
              SELECT 1
@@ -975,6 +991,16 @@ pub(crate) async fn supersede_incomplete_deployments(
                         )
                     )
                 )
+         ) OR EXISTS (
+             SELECT 1
+               FROM deployment_apply_jobs AS job
+               JOIN apps AS app ON app.id = job.app_id
+              WHERE job.app_id = $1
+                AND job.customer_config_hold
+                AND job.customer_config_released_at IS NULL
+                AND job.state = 'setup_pending'
+                AND job.customer_config_hold_until > clock_timestamp()
+                AND app.status <> 'deleting'::app_status_enum
          )",
     )
     .bind(app_id)
@@ -1761,6 +1787,14 @@ mod tests {
 
     /// A Kubernetes API double with configurable readiness and an empty pod list.
     fn rollout_client(ready: bool) -> kube::Client {
+        rollout_client_with(1, 1, i32::from(ready))
+    }
+
+    fn rollout_client_with(
+        generation: i64,
+        observed_generation: i64,
+        ready_replicas: i32,
+    ) -> kube::Client {
         use axum::http::{Request, Response};
         use http_body_util::BodyExt;
         use kube::client::Body;
@@ -1784,15 +1818,15 @@ mod tests {
                         "metadata": {
                             "name": "queued-app",
                             "namespace": "cap-queued-app",
-                            "generation": 1,
+                            "generation": generation,
                         },
                         "spec": { "replicas": 1 },
                         "status": {
-                            "observedGeneration": 1,
-                            "replicas": 1,
-                            "readyReplicas": i32::from(ready),
-                            "currentReplicas": i32::from(ready),
-                            "updatedReplicas": i32::from(ready),
+                            "observedGeneration": observed_generation,
+                            "replicas": ready_replicas,
+                            "readyReplicas": ready_replicas,
+                            "currentReplicas": ready_replicas,
+                            "updatedReplicas": ready_replicas,
                         },
                     })
                 };
@@ -2036,6 +2070,210 @@ mod tests {
         assert_eq!(outcome.deploy_status, "watching");
         assert_eq!(outcome.app_status, "creating");
         assert!(!outcome.terminal);
+    }
+
+    fn settled_statefulset(
+        generation: i64,
+        observed: i64,
+        desired: i32,
+        ready: i32,
+        current: i32,
+        updated: i32,
+    ) -> k8s_openapi::api::apps::v1::StatefulSet {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": {"name": "app", "namespace": "cap-app", "generation": generation},
+            "spec": {"replicas": desired},
+            "status": {
+                "observedGeneration": observed,
+                "readyReplicas": ready,
+                "currentReplicas": current,
+                "updatedReplicas": updated,
+            },
+        }))
+        .expect("statefulset settling fixture")
+    }
+
+    #[test]
+    fn statefulset_rollout_settled_matches_the_rollout_completion_criterion() {
+        // Fully converged: the controller has observed the current
+        // generation and every replica matches the latest spec.
+        assert!(statefulset_rollout_settled(&settled_statefulset(
+            3, 3, 1, 1, 1, 1
+        )));
+        // The controller has not observed the newest applied generation:
+        // a failed rollout's spec is still being reconciled and its
+        // controller can still replace the TEE.
+        assert!(!statefulset_rollout_settled(&settled_statefulset(
+            3, 2, 1, 1, 1, 1
+        )));
+        // The replacement is not up yet: the workload is mid-swap even
+        // though the controller caught up with the generation.
+        assert!(!statefulset_rollout_settled(&settled_statefulset(
+            3, 3, 1, 0, 1, 1
+        )));
+        assert!(!statefulset_rollout_settled(&settled_statefulset(
+            3, 3, 1, 1, 1, 0
+        )));
+        // A scaled-down workload has no TEE that could be replaced.
+        assert!(statefulset_rollout_settled(&settled_statefulset(
+            3, 3, 0, 0, 0, 0
+        )));
+    }
+
+    #[tokio::test]
+    async fn supersession_serializes_customer_config_delivery() {
+        let pool = crate::test_support::database_test_pool().await;
+        let (app, deployment_id, _, _) =
+            crate::deployment_jobs::tests::insert_job_fixture(&pool).await;
+        sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET customer_config_hold = true,
+                    customer_config_hold_until = clock_timestamp() + interval '1 hour',
+                    next_attempt_at = 'infinity'
+              WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("arm config delivery hold");
+
+        for (scenario, blocked) in [
+            ("active", true),
+            ("expired", false),
+            ("released", false),
+            ("deleting", false),
+        ] {
+            let mut tx = pool.begin().await.expect("begin supersession scenario");
+            lock_app_deployment_lane(&mut tx, app.id).await.unwrap();
+            if scenario == "expired" {
+                sqlx::query(
+                    "UPDATE deployment_apply_jobs
+                        SET customer_config_hold_until = clock_timestamp() - interval '1 second'
+                      WHERE deployment_id = $1",
+                )
+                .bind(deployment_id)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            }
+            if scenario == "released" {
+                sqlx::query(
+                    "UPDATE deployment_apply_jobs
+                        SET customer_config_released_at = clock_timestamp(),
+                            next_attempt_at = clock_timestamp()
+                      WHERE deployment_id = $1",
+                )
+                .bind(deployment_id)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            }
+            if scenario == "deleting" {
+                sqlx::query("UPDATE apps SET status = 'deleting' WHERE id = $1")
+                    .bind(app.id)
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+            }
+            let result = supersede_incomplete_deployments(&mut tx, app.id).await;
+            if blocked {
+                assert!(matches!(result, Err(SupersedeDeploymentError::Busy)));
+                let state: String = sqlx::query_scalar(
+                    "SELECT state FROM deployment_apply_jobs WHERE deployment_id = $1",
+                )
+                .bind(deployment_id)
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+                assert_eq!(state, "setup_pending");
+            } else {
+                assert_eq!(result.expect(scenario), 1);
+            }
+            tx.rollback().await.unwrap();
+        }
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn workload_rollout_settled_reads_the_live_generation() {
+        let converged = ApplyEngine::new(
+            rollout_client(true),
+            enclava_engine::apply::types::ApplyConfig::default(),
+        );
+        assert_eq!(
+            workload_rollout_settled(&converged, "cap-queued-app", "queued-app")
+                .await
+                .expect("probe converged workload"),
+            Some(true)
+        );
+
+        let converging = ApplyEngine::new(
+            rollout_client(false),
+            enclava_engine::apply::types::ApplyConfig::default(),
+        );
+        assert_eq!(
+            workload_rollout_settled(&converging, "cap-queued-app", "queued-app")
+                .await
+                .expect("probe converging workload"),
+            Some(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn workload_rollout_settled_rejects_an_unobserved_generation() {
+        // observedGeneration behind metadata.generation: the controller has
+        // not caught up to the newest applied spec yet, so the failed
+        // rollout is still reconciling even though the replica counts look
+        // ready. The probe must read both fields through the client.
+        let lagging = ApplyEngine::new(
+            rollout_client_with(3, 2, 1),
+            enclava_engine::apply::types::ApplyConfig::default(),
+        );
+        assert_eq!(
+            workload_rollout_settled(&lagging, "cap-queued-app", "queued-app")
+                .await
+                .expect("probe lagging workload"),
+            Some(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn workload_rollout_settled_distinguishes_a_missing_workload() {
+        use axum::http::{Request, Response};
+        use http_body_util::BodyExt;
+        use kube::client::Body;
+        use tower::service_fn;
+
+        let client = kube::Client::new(
+            service_fn(move |request: Request<Body>| async move {
+                let _ = request.into_body().collect().await;
+                let status = serde_json::json!({
+                    "apiVersion": "v1", "kind": "Status",
+                    "status": "Failure", "reason": "NotFound",
+                    "message": "absent", "code": 404,
+                });
+                Ok::<_, std::io::Error>(
+                    Response::builder()
+                        .status(404)
+                        .body(Body::from(serde_json::to_vec(&status).unwrap()))
+                        .unwrap(),
+                )
+            }),
+            "default",
+        );
+        let engine = ApplyEngine::new(client, enclava_engine::apply::types::ApplyConfig::default());
+        assert_eq!(
+            workload_rollout_settled(&engine, "cap-absent-app", "absent-app")
+                .await
+                .expect("probe missing workload"),
+            None
+        );
     }
 
     #[tokio::test]
@@ -2499,6 +2737,58 @@ async fn statefulset_exists(
     }
 }
 
+/// Probe under the app deployment lane: terminal SQL rows cannot prove a
+/// Kubernetes controller stopped replacing the TEE. `None` means no live
+/// workload exists, so recovery must not wait for config delivery to it.
+pub async fn workload_rollout_settled(
+    engine: &ApplyEngine,
+    namespace: &str,
+    workload_name: &str,
+) -> Result<Option<bool>, DeployError> {
+    use k8s_openapi::api::apps::v1::StatefulSet;
+    use kube::Api;
+
+    let api: Api<StatefulSet> = Api::namespaced(engine.client().clone(), namespace);
+    match api.get(workload_name).await {
+        Ok(sts)
+            if sts
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.replicas)
+                .unwrap_or(1)
+                <= 0 =>
+        {
+            Ok(None)
+        }
+        Ok(sts) => Ok(Some(statefulset_rollout_settled(&sts))),
+        Err(kube::Error::Api(ae)) if ae.code == 404 => Ok(None),
+        Err(e) => Err(enclava_engine::apply::engine::ApplyError::Kube(e).into()),
+    }
+}
+
+/// Whether a live StatefulSet is fully converged: the controller has
+/// observed the current generation and every replica matches the latest
+/// spec. Anything less means the cluster may still replace the workload's
+/// pod — including past any SQL settling window, because a controller never
+/// abandons an applied generation. A scaled-down workload (`desired == 0`)
+/// has no TEE that could be replaced.
+pub fn statefulset_rollout_settled(sts: &k8s_openapi::api::apps::v1::StatefulSet) -> bool {
+    let status = sts.status.as_ref();
+    let generation = sts.metadata.generation.unwrap_or(0);
+    let observed_generation = status.and_then(|s| s.observed_generation).unwrap_or(0);
+    let desired = sts.spec.as_ref().and_then(|s| s.replicas).unwrap_or(1);
+    let ready = status.and_then(|s| s.ready_replicas).unwrap_or(0);
+    let current = status.and_then(|s| s.current_replicas).unwrap_or(0);
+    let updated = status.and_then(|s| s.updated_replicas).unwrap_or(0);
+    if desired <= 0 {
+        return true;
+    }
+    observed_generation >= generation
+        && ready >= desired
+        && current >= desired
+        && updated >= desired
+}
+
 async fn ensure_statefulset_exists(
     engine: &ApplyEngine,
     namespace: &str,
@@ -2837,6 +3127,8 @@ pub async fn apply_deployment_manifests(
         &hash,
         tenant_image_pull_secret_config.as_ref(),
         generation,
+        &pool,
+        deployment_id,
     )
     .await?;
     let edge_config = crate::edge::EdgeRouteConfig::from_env();

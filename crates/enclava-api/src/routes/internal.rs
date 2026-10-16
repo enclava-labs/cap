@@ -1567,6 +1567,7 @@ const TRANSIENT_RETRY_CONFLICT_MESSAGES: &[&str] = &[
     "deployment mutation is still in progress; retry rollback",
     "current deployment generation is still in progress",
     "an earlier deployment is still completing setup; retry after setup is reconciled",
+    "an earlier deployment rollout is still in progress; retry after it settles",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4682,6 +4683,7 @@ pub async fn deploy_paas_app(
             signed_policy_artifact: body.signed_policy_artifact,
             workload_security_profile: body.workload_security_profile,
             log_encryption: body.log_encryption,
+            customer_config_roll_hold_seconds: None,
         };
         let (status, Json(response)) = crate::routes::deployments::deploy(
             auth,
@@ -5345,7 +5347,17 @@ pub async fn create_paas_generic_deployment(
     .await?
     {
         IdempotencyBegin::Execute(lease) => lease,
-        IdempotencyBegin::Replay((status, body)) => return Ok((status, Json(body))),
+        // The cached response stores a time-relative
+        // `customer_config_hold_remaining_ms` measured when the first
+        // request committed. Replaying it verbatim would anchor the stale
+        // duration at the retry's receipt and grant a fresh window after
+        // CAP's real deadline, so recompute the remainder from the stored
+        // hold before replaying — and refuse the replay when the hold's
+        // durable state cannot be established or ended terminally.
+        IdempotencyBegin::Replay((status, body)) => {
+            let (status, body) = refresh_replayed_hold_remainder(&state, status, body).await?;
+            return Ok((status, Json(body)));
+        }
     };
     let reclaimed = idempotency.reclaimed();
     let result: Result<IdempotencyResponse, InternalRouteError> = async {
@@ -5356,10 +5368,11 @@ pub async fn create_paas_generic_deployment(
                 idempotency.operation_id(),
             ));
         }
-        let (status, Json(response)) = crate::routes::deployments::create_generic_deployment(
+        let (status, Json(response)) = crate::routes::deployments::create_generic_deployment_inner(
             auth,
-            State(state.clone()),
-            Json(parsed),
+            state.clone(),
+            parsed,
+            true,
         )
         .await?;
         Ok((status, to_value(response)?))
@@ -5379,6 +5392,125 @@ pub async fn create_paas_generic_deployment(
     Ok((status, Json(response)))
 }
 
+/// Recompute a cached idempotent response's `customer_config_hold_remaining_ms`
+/// from the stored hold before replay. The field is a duration measured at
+/// commit time; replaying the cached value verbatim would anchor that stale
+/// remainder at the retry's receipt and let the CLI spend a fresh window
+/// after CAP's real expiry.
+///
+/// Terminal outcomes fail closed rather than being replayed as-is:
+///
+/// * An *unreleased terminal* hold (expired, swept, or superseded) means the
+///   deployment failed without ever rolling. Replaying the cached success
+///   body with `customer_config_hold: false` would let a retried CLI treat
+///   that failed deployment as an ordinary unheld deploy and write the old
+///   request's values into whichever TEE is serving, so the replay is
+///   answered with the durable terminal failure instead.
+/// * A database failure while reloading the hold is served as a retryable
+///   503, never as an authoritative-looking hold without its deadline. The
+///   CLI's only fallback for `hold: true` with no deadline anchors at the
+///   retry's own request time, which can grant a fresh window after CAP
+///   already expired the hold.
+async fn refresh_replayed_hold_remainder(
+    state: &AppState,
+    status: StatusCode,
+    mut body: serde_json::Value,
+) -> Result<(StatusCode, serde_json::Value), (StatusCode, Json<serde_json::Value>)> {
+    let Some(deployment_id) = body
+        .get("deployment_id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())
+    else {
+        return Ok((status, body));
+    };
+    let replay_state =
+        crate::deployment_jobs::customer_config_hold_replay_state(&state.db, deployment_id)
+            .await
+            .map_err(|_| {
+                json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "the customer-config hold state could not be re-read for replay; retry with the same idempotency key",
+                )
+            })?;
+    let Some(object) = body.as_object_mut() else {
+        return Ok((status, body));
+    };
+    match replay_state {
+        crate::deployment_jobs::CustomerConfigHoldReplay::Open(hold) => {
+            object.insert(
+                "customer_config_hold".to_string(),
+                serde_json::Value::Bool(true),
+            );
+            object.insert(
+                "customer_config_hold_until".to_string(),
+                serde_json::Value::String(hold.until.to_rfc3339()),
+            );
+            object.insert(
+                "customer_config_hold_remaining_ms".to_string(),
+                serde_json::Value::from(hold.remaining_ms),
+            );
+        }
+        crate::deployment_jobs::CustomerConfigHoldReplay::Released => {
+            // The hold released since the first response: the roll resumed.
+            // Do not keep reporting a live window, and let the replayed
+            // response describe the deployment's then-current state.
+            object.insert(
+                "customer_config_hold".to_string(),
+                serde_json::Value::Bool(false),
+            );
+            object.insert(
+                "customer_config_hold_until".to_string(),
+                serde_json::Value::Null,
+            );
+            object.insert(
+                "customer_config_hold_remaining_ms".to_string(),
+                serde_json::Value::Null,
+            );
+        }
+        crate::deployment_jobs::CustomerConfigHoldReplay::EndedUnreleased => {
+            // The hold expired or was superseded without a release: the
+            // deployment is terminally failed and its roll never happened.
+            // Replay the durable failure instead of letting the cached
+            // success body masquerade as an ordinary unheld deploy.
+            *object = ended_unreleased_hold_replay_body(object);
+            return Ok((StatusCode::GONE, body));
+        }
+        crate::deployment_jobs::CustomerConfigHoldReplay::NotHeld => {
+            // No held apply job exists. A cached body that never reported a
+            // hold replays verbatim; a cached *held* response whose job row
+            // is gone (e.g. the app was deleted) must not masquerade as a
+            // live hold, so it fails closed the same way.
+            if object
+                .get("customer_config_hold")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                *object = ended_unreleased_hold_replay_body(object);
+                return Ok((StatusCode::GONE, body));
+            }
+            return Ok((status, body));
+        }
+    }
+    Ok((status, body))
+}
+
+/// Replace a cached held-create response body with the terminal-failure
+/// body an unreleased ended hold must replay.
+fn ended_unreleased_hold_replay_body(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut replacement = serde_json::json!({
+        "error": "the customer-config roll hold ended without a release and the deployment failed without rolling; start a new deploy instead of retrying this one",
+    });
+    let replacement_object = replacement
+        .as_object_mut()
+        .expect("replacement error object");
+    if let Some(instance) = object.get("app_name") {
+        replacement_object.insert("app_name".to_string(), instance.clone());
+    }
+    std::mem::take(replacement_object)
+}
+
 pub async fn get_paas_generic_deployment(
     _auth: InternalAuth,
     State(state): State<AppState>,
@@ -5391,6 +5523,41 @@ pub async fn get_paas_generic_deployment(
         crate::routes::deployments::get_generic_deployment(auth, State(state), Path(deployment_id))
             .await?;
     Ok(Json(to_value(response)?))
+}
+
+pub async fn release_paas_customer_config_roll(
+    _auth: InternalAuth,
+    State(state): State<AppState>,
+    Path((paas_org_id, deployment_id)): Path<(String, Uuid)>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_external_id(&paas_org_id, "paas_org_id")?;
+    let auth = internal_actor_context(&state, &paas_org_id, &headers).await?;
+    crate::auth::scopes::require_app_write(&auth)?;
+    match crate::deployment_jobs::release_customer_config_hold(
+        &state.db,
+        auth.org_id,
+        deployment_id,
+    )
+    .await
+    .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?
+    {
+        crate::deployment_jobs::CustomerConfigHoldRelease::Released => {
+            Ok(Json(serde_json::json!({"status": "released"})))
+        }
+        crate::deployment_jobs::CustomerConfigHoldRelease::AlreadyReleased => {
+            Ok(Json(serde_json::json!({"status": "already_released"})))
+        }
+        crate::deployment_jobs::CustomerConfigHoldRelease::NotHeld => {
+            Ok(Json(serde_json::json!({"status": "not_held"})))
+        }
+        crate::deployment_jobs::CustomerConfigHoldRelease::NotFound => {
+            Err(json_error(StatusCode::NOT_FOUND, "deployment not found"))
+        }
+        crate::deployment_jobs::CustomerConfigHoldRelease::Unavailable(message) => {
+            Err(json_error(StatusCode::CONFLICT, message))
+        }
+    }
 }
 
 pub async fn issue_paas_generic_config_token(
@@ -8564,6 +8731,189 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replayed_hold_refresh_distinguishes_terminal_and_released_holds() {
+        let pool = database_test_pool().await;
+        let state = idempotency_test_state(pool.clone());
+        let suffix = Uuid::new_v4().simple().to_string();
+
+        // A held apply job in setup_pending with a live deadline.
+        let org_id = Uuid::new_v4();
+        let app_id = Uuid::new_v4();
+        let deployment_id = Uuid::new_v4();
+        let mut tx = pool.begin().await.expect("begin replay fixture");
+        sqlx::query(
+            "INSERT INTO organizations (id, name, cust_slug)
+             VALUES ($1, $2, $3)",
+        )
+        .bind(org_id)
+        .bind(format!("replay-hold-{suffix}"))
+        .bind(&suffix[..8])
+        .execute(&mut *tx)
+        .await
+        .expect("insert replay org");
+        sqlx::query(
+            "INSERT INTO apps (
+                id, org_id, name, namespace, instance_id, tenant_id,
+                service_account, bootstrap_owner_pubkey_hash,
+                tenant_instance_identity_hash, domain, tee_domain
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+        )
+        .bind(app_id)
+        .bind(org_id)
+        .bind(format!("app-{suffix}"))
+        .bind(format!("cap-app-{suffix}"))
+        .bind(format!("instance-{suffix}"))
+        .bind(&suffix[..8])
+        .bind(format!("cap-app-{suffix}-sa"))
+        .bind("11".repeat(32))
+        .bind("22".repeat(32))
+        .bind(format!("app-{suffix}.{}.enclava.dev", &suffix[..8]))
+        .bind(format!("app-{suffix}.{}.tee.enclava.dev", &suffix[..8]))
+        .execute(&mut *tx)
+        .await
+        .expect("insert replay app");
+        sqlx::query(
+            "INSERT INTO deployment_apply_jobs (
+                 deployment_id, app_id, org_id, source_deployment_id,
+                 payload_version, payload, payload_sha256,
+                 cleanup_app_on_setup_failure, signed_required,
+                 artifact_deployment_id, artifact_descriptor_core_hash,
+                 log_encryption, state, next_attempt_at,
+                 customer_config_hold, customer_config_hold_until
+             ) VALUES (
+                 $1, $2, $3, $1, 1,
+                 '{\"version\":1,\"log_encryption\":null}'::jsonb,
+                 $4, false, false, NULL, NULL, NULL, 'setup_pending',
+                 'infinity'::timestamptz, true,
+                 clock_timestamp() + interval '1 hour'
+             )",
+        )
+        .bind(deployment_id)
+        .bind(app_id)
+        .bind(org_id)
+        .bind(vec![7_u8; 32])
+        .execute(&mut *tx)
+        .await
+        .expect("insert held apply job");
+        sqlx::query(
+            "INSERT INTO deployments (id, org_id, app_id, trigger, status, spec_snapshot)
+             VALUES ($1, $2, $3, 'api', 'pending', '{}'::jsonb)",
+        )
+        .bind(deployment_id)
+        .bind(org_id)
+        .bind(app_id)
+        .execute(&mut *tx)
+        .await
+        .expect("insert pending deployment");
+        tx.commit().await.expect("commit replay fixture");
+
+        let cached = serde_json::json!({
+            "deployment_id": deployment_id.to_string(),
+            "app_name": format!("app-{suffix}"),
+            "customer_config_hold": true,
+            "customer_config_hold_until": "2020-01-01T00:00:00Z",
+            "customer_config_hold_remaining_ms": 3_600_000_i64,
+        });
+
+        // Open hold: refreshed expiry and a fresh database-clock remainder.
+        let (status, body) =
+            refresh_replayed_hold_remainder(&state, StatusCode::CREATED, cached.clone())
+                .await
+                .expect("refresh an open hold");
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["customer_config_hold"], true);
+        let refreshed_until = body["customer_config_hold_until"].as_str().expect("until");
+        assert_ne!(
+            refreshed_until, "2020-01-01T00:00:00Z",
+            "the stored expiry must replace the cached one"
+        );
+        let refreshed_ms = body["customer_config_hold_remaining_ms"]
+            .as_i64()
+            .expect("remaining");
+        assert!(
+            refreshed_ms > 0 && refreshed_ms <= 3_600_000,
+            "a fresh database-clock remainder must be quoted, got {refreshed_ms}"
+        );
+
+        // Released: the hold flag drops and no deadline fields remain.
+        sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET customer_config_released_at = clock_timestamp()
+              WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("release the hold");
+        let (status, body) =
+            refresh_replayed_hold_remainder(&state, StatusCode::CREATED, cached.clone())
+                .await
+                .expect("refresh a released hold");
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["customer_config_hold"], false);
+        assert_eq!(body["customer_config_hold_until"], serde_json::Value::Null);
+        assert_eq!(
+            body["customer_config_hold_remaining_ms"],
+            serde_json::Value::Null
+        );
+
+        // Terminally ended without a release: the cached success body must
+        // be replaced with a terminal failure, never replayed as an
+        // ordinary unheld deploy. The deployment terminalizes first: the
+        // schema's deferred job-preservation trigger refuses a nonterminal
+        // deployment whose apply job left `setup_pending`.
+        sqlx::query("UPDATE deployments SET status = 'failed' WHERE id = $1")
+            .bind(deployment_id)
+            .execute(&pool)
+            .await
+            .expect("fail the held deployment");
+        sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET customer_config_released_at = NULL,
+                    state = 'failed',
+                    last_error_code = 'customer_config_hold_expired'
+              WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("expire the hold");
+        let (status, body) =
+            refresh_replayed_hold_remainder(&state, StatusCode::CREATED, cached.clone())
+                .await
+                .expect("refresh a terminally ended hold");
+        assert_eq!(status, StatusCode::GONE);
+        assert!(
+            body["error"]
+                .as_str()
+                .expect("terminal error")
+                .contains("ended without a release"),
+            "terminal holds must replay a failure, got {body}"
+        );
+        assert_eq!(body["app_name"], format!("app-{suffix}"));
+
+        // A cached held response whose job row vanished fails closed too.
+        // The apply job references the deployment (deferrable FK), so
+        // deleting the job alone is valid and leaves the deployment row.
+        sqlx::query("DELETE FROM deployment_apply_jobs WHERE deployment_id = $1")
+            .bind(deployment_id)
+            .execute(&pool)
+            .await
+            .expect("delete the apply job");
+        let (status, body) = refresh_replayed_hold_remainder(&state, StatusCode::CREATED, cached)
+            .await
+            .expect("refresh a vanished held job");
+        assert_eq!(status, StatusCode::GONE);
+        assert!(
+            body["error"]
+                .as_str()
+                .expect("terminal error")
+                .contains("ended without a release"),
+            "a vanished held job must not replay as a live hold, got {body}"
+        );
+    }
+
+    #[tokio::test]
     async fn whitelisted_known_not_applied_outcomes_preserve_binding_and_re_execute() {
         // The exact-match whitelist is the complete set of known-not-applied
         // 409s that release the bound reservation so a same-key retry
@@ -8580,7 +8930,7 @@ mod tests {
         let messages: Vec<&str> = TRANSIENT_RETRY_CONFLICT_MESSAGES.to_vec();
         assert_eq!(
             messages.len(),
-            6,
+            7,
             "whitelist drift: update this count when editing the constant"
         );
         for (i, message) in messages.iter().enumerate() {

@@ -379,6 +379,13 @@ pub struct CreateTemplateInstanceRequest {
     pub org_keyring_blob: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signed_policy_artifact: Option<String>,
+    /// Ask PaaS to hold the workload roll until customer config has been
+    /// written to the current TEE. Always sent with the deploy's normalized
+    /// budget so a retried request keeps one idempotency key; PaaS and CAP
+    /// apply the hold only when a live workload is being replaced, so first
+    /// deploys stay unheld.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub customer_config_roll_hold_seconds: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -388,6 +395,21 @@ pub struct TemplateInstanceResponse {
     pub deployment: TemplateDeploymentResponse,
     pub config_token: Option<ConfigTokenResponse>,
     pub cap: serde_json::Value,
+    /// The workload roll is waiting until customer config is released.
+    #[serde(default)]
+    pub customer_config_hold: bool,
+    /// The hold deadline CAP stored when it accepted the deployment. A
+    /// replayed create response carries the original expiry, not a fresh
+    /// window. Diagnostic only — deadlines derive from
+    /// `customer_config_hold_remaining_ms` instead, since subtracting the
+    /// client wall clock from this timestamp is unsafe under clock skew.
+    #[serde(default)]
+    pub customer_config_hold_until: Option<String>,
+    /// Milliseconds left on the stored hold, computed on CAP's database
+    /// clock at response time. Derive monotonic deadlines from this instead
+    /// of subtracting wall clocks; zero or negative means already expired.
+    #[serde(default)]
+    pub customer_config_hold_remaining_ms: Option<i64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -480,6 +502,18 @@ pub struct ManagedConfigDeliveryResponse {
     pub status: String,
     pub app_name: String,
     pub template_slug: String,
+    /// This call's delivery receipt on PaaS versions that expose it. Poll
+    /// `managed_config_delivery_status` until it reports `delivered` to
+    /// prove the enqueued values reached the TEE.
+    #[serde(default)]
+    pub delivery_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ManagedConfigDeliveryStatusResponse {
+    pub status: String,
+    #[serde(default)]
+    pub delivery_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

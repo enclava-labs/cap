@@ -191,6 +191,7 @@ async fn setup_test_state_with_mode(management_mode: CapManagementMode) -> (AppS
             enclava_api::clients::AllowList::from_env_or_default(None),
         )
         .unwrap(),
+        cosign_egress: enclava_api::clients::EgressGuard::from_env(),
         trustee_http_client: reqwest::Client::new(),
         tee_http_client: reqwest::Client::new(),
         recent_tee_probe_failures: Arc::new(std::sync::Mutex::new(
@@ -3782,6 +3783,7 @@ async fn generic_deployment_external_id_is_idempotent_and_conflict_checked() {
         deployment_id,
         &payload,
         false,
+        None,
     )
     .await
     .expect("insert idempotency deployment durable job");

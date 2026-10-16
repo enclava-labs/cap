@@ -453,6 +453,10 @@ pub struct DeployRequest {
     pub workload_security_profile: Option<String>,
     #[serde(default)]
     pub log_encryption: Option<LogEncryptionConfig>,
+    /// When set on a redeploy of an app that already has a TEE domain, DNS
+    /// setup and the workload roll wait until customer config is released.
+    #[serde(default)]
+    pub customer_config_roll_hold_seconds: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -558,7 +562,8 @@ const PUBLIC_DEPLOYMENT_ERROR_MESSAGE: &str = "deployment_error";
 /// arbitrary backend, runtime, or workload-controlled plaintext.
 pub(crate) fn public_deployment_error_message(error_message: Option<&str>) -> Option<String> {
     error_message.map(|error_message| match error_message {
-        crate::deploy::DEPLOYMENT_SUPERSEDED_ERROR => error_message.to_string(),
+        crate::deploy::DEPLOYMENT_SUPERSEDED_ERROR
+        | crate::deployment_jobs::CUSTOMER_CONFIG_HOLD_EXPIRED => error_message.to_string(),
         _ => PUBLIC_DEPLOYMENT_ERROR_MESSAGE.to_string(),
     })
 }
@@ -585,6 +590,7 @@ impl DeploymentResponse {
 }
 
 mod generic;
+pub(crate) use generic::create_generic_deployment_inner;
 pub(crate) use generic::generic_config_token_for_issuance;
 use generic::json_error;
 pub use generic::{
@@ -630,12 +636,152 @@ async fn app_has_incomplete_deployment_setup(
     sqlx::query_scalar(
         "SELECT EXISTS(
              SELECT 1
-             FROM deployments
-             WHERE app_id = $1
-               AND spec_snapshot ->> 'setup_state' IN ('dns_pending', 'cleanup_pending')
+               FROM deployments AS deployment
+              WHERE deployment.app_id = $1
+                AND deployment.spec_snapshot ->> 'setup_state'
+                    IN ('dns_pending', 'cleanup_pending')
+                AND NOT EXISTS (
+                    SELECT 1
+                      FROM deployment_apply_jobs AS job
+                     WHERE job.deployment_id = deployment.id
+                       AND job.customer_config_hold
+                       AND job.customer_config_released_at IS NULL
+                )
          )",
     )
     .bind(app_id)
+    .fetch_one(&mut **tx)
+    .await
+}
+
+/// True while an earlier deployment of this app still reports healthy — the
+/// same evidence the KBS selector uses to retain a failed app's workload
+/// authority. Held deployments stay `pending`, so an unreleased hold never
+/// counts as live evidence, and a lost-response retry sees the same
+/// deployments the first request saw. A failed app that never produced a
+/// healthy deployment has no TEE to receive customer config.
+async fn app_has_prior_healthy_deployment(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    app_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1
+               FROM deployments
+              WHERE app_id = $1
+                AND status = 'healthy'
+         )",
+    )
+    .bind(app_id)
+    .fetch_one(&mut **tx)
+    .await
+}
+
+/// Keep recent terminal applies as conservative SQL evidence; after this
+/// window the live Kubernetes probe still has to prove convergence.
+fn terminal_rollout_settling_window() -> std::time::Duration {
+    enclava_engine::apply::types::ApplyConfig::default().rollout_timeout
+}
+
+/// SQL interval literal for the settling window, bound as text and cast by
+/// the query (`$2::interval`), matching the repo's other interval binds.
+fn terminal_rollout_settling_window_sql() -> String {
+    format!("{} seconds", terminal_rollout_settling_window().as_secs())
+}
+
+/// True while an earlier rollout is still in flight: supersession
+/// terminalizes the job and deployment rows in SQL but cannot cancel an
+/// apply already running against the cluster, so a `watching` (or
+/// `pending`/`applying`) rollout may still replace or boot the TEE a held
+/// redeploy is trying to write customer config into. Callers must run this
+/// *before* `supersede_incomplete_deployments`, which rewrites exactly
+/// these statuses to `failed`. A frozen hold has no controller rollout;
+/// the shared supersession guard separately protects its config delivery.
+///
+/// A rollout that *terminalized on failure* (timeout or engine error) is
+/// equally capable of replacing the TEE — its Kubernetes Deployment was
+/// already applied and the controller keeps converging toward it — so the
+/// most recent cluster-applied generation counts as in-flight for the
+/// settling window above.
+///
+/// "Cluster-applied" is proven by ONE authoritative persisted signal: the
+/// deployment's generation reached the Kubernetes workload apply (the
+/// StatefulSet write). `apply_committed_at` (stamped as that write is
+/// entered) is
+/// that proof, with `observing_since` (0047, set at the `watching`
+/// transition for rows that reached observation) accepted as its legacy
+/// equivalent. The stamp is deliberately conservative: it does not depend
+/// on the client observing the provider response, so an apply whose
+/// response was lost to a timeout or connection error after Kubernetes
+/// accepted the request still counts. `manifest_hash` is deliberately NOT
+/// proof of apply: it is stored at the `'applying'` transition — before
+/// KBS reconciliation and before the provider write — so a newer attempt
+/// that failed before the provider call carries a hash without having
+/// changed the cluster's desired state, and must not suppress the older
+/// rollout's settling guard.
+///
+/// Post-apply failures and supersession rewrites count too: any terminal
+/// row that reached the provider (`deployment_apply_failed` after the SSA
+/// apply, `deployment_rollout_failed` timeouts, `deployment_superseded`
+/// rewrites of watching/applying rows) leaves the same converging
+/// controller behind, so the marker -- not the error class -- is the
+/// settling evidence. Rows that never reached the cluster carry no
+/// `apply_committed_at`/`observing_since` and are excluded.
+async fn app_has_rollout_in_flight(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    app_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1
+               FROM deployments AS deployment
+              WHERE deployment.app_id = $1
+                AND deployment.status IN ('pending', 'applying', 'watching')
+                AND NOT EXISTS (
+                    SELECT 1
+                      FROM deployment_apply_jobs AS job
+                     WHERE job.deployment_id = deployment.id
+                       AND job.customer_config_hold
+                       AND job.customer_config_released_at IS NULL
+                )
+         )
+         OR EXISTS (
+             SELECT 1
+               FROM deployments AS failed_rollout
+              WHERE failed_rollout.app_id = $1
+                AND failed_rollout.status = 'failed'
+                -- Any terminal error class is settling evidence as long as
+                -- the generation reached the Kubernetes apply stage:
+                -- rollout/apply timeouts, post-apply step failures (backend
+                -- resolution or `ensure_haproxy_routes` after the SSA
+                -- apply), and supersession rewrites
+                -- ('deployment_superseded') alike leave a controller that
+                -- SQL cannot cancel still converging toward the applied
+                -- spec. Rows that failed before the Kubernetes apply carry
+                -- no marker and changed nothing in-cluster.
+                AND (
+                    failed_rollout.apply_committed_at IS NOT NULL
+                    OR failed_rollout.observing_since IS NOT NULL
+                )
+                AND failed_rollout.completed_at
+                    > clock_timestamp() - $2::interval
+                -- Only the newest cluster-applied generation's controller
+                -- still acts; a later apply that actually reached the
+                -- cluster superseded this one's desired state.
+                AND NOT EXISTS (
+                    SELECT 1
+                      FROM deployments AS newer
+                     WHERE newer.app_id = $1
+                       AND (
+                           newer.apply_committed_at IS NOT NULL
+                           OR newer.observing_since IS NOT NULL
+                       )
+                       AND newer.created_at > failed_rollout.created_at
+                )
+         )",
+    )
+    .bind(app_id)
+    .bind(terminal_rollout_settling_window_sql())
     .fetch_one(&mut **tx)
     .await
 }
@@ -727,7 +873,20 @@ pub async fn deploy(
             Json(serde_json::json!({"error": "app not found"})),
         ))?;
 
-    deploy_app_candidate(auth, state, app, body, AppMutation::None).await
+    // The public deploy route has no customer-config release endpoint.
+    // Only the internal generic deployment path may arm a roll hold: a
+    // requested hold must be rejected here rather than silently dropped,
+    // or the caller would believe config-before-roll safety applied.
+    if body
+        .customer_config_roll_hold_seconds
+        .is_some_and(|seconds| seconds > 0)
+    {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "customer_config_roll_hold_seconds requires the internal generic deployment route; this route cannot release the hold",
+        ));
+    }
+    deploy_app_candidate(auth, state, app, body, AppMutation::None, false).await
 }
 
 async fn deploy_app_candidate(
@@ -736,6 +895,7 @@ async fn deploy_app_candidate(
     app: App,
     body: DeployRequest,
     app_mutation: AppMutation,
+    honor_customer_config_roll_hold: bool,
 ) -> Result<(StatusCode, Json<DeploymentResponse>), (StatusCode, Json<serde_json::Value>)> {
     if app_mutation != AppMutation::Insert
         && let Some(error) = runtime_reapply_status_error(app.status)
@@ -816,6 +976,42 @@ async fn deploy_app_candidate(
     })?;
 
     let image_digest = if image_ref.has_digest() {
+        // Digest-pinned references skip the allowlisted registry_client tag
+        // resolution, but the registry host still drives the cosign/sigstore
+        // egress below — so enforce the same destination policy up front
+        // (issue #224): an unallowlisted or private/literal-IP registry
+        // must never steer API egress, pinned digest or not.
+        let (registry, _) = crate::cosign::parse_image_parts(&body.image).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("invalid image reference: {e}")})),
+            )
+        })?;
+        let base_url = crate::registry::registry_base_url(&registry).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("unsupported registry: {e}")})),
+            )
+        })?;
+        let url = reqwest::Url::parse(&base_url).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("invalid registry URL: {e}")})),
+            )
+        })?;
+        state
+            .cosign_egress
+            .check_registry_url(&url)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "registry_destination_not_allowed",
+                        "message": e.to_string(),
+                    })),
+                )
+            })?;
         image_ref.digest().to_string()
     } else {
         crate::registry::resolve_image_digest(&state.registry_client, &image_ref)
@@ -1148,28 +1344,31 @@ async fn deploy_app_candidate(
             ));
         }
     };
-    let verified = crate::cosign::verify_image(&body.image, &image_digest, &policy)
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "cosign_verification_failed"})),
-            )
-        })?;
-    let portable_material =
-        crate::cosign::fetch_portable_verification_material(&body.image, &image_digest)
+    let verified =
+        crate::cosign::verify_image(&state.cosign_egress, &body.image, &image_digest, &policy)
             .await
             .map_err(|_| {
                 (
                     StatusCode::BAD_REQUEST,
-                    Json(
-                        serde_json::json!({"error": "portable_verification_material_unavailable"}),
-                    ),
+                    Json(serde_json::json!({"error": "cosign_verification_failed"})),
                 )
             })?;
+    let portable_material = crate::cosign::fetch_portable_verification_material(
+        &state.cosign_egress,
+        &body.image,
+        &image_digest,
+    )
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "portable_verification_material_unavailable"})),
+        )
+    })?;
 
     // Fetch provenance attestation and SBOM if available (non-fatal if missing).
     let (provenance, sbom) = crate::cosign::fetch_attestations(
+        &state.cosign_egress,
         &state.http_client,
         &body.image,
         &image_digest,
@@ -1252,6 +1451,75 @@ async fn deploy_app_candidate(
     crate::deploy::lock_app_deployment_lane(&mut tx, app.id)
         .await
         .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+    // A customer-config roll hold's safety contract is "write config into
+    // the live TEE before the roll", so the live workload must be settled
+    // before the hold is armed. SQL evidence alone cannot prove the cluster
+    // stopped acting on a failed rollout: a terminal row says nothing about
+    // a controller still converging toward its already-applied spec past
+    // the settling window, and a config write acknowledged into the old TEE
+    // cannot detect a replacement that lands afterwards. Probe the live
+    // StatefulSet generation (the same convergence criterion rollout
+    // observation uses) and refuse the hold while it is still converging.
+    // The probe runs INSIDE the app deployment lane: a sample taken before
+    // the lane lock could be invalidated by the previous lane holder (an
+    // ingress restart that timed out leaves its controller replacing the
+    // pod while the lane releases), and the hold must not be armed against
+    // that stale sample. Probe failures fail closed like an in-flight
+    // rollout: the request is rejected with the retryable conflict instead
+    // of arming a hold that cannot be trusted.
+    let mut cluster_workload_settled = Some(true);
+    if honor_customer_config_roll_hold
+        && body
+            .customer_config_roll_hold_seconds
+            .is_some_and(|seconds| seconds > 0)
+        && app_mutation != AppMutation::Insert
+        && app
+            .tee_domain
+            .as_deref()
+            .is_some_and(|domain| !domain.trim().is_empty())
+    {
+        match enclava_engine::apply::engine::ApplyEngine::try_default().await {
+            Ok(engine) => {
+                // Bounded: the probe runs under the acceptance transaction
+                // and the organization lanes, so a slow Kubernetes API must
+                // not pin them (and a pooled connection) for kube-client's
+                // full request timeout. Timeout fails closed like an
+                // in-flight rollout.
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    crate::deploy::workload_rollout_settled(&engine, &app.namespace, &app.name),
+                )
+                .await
+                {
+                    Ok(Ok(settled)) => cluster_workload_settled = settled,
+                    Ok(Err(error)) => {
+                        tracing::warn!(
+                            app_id = %app.id,
+                            error = %error,
+                            "could not verify live rollout settling; failing the roll hold closed"
+                        );
+                        cluster_workload_settled = Some(false);
+                    }
+                    Err(elapsed) => {
+                        tracing::warn!(
+                            app_id = %app.id,
+                            error = %elapsed,
+                            "live rollout settling probe timed out; failing the roll hold closed"
+                        );
+                        cluster_workload_settled = Some(false);
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    app_id = %app.id,
+                    error = %error,
+                    "no Kubernetes client for the rollout settling probe; failing the roll hold closed"
+                );
+                cluster_workload_settled = Some(false);
+            }
+        }
+    }
     enforce_authoritative_entitlement(
         &mut tx,
         auth.org_id,
@@ -1294,14 +1562,14 @@ async fn deploy_app_candidate(
             "app deployment inputs changed while deployment was validating; retry the deployment",
         ));
     }
+    let mut live_app_status = app.status;
     if app_mutation != AppMutation::Insert {
-        let current_status: crate::models::AppStatus =
-            sqlx::query_scalar("SELECT status FROM apps WHERE id = $1")
-                .bind(app.id)
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
-        if let Some(error) = runtime_reapply_status_error(current_status) {
+        live_app_status = sqlx::query_scalar("SELECT status FROM apps WHERE id = $1")
+            .bind(app.id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+        if let Some(error) = runtime_reapply_status_error(live_app_status) {
             return Err(json_error(StatusCode::CONFLICT, error));
         }
         if crate::mutation_leases::desired_state_mutation_in_progress(&mut tx, app.id)
@@ -1523,6 +1791,60 @@ async fn deploy_app_candidate(
     .await
     .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
 
+    // Capture in-flight evidence before supersession: supersede rewrites
+    // those rows to `failed`, which would erase the signal this hold
+    // decision depends on. The live-cluster settling probe is folded in
+    // here: a converged StatefulSet generation is the only proof that no
+    // earlier rollout's controller is still replacing the TEE behind the
+    // held write, and an unverifiable probe fails closed the same way.
+    let rollout_in_flight = cluster_workload_settled == Some(false)
+        || ((app_mutation != AppMutation::Insert)
+            && app_has_rollout_in_flight(&mut tx, app.id)
+                .await
+                .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?);
+    // The requested seconds are the idempotency identity. The accepted
+    // duration depends on the status read in this transaction, and apply
+    // changes that status before a lost-response retry arrives.
+    let customer_config_roll_hold_request = honor_customer_config_roll_hold
+        .then_some(body.customer_config_roll_hold_seconds)
+        .flatten();
+    // A failed app can still be serving its previous workload: a failed
+    // apply or rollout does not stop the old TEE, and the KBS selector keeps
+    // its authority for exactly that case. Hold only when an earlier
+    // deployment still reports healthy — the same evidence — so a failed app
+    // that never produced a live workload is not stranded waiting for a
+    // handshake no TEE can accept. `Creating` needs the same evidence: an
+    // apply in flight has projected the app to `Creating` while the previous
+    // workload keeps serving, and the hold decision below rejects a
+    // requested hold there instead of silently dropping it. A nonterminal
+    // earlier rollout means the workload is unstable: a requested hold is
+    // rejected rather than armed, because that rollout could still replace
+    // the TEE while this CLI writes config.
+    let prior_healthy_workload = matches!(
+        live_app_status,
+        crate::models::AppStatus::Failed | crate::models::AppStatus::Creating
+    ) && app_mutation != AppMutation::Insert
+        && app_has_prior_healthy_deployment(&mut tx, app.id)
+            .await
+            .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+    let customer_config_hold_seconds =
+        match crate::deployment_jobs::customer_config_roll_hold_decision(
+            customer_config_roll_hold_request.filter(|_| cluster_workload_settled.is_some()),
+            app_mutation == AppMutation::Insert,
+            live_app_status,
+            prior_healthy_workload,
+            rollout_in_flight,
+            app.tee_domain.as_deref(),
+        ) {
+            crate::deployment_jobs::CustomerConfigRollHoldDecision::Hold(seconds) => Some(seconds),
+            crate::deployment_jobs::CustomerConfigRollHoldDecision::Unheld => None,
+            crate::deployment_jobs::CustomerConfigRollHoldDecision::Conflict => {
+                return Err(json_error(
+                    StatusCode::CONFLICT,
+                    crate::deployment_jobs::CUSTOMER_CONFIG_HOLD_IN_FLIGHT_CONFLICT,
+                ));
+            }
+        };
     crate::deploy::supersede_incomplete_deployments(&mut tx, app.id)
         .await
         .map_err(|error| match error {
@@ -1588,12 +1910,35 @@ async fn deploy_app_candidate(
             .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
     }
 
+    sqlx::query(
+        "UPDATE deployments
+            SET spec_snapshot = jsonb_set(
+                  jsonb_set(
+                    spec_snapshot,
+                    '{customer_config_roll_hold_seconds}',
+                    COALESCE($2::jsonb, 'null'::jsonb),
+                    true
+                  ),
+                  '{customer_config_roll_hold_requested_seconds}',
+                  COALESCE($3::jsonb, 'null'::jsonb),
+                  true
+                )
+          WHERE id = $1",
+    )
+    .bind(deploy_id)
+    .bind(serde_json::json!(customer_config_hold_seconds))
+    .bind(serde_json::json!(customer_config_roll_hold_request))
+    .execute(&mut *tx)
+    .await
+    .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+
     let setup_job = crate::deployment_jobs::insert_setup_job(
         &mut tx,
         deploy_id,
         deploy_id,
         &apply_payload,
         signed_required,
+        customer_config_hold_seconds,
     )
     .await
     .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
@@ -1624,22 +1969,26 @@ async fn deploy_app_candidate(
         .await
         .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
 
-    match crate::deployment_jobs::process_setup_job(&state, setup_job).await {
-        Ok(()) => {}
-        Err(crate::deployment_jobs::DeploymentJobError::Dns(error)) => {
-            return Err(dns_error_response(error));
-        }
-        Err(error) => {
-            tracing::error!(
-                app_id = %app.id,
-                deployment_id = %deploy_id,
-                error_code = error.code(),
-                "durable deployment setup did not complete"
-            );
-            return Err(json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "database error",
-            ));
+    // A redeploy hold keeps the current TEE serving until the CLI releases
+    // the handshake. Starting setup here would race that write.
+    if customer_config_hold_seconds.is_none() {
+        match crate::deployment_jobs::process_setup_job(&state, setup_job).await {
+            Ok(()) => {}
+            Err(crate::deployment_jobs::DeploymentJobError::Dns(error)) => {
+                return Err(dns_error_response(error));
+            }
+            Err(error) => {
+                tracing::error!(
+                    app_id = %app.id,
+                    deployment_id = %deploy_id,
+                    error_code = error.code(),
+                    "durable deployment setup did not complete"
+                );
+                return Err(json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "database error",
+                ));
+            }
         }
     }
 
@@ -2284,6 +2633,7 @@ mod tests {
             deployment_id,
             &payload,
             false,
+            None,
         )
         .await
         .expect("persist accepted setup job");
@@ -2551,6 +2901,370 @@ mod tests {
             .await
             .expect("load app status after current watcher");
         assert_eq!(app_status, "running");
+
+        delete_setup_test_org(&pool, app.org_id).await;
+    }
+
+    #[tokio::test]
+    async fn prior_healthy_deployment_evidence_distinguishes_a_live_failed_app() {
+        let pool = database_test_pool().await;
+        let app = insert_setup_test_app(&pool).await;
+        async fn has_healthy(pool: &sqlx::PgPool, app_id: Uuid) -> bool {
+            let mut tx = pool.begin().await.expect("begin evidence probe");
+            let result = app_has_prior_healthy_deployment(&mut tx, app_id)
+                .await
+                .expect("probe prior healthy deployment");
+            tx.commit().await.expect("commit evidence probe");
+            result
+        }
+
+        // No deployment yet: a failed app that never had a live workload
+        // must not count as holding a live TEE.
+        assert!(
+            !has_healthy(&pool, app.id).await,
+            "an app without deployments has no prior healthy workload"
+        );
+
+        // A failed-only history still has nothing live to configure.
+        sqlx::query(
+            "INSERT INTO deployments (id, org_id, app_id, trigger, status, spec_snapshot)
+             VALUES ($1, $2, $3, 'api', 'failed', '{}'::jsonb)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(app.org_id)
+        .bind(app.id)
+        .execute(&pool)
+        .await
+        .expect("insert failed deployment");
+        assert!(
+            !has_healthy(&pool, app.id).await,
+            "failed deployments alone do not prove a live workload"
+        );
+
+        // A previously healthy deployment is exactly the evidence a failed
+        // apply leaves behind while the old TEE keeps serving.
+        sqlx::query(
+            "INSERT INTO deployments (id, org_id, app_id, trigger, status, spec_snapshot)
+             VALUES ($1, $2, $3, 'api', 'healthy', '{}'::jsonb)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(app.org_id)
+        .bind(app.id)
+        .execute(&pool)
+        .await
+        .expect("insert healthy deployment");
+        assert!(
+            has_healthy(&pool, app.id).await,
+            "a prior healthy deployment means the failed app may still be live"
+        );
+
+        delete_setup_test_org(&pool, app.org_id).await;
+    }
+
+    #[tokio::test]
+    async fn rollout_in_flight_evidence_distinguishes_frozen_holds() {
+        let pool = database_test_pool().await;
+        let app = insert_setup_test_app(&pool).await;
+
+        async fn in_flight(pool: &sqlx::PgPool, app_id: Uuid) -> bool {
+            let mut tx = pool.begin().await.expect("begin in-flight probe");
+            let result = app_has_rollout_in_flight(&mut tx, app_id)
+                .await
+                .expect("probe in-flight rollout evidence");
+            tx.commit().await.expect("commit in-flight probe");
+            result
+        }
+        // A watching rollout is still replacing the workload and counts as
+        // in flight for every later deployment. The schema trigger requires
+        // the job row first; the deferred FK lets the deployment follow in
+        // the same transaction.
+        async fn insert_in_flight(
+            pool: &sqlx::PgPool,
+            app_id: Uuid,
+            org_id: Uuid,
+            status: &str,
+            hold: bool,
+        ) -> Uuid {
+            let id = Uuid::new_v4();
+            let mut tx = pool.begin().await.expect("begin in-flight fixture");
+            sqlx::query(
+                "INSERT INTO deployment_apply_jobs (
+                     deployment_id, app_id, org_id, source_deployment_id,
+                     payload_version, payload, payload_sha256,
+                     cleanup_app_on_setup_failure, signed_required,
+                     artifact_deployment_id, artifact_descriptor_core_hash,
+                     log_encryption, state, next_attempt_at,
+                     customer_config_hold, customer_config_hold_until
+                 ) VALUES (
+                     $1, $2, $3, $1, 1,
+                     '{\"version\":1,\"log_encryption\":null}'::jsonb,
+                     $4, false, false, NULL, NULL, NULL, 'setup_pending',
+                     CASE WHEN $5 THEN 'infinity'::timestamptz ELSE now() END,
+                     $5,
+                     CASE WHEN $5 THEN clock_timestamp() + interval '1 hour' END
+                 )",
+            )
+            .bind(id)
+            .bind(app_id)
+            .bind(org_id)
+            .bind(vec![5u8; 32])
+            .bind(hold)
+            .execute(&mut *tx)
+            .await
+            .expect("insert in-flight apply job");
+            sqlx::query(
+                "INSERT INTO deployments (id, org_id, app_id, trigger, status, spec_snapshot)
+                 VALUES ($1, $2, $3, 'api', $4::deploy_status_enum, '{}'::jsonb)",
+            )
+            .bind(id)
+            .bind(org_id)
+            .bind(app_id)
+            .bind(status)
+            .execute(&mut *tx)
+            .await
+            .expect("insert in-flight deployment");
+            tx.commit().await.expect("commit in-flight fixture");
+            id
+        }
+
+        let watching = insert_in_flight(&pool, app.id, app.org_id, "watching", false).await;
+        assert!(
+            in_flight(&pool, app.id).await,
+            "a watching earlier rollout means the workload is unstable"
+        );
+
+        // Frozen config delivery has no cluster rollout; the shared
+        // supersession guard protects it separately.
+        sqlx::query("UPDATE deployments SET status = 'failed' WHERE id = $1")
+            .bind(watching)
+            .execute(&pool)
+            .await
+            .expect("settle watching deployment");
+        let held = insert_in_flight(&pool, app.id, app.org_id, "pending", true).await;
+        assert!(
+            !in_flight(&pool, app.id).await,
+            "a frozen unreleased hold must not count as an in-flight rollout"
+        );
+
+        // Once the hold is released its roll resumes and counts as in
+        // flight again.
+        sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET customer_config_released_at = clock_timestamp()
+              WHERE deployment_id = $1",
+        )
+        .bind(held)
+        .execute(&pool)
+        .await
+        .expect("release hold job");
+        assert!(
+            in_flight(&pool, app.id).await,
+            "a released hold is rolling again and blocks a new hold"
+        );
+
+        // The released roll completes: the deployment reaches a terminal
+        // applied state and stops counting as in flight.
+        sqlx::query(
+            "UPDATE deployments
+                SET status = 'healthy',
+                    manifest_hash = 'released-roll',
+                    completed_at = clock_timestamp()
+              WHERE id = $1",
+        )
+        .bind(held)
+        .execute(&pool)
+        .await
+        .expect("complete the released roll");
+        assert!(
+            !in_flight(&pool, app.id).await,
+            "a completed released roll is no longer in flight"
+        );
+
+        // A rollout that terminalized on failure inside the settling
+        // window still counts: its Kubernetes Deployment was applied and
+        // the controller can keep replacing the TEE even though the SQL
+        // rows are terminal. `observing_since` is the legacy proof that
+        // the apply reached the cluster (stamped at the watching
+        // transition); `apply_committed_at` is the same proof for rows
+        // that failed after the provider write but before observation.
+        sqlx::query(
+            "INSERT INTO deployments (
+                 id, org_id, app_id, trigger, status, spec_snapshot,
+                 error_message, completed_at, manifest_hash, observing_since
+             ) VALUES (
+                 $1, $2, $3, 'api', 'failed', '{}'::jsonb,
+                 'deployment_rollout_failed', clock_timestamp(), 'timed-out',
+                 clock_timestamp()
+             )",
+        )
+        .bind(Uuid::new_v4())
+        .bind(app.org_id)
+        .bind(app.id)
+        .execute(&pool)
+        .await
+        .expect("insert timed-out rollout deployment");
+        assert!(
+            in_flight(&pool, app.id).await,
+            "a recently timed-out rollout may still replace the TEE"
+        );
+
+        // Past the settling window the failure is treated as settled.
+        // The window literal is interpolated from the Rust helper (a
+        // constant derived from ApplyConfig::default()) rather than bound,
+        // because the test needs it inside an interval arithmetic fold.
+        sqlx::query(&format!(
+            "UPDATE deployments
+                SET completed_at = clock_timestamp()
+                    - ('{}'::interval + interval '1 second')
+              WHERE app_id = $1 AND error_message = 'deployment_rollout_failed'",
+            terminal_rollout_settling_window_sql(),
+        ))
+        .bind(app.id)
+        .execute(&pool)
+        .await
+        .expect("age out the timed-out rollout");
+        assert!(
+            !in_flight(&pool, app.id).await,
+            "an aged-out timed-out rollout no longer blocks holds"
+        );
+
+        // The same fresh failure stops counting once a later deployment
+        // actually committed a newer generation to the cluster: only the
+        // newest cluster-applied generation's controller still acts, so
+        // the timed-out one is superseded.
+        sqlx::query(
+            "UPDATE deployments
+                SET completed_at = clock_timestamp()
+              WHERE app_id = $1 AND error_message = 'deployment_rollout_failed'",
+        )
+        .bind(app.id)
+        .execute(&pool)
+        .await
+        .expect("refresh the timed-out rollout");
+        assert!(
+            in_flight(&pool, app.id).await,
+            "a fresh timed-out rollout counts again before supersession"
+        );
+
+        // A newer attempt that stored a manifest hash but failed BEFORE
+        // the provider apply (e.g. during KBS reconciliation) does NOT
+        // supersede the timed-out rollout: `manifest_hash` is written at
+        // the 'applying' transition, before the cluster's desired state
+        // changed, so the older generation's controller is still the one
+        // converging. The pre-provider failure itself carries no
+        // apply-committed marker and is not settling evidence either.
+        sqlx::query(
+            "INSERT INTO deployments (
+                 id, org_id, app_id, trigger, status, spec_snapshot,
+                 error_message, completed_at, manifest_hash, created_at
+             ) VALUES (
+                 $1, $2, $3, 'api', 'failed', '{}'::jsonb,
+                 'deployment_apply_failed', clock_timestamp(),
+                 'kbs-reconcile-failed', clock_timestamp() + interval '1 second'
+             )",
+        )
+        .bind(Uuid::new_v4())
+        .bind(app.org_id)
+        .bind(app.id)
+        .execute(&pool)
+        .await
+        .expect("insert hash-only pre-apply failure");
+        assert!(
+            in_flight(&pool, app.id).await,
+            "a hash-only newer failure does not hide the active rollout"
+        );
+
+        // A newer deployment whose Kubernetes apply actually committed
+        // (`apply_committed_at`, stamped after the SSA provider write)
+        // supersedes the failed generations: its controller is the only
+        // one still acting on the cluster.
+        sqlx::query(
+            "INSERT INTO deployments (
+                 id, org_id, app_id, trigger, status, spec_snapshot,
+                 error_message, completed_at, manifest_hash,
+                 apply_committed_at, created_at
+             ) VALUES (
+                 $1, $2, $3, 'api', 'healthy', '{}'::jsonb,
+                 NULL, clock_timestamp(), 'superseding',
+                 clock_timestamp(), clock_timestamp() + interval '2 seconds'
+             )",
+        )
+        .bind(Uuid::new_v4())
+        .bind(app.org_id)
+        .bind(app.id)
+        .execute(&pool)
+        .await
+        .expect("insert newer cluster-applied generation");
+        assert!(
+            !in_flight(&pool, app.id).await,
+            "a superseded timed-out generation no longer blocks holds"
+        );
+
+        // A POST-apply failure (backend resolution or ensure_haproxy_routes
+        // failing after the SSA apply committed) leaves the same converging
+        // controller behind: it counts as an unsettled rollout for the
+        // settling window.
+        let post_apply_failure_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO deployments (
+                 id, org_id, app_id, trigger, status, spec_snapshot,
+                 error_message, completed_at, apply_committed_at, created_at
+             ) VALUES (
+                 $1, $2, $3, 'api', 'failed', '{}'::jsonb,
+                 'deployment_apply_failed', clock_timestamp(),
+                 clock_timestamp(), clock_timestamp() + interval '3 seconds'
+             )",
+        )
+        .bind(post_apply_failure_id)
+        .bind(app.org_id)
+        .bind(app.id)
+        .execute(&pool)
+        .await
+        .expect("insert post-apply failure");
+        assert!(
+            in_flight(&pool, app.id).await,
+            "a post-apply failure still owns the cluster generation"
+        );
+
+        // A supersession rewrite ('deployment_superseded') of a watching
+        // generation carries the same converging-controller risk: SQL
+        // cannot cancel an apply the cluster already accepted, and the
+        // successor may die before its own provider write. The marker --
+        // not the error class -- is the settling evidence.
+        let superseded_failure_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO deployments (
+                 id, org_id, app_id, trigger, status, spec_snapshot,
+                 error_message, completed_at, apply_committed_at, created_at
+             ) VALUES (
+                 $1, $2, $3, 'api', 'failed', '{}'::jsonb,
+                 'deployment_superseded', clock_timestamp(),
+                 clock_timestamp(), clock_timestamp() + interval '4 seconds'
+             )",
+        )
+        .bind(superseded_failure_id)
+        .bind(app.org_id)
+        .bind(app.id)
+        .execute(&pool)
+        .await
+        .expect("insert superseded applied generation");
+        assert!(
+            in_flight(&pool, app.id).await,
+            "a superseded applied generation still counts as in-flight"
+        );
+
+        // The same failures WITHOUT the apply marker changed nothing
+        // in-cluster (they failed before the provider call) and stay
+        // settled — only the marker distinguishes the two.
+        sqlx::query("UPDATE deployments SET apply_committed_at = NULL WHERE id = ANY($1)")
+            .bind(vec![post_apply_failure_id, superseded_failure_id])
+            .execute(&pool)
+            .await
+            .expect("strip the apply marker from the newest failures");
+        assert!(
+            !in_flight(&pool, app.id).await,
+            "pre-provider failures never owned the cluster generation"
+        );
 
         delete_setup_test_org(&pool, app.org_id).await;
     }

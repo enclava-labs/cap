@@ -751,7 +751,12 @@ async fn main() {
         startup_proxy_image.as_deref(),
         startup_caddy_image.as_deref(),
     ) {
-        Ok(Some(pins)) => match enclava_api::cosign::verify_sidecars_at_startup(&pins).await {
+        Ok(Some(pins)) => match enclava_api::cosign::verify_sidecars_at_startup(
+            &enclava_api::clients::EgressGuard::from_env(),
+            &pins,
+        )
+        .await
+        {
             Ok(v) => tracing::info!(
                 attestation_proxy = %v.attestation_proxy,
                 caddy_ingress = %v.caddy_ingress,
@@ -882,6 +887,7 @@ async fn main() {
     let outbound_body_limit = outbound_config.body_limit_bytes;
     let registry_client =
         enclava_api::clients::RegistryClient::from_env().expect("failed to build registry client");
+    let cosign_egress = enclava_api::clients::EgressGuard::from_env();
     let trustee_http_client =
         build_trustee_http_client().expect("failed to build Trustee HTTP client");
 
@@ -900,6 +906,7 @@ async fn main() {
         http_client,
         outbound_body_limit,
         registry_client,
+        cosign_egress,
         trustee_http_client,
         tee_http_client,
         recent_tee_probe_failures: std::sync::Arc::new(std::sync::Mutex::new(

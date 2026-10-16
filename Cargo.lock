@@ -1567,6 +1567,7 @@ dependencies = [
  "indicatif",
  "nostr",
  "openssl",
+ "parking_lot",
  "rand 0.8.6",
  "reqwest 0.13.2",
  "rustls",
