@@ -172,10 +172,36 @@ pub fn build_volumes(app: &ConfidentialApp) -> Vec<Volume> {
             name: "unlock-socket".to_string(),
             empty_dir: Some(EmptyDirVolumeSource {
                 medium: Some("Memory".to_string()),
-                size_limit: Some(Quantity("16Mi".to_string())),
+                // cap#242: /run/enclava also holds the detached LUKS2 header
+                // copies (a full header region is 16MiB per volume, two
+                // volumes) alongside init-ready, containers, caddy-runtime
+                // and the ephemeral key files. 16Mi could not fit even one
+                // header; give the RAM-backed volume enough headroom that
+                // the sizeLimit never wedges boot where it is enforced.
+                size_limit: Some(Quantity("64Mi".to_string())),
             }),
             ..Default::default()
         });
+        // cap#244 review: plaintext LUKS material (detached header copies,
+        // transient key files) must be isolated from the workload
+        // container. /run/enclava is mounted writable into the primary
+        // container, and rootful workload profiles share UID 0 with
+        // enclava-init, so uid/mode checks there provide no isolation.
+        // This RAM-backed volume is mounted into enclava-init ONLY
+        // (mount-level isolation) at the path enclava-init's
+        // PRIVATE_MATERIAL_DIR expects (/run/enclava-luks).
+        if !legacy {
+            v.push(Volume {
+                name: "luks-material".to_string(),
+                empty_dir: Some(EmptyDirVolumeSource {
+                    medium: Some("Memory".to_string()),
+                    // Two full header regions (state + tls-state, 16MiB
+                    // each) plus transient key files and headroom.
+                    size_limit: Some(Quantity("48Mi".to_string())),
+                }),
+                ..Default::default()
+            });
+        }
         v.push(Volume {
             name: "unlock-channel".to_string(),
             empty_dir: Some(EmptyDirVolumeSource {

@@ -38,6 +38,7 @@ use sigstore::crypto::SigningScheme;
 use sigstore::registry::{Auth, ClientConfig, ClientProtocol, OciReference};
 use sigstore::trust::sigstore::SigstoreTrustRoot;
 
+use crate::clients::EgressGuard;
 use crate::registry::registry_base_url;
 
 const MAX_SIGSTORE_MATERIAL_BYTES: usize = 196_608;
@@ -146,7 +147,9 @@ fn digest_to_cosign_tag(digest: &str, suffix: &str) -> String {
 }
 
 /// Parse an image reference into (registry, repository) components.
-fn parse_image_parts(image_ref: &str) -> Result<(String, String), CosignError> {
+/// Public for the deploy route's digest-pinned pre-flight egress check
+/// (issue #224); the parsing itself performs no I/O.
+pub fn parse_image_parts(image_ref: &str) -> Result<(String, String), CosignError> {
     let base = image_ref.split('@').next().unwrap_or(image_ref);
     let base = match (base.rfind('/'), base.rfind(':')) {
         (slash, Some(colon)) if slash.is_none_or(|slash| colon > slash) => &base[..colon],
@@ -254,22 +257,60 @@ fn build_constraints(
 
 /// Verify that a cosign signature exists for the given image digest and
 /// satisfies the app's pinned verification policy.
+///
+/// `egress` is the pre-flight destination guard (issue #224): the sigstore
+/// client builds its own reqwest transport internally (no resolver or
+/// redirect-policy injection point), so the registry host — which for a
+/// tenant-supplied, digest-pinned reference is attacker-chosen — is checked
+/// against the allowlist, the literal-IP blocklist, and DNS before the
+/// unguarded transport dials anything.
 pub async fn verify_image(
+    egress: &EgressGuard,
     image_ref: &str,
     image_digest: &str,
     policy: &VerificationPolicy,
 ) -> Result<VerifiedSignature, CosignError> {
+    // Guard the sigstore client's egress before anything else (issue #224):
+    // the sigstore transport is unguarded, so the registry host — which for
+    // a tenant-supplied, digest-pinned reference is attacker-chosen — is
+    // checked against the allowlist, the literal-IP blocklist, and DNS
+    // before any network I/O (including the dev TUF fallback below).
+    let (registry, _) = parse_image_parts(image_ref)?;
+    let base_url = registry_base_url(&registry)
+        .map_err(|e| CosignError::VerificationFailed(format!("unsupported registry: {e}")))?;
+    let registry_url = reqwest::Url::parse(&base_url)
+        .map_err(|e| CosignError::VerificationFailed(format!("invalid registry URL: {e}")))?;
+    egress
+        .check_registry_url(&registry_url)
+        .await
+        .map_err(|e| {
+            CosignError::VerificationFailed(format!("registry destination rejected: {e}"))
+        })?;
+
     let trust_root = load_trust_root().await?;
 
     let image: OciReference = image_ref
         .parse()
         .map_err(|e| CosignError::VerificationFailed(format!("invalid image reference: {e}")))?;
-    let (registry, _) = parse_image_parts(image_ref)?;
 
     let mut oci_client_config = ClientConfig::default();
     if env_flag("COSIGN_ALLOW_HTTP_REGISTRY") {
         oci_client_config.protocol = ClientProtocol::Http;
     }
+    // Route the sigstore/oci transports through the loopback egress proxy
+    // (cap#241 review): those stacks build their own reqwest clients with
+    // their own resolvers and the default follow-redirect policy, so a
+    // pre-flight check alone leaves a DNS-rebinding window and unvalidated
+    // redirect/token-realm destinations. Through the proxy, every dialed
+    // destination — initial host, each redirect hop, each bearer realm —
+    // is resolved and blocklist-checked by the proxy itself, and the proxy
+    // dials the validated answers (no second resolution).
+    let proxy_url = egress
+        .proxy
+        .url()
+        .map_err(|e| CosignError::VerificationFailed(format!("egress proxy unavailable: {e}")))?;
+    oci_client_config.https_proxy = Some(proxy_url.clone());
+    oci_client_config.http_proxy = Some(proxy_url);
 
     let mut cosign_client = ClientBuilder::default()
         .with_oci_client_config(oci_client_config)
@@ -404,7 +445,13 @@ fn extract_signer_metadata(
 /// `body_limit` caps how many manifest bytes a registry response may carry
 /// before the read is aborted (see `clients::read_body_capped`); callers
 /// should pass the outbound client's `ClientConfig::body_limit_bytes`.
+///
+/// `egress` pre-checks the registry host (issue #224): the caller's client
+/// is the guarded `state.http_client` (resolver-backed), but reqwest never
+/// consults a custom resolver for literal-IP hosts, so a literal registry
+/// host must be rejected explicitly before the first request.
 pub async fn fetch_attestations(
+    egress: &EgressGuard,
     client: &reqwest::Client,
     image_ref: &str,
     digest: &str,
@@ -413,6 +460,14 @@ pub async fn fetch_attestations(
     let (registry, repository) = parse_image_parts(image_ref)?;
     let base_url = registry_base_url(&registry)
         .map_err(|e| CosignError::VerificationFailed(format!("unsupported registry: {e}")))?;
+    let registry_url = reqwest::Url::parse(&base_url)
+        .map_err(|e| CosignError::VerificationFailed(format!("invalid registry URL: {e}")))?;
+    egress
+        .check_registry_url(&registry_url)
+        .await
+        .map_err(|e| {
+            CosignError::VerificationFailed(format!("registry destination rejected: {e}"))
+        })?;
 
     // Attestation manifests are provenance material: bound the read by the
     // same cap the portable-material checks enforce, so a malicious registry
@@ -429,7 +484,14 @@ pub async fn fetch_attestations(
 }
 
 /// Preserve the exact OCI manifests and signed layers needed for offline replay.
+///
+/// `egress` guards the oci-client transport the same way `verify_image`
+/// guards the sigstore one (issue #224): `oci_client::client::Client`
+/// builds its own reqwest stack with the default (follow) redirect policy
+/// and no custom resolver, so the tenant-chosen registry host is validated
+/// before any manifest, blob, or referrers request is issued.
 pub async fn fetch_portable_verification_material(
+    egress: &EgressGuard,
     image_ref: &str,
     image_digest: &str,
 ) -> Result<PortableVerificationMaterial, CosignError> {
@@ -444,11 +506,30 @@ pub async fn fetch_portable_verification_material(
     ];
 
     let (registry, repository) = parse_image_parts(image_ref)?;
+    let base_url = registry_base_url(&registry)
+        .map_err(|e| CosignError::VerificationFailed(format!("unsupported registry: {e}")))?;
+    let registry_url = reqwest::Url::parse(&base_url)
+        .map_err(|e| CosignError::VerificationFailed(format!("invalid registry URL: {e}")))?;
+    egress
+        .check_registry_url(&registry_url)
+        .await
+        .map_err(|e| {
+            CosignError::VerificationFailed(format!("registry destination rejected: {e}"))
+        })?;
     let auth: RegistryAuth = (&registry_auth_from_env(&registry)).into();
     let mut config = ClientConfig::default();
     if env_flag("COSIGN_ALLOW_HTTP_REGISTRY") {
         config.protocol = oci_client::client::ClientProtocol::Http;
     }
+    // Same proxy routing as `verify_image`: bind the guarded resolution to
+    // the actual connection and re-validate every redirect/token-realm
+    // destination the oci-client transport follows (cap#241 review).
+    let proxy_url = egress
+        .proxy
+        .url()
+        .map_err(|e| CosignError::VerificationFailed(format!("egress proxy unavailable: {e}")))?;
+    config.https_proxy = Some(proxy_url.clone());
+    config.http_proxy = Some(proxy_url);
     let client = Client::new(config);
     let source = oci_client::Reference::with_digest(
         registry.clone(),
@@ -839,6 +920,7 @@ pub struct VerifiedSidecars {
 /// `SKIP_COSIGN_VERIFY` (debug builds only — release rejects via env_gates)
 /// short-circuits this check. Production must always verify.
 pub async fn verify_sidecars_at_startup(
+    egress: &EgressGuard,
     pins: &[SidecarPin],
 ) -> Result<VerifiedSidecars, CosignError> {
     if std::env::var("SKIP_COSIGN_VERIFY")
@@ -864,7 +946,7 @@ pub async fn verify_sidecars_at_startup(
     let mut ap = String::new();
     let mut ca = String::new();
     for pin in pins {
-        let v = verify_image(&pin.image_ref, &pin.image_digest, &pin.policy).await?;
+        let v = verify_image(egress, &pin.image_ref, &pin.image_digest, &pin.policy).await?;
         tracing::info!(
             sidecar = %pin.label,
             digest = %v.digest,
@@ -1016,6 +1098,128 @@ fn read_public_key_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clients::EgressGuard;
+
+    fn hermetic_egress_guard() -> EgressGuard {
+        let blocked =
+            std::sync::Arc::new(enclava_common::outbound_http::BlockedNetworks::defaults());
+        EgressGuard {
+            proxy: crate::egress_proxy::EgressProxy::new(std::sync::Arc::clone(&blocked)),
+            blocked,
+            allowlist: crate::clients::AllowList::from_env_or_default(None),
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_image_rejects_literal_ip_registry_before_any_io() {
+        // The sigstore transport is unguarded; the pre-flight guard must
+        // reject a tenant-chosen literal-IP registry host (issue #224)
+        // before the sigstore client dials anything. SIGSTORE_TUF_ROOT_PATH
+        // must be set so load_trust_root does not hit the network first.
+        let root =
+            std::env::temp_dir().join(format!("cap-224-trusted-root-{}.json", std::process::id()));
+        std::fs::write(&root, b"{}").unwrap();
+        unsafe {
+            std::env::set_var("SIGSTORE_TUF_ROOT_PATH", &root);
+        }
+        let guard = hermetic_egress_guard();
+        let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let err = verify_image(
+            &guard,
+            "10.0.5.7/team/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            digest,
+            &url_policy(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("registry destination rejected"),
+            "literal-IP registry must be rejected, got: {err}"
+        );
+        // ::/96 spelling must fail identically.
+        let err = verify_image(
+            &guard,
+            "[::10.0.5.7]/team/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            digest,
+            &url_policy(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("registry destination rejected"),
+            "IPv4-compatible v6 registry must be rejected, got: {err}"
+        );
+        unsafe {
+            std::env::remove_var("SIGSTORE_TUF_ROOT_PATH");
+        }
+        let _ = std::fs::remove_file(&root);
+    }
+
+    #[tokio::test]
+    async fn verify_image_rejects_unallowlisted_registry_before_any_io() {
+        let root =
+            std::env::temp_dir().join(format!("cap-224-trusted-root-{}.json", std::process::id()));
+        std::fs::write(&root, b"{}").unwrap();
+        unsafe {
+            std::env::set_var("SIGSTORE_TUF_ROOT_PATH", &root);
+        }
+        let guard = hermetic_egress_guard();
+        let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let err = verify_image(
+            &guard,
+            "internal.svc.cluster.local/repo/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            digest,
+            &url_policy(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("registry destination rejected"),
+            "cluster-internal registry host must be rejected, got: {err}"
+        );
+        unsafe {
+            std::env::remove_var("SIGSTORE_TUF_ROOT_PATH");
+        }
+        let _ = std::fs::remove_file(&root);
+    }
+
+    #[tokio::test]
+    async fn fetch_attestations_rejects_unguarded_destinations() {
+        let guard = hermetic_egress_guard();
+        let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let client = reqwest::Client::new();
+        for image in [
+            "10.0.5.7/team/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "internal.svc.cluster.local/repo/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            let err = fetch_attestations(&guard, &client, image, digest, 1024)
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("registry destination rejected"),
+                "{image} must be rejected, got: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_portable_verification_material_rejects_unguarded_destinations() {
+        let guard = hermetic_egress_guard();
+        let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        for image in [
+            "169.254.169.254/repo/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "[::ffff:10.0.5.7]/repo/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "evil.example/repo/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            let err = fetch_portable_verification_material(&guard, image, digest)
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("registry destination rejected"),
+                "{image} must be rejected, got: {err}"
+            );
+        }
+    }
 
     fn url_policy() -> VerificationPolicy {
         VerificationPolicy::FulcioUrlIdentity {

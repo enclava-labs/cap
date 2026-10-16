@@ -5,6 +5,7 @@
 
 use sha2::{Digest, Sha256};
 use std::io::Write;
+use std::sync::OnceLock;
 
 use crate::types::ConfidentialApp;
 
@@ -31,11 +32,77 @@ pub fn trustee_kbs_resource_url() -> String {
     )
 }
 
+/// LUKS2 header-seal rollout claim rendered into the signed cc_init_data
+/// (cap#242): "adopt" during the migration window (legacy pre-seal volumes
+/// are adopted after the passphrase gate), "required" once the fleet has
+/// migrated (an unsealed header is rejected as rollback). One-way rollout:
+/// the value lives in the *signed platform release metadata*
+/// (`luks2_header_seal`, cap#244 review) and is installed here at startup,
+/// so every producer of `expected_cc_init_data_hash` (enclava-api render,
+/// hosted/local CLI signing) hashes identical bytes. It must never be
+/// sourced from a producer's private environment: a CLI without the
+/// setting would hash a different render than the API and every deploy
+/// would fail on `expected_cc_init_data_hash` mismatch — or worse, the
+/// signed hash would fail to commit to the actual rollout state. The
+/// environment variable remains only as a release-less dev/test fallback,
+/// and enclava-api refuses to start when it conflicts with the signed
+/// value.
+static LUKS2_HEADER_SEAL_CLAIM: OnceLock<String> = OnceLock::new();
+
+/// Install the release-sourced rollout claim (called once at process
+/// startup by producers that have verified a signed platform release).
+pub fn set_luks2_header_seal_claim(value: &str) {
+    let value = validate_luks2_header_seal_claim(value);
+    // First write wins; startup runs this exactly once per process.
+    let _ = LUKS2_HEADER_SEAL_CLAIM.set(value);
+}
+
+/// The claim value rendered into cc_init_data: the release-installed value
+/// when set, else the dev/test environment fallback, else "adopt".
+pub fn luks2_header_seal_claim() -> String {
+    resolve_luks2_header_seal_claim(
+        LUKS2_HEADER_SEAL_CLAIM.get().map(String::as_str),
+        std::env::var("ENCLAVA_LUKS2_HEADER_SEAL")
+            .ok()
+            .as_deref()
+            .map(str::trim),
+    )
+}
+
+/// Pure precedence rule, testable without process-global state.
+fn resolve_luks2_header_seal_claim(release_value: Option<&str>, env_value: Option<&str>) -> String {
+    if let Some(value) = release_value {
+        return validate_luks2_header_seal_claim(value.trim());
+    }
+    match env_value {
+        Some(value) if !value.trim().is_empty() => validate_luks2_header_seal_claim(value.trim()),
+        _ => "adopt".to_string(),
+    }
+}
+
+/// Validate an explicit claim value; testable without process-global env
+/// mutation (edition 2024 makes `set_var` unsafe, and env mutation races
+/// parallel tests anyway).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn validate_luks2_header_seal_claim(value: &str) -> String {
+    match value {
+        "adopt" | "required" => value.to_string(),
+        other => panic!(
+            "invalid ENCLAVA_LUKS2_HEADER_SEAL {other:?}: expected \"adopt\" or \"required\""
+        ),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CcInitDataOptions {
     pub kbs_url: String,
     pub kbs_ca_cert_pem: Option<String>,
     pub runtime_class: String,
+    /// LUKS2 header-seal rollout claim (cap#242): part of the deterministic
+    /// render options so every producer of `expected_cc_init_data_hash`
+    /// (enclava-api render, hosted/local CLI signing) renders identical
+    /// bytes instead of each process reading its private environment.
+    pub luks2_header_seal: String,
 }
 
 impl CcInitDataOptions {
@@ -44,6 +111,7 @@ impl CcInitDataOptions {
             kbs_url: trustee_kbs_url(),
             kbs_ca_cert_pem: trustee_kbs_ca_cert_pem(),
             runtime_class: runtime_class(),
+            luks2_header_seal: luks2_header_seal_claim(),
         }
     }
 }
@@ -170,6 +238,21 @@ pub fn build_toml_with_options(app: &ConfidentialApp, options: &CcInitDataOption
         "tls_state_hkdf_info",
         crate::manifest::enclava_init_config::TLS_STATE_HKDF_INFO,
     );
+    // cap#242 render compatibility: artifacts signed before this claim
+    // existed hash a render without it; the binding pin reproduces those
+    // exact bytes. A claim-less render means the rollout-window ("adopt")
+    // default on the guest side.
+    let omit_seal_claim = app
+        .workload_artifact_binding
+        .as_ref()
+        .is_some_and(|binding| binding.omit_luks2_header_seal_claim);
+    if !omit_seal_claim {
+        push_toml_string(
+            &mut toml,
+            "luks2_header_seal",
+            &validate_luks2_header_seal_claim(&options.luks2_header_seal),
+        );
+    }
     push_toml_string(
         &mut toml,
         "unlock_socket",
@@ -325,7 +408,6 @@ pub fn build_toml_with_options(app: &ConfidentialApp, options: &CcInitDataOption
     }
     toml.push('\n');
 
-    // policy.rego
     if let Some(agent_policy) = &app.generated_agent_policy {
         let actual_hash: [u8; 32] = Sha256::digest(agent_policy.policy_text.as_bytes()).into();
         assert_eq!(
@@ -351,7 +433,6 @@ pub fn build_toml_with_options(app: &ConfidentialApp, options: &CcInitDataOption
     }
     toml.push('\n');
 
-    // aa.toml
     let mut aa_toml = String::new();
     aa_toml.push_str("[token_configs]\n");
     aa_toml.push_str("[token_configs.kbs]\n");
@@ -362,7 +443,6 @@ pub fn build_toml_with_options(app: &ConfidentialApp, options: &CcInitDataOption
     push_toml_multiline_string(&mut toml, "\"aa.toml\"", &aa_toml);
     toml.push('\n');
 
-    // cdh.toml
     let mut cdh_toml = String::new();
     cdh_toml.push_str("[kbc]\n");
     cdh_toml.push_str("name = \"cc_kbc\"\n");
@@ -719,6 +799,49 @@ pub fn verify_runtime_class_binding(
             "rendered Pod runtimeClassName is `{other}`, expected `{expected}`"
         )),
         None => Err("rendered Pod has no runtimeClassName".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod seal_claim_tests {
+    use super::{luks2_header_seal_claim, resolve_luks2_header_seal_claim};
+
+    /// Pure precedence: the release-installed value always wins; the env
+    /// fallback applies only when no release value is installed (release-
+    /// less dev/test), and absence of both is the rollout-window default.
+    #[test]
+    fn resolve_prefers_the_release_value_over_environment() {
+        assert_eq!(
+            resolve_luks2_header_seal_claim(Some("required"), Some("adopt")),
+            "required"
+        );
+        assert_eq!(
+            resolve_luks2_header_seal_claim(Some("adopt"), Some("required")),
+            "adopt"
+        );
+        assert_eq!(
+            resolve_luks2_header_seal_claim(None, Some("required")),
+            "required"
+        );
+        assert_eq!(resolve_luks2_header_seal_claim(None, None), "adopt");
+        assert_eq!(
+            resolve_luks2_header_seal_claim(None, Some("  ")),
+            "adopt",
+            "blank env values fall back to the default"
+        );
+        assert_eq!(
+            resolve_luks2_header_seal_claim(None, Some(" required ")),
+            "required",
+            "env values are trimmed"
+        );
+    }
+
+    /// The claim rendered into cc_init_data is always one of the two
+    /// rollout values, even with a hostile environment.
+    #[test]
+    fn rendered_claim_is_always_a_valid_value() {
+        let value = luks2_header_seal_claim();
+        assert!(value == "adopt" || value == "required", "got {value}");
     }
 }
 

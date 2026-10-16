@@ -1617,6 +1617,7 @@ fn pinned_app_for_descriptor(descriptor: &DeploymentDescriptor) -> ConfidentialA
         descriptor_signing_pubkey: [2; 32],
         org_keyring_fingerprint: [3; 32],
         omit_log_encryption_claim: false,
+        omit_luks2_header_seal_claim: false,
     });
     app
 }
@@ -1638,7 +1639,16 @@ fn modern_render_match_clears_the_legacy_pin() {
         .as_mut()
         .unwrap()
         .omit_log_encryption_claim = true;
-    let (_, modern_hash) = enclava_engine::manifest::cc_init_data::compute_cc_init_data(&app);
+    // The artifact was signed over the true modern render (both pins clear);
+    // the stale pin on the app must not affect which render matches.
+    let mut modern_app = app.clone();
+    modern_app
+        .workload_artifact_binding
+        .as_mut()
+        .unwrap()
+        .omit_log_encryption_claim = false;
+    let (_, modern_hash) =
+        enclava_engine::manifest::cc_init_data::compute_cc_init_data(&modern_app);
     let artifacts = artifacts_with_expected_hash(
         &descriptor,
         hex::decode(modern_hash).unwrap().try_into().unwrap(),
@@ -1699,4 +1709,124 @@ fn render_mismatch_resets_the_pin_and_errors() {
             .omit_log_encryption_claim,
         "a failed validation must not leave the legacy pin set"
     );
+}
+
+// --- luks2_header_seal render compatibility (cap#242) ---
+
+#[test]
+fn pre_seal_claim_render_match_pins_the_binding() {
+    let descriptor = descriptor();
+    let mut app = pinned_app_for_descriptor(&descriptor);
+    // An artifact signed before the luks2_header_seal claim existed hashes a
+    // render without it.
+    let mut pre_seal_app = app.clone();
+    pre_seal_app
+        .workload_artifact_binding
+        .as_mut()
+        .unwrap()
+        .omit_luks2_header_seal_claim = true;
+    let (_, pre_seal_hash) =
+        enclava_engine::manifest::cc_init_data::compute_cc_init_data(&pre_seal_app);
+    let artifacts = artifacts_with_expected_hash(
+        &descriptor,
+        hex::decode(pre_seal_hash).unwrap().try_into().unwrap(),
+    );
+    artifacts
+        .validate_and_pin_cc_init_data_render(&mut app)
+        .expect("pre-seal render must validate");
+    let binding = app.workload_artifact_binding.as_ref().unwrap();
+    assert!(
+        binding.omit_luks2_header_seal_claim,
+        "a pre-seal-only match must pin the binding to the claim-less render"
+    );
+    assert!(
+        !binding.omit_log_encryption_claim,
+        "the log-encryption pin must stay modern when only the seal claim differs"
+    );
+}
+
+#[test]
+fn seal_claim_render_without_log_encryption_also_matches() {
+    // The (log legacy, seal legacy) combination must validate for artifacts
+    // predating both claims.
+    let descriptor = descriptor();
+    let mut app = pinned_app_for_descriptor(&descriptor);
+    let mut both_legacy = app.clone();
+    both_legacy
+        .workload_artifact_binding
+        .as_mut()
+        .unwrap()
+        .omit_log_encryption_claim = true;
+    both_legacy
+        .workload_artifact_binding
+        .as_mut()
+        .unwrap()
+        .omit_luks2_header_seal_claim = true;
+    let (_, both_hash) = enclava_engine::manifest::cc_init_data::compute_cc_init_data(&both_legacy);
+    let artifacts = artifacts_with_expected_hash(
+        &descriptor,
+        hex::decode(both_hash).unwrap().try_into().unwrap(),
+    );
+    artifacts
+        .validate_and_pin_cc_init_data_render(&mut app)
+        .expect("both-legacy render must validate");
+    let binding = app.workload_artifact_binding.as_ref().unwrap();
+    assert!(binding.omit_log_encryption_claim);
+    assert!(binding.omit_luks2_header_seal_claim);
+}
+
+// --- claim-less artifacts once sealing is required (cap#244 review) ---
+
+#[test]
+fn required_seal_policy_rejects_claim_less_artifacts() {
+    // An artifact signed before the seal claim existed (claim-less render)
+    // must be REJECTED once the active signed release requires sealing —
+    // enclava-init would default the missing claim to `adopt`, letting a
+    // hostile host replay an unsealed header. The artifact must be
+    // re-signed instead.
+    let descriptor = descriptor();
+    let mut app = pinned_app_for_descriptor(&descriptor);
+    let mut pre_seal_app = app.clone();
+    pre_seal_app
+        .workload_artifact_binding
+        .as_mut()
+        .unwrap()
+        .omit_luks2_header_seal_claim = true;
+    let (_, pre_seal_hash) =
+        enclava_engine::manifest::cc_init_data::compute_cc_init_data(&pre_seal_app);
+    let err = crate::signing_service::pin_matching_cc_init_data_render(
+        &mut app,
+        &pre_seal_hash,
+        true, // active signed release: luks2_header_seal = required
+    )
+    .expect_err("claim-less artifact must be rejected under a required seal");
+    assert!(
+        matches!(err, SigningServiceError::Mismatch(ref msg) if msg.contains("requires sealing")),
+        "expected a re-sign diagnostic, got: {err:?}"
+    );
+    assert!(
+        !app.workload_artifact_binding
+            .as_ref()
+            .unwrap()
+            .omit_luks2_header_seal_claim,
+        "a rejected artifact must not keep any legacy pin"
+    );
+}
+
+#[test]
+fn required_seal_policy_still_accepts_modern_render() {
+    // Under a required seal, an artifact signed over the full modern render
+    // (with the claim) keeps validating.
+    let descriptor = descriptor();
+    let mut app = pinned_app_for_descriptor(&descriptor);
+    let (_, modern_hash) = enclava_engine::manifest::cc_init_data::compute_cc_init_data(&app);
+    crate::signing_service::pin_matching_cc_init_data_render(
+        &mut app,
+        &modern_hash,
+        true, // active signed release: luks2_header_seal = required
+    )
+    .expect("modern render must still validate under a required seal");
+    let binding = app.workload_artifact_binding.as_ref().unwrap();
+    assert!(!binding.omit_luks2_header_seal_claim);
+    assert!(!binding.omit_log_encryption_claim);
 }

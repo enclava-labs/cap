@@ -22,7 +22,7 @@ path = "src/bin/cap_migrate.rs"
 [dependencies]
 anyhow = { workspace = true }
 enclava-engine = { workspace = true }
-enclava-common = { workspace = true }
+enclava-common = { workspace = true, features = ["outbound-http"] }
 tokio = { workspace = true }
 axum = { workspace = true }
 sqlx = { workspace = true }

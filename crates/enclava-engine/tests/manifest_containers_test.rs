@@ -7,6 +7,7 @@ use enclava_engine::manifest::containers::{
     ENCLAVA_WAIT_EXEC_PATH, build_app_container, build_attestation_proxy_container,
     build_caddy_container, build_enclava_init_container, build_enclava_tools_init_container,
 };
+use enclava_engine::manifest::volumes::build_volumes;
 use enclava_engine::testutil::{sample_app, sample_password_app};
 use enclava_engine::types::{CaddyTlsMode, WorkloadSecurityProfile};
 
@@ -870,6 +871,54 @@ fn enclava_init_container_mounts_both_luks_devices_and_unlock_socket() {
         tls_mount.mount_propagation.as_deref(),
         Some("Bidirectional")
     );
+}
+
+/// cap#244 review: LUKS private material (detached headers, transient key
+/// files) is mount-isolated from the workload — a dedicated volume mounted
+/// at /run/enclava-luks in enclava-init ONLY, never referenced by the app
+/// container (rootful profiles share UID 0, so /run/enclava uid/mode gates
+/// give no isolation there).
+#[test]
+fn luks_private_material_volume_is_mounted_only_into_enclava_init() {
+    let app = sample_app();
+    let init = build_enclava_init_container(&app);
+    let init_mounts = init.volume_mounts.as_ref().unwrap();
+    let luks_mount = init_mounts
+        .iter()
+        .find(|m| m.name == "luks-material")
+        .expect("enclava-init mounts the luks-material volume");
+    assert_eq!(luks_mount.mount_path, "/run/enclava-luks");
+    assert_ne!(
+        luks_mount.read_only,
+        Some(true),
+        "enclava-init must write private LUKS material"
+    );
+
+    let primary = build_app_container(&app);
+    let primary_mounts = primary.volume_mounts.as_ref().unwrap();
+    assert!(
+        primary_mounts.iter().all(|m| m.name != "luks-material"),
+        "the workload container must never see the luks-material volume"
+    );
+    assert!(
+        primary_mounts
+            .iter()
+            .all(|m| m.mount_path != "/run/enclava-luks"),
+        "the workload container must never mount /run/enclava-luks"
+    );
+
+    let volumes = build_volumes(&app);
+    let volume = volumes
+        .iter()
+        .find(|v| v.name == "luks-material")
+        .expect("luks-material volume exists");
+    let empty_dir = volume.empty_dir.as_ref().unwrap();
+    assert_eq!(
+        empty_dir.medium.as_deref(),
+        Some("Memory"),
+        "LUKS private material must be RAM-backed"
+    );
+    assert!(empty_dir.size_limit.is_some());
 }
 
 // === Prod-strict env pinning cross-check (#169) ===

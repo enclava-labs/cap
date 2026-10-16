@@ -50,6 +50,7 @@ pub mod errors;
 pub mod kbs_fetch;
 pub mod log_relay;
 pub mod luks;
+pub mod luks2_seal;
 pub mod safe_diagnostics;
 pub mod secrets;
 pub mod seeds;

@@ -4,9 +4,11 @@ pub mod clients;
 pub mod cosign;
 pub mod db;
 pub mod deploy;
+pub mod deployment_failure_cleanup;
 pub mod deployment_jobs;
 pub mod dns;
 pub mod edge;
+pub mod egress_proxy;
 pub mod entitlements;
 pub mod env_gates;
 pub mod kbs;
@@ -2161,6 +2163,7 @@ pub(crate) mod test_support {
                 AllowList::from_env_or_default(None),
             )
             .unwrap(),
+            cosign_egress: crate::clients::EgressGuard::from_env(),
             trustee_http_client: reqwest::Client::new(),
             tee_http_client: reqwest::Client::new(),
             recent_tee_probe_failures: std::sync::Arc::new(std::sync::Mutex::new(

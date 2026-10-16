@@ -541,6 +541,15 @@ pub fn build_enclava_init_container(app: &ConfidentialApp) -> Container {
             mount_path: "/run/enclava".to_string(),
             ..Default::default()
         },
+        // cap#244 review: LUKS private material gets its own RAM-backed
+        // volume, mounted here ONLY — never into the workload container
+        // (rootful profiles share UID 0 with us, so /run/enclava's
+        // uid/mode gates give no isolation there).
+        VolumeMount {
+            name: "luks-material".to_string(),
+            mount_path: "/run/enclava-luks".to_string(),
+            ..Default::default()
+        },
         VolumeMount {
             name: "unlock-channel".to_string(),
             mount_path: "/run/enclava-unlock".to_string(),

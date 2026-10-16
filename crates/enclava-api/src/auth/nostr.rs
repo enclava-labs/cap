@@ -140,12 +140,10 @@ fn verify_nip98_parsed_event(
         return Err(NostrAuthError::WrongKind);
     }
 
-    // Verify event signature
     event
         .verify()
         .map_err(|_| NostrAuthError::InvalidSignature)?;
 
-    // Check timestamp freshness (60-second window)
     let now = Timestamp::now();
     let created = event.created_at;
     let diff = if now > created {
@@ -157,7 +155,6 @@ fn verify_nip98_parsed_event(
         return Err(NostrAuthError::Expired);
     }
 
-    // Verify url tag matches
     let url_tag = event
         .tags
         .iter()
@@ -169,7 +166,6 @@ fn verify_nip98_parsed_event(
         return Err(NostrAuthError::UrlMismatch);
     }
 
-    // Verify method tag matches
     let method_tag = event
         .tags
         .iter()
@@ -336,7 +332,6 @@ pub async fn signup_or_login(
     .await?;
 
     if let Some((user_id,)) = existing {
-        // Existing user: find their personal org
         let org_id: Uuid = sqlx::query_scalar(
             "SELECT o.id FROM organizations o
              JOIN memberships m ON m.org_id = o.id
@@ -350,7 +345,6 @@ pub async fn signup_or_login(
         return Ok((user_id, org_id, false));
     }
 
-    // New user: create user, identity, personal org, membership
     let user_id = Uuid::new_v4();
     let org_id = Uuid::new_v4();
     let identity_id = Uuid::new_v4();

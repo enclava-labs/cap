@@ -117,7 +117,6 @@ async fn resolve_auth(
     hmac_key: &[u8; 32],
     parts: &Parts,
 ) -> Result<(Uuid, Option<ValidatedApiKey>), AuthError> {
-    // Try X-API-Key header first
     if let Some(key) = extract_api_key_header(parts)
         && is_api_key_candidate(&key)
     {
@@ -127,10 +126,8 @@ async fn resolve_auth(
         return Ok((validated.created_by, Some(validated)));
     }
 
-    // Try Authorization: Bearer
     let token = extract_bearer(parts).ok_or(AuthError::MissingAuth)?;
 
-    // API key in bearer
     if is_api_key_candidate(&token) {
         let validated = validate_api_key(pool, &token)
             .await

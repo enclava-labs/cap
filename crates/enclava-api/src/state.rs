@@ -259,6 +259,11 @@ pub struct AppState {
     pub outbound_body_limit: u64,
     /// Outbound client for registry tag resolution, with registry allowlist.
     pub registry_client: RegistryClient,
+    /// Pre-flight egress guard for the cosign/sigstore verification paths
+    /// (issue #224): those stacks build their own reqwest transports, so
+    /// their registry-derived destinations are validated through this
+    /// shared allowlist + blocked-networks policy before any I/O.
+    pub cosign_egress: crate::clients::EgressGuard,
     /// HTTP client for fixed internal Trustee/KBS calls.
     pub trustee_http_client: reqwest::Client,
     /// HTTP client for tenant TEE endpoints. Test environments may use staging

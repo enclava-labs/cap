@@ -234,7 +234,6 @@ pub async fn delete_pvcs_and_wait(
 ) -> Result<(), ApplyError> {
     let api: Api<PersistentVolumeClaim> = Api::namespaced(engine.client().clone(), namespace);
 
-    // List all PVCs in the namespace, keep only the target StatefulSet's.
     let pvcs: Vec<String> = api
         .list(&ListParams::default())
         .await?
@@ -273,7 +272,6 @@ pub async fn delete_pvcs_and_wait(
         }
     }
 
-    // Wait for PVCs to be fully deleted
     let start = Instant::now();
     loop {
         if start.elapsed() >= timeout_duration {
@@ -377,7 +375,6 @@ pub async fn delete_namespace_and_wait(
             Err(e) => return Err(e),
         }
 
-        // Wait for the namespace to disappear.
         let start = Instant::now();
         loop {
             if start.elapsed() >= timeout_duration {

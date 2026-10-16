@@ -6,8 +6,8 @@
 -- Persist that exhaustion with its own bounded, operator-visible
 -- classification so the job row carries why it stopped retrying. Retain
 -- the full bounded classification set from #220's 0073 (plus this code):
--- previously legal rows must stay legal when #220 has landed first. Since
--- 0073 replaces this constraint wholesale, #220 must land before #231.
+-- previously legal rows must stay legal when #220 has landed first. If #220
+-- lands afterward, its migration must retain deployment_retry_exhausted.
 ALTER TABLE deployment_apply_jobs
     DROP CONSTRAINT deployment_apply_jobs_last_error_code_check;
 

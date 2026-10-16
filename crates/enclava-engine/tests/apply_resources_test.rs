@@ -15,12 +15,10 @@ async fn apply_service_account_creates() {
     let engine = ApplyEngine::try_default().await.unwrap();
     let app = sample_app();
 
-    // Create namespace first
     let ns = generate_namespace(&app);
     let generation = MutationGeneration::new(1).unwrap();
     apply_namespace(&engine, &ns, generation).await.unwrap();
 
-    // Apply ServiceAccount
     let sa = generate_service_account(&app);
     let result: ServiceAccount =
         apply_namespaced_resource(&engine, &app.namespace, &sa, generation)
@@ -28,7 +26,6 @@ async fn apply_service_account_creates() {
             .unwrap();
     assert_eq!(result.metadata.name.as_deref(), Some("cap-test-app-sa"));
 
-    // Cleanup
     use k8s_openapi::api::core::v1::Namespace;
     use kube::api::{Api, DeleteParams};
     let ns_api: Api<Namespace> = Api::all(engine.client().clone());
@@ -63,7 +60,6 @@ async fn apply_configmap_creates() {
         .unwrap();
     assert!(result.metadata.name.is_some());
 
-    // Cleanup
     use k8s_openapi::api::core::v1::Namespace;
     use kube::api::{Api, DeleteParams};
     let ns_api: Api<Namespace> = Api::all(engine.client().clone());

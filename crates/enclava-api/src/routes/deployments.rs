@@ -968,7 +968,6 @@ async fn deploy_app_candidate(
         ));
     }
 
-    // Resolve image tag to digest
     let image_ref = enclava_common::image::ImageRef::parse(&body.image).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
@@ -977,6 +976,42 @@ async fn deploy_app_candidate(
     })?;
 
     let image_digest = if image_ref.has_digest() {
+        // Digest-pinned references skip the allowlisted registry_client tag
+        // resolution, but the registry host still drives the cosign/sigstore
+        // egress below — so enforce the same destination policy up front
+        // (issue #224): an unallowlisted or private/literal-IP registry
+        // must never steer API egress, pinned digest or not.
+        let (registry, _) = crate::cosign::parse_image_parts(&body.image).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("invalid image reference: {e}")})),
+            )
+        })?;
+        let base_url = crate::registry::registry_base_url(&registry).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("unsupported registry: {e}")})),
+            )
+        })?;
+        let url = reqwest::Url::parse(&base_url).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("invalid registry URL: {e}")})),
+            )
+        })?;
+        state
+            .cosign_egress
+            .check_registry_url(&url)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "registry_destination_not_allowed",
+                        "message": e.to_string(),
+                    })),
+                )
+            })?;
         image_ref.digest().to_string()
     } else {
         crate::registry::resolve_image_digest(&state.registry_client, &image_ref)
@@ -1309,28 +1344,30 @@ async fn deploy_app_candidate(
             ));
         }
     };
-    let verified = crate::cosign::verify_image(&body.image, &image_digest, &policy)
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "cosign_verification_failed"})),
-            )
-        })?;
-    let portable_material =
-        crate::cosign::fetch_portable_verification_material(&body.image, &image_digest)
+    let verified =
+        crate::cosign::verify_image(&state.cosign_egress, &body.image, &image_digest, &policy)
             .await
             .map_err(|_| {
                 (
                     StatusCode::BAD_REQUEST,
-                    Json(
-                        serde_json::json!({"error": "portable_verification_material_unavailable"}),
-                    ),
+                    Json(serde_json::json!({"error": "cosign_verification_failed"})),
                 )
             })?;
+    let portable_material = crate::cosign::fetch_portable_verification_material(
+        &state.cosign_egress,
+        &body.image,
+        &image_digest,
+    )
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "portable_verification_material_unavailable"})),
+        )
+    })?;
 
-    // Fetch provenance attestation and SBOM if available (non-fatal if missing).
     let (provenance, sbom) = crate::cosign::fetch_attestations(
+        &state.cosign_egress,
         &state.http_client,
         &body.image,
         &image_digest,

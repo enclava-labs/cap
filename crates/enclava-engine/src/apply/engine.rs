@@ -28,6 +28,11 @@ pub enum ApplyError {
     },
 
     #[error(
+        "{kind} '{name}' vanished between the ownership probe and the apply; the caller must re-probe"
+    )]
+    VanishedResource { kind: String, name: String },
+
+    #[error(
         "Kubernetes accepted {kind} '{name}' without provider mutation generation {expected} (found {actual})"
     )]
     ProviderGenerationNotApplied {
@@ -35,6 +40,13 @@ pub enum ApplyError {
         name: String,
         expected: i64,
         actual: i64,
+    },
+
+    #[error("{kind} '{name}' lost CAP creation evidence annotation '{key}' in the update response")]
+    CreationEvidenceLost {
+        kind: String,
+        name: String,
+        key: String,
     },
 
     #[error("{0} is missing the UID, name, or resourceVersion required for a fenced mutation")]
@@ -78,9 +90,11 @@ impl ApplyError {
             Self::InvalidLiveMutationGeneration { .. } => "invalid_live_mutation_generation",
             Self::StaleMutationGeneration { .. } => "stale_mutation_generation",
             Self::ProviderGenerationNotApplied { .. } => "provider_generation_not_applied",
+            Self::CreationEvidenceLost { .. } => "creation_evidence_lost",
             Self::MissingResourceIdentity(_) => "missing_resource_identity",
             Self::ResourceNotFound { .. } => "resource_not_found",
             Self::MutationConflictExhausted { .. } => "mutation_conflict_exhausted",
+            Self::VanishedResource { .. } => "resource_vanished",
             Self::NamespaceNotReady(_) => "namespace_not_ready",
             Self::RolloutTimeout(_, _) => "rollout_timeout",
             Self::RolloutFailed(_) => "rollout_failed",
@@ -168,6 +182,14 @@ mod public_code_tests {
                     actual: 1,
                 },
                 "provider_generation_not_applied",
+            ),
+            (
+                ApplyError::CreationEvidenceLost {
+                    kind: SECRET.to_string(),
+                    name: SECRET.to_string(),
+                    key: SECRET.to_string(),
+                },
+                "creation_evidence_lost",
             ),
             (
                 ApplyError::MissingResourceIdentity(SECRET.to_string()),
