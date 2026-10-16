@@ -447,7 +447,6 @@ pub async fn watch_rollout(
                 worst_phase = phase;
             }
 
-            // Pod in terminal failure
             if let Some(code) = pod_terminal_failure_code(pod) {
                 tracing::warn!(failure_code = code, "pod entered terminal failure state");
                 return Ok(DeployStatus::failed(code));
@@ -469,7 +468,6 @@ pub async fn watch_rollout(
             last_phase = worst_phase;
         }
 
-        // Wait before next poll
         let remaining = deadline.saturating_sub(start.elapsed());
         let sleep_dur = poll.min(remaining);
         if sleep_dur.is_zero() {

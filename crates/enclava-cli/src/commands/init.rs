@@ -180,13 +180,11 @@ pub struct InitArgs {
 pub async fn init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     let cwd = std::env::current_dir()?;
 
-    // Check if enclava.toml already exists
     let toml_path = cwd.join("enclava.toml");
     if toml_path.exists() {
         return Err("enclava.toml already exists in this directory".into());
     }
 
-    // Detect Dockerfile
     let dockerfile = cwd.join("Dockerfile");
     let detected_port = if dockerfile.exists() {
         let port = detect_dockerfile_port(&dockerfile);
@@ -249,7 +247,6 @@ pub async fn init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
-    // Write enclava.toml
     let toml_content = generate_enclava_toml(&app_name, port);
     // Parse the generated TOML before it lands on disk so a generation bug
     // fails here instead of poisoning the next command that loads it.
@@ -258,7 +255,6 @@ pub async fn init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     println!();
     println!("Creating enclava.toml... done");
 
-    // Write GitHub Actions starter workflow
     let workflow_dir = cwd.join(".github").join("workflows");
     std::fs::create_dir_all(&workflow_dir)?;
     let workflow_path = workflow_dir.join("enclava-deploy.yml");

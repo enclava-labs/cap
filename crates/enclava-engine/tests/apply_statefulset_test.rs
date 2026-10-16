@@ -14,19 +14,16 @@ async fn apply_statefulset_creates() {
     let engine = ApplyEngine::try_default().await.unwrap();
     let app = sample_app();
 
-    // Create namespace first
     let ns = generate_namespace(&app);
     let generation = MutationGeneration::new(1).unwrap();
     apply_namespace(&engine, &ns, generation).await.unwrap();
 
-    // Apply StatefulSet
     let sts = generate_statefulset(&app);
     let result = apply_statefulset(&engine, &app.namespace, &sts, generation)
         .await
         .unwrap();
     assert_eq!(result.metadata.name.as_deref(), Some(&*app.name));
 
-    // Cleanup
     use k8s_openapi::api::core::v1::Namespace;
     use kube::api::{Api, DeleteParams};
     let ns_api: Api<Namespace> = Api::all(engine.client().clone());

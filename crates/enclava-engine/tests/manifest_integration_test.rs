@@ -94,7 +94,6 @@ fn generate_all_manifests_returns_all_resources() {
         8081
     );
 
-    // Bootstrap ConfigMap
     assert_eq!(
         m.bootstrap_configmap.metadata.name.as_deref(),
         Some("secure-pv-bootstrap-script")
@@ -140,7 +139,6 @@ fn generate_all_manifests_returns_all_resources() {
         Some("test-app-enclava-init")
     );
 
-    // KBS owner binding
     let (key, value) = &m.kbs_owner_binding;
     assert!(key.ends_with("-owner"));
     assert!(value.get("allowed_identity_hashes").is_some());
