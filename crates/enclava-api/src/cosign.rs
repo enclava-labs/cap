@@ -1441,9 +1441,10 @@ mod tests {
     async fn fetch_portable_verification_material_rejects_unguarded_destinations() {
         let guard = hermetic_egress_guard();
         let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        // Refs that parse under the OCI grammar must be stopped by the egress
+        // guard before any request is issued.
         for image in [
             "169.254.169.254/repo/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "[::ffff:10.0.5.7]/repo/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "evil.example/repo/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         ] {
             let err = fetch_portable_verification_material(&guard, image, digest)
@@ -1454,6 +1455,21 @@ mod tests {
                 "{image} must be rejected, got: {err}"
             );
         }
+        // A bracket-IPv6 literal fails the OCI reference grammar (the same
+        // parser the dialing client uses) before the egress check — still
+        // fail closed, just with the parse error.
+        let err = fetch_portable_verification_material(
+            &guard,
+            "[::ffff:10.0.5.7]/repo/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            digest,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("invalid image reference")
+                || err.to_string().contains("registry destination rejected"),
+            "bracket-IPv6 image ref must be rejected, got: {err}"
+        );
     }
 
     fn url_policy() -> VerificationPolicy {
