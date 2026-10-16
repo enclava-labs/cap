@@ -314,8 +314,6 @@ async fn apply_all_with_tenant_image_pull_secret(
     manifest_hash: &str,
     image_pull_secret_config: Option<&TenantImagePullSecretConfig>,
     generation: MutationGeneration,
-    pool: &PgPool,
-    deployment_id: Uuid,
 ) -> Result<(), DeployError> {
     let ns_name = manifests
         .namespace
@@ -3127,8 +3125,6 @@ pub async fn apply_deployment_manifests(
         &hash,
         tenant_image_pull_secret_config.as_ref(),
         generation,
-        &pool,
-        deployment_id,
     )
     .await?;
     let edge_config = crate::edge::EdgeRouteConfig::from_env();
