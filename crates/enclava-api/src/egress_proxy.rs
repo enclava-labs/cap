@@ -68,7 +68,9 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::clients::{BlockedNetworks, ClientError};
+use enclava_common::outbound_http::BlockedNetworks;
+
+use crate::clients::ClientError;
 
 /// Maximum bytes accepted for a CONNECT request head. Anything larger is a
 /// malformed (or hostile) client and gets refused.
