@@ -1169,22 +1169,25 @@ fn parse_cryptsetup_status(output: &str) -> CryptsetupStatus {
     status
 }
 
+/// Kernel device number (major:minor) of a block device, decoded from
+/// `stat`'s `rdev` with glibc's exact masks (same as dm_sysfs_dir).
+/// None for non-block-devices and unstat-able paths.
+fn dev_number(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.file_type().is_block_device() {
+        return None;
+    }
+    let rdev = meta.rdev();
+    let major = ((rdev & 0x0000_0000_000f_ff00) >> 8) | ((rdev & 0xffff_f000_0000_0000) >> 32);
+    let minor = (rdev & 0x0000_0000_0000_00ff) | ((rdev & 0x00000ffffff00000) >> 12);
+    Some((major, minor))
+}
+
 /// Kernel-identity block-device comparison: two paths name the same device
 /// when their `stat` device numbers (major:minor) match — independent of
 /// the path spelling (kernel name vs container-local bind mount).
 fn same_block_device(kernel_name: &str, device: &Path) -> bool {
-    fn dev_number(path: &Path) -> Option<(u64, u64)> {
-        use std::os::unix::fs::{FileTypeExt, MetadataExt};
-        let meta = std::fs::metadata(path).ok()?;
-        if !meta.file_type().is_block_device() {
-            return None;
-        }
-        // glibc-compatible dev_t decoding (same masks as dm_sysfs_dir).
-        let rdev = meta.rdev();
-        let major = ((rdev & 0x0000_0000_000f_ff00) >> 8) | ((rdev & 0xffff_f000_0000_0000) >> 32);
-        let minor = (rdev & 0x0000_0000_0000_00ff) | ((rdev & 0x00000ffffff00000) >> 12);
-        Some((major, minor))
-    }
     let slave = PathBuf::from("/dev").join(kernel_name);
     match (dev_number(&slave), dev_number(device)) {
         (Some(a), Some(b)) => a == b,
@@ -1198,10 +1201,16 @@ fn paths_equivalent(left: &Path, right: &Path) -> bool {
     if left == right {
         return true;
     }
-    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
-        (Ok(left), Ok(right)) => left == right,
-        _ => false,
+    if let (Ok(left), Ok(right)) = (std::fs::canonicalize(left), std::fs::canonicalize(right))
+        && left == right
+    {
+        return true;
     }
+    // cryptsetup status reports the kernel's underlying device name (e.g.
+    // /dev/vdb) while generated workloads name the same disk through a
+    // container-local node (e.g. /dev/csi0): distinct nodes, one device.
+    // Kernel identity (major:minor) decides, not the spelling.
+    matches!((dev_number(left), dev_number(right)), (Some(a), Some(b)) if a == b)
 }
 
 /// Keyslot probe against the *detached* copy of an already region-validated
