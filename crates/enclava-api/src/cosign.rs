@@ -684,7 +684,7 @@ fn is_portable_signature_blob(blob: &[u8]) -> bool {
 async fn pull_provenance_objects(
     client: &oci_client::client::Client,
     source_manifest: &[u8],
-    image_digest: &str,
+    _image_digest: &str,
     registry: &str,
     repository: &str,
     auth: &oci_client::secrets::RegistryAuth,

@@ -486,7 +486,7 @@ fn verify_provenance(
         .ok_or(SigstoreError::Malformed)?;
     let source: Value =
         serde_json::from_slice(source_record.value).map_err(|_| SigstoreError::Malformed)?;
-    let mut referenced = source
+    let referenced = source
         .get("manifests")
         .and_then(Value::as_array)
         .into_iter()
@@ -500,7 +500,7 @@ fn verify_provenance(
         .filter_map(|descriptor| descriptor.get("digest").and_then(Value::as_str))
         .map(str::to_string)
         .collect::<Vec<_>>();
-    let mut attestation_manifests = source
+    let attestation_manifests = source
         .get("manifests")
         .and_then(Value::as_array)
         .into_iter()
