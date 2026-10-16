@@ -358,7 +358,10 @@ fn parse_image_pull_repository_scope(raw: &str) -> Result<ImagePullRepositorySco
                 .to_string(),
         );
     }
-    let value = value.trim_end_matches('/');
+    // #252: a trailing '/' (e.g. the typo `ghcr.io/company/private//*`,
+    // which strips exactly one `/*` and leaves a trailing slash) must be a
+    // validation error, never silently normalized — the empty-component
+    // check below rejects it instead of trimming it away.
     let Some((registry, repository)) = value.split_once('/') else {
         return Err("expected registry/repository or registry/repository/*".to_string());
     };
@@ -386,7 +389,7 @@ fn parse_image_pull_repository_scope(raw: &str) -> Result<ImagePullRepositorySco
     for component in repository.split('/') {
         if component.is_empty() {
             return Err(
-                "repository path components must be non-empty (no leading or repeated '/')"
+                "repository path components must be non-empty (no leading, repeated, or trailing '/')"
                     .to_string(),
             );
         }
@@ -2502,7 +2505,9 @@ async fn apply_scoped_pull_secret(
     config: &TenantImagePullSecretConfig,
     generation: MutationGeneration,
 ) -> Result<(), DeployError> {
-    use enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION;
+    use enclava_engine::apply::generation::{
+        MUTATION_GENERATION_ANNOTATION, RESOURCE_CREATED_BY_ANNOTATION,
+    };
     let api: Api<Secret> = Api::namespaced(engine.client().clone(), namespace);
     let mut desired = generate_tenant_image_pull_secret(namespace, config);
     desired
@@ -2557,8 +2562,27 @@ async fn apply_scoped_pull_secret(
                 }
             }
             Err(kube::Error::Api(error)) if error.code == 404 => {
+                // Stamp the engine's creation evidence on this raw POST (the
+                // applied-resource path does the same in `annotate_created`;
+                // Codex review on #243, P1): the adopted-namespace
+                // compensating sweep classifies leftovers by
+                // `RESOURCE_CREATED_BY_ANNOTATION`, so an unstamped Secret is
+                // classified as foreign, skipped by cleanup, and its evidence
+                // can be cleared — leaving the platform PAT refreshed in a
+                // tenant namespace forever. Stamped ONLY on the create branch:
+                // the patch path must not claim creation of an object that
+                // already existed.
+                let mut created = desired.clone();
+                created
+                    .metadata
+                    .annotations
+                    .get_or_insert_with(Default::default)
+                    .insert(
+                        RESOURCE_CREATED_BY_ANNOTATION.to_string(),
+                        generation.get().to_string(),
+                    );
                 match api
-                    .create(&kube::api::PostParams::default(), &desired)
+                    .create(&kube::api::PostParams::default(), &created)
                     .await
                 {
                     Ok(_) => return Ok(()),
@@ -2569,8 +2593,15 @@ async fn apply_scoped_pull_secret(
             Err(error) => return Err(DeployError::Apply(error.into())),
         }
     }
-    Err(DeployError::PullSecretDeleteConflict(format!(
-        "{namespace}/{}",
+    // Codex review on #243, P2: exhausting the immediate retries on
+    // resource-version contention (a sweep, controller, or other writer
+    // racing each GET→patch) is transient — a fresh mutation attempt
+    // converges — so defer (requeueable via
+    // `should_requeue_without_terminal_failure`) instead of terminally
+    // failing the deployment.
+    Err(DeployError::PullSecretReconcileDeferred(format!(
+        "pull-secret apply for {namespace}/{} exhausted its immediate retries on \
+         concurrent writes; retrying the deployment under a fresh mutation attempt converges",
         config.name
     )))
 }
@@ -3931,6 +3962,19 @@ mod tests {
             }
         );
         assert!(parse_image_pull_repository_scope("ghcr.io").is_err());
+    }
+
+    /// #252: scopes with empty path segments — a trailing '/' (including the
+    /// `ghcr.io/company/private//*` typo that strips exactly one `/*` and
+    /// leaves a trailing slash), interior `//`, or a leading '/' — must be
+    /// validation errors, never silently normalized into a scope.
+    #[test]
+    fn tenant_image_pull_scope_rejects_trailing_slash_and_empty_segments() {
+        assert!(parse_image_pull_repository_scope("ghcr.io/company/private//*").is_err());
+        assert!(parse_image_pull_repository_scope("ghcr.io/company/private/").is_err());
+        assert!(parse_image_pull_repository_scope("ghcr.io/company/private//").is_err());
+        assert!(parse_image_pull_repository_scope("ghcr.io/company//private").is_err());
+        assert!(parse_image_pull_repository_scope("/ghcr.io/company/private").is_err());
     }
 
     /// A repeated wildcard suffix must be rejected, never stripped down into
@@ -5317,6 +5361,10 @@ mod tests {
         /// repair-intent path (Codex review on #243, P2): the clear succeeds,
         /// the delete finds a replacement, and the restore fails.
         fail_reference_restores: u8,
+        /// Simulate perpetual resource-version contention on Secret writes
+        /// (Codex review on #243, P2): every Secret PATCH and CREATE returns
+        /// 409, driving the apply retry loop to exhaustion.
+        secret_write_conflicts: bool,
     }
 
     fn fake_managed_secret(name: &str, labeled: bool, username: &str, token: &str) -> Secret {
@@ -5531,6 +5579,11 @@ mod tests {
                 (200, serde_json::to_value(&state.secrets[index]).unwrap())
             }
             ("secrets", "PATCH") => {
+                if state.secret_write_conflicts {
+                    // Perpetual resource-version contention (Codex review on
+                    // #243, P2): every conditional write 409s.
+                    return conflict();
+                }
                 let patch: serde_json::Value = serde_json::from_slice(body).unwrap();
                 let Some(secret) = state
                     .secrets
@@ -5600,6 +5653,31 @@ mod tests {
                     secret.metadata.resource_version.as_deref().unwrap_or("1")
                 ));
                 (200, serde_json::to_value(secret).unwrap())
+            }
+            ("secrets", "POST") => {
+                if state.secret_write_conflicts {
+                    return conflict();
+                }
+                let mut created: Secret = serde_json::from_slice(body).unwrap();
+                if state
+                    .secrets
+                    .iter()
+                    .any(|secret| secret.metadata.name == created.metadata.name)
+                {
+                    return conflict();
+                }
+                created.metadata.uid.get_or_insert_with(|| {
+                    format!("uid-{}", created.metadata.name.clone().unwrap_or_default())
+                });
+                created
+                    .metadata
+                    .resource_version
+                    .get_or_insert_with(|| "1".to_string());
+                state.secrets.push(created);
+                (
+                    201,
+                    serde_json::to_value(state.secrets.last().unwrap()).unwrap(),
+                )
             }
             ("secrets", "DELETE") => {
                 if let Some(replacement) = state.replace_on_delete.take() {
@@ -6756,6 +6834,80 @@ mod tests {
             expected_dockerconfigjson("cap-bot", "ghp_new").into_bytes()
         );
         assert_eq!(secret_mutation_generation(&state.secrets[0]), Some(2));
+    }
+
+    /// Codex review on #243, P1: the raw create POST must stamp
+    /// `RESOURCE_CREATED_BY_ANNOTATION` exactly like the engine's
+    /// applied-resource path, or the adopted-namespace compensating sweep
+    /// (`classify_generation_leftover`) classifies the new Secret as foreign,
+    /// skips deletion, and the periodic sweep keeps refreshing the platform
+    /// PAT in the tenant namespace forever.
+    #[tokio::test]
+    async fn scoped_deploy_created_secret_carries_creation_evidence() {
+        use enclava_engine::apply::generation::RESOURCE_CREATED_BY_ANNOTATION;
+        let cluster = Arc::new(Mutex::new(FakeCluster::default()));
+        let engine = reconcile_engine(cluster.clone());
+        let config = TenantImagePullSecretConfig {
+            name: "enclava-registry-auth".to_string(),
+            username: "cap-bot".to_string(),
+            token: "ghp_new".to_string(),
+            allowed_repositories: Vec::new(),
+        };
+        apply_scoped_pull_secret(
+            &engine,
+            "tenant-ns",
+            &config,
+            MutationGeneration::new(4).unwrap(),
+        )
+        .await
+        .unwrap();
+        let state = cluster.lock().unwrap();
+        assert_eq!(state.secrets.len(), 1);
+        assert_eq!(
+            state.secrets[0]
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.get(RESOURCE_CREATED_BY_ANNOTATION)),
+            Some(&"4".to_string()),
+            "the create POST must stamp creation evidence"
+        );
+    }
+
+    /// Codex review on #243, P2: resource-version contention between each GET
+    /// and conditional patch is transient — an exhausted retry budget must
+    /// defer (requeueable) instead of terminally failing the deployment.
+    #[tokio::test]
+    async fn scoped_deploy_apply_conflict_exhaustion_defers_instead_of_failing() {
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![fake_managed_secret(
+                "enclava-registry-auth",
+                true,
+                "cap-bot",
+                "ghp_old",
+            )],
+            secret_write_conflicts: true,
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        let config = TenantImagePullSecretConfig {
+            name: "enclava-registry-auth".to_string(),
+            username: "cap-bot".to_string(),
+            token: "ghp_new".to_string(),
+            allowed_repositories: Vec::new(),
+        };
+        let error = apply_scoped_pull_secret(
+            &engine,
+            "tenant-ns",
+            &config,
+            MutationGeneration::new(2).unwrap(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, DeployError::PullSecretReconcileDeferred(_)),
+            "exhausted apply conflicts must defer, got {error:?}"
+        );
     }
 
     #[tokio::test]
