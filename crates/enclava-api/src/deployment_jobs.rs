@@ -2279,6 +2279,15 @@ async fn own_abandoned_apply_fences_reclaimable_at(
 /// review round 2); `array_append` never replaces earlier values, so a
 /// preflight-only attempt cannot strand an earlier writer's namespace
 /// behind a mismatched generation (Devin, #260 review round 2).
+///
+/// The status guard mirrors `deployment_is_active_for_apply`: at claim
+/// time a fresh apply's row is still `pending` and a reclaimed rollout's
+/// is `watching` — `applying` alone would silently no-op (`rows_affected
+/// == 0`) for exactly the attempt that stamps the namespace, because the
+/// only production transition to `applying` runs later, inside the apply
+/// itself. A zero-row match is therefore an error (`LeaseLost`), never a
+/// quiet success: the deployment is no longer active for this apply, and
+/// the attempt must release and requeue instead of proceeding.
 async fn record_namespace_fence_claim(
     pool: &sqlx::PgPool,
     deployment_id: Uuid,
@@ -2287,14 +2296,18 @@ async fn record_namespace_fence_claim(
     generation: i64,
 ) -> Result<(), DeploymentJobError> {
     let mut tx = pool.begin().await?;
-    sqlx::query(
+    let recorded = sqlx::query(
         "UPDATE deployments
             SET namespace_fence_generations =
                     array_append(namespace_fence_generations, $2)
           WHERE id = $1
             AND app_id = $3
             AND org_id = $4
-            AND status = 'applying'::deploy_status_enum",
+            AND status IN (
+                'pending'::deploy_status_enum,
+                'applying'::deploy_status_enum,
+                'watching'::deploy_status_enum
+            )",
     )
     .bind(deployment_id)
     .bind(generation)
@@ -2302,6 +2315,9 @@ async fn record_namespace_fence_claim(
     .bind(org_id)
     .execute(&mut *tx)
     .await?;
+    if recorded.rows_affected() != 1 {
+        return Err(DeploymentJobError::LeaseLost);
+    }
     tx.commit().await?;
     Ok(())
 }
@@ -6090,18 +6106,12 @@ pub(crate) mod tests {
             "rows that predate the provenance column must classify conservatively"
         );
 
-        // Stage the status the acceptance path persists before the apply
-        // job becomes claimable; the fixture inserts 'pending' directly.
-        sqlx::query("UPDATE deployments SET status = 'applying'::deploy_status_enum WHERE id = $1")
-            .bind(deployment_id)
-            .execute(&pool)
-            .await
-            .expect("stage the accepted applying status");
-
-        // The writer attempt (Devin, #260 review round 1): it claimed this
-        // namespace's fence — generation 1 for the fresh row — appended
-        // that generation durably exactly like every claiming attempt now
-        // does, stamped it onto the provider, and then dropped the lease.
+        // The fixture inserts the deployment as 'pending' and LEAVES it
+        // there: a fresh apply claims its lease while the row is still
+        // pending (the only production transition to 'applying' happens
+        // later, inside the apply itself), so the writer below records
+        // its provenance under exactly the status production presents at
+        // claim time — the recording must succeed from 'pending'.
         let attempt = crate::mutation_leases::claim(
             &state,
             app.id,
