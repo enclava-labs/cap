@@ -3,6 +3,11 @@ use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use sha2::{Digest, Sha256};
 
 /// Typed HTTP client for the Enclava Platform API.
+///
+/// `Clone` is cheap (the underlying `reqwest::Client` is an `Arc`) and shares
+/// one connection pool; detached background requests (e.g. the deployment
+/// history feed in the deploy waits) clone the client to move it into a task.
+#[derive(Clone)]
 pub struct ApiClient {
     base_url: String,
     origin: String,

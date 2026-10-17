@@ -101,6 +101,22 @@ where
         .map_err(KbsPolicyError::Kube)
 }
 
+impl KbsPolicyError {
+    /// Return a bounded failure code safe for persistence and operator logs.
+    ///
+    /// The Display strings embed ConfigMap state and aggregate byte counts of
+    /// other tenants' policy artifacts; those must stay internal. The budget
+    /// variant gets its own code so operators can distinguish the shared
+    /// signed-policy budget ceiling (#18) from other KBS authority failures
+    /// without exposing the counts.
+    pub fn public_code(&self) -> &'static str {
+        match self {
+            Self::SignedPolicyBudgetExceeded { .. } => "signed_policy_budget_exceeded",
+            _ => "kbs_policy_error",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, sqlx::FromRow)]
 struct KbsOwnerBinding {
     binding_key: String,
@@ -2966,6 +2982,24 @@ resource_bindings := {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn signed_policy_budget_exceeded_maps_to_its_own_public_code() {
+        // cap#220: the bounded code that migration 0082, the public-code
+        // allowlist, and the error emitter all pin must stay mapped through
+        // the type -- the tests writing the string literal themselves would
+        // not notice this arm collapsing back to `kbs_policy_error`.
+        let err = KbsPolicyError::SignedPolicyBudgetExceeded {
+            required_artifacts: 2,
+            policy_bytes: 2048,
+            max_policy_bytes: 1024,
+        };
+        assert_eq!(err.public_code(), "signed_policy_budget_exceeded");
+        assert_eq!(
+            KbsPolicyError::NotConfigured.public_code(),
+            "kbs_policy_error"
+        );
     }
 
     #[test]
