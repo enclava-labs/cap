@@ -1365,15 +1365,14 @@ async fn deploy_app_candidate(
         )
     })?;
 
-    let (provenance, sbom) = crate::cosign::fetch_attestations(
-        &state.cosign_egress,
-        &state.http_client,
-        &body.image,
-        &image_digest,
-        state.outbound_body_limit,
-    )
-    .await
-    .unwrap_or((None, None));
+    // Legacy .att/.sbom tags are mutable and neither the image signature nor
+    // the index-bound portable provenance authenticates these independent
+    // manifest responses. Do not persist or surface them as verified-adjacent
+    // metadata. The portable provenance is checked separately by the offline
+    // verifier; a signed/subject-bound metadata ingestion path is required
+    // before these nullable fields can safely be populated again.
+    let provenance: Option<serde_json::Value> = None;
+    let sbom: Option<serde_json::Value> = None;
 
     let source_provider = body.source_provider.map(SourceProvider::as_str);
     let spec_snapshot = serde_json::json!({
