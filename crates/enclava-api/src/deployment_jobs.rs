@@ -6961,6 +6961,60 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn incomplete_provenance_lookup_failure_retains_retryable_namespace_fence() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _, _) = insert_job_fixture(&pool).await;
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.side_effect_admission = Arc::new(tokio::sync::Semaphore::new(4));
+        let mut mutation = crate::mutation_leases::claim(
+            &state,
+            app.id,
+            "deployment_apply",
+            deployment_id,
+            false,
+            deployment_apply_resource_fences(&app),
+        )
+        .await
+        .expect("claim cleanup fences");
+        // Only the provenance read uses this closed pool; the lease retains
+        // its healthy pool, simulating a failed lookup followed by recovery.
+        let unavailable = PgPool::connect_lazy("postgresql://unused.invalid/test").unwrap();
+        unavailable.close().await;
+        state.db = unavailable;
+        let outcome = crate::deployment_failure_cleanup::cleanup_after_terminal_apply_failure(
+            &state,
+            &app,
+            deployment_id,
+            &mut mutation,
+            false,
+            None,
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            crate::deployment_failure_cleanup::CleanupFenceOutcome::RetainNamespaceFence
+        );
+        let (kind, retained): (String, bool) = sqlx::query_as(
+            "SELECT operation_kind, reclaim_after = 'infinity'::timestamptz FROM external_resource_mutation_leases WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1",
+        ).bind(&app.namespace).fetch_one(&pool).await.expect("load durable retry marker");
+        assert_eq!(
+            kind,
+            crate::mutation_leases::RETAINED_DEPLOYMENT_NAMESPACE_OPERATION
+        );
+        assert!(retained);
+        drop(mutation);
+        sqlx::query("DELETE FROM external_resource_mutation_leases WHERE resource_key IN ('global', $1, $2, $3, $4)")
+            .bind(&app.namespace).bind(&app.domain).bind(app.tee_domain.as_deref())
+            .bind(app.custom_domain.as_deref()).execute(&pool).await.expect("remove retained fences");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("remove fixture");
+    }
+
+    #[tokio::test]
     async fn incomplete_migrated_observation_publishes_terminal_exhaustion() {
         let pool = database_test_pool().await;
         let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;

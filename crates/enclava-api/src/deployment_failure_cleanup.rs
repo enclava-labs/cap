@@ -1761,9 +1761,18 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
                 app_id = %app.id,
                 error = %lookup_error,
                 error_code = "incomplete_provenance_lookup_failed",
-                "failed-apply cleanup could not load the provenance marker; leaving provider cleanup to reconciliation"
+                "failed-apply cleanup could not load the provenance marker; retaining namespace for reconciliation"
             );
-            return CleanupFenceOutcome::ReleaseNormally;
+            // A sweep-incomplete row alone has no independent retry loop.
+            // Persist a retained fence so the periodic reconciler retries the
+            // lookup before making any ownership or deletion decision.
+            return if persist_retained_namespace_marker(mutation, app.id, failed_deployment_id)
+                .await
+            {
+                CleanupFenceOutcome::RetainNamespaceFence
+            } else {
+                CleanupFenceOutcome::ReleaseNormally
+            };
         }
     };
     // Durably record the evidence loss BEFORE any later step: even if this

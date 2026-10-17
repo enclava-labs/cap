@@ -3619,7 +3619,16 @@ mod tests {
     /// retained fence's own — and must still never delete a namespace
     /// whose annotation matches neither.
     #[tokio::test]
+    async fn retained_fence_reconciliation_retries_incomplete_legacy_provenance() {
+        check_retained_fence_provenance(true).await;
+    }
+
+    #[tokio::test]
     async fn retained_fence_reconciliation_classifies_against_recorded_provenance() {
+        check_retained_fence_provenance(false).await;
+    }
+
+    async fn check_retained_fence_provenance(incomplete: bool) {
         let pool = database_test_pool(2).await;
 
         // Fixture one mirrors the exhaustion shape: the attempts claimed
@@ -3647,15 +3656,20 @@ mod tests {
         sqlx::query(
             "INSERT INTO deployments (
                  id, org_id, app_id, status, spec_snapshot,
-                 namespace_fence_generations
+                 namespace_fence_generations, namespace_fence_provenance_incomplete
              ) VALUES (
-                 $1, $2, $3, 'failed'::deploy_status_enum, '{}'::jsonb, $4
+                 $1, $2, $3, 'failed'::deploy_status_enum, '{}'::jsonb, $4, $5
              )",
         )
         .bind(operation_one)
         .bind(org_one)
         .bind(app_one)
-        .bind(vec![provenance_generation])
+        .bind(vec![if incomplete {
+            fence_one
+        } else {
+            provenance_generation
+        }])
+        .bind(incomplete)
         .execute(&pool)
         .await
         .expect("insert the marker's failed deployment row");
@@ -3706,15 +3720,16 @@ mod tests {
         sqlx::query(
             "INSERT INTO deployments (
                  id, org_id, app_id, status, spec_snapshot,
-                 namespace_fence_generations
+                 namespace_fence_generations, namespace_fence_provenance_incomplete
              ) VALUES (
-                 $1, $2, $3, 'failed'::deploy_status_enum, '{}'::jsonb, $4
+                 $1, $2, $3, 'failed'::deploy_status_enum, '{}'::jsonb, $4, $5
              )",
         )
         .bind(operation_two)
         .bind(org_two)
         .bind(app_two)
         .bind(vec![fence_two - 1])
+        .bind(incomplete)
         .execute(&pool)
         .await
         .expect("insert the second marker's failed deployment row");
