@@ -993,7 +993,7 @@ async fn public_error_codes_are_persistable_job_codes() {
     // deployment_apply_jobs.last_error_code CHECK constraint accepts, or the
     // classified failure published by publish_apply_failure_with_mutation is
     // rejected by the database and the real reason never survives. The
-    // constraint list lives in migrations/0073 (widening 0038); this test
+    // constraint list lives in migrations/0082 (widening 0038); this test
     // fails if either side drifts.
     let pool = crate::test_support::database_test_pool().await;
     let constraint_def: String = sqlx::query_scalar(
@@ -1011,7 +1011,7 @@ async fn public_error_codes_are_persistable_job_codes() {
             constraint_def.contains(&needle),
             "PUBLIC_DEPLOYMENT_ERROR_CODES entry `{code}` is rejected by the \
              deployment_apply_jobs_last_error_code_check constraint; widen \
-             migrations/0073_widen_deployment_apply_jobs_last_error_code.sql",
+             migrations/0082_widen_deployment_apply_jobs_last_error_code.sql",
         );
     }
 }
@@ -1094,7 +1094,7 @@ async fn every_emitter_error_code_is_persistable_and_public() {
             constraint_def.contains(&needle),
             "emitter code `{code}` is rejected by the \
              deployment_apply_jobs_last_error_code_check constraint; widen \
-             migrations/0073_widen_deployment_apply_jobs_last_error_code.sql",
+             migrations/0082_widen_deployment_apply_jobs_last_error_code.sql",
         );
         assert!(
             PUBLIC_DEPLOYMENT_ERROR_CODES.contains(&code),
