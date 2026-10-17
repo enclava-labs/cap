@@ -70,6 +70,9 @@ axum-test = "20"
 tower = { version = "0.5", features = ["util"] }
 rcgen = "0.14"
 tokio-rustls = { workspace = true }
+# start_paused for the pull-secret cleanup tests: the delete conflict backoff
+# (~60 s budget) and the finalizer poll (30 s) run in simulated time.
+tokio = { version = "1", features = ["full", "test-util"] }
 # Test-only mirror of the router's matcher: the freeze-gate invariant test
 # asserts gate classification matches matchit dispatch. Pinned =0.8.4 so a
 # cargo update can never silently move the mirror off the semantics the

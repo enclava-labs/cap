@@ -223,7 +223,7 @@ async fn freeze_workload_authority_mutations(
     request: Request,
     next: Next,
 ) -> Response {
-    if state.deployment_dispatch_enabled
+    if state.deployment_dispatch_is_enabled()
         || !is_workload_authority_mutation(request.method(), request.uri().path())
     {
         return next.run(request).await;
@@ -1784,8 +1784,8 @@ mod runtime_gate_tests {
         // cases are the ones a percent-decoding normalizer would wrongly
         // allow: the router dispatches them to mutation handlers while a
         // decoded/dot-resolved view collapses them into an allow pattern.
-        let mut state = crate::test_support::lazy_state();
-        state.deployment_dispatch_enabled = false;
+        let state = crate::test_support::lazy_state();
+        state.set_deployment_dispatch_enabled(false);
         state.mark_startup_ready();
         let app = test_router(state);
 
@@ -1846,7 +1846,7 @@ mod runtime_gate_tests {
         // would 400 on the empty org id after InternalAuth).
         let mut paas_state = crate::test_support::lazy_state();
         paas_state.management_mode = crate::state::CapManagementMode::PaasManaged;
-        paas_state.deployment_dispatch_enabled = false;
+        paas_state.set_deployment_dispatch_enabled(false);
         paas_state.mark_startup_ready();
         let paas_app = test_router(paas_state);
         let response = paas_app
@@ -1915,7 +1915,7 @@ mod runtime_gate_tests {
         // exactly while the dispatch gate is tripped.
         let mut state = crate::test_support::lazy_state();
         state.management_mode = crate::state::CapManagementMode::PaasManaged;
-        state.deployment_dispatch_enabled = false;
+        state.set_deployment_dispatch_enabled(false);
         let app = build_router_inner(state, true);
 
         let mut saw_gate_rejection = false;
@@ -1958,7 +1958,7 @@ mod runtime_gate_tests {
         // production router (rate limits enabled, three-way merge).
         let mut state = crate::test_support::lazy_state();
         state.management_mode = crate::state::CapManagementMode::PaasManaged;
-        state.deployment_dispatch_enabled = false;
+        state.set_deployment_dispatch_enabled(false);
         state.mark_startup_ready();
         let app = build_router_inner(state, true);
 
@@ -2038,8 +2038,8 @@ mod runtime_gate_tests {
 
     #[tokio::test]
     async fn router_exposes_only_liveness_until_ready_then_enforces_dispatch_gate() {
-        let mut state = crate::test_support::lazy_state();
-        state.deployment_dispatch_enabled = false;
+        let state = crate::test_support::lazy_state();
+        state.set_deployment_dispatch_enabled(false);
         state
             .startup_ready
             .store(false, std::sync::atomic::Ordering::Release);
@@ -2148,7 +2148,7 @@ pub(crate) mod test_support {
         AppState {
             db: pool,
             management_mode: crate::state::CapManagementMode::Standalone,
-            deployment_dispatch_enabled: true,
+            deployment_dispatch_enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             startup_ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             signing_key: Arc::new(SigningKey::generate(&mut OsRng)),
             hmac_key: Arc::new([7u8; 32]),
