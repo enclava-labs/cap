@@ -2404,7 +2404,10 @@ async fn retry_exhaustion_namespace_provenance(
 /// quarantine and claim again. Second, a foreign owner of the SHARED
 /// global fences (an unrelated app's KBS/edge reconcile) can never
 /// compensate this deployment, so its bounded quarantine is waited out
-/// too, under a total wait budget; a foreign owner of an APP-SPECIFIC
+/// too, under a total wait budget and with short bounded polls so a fence
+/// the owner releases early is reclaimed promptly (each waiting
+/// compensation occupies one of the bounded apply worker slots); a
+/// foreign owner of an APP-SPECIFIC
 /// lane (another live generation of this app, a deleting app, a
 /// retained-namespace marker) still skips — its own terminal path owns
 /// compensation and the periodic reconcilers retain convergence for every
@@ -2509,13 +2512,22 @@ async fn compensate_after_retry_exhaustion(state: &AppState, job: &ClaimedJob, a
                     deployment_id = %job.deployment_id,
                     app_id = %job.app_id,
                     reclaimable_at = %waitable_until,
-                    "retry-exhaustion compensation waiting out a bounded fence quarantine"
+                    "retry-exhaustion compensation polling a bounded fence quarantine"
                 );
+                // Poll, never park: a global owner may `finish` and clear
+                // its row long before the reclaim deadline it last wrote,
+                // and each waiting compensation occupies one of the bounded
+                // apply worker slots (Devin, #260 review round 4). Short
+                // bounded retries claim a released fence promptly while
+                // the total budget still bounds the loop; the own-lease
+                // case is dead by construction, so its fixed deadline is
+                // simply polled at the same granularity.
                 let wait = (waitable_until - chrono::Utc::now())
                     .to_std()
                     .unwrap_or_default()
                     + std::time::Duration::from_millis(250);
-                let sleep_until = (tokio::time::Instant::now() + wait).min(wait_deadline);
+                let poll = wait.min(std::time::Duration::from_secs(5));
+                let sleep_until = (tokio::time::Instant::now() + poll).min(wait_deadline);
                 if sleep_until > tokio::time::Instant::now() {
                     tokio::time::sleep_until(sleep_until).await;
                 }
