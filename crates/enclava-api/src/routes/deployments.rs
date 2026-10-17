@@ -579,8 +579,12 @@ const PUBLIC_DEPLOYMENT_ERROR_CODES: &[&str] = &[
     "invalid_live_mutation_generation",
     "stale_mutation_generation",
     "provider_generation_not_applied",
+    // engine codes inherited from main's P2 evidence work (0075): both are
+    // bounded ApplyError classifications and must pass through verbatim
+    "creation_evidence_lost",
     "missing_resource_identity",
     "resource_not_found",
+    "resource_vanished",
     "mutation_conflict_exhausted",
     "namespace_not_ready",
     "rollout_timeout",
