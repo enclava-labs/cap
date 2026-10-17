@@ -71,6 +71,10 @@ ALTER TABLE deployment_apply_jobs
             'app_mutation_lease_lost',
             'app_mutation_unavailable',
             -- preflight volume-evidence codes (main; DeploymentJobError::code)
-            'volume_evidence_unavailable'
+            'volume_evidence_unavailable',
+            -- cap#260 (#231) terminal exhaustion code: its 0076 re-widening
+            -- requires every later allowlist to retain it (merge-order
+            -- contract: both sides converge to the same allowlist set)
+            'deployment_retry_exhausted'
         )
     );
