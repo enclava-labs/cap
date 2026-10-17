@@ -48,6 +48,8 @@
 
 use uuid::Uuid;
 
+use enclava_engine::apply::generation::MutationGeneration;
+
 use crate::models::App;
 use crate::mutation_leases::{AppMutationLease, ResourceFence};
 use crate::state::AppState;
@@ -1720,6 +1722,17 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
     // its compensating restores) — forwarded to the adopted-namespace
     // sweep so unmarked live targets count as unresolved there.
     evidence_loss_unresolved: bool,
+    // Durable provenance for the namespace-fence generation the FAILED
+    // attempts claimed (Devin, #260 review). The immediate terminal path
+    // holds the apply's own lease, so its `mutation` carries the exact
+    // generation the apply stamped and passes `None`. Retry-exhaustion
+    // compensation reacquires a FRESH fence whose generation is one the
+    // failed attempts never wrote: classifying against it would always
+    // mismatch the live namespace annotation and strand the namespace as
+    // foreign. When the failed attempts durably recorded their claimed
+    // generation, pass it here so classification and the teardown sweep
+    // run against the generation the provider state actually carries.
+    namespace_generation_provenance: Option<MutationGeneration>,
 ) -> CleanupFenceOutcome {
     // Durably record the evidence loss BEFORE any later step: even if this
     // process dies mid-cleanup, a later sweep of any failed generation of
@@ -1783,28 +1796,37 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
         }
     }
 
-    let namespace_generation = match mutation
-        .resource_generation(&ResourceFence::new("kubernetes_namespace", &app.namespace))
-    {
-        Some(raw) => match enclava_engine::apply::generation::MutationGeneration::new(raw) {
-            Ok(generation) => generation,
-            Err(error) => {
-                tracing::warn!(
+    let namespace_generation = if let Some(provenance) = namespace_generation_provenance {
+        // Provenance generations were validated when the failed attempts'
+        // durable record was loaded; the reacquired fence's generation is
+        // deliberately NOT consulted — the failed attempts stamped the
+        // provider with the provenance generation, and every ownership
+        // probe and delete precondition must match what they wrote.
+        provenance
+    } else {
+        match mutation
+            .resource_generation(&ResourceFence::new("kubernetes_namespace", &app.namespace))
+        {
+            Some(raw) => match MutationGeneration::new(raw) {
+                Ok(generation) => generation,
+                Err(error) => {
+                    tracing::warn!(
+                        app_id = %app.id,
+                        namespace = %app.namespace,
+                        error = %error,
+                        "failed-apply cleanup cannot validate kubernetes_namespace generation; skipping provider cleanup"
+                    );
+                    return CleanupFenceOutcome::ReleaseNormally;
+                }
+            },
+            None => {
+                tracing::info!(
                     app_id = %app.id,
                     namespace = %app.namespace,
-                    error = %error,
-                    "failed-apply cleanup cannot validate kubernetes_namespace generation; skipping provider cleanup"
+                    "failed-apply cleanup holds no kubernetes_namespace generation; skipping provider cleanup"
                 );
                 return CleanupFenceOutcome::ReleaseNormally;
             }
-        },
-        None => {
-            tracing::info!(
-                app_id = %app.id,
-                namespace = %app.namespace,
-                "failed-apply cleanup holds no kubernetes_namespace generation; skipping provider cleanup"
-            );
-            return CleanupFenceOutcome::ReleaseNormally;
         }
     };
 
