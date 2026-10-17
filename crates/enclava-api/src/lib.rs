@@ -2120,6 +2120,125 @@ pub(crate) mod test_support {
         pool
     }
 
+    /// A migrated database isolated from every other test (Codex P2, #258
+    /// review). `#[sqlx::test]` provisions the same isolation but hard
+    /// REQUIRES the `DATABASE_URL` environment variable (or a `.env` file)
+    /// before a test body runs, which breaks the AGENTS.md-mandated bare
+    /// `cargo test --workspace` command on the default local setup. This
+    /// harness keeps that isolation — a uniquely named database created
+    /// from the same URL [`database_test_pool`] would use, including its
+    /// fallback — so tests whose fixtures must not share state (like the
+    /// KBS reconciliation singleton) stay isolated while the documented
+    /// default command remains runnable. Dropping the guard drops the
+    /// database best-effort, mirroring `#[sqlx::test]` teardown; a dropped
+    /// guard on an aborted run leaves an orphaned database, never a
+    /// silently skipped or cross-contaminated test.
+    pub(crate) struct IsolatedTestDatabase {
+        pub(crate) pool: sqlx::PgPool,
+        name: String,
+        admin: sqlx::PgPool,
+    }
+
+    impl IsolatedTestDatabase {
+        pub(crate) async fn new(label: &str) -> Self {
+            debug_assert!(
+                label
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '_'),
+                "isolated database labels must be plain identifiers"
+            );
+            let database_url = std::env::var("DATABASE_URL")
+                .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
+            let admin = sqlx::PgPool::connect(&database_url)
+                .await
+                .expect("connect test database server");
+            let name = format!("cap_test_{}_{}", label, Uuid::new_v4().simple());
+            sqlx::query(&format!(r#"CREATE DATABASE "{name}""#))
+                .execute(&admin)
+                .await
+                .unwrap_or_else(|error| panic!("create isolated test database {name}: {error}"));
+            let options = {
+                use std::str::FromStr as _;
+                sqlx::postgres::PgConnectOptions::from_str(&database_url)
+                    .expect("parse test database URL")
+            };
+            let pool = PgPoolOptions::new()
+                .connect_with(options.database(&name))
+                .await
+                .unwrap_or_else(|error| panic!("connect isolated test database {name}: {error}"));
+            crate::db::pool::run_migrations(&pool)
+                .await
+                .unwrap_or_else(|error| panic!("migrate isolated test database {name}: {error}"));
+            Self { pool, name, admin }
+        }
+    }
+
+    impl IsolatedTestDatabase {
+        /// Teardown for the normal path: close the pool and drop the
+        /// database inline so a passing run never leaks it. A detached
+        /// thread cannot guarantee that — the test binary may exit before
+        /// it finishes — so tests call this explicitly; the `Drop` guard
+        /// below remains only as the assertion-panic safety net.
+        pub(crate) async fn drop_database(mut self) {
+            let name = std::mem::take(&mut self.name);
+            self.pool.close().await;
+            if let Err(error) = drop_isolated_database(&self.admin, &name).await {
+                eprintln!(
+                    "failed to drop isolated test database {name}: {error}; \
+                     leftover database must be removed manually"
+                );
+            }
+        }
+    }
+
+    async fn drop_isolated_database(admin: &sqlx::PgPool, name: &str) -> Result<(), sqlx::Error> {
+        // Postgres 13+ can force-drop around just-closed pool sockets;
+        // older servers fall back to a plain drop that may legitimately
+        // fail on a straggler connection.
+        match sqlx::query(&format!(r#"DROP DATABASE IF EXISTS "{name}" WITH (FORCE)"#))
+            .execute(admin)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(_) => sqlx::query(&format!(r#"DROP DATABASE IF EXISTS "{name}""#))
+                .execute(admin)
+                .await
+                .map(|_| ()),
+        }
+    }
+
+    impl Drop for IsolatedTestDatabase {
+        fn drop(&mut self) {
+            let name = std::mem::take(&mut self.name);
+            if name.is_empty() {
+                return;
+            }
+            let pool = self.pool.clone();
+            let admin = self.admin.clone();
+            // Drop the database from a fresh single-threaded runtime: the
+            // guard can be dropped from inside a test runtime (including
+            // while a panic unwinds), where block_on is unavailable.
+            std::thread::spawn(move || {
+                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    return;
+                };
+                let dropped = runtime.block_on(async {
+                    pool.close().await;
+                    drop_isolated_database(&admin, &name).await
+                });
+                if let Err(error) = dropped {
+                    eprintln!(
+                        "failed to drop isolated test database {name}: {error}; \
+                         leftover database must be removed manually"
+                    );
+                }
+            });
+        }
+    }
+
     pub(crate) fn auth_context(role: Role, scopes: &[&str]) -> AuthContext {
         AuthContext {
             user_id: Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),

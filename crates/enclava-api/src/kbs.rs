@@ -3293,11 +3293,19 @@ resource_bindings := {
     ///   leaves the serving policy untouched.
     /// - Pending generation: the reconciler publishes the eligible artifact
     ///   into the serving ConfigMap policy.
-    // SQLx provisions a separate migrated database for this test. The
+    // An isolated migrated database for this test, provisioned with the
+    // same DATABASE_URL fallback the shared harness uses (Codex P2, #258
+    // review): `#[sqlx::test]` requires DATABASE_URL to be exported before
+    // the mandated bare `cargo test --workspace` command runs, while this
+    // harness keeps the default local setup runnable and still fails loud
+    // when no database is reachable — never a silent skip. The
     // reconciliation singleton is shared within a database, so neither the
-    // zero-generation setup nor an assertion failure can clobber other tests.
-    #[sqlx::test(migrator = "crate::db::pool::MIGRATOR")]
-    async fn pending_generation_publishes_eligible_artifact_to_kbs_policy(pool: PgPool) {
+    // zero-generation setup nor an assertion failure can clobber other
+    // tests; the guard drops the whole database when the test returns.
+    #[tokio::test]
+    async fn pending_generation_publishes_eligible_artifact_to_kbs_policy() {
+        let database = crate::test_support::IsolatedTestDatabase::new("kbs_signed_policy").await;
+        let pool = database.pool.clone();
         let (org_id, app_id) = insert_test_app(&pool, "creating").await;
         let deployment_id = Uuid::new_v4();
         insert_test_deployment(&pool, org_id, app_id, deployment_id, "healthy", Utc::now()).await;
@@ -3397,8 +3405,10 @@ resource_bindings := {
             "the reconciler must durably converge applied_generation to desired"
         );
 
-        // SQLx drops the isolated database after this test, including its
-        // fixture and reconciliation state even if an assertion fails.
+        // Inline teardown on the passing path (a detached drop thread
+        // cannot guarantee the binary stays alive for it); the guard's
+        // Drop remains the safety net for assertion panics.
+        database.drop_database().await;
     }
 
     async fn insert_test_app(pool: &PgPool, status: &str) -> (Uuid, Uuid) {
