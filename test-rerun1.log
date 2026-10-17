@@ -1,0 +1,82 @@
+    Blocking waiting for file lock on build directory
+warning: unnecessary `unsafe` block
+   --> vendor/rdrand-0.8.3/src/lib.rs:169:18
+    |
+169 |     let cpuid0 = unsafe { arch::__cpuid(0) };
+    |                  ^^^^^^ unnecessary `unsafe` block
+    |
+    = note: `#[warn(unused_unsafe)]` (part of `#[warn(unused)]`) on by default
+
+warning: unnecessary `unsafe` block
+   --> vendor/rdrand-0.8.3/src/lib.rs:193:5
+    |
+193 |     unsafe { arch::__cpuid(7).ebx & FLAG == FLAG }
+    |     ^^^^^^ unnecessary `unsafe` block
+
+warning: unnecessary `unsafe` block
+   --> vendor/rdrand-0.8.3/src/lib.rs:211:26
+    |
+211 |               let cpuid1 = unsafe { arch::__cpuid(1) };
+    |                            ^^^^^^ unnecessary `unsafe` block
+...
+470 | / impl_rand!(
+471 | |     RdRand,
+472 | |     "rdrand",
+473 | |     arch::_rdrand16_step,
+...   |
+477 | |     maxty = u64
+478 | | );
+    | |_- in this macro invocation
+    |
+    = note: this warning originates in the macro `is_available` which comes from the expansion of the macro `impl_rand` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unnecessary `unsafe` block
+   --> vendor/rdrand-0.8.3/src/lib.rs:214:60
+    |
+214 |               cfg!(target_feature = "rdrand") || has_rdrand(&unsafe { arch::__cpuid(1) })
+    |                                                              ^^^^^^ unnecessary `unsafe` block
+...
+470 | / impl_rand!(
+471 | |     RdRand,
+472 | |     "rdrand",
+473 | |     arch::_rdrand16_step,
+...   |
+477 | |     maxty = u64
+478 | | );
+    | |_- in this macro invocation
+    |
+    = note: this warning originates in the macro `is_available` which comes from the expansion of the macro `impl_rand` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unnecessary `unsafe` block
+   --> vendor/rdrand-0.8.3/src/lib.rs:219:25
+    |
+219 |               amd_family(&unsafe { arch::__cpuid(1) }) >= FIRST_GOOD_AMD_FAMILY && has_rdseed()
+    |                           ^^^^^^ unnecessary `unsafe` block
+...
+480 | / impl_rand!(
+481 | |     RdSeed,
+482 | |     "rdseed",
+483 | |     arch::_rdseed16_step,
+...   |
+487 | |     maxty = u64
+488 | | );
+    | |_- in this macro invocation
+    |
+    = note: this warning originates in the macro `is_available` which comes from the expansion of the macro `impl_rand` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: `rdrand` (lib) generated 5 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2m 42s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/lib.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/enclava_api-95cbad1fd2d48629)
+
+running 5 tests
+test deployment_jobs::tests::artifact_binding_is_unique_and_exact_hash_mismatch_is_absent ... ok
+test deployment_jobs::tests::cross_app_kbs_fence_contention_requeues_without_terminal_failure ... ok
+test deployment_jobs::tests::orphan_reconciler_repairs_only_exact_inactive_deployment_owner ... ok
+test routes::deployments::tests::superseded_watcher_cannot_publish_over_new_manifest ... ok
+test routes::internal::tests::app_delete_recovery_has_one_reservation_winner ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 630 filtered out; finished in 9.28s
+
+RERUN1_EXIT=0
