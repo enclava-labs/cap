@@ -221,23 +221,25 @@ where
     Ok(items)
 }
 
-/// Per-object budget for confirming a DELETE's absence (codex P2: poll
-/// foreground deletions before marking the sweep incomplete). A foreground
-/// delete of a StatefulSet with Pods keeps the set visible — a
-/// `deletionTimestamp` and a `foregroundDeletion` finalizer — until the
-/// garbage collector removes the
-/// dependents, so the first GET after an accepted DELETE commonly still
-/// returns the object even though the deletion is progressing normally.
-/// Longhorn PVC finalizers similarly hold claims after an accepted DELETE.
-/// Treating that first live response as the final outcome counted healthy
-/// deletions as incomplete (evidence retained, storage-size changes blocked)
-/// and skipped the StatefulSet's PVC sweep entirely. The poll is capped PER
-/// OBJECT so one wedged target cannot starve the remaining targets' own
-/// convergence inside the overall sweep deadline.
+/// Per-object budget for confirming a DELETE's absence. An accepted
+/// orphan delete can remain visible while the orphan finalizer detaches
+/// dependents, and other finalizers can hold it indefinitely. Poll rather
+/// than treating the first live response as failure. The budget is capped
+/// per object so a wedged target cannot starve the remaining targets.
 const SWEEP_CONFIRM_ABSENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Poll interval while waiting for an accepted DELETE to converge.
 const SWEEP_CONFIRM_ABSENCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Never cascade through tenant-writable ownerReferences in an adopted
+/// namespace, even for non-workload targets (a PVC can reference a Secret).
+fn adopted_sweep_delete_params(preconditions: kube::api::Preconditions) -> kube::api::DeleteParams {
+    kube::api::DeleteParams {
+        preconditions: Some(preconditions),
+        propagation_policy: Some(kube::api::PropagationPolicy::Orphan),
+        ..kube::api::DeleteParams::default()
+    }
+}
 
 /// Outcome of polling an accepted DELETE for confirmed absence.
 #[derive(Debug, PartialEq, Eq)]
@@ -245,7 +247,7 @@ enum SweepAbsence {
     /// The object is confirmed gone (404 observed).
     Absent,
     /// The object is still live when the confirmation window closed
-    /// (foreground GC or a finalizer still holds it): the sweep must not
+    /// (orphaning or another finalizer still holds it): the sweep must not
     /// report completion while the object may survive.
     StillLive,
     /// Absence could not be confirmed (read failures/deadline): undecidable.
@@ -550,14 +552,14 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
             };
             let Some(live) = live else {
                 // Absent. For the StatefulSet this may be a RETRY after a
-                // previous sweep deleted it but could not finish its PVC
-                // sweep: run the claim sweep now — which retains every
+                // previous sweep orphaned it but could not finish its
+                // dependent sweep: inspect Pods too, and retain every
                 // name-matching claim fail-closed (#273: in an adopted
                 // namespace no claim field is non-forgeable, so claims are
                 // never deleted here; the sweep only reports how many
                 // keep it incomplete).
                 if target.kind == "StatefulSet" {
-                    failures += sweep_statefulset_pvcs(
+                    failures += sweep_statefulset_dependents(
                         &client,
                         &app.namespace,
                         &target.name,
@@ -725,26 +727,15 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
             }
             match bounded_sweep_read(
                 sweep_deadline,
-                api.delete(
-                    &target.name,
-                    &kube::api::DeleteParams {
-                        preconditions: Some(preconditions),
-                        // Foreground propagation: the owner must not vanish
-                        // while its Pods or other dependents are still live
-                        // (background cascading deletion would let the 404
-                        // confirmation here run ahead of the collector).
-                        propagation_policy: Some(kube::api::PropagationPolicy::Foreground),
-                        ..kube::api::DeleteParams::default()
-                    },
-                ),
+                api.delete(&target.name, &adopted_sweep_delete_params(preconditions)),
             )
             .await
             {
                 Ok(_) => {
                     // Accepted DELETE is not absence: a finalizer can hold
                     // the object in Terminating indefinitely — and with the
-                    // foreground propagation above, a StatefulSet with Pods
-                    // stays visible until garbage collection finishes.
+                    // orphan propagation above, the orphan finalizer must
+                    // finish detaching dependents before the owner vanishes.
                     // Poll for confirmed 404 within the confirmation window
                     // (codex P2) instead of treating the first live response
                     // as the final outcome, then count the target complete.
@@ -762,7 +753,7 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
                                 namespace = %app.namespace,
                                 kind = target.kind,
                                 name = %target.name,
-                                "adopted-namespace sweep delete accepted but object still live after the confirmation window (foreground GC or finalizer?); counting as incomplete"
+                                "adopted-namespace sweep delete accepted but object still live after the confirmation window (orphaning or finalizer?); counting as incomplete"
                             );
                             failures += 1;
                             break;
@@ -830,9 +821,11 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
             // non-forgeable); it counts every remaining name-matching
             // claim as a failure so the sweep stays INCOMPLETE and the
             // storage-size guard stays armed until the claims are gone
-            // (GC cascade, namespace owner, or app deletion — #251).
+            // (namespace owner or app deletion — #251). Orphaned Pods
+            // also keep cleanup incomplete; they are not deleted via GC.
             failures +=
-                sweep_statefulset_pvcs(&client, &app.namespace, &target.name, sweep_deadline).await;
+                sweep_statefulset_dependents(&client, &app.namespace, &target.name, sweep_deadline)
+                    .await;
         }
     }
     failures
@@ -1094,6 +1087,48 @@ async fn count_name_matching_claims(
     }
 }
 
+/// Orphan deletion must not let the owner reaching 404 hide running Pods.
+/// Names, not ownerReferences, identify candidates: orphaning removes refs,
+/// and retries must still find the Pods after the StatefulSet has vanished.
+/// Retain rather than delete them: cascading a Pod delete could likewise
+/// remove a tenant PVC with a forged reference to that Pod. Pods may still
+/// be running; the namespace owner must remove them (or delete the app).
+/// Until then, cleanup remains incomplete even when no PVCs exist.
+async fn sweep_statefulset_dependents(
+    client: &kube::Client,
+    namespace: &str,
+    statefulset: &str,
+    sweep_deadline: tokio::time::Instant,
+) -> usize {
+    let claims = sweep_statefulset_pvcs(client, namespace, statefulset, sweep_deadline).await;
+    let pods: kube::Api<k8s_openapi::api::core::v1::Pod> =
+        kube::Api::namespaced(client.clone(), namespace);
+    match bounded_sweep_list_all(&pods, sweep_deadline).await {
+        Ok(pods) => {
+            claims
+                + pods
+                    .iter()
+                    .filter(|pod| {
+                        pod.metadata.name.as_deref().is_some_and(|name| {
+                            name.strip_prefix(statefulset)
+                                .and_then(|suffix| suffix.strip_prefix('-'))
+                                .is_some_and(|ordinal| {
+                                    !ordinal.is_empty()
+                                        && ordinal.bytes().all(|c| c.is_ascii_digit())
+                                        && (ordinal == "0" || !ordinal.starts_with('0'))
+                                })
+                        })
+                    })
+                    .count()
+        }
+        Err(error) => {
+            tracing::warn!(%namespace, %statefulset, %error,
+                "cannot inspect orphaned Pods; retaining adopted-namespace cleanup evidence");
+            claims + 1
+        }
+    }
+}
+
 /// Inspect the name-matching PVC claims of a swept StatefulSet in an
 /// ADOPTED namespace and report how many claims keep the sweep INCOMPLETE.
 /// Since #273 this sweep DELETES NOTHING: deletion authority used to be the
@@ -1131,15 +1166,10 @@ async fn count_name_matching_claims(
 /// evidence over retained claims, allowing a later resized deployment to
 /// silently adopt them at their old size (the deploy route's storage-size
 /// guard — `status <> 'failed' OR manifest_hash IS NOT NULL` — is the only
-/// resize protection and must stay armed). This does not conflict with GC
-/// alignment (grok P1, bcfb3fa8): CAP simply declines to be the claim
-/// deleter; claims the Kubernetes GC cascade removes after the
-/// StatefulSet delete — any ownerReference pinning the STS UID is a GC
-/// dependent, whether stamped under a previous Delete retention policy
-/// or freshly tenant-forged — vanish by Kubernetes' own policy, not by
-/// a CAP delete call, and a later retry of this sweep — or the same
-/// attempt, if GC lands inside the STS-delete confirmation window —
-/// observes their absence and completes then.
+/// resize protection and must stay armed). Owner deletion uses Orphan
+/// propagation as well: delegating deletion to Kubernetes GC would still
+/// destroy tenant PVCs carrying forged references. Orphaned Pods are also
+/// retained and counted by `sweep_statefulset_dependents`.
 /// Resolution paths for retained claims: the namespace
 /// owner removes the claim, or the app is deleted (issue #251).
 pub(crate) async fn sweep_statefulset_pvcs(
@@ -3440,6 +3470,157 @@ mod tests {
         ));
     }
 
+    /// Owner deletion must not turn forged refs into GC deletion authority.
+    #[tokio::test]
+    async fn adopted_sweep_orphans_owner_and_retains_forged_dependents() {
+        use axum::http::{Request, Response};
+        use http_body_util::BodyExt;
+        use kube::client::Body;
+        use std::sync::{Arc, Mutex};
+        use tower::service_fn;
+
+        let delete_options = Arc::new(Mutex::new(None));
+        let observed = delete_options.clone();
+        let client = kube::Client::new(
+            service_fn(move |request: Request<Body>| {
+                let observed = observed.clone();
+                async move {
+                    let method = request.method().clone();
+                    let path = request.uri().path().to_string();
+                    let bytes = request.into_body().collect().await.unwrap().to_bytes();
+                    let (status, body) = if method == "DELETE" {
+                        assert!(
+                            path.ends_with("/statefulsets/demo"),
+                            "must not delete Pods/PVCs"
+                        );
+                        let options: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                        *observed.lock().unwrap() = Some(options.clone());
+                        // Model GC's key security consequence: cascading owner
+                        // deletion would remove the forged claim before inspection.
+                        (
+                            200,
+                            serde_json::json!({"apiVersion":"v1", "kind":"Status", "status":"Success"}),
+                        )
+                    } else if path.ends_with("/persistentvolumeclaims") {
+                        let options = observed
+                            .lock()
+                            .unwrap()
+                            .clone()
+                            .expect("owner deleted first");
+                        let items = if options["propagationPolicy"] == "Orphan" {
+                            vec![
+                                serde_json::json!({"apiVersion":"v1", "kind":"PersistentVolumeClaim",
+                            "metadata":{"name":"state-demo-999", "uid":"tenant-claim",
+                                "ownerReferences":[{"apiVersion":"apps/v1", "kind":"StatefulSet",
+                                    "name":"demo", "uid":"sts-uid", "controller":true}]}}),
+                            ]
+                        } else {
+                            vec![]
+                        };
+                        (
+                            200,
+                            serde_json::json!({"apiVersion":"v1", "kind":"PersistentVolumeClaimList", "items":items}),
+                        )
+                    } else if path.ends_with("/pods") {
+                        // Already-orphaned Pod: retry discovery cannot rely on refs.
+                        (
+                            200,
+                            serde_json::json!({"apiVersion":"v1", "kind":"PodList", "items":[
+                                {"metadata":{"name":"demo-0"}},
+                                {"metadata":{"name":"other-0"}},
+                                {"metadata":{"name":"demo-extra-0"}}
+                            ]}),
+                        )
+                    } else {
+                        assert!(path.ends_with("/statefulsets/demo"));
+                        (
+                            404,
+                            serde_json::json!({"apiVersion":"v1", "kind":"Status", "status":"Failure", "reason":"NotFound", "code":404}),
+                        )
+                    };
+                    Ok::<_, std::io::Error>(
+                        Response::builder()
+                            .status(status)
+                            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                            .unwrap(),
+                    )
+                }
+            }),
+            "default",
+        );
+        let api: kube::Api<k8s_openapi::api::apps::v1::StatefulSet> =
+            kube::Api::namespaced(client.clone(), "cap-demo");
+        api.delete(
+            "demo",
+            &adopted_sweep_delete_params(kube::api::Preconditions {
+                uid: Some("sts-uid".into()),
+                resource_version: Some("42".into()),
+            }),
+        )
+        .await
+        .unwrap();
+        let deadline = tokio::time::Instant::now() + SWEEP_DEADLINE;
+        assert_eq!(
+            wait_for_sweep_absence(&api, "demo", deadline).await,
+            SweepAbsence::Absent
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                sweep_statefulset_dependents(&client, "cap-demo", "demo", deadline).await,
+                2,
+                "owner 404 must not clear evidence over a forged PVC or an orphaned Pod, including retries"
+            );
+        }
+        let options = delete_options.lock().unwrap().clone().unwrap();
+        assert_eq!(options["propagationPolicy"], "Orphan");
+        assert_eq!(options["preconditions"]["uid"], "sts-uid");
+        assert_eq!(options["preconditions"]["resourceVersion"], "42");
+    }
+
+    #[tokio::test]
+    async fn orphaned_pod_inspection_fails_closed() {
+        use axum::http::{Request, Response};
+        use http_body_util::BodyExt;
+        use kube::client::Body;
+        use tower::service_fn;
+        for pod_list_fails in [false, true] {
+            let client = kube::Client::new(
+                service_fn(move |request: Request<Body>| async move {
+                    let is_pod = request.uri().path().ends_with("/pods");
+                    let _ = request.into_body().collect().await;
+                    let (status, body) = if is_pod && pod_list_fails {
+                        (
+                            500,
+                            serde_json::json!({"apiVersion":"v1", "kind":"Status", "status":"Failure", "message":"unavailable", "code":500}),
+                        )
+                    } else {
+                        (
+                            200,
+                            serde_json::json!({"apiVersion":"v1", "kind":if is_pod {"PodList"} else {"PersistentVolumeClaimList"}, "items":[]}),
+                        )
+                    };
+                    Ok::<_, std::io::Error>(
+                        Response::builder()
+                            .status(status)
+                            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                            .unwrap(),
+                    )
+                }),
+                "default",
+            );
+            assert_eq!(
+                sweep_statefulset_dependents(
+                    &client,
+                    "cap-demo",
+                    "demo",
+                    tokio::time::Instant::now() + SWEEP_DEADLINE
+                )
+                .await,
+                usize::from(pod_list_fails)
+            );
+        }
+    }
+
     /// #273 regression: in an adopted namespace the tenant can read the
     /// live StatefulSet's UID (namespace-readable) and write
     /// `ownerReferences` on their own PVCs (tenant-writable), so a forged
@@ -3449,10 +3630,8 @@ mod tests {
     /// — must NOT be deleted by the sweep. No PVC delete request may be
     /// issued at all: every name-matching claim is retained and counted,
     /// keeping the sweep incomplete (evidence and the storage-size guard
-    /// survive; resolution paths per #251). Scope: this exercises the
-    /// claim-counting helper against a listed claim set — the
-    /// foreground-GC cascade that follows a live StatefulSet delete is
-    /// documented on the function, not proven here.
+    /// survive; resolution paths per #251). The owner-delete propagation
+    /// is covered separately by the orphan-propagation regression.
     #[tokio::test]
     async fn forged_owner_ref_claims_are_retained_and_sweep_stays_incomplete() {
         use axum::http::{Request, Response};
