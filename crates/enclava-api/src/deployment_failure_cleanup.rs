@@ -1743,13 +1743,29 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
     // incomplete marker itself is the durable proof this deployment created
     // that state, so the live annotation — when not newer than anything
     // this deployment could have written — authorizes teardown.
-    let provenance_incomplete: bool = sqlx::query_scalar(
+    // Round 3 (Codex P2): fail CLOSED on lookup failure — defaulting to
+    // `false` would classify a pre-ledger stamp as Foreign, release the
+    // fences, and never retry; instead skip provider cleanup entirely and
+    // leave it to reconciliation, exactly like a failed precondition.
+    let provenance_incomplete = match sqlx::query_scalar::<_, bool>(
         "SELECT namespace_fence_provenance_incomplete FROM deployments WHERE id = $1",
     )
     .bind(failed_deployment_id)
     .fetch_one(&state.db)
     .await
-    .unwrap_or(false);
+    {
+        Ok(incomplete) => incomplete,
+        Err(lookup_error) => {
+            tracing::warn!(
+                deployment_id = %failed_deployment_id,
+                app_id = %app.id,
+                error = %lookup_error,
+                error_code = "incomplete_provenance_lookup_failed",
+                "failed-apply cleanup could not load the provenance marker; leaving provider cleanup to reconciliation"
+            );
+            return CleanupFenceOutcome::ReleaseNormally;
+        }
+    };
     // Durably record the evidence loss BEFORE any later step: even if this
     // process dies mid-cleanup, a later sweep of any failed generation of
     // this app must still see the marker and count unmarked live targets as

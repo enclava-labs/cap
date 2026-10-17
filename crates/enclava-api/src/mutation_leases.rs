@@ -1583,10 +1583,25 @@ async fn reconcile_one_retained_namespace(
                 let mut ownership_generations =
                     retained_marker_namespace_provenance(pool, operation_id).await?;
                 ownership_generations.push(generation_value);
+                // Round 3 (Devin BUG / Codex P2): a migrated deployment's
+                // namespace may carry a PRE-LEDGER generation the recorded
+                // set never includes; rejecting it here bounds the retained
+                // fence without ever retrying the delete, stranding the
+                // namespace. Carry the deployment's incomplete marker (a
+                // missing row keeps fence-generation-only behavior; a
+                // lookup error propagates and retries on the next pass —
+                // fail closed, never misclassify).
+                let provenance_incomplete = sqlx::query_scalar::<_, bool>(
+                    "SELECT namespace_fence_provenance_incomplete FROM deployments WHERE id = $1",
+                )
+                .bind(operation_id)
+                .fetch_optional(pool)
+                .await?
+                .unwrap_or(false);
                 match classify_initial_namespace_get(
                     &Ok(live_namespace),
                     &ownership_generations,
-                    false,
+                    provenance_incomplete,
                 ) {
                     InitialNamespaceOwnership::Owned {
                         uid,
