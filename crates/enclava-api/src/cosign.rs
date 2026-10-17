@@ -224,9 +224,13 @@ fn registry_auth_with_allowlist(
     // explicitly listed the destination host in COSIGN_REGISTRY_ALLOWED_HOSTS.
     // An unset/empty allowlist fails closed to anonymous access.
     if let Some(credentials) = credentials {
-        let host_allowed = allowed_hosts
-            .iter()
-            .any(|pattern| host_matches_allowed_pattern(registry, pattern));
+        let allow_http = env_flag("COSIGN_ALLOW_HTTP_REGISTRY");
+        let scheme = if allow_http { "http" } else { "https" };
+        let host_allowed = realm_host_allowed(
+            &format!("{scheme}://{registry}/"),
+            allowed_hosts,
+            allow_http,
+        );
         match (credentials.auth(), host_allowed) {
             (Some(auth), true) => return auth,
             (Some(_), false) => {
@@ -259,169 +263,207 @@ fn registry_auth_from_env(registry: &str) -> Auth {
     )
 }
 
-/// Extract the `realm` URL from a `WWW-Authenticate: Bearer ...` challenge
-/// value, tolerating quoted and bare realm parameters and case variance.
-/// Returns `None` when no realm parameter is present or it is empty.
-fn bearer_challenge_realm(www_authenticate: &str) -> Option<String> {
-    let mut in_quotes = false;
-    let mut parameters = Vec::new();
-    let mut current = String::new();
-    for character in www_authenticate.chars() {
-        match character {
-            '"' => {
-                in_quotes = !in_quotes;
-                current.push(character);
-            }
-            ',' if !in_quotes => {
-                parameters.push(std::mem::take(&mut current));
-            }
-            _ => current.push(character),
-        }
+/// Parse a Bearer challenge parameter, refusing malformed or duplicate fields.
+fn bearer_challenge_parameter(challenge: &str, wanted: &str) -> Option<String> {
+    let (scheme, parameters) = challenge.trim().split_once(char::is_whitespace)?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
     }
-    parameters.push(current);
-    for parameter in parameters {
-        let parameter = parameter.trim();
-        // The first parameter carries the challenge scheme ("Bearer
-        // realm=..."): strip it so the key comparison sees a bare `realm`.
-        let parameter = if parameter.to_ascii_lowercase().starts_with("bearer")
-            && parameter.contains(char::is_whitespace)
-        {
-            parameter
-                .split_once(char::is_whitespace)
-                .map(|(_, rest)| rest)
-                .unwrap_or(parameter)
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut fields = Vec::new();
+    let mut field = String::new();
+    for ch in parameters.chars() {
+        if escaped {
+            field.push(ch);
+            escaped = false;
+        } else if ch == '\\' && quoted {
+            escaped = true;
+        } else if ch == '"' {
+            quoted = !quoted;
+        } else if ch == ',' && !quoted {
+            fields.push(std::mem::take(&mut field));
         } else {
-            parameter
-        };
-        let Some((key, value)) = parameter.split_once('=') else {
-            continue;
-        };
-        if !key.trim().eq_ignore_ascii_case("realm") {
-            continue;
+            field.push(ch);
         }
-        let value = value.trim().trim_matches('"').trim();
-        if value.is_empty() {
-            return None;
-        }
-        return Some(value.to_string());
     }
-    None
+    if quoted || escaped {
+        return None;
+    }
+    fields.push(field);
+    let mut value = None;
+    for field in fields {
+        let (key, candidate) = field.split_once('=')?;
+        if key.trim().eq_ignore_ascii_case(wanted) {
+            if value.is_some() || candidate.trim().is_empty() {
+                return None;
+            }
+            value = Some(candidate.trim().to_string());
+        }
+    }
+    value
 }
 
-/// Whether a bearer-challenge realm URL's host is covered by the operator's
-/// `COSIGN_REGISTRY_ALLOWED_HOSTS` patterns (same grammar as registry
-/// hosts). Unparseable realms fail closed: an unreadable destination is not
-/// an allowlisted one.
-fn realm_host_allowed(realm: &str, allowed_hosts: &[String]) -> bool {
-    reqwest::Url::parse(realm)
-        .ok()
-        .and_then(|url| url.host_str().map(|host| host.to_string()))
-        .is_some_and(|host| {
-            allowed_hosts
-                .iter()
-                .any(|pattern| host_matches_allowed_pattern(&host, pattern))
-        })
+fn bearer_challenge_realm(challenge: &str) -> Option<String> {
+    bearer_challenge_parameter(challenge, "realm")
 }
 
-/// Codex review on #243, round 3, P1 "Validate token realms before
-/// forwarding basic credentials": `oci-client` 0.17 answers a registry's
-/// bearer challenge by requesting the challenge's `realm` URL WITH the same
-/// credentials attached to the original call, and the local egress proxy
-/// applies network blocking — not `COSIGN_REGISTRY_ALLOWED_HOSTS` — to
-/// token realms. A compromised or hostile registry could therefore route
-/// `COSIGN_REGISTRY_USERNAME`/`COSIGN_REGISTRY_PASSWORD` to an arbitrary
-/// host via `realm`. This probe issues one anonymous request to the
-/// registry's `/v2/` endpoint (through the same egress proxy) and, when it
-/// answers `401` with a bearer challenge, requires the challenge's realm
-/// host to be allowlisted before the caller attaches platform credentials.
-/// No bearer challenge, a non-401 answer, or a probe failure never GIVES
-/// credentials (the caller's host policy still applies); a challenge whose
-/// realm is not provably allowlisted makes the caller downgrade to
-/// anonymous — the file's fail-closed posture.
-async fn registry_token_realm_allowed(
+/// A bare allowlist host authorizes the scheme's default port, not arbitrary
+/// services on that host. Explicit :443 also matches implicit HTTPS port 443.
+fn realm_host_allowed(realm: &str, allowed_hosts: &[String], allow_http: bool) -> bool {
+    let Ok(url) = reqwest::Url::parse(realm) else {
+        return false;
+    };
+    if !(url.scheme() == "https" || (allow_http && url.scheme() == "http"))
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    allowed_hosts.iter().any(|pattern| {
+        if pattern == "*" {
+            return true;
+        }
+        let (pattern_host, pattern_port) = match pattern.rsplit_once(':') {
+            Some((host, port)) => (host, port.parse::<u16>().ok()),
+            None => (
+                pattern.as_str(),
+                Some(if url.scheme() == "https" { 443 } else { 80 }),
+            ),
+        };
+        pattern_port == url.port_or_known_default()
+            && host_matches_allowed_pattern(host, pattern_host)
+    })
+}
+
+/// Raw Basic credentials are used ONLY here, never passed to OCI. In
+/// oci-client 0.17, _auth returns immediately for RegistryAuth::Bearer. Later
+/// requests therefore cannot replay our password to a changed /v2/ challenge.
+/// This is not an advisory preflight. Token redirects are disabled, including
+/// same-host redirects that could change ports or downgrade HTTPS. Both
+/// requests still traverse the SSRF-guarded egress proxy.
+async fn exchange_registry_basic_auth(
     proxy_url: Option<&str>,
     registry_base: &str,
+    repository: &str,
+    auth: Auth,
     allowed_hosts: &[String],
-) -> bool {
-    let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10));
-    if let Some(proxy) = proxy_url
-        && let Ok(proxy) = reqwest::Proxy::all(proxy)
-    {
-        builder = builder.proxy(proxy);
-    }
-    let Ok(client) = builder.build() else {
-        return false;
+    allow_http: bool,
+) -> Result<Auth, CosignError> {
+    let Auth::Basic(username, password) = auth else {
+        return Ok(auth);
     };
-    let probe_url = format!("{}/v2/", registry_base.trim_end_matches('/'));
-    let Ok(response) = client.get(&probe_url).send().await else {
-        tracing::warn!(
-            probe_url = %probe_url,
-            "registry token-realm probe failed; platform credentials fail closed to anonymous"
-        );
-        return false;
-    };
-    if response.status().as_u16() != 401 {
-        // No bearer challenge in play: the client dials only the (already
-        // allowlist-gated) registry host.
-        return true;
+    let mut builder = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy();
+    if let Some(proxy) = proxy_url {
+        builder = builder.proxy(reqwest::Proxy::all(proxy)?);
     }
-    let Some(challenge) = response
+    let client = builder.build()?;
+    let response = client
+        .get(format!("{}/v2/", registry_base.trim_end_matches('/')))
+        .send()
+        .await?;
+    let challenge = response
         .headers()
         .get(reqwest::header::WWW_AUTHENTICATE)
         .and_then(|value| value.to_str().ok())
-    else {
-        return true;
-    };
-    if !challenge
-        .trim_start()
-        .to_ascii_lowercase()
-        .starts_with("bearer")
-    {
-        // Non-bearer challenge: no token-realm redirection.
-        return true;
+        .unwrap_or("");
+    let realm = bearer_challenge_realm(challenge).ok_or_else(|| {
+        CosignError::VerificationFailed(
+            "credentialed registry requires a Bearer challenge; unsafe OCI Basic fallback is disabled".into(),
+        )
+    })?;
+    if !realm_host_allowed(&realm, allowed_hosts, allow_http) {
+        return Err(CosignError::VerificationFailed(
+            "registry token realm rejected by credential host/port/HTTPS policy".into(),
+        ));
     }
-    let Some(realm) = bearer_challenge_realm(challenge) else {
-        tracing::warn!(
-            %challenge,
-            env = COSIGN_REGISTRY_ALLOWED_HOSTS_ENV,
-            "registry bearer challenge has no parseable realm; platform credentials fail \
-             closed to anonymous"
-        );
-        return false;
-    };
-    let allowed = realm_host_allowed(&realm, allowed_hosts);
-    if !allowed {
-        tracing::warn!(
-            %realm,
-            env = COSIGN_REGISTRY_ALLOWED_HOSTS_ENV,
-            "registry bearer-token realm host is not allowlisted; platform credentials are \
-             not attached — add the realm host (e.g. auth.docker.io for docker.io) to the \
-             allowlist to use credentials with this registry"
-        );
+    let scope = format!("repository:{repository}:pull");
+    let mut request = client.get(&realm).query(&[("scope", scope)]);
+    if let Some(service) = bearer_challenge_parameter(challenge, "service") {
+        request = request.query(&[("service", service)]);
     }
-    allowed
+    let response = request.basic_auth(username, Some(password)).send().await?;
+    if !response.status().is_success() {
+        // Server bodies might echo secrets: report status only.
+        return Err(CosignError::VerificationFailed(format!(
+            "registry token exchange failed with status {}",
+            response.status()
+        )));
+    }
+    let bytes = crate::clients::read_body_capped(response, 65_536)
+        .await
+        .map_err(|_| CosignError::VerificationFailed("invalid registry token response".into()))?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|_| CosignError::VerificationFailed("invalid registry token JSON".into()))?;
+    let token = value
+        .get("token")
+        .or_else(|| value.get("access_token"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| {
+            CosignError::VerificationFailed("registry token response has no token".into())
+        })?;
+    Ok(Auth::Bearer(token.to_string()))
 }
 
-/// [`registry_auth_from_env`] plus the round-3 token-realm policy: the host
-/// allowlist gates the registry, this gates the registry-supplied bearer
-/// realm. Returns `Auth::Anonymous` when either policy refuses.
+fn registry_realm_allowed_hosts(
+    registry: &str,
+    mut allowed_hosts: Vec<String>,
+    legacy_ghcr_token_configured: bool,
+) -> Vec<String> {
+    // Legacy GHCR credentials are independently scoped to ghcr.io, including
+    // GHCR's same-host token service; they do not require the COSIGN_* list.
+    if registry == "ghcr.io" && legacy_ghcr_token_configured {
+        allowed_hosts.push("ghcr.io".into());
+    }
+    allowed_hosts
+}
+
 async fn registry_auth_from_env_with_realm_policy(
     proxy_url: Option<&str>,
     registry_base: &str,
-    registry: &str,
-) -> Auth {
-    let mut auth = registry_auth_from_env(registry);
-    if !matches!(auth, Auth::Anonymous)
-        && !registry_token_realm_allowed(
-            proxy_url,
-            registry_base,
-            &cosign_registry_allowed_hosts_from_env(),
-        )
-        .await
-    {
-        auth = Auth::Anonymous;
-    }
-    auth
+    image: &OciReference,
+) -> Result<Auth, CosignError> {
+    let auth = registry_auth_from_env(image.resolve_registry());
+    let allowed_hosts = registry_realm_allowed_hosts(
+        image.resolve_registry(),
+        cosign_registry_allowed_hosts_from_env(),
+        env_nonempty("GHCR_TOKEN").is_some(),
+    );
+    exchange_registry_basic_auth(
+        proxy_url,
+        registry_base,
+        image.repository(),
+        auth,
+        &allowed_hosts,
+        env_flag("COSIGN_ALLOW_HTTP_REGISTRY"),
+    )
+    .await
+}
+
+/// The OCI parser calls Hub index.docker.io, while the guarded public
+/// distribution endpoint is registry-1.docker.io. Use the same mapping for
+/// prechecks and token discovery regardless of the user's Hub spelling.
+fn cosign_registry_base_url(registry: &str) -> Result<String, CosignError> {
+    let registry = if registry == "index.docker.io" {
+        "docker.io"
+    } else {
+        registry
+    };
+    let base = registry_base_url(registry)
+        .map_err(|e| CosignError::VerificationFailed(format!("unsupported registry: {e}")))?;
+    Ok(if env_flag("COSIGN_ALLOW_HTTP_REGISTRY") {
+        base.replacen("https://", "http://", 1)
+    } else {
+        base
+    })
 }
 
 /// Entry grammar for `COSIGN_REGISTRY_ALLOWED_HOSTS`: exactly `*`,
@@ -683,8 +725,7 @@ pub async fn verify_image(
     // checked against the allowlist, the literal-IP blocklist, and DNS
     // before any network I/O (including the dev TUF fallback below).
     let (registry, _) = parse_image_parts(image_ref)?;
-    let base_url = registry_base_url(&registry)
-        .map_err(|e| CosignError::VerificationFailed(format!("unsupported registry: {e}")))?;
+    let base_url = cosign_registry_base_url(&registry)?;
     let registry_url = reqwest::Url::parse(&base_url)
         .map_err(|e| CosignError::VerificationFailed(format!("invalid registry URL: {e}")))?;
     egress
@@ -740,9 +781,9 @@ pub async fn verify_image(
     let auth = registry_auth_from_env_with_realm_policy(
         Some(realm_policy_proxy.as_str()),
         &base_url,
-        image.resolve_registry(),
+        &image,
     )
-    .await;
+    .await?;
     let (_, source_image_digest) = cosign_client
         .triangulate(&image, &auth)
         .await
@@ -935,8 +976,7 @@ pub async fn fetch_portable_verification_material(
         .map_err(|e| CosignError::VerificationFailed(format!("invalid image reference: {e}")))?;
     let registry = image.resolve_registry().to_string();
     let repository = image.repository().to_string();
-    let base_url = registry_base_url(&registry)
-        .map_err(|e| CosignError::VerificationFailed(format!("unsupported registry: {e}")))?;
+    let base_url = cosign_registry_base_url(&registry)?;
     let registry_url = reqwest::Url::parse(&base_url)
         .map_err(|e| CosignError::VerificationFailed(format!("invalid registry URL: {e}")))?;
     egress
@@ -945,8 +985,8 @@ pub async fn fetch_portable_verification_material(
         .map_err(|e| {
             CosignError::VerificationFailed(format!("registry destination rejected: {e}"))
         })?;
-    // Auth is computed after the egress proxy URL is known: the round-3
-    // token-realm policy probes the registry through the same proxy.
+    // Resolve credentials only after the egress proxy URL is known: the
+    // guarded Basic-to-Bearer exchange uses that proxy too.
     let mut config = ClientConfig::default();
     if env_flag("COSIGN_ALLOW_HTTP_REGISTRY") {
         config.protocol = oci_client::client::ClientProtocol::Http;
@@ -961,13 +1001,14 @@ pub async fn fetch_portable_verification_material(
     let realm_policy_proxy = proxy_url.clone();
     config.https_proxy = Some(proxy_url.clone());
     config.http_proxy = Some(proxy_url);
-    let client = Client::new(config);
+    let client = Client::try_from(config)
+        .map_err(|e| CosignError::VerificationFailed(format!("OCI client setup failed: {e}")))?;
     let auth: RegistryAuth = (&registry_auth_from_env_with_realm_policy(
         Some(realm_policy_proxy.as_str()),
         &base_url,
-        &registry,
+        &image,
     )
-    .await)
+    .await?)
         .into();
     let source = oci_client::Reference::with_digest(
         registry.clone(),
@@ -2120,86 +2161,351 @@ mod tests {
     }
 
     #[test]
-    fn realm_host_allowed_uses_the_registry_allowlist_grammar() {
-        let allowed = vec!["ghcr.io".to_string(), "*.corp.example".to_string()];
-        assert!(realm_host_allowed("https://ghcr.io/token", &allowed));
-        assert!(realm_host_allowed(
-            "https://auth.corp.example/token",
-            &allowed
-        ));
-        assert!(!realm_host_allowed(
-            "https://auth.ghcr.io.evil.com/token",
-            &allowed
-        ));
-        assert!(!realm_host_allowed("https://evil.example/token", &allowed));
-        assert!(!realm_host_allowed("not a url", &allowed));
+    fn legacy_ghcr_realms_work_without_cosign_allowlist() {
+        let allowed = registry_realm_allowed_hosts("ghcr.io", vec![], true);
+        assert!(realm_host_allowed("https://ghcr.io/token", &allowed, false));
+        for realm in [
+            "https://evil.example/token",
+            "https://ghcr.io:8443/token",
+            "http://ghcr.io/token",
+        ] {
+            assert!(!realm_host_allowed(realm, &allowed, false));
+        }
+        assert!(registry_realm_allowed_hosts("evil.example", vec![], true).is_empty());
+        assert!(registry_realm_allowed_hosts("ghcr.io", vec![], false).is_empty());
     }
 
-    /// The probe itself: a registry answering 401 with a bearer challenge
-    /// whose realm host is NOT allowlisted must fail the policy; an
-    /// allowlisted realm or a challenge-free 200 passes it.
-    #[tokio::test]
-    async fn registry_token_realm_probe_blocks_unlisted_realm_hosts() {
-        use std::sync::Arc;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        async fn spawn_status(status_line: &str, extra_headers: &str) -> String {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-                .await
-                .expect("loopback bind");
-            let addr = listener.local_addr().expect("loopback address");
-            let response = format!(
-                "{status_line}\r\n{extra_headers}Content-Length: 0\r\nConnection: close\r\n\r\n"
-            );
-            let response = Arc::new(response);
-            tokio::spawn(async move {
-                let (mut stream, _) = listener.accept().await.expect("accept");
-                let mut chunk = [0u8; 1024];
-                let mut head = Vec::new();
-                loop {
-                    let read = stream.read(&mut chunk).await.expect("read head");
-                    if read == 0 {
-                        return;
-                    }
-                    head.extend_from_slice(&chunk[..read]);
-                    if head.windows(4).any(|w| w == b"\r\n\r\n") {
-                        break;
-                    }
-                }
-                stream
-                    .write_all(response.as_bytes())
-                    .await
-                    .expect("write response");
-            });
-            format!("http://{addr}")
+    #[test]
+    fn registry_default_https_ports_match_allowlist() {
+        let creds = CosignRegistryCredentials::basic("test-user", "test-password");
+        for (registry, pattern) in [
+            ("reg.example", "reg.example:443"),
+            ("reg.example:443", "reg.example"),
+            ("docker.io:443", "index.docker.io"),
+        ] {
+            assert!(matches!(
+                registry_auth_with_allowlist(registry, Some(&creds), &[pattern.into()]),
+                Auth::Basic(..)
+            ));
         }
+        assert!(matches!(
+            registry_auth_with_allowlist("reg.example:8443", Some(&creds), &["reg.example".into()]),
+            Auth::Anonymous
+        ));
+    }
 
-        let allowed = vec!["127.0.0.1".to_string()];
+    #[test]
+    fn realm_policy_preserves_ports_and_requires_https() {
+        for (realm, pattern, http, expected) in [
+            ("https://auth.example/token", "auth.example", false, true),
+            (
+                "https://auth.example:443/token",
+                "auth.example",
+                false,
+                true,
+            ),
+            (
+                "https://auth.example/token",
+                "auth.example:443",
+                false,
+                true,
+            ),
+            (
+                "https://auth.example:8443/token",
+                "auth.example",
+                false,
+                false,
+            ),
+            (
+                "https://auth.example:8443/token",
+                "auth.example:8443",
+                false,
+                true,
+            ),
+            (
+                "https://auth.example:8443/token",
+                "*.example:8443",
+                false,
+                true,
+            ),
+            (
+                "https://auth.example:8443/token",
+                "*.example:443",
+                false,
+                false,
+            ),
+            ("http://auth.example/token", "auth.example", false, false),
+            ("http://auth.example/token", "*", false, false),
+            ("http://auth.example/token", "auth.example", true, true),
+            (
+                "http://auth.example:8080/token",
+                "auth.example",
+                true,
+                false,
+            ),
+            (
+                "http://auth.example:8080/token",
+                "auth.example:8080",
+                true,
+                true,
+            ),
+            (
+                "https://auth.example.evil/token",
+                "auth.example",
+                false,
+                false,
+            ),
+            (
+                "https://user@auth.example/token",
+                "auth.example",
+                false,
+                false,
+            ),
+            ("ftp://auth.example/token", "*", true, false),
+            ("not a URL", "*", true, false),
+        ] {
+            assert_eq!(
+                realm_host_allowed(realm, &[pattern.into()], http),
+                expected,
+                "realm={realm}, pattern={pattern}, http={http}"
+            );
+        }
+    }
 
-        // Hostile registry: bearer challenge routing credentials to an
-        // unlisted realm host — credentials must not be attached.
-        let base = spawn_status(
-            "HTTP/1.1 401 Unauthorized",
-            "WWW-Authenticate: Bearer realm=\"https://evil.example/token\"\r\n",
-        )
+    async fn auth_test_server(router: axum::Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        (base, task)
+    }
+
+    #[tokio::test]
+    async fn actual_oci_requests_never_replay_basic_to_changed_challenges() {
+        use axum::{
+            Router,
+            http::{HeaderMap, StatusCode},
+            routing::get,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let evil_hits = Arc::new(AtomicUsize::new(0));
+        let hits = evil_hits.clone();
+        let (evil, evil_task) = auth_test_server(Router::new().fallback(move || {
+            hits.fetch_add(1, Ordering::SeqCst);
+            async { "stolen" }
+        }))
         .await;
+        let registry_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let registry = registry_listener.local_addr().unwrap().to_string();
+        let base = format!("http://{registry}");
+        let v2_hits = Arc::new(AtomicUsize::new(0));
+        let count = v2_hits.clone();
+        let token_hits = Arc::new(AtomicUsize::new(0));
+        let tokens = token_hits.clone();
+        let safe_realm = format!("{base}/token");
+        let bad_challenge = format!("Bearer realm=\"{evil}/token\"");
+        let later = bad_challenge.clone();
+        let router = Router::new()
+            .route(
+                "/v2/",
+                get(move |headers: HeaderMap| {
+                    assert!(!headers.contains_key("authorization"));
+                    let realm = if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                        format!("Bearer realm=\"{safe_realm}\",service=\"test\"")
+                    } else {
+                        bad_challenge.clone()
+                    };
+                    async move { (StatusCode::UNAUTHORIZED, [("www-authenticate", realm)]) }
+                }),
+            )
+            .route(
+                "/token",
+                get(move |headers: HeaderMap, uri: axum::http::Uri| {
+                    tokens.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(
+                        headers["authorization"],
+                        format!("Basic {}", B64.encode("test-user:test-password"))
+                    );
+                    assert!(
+                        uri.query()
+                            .unwrap()
+                            .contains("scope=repository%3Ateam%2Fapp%3Apull")
+                    );
+                    assert!(uri.query().unwrap().contains("service=test"));
+                    async { r#"{"token":"short-lived-test-token"}"# }
+                }),
+            )
+            .fallback(move |headers: HeaderMap| {
+                assert_eq!(headers["authorization"], "Bearer short-lived-test-token");
+                let challenge = later.clone();
+                async move { (StatusCode::UNAUTHORIZED, [("www-authenticate", challenge)]) }
+            });
+        let registry_task = tokio::spawn(async move {
+            axum::serve(registry_listener, router).await.unwrap();
+        });
+        let auth = exchange_registry_basic_auth(
+            None,
+            &base,
+            "team/app",
+            Auth::Basic("test-user".into(), "test-password".into()),
+            std::slice::from_ref(&registry),
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(&auth, Auth::Bearer(token) if token == "short-lived-test-token"));
+        let client = oci_client::client::Client::try_from(oci_client::client::ClientConfig {
+            protocol: oci_client::client::ClientProtocol::Http,
+            ..Default::default()
+        })
+        .unwrap();
+        let image = oci_client::Reference::with_tag(registry, "team/app".into(), "latest".into());
+        let auth = (&auth).into();
+        // Exercise both explicit auth and real manifest/blob/referrers paths.
+        client
+            .auth(&image, &auth, oci_client::RegistryOperation::Pull)
+            .await
+            .unwrap();
         assert!(
-            !registry_token_realm_allowed(None, &base, &allowed).await,
-            "an unlisted realm host must fail the credential policy"
+            client
+                .pull_manifest_raw(
+                    &image,
+                    &auth,
+                    &["application/vnd.oci.image.manifest.v1+json"]
+                )
+                .await
+                .is_err()
         );
+        assert!(client.pull_referrers(&image, None).await.is_err());
+        let layer = oci_client::manifest::OciDescriptor {
+            digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .into(),
+            media_type: "application/octet-stream".into(),
+            size: 1,
+            urls: None,
+            annotations: None,
+            artifact_type: None,
+        };
+        assert!(client.pull_blob_stream(&image, &layer).await.is_err());
+        assert_eq!(
+            v2_hits.load(Ordering::SeqCst),
+            1,
+            "OCI must never discover a second realm"
+        );
+        assert_eq!(token_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(evil_hits.load(Ordering::SeqCst), 0);
+        registry_task.abort();
+        evil_task.abort();
+    }
 
-        // Legitimate registry: the challenge realm's host IS allowlisted.
-        let base = spawn_status(
-            "HTTP/1.1 401 Unauthorized",
-            "WWW-Authenticate: Bearer realm=\"http://127.0.0.1:1/token\"\r\n",
-        )
-        .await;
-        assert!(registry_token_realm_allowed(None, &base, &allowed).await);
+    #[tokio::test]
+    async fn challenge_free_or_basic_only_registry_never_releases_basic_to_oci() {
+        use axum::{Router, http::StatusCode, routing::get};
+        for challenge in [None, Some("Basic realm=\"registry\"")] {
+            let router = Router::new().route(
+                "/v2/",
+                get(move || async move {
+                    match challenge {
+                        Some(value) => (StatusCode::UNAUTHORIZED, [("www-authenticate", value)]),
+                        None => (StatusCode::OK, [("www-authenticate", "")]),
+                    }
+                }),
+            );
+            let (base, task) = auth_test_server(router).await;
+            let err = exchange_registry_basic_auth(
+                None,
+                &base,
+                "team/app",
+                Auth::Basic("test-user".into(), "test-password".into()),
+                &["*".into()],
+                true,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("unsafe OCI Basic fallback is disabled")
+            );
+            task.abort();
+        }
+    }
 
-        // No bearer challenge in play: the registry host policy alone
-        // governs (the probe grants nothing by itself).
-        let base = spawn_status("HTTP/1.1 200 OK", "").await;
-        assert!(registry_token_realm_allowed(None, &base, &[]).await);
+    #[tokio::test]
+    async fn token_exchange_blocks_unlisted_ports_http_and_redirects() {
+        use axum::{Router, http::StatusCode, routing::get};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let realm = format!("http://{addr}/token");
+        let challenge = format!("Bearer realm=\"{realm}\"");
+        let router = Router::new()
+            .route(
+                "/v2/",
+                get(move || {
+                    let challenge = challenge.clone();
+                    async move { (StatusCode::UNAUTHORIZED, [("www-authenticate", challenge)]) }
+                }),
+            )
+            .route(
+                "/token",
+                get(|| async {
+                    (
+                        StatusCode::TEMPORARY_REDIRECT,
+                        [("location", "/must-not-receive-auth")],
+                    )
+                }),
+            )
+            .route(
+                "/must-not-receive-auth",
+                get(|| async {
+                    panic!("token redirects must not be followed");
+                    #[allow(unreachable_code)]
+                    ""
+                }),
+            );
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        for (allowed, http, error) in [
+            (vec![addr.to_string()], false, "realm rejected"),
+            (vec!["127.0.0.1".into()], true, "realm rejected"),
+            (vec![addr.to_string()], true, "status 307"),
+        ] {
+            let err = exchange_registry_basic_auth(
+                None,
+                &format!("http://{addr}"),
+                "team/app",
+                Auth::Basic("test-user".into(), "test-password".into()),
+                &allowed,
+                http,
+            )
+            .await
+            .unwrap_err();
+            assert!(err.to_string().contains(error), "{err}");
+        }
+        task.abort();
+    }
+
+    #[test]
+    fn portable_hub_precheck_uses_the_distribution_endpoint() {
+        for registry in ["docker.io", "index.docker.io", "registry-1.docker.io"] {
+            assert_eq!(
+                cosign_registry_base_url(registry).unwrap(),
+                "https://registry-1.docker.io"
+            );
+        }
+        for reference in [
+            "nginx:latest",
+            "docker.io/library/nginx:latest",
+            "index.docker.io/library/nginx:latest",
+        ] {
+            let image: OciReference = reference.parse().unwrap();
+            let base = cosign_registry_base_url(image.resolve_registry()).unwrap();
+            assert_eq!(
+                reqwest::Url::parse(&base).unwrap().host_str(),
+                Some("registry-1.docker.io")
+            );
+        }
     }
 
     /// Regression test for issue #125: a malicious registry must not be able
