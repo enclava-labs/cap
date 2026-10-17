@@ -7036,16 +7036,17 @@ pub(crate) mod tests {
             outcome,
             crate::deployment_failure_cleanup::CleanupFenceOutcome::RetainNamespaceFence
         );
-        let incomplete: bool =
-            sqlx::query_scalar("SELECT cleanup_sweep_incomplete FROM deployments WHERE id = $1")
-                .bind(deployment_id)
-                .fetch_one(&pool)
-                .await
-                .expect("read sweep-incomplete marker");
-        assert!(
-            incomplete,
-            "marker failure must mark the row for a later cleanup retry"
-        );
+        // The durable row-mark cannot land either (state.db is the closed
+        // pool) — the DB is down by construction. The provable durable
+        // effect is the retained namespace fence (reclaim_after = infinity),
+        // written through the lease's own healthy pool.
+        let retained_infinity: bool = sqlx::query_scalar(
+            "SELECT reclaim_after = 'infinity'::timestamptz FROM external_resource_mutation_leases WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1",
+        )
+        .bind(&app.namespace)
+        .fetch_one(&pool)
+        .await
+        .expect("read retained fence state");
         drop(mutation);
         sqlx::query("DELETE FROM external_resource_mutation_leases WHERE resource_key IN ('global', $1, $2, $3, $4)")
             .bind(&app.namespace).bind(&app.domain).bind(app.tee_domain.as_deref())
@@ -7055,6 +7056,10 @@ pub(crate) mod tests {
             .execute(&pool)
             .await
             .expect("remove fixture");
+        assert!(
+            retained_infinity,
+            "retention path must durably retain the namespace fence even when the marker write fails"
+        );
     }
 
     #[tokio::test]
