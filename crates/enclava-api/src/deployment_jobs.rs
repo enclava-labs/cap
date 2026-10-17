@@ -6943,6 +6943,120 @@ pub(crate) mod tests {
             .expect("delete legacy fixture");
     }
 
+    // Devin ANALYSIS (round 6): drive the REAL cleanup path with a failed
+    // provenance lookup instead of calling persist_creation_evidence_loss
+    // directly — these two cover both early-return branches.
+    #[tokio::test]
+    async fn evidence_loss_marker_lands_before_provenance_error_retention() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _, _) = insert_job_fixture(&pool).await;
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.side_effect_admission = Arc::new(tokio::sync::Semaphore::new(4));
+        let mut mutation = crate::mutation_leases::claim(
+            &state,
+            app.id,
+            "deployment_apply",
+            deployment_id,
+            false,
+            deployment_apply_resource_fences(&app),
+        )
+        .await
+        .expect("claim cleanup fences");
+        // Healthy pool: the marker write must land BEFORE classification,
+        // even though the provenance lookup arrives as a hard error.
+        let outcome = crate::deployment_failure_cleanup::cleanup_after_terminal_apply_failure(
+            &state,
+            &app,
+            deployment_id,
+            &mut mutation,
+            true,
+            Err(sqlx::Error::PoolClosed),
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            crate::deployment_failure_cleanup::CleanupFenceOutcome::RetainNamespaceFence
+        );
+        let marked: bool =
+            sqlx::query_scalar("SELECT creation_evidence_lost FROM apps WHERE id = $1")
+                .bind(app.id)
+                .fetch_one(&pool)
+                .await
+                .expect("read evidence-loss marker");
+        assert!(
+            marked,
+            "evidence-loss marker must persist before provenance classification"
+        );
+        drop(mutation);
+        sqlx::query("DELETE FROM external_resource_mutation_leases WHERE resource_key IN ('global', $1, $2, $3, $4)")
+            .bind(&app.namespace).bind(&app.domain).bind(app.tee_domain.as_deref())
+            .bind(app.custom_domain.as_deref()).execute(&pool).await.expect("remove retained fences");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("remove fixture");
+    }
+
+    // Devin BUG 2 (round 6): marker write fails AND provenance errors — the
+    // retention path must still run (lease pool), never a plain release.
+    #[tokio::test]
+    async fn evidence_loss_marker_failure_still_retains_fence_on_provenance_error() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _, _) = insert_job_fixture(&pool).await;
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.side_effect_admission = Arc::new(tokio::sync::Semaphore::new(4));
+        let mut mutation = crate::mutation_leases::claim(
+            &state,
+            app.id,
+            "deployment_apply",
+            deployment_id,
+            false,
+            deployment_apply_resource_fences(&app),
+        )
+        .await
+        .expect("claim cleanup fences");
+        // Closed pool: BOTH the marker write and any state.db read fail; the
+        // lease keeps its own healthy pool for the retained-fence write.
+        let unavailable = PgPool::connect_lazy("postgresql://unused.invalid/test").unwrap();
+        unavailable.close().await;
+        state.db = unavailable;
+        let outcome = crate::deployment_failure_cleanup::cleanup_after_terminal_apply_failure(
+            &state,
+            &app,
+            deployment_id,
+            &mut mutation,
+            true,
+            Err(sqlx::Error::PoolClosed),
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            crate::deployment_failure_cleanup::CleanupFenceOutcome::RetainNamespaceFence
+        );
+        let incomplete: bool =
+            sqlx::query_scalar("SELECT cleanup_sweep_incomplete FROM deployments WHERE id = $1")
+                .bind(deployment_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read sweep-incomplete marker");
+        assert!(
+            incomplete,
+            "marker failure must mark the row for a later cleanup retry"
+        );
+        drop(mutation);
+        sqlx::query("DELETE FROM external_resource_mutation_leases WHERE resource_key IN ('global', $1, $2, $3, $4)")
+            .bind(&app.namespace).bind(&app.domain).bind(app.tee_domain.as_deref())
+            .bind(app.custom_domain.as_deref()).execute(&pool).await.expect("remove retained fences");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("remove fixture");
+    }
+
     #[tokio::test]
     async fn incomplete_provenance_lookup_failure_retains_retryable_namespace_fence() {
         check_provenance_lookup_failure_retention(false).await;

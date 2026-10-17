@@ -1740,13 +1740,17 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
     // Devin BUG (round 5, on edf07e5f): both provenance-lookup early returns
     // below skipped persisting the creation-evidence-loss marker, so a later
     // sweep could clear cleanup evidence over an unmarked CAP-created object
-    // whose annotation a webhook stripped. Record it FIRST — its own failure
-    // handling below retains retryable evidence.
+    // whose annotation a webhook stripped. Attempt it FIRST. A failed write
+    // does NOT return immediately (Devin BUG 2, round 6): when provenance is
+    // also unknown the retention paths below must still run — the marker
+    // only gates provider deletion, never fence retention.
+    let mut evidence_marker_durable = true;
     if evidence_loss_unresolved && !persist_creation_evidence_loss(&state.db, app.id).await {
+        evidence_marker_durable = false;
         tracing::error!(
             app_id = %app.id,
             deployment_id = %failed_deployment_id,
-            "creation-evidence-loss marker could not be persisted before provenance classification; retaining cleanup for a later retry"
+            "creation-evidence-loss marker could not be persisted before provenance classification; skipping the compensating sweep for a later retry"
         );
         let _ = sqlx::query(
             "UPDATE deployments
@@ -1757,7 +1761,6 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
         .bind(app.id)
         .execute(&state.db)
         .await;
-        return CleanupFenceOutcome::ReleaseNormally;
     }
     let namespace_generation_provenance = match namespace_generation_provenance {
         Ok(provenance) => provenance,
@@ -1811,38 +1814,15 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
             };
         }
     };
-    // Durably record the evidence loss BEFORE any later step: even if this
-    // process dies mid-cleanup, a later sweep of any failed generation of
-    // this app must still see the marker and count unmarked live targets as
-    // unresolved instead of clearing cleanup evidence over them.
-    if evidence_loss_unresolved && !persist_creation_evidence_loss(&state.db, app.id).await {
-        // The durable marker is the only signal a LATER generation's sweep
-        // will have; without it this failure's knowledge dies with this
-        // call. Failing to persist is a database outage: skip the sweep
-        // entirely (nothing is cleared) and mark the row incomplete so a
-        // later cleanup retries from the top.
-        tracing::error!(
-            app_id = %app.id,
-            deployment_id = %failed_deployment_id,
-            "creation-evidence-loss marker could not be persisted; skipping the compensating sweep for a later retry"
-        );
-        if let Err(mark_error) = sqlx::query(
-            "UPDATE deployments
-             SET cleanup_sweep_incomplete = true
-             WHERE id = $1 AND app_id = $2 AND status = 'failed'",
-        )
-        .bind(failed_deployment_id)
-        .bind(app.id)
-        .execute(&state.db)
-        .await
-        {
-            tracing::warn!(
-                app_id = %app.id,
-                deployment_id = %failed_deployment_id,
-                error = %mark_error,
-                "failed-apply cleanup could not mark the row's sweep incomplete"
-            );
-        }
+    // Devin BUG 1 (round 6, on b4a119fb): the early attempt is the SOLE
+    // persistence gate — this used to re-run the write and treat a transient
+    // failure of the duplicate as a reason to abandon cleanup even though
+    // the marker was already durable. Reaching here means every
+    // provenance-unknown retention path above has already had its chance;
+    // with classification successful but the marker undurable, no provider
+    // deletion or sweep may run (the row is already marked incomplete, so a
+    // later cleanup retries from the top).
+    if !evidence_marker_durable {
         return CleanupFenceOutcome::ReleaseNormally;
     }
     // Row-level gate: no other generation of this app may carry ANY
@@ -2630,7 +2610,17 @@ pub(crate) fn classify_initial_namespace_get(
                 generations
                     .iter()
                     .any(|generation| live == generation.get())
-                    || (provenance_incomplete && known_max.is_none_or(|max| live < max))
+                    || (provenance_incomplete
+                        // Codex P1 (round 6): `0`/negative annotations are
+                        // corrupt last-writer evidence, not pre-ledger
+                        // stamps — MutationGeneration admits only positive
+                        // values, so an invalid live generation must never
+                        // satisfy the incomplete-provenance fallback (it
+                        // could authorize deleting the whole namespace while
+                        // the CAP-attributed creation marker survives).
+                        && enclava_engine::apply::generation::MutationGeneration::new(live)
+                            .is_ok()
+                        && known_max.is_none_or(|max| live < max))
             }) {
                 // Last-writer proof alone is not creation proof: only the
                 // creation annotation (stamped by `apply_namespace`'s
