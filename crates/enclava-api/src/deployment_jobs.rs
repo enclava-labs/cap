@@ -8446,7 +8446,10 @@ pub(crate) mod tests {
         .fetch_one(&pool)
         .await
         .expect("load dispatcher attempts");
-        assert_eq!(attempts, 1, "request must not claim or duplicate DNS setup");
+        assert_eq!(
+            attempts, 0,
+            "accepted setup resets attempts; request must not reclaim it"
+        );
 
         sqlx::query("DELETE FROM organizations WHERE id = $1")
             .bind(app.org_id)
