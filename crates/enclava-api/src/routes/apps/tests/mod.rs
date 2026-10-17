@@ -704,16 +704,61 @@ fn app_delete_source_never_reads_or_formats_external_diagnostics() {
     );
     assert!(
         deletion
-            .find("request_workload_teardown")
+            .rfind("request_workload_teardown")
             .expect("app deletion requests workload teardown")
             < deletion
-                .find("enqueue_signed_policy_revocation_if_active")
+                .rfind("enqueue_signed_policy_revocation_if_active")
                 .expect("app deletion enqueues signed-policy revocation"),
         "app deletion must preserve KBS authorization until workload teardown completes"
     );
     assert!(
+        deletion.contains("enqueue_signed_policy_revocation_if_active(&mut phase_tx)"),
+        "the deleting transition and teardown publication intent must commit atomically"
+    );
+    assert!(
+        source.contains("enqueue_signed_policy_revocation_if_active(&mut tx)"),
+        "the successful teardown marker must enqueue its revocation in the same transaction"
+    );
+    assert!(
+        deletion.contains("enqueue_signed_policy_revocation_if_active(&mut abandon_tx)"),
+        "the abandoned teardown marker must enqueue its revocation in the same transaction"
+    );
+    assert!(
+        !deletion.contains("enqueue_signed_policy_revocation_if_active(&mut publish_tx)"),
+        "a post-phase publication transaction leaves an unrecoverable crash window"
+    );
+    assert!(
         deletion.contains("enqueue_signed_policy_revocation_if_active(&mut delete_lane)"),
         "the delete-tail revocation enqueue must ride the delete transaction — a post-commit enqueue can be lost to a transient transaction failure, and the periodic reconciler only advances committed generations"
+    );
+    let restore = deletion
+        .split("if restored {")
+        .nth(1)
+        .expect("teardown failure has a restore branch")
+        .split("// Merely dropping the lease")
+        .next()
+        .expect("restore branch ends before lease release");
+    assert!(
+        restore.contains("enqueue_signed_policy_revocation_if_active(&mut delete_lane)"),
+        "restoring the app must enqueue a fresh content-bound policy generation in the same transaction"
+    );
+    assert!(
+        deletion
+            .find("guard_provider(crate::kbs::reconcile_pending_signed_policy_artifacts")
+            .expect("app deletion publishes the admitted teardown unit before teardown")
+            < deletion
+                .find("guard_provider(request_workload_teardown")
+                .expect("app deletion requests workload teardown"),
+        "the admitted teardown unit must be converged into the live policy before the workload is asked to erase its owner seed"
+    );
+    assert!(
+        deletion
+            .find("guard_provider(crate::kbs::reconcile_pending_signed_policy_artifacts")
+            .expect("app deletion publishes the admitted teardown unit before teardown")
+            < deletion
+                .find("guard_provider(request_workload_teardown")
+                .expect("app deletion requests workload teardown"),
+        "the admitted teardown unit must be converged into the live policy before the workload is asked to erase its owner seed"
     );
     assert!(
         deletion
