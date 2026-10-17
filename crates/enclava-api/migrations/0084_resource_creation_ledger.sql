@@ -11,15 +11,15 @@
 -- observed by this control plane. This table records (kind, name, uid) per
 -- app for every object CAP's applies create; the failed-apply sweep and the
 -- namespace teardown require the live object's UID to match a row here (or
--- the object to predate the compiled-in CREATION_LEDGER_CUTOVER — bounded
--- one-time migration trust) before creation evidence authorizes deletion.
+-- an explicitly configured, audited legacy activation cutoff) before creation
+-- evidence authorizes deletion. See docs/creation-ledger-rollout.md.
 --
 -- Rows are append-only facts written by the apply path before it may
--- proceed; nothing ever updates or deletes them. app_id-scoped uniqueness:
+-- proceed; app deletion cascades their removal after teardown. App-scoped uniqueness:
 -- the same UID re-observed by a retry of the same app must not duplicate.
 CREATE TABLE resource_creation_ledger (
     id BIGSERIAL PRIMARY KEY,
-    app_id UUID NOT NULL,
+    app_id UUID NOT NULL REFERENCES apps(id) ON DELETE CASCADE,
     deployment_id UUID,
     kind TEXT NOT NULL,
     name TEXT NOT NULL,

@@ -422,6 +422,38 @@ impl AppMutationLease {
         Ok(())
     }
 
+    /// A compensation DELETE may already be in flight before terminal cleanup
+    /// can classify the namespace. Its durable marker takes precedence over
+    /// the ledger's (necessarily unproven) adopted classification.
+    pub(crate) async fn has_retained_namespace_fence(&self) -> Result<bool, MutationLeaseError> {
+        for resource in self
+            .resources
+            .iter()
+            .filter(|resource| resource.fence.scope == "kubernetes_namespace")
+        {
+            let retained: bool = sqlx::query_scalar(
+                "SELECT EXISTS (
+                    SELECT 1 FROM external_resource_mutation_leases
+                     WHERE resource_scope = $1 AND resource_key = $2
+                       AND owner_token = $3 AND generation = $4
+                       AND operation_kind = $5
+                       AND reclaim_after = 'infinity'::timestamptz
+                )",
+            )
+            .bind(&resource.fence.scope)
+            .bind(&resource.fence.key)
+            .bind(self.token)
+            .bind(resource.generation)
+            .bind(RETAINED_DEPLOYMENT_NAMESPACE_OPERATION)
+            .fetch_one(&self.pool)
+            .await?;
+            if retained {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Fail-closed fallback when the full retained-marker write could not be
     /// persisted (Codex P1): relabel the namespace fence rows so
     /// [`reconcile_orphaned_deployment_apply_leases`] — which joins on
@@ -2997,10 +3029,14 @@ mod tests {
     ) {
         use axum::http::StatusCode;
         use axum::response::IntoResponse;
-        let mode = Arc::new(std::sync::atomic::AtomicU8::new(MOCK_NS_OURS));
+        let mode = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let delete_count = Arc::clone(&mode);
         let app = axum::Router::new().fallback(move |request: axum::extract::Request| {
+            let delete_count = Arc::clone(&delete_count);
             async move {
-                let _ = request;
+                if request.method() == axum::http::Method::DELETE {
+                    delete_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
                 let annotations = std::collections::BTreeMap::from([
                     (
                         enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION
@@ -3263,6 +3299,169 @@ mod tests {
         .await
         .expect("expire retained provider deadlines");
         (org_id, app_id, owner_token, namespace)
+    }
+
+    #[tokio::test]
+    async fn unledgered_compensation_marker_survives_terminal_cleanup() {
+        let pool = database_test_pool(4).await;
+        let namespace = format!("unledgered-compensation-{}", Uuid::new_v4().simple());
+        let (org_id, app_id) = insert_app(&pool, &format!("{namespace}.example.test")).await;
+        sqlx::query("UPDATE apps SET namespace = $1 WHERE id = $2")
+            .bind(&namespace)
+            .bind(app_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let state = state_with_pool(pool.clone());
+        let mut owner = claim(
+            &state,
+            app_id,
+            "deployment_apply",
+            Uuid::new_v4(),
+            false,
+            vec![ResourceFence::new("kubernetes_namespace", &namespace)],
+        )
+        .await
+        .unwrap();
+        let owner_token = owner.token;
+        let generation = owner.resources[0].generation;
+        assert!(!owner.has_retained_namespace_fence().await.unwrap());
+        // Ledger persistence failed. The compensation path relabels before
+        // DELETE, so neither lost responses nor finalizers permit name reuse.
+        owner
+            .relabel_namespace_fence_fail_closed(
+                "kubernetes_namespace",
+                RETAINED_DEPLOYMENT_NAMESPACE_OPERATION,
+            )
+            .await
+            .unwrap();
+        assert!(owner.has_retained_namespace_fence().await.unwrap());
+        let app: crate::models::App = sqlx::query_as("SELECT * FROM apps WHERE id = $1")
+            .bind(app_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::deployment_failure_cleanup::cleanup_after_terminal_apply_failure(
+                &state,
+                &app,
+                Uuid::new_v4(),
+                &mut owner,
+                false
+            )
+            .await,
+            crate::deployment_failure_cleanup::CleanupFenceOutcome::RetainNamespaceFence,
+        );
+        let retained: (String, bool) = sqlx::query_as(
+            "SELECT operation_kind, reclaim_after = 'infinity'::timestamptz
+               FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1",
+        )
+        .bind(&namespace)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            retained,
+            (RETAINED_DEPLOYMENT_NAMESPACE_OPERATION.to_string(), true)
+        );
+        drop(owner);
+        sqlx::query("UPDATE app_mutation_leases SET locked_until = clock_timestamp() - interval '2 seconds', reclaim_after = clock_timestamp() - interval '1 second' WHERE app_id = $1")
+            .bind(app_id).execute(&pool).await.unwrap();
+        sqlx::query("UPDATE external_resource_mutation_leases SET locked_until = clock_timestamp() - interval '2 seconds' WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1")
+            .bind(&namespace).execute(&pool).await.unwrap();
+        reconcile_orphaned_deployment_apply_leases(&pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            claim(
+                &state,
+                app_id,
+                "deployment_apply",
+                Uuid::new_v4(),
+                false,
+                vec![ResourceFence::new("kubernetes_namespace", &namespace)]
+            )
+            .await,
+            Err(MutationLeaseError::Busy)
+        ));
+        fn observation_client(absent: bool) -> kube::Client {
+            kube::Client::new(
+                tower::service_fn(
+                    move |request: http::Request<kube::client::Body>| async move {
+                        assert_eq!(
+                            request.method(),
+                            http::Method::GET,
+                            "no unproven DELETE is authorized"
+                        );
+                        let name = request.uri().path().rsplit('/').next().unwrap();
+                        let (code, value) = if absent {
+                            (
+                                404,
+                                serde_json::json!({"apiVersion":"v1", "kind":"Status", "status":"Failure", "reason":"NotFound", "message":"absent", "code":404}),
+                            )
+                        } else {
+                            (
+                                200,
+                                serde_json::json!({"apiVersion":"v1", "kind":"Namespace", "metadata":{
+                                    "name":name, "uid":"unledgered-created-uid", "resourceVersion":"2",
+                                    "deletionTimestamp":"2026-10-17T00:00:00Z", "finalizers":["kubernetes"]
+                                }}),
+                            )
+                        };
+                        Ok::<_, std::io::Error>(
+                            http::Response::builder()
+                                .status(code)
+                                .body(axum::body::Body::from(serde_json::to_vec(&value).unwrap()))
+                                .unwrap(),
+                        )
+                    },
+                ),
+                "default",
+            )
+        }
+        let operation_id: Uuid = sqlx::query_scalar("SELECT operation_id FROM external_resource_mutation_leases WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1")
+            .bind(&namespace).fetch_one(&pool).await.unwrap();
+        // No ledger row exists: a still-Terminating namespace must remain
+        // fenced anyway. Only an observed 404 converges compensation.
+        let api = kube::Api::all(observation_client(false));
+        assert!(
+            !reconcile_one_retained_namespace(
+                &pool,
+                &api,
+                owner_token,
+                namespace.clone(),
+                operation_id,
+                generation,
+                tokio::time::Instant::now() + Duration::from_secs(5)
+            )
+            .await
+            .unwrap()
+        );
+        let api = kube::Api::all(observation_client(true));
+        assert!(
+            reconcile_one_retained_namespace(
+                &pool,
+                &api,
+                owner_token,
+                namespace.clone(),
+                operation_id,
+                generation,
+                tokio::time::Instant::now() + Duration::from_secs(5)
+            )
+            .await
+            .unwrap()
+        );
+        sqlx::query("DELETE FROM apps WHERE id = $1")
+            .bind(app_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -3655,7 +3854,7 @@ mod tests {
         );
         assert_eq!(
             forged_mode.load(std::sync::atomic::Ordering::SeqCst),
-            MOCK_NS_OURS,
+            0,
             "no DELETE was issued against the forged namespace"
         );
         forged_server.abort();

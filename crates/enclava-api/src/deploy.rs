@@ -309,9 +309,8 @@ fn generate_tenant_image_pull_secret(
 
 /// The engine's attached creation ledger, or a throwaway empty one for
 /// engines constructed without provenance recording (tests, non-apply
-/// paths). An empty ledger enforces only the cutover rule: post-cutover
-/// objects without a recorded row never gain deletion authority from a
-/// forged stamp.
+/// paths). The default empty ledger is strict: no unrecorded object gains
+/// deletion authority from a forged stamp or an implicit legacy cutoff.
 fn engine_ledger_or_empty(
     engine: &ApplyEngine,
 ) -> Arc<enclava_engine::apply::creation_ledger::CreationLedgerBuffer> {
@@ -333,6 +332,7 @@ async fn persist_and_gate_creation_records(
     app_id: Uuid,
     deployment_id: Uuid,
     namespace: &str,
+    mutation: &crate::mutation_leases::AppMutationLease,
 ) -> Result<(), DeployError> {
     let Some(ledger) = engine.creation_ledger() else {
         return Ok(());
@@ -356,7 +356,12 @@ async fn persist_and_gate_creation_records(
             error = %error,
             "cannot persist the creation ledger; compensating this step's created objects and failing the apply closed (cap#272)"
         );
-        compensate_unledgered_creations(engine, &pending).await;
+        // Restore before awaiting compensation, so cancellation cannot lose
+        // observations that were refused, failed, or only accepted for delete.
+        for record in &pending {
+            ledger.record(record.clone());
+        }
+        compensate_unledgered_creations(engine, &pending, mutation).await;
         return Err(DeployError::Db(error));
     }
     Ok(())
@@ -369,8 +374,37 @@ async fn persist_and_gate_creation_records(
 async fn compensate_unledgered_creations(
     engine: &ApplyEngine,
     records: &[enclava_engine::apply::creation_ledger::CreationRecord],
+    mutation: &crate::mutation_leases::AppMutationLease,
 ) {
     for record in records {
+        if record.kind == "Namespace" {
+            if mutation
+                .resource_generation(&crate::mutation_leases::ResourceFence::new(
+                    "kubernetes_namespace",
+                    &record.name,
+                ))
+                .is_none()
+            {
+                tracing::error!(name = %record.name,
+                    "no matching namespace fence; refusing compensation DELETE");
+                continue;
+            }
+            // DELETE acceptance is not absence. Persist the retained marker
+            // BEFORE sending it: cleanup cannot prove this unledgered UID's
+            // lineage and would otherwise classify it as adopted and release
+            // the name while Kubernetes is still terminating the namespace.
+            if let Err(error) = mutation
+                .relabel_namespace_fence_fail_closed(
+                    "kubernetes_namespace",
+                    crate::mutation_leases::RETAINED_DEPLOYMENT_NAMESPACE_OPERATION,
+                )
+                .await
+            {
+                tracing::error!(name = %record.name, error = %error,
+                    "cannot retain namespace fence; refusing compensation DELETE");
+                continue;
+            }
+        }
         let ar = crate::deployment_failure_cleanup::sweep_api_resource(&record.kind);
         let api: kube::Api<kube::api::DynamicObject> = match &record.namespace {
             Some(namespace) => kube::Api::namespaced_with(engine.client().clone(), namespace, &ar),
@@ -410,6 +444,20 @@ async fn compensate_unledgered_creations(
     }
 }
 
+/// Settle provenance even when a batched step fails after earlier creates.
+/// Preserve the provider error (including structured evidence loss) after the
+/// persistence/compensation future has run; gate errors fail successful steps.
+async fn complete_creation_step<T>(
+    result: Result<T, enclava_engine::apply::engine::ApplyError>,
+    gate: impl std::future::Future<Output = Result<(), DeployError>>,
+) -> Result<T, DeployError> {
+    let persistence = gate.await;
+    match result {
+        Err(error) => Err(error.into()),
+        Ok(value) => persistence.map(|()| value),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn apply_all_with_tenant_image_pull_secret(
     engine: &ApplyEngine,
@@ -420,6 +468,7 @@ async fn apply_all_with_tenant_image_pull_secret(
     manifest_hash: &str,
     image_pull_secret_config: Option<&TenantImagePullSecretConfig>,
     generation: MutationGeneration,
+    mutation: &crate::mutation_leases::AppMutationLease,
 ) -> Result<(), DeployError> {
     let ns_name = manifests
         .namespace
@@ -432,19 +481,34 @@ async fn apply_all_with_tenant_image_pull_secret(
             )
         })?;
 
-    apply_namespace(engine, &manifests.namespace, generation).await?;
+    let step = apply_namespace(engine, &manifests.namespace, generation).await;
     // cap#272: creations observed by a step MUST be durably recorded
     // before the apply proceeds — an object whose ledger row cannot be
-    // persisted is compensated (deleted) and the apply fails closed, so
-    // "created but unrecorded" can never leak into cleanup as a
-    // permanently unresolved sweep target.
-    persist_and_gate_creation_records(engine, pool, app_id, deployment_id, ns_name).await?;
+    // persisted is compensated where safe and the apply fails closed.
+    // Failed steps must pass the same gate: a batch may have created earlier
+    // objects before a later write failed.
+    complete_creation_step(
+        step,
+        persist_and_gate_creation_records(engine, pool, app_id, deployment_id, ns_name, mutation),
+    )
+    .await?;
     tracing::info!(namespace = %ns_name, "step 1/5: namespace ready");
 
     if let Some(config) = image_pull_secret_config {
         let secret = generate_tenant_image_pull_secret(ns_name, config);
-        apply_namespaced_resource(engine, ns_name, &secret, generation).await?;
-        persist_and_gate_creation_records(engine, pool, app_id, deployment_id, ns_name).await?;
+        let step = apply_namespaced_resource(engine, ns_name, &secret, generation).await;
+        complete_creation_step(
+            step,
+            persist_and_gate_creation_records(
+                engine,
+                pool,
+                app_id,
+                deployment_id,
+                ns_name,
+                mutation,
+            ),
+        )
+        .await?;
         tracing::info!(
             namespace = %ns_name,
             secret = %config.name,
@@ -452,15 +516,23 @@ async fn apply_all_with_tenant_image_pull_secret(
         );
     }
 
-    apply_standard_resources(engine, manifests, generation).await?;
-    persist_and_gate_creation_records(engine, pool, app_id, deployment_id, ns_name).await?;
+    let step = apply_standard_resources(engine, manifests, generation).await;
+    complete_creation_step(
+        step,
+        persist_and_gate_creation_records(engine, pool, app_id, deployment_id, ns_name, mutation),
+    )
+    .await?;
     tracing::info!(namespace = %ns_name, "step 2/5: standard resources applied");
 
-    apply_network_policy(engine, ns_name, &manifests.network_policy, generation).await?;
-    persist_and_gate_creation_records(engine, pool, app_id, deployment_id, ns_name).await?;
+    let step = apply_network_policy(engine, ns_name, &manifests.network_policy, generation).await;
+    complete_creation_step(
+        step,
+        persist_and_gate_creation_records(engine, pool, app_id, deployment_id, ns_name, mutation),
+    )
+    .await?;
     tracing::info!(namespace = %ns_name, "step 3/5: CiliumNetworkPolicy applied");
 
-    apply_gateway_resources(
+    let step = apply_gateway_resources(
         engine,
         ns_name,
         &manifests.envoy_proxy,
@@ -469,8 +541,12 @@ async fn apply_all_with_tenant_image_pull_secret(
         &manifests.tee_tls_route,
         generation,
     )
+    .await;
+    complete_creation_step(
+        step,
+        persist_and_gate_creation_records(engine, pool, app_id, deployment_id, ns_name, mutation),
+    )
     .await?;
-    persist_and_gate_creation_records(engine, pool, app_id, deployment_id, ns_name).await?;
     tracing::info!(namespace = %ns_name, "step 4/5: Gateway API resources applied");
 
     let mut sts = manifests.statefulset.clone();
@@ -515,8 +591,12 @@ async fn apply_all_with_tenant_image_pull_secret(
     .bind(deployment_id)
     .execute(pool)
     .await?;
-    let sts_live = apply_statefulset(engine, ns_name, &sts, generation).await?;
-    persist_and_gate_creation_records(engine, pool, app_id, deployment_id, ns_name).await?;
+    let step = apply_statefulset(engine, ns_name, &sts, generation).await;
+    let sts_live = complete_creation_step(
+        step,
+        persist_and_gate_creation_records(engine, pool, app_id, deployment_id, ns_name, mutation),
+    )
+    .await?;
     // Persist the server-reported UID and creationTimestamp of the
     // StatefulSet object this apply produced (the POST/SSA response — not
     // a pre-call stamp). This is the identity the claim sweep matches
@@ -533,7 +613,7 @@ async fn apply_all_with_tenant_image_pull_secret(
         // the sweep — the engine's ledger holds this apply's own create
         // records plus the app's preloaded durable rows, so a forged
         // stamp on a pre-existing set never becomes claim-deletion
-        // authority. Engines without a ledger keep the cutover-only rule.
+        // authority. Engines without a ledger use strict no-legacy trust.
         &engine_ledger_or_empty(engine),
     ) {
         if let (Some(uid), Some(created)) = (
@@ -1259,6 +1339,10 @@ pub(crate) async fn record_deployment_result_if_current(
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
+    mod creation_ledger_regressions {
+        use super::*;
+        include!("deploy_creation_ledger_tests.rs");
+    }
     use super::*;
     use chrono::TimeZone;
     use enclava_common::descriptor::{
@@ -2803,7 +2887,10 @@ pub async fn reapply_tenant_ingress(
 
     let cm = enclava_engine::manifest::ingress::generate_ingress_configmap(&app_spec);
 
-    let engine = ApplyEngine::try_default().await?;
+    let ledger = crate::deployment_failure_cleanup::load_creation_ledger(pool, app.id).await?;
+    let engine = ApplyEngine::try_default()
+        .await?
+        .with_creation_ledger(ledger);
     // Domain-only reapply: the pod restart re-opens existing volumes, so the
     // base rollout budget applies — the fresh-initialization allowance is
     // reserved for renders that provision a new claim.
@@ -2813,11 +2900,17 @@ pub async fn reapply_tenant_ingress(
     mutation
         .arm_resource_scope_until_reconciled("kubernetes_namespace")
         .await?;
-    enclava_engine::apply::resources::apply_namespaced_resource(
-        &engine,
-        &app_spec.namespace,
-        &cm,
-        generation,
+    let step = apply_namespaced_resource(&engine, &app_spec.namespace, &cm, generation).await;
+    complete_creation_step(
+        step,
+        persist_and_gate_creation_records(
+            &engine,
+            pool,
+            app.id,
+            deployment_id,
+            &app_spec.namespace,
+            mutation,
+        ),
     )
     .await?;
     restart_statefulset_for_ingress(&engine, &app_spec.namespace, &app_spec.name, generation)
@@ -3259,6 +3352,7 @@ pub async fn apply_deployment_manifests(
         &hash,
         tenant_image_pull_secret_config.as_ref(),
         generation,
+        mutation,
     )
     .await?;
     let edge_config = crate::edge::EdgeRouteConfig::from_env();

@@ -1225,6 +1225,44 @@ pub(crate) async fn persist_sts_provenance(
     .map(|_| ())
 }
 
+/// Trusted operator-only rollout configuration, snapshotted once per process.
+/// `CAP_CREATION_LEDGER_ACTIVATED_AT` is an absolute activation timestamp, NOT
+/// a duration, startup time, or tenant setting. Absent means no legacy trust;
+/// malformed/future values abort ledger loading (and therefore cleanup).
+///
+/// Activation procedure and accepted legacy-forgery risk are documented in
+/// `enclava_engine::apply::creation_ledger`. Quiesce writers, drain old binaries,
+/// deploy ledger recording everywhere, audit legacy objects, then pin the
+/// observed activation instant consistently in every replica's deployment
+/// configuration. Retain that exact value across upgrades; never advance it
+/// to make an unresolved object deletable. Clearing it only removes trust.
+fn configured_creation_ledger()
+-> Result<enclava_engine::apply::creation_ledger::CreationLedgerBuffer, sqlx::Error> {
+    use enclava_engine::apply::creation_ledger::CreationLedgerBuffer;
+    use k8s_openapi::jiff::Timestamp;
+
+    static CUTOFF: std::sync::OnceLock<Result<Option<String>, String>> = std::sync::OnceLock::new();
+    let cutoff = CUTOFF.get_or_init(|| match std::env::var("CAP_CREATION_LEDGER_ACTIVATED_AT") {
+        Ok(raw) => {
+            CreationLedgerBuffer::with_legacy_cutover(&raw, Timestamp::now())?;
+            Ok(Some(raw))
+        }
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(format!("CAP_CREATION_LEDGER_ACTIVATED_AT: {error}")),
+    });
+    let result = match cutoff {
+        Ok(Some(raw)) => CreationLedgerBuffer::with_legacy_cutover(raw, Timestamp::now()),
+        Ok(None) => Ok(CreationLedgerBuffer::new()),
+        Err(error) => Err(error.clone()),
+    };
+    result.map_err(|error| {
+        sqlx::Error::Configuration(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("CAP_CREATION_LEDGER_ACTIVATED_AT: {error}"),
+        )))
+    })
+}
+
 /// Load the app's durable creation-ledger rows (cap#272) into an
 /// engine-side [`CreationLedgerBuffer`]. Every deletion-authority check in
 /// this module (object sweep, namespace teardown, StatefulSet provenance)
@@ -1241,8 +1279,7 @@ pub(crate) async fn load_creation_ledger(
             .bind(app_id)
             .fetch_all(pool)
             .await?;
-    let ledger =
-        std::sync::Arc::new(enclava_engine::apply::creation_ledger::CreationLedgerBuffer::new());
+    let ledger = std::sync::Arc::new(configured_creation_ledger()?);
     ledger.preload(rows);
     Ok(ledger)
 }
@@ -1261,12 +1298,9 @@ pub(crate) async fn load_creation_ledger_for_namespace(
         .await?;
     match app_id {
         Some(app_id) => load_creation_ledger(pool, app_id).await,
-        // No app row owns the namespace name anymore: nothing was ever
-        // recorded for it under this scheme; an empty ledger keeps the
-        // cutover rule as the only authority.
-        None => Ok(std::sync::Arc::new(
-            enclava_engine::apply::creation_ledger::CreationLedgerBuffer::new(),
-        )),
+        // No app row owns the namespace anymore: no ledger rows can match.
+        // Only the explicitly configured bounded legacy trust may remain.
+        None => Ok(std::sync::Arc::new(configured_creation_ledger()?)),
     }
 }
 
@@ -1873,6 +1907,19 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
     // sweep so unmarked live targets count as unresolved there.
     evidence_loss_unresolved: bool,
 ) -> CleanupFenceOutcome {
+    // Ledger-persistence compensation may have sent a namespace DELETE
+    // already. Never downgrade its durable retained marker merely because
+    // the missing ledger row now makes this namespace look adopted. This
+    // check precedes ALL ordinary-release exits; the retained reconciler
+    // observes absence/termination with bounded requests after we drop.
+    let namespace_fence_retained = match mutation.has_retained_namespace_fence().await {
+        Ok(retained) => retained,
+        Err(error) => {
+            tracing::warn!(app_id = %app.id, error = %error,
+                "cannot inspect retained namespace marker; keeping the fence for reconciliation");
+            true
+        }
+    };
     // Durably record the evidence loss BEFORE any later step: even if this
     // process dies mid-cleanup, a later sweep of any failed generation of
     // this app must still see the marker and count unmarked live targets as
@@ -1905,7 +1952,14 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
                 "failed-apply cleanup could not mark the row's sweep incomplete"
             );
         }
-        return CleanupFenceOutcome::ReleaseNormally;
+        return if namespace_fence_retained {
+            CleanupFenceOutcome::RetainNamespaceFence
+        } else {
+            CleanupFenceOutcome::ReleaseNormally
+        };
+    }
+    if namespace_fence_retained {
+        return CleanupFenceOutcome::RetainNamespaceFence;
     }
     // Row-level gate: no other generation of this app may carry ANY
     // provider-state evidence, and the app must not be deleting. Whether THIS
@@ -3139,6 +3193,37 @@ mod tests {
         pool
     }
 
+    #[tokio::test]
+    async fn deleting_app_cascades_creation_ledger_rows() {
+        let pool = cleanup_test_pool().await;
+        let app_id = insert_cleanup_app_fixture(&pool).await;
+        let record = enclava_engine::apply::creation_ledger::CreationRecord {
+            kind: "ConfigMap".to_string(),
+            name: "ingress".to_string(),
+            namespace: Some("ledger-cascade".to_string()),
+            uid: Uuid::new_v4().to_string(),
+            mutation_generation: 1,
+        };
+        persist_creation_records(&pool, app_id, Uuid::new_v4(), &[record])
+            .await
+            .expect("persist app creation lineage");
+        let before: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM resource_creation_ledger WHERE app_id = $1")
+                .bind(app_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(before, 1);
+        delete_cleanup_fixture(&pool, app_id).await;
+        let after: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM resource_creation_ledger WHERE app_id = $1")
+                .bind(app_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(after, 0, "app teardown must not orphan ledger rows");
+    }
+
     async fn insert_cleanup_app_fixture(pool: &PgPool) -> Uuid {
         let org_id = Uuid::new_v4();
         let app_id = Uuid::new_v4();
@@ -4143,7 +4228,13 @@ mod tests {
     }
 
     fn empty_ledger() -> enclava_engine::apply::creation_ledger::CreationLedgerBuffer {
-        enclava_engine::apply::creation_ledger::CreationLedgerBuffer::new()
+        // Legacy fixtures explicitly opt into their historical trust boundary;
+        // production's default remains strict and no process env is mutated.
+        enclava_engine::apply::creation_ledger::CreationLedgerBuffer::with_legacy_cutover(
+            "2026-10-17T00:00:00Z",
+            "2026-10-17T00:00:00Z".parse().unwrap(),
+        )
+        .expect("fixture activation cutoff")
     }
 
     /// Legacy-signature forwarders: these tests exercise the grandfathered
@@ -4227,6 +4318,35 @@ mod tests {
         assert!(matches!(
             classify_generation_leftover(&legacy, 7, &empty_ledger()),
             GenerationLeftover::Leftover
+        ));
+    }
+
+    #[test]
+    fn legacy_cleanup_requires_explicit_activation_and_uses_full_instants() {
+        use enclava_engine::apply::creation_ledger::CreationLedgerBuffer;
+        let mut object = forged_post_cutover_object();
+        object.metadata.creation_timestamp = Some(k8s_time("2026-10-17T11:59:59Z"));
+        // No configured activation: even an otherwise legacy-shaped object
+        // cannot become destructive authority solely because it is old.
+        assert!(matches!(
+            classify_generation_leftover(&object, 7, &CreationLedgerBuffer::new()),
+            GenerationLeftover::ProvenanceUnproven
+        ));
+        let migration = CreationLedgerBuffer::with_legacy_cutover(
+            "2026-10-17T12:00:00Z",
+            "2026-10-17T12:00:00Z".parse().unwrap(),
+        )
+        .unwrap();
+        // Old binaries may have created CAP objects after the former midnight
+        // boundary. The explicit actual activation includes that rollout gap.
+        assert!(matches!(
+            classify_generation_leftover(&object, 7, &migration),
+            GenerationLeftover::Leftover
+        ));
+        object.metadata.creation_timestamp = Some(k8s_time("2026-10-17T12:00:00.000000001Z"));
+        assert!(matches!(
+            classify_generation_leftover(&object, 7, &migration),
+            GenerationLeftover::ProvenanceUnproven
         ));
     }
 
