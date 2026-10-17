@@ -2240,8 +2240,9 @@ fn fence_is_shared_global(fence: &crate::mutation_leases::ResourceFence) -> bool
 }
 
 /// Inspect what a `Busy` compensation claim is waiting on. App-specific
-/// rows must belong to this deployment's own abandoned lease; global rows
-/// accept any bounded owner. A database failure inspecting the rows is an
+/// rows accept this deployment's abandoned lease or a bounded non-deployment
+/// owner that cannot do its cleanup; global rows accept any bounded owner.
+/// A database failure inspecting the rows is an
 /// error, never a silent "nothing to wait for" — the caller skips with the
 /// marker armed and the failure logged.
 async fn exhaustion_claim_blocker(
@@ -6384,6 +6385,93 @@ pub(crate) mod tests {
             .execute(&pool)
             .await
             .expect("delete desired-state fixture");
+    }
+
+    #[tokio::test]
+    async fn retry_exhaustion_compensation_retries_after_live_desired_state_finishes() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _setup_handle, payload) = insert_job_fixture(&pool).await;
+        let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim setup")
+            .expect("setup exists");
+        mark_setup_accepted(&pool, deployment_id, setup.lock_token)
+            .await
+            .expect("accept setup");
+        let apply = claim_job(&pool, "pending", "running", Some(deployment_id))
+            .await
+            .expect("claim apply")
+            .expect("apply exists");
+        sqlx::query("UPDATE deployment_apply_jobs SET contention_started_at = clock_timestamp() - interval '31 days' WHERE deployment_id = $1")
+            .bind(deployment_id).execute(&pool).await.expect("age contention");
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.side_effect_admission = Arc::new(tokio::sync::Semaphore::new(4));
+        // Unlike the crashed-owner test, keep this owner LIVE through terminal
+        // publication, then release well before its ordinary reclaim deadline.
+        let owner = crate::mutation_leases::claim(
+            &state,
+            app.id,
+            "app_desired_state",
+            Uuid::new_v4(),
+            false,
+            vec![crate::mutation_leases::ResourceFence::new(
+                "kubernetes_namespace",
+                &app.namespace,
+            )],
+        )
+        .await
+        .expect("claim live desired-state convergence");
+        assert!(
+            requeue_or_exhaust_apply_job(&pool, &apply)
+                .await
+                .expect("publish exhaustion under temporary owner")
+        );
+        assert!(matches!(
+            exhaustion_claim_blocker(
+                &pool,
+                app.id,
+                deployment_id,
+                &deployment_apply_resource_fences(&payload.app)
+            )
+            .await
+            .expect("inspect live owner"),
+            ExhaustionClaimBlocker::WaitableUntil(_)
+        ));
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            owner
+                .finish()
+                .await
+                .expect("desired-state convergence finishes");
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            compensate_after_retry_exhaustion(&state, &apply, &payload.app),
+        )
+        .await
+        .expect("retry notices early release, not stale reclaim deadline");
+        release.await.expect("release task");
+        let generation: i64 = sqlx::query_scalar(
+            "SELECT generation FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1",
+        )
+        .bind(&app.namespace)
+        .fetch_one(&pool)
+        .await
+        .expect("compensation reclaimed namespace");
+        assert!(
+            generation >= 2,
+            "must retry after temporary owner releases, not return ForeignOwner"
+        );
+        sqlx::query("DELETE FROM external_resource_mutation_leases WHERE resource_key IN ('global', $1, $2, $3, $4)")
+            .bind(&app.namespace).bind(&app.domain).bind(app.tee_domain.as_deref())
+            .bind(app.custom_domain.as_deref()).execute(&pool).await.expect("remove compensation fences");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete live-owner fixture");
     }
 
     /// Codex P2 (#260 review round 5), counter-case: the app DELETE flow
