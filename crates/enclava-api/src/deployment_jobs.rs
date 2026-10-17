@@ -2209,68 +2209,99 @@ fn deployment_apply_resource_fences(app: &App) -> Vec<crate::mutation_leases::Re
     resources
 }
 
-/// The earliest instant a fresh `claim` of this deployment's fences can
-/// succeed when every blocking row is this deployment's OWN abandoned
-/// `deployment_apply` lease (Codex P2, #260 review). The exhausting attempt
-/// dropped its lease without `finish`, so its rows stay owned through the
-/// bounded reclaim quarantine; the claim therefore returns `Busy` even
-/// though no live generation holds the lanes. `None` when nothing blocks,
-/// or when any blocking row belongs to a DIFFERENT operation — never wait
-/// on a foreign live owner, whose own terminal path owns compensation.
-async fn own_abandoned_apply_fences_reclaimable_at(
+/// What blocks a fresh `claim` of this deployment's fences after the
+/// requeue loop exhausted (Codex P2, #260 review rounds 1 and 3).
+enum ExhaustionClaimBlocker {
+    /// Every blocking row frees at a bounded instant: this deployment's
+    /// OWN abandoned `deployment_apply` lease (dropped without `finish`,
+    /// rows owned through the reclaim quarantine), or — for the SHARED
+    /// global fences only — any foreign owner whose quarantine is finite.
+    /// An unrelated app's KBS/edge reconcile can never compensate THIS
+    /// deployment, so waiting it out is the only way its partial provider
+    /// state is ever cleaned.
+    WaitableUntil(chrono::DateTime<chrono::Utc>),
+    /// An APP-SPECIFIC lane (app row, namespace, app edge routes) is owned
+    /// by a different live operation of this app — another generation
+    /// whose own terminal path owns compensation — or some row carries an
+    /// unbounded retained marker. Never wait: the terminalized job is not
+    /// this owner's to converge.
+    ForeignOwner,
+}
+
+/// A fence whose row is intentionally shared across apps: a foreign owner
+/// blocks this deployment's all-fence compensation claim but will never
+/// compensate this deployment itself, so its bounded quarantine is worth
+/// waiting out (Codex P2, #260 review round 3).
+fn fence_is_shared_global(fence: &crate::mutation_leases::ResourceFence) -> bool {
+    matches!(fence.scope.as_str(), "kbs_policy" | "edge_config")
+}
+
+/// Inspect what a `Busy` compensation claim is waiting on. App-specific
+/// rows must belong to this deployment's own abandoned lease; global rows
+/// accept any bounded owner. A database failure inspecting the rows is an
+/// error, never a silent "nothing to wait for" — the caller skips with the
+/// marker armed and the failure logged.
+async fn exhaustion_claim_blocker(
     pool: &sqlx::PgPool,
     app_id: Uuid,
     deployment_id: Uuid,
     fences: &[crate::mutation_leases::ResourceFence],
-) -> Option<chrono::DateTime<chrono::Utc>> {
-    let mut reclaimable_at: Option<chrono::DateTime<chrono::Utc>> = None;
-    let mut extend = |row: Option<(String, Option<Uuid>, chrono::DateTime<chrono::Utc>)>| -> bool {
+) -> Result<ExhaustionClaimBlocker, sqlx::Error> {
+    let mut waitable_until: Option<chrono::DateTime<chrono::Utc>> = None;
+    let mut extend = |row: Option<(String, Option<Uuid>, chrono::DateTime<chrono::Utc>, bool)>,
+                      shared_global: bool|
+     -> bool {
         match row {
             None => true,
-            Some((operation_kind, operation_id, reclaim_after)) => {
-                if operation_kind != "deployment_apply" || operation_id != Some(deployment_id) {
+            Some((operation_kind, operation_id, reclaim_after, unbounded)) => {
+                let own_abandoned =
+                    operation_kind == "deployment_apply" && operation_id == Some(deployment_id);
+                if !(own_abandoned || (shared_global && !unbounded)) {
                     return false;
                 }
-                if reclaimable_at.is_none_or(|current| reclaim_after > current) {
-                    reclaimable_at = Some(reclaim_after);
+                if waitable_until.is_none_or(|current| reclaim_after > current) {
+                    waitable_until = Some(reclaim_after);
                 }
                 true
             }
         }
     };
-    let app_lane = sqlx::query_as::<_, (String, Option<Uuid>, chrono::DateTime<chrono::Utc>)>(
-        "SELECT operation_kind, operation_id, reclaim_after
+    let app_lane =
+        sqlx::query_as::<_, (String, Option<Uuid>, chrono::DateTime<chrono::Utc>, bool)>(
+            "SELECT operation_kind, operation_id, reclaim_after,
+                reclaim_after = 'infinity'::timestamptz
            FROM app_mutation_leases
           WHERE app_id = $1
             AND owner_token IS NOT NULL
             AND reclaim_after > clock_timestamp()",
-    )
-    .bind(app_id)
-    .fetch_optional(pool)
-    .await
-    .ok()?;
-    if !extend(app_lane) {
-        return None;
+        )
+        .bind(app_id)
+        .fetch_optional(pool)
+        .await?;
+    if !extend(app_lane, false) {
+        return Ok(ExhaustionClaimBlocker::ForeignOwner);
     }
     for fence in fences {
-        let row = sqlx::query_as::<_, (String, Option<Uuid>, chrono::DateTime<chrono::Utc>)>(
-            "SELECT operation_kind, operation_id, reclaim_after
-               FROM external_resource_mutation_leases
-              WHERE resource_scope = $1
-                AND resource_key = $2
-                AND owner_token IS NOT NULL
-                AND reclaim_after > clock_timestamp()",
+        let row = sqlx::query_as::<_, (String, Option<Uuid>, chrono::DateTime<chrono::Utc>, bool)>(
+            "SELECT operation_kind, operation_id, reclaim_after,
+                        reclaim_after = 'infinity'::timestamptz
+                   FROM external_resource_mutation_leases
+                  WHERE resource_scope = $1
+                    AND resource_key = $2
+                    AND owner_token IS NOT NULL
+                    AND reclaim_after > clock_timestamp()",
         )
         .bind(&fence.scope)
         .bind(&fence.key)
         .fetch_optional(pool)
-        .await
-        .ok()?;
-        if !extend(row) {
-            return None;
+        .await?;
+        if !extend(row, fence_is_shared_global(fence)) {
+            return Ok(ExhaustionClaimBlocker::ForeignOwner);
         }
     }
-    reclaimable_at
+    Ok(ExhaustionClaimBlocker::WaitableUntil(
+        waitable_until.unwrap_or_else(chrono::Utc::now),
+    ))
 }
 
 /// Append one claimed namespace-fence generation to the deployment's
@@ -2333,24 +2364,24 @@ async fn record_namespace_fence_claim(
 async fn retry_exhaustion_namespace_provenance(
     pool: &sqlx::PgPool,
     deployment_id: Uuid,
-) -> Option<Vec<enclava_engine::apply::generation::MutationGeneration>> {
-    let raw = sqlx::query_scalar::<_, Vec<i64>>(
+) -> Result<Option<Vec<enclava_engine::apply::generation::MutationGeneration>>, sqlx::Error> {
+    let raw = sqlx::query_scalar::<_, Option<Vec<i64>>>(
         "SELECT namespace_fence_generations FROM deployments WHERE id = $1",
     )
     .bind(deployment_id)
     .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten()?;
+    .await?
+    .flatten()
+    .unwrap_or_default();
     let generations: Vec<_> = raw
         .into_iter()
         .filter_map(|value| enclava_engine::apply::generation::MutationGeneration::new(value).ok())
         .collect();
-    if generations.is_empty() {
+    Ok(if generations.is_empty() {
         None
     } else {
         Some(generations)
-    }
+    })
 }
 
 /// Reacquire this generation's provider fences and run the compensating
@@ -2363,17 +2394,23 @@ async fn retry_exhaustion_namespace_provenance(
 /// so a crash between publication and this compensation leaves the sweep
 /// retryable for a later failed generation instead of wedging the app.
 ///
-/// Two exhaustion-specific hazards are handled here. First, the exhausting
+/// Three exhaustion-specific hazards are handled here. First, the exhausting
 /// attempt's own dropped lease still owns the fence rows through the
 /// bounded reclaim quarantine, so the immediate reacquire returns `Busy`
 /// for a lease that no live generation holds — since the job is already
 /// terminal and is never claimed again, skipping would strand the partial
 /// provider state indefinitely. When every blocking row belongs to this
 /// deployment's own abandoned `deployment_apply` lease, wait out the
-/// quarantine and claim again; a foreign owner (another live generation,
-/// a deleting app, a retained-namespace marker) still skips immediately —
-/// its own terminal path owns compensation and the periodic reconcilers
-/// retain convergence for every skipped step.
+/// quarantine and claim again. Second, a foreign owner of the SHARED
+/// global fences (an unrelated app's KBS/edge reconcile) can never
+/// compensate this deployment, so its bounded quarantine is waited out
+/// too, under a total wait budget; a foreign owner of an APP-SPECIFIC
+/// lane (another live generation of this app, a deleting app, a
+/// retained-namespace marker) still skips — its own terminal path owns
+/// compensation and the periodic reconcilers retain convergence for every
+/// skipped step. Third, a failed provenance lookup (as opposed to a
+/// genuinely legacy NULL) never falls back to the reacquired generation:
+/// the durable sweep marker stays armed and the fences release bounded.
 ///
 /// Second, the reacquired fence's namespace generation is NEWER than
 /// anything the failed attempts stamped, so classification runs against
@@ -2382,10 +2419,13 @@ async fn retry_exhaustion_namespace_provenance(
 /// namespace would always classify as foreign and never be reclaimed.
 async fn compensate_after_retry_exhaustion(state: &AppState, job: &ClaimedJob, app: &App) {
     let resources = deployment_apply_resource_fences(app);
-    // The reclaim quarantine is bounded (lease + quarantine seconds from
-    // the dead attempt's last renewal); two waits absorb clock drift and
-    // one re-claim race without ever blocking the worker unboundedly.
-    let mut reclaim_waits_remaining: u32 = 2;
+    // Wait budget for Busy claims: every quarantined row this compensation
+    // can legitimately wait on has a bounded horizon (lease + quarantine
+    // seconds from the owner's last renewal), but a live global-fence
+    // owner keeps RENEWING its horizon — the budget, not the horizon,
+    // bounds this loop. Fifteen minutes covers an own-lease quarantine
+    // (≤ 540 s) plus interleaved global contention with drift to spare.
+    let wait_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(900);
     let mut mutation = loop {
         match crate::mutation_leases::claim(
             state,
@@ -2399,33 +2439,55 @@ async fn compensate_after_retry_exhaustion(state: &AppState, job: &ClaimedJob, a
         {
             Ok(mutation) => break mutation,
             Err(claim_error) => {
-                let reclaimable_at = if matches!(
+                let blocker = if matches!(
                     claim_error,
                     crate::mutation_leases::MutationLeaseError::Busy
-                ) && reclaim_waits_remaining > 0
+                ) && tokio::time::Instant::now() < wait_deadline
                 {
-                    reclaim_waits_remaining -= 1;
-                    own_abandoned_apply_fences_reclaimable_at(
-                        &state.db,
-                        job.app_id,
-                        job.deployment_id,
-                        &resources,
-                    )
-                    .await
+                    exhaustion_claim_blocker(&state.db, job.app_id, job.deployment_id, &resources)
+                        .await
                 } else {
-                    None
+                    // Not a Busy claim, or the wait budget is spent: do
+                    // not wait, whatever the claim error was.
+                    Ok(ExhaustionClaimBlocker::ForeignOwner)
                 };
-                let Some(reclaimable_at) = reclaimable_at else {
-                    // Busy from a foreign live owner: another live
+                let waitable_until = match blocker {
+                    // Every blocking row frees at a bounded instant: our
+                    // own abandoned lease, or an unrelated operation on a
+                    // SHARED global fence that can never compensate this
+                    // deployment. The terminalized job is never claimed
+                    // again, so the compensation itself must outlive the
+                    // quarantine.
+                    Ok(ExhaustionClaimBlocker::WaitableUntil(reclaimable_at)) => {
+                        Some(reclaimable_at)
+                    }
+                    // A database failure INSPECTING the blockers is
+                    // distinct from a foreign owner: log it as its own
+                    // error so operators can tell a wedged claim from a
+                    // skipped one.
+                    Err(inspect_error) => {
+                        tracing::warn!(
+                            deployment_id = %job.deployment_id,
+                            app_id = %job.app_id,
+                            error = %inspect_error,
+                            error_code = "exhaustion_claim_blocker_lookup_failed",
+                            "retry-exhaustion compensation could not inspect its Busy blockers"
+                        );
+                        None
+                    }
+                    Ok(ExhaustionClaimBlocker::ForeignOwner) => None,
+                };
+                let Some(waitable_until) = waitable_until else {
+                    // Busy from a foreign APP-SPECIFIC owner (another live
                     // generation of this app owns the lanes — its own
-                    // terminal path owns compensation for the provider
-                    // state, and the row-level gate in
-                    // cleanup_after_terminal_apply_failure would skip this
-                    // generation anyway. AppUnavailable: the delete flow
-                    // tears the provider state down itself. Either way the
-                    // sweep stays durably armed; converge only the
-                    // enqueued revocation under an independent global
-                    // fence.
+                    // terminal path owns compensation, and the row-level
+                    // gate in cleanup_after_terminal_apply_failure would
+                    // skip this generation anyway); AppUnavailable (the
+                    // delete flow tears the provider state down itself);
+                    // an unbounded retained marker; or the wait budget is
+                    // spent. Either way the sweep stays durably armed;
+                    // converge only the enqueued revocation under an
+                    // independent global fence.
                     tracing::warn!(
                         deployment_id = %job.deployment_id,
                         app_id = %job.app_id,
@@ -2443,29 +2505,68 @@ async fn compensate_after_retry_exhaustion(state: &AppState, job: &ClaimedJob, a
                     }
                     return;
                 };
-                // Our own abandoned lease owns the rows until the bounded
-                // quarantine expires; no live generation holds them and
-                // the terminalized job is never claimed again, so the
-                // compensation itself must outlive the quarantine.
                 tracing::info!(
                     deployment_id = %job.deployment_id,
                     app_id = %job.app_id,
-                    reclaimable_at = %reclaimable_at,
-                    "retry-exhaustion compensation waiting out its own abandoned lease quarantine"
+                    reclaimable_at = %waitable_until,
+                    "retry-exhaustion compensation waiting out a bounded fence quarantine"
                 );
-                let cap =
-                    reclaimable_at.min(chrono::Utc::now() + std::time::Duration::from_secs(660));
-                let wait = (cap - chrono::Utc::now()).to_std().unwrap_or_default()
+                let wait = (waitable_until - chrono::Utc::now())
+                    .to_std()
+                    .unwrap_or_default()
                     + std::time::Duration::from_millis(250);
-                tokio::time::sleep(wait).await;
+                let sleep_until = (tokio::time::Instant::now() + wait).min(wait_deadline);
+                if sleep_until > tokio::time::Instant::now() {
+                    tokio::time::sleep_until(sleep_until).await;
+                }
             }
         }
     };
     // Classify and sweep against the generation the failed attempts
     // actually stamped (when they recorded one), never the fresh
-    // generation the reacquired fence carries.
-    let namespace_provenance =
+    // generation the reacquired fence carries. A FAILED lookup is never
+    // treated as "no provenance": classifying against the reacquired
+    // generation would mark a namespace the attempts DID write as
+    // foreign and strand it with no retry. The lookup gets one transient
+    // retry; a persistent failure keeps the durable sweep marker armed,
+    // converges the revocation under the held lease, and releases the
+    // fences through the bounded quarantine.
+    let mut namespace_provenance =
         retry_exhaustion_namespace_provenance(&state.db, job.deployment_id).await;
+    if namespace_provenance.is_err() {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        namespace_provenance =
+            retry_exhaustion_namespace_provenance(&state.db, job.deployment_id).await;
+    }
+    let namespace_provenance = match namespace_provenance {
+        Ok(provenance) => provenance,
+        Err(lookup_error) => {
+            tracing::error!(
+                deployment_id = %job.deployment_id,
+                app_id = %job.app_id,
+                error = %lookup_error,
+                error_code = "exhaustion_provenance_lookup_failed",
+                "retry-exhaustion compensation skipped: cannot load the attempts' provenance; the durable sweep marker stays armed"
+            );
+            if let Ok(()) = reconcile_pending_kbs_with_mutation(state, &mutation).await
+                && let Err(release_error) = release_kbs_resource(&state.db, &mut mutation).await
+            {
+                tracing::error!(
+                    deployment_id = %job.deployment_id,
+                    error_code = release_error.code(),
+                    "failed to release reconciled global KBS mutation fence"
+                );
+            }
+            if let Err(release_error) = mutation.release_after_provider_quarantine().await {
+                tracing::error!(
+                    deployment_id = %job.deployment_id,
+                    error_code = DeploymentJobError::from(release_error).code(),
+                    "failed to bound retry-exhausted deployment mutation leases"
+                );
+            }
+            return;
+        }
+    };
     let cleanup_outcome = crate::deployment_failure_cleanup::cleanup_after_terminal_apply_failure(
         state,
         app,
@@ -5975,6 +6076,126 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn retry_exhaustion_compensation_waits_out_unrelated_global_fence_contention() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _setup_handle, payload) = insert_job_fixture(&pool).await;
+        let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim setup")
+            .expect("setup exists");
+        mark_setup_accepted(&pool, deployment_id, setup.lock_token)
+            .await
+            .expect("accept setup");
+        let apply = claim_job(&pool, "pending", "running", Some(deployment_id))
+            .await
+            .expect("claim apply")
+            .expect("apply exists");
+        sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET contention_started_at = clock_timestamp() - '31 days'::interval
+              WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("age contention past the horizon");
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.side_effect_admission = Arc::new(tokio::sync::Semaphore::new(4));
+        assert!(
+            requeue_or_exhaust_apply_job(&state.db, &apply)
+                .await
+                .expect("terminalize exhausted contention")
+        );
+
+        // Codex P2 (#260 review round 3): an UNRELATED operation — another
+        // app's KBS reconcile — owns the shared global kbs_policy fence.
+        // It will never compensate THIS deployment, so the compensation
+        // must wait out its (bounded) quarantine instead of skipping and
+        // stranding the terminalized job's namespace forever. The app's
+        // own lanes stay free.
+        let unrelated_operation = Uuid::new_v4();
+        let unrelated = crate::mutation_leases::claim_resources(
+            &state,
+            "deployment_apply_kbs_reconcile",
+            unrelated_operation,
+            vec![crate::mutation_leases::ResourceFence::kbs_policy()],
+        )
+        .await
+        .expect("claim the unrelated global fence");
+        drop(unrelated);
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET locked_until = clock_timestamp() + interval '1 second',
+                    reclaim_after = clock_timestamp() + interval '2 seconds'
+              WHERE resource_scope = 'kbs_policy'
+                AND operation_id = $1
+                AND owner_token IS NOT NULL",
+        )
+        .bind(unrelated_operation)
+        .execute(&pool)
+        .await
+        .expect("shrink the unrelated global fence quarantine");
+
+        let started = std::time::Instant::now();
+        compensate_after_retry_exhaustion(&state, &apply, &payload.app).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_secs(2),
+            "compensation must wait out the unrelated global fence's quarantine, took {elapsed:?}"
+        );
+
+        let (job_error, sweep_armed): (Option<String>, bool) = sqlx::query_as(
+            "SELECT job.last_error_code, deployment.cleanup_sweep_incomplete
+               FROM deployment_apply_jobs AS job
+               JOIN deployments AS deployment ON deployment.id = job.deployment_id
+              WHERE job.deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load compensated exhaustion state");
+        assert_eq!(job_error.as_deref(), Some("deployment_retry_exhausted"));
+        assert!(
+            sweep_armed,
+            "the compensating cleanup ran: an unreachable cluster keeps the retryable-sweep marker armed"
+        );
+        let (kbs_generation, kbs_bounded): (i64, bool) = sqlx::query_as(
+            "SELECT generation, reclaim_after < 'infinity'::timestamptz
+               FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kbs_policy' AND resource_key = 'global'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("load the compensated global fence");
+        assert!(
+            kbs_generation >= 2,
+            "the compensation reclaimed the global fence past the unrelated owner"
+        );
+        assert!(
+            kbs_bounded,
+            "the reclaimed global fence keeps a finite horizon"
+        );
+
+        sqlx::query(
+            "DELETE FROM external_resource_mutation_leases
+              WHERE resource_key IN ('global', $1, $2, $3, $4)",
+        )
+        .bind(&app.namespace)
+        .bind(&app.domain)
+        .bind(app.tee_domain.as_deref())
+        .bind(app.custom_domain.as_deref())
+        .execute(&pool)
+        .await
+        .expect("remove quarantined exhaustion fences");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete global-contention fixture");
+    }
+
+    #[tokio::test]
     async fn retry_exhaustion_compensation_skips_a_foreign_owned_fence_immediately() {
         let pool = database_test_pool().await;
         let (app, deployment_id, _setup_handle, payload) = insert_job_fixture(&pool).await;
@@ -6102,6 +6323,7 @@ pub(crate) mod tests {
         assert!(
             retry_exhaustion_namespace_provenance(&pool, deployment_id)
                 .await
+                .expect("the provenance lookup must propagate errors, not swallow them")
                 .is_none(),
             "rows that predate the provenance column must classify conservatively"
         );
@@ -6212,6 +6434,7 @@ pub(crate) mod tests {
         // the sibling's fresher claim alone would have stranded it.
         let provenance = retry_exhaustion_namespace_provenance(&pool, deployment_id)
             .await
+            .expect("the provenance lookup must propagate errors, not swallow them")
             .expect("the recorded provenance set is non-empty");
         assert_eq!(
             provenance
