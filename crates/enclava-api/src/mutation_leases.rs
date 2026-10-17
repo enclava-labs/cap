@@ -1154,9 +1154,13 @@ pub async fn reconcile_orphaned_deployment_apply_leases(
 /// owner/generation/marker row is cleared with a compare-and-swap that also
 /// requires the fence to still be expired, so a snapshot taken before the
 /// (potentially slow) GET cannot authorize the release. A GET error or a
-/// still-deleting namespace retains the fence. A namespace that is live but
-/// no longer classifies as the retained generation's (external annotation
-/// rewrite, or a same-named replacement) is released on a FRESH bounded
+/// still-deleting namespace retains the fence. A live, not-deleting
+/// namespace retries the pinned delete only while it still classifies as
+/// the retained generation's — or as one of the generations the marker's
+/// deployment durably recorded (`namespace_fence_generations`; Codex P2,
+/// #260 review round 5) — CAP-created namespace. A namespace that is live
+/// but no longer classifies as any of those (external annotation rewrite,
+/// or a same-named replacement) is released on a FRESH bounded
 /// reclaim deadline instead — a 404 can never occur for it and the settle
 /// margin proves no deletion is in flight (see
 /// [`bound_stranded_foreign_namespace_fence`]); an operator can reclaim it
@@ -1472,6 +1476,33 @@ async fn bound_stranded_foreign_namespace_fence(
     Ok(true)
 }
 
+/// The namespace-fence generations the retained marker's deployment
+/// durably recorded for its failed apply attempts (each appended in its
+/// own transaction before that attempt's provider execution; migration
+/// 0078). A missing deployment row (the app was hard-deleted) yields an
+/// empty set — the caller then classifies against the fence generation
+/// alone, exactly the pre-provenance behavior. A database failure
+/// propagates so the caller retains the fence and retries next cycle —
+/// never a silent "no provenance" that would misclassify a still-live
+/// namespace as foreign (Codex P2, #260 review round 5).
+async fn retained_marker_namespace_provenance(
+    pool: &PgPool,
+    deployment_id: Uuid,
+) -> Result<Vec<MutationGeneration>, MutationLeaseError> {
+    let raw = sqlx::query_scalar::<_, Option<Vec<i64>>>(
+        "SELECT namespace_fence_generations FROM deployments WHERE id = $1",
+    )
+    .bind(deployment_id)
+    .fetch_optional(pool)
+    .await?
+    .flatten()
+    .unwrap_or_default();
+    Ok(raw
+        .into_iter()
+        .filter_map(|value| MutationGeneration::new(value).ok())
+        .collect())
+}
+
 /// Reconcile a single expired retained-namespace fence: probe the live
 /// namespace, retry the pinned delete when it is still provably ours, and
 /// release the fence (plus the converged rows' stale evidence) only on
@@ -1537,10 +1568,22 @@ async fn reconcile_one_retained_namespace(
                 let Ok(generation_value) = MutationGeneration::new(generation) else {
                     return Ok(false);
                 };
-                match classify_initial_namespace_get(
-                    &Ok(live_namespace),
-                    std::slice::from_ref(&generation_value),
-                ) {
+                // Codex P2 (#260 review round 5): the retained fence often
+                // belongs to the retry-exhaustion compensation's FRESHLY
+                // reacquired generation, while the namespace was classified
+                // and its delete issued against the OLDER generations the
+                // failed attempts durably recorded
+                // (`deployments.namespace_fence_generations`). Classifying
+                // against the fence generation alone would misread that
+                // still-live namespace as foreign, bound the marker, and
+                // never retry the delete — so the ownership classification
+                // accepts the recorded set too (every member was uniquely
+                // claimed by this marker's own deployment). A missing
+                // deployment row keeps the fence-generation-only behavior.
+                let mut ownership_generations =
+                    retained_marker_namespace_provenance(pool, operation_id).await?;
+                ownership_generations.push(generation_value);
+                match classify_initial_namespace_get(&Ok(live_namespace), &ownership_generations) {
                     InitialNamespaceOwnership::Owned {
                         uid,
                         resource_version,
@@ -3543,6 +3586,177 @@ mod tests {
                 .execute(&pool)
                 .await
                 .expect("remove retry-fixture organization");
+        }
+    }
+
+    /// Codex P2 (#260 review round 5): a retry-exhaustion compensation's
+    /// retained fence carries the FRESHLY reacquired generation, while the
+    /// namespace it classified and tried to delete is annotated with an
+    /// OLDER generation from `deployments.namespace_fence_generations`
+    /// (the set the failed attempts durably claimed before their provider
+    /// execution). The reconciler must classify against that recorded set
+    /// — retrying the pinned delete for a namespace whose annotation
+    /// matches a recorded generation even though it differs from the
+    /// retained fence's own — and must still never delete a namespace
+    /// whose annotation matches neither.
+    #[tokio::test]
+    async fn retained_fence_reconciliation_classifies_against_recorded_provenance() {
+        let pool = database_test_pool(2).await;
+
+        // Fixture one mirrors the exhaustion shape: the attempts claimed
+        // generation 1 (recorded in the deployment's provenance set), the
+        // compensation reacquired the fence at a FRESH generation 2 and
+        // retained it under the marker after its delete could not be
+        // confirmed.
+        let (org_one, app_one, _owner_one, namespace_one) =
+            stage_retained_namespace_fixture(&pool, Vec::new()).await;
+        let (operation_one, fence_one): (Uuid, i64) = sqlx::query_as(
+            "UPDATE external_resource_mutation_leases
+                SET generation = generation + 1
+              WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1
+            RETURNING operation_id, generation",
+        )
+        .bind(&namespace_one)
+        .fetch_one(&pool)
+        .await
+        .expect("reacquire the retained fence at a fresh generation");
+        let provenance_generation = fence_one - 1;
+        assert!(
+            provenance_generation > 0,
+            "the fixture must hold a recordable provenance generation"
+        );
+        sqlx::query(
+            "INSERT INTO deployments (
+                 id, org_id, app_id, status, spec_snapshot,
+                 namespace_fence_generations
+             ) VALUES (
+                 $1, $2, $3, 'failed'::deploy_status_enum, '{}'::jsonb, $4
+             )",
+        )
+        .bind(operation_one)
+        .bind(org_one)
+        .bind(app_one)
+        .bind(vec![provenance_generation])
+        .execute(&pool)
+        .await
+        .expect("insert the marker's failed deployment row");
+
+        let (server_url, mode, server) = mock_namespace_api_server(
+            None,
+            Arc::new(std::sync::atomic::AtomicI64::new(provenance_generation)),
+        )
+        .await;
+        let client = mock_kube_client(&server_url);
+
+        // The live namespace carries the OLDER recorded generation's
+        // ownership annotations: still provably an attempt's of THIS
+        // deployment, so the reconciler must retry the pinned delete and
+        // release the fence on the confirmed absence — classifying against
+        // the fence's fresh generation alone would have misread it as
+        // foreign and bounded the marker without ever deleting.
+        mode.store(MOCK_NS_OURS, std::sync::atomic::Ordering::SeqCst);
+        let released = release_retained_deployment_namespace_fences_with(&pool, client.clone())
+            .await
+            .expect("reconcile provenance-annotated namespace");
+        assert_eq!(
+            released, 1,
+            "a recorded provenance generation authorizes the pinned delete retry"
+        );
+        assert_eq!(
+            mode.load(std::sync::atomic::Ordering::SeqCst),
+            MOCK_NS_ABSENT,
+            "the reconciler issued the pinned DELETE against the provenance-owned namespace"
+        );
+
+        // Fixture two: the same shape, but the live annotation matches
+        // NEITHER the retained fence's fresh generation NOR the recorded
+        // set — a replaced or externally rewritten namespace is never
+        // deleted, and the unsettled marker stays retained (fail closed).
+        let (org_two, app_two, _owner_two, namespace_two) =
+            stage_retained_namespace_fixture(&pool, Vec::new()).await;
+        let (operation_two, fence_two): (Uuid, i64) = sqlx::query_as(
+            "UPDATE external_resource_mutation_leases
+                SET generation = generation + 1
+              WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1
+            RETURNING operation_id, generation",
+        )
+        .bind(&namespace_two)
+        .fetch_one(&pool)
+        .await
+        .expect("reacquire the second fixture's fence at a fresh generation");
+        sqlx::query(
+            "INSERT INTO deployments (
+                 id, org_id, app_id, status, spec_snapshot,
+                 namespace_fence_generations
+             ) VALUES (
+                 $1, $2, $3, 'failed'::deploy_status_enum, '{}'::jsonb, $4
+             )",
+        )
+        .bind(operation_two)
+        .bind(org_two)
+        .bind(app_two)
+        .bind(vec![fence_two - 1])
+        .execute(&pool)
+        .await
+        .expect("insert the second marker's failed deployment row");
+
+        // Serve an annotation that matches nothing: the fixture's shared
+        // mock keeps one `ours` value for every namespace, so the stranger
+        // case runs through a fresh mock (fixture one's fence is already
+        // released and is not re-probed).
+        let stranger_generation = fence_two + 5;
+        let (server_url_two, mode_two, server_two) = mock_namespace_api_server(
+            None,
+            Arc::new(std::sync::atomic::AtomicI64::new(stranger_generation)),
+        )
+        .await;
+        let client_two = mock_kube_client(&server_url_two);
+        mode_two.store(MOCK_NS_OURS, std::sync::atomic::Ordering::SeqCst);
+        let released = release_retained_deployment_namespace_fences_with(&pool, client_two)
+            .await
+            .expect("reconcile stranger-annotated namespace");
+        assert_eq!(
+            released, 0,
+            "an annotation matching neither the fence nor the recorded set is never deleted"
+        );
+        assert_eq!(
+            mode_two.load(std::sync::atomic::Ordering::SeqCst),
+            MOCK_NS_OURS,
+            "no DELETE was issued against the stranger-annotated namespace"
+        );
+        let still_infinite: bool = sqlx::query_scalar(
+            "SELECT reclaim_after = 'infinity'::timestamptz
+               FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kubernetes_namespace'
+                AND resource_key = $1",
+        )
+        .bind(&namespace_two)
+        .fetch_one(&pool)
+        .await
+        .expect("verify unsettled stranger marker retained");
+        assert!(
+            still_infinite,
+            "the unsettled stranger marker must stay retained (fail closed)"
+        );
+
+        server.abort();
+        server_two.abort();
+        for namespace in [&namespace_one, &namespace_two] {
+            sqlx::query(
+                "DELETE FROM external_resource_mutation_leases
+                  WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1",
+            )
+            .bind(namespace)
+            .execute(&pool)
+            .await
+            .expect("remove provenance-fixture fence");
+        }
+        for org in [org_one, org_two] {
+            sqlx::query("DELETE FROM organizations WHERE id = $1")
+                .bind(org)
+                .execute(&pool)
+                .await
+                .expect("remove provenance-fixture organization");
         }
     }
 }

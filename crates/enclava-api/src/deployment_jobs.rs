@@ -2214,17 +2214,20 @@ fn deployment_apply_resource_fences(app: &App) -> Vec<crate::mutation_leases::Re
 enum ExhaustionClaimBlocker {
     /// Every blocking row frees at a bounded instant: this deployment's
     /// OWN abandoned `deployment_apply` lease (dropped without `finish`,
-    /// rows owned through the reclaim quarantine), or — for the SHARED
-    /// global fences only — any foreign owner whose quarantine is finite.
-    /// An unrelated app's KBS/edge reconcile can never compensate THIS
-    /// deployment, so waiting it out is the only way its partial provider
-    /// state is ever cleaned.
+    /// rows owned through the reclaim quarantine), any foreign owner of
+    /// the SHARED global fences whose quarantine is finite, or a bounded
+    /// NON-deployment owner of an app-specific lane — the desired-state
+    /// reconciler, a custom-domain operation, create-time DNS. None of
+    /// those owners can ever compensate THIS deployment, so waiting them
+    /// out is the only way its partial provider state is ever cleaned
+    /// (Codex P2, #260 review round 5).
     WaitableUntil(chrono::DateTime<chrono::Utc>),
     /// An APP-SPECIFIC lane (app row, namespace, app edge routes) is owned
-    /// by a different live operation of this app — another generation
-    /// whose own terminal path owns compensation — or some row carries an
-    /// unbounded retained marker. Never wait: the terminalized job is not
-    /// this owner's to converge.
+    /// by a different DEPLOYMENT operation of this app — another
+    /// generation whose own terminal path owns compensation — by the app
+    /// delete flow (which tears the provider state down itself), or some
+    /// row carries an unbounded retained marker. Never wait: the
+    /// terminalized job is not this owner's to converge.
     ForeignOwner,
 }
 
@@ -2256,7 +2259,28 @@ async fn exhaustion_claim_blocker(
             Some((operation_kind, operation_id, reclaim_after, unbounded)) => {
                 let own_abandoned =
                     operation_kind == "deployment_apply" && operation_id == Some(deployment_id);
-                if !(own_abandoned || (shared_global && !unbounded)) {
+                // Codex P2 (#260 review round 5): a bounded NON-deployment
+                // owner of an app-specific lane is temporary and will never
+                // compensate this deployment. Fresh evidence: the
+                // `app_desired_state` Running path (routes/internal.rs)
+                // claims the app and namespace while an apply job runs —
+                // its in-progress-job check applies only to Stopped — and
+                // releases the advisory lane for provider convergence
+                // while its mutation lease stays live, so exhaustion
+                // publication can commit underneath it. The same holds for
+                // custom-domain operations and create-time DNS. Wait out
+                // their finite quarantine exactly like shared-global
+                // contention; deployment-flow owners (`deployment_*`) of a
+                // different operation id and the app delete flow stay
+                // foreign — their own terminal paths own this
+                // deployment's convergence.
+                let transient_non_deployment_owner = !operation_kind.starts_with("deployment_")
+                    && operation_kind != "app_delete"
+                    && !unbounded;
+                if !(own_abandoned
+                    || (shared_global && !unbounded)
+                    || transient_non_deployment_owner)
+                {
                     return false;
                 }
                 if waitable_until.is_none_or(|current| reclaim_after > current) {
@@ -2401,17 +2425,21 @@ async fn retry_exhaustion_namespace_provenance(
 /// terminal and is never claimed again, skipping would strand the partial
 /// provider state indefinitely. When every blocking row belongs to this
 /// deployment's own abandoned `deployment_apply` lease, wait out the
-/// quarantine and claim again. Second, a foreign owner of the SHARED
-/// global fences (an unrelated app's KBS/edge reconcile) can never
-/// compensate this deployment, so its bounded quarantine is waited out
-/// too, under a total wait budget and with short bounded polls so a fence
-/// the owner releases early is reclaimed promptly (each waiting
-/// compensation occupies one of the bounded apply worker slots); a
-/// foreign owner of an APP-SPECIFIC
-/// lane (another live generation of this app, a deleting app, a
-/// retained-namespace marker) still skips — its own terminal path owns
-/// compensation and the periodic reconcilers retain convergence for every
-/// skipped step. Third, a failed provenance lookup (as opposed to a
+/// quarantine and claim again. Second, an owner that can never compensate
+/// this deployment is waited out under a total wait budget with short
+/// bounded polls, so a fence it releases early is reclaimed promptly
+/// (each waiting compensation occupies one of the bounded apply worker
+/// slots): any bounded foreign owner of the SHARED global fences (an
+/// unrelated app's KBS/edge reconcile), and — Codex P2, #260 review
+/// round 5 — any bounded NON-deployment owner of an APP-SPECIFIC lane
+/// (the desired-state reconciler, which may claim the app and namespace
+/// while an apply job runs and then release the advisory lane for
+/// provider convergence; custom-domain operations; create-time DNS).
+/// Still skipping: another deployment operation of this app (its own
+/// terminal path owns compensation), the app delete flow (it tears the
+/// provider state down itself), and any unbounded retained marker — the
+/// periodic reconcilers retain convergence for every skipped step.
+/// Third, a failed provenance lookup (as opposed to a
 /// genuinely legacy NULL) never falls back to the reacquired generation:
 /// the durable sweep marker stays armed and the fences release bounded.
 ///
@@ -2487,10 +2515,11 @@ async fn compensate_after_retry_exhaustion(state: &AppState, job: &ClaimedJob, a
                     // gate in cleanup_after_terminal_apply_failure would
                     // skip this generation anyway); AppUnavailable (the
                     // delete flow tears the provider state down itself);
-                    // an unbounded retained marker; or the wait budget is
-                    // spent. Either way the sweep stays durably armed;
-                    // converge only the enqueued revocation under an
-                    // independent global fence.
+                    // an unbounded retained marker; or a bounded
+                    // non-deployment app owner (desired-state, domains)
+                    // that outlived the wait budget. Either way the sweep
+                    // stays durably armed; converge only the enqueued
+                    // revocation under an independent global fence.
                     tracing::warn!(
                         deployment_id = %job.deployment_id,
                         app_id = %job.app_id,
@@ -6205,6 +6234,245 @@ pub(crate) mod tests {
             .execute(&pool)
             .await
             .expect("delete global-contention fixture");
+    }
+
+    /// Codex P2 (#260 review round 5): a bounded NON-deployment owner of
+    /// the APP-SPECIFIC lanes is temporary and will never compensate this
+    /// deployment. Fresh evidence: the `app_desired_state` Running path
+    /// (routes/internal.rs) claims the app lane and namespace while an
+    /// apply job is running — its in-progress-job check applies only to
+    /// Stopped — then releases the advisory lane for provider convergence
+    /// while its mutation lease stays live, so the exhaustion publication
+    /// commits underneath it. The compensation must wait out that owner's
+    /// finite quarantine instead of skipping and leaving the terminalized
+    /// job's partial namespace indefinitely.
+    #[tokio::test]
+    async fn retry_exhaustion_compensation_waits_out_bounded_desired_state_owner() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _setup_handle, payload) = insert_job_fixture(&pool).await;
+        let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim setup")
+            .expect("setup exists");
+        mark_setup_accepted(&pool, deployment_id, setup.lock_token)
+            .await
+            .expect("accept setup");
+        let apply = claim_job(&pool, "pending", "running", Some(deployment_id))
+            .await
+            .expect("claim apply")
+            .expect("apply exists");
+        sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET contention_started_at = clock_timestamp() - '31 days'::interval
+              WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("age contention past the horizon");
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.side_effect_admission = Arc::new(tokio::sync::Semaphore::new(4));
+        assert!(
+            requeue_or_exhaust_apply_job(&state.db, &apply)
+                .await
+                .expect("terminalize exhausted contention")
+        );
+
+        // The desired-state operation's DROPPED lease still owns the app
+        // lane and the namespace fence through the bounded reclaim
+        // quarantine — exactly a crashed convergence request. The
+        // publication committed while the lane was released (the desired
+        // state path drops it for provider convergence), so the
+        // compensation now finds the lanes Busy.
+        let desired_state = crate::mutation_leases::claim(
+            &state,
+            app.id,
+            "app_desired_state",
+            Uuid::new_v4(),
+            false,
+            vec![crate::mutation_leases::ResourceFence::new(
+                "kubernetes_namespace",
+                &app.namespace,
+            )],
+        )
+        .await
+        .expect("claim the desired-state operation's lease");
+        drop(desired_state);
+        sqlx::query(
+            "UPDATE app_mutation_leases
+                SET locked_until = clock_timestamp() + interval '1 second',
+                    reclaim_after = clock_timestamp() + interval '2 seconds'
+              WHERE app_id = $1
+                AND operation_kind = 'app_desired_state'
+                AND owner_token IS NOT NULL",
+        )
+        .bind(app.id)
+        .execute(&pool)
+        .await
+        .expect("shrink the desired-state app lane quarantine");
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET locked_until = clock_timestamp() + interval '1 second',
+                    reclaim_after = clock_timestamp() + interval '2 seconds'
+              WHERE resource_scope = 'kubernetes_namespace'
+                AND resource_key = $1
+                AND operation_kind = 'app_desired_state'
+                AND owner_token IS NOT NULL",
+        )
+        .bind(&app.namespace)
+        .execute(&pool)
+        .await
+        .expect("shrink the desired-state namespace fence quarantine");
+
+        let started = std::time::Instant::now();
+        compensate_after_retry_exhaustion(&state, &apply, &payload.app).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_secs(2),
+            "compensation must wait out the bounded desired-state owner, took {elapsed:?}"
+        );
+
+        let (job_error, sweep_armed): (Option<String>, bool) = sqlx::query_as(
+            "SELECT job.last_error_code, deployment.cleanup_sweep_incomplete
+               FROM deployment_apply_jobs AS job
+               JOIN deployments AS deployment ON deployment.id = job.deployment_id
+              WHERE job.deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load compensated exhaustion state");
+        assert_eq!(job_error.as_deref(), Some("deployment_retry_exhausted"));
+        assert!(
+            sweep_armed,
+            "the compensating cleanup ran: an unreachable cluster keeps the retryable-sweep marker armed"
+        );
+        let (namespace_generation, bounded): (i64, bool) = sqlx::query_as(
+            "SELECT generation, reclaim_after < 'infinity'::timestamptz
+               FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1",
+        )
+        .bind(&app.namespace)
+        .fetch_one(&pool)
+        .await
+        .expect("load the compensated namespace fence");
+        assert!(
+            namespace_generation >= 2,
+            "the compensation reclaimed the namespace fence past the desired-state owner"
+        );
+        assert!(bounded, "the reclaimed fence keeps a finite horizon");
+
+        sqlx::query(
+            "DELETE FROM external_resource_mutation_leases
+              WHERE resource_key IN ('global', $1, $2, $3, $4)",
+        )
+        .bind(&app.namespace)
+        .bind(&app.domain)
+        .bind(app.tee_domain.as_deref())
+        .bind(app.custom_domain.as_deref())
+        .execute(&pool)
+        .await
+        .expect("remove quarantined exhaustion fences");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete desired-state fixture");
+    }
+
+    /// Codex P2 (#260 review round 5), counter-case: the app DELETE flow
+    /// owning the lanes is NOT a temporary non-deployment owner — it tears
+    /// the provider state down itself — so the compensation must keep
+    /// skipping immediately instead of waiting out (or stealing) its rows.
+    #[tokio::test]
+    async fn retry_exhaustion_compensation_still_skips_the_app_delete_owner() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _setup_handle, payload) = insert_job_fixture(&pool).await;
+        let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim setup")
+            .expect("setup exists");
+        mark_setup_accepted(&pool, deployment_id, setup.lock_token)
+            .await
+            .expect("accept setup");
+        let apply = claim_job(&pool, "pending", "running", Some(deployment_id))
+            .await
+            .expect("claim apply")
+            .expect("apply exists");
+        sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET contention_started_at = clock_timestamp() - '31 days'::interval
+              WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("age contention past the horizon");
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.side_effect_admission = Arc::new(tokio::sync::Semaphore::new(4));
+
+        let delete_operation = crate::mutation_leases::claim(
+            &state,
+            app.id,
+            "app_delete",
+            app.id,
+            true,
+            deployment_apply_resource_fences(&payload.app),
+        )
+        .await
+        .expect("claim the app delete flow's lease");
+        assert!(
+            requeue_or_exhaust_apply_job(&state.db, &apply)
+                .await
+                .expect("terminalize exhausted contention")
+        );
+
+        let started = std::time::Instant::now();
+        compensate_after_retry_exhaustion(&state, &apply, &payload.app).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(60),
+            "the delete-flow owner must be skipped without waiting, took {elapsed:?}"
+        );
+        let (owner_operation, namespace_generation): (Option<Uuid>, i64) = sqlx::query_as(
+            "SELECT operation_id, generation
+               FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kubernetes_namespace'
+                AND resource_key = $1",
+        )
+        .bind(&app.namespace)
+        .fetch_one(&pool)
+        .await
+        .expect("load the delete-owned namespace fence");
+        assert_eq!(
+            owner_operation,
+            Some(app.id),
+            "the delete flow keeps its rows untouched"
+        );
+        assert_eq!(
+            namespace_generation, 1,
+            "the compensation must not advance the delete flow's fence"
+        );
+
+        drop(delete_operation);
+        sqlx::query(
+            "DELETE FROM external_resource_mutation_leases
+              WHERE resource_key IN ('global', $1, $2, $3, $4)",
+        )
+        .bind(&app.namespace)
+        .bind(&app.domain)
+        .bind(app.tee_domain.as_deref())
+        .bind(app.custom_domain.as_deref())
+        .execute(&pool)
+        .await
+        .expect("remove delete-owned exhaustion fences");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete app-delete fixture");
     }
 
     #[tokio::test]
