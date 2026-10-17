@@ -221,23 +221,25 @@ where
     Ok(items)
 }
 
-/// Per-object budget for confirming a DELETE's absence (codex P2: poll
-/// foreground deletions before marking the sweep incomplete). A foreground
-/// delete of a StatefulSet with Pods keeps the set visible — a
-/// `deletionTimestamp` and a `foregroundDeletion` finalizer — until the
-/// garbage collector removes the
-/// dependents, so the first GET after an accepted DELETE commonly still
-/// returns the object even though the deletion is progressing normally.
-/// Longhorn PVC finalizers similarly hold claims after an accepted DELETE.
-/// Treating that first live response as the final outcome counted healthy
-/// deletions as incomplete (evidence retained, storage-size changes blocked)
-/// and skipped the StatefulSet's PVC sweep entirely. The poll is capped PER
-/// OBJECT so one wedged target cannot starve the remaining targets' own
-/// convergence inside the overall sweep deadline.
+/// Per-object budget for confirming a DELETE's absence. An accepted
+/// orphan delete can remain visible while the orphan finalizer detaches
+/// dependents, and other finalizers can hold it indefinitely. Poll rather
+/// than treating the first live response as failure. The budget is capped
+/// per object so a wedged target cannot starve the remaining targets.
 const SWEEP_CONFIRM_ABSENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Poll interval while waiting for an accepted DELETE to converge.
 const SWEEP_CONFIRM_ABSENCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Never cascade through tenant-writable ownerReferences in an adopted
+/// namespace, even for non-workload targets (a PVC can reference a Secret).
+fn adopted_sweep_delete_params(preconditions: kube::api::Preconditions) -> kube::api::DeleteParams {
+    kube::api::DeleteParams {
+        preconditions: Some(preconditions),
+        propagation_policy: Some(kube::api::PropagationPolicy::Orphan),
+        ..kube::api::DeleteParams::default()
+    }
+}
 
 /// Outcome of polling an accepted DELETE for confirmed absence.
 #[derive(Debug, PartialEq, Eq)]
@@ -245,7 +247,7 @@ enum SweepAbsence {
     /// The object is confirmed gone (404 observed).
     Absent,
     /// The object is still live when the confirmation window closed
-    /// (foreground GC or a finalizer still holds it): the sweep must not
+    /// (orphaning or another finalizer still holds it): the sweep must not
     /// report completion while the object may survive.
     StillLive,
     /// Absence could not be confirmed (read failures/deadline): undecidable.
@@ -375,34 +377,25 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
         }
     };
     let sweep_deadline = tokio::time::Instant::now() + SWEEP_DEADLINE;
-    // The durable PROVEN lineage windows (Codex P1): the server-reported
-    // StatefulSet creation time, UID, and — once a sweep of the row issued
-    // the sts delete — deletion time of this row and every still-incomplete
-    // sibling (a completed sweep cleared those siblings' evidence — their
-    // claims were converged). A sts creation time is only a LOWER bound on
-    // CAP lineage, never proof that a later matching claim is ours: a claim
-    // is deletable only on claim-specific evidence — creation strictly
-    // inside a CLOSED window [sts_created_at, sts_observed_deleted_at], or
-    // a controller ownerReference pinning a proven UID. Loaded fail-closed:
-    // a query failure counts as sweep failure (retryable), not as "no
-    // window" (which would silently skip claims then clear evidence
-    // over them).
-    let (sts_proven_windows, reached_sts_step_without_window, legacy_row_started_at) =
-        match sqlx::query_as::<
-            _,
-            (
-                Option<String>,
-                Option<chrono::DateTime<chrono::Utc>>,
-                Option<chrono::DateTime<chrono::Utc>>,
-                Option<chrono::DateTime<chrono::Utc>>,
-                Option<String>,
-                Option<chrono::DateTime<chrono::Utc>>,
-                chrono::DateTime<chrono::Utc>,
-                Option<Vec<String>>,
-            ),
-        >(
-            "SELECT sts_uid, sts_created_at, sts_observed_deleted_at, sts_apply_started_at,
-                manifest_hash, apply_started_at, created_at, sts_proven_uids
+    // The legacy temporal bound (devin 🔴 round-6): rows published before
+    // the `apply_started_at` column existed (manifest_hash set,
+    // apply_started_at NULL) can only be pre-release rows whose objects
+    // never carry creation evidence — a live unmarked target under them is
+    // UNRESOLVED, not foreign (see `unmarked_target_is_unresolved`).
+    // Loaded fail-closed: a query failure counts as sweep failure
+    // (retryable), not as "no legacy rows" (which would silently skip
+    // unmarked targets as foreign and clear evidence over them).
+    //
+    // (#273) The StatefulSet lineage columns (sts_uid, sts_proven_uids,
+    // ...) are deliberately NOT loaded here anymore: they used to feed the
+    // claim-deletion authority (`classify_claim_lineage` matched PVC
+    // ownerReferences against proven UIDs), which was tenant-forgeable in
+    // an adopted namespace and is removed — see
+    // `sweep_statefulset_pvcs`. The columns stay populated for
+    // observability only.
+    let legacy_row_started_at: Option<chrono::DateTime<chrono::Utc>> = {
+        let rows: Vec<SweepScopeRow> = match sqlx::query_as(
+            "SELECT manifest_hash, apply_started_at, created_at
            FROM deployments
           WHERE app_id = $1
             AND (id = $2 OR cleanup_sweep_incomplete)",
@@ -412,46 +405,23 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
         .fetch_all(&state.db)
         .await
         {
-            Ok(rows) => (
-                rows.iter()
-                    .flat_map(|(uid, created_at, _, _, _, _, _, proven_uids)| {
-                        // A row counts as a proven lineage record when the
-                        // apply response (or a prior sweep) persisted the
-                        // server-reported sts provenance. Every proven UID
-                        // stays matchable (a recreated set has a NEW uid —
-                        // Codex P2).
-                        proven_windows_for_row(
-                            uid.as_deref(),
-                            *created_at,
-                            proven_uids.as_deref().unwrap_or_default(),
-                        )
-                    })
-                    .collect::<Vec<_>>(),
-                // A row that reached the StatefulSet step but recorded no
-                // server-reported provenance (the apply response's provenance
-                // write failed): its claims are unprovable — an out-of-window
-                // matching claim may still be that row's, so "foreign" skips
-                // must not let the sweep complete over it.
-                rows.iter()
-                    .any(|(_, created_at, _, apply_started, _, _, _, _)| {
-                        apply_started.is_some() && created_at.is_none()
-                    }),
-                earliest_legacy_row_started_at(rows.iter().map(
-                    |(_, _, _, _, manifest_hash, apply_started, row_created_at, _)| {
-                        (manifest_hash.as_deref(), *apply_started, *row_created_at)
-                    },
-                )),
-            ),
+            Ok(rows) => rows,
             Err(error) => {
                 tracing::warn!(
                     app_id = %app.id,
                     deployment_id = %failed_deployment_id,
                     error = %error,
-                    "adopted-namespace sweep cannot load the proven sts lineage windows; counting the sweep as failed for retry"
+                    "adopted-namespace sweep cannot load the legacy row bound; counting the sweep as failed for retry"
                 );
                 return usize::MAX;
             }
         };
+        earliest_legacy_row_started_at(rows.iter().map(
+            |(manifest_hash, apply_started, row_created_at)| {
+                (manifest_hash.as_deref(), *apply_started, *row_created_at)
+            },
+        ))
+    };
     // Codex P2: the in-memory flag covers THIS failure; the durable
     // app-level marker covers earlier losses (a later sweep of a different
     // failed generation, or a loss surfaced on a non-job write path).
@@ -564,8 +534,6 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
         // replaced object of another generation is never hit.
         let mut deleted = false;
         let mut exhausted_conflicts = false;
-        let mut statefulset_uid: Option<String> = None;
-        let mut statefulset_created_at: Option<chrono::DateTime<chrono::Utc>> = None;
         for attempt in 0..SWEEP_DELETE_RETRIES {
             let live = match bounded_sweep_read(sweep_deadline, api.get_opt(&target.name)).await {
                 Ok(live) => live,
@@ -583,30 +551,8 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
                 }
             };
             let Some(live) = live else {
-                // Absent. For the StatefulSet this may be a RETRY after a
-                // previous sweep deleted it but could not finish its PVC
-                // sweep: run the claim sweep now under the retry-time
-                // claim-specific provenance rules — closed lineage windows
-                // and UID-pinned controller refs only (Codex P1).
-                if target.kind == "StatefulSet" {
-                    failures += sweep_statefulset_pvcs(
-                        &client,
-                        &app.namespace,
-                        &target.name,
-                        sweep_deadline,
-                        // Retry sweep after a previous sweep deleted the
-                        // sts: only the durable PROVEN lineage windows
-                        // (uid + [created_at, observed_deleted_at] of this
-                        // row and still-incomplete siblings) may authorize
-                        // deletion — Codex P1: the sts creation time alone
-                        // is only a lower bound, never proof that a later
-                        // matching claim is CAP lineage.
-                        &sts_proven_windows,
-                        None,
-                        reached_sts_step_without_window,
-                    )
-                    .await;
-                }
+                // Dependents are inspected below even on this absent-owner
+                // retry path: orphaned Pods and PVCs can still be live.
                 break; // never created, or already deleted
             };
             if !matches!(
@@ -695,34 +641,9 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
                         name = %target.name,
                         "adopted-namespace sweep skips object not created by a CAP failed apply"
                     );
-                    // self-check: a StatefulSet we refuse to delete may
-                    // still be backing live data — but its name-matching
-                    // claims remain adoptable at their old size by a later
-                    // resized deployment once this sweep reports
-                    // completion and the caller clears manifest evidence
-                    // (the storage-size guard). List them (deleting
-                    // NOTHING: the set we refused owns them) and count
-                    // each as a sweep failure so completion is never
-                    // reported over an uninspected claim set.
-                    if target.kind == "StatefulSet" {
-                        let retained_claims = count_name_matching_claims(
-                            &client,
-                            &app.namespace,
-                            &target.name,
-                            sweep_deadline,
-                        )
-                        .await;
-                        if retained_claims > 0 {
-                            tracing::warn!(
-                                app_id = %app.id,
-                                namespace = %app.namespace,
-                                statefulset = %target.name,
-                                claims = retained_claims,
-                                "adopted-namespace sweep refused a live StatefulSet but its name-matching claims remain; counting them as failures so manifest evidence (and the storage-size guard) survives"
-                            );
-                            failures += retained_claims;
-                        }
-                    }
+                    // A foreign replacement must not hide orphaned Pods or
+                    // PVCs from a previous sweep. Inspect dependents below,
+                    // irrespective of the owner's classification.
                 }
                 break;
             }
@@ -731,27 +652,19 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
                 resource_version: live.metadata.resource_version.clone(),
             };
             if target.kind == "StatefulSet" {
-                statefulset_uid = live.metadata.uid.clone();
-                // Capture the StatefulSet's creation timestamp to use as the
-                // evidence-bound for PVC deletion. Using the StatefulSet's own
-                // creation time rather than apply_started_at ensures we only
-                // delete PVCs created by THIS StatefulSet, not ones a tenant
-                // created between apply_started_at and when CAP reached the
-                // StatefulSet step.
+                // Persist the StatefulSet's proven lineage record BEFORE
+                // the delete (server-reported uid + creationTimestamp) for
+                // observability: which StatefulSet UIDs this app's failed
+                // applies created. (#273: this record no longer authorizes
+                // claim deletion — PVC ownerReferences are matched against
+                // nothing; see `sweep_statefulset_pvcs`.) The deletion edge
+                // is recorded alongside for observability.
                 let observed_created_at =
                     live.metadata.creation_timestamp.as_ref().and_then(|ts| {
                         ts.0.to_string()
                             .parse::<chrono::DateTime<chrono::Utc>>()
                             .ok()
                     });
-                statefulset_created_at = observed_created_at;
-                // Persist the StatefulSet's proven lineage record BEFORE
-                // the delete (server-reported uid + creationTimestamp):
-                // retry sweeps after the sts is gone read these columns to
-                // know which StatefulSet UID is proven CAP lineage for the
-                // ownerReference match (Codex P1 — timestamps themselves
-                // never authorize deletion). The deletion edge is recorded
-                // alongside for observability.
                 let deleted_edge = chrono::Utc::now();
                 if let (Some(uid), Some(created)) =
                     (live.metadata.uid.as_deref(), observed_created_at)
@@ -769,32 +682,21 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
                         app_id = %app.id,
                         deployment_id = %failed_deployment_id,
                         error = %error,
-                        "adopted-namespace sweep could not persist the observed sts lineage record; retry sweeps stay fail-closed"
+                        "adopted-namespace sweep could not persist the observed sts lineage record (observability-only; no sweep decision reads it)"
                     );
                 }
             }
             match bounded_sweep_read(
                 sweep_deadline,
-                api.delete(
-                    &target.name,
-                    &kube::api::DeleteParams {
-                        preconditions: Some(preconditions),
-                        // Foreground propagation: the owner must not vanish
-                        // while its Pods or other dependents are still live
-                        // (background cascading deletion would let the 404
-                        // confirmation here run ahead of the collector).
-                        propagation_policy: Some(kube::api::PropagationPolicy::Foreground),
-                        ..kube::api::DeleteParams::default()
-                    },
-                ),
+                api.delete(&target.name, &adopted_sweep_delete_params(preconditions)),
             )
             .await
             {
                 Ok(_) => {
                     // Accepted DELETE is not absence: a finalizer can hold
                     // the object in Terminating indefinitely — and with the
-                    // foreground propagation above, a StatefulSet with Pods
-                    // stays visible until garbage collection finishes.
+                    // orphan propagation above, the orphan finalizer must
+                    // finish detaching dependents before the owner vanishes.
                     // Poll for confirmed 404 within the confirmation window
                     // (codex P2) instead of treating the first live response
                     // as the final outcome, then count the target complete.
@@ -812,7 +714,7 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
                                 namespace = %app.namespace,
                                 kind = target.kind,
                                 name = %target.name,
-                                "adopted-namespace sweep delete accepted but object still live after the confirmation window (foreground GC or finalizer?); counting as incomplete"
+                                "adopted-namespace sweep delete accepted but object still live after the confirmation window (orphaning or finalizer?); counting as incomplete"
                             );
                             failures += 1;
                             break;
@@ -871,29 +773,24 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
             );
             failures += 1;
         }
-        if deleted && target.kind == "StatefulSet" {
+        // Always inspect StatefulSet dependents, including absent owners,
+        // foreign same-name replacements, refused deletes, and conflicts.
+        // Orphaned Pods lose refs; the current owner's UID/creation evidence
+        // says nothing about whether an earlier sweep left them running.
+        if target.kind == "StatefulSet" {
             // A deleted StatefulSet leaves its PVCs behind (the manifest's
-            // retention policy is Retain): sweep the CAP-created claims
-            // too, or a later resized workload would silently reuse the
-            // old-size volumes while the cleared manifest_hash had
-            // disabled the storage-size guard.
-            failures += sweep_statefulset_pvcs(
-                &client,
-                &app.namespace,
-                &target.name,
-                sweep_deadline,
-                // The durable proven windows of this row and its
-                // still-incomplete siblings (retry evidence).
-                &sts_proven_windows,
-                // The sts was proven live and just deleted by THIS sweep:
-                // its UID is this instance's proven lineage record for the
-                // ownerReference match (Codex P1).
-                statefulset_created_at.map(|_| StsProvenanceWindow {
-                    uid: statefulset_uid.clone(),
-                }),
-                reached_sts_step_without_window,
-            )
-            .await;
+            // retention policy is Retain): inspect the name-matching
+            // claims too. Since #273 the claim sweep deletes NOTHING (in
+            // an adopted namespace, PVC ownerReferences are tenant-writable
+            // and the live UID tenant-readable, so no claim field is
+            // non-forgeable); it counts every remaining name-matching
+            // claim as a failure so the sweep stays INCOMPLETE and the
+            // storage-size guard stays armed until the claims are gone
+            // (namespace owner or app deletion — #251). Orphaned Pods
+            // also keep cleanup incomplete; they are not deleted via GC.
+            failures +=
+                sweep_statefulset_dependents(&client, &app.namespace, &target.name, sweep_deadline)
+                    .await;
         }
     }
     failures
@@ -991,6 +888,14 @@ where
     )
 }
 
+/// (manifest_hash, apply_started_at, created_at) of one sweep-scope
+/// deployment row.
+type SweepScopeRow = (
+    Option<String>,
+    Option<chrono::DateTime<chrono::Utc>>,
+    chrono::DateTime<chrono::Utc>,
+);
+
 /// Codex P1 (legacy unmarked rows): a failed row that holds provider-state
 /// evidence (`manifest_hash`) but predates the migration that added
 /// `apply_started_at` — the column is stamped in the SAME atomic UPDATE
@@ -1062,74 +967,20 @@ fn unmarked_target_is_unresolved(
 /// Bounded re-read retry budget for preconditioned sweep deletes.
 const SWEEP_DELETE_RETRIES: usize = 3;
 
-/// Claim-specific lineage verdict for a name-matching PVC.
-#[derive(Debug, PartialEq, Eq)]
-enum ClaimLineage {
-    /// Proven CAP lineage — safe to delete: the claim carries a StatefulSet
-    /// controller ownerReference pinning the immutable UID of a StatefulSet
-    /// a CAP apply created (a `StsProvenanceWindow`). This is claim-specific,
-    /// NON-temporal evidence — the claim's own declared lifecycle (Kubernetes
-    /// GC deletes it together with that exact set), so sweeping it can never
-    /// hit a claim that does not belong to the workload. Codex P1: creation
-    /// during the StatefulSet's lifetime is NOT ownership proof (a tenant can
-    /// create the predictable ownerless `<vct>-<sts>-<ordinal>` name at any
-    /// moment, including the StatefulSet's birth second or the interval
-    /// before the delete edge is stamped).
-    Proven,
-    /// No controller ownerReference pins a proven StatefulSet UID: the claim
-    /// cannot be attributed to this workload's lineage. RETAINED and counted
-    /// as a failure so the sweep stays incomplete (fail closed): a retained
-    /// claim of ANY provenance that keeps the `<vct>-<sts>-<ordinal>` name
-    /// would be silently adopted at its old size — foreign data included —
-    /// by a later resized deployment once the storage guard's evidence were
-    /// cleared over it. Resolution paths: the namespace owner removes the
-    /// claim, or the app is deleted.
-    Unproven,
-}
-
-/// A proven StatefulSet lineage record: the immutable Kubernetes identity
-/// (`uid`) of a StatefulSet a CAP apply created — persisted from the apply
-/// response, or observed live by a sweep before it deleted the set. This is
-/// the identity claim ownerReferences are matched against; the recorded
-/// creation/deletion timestamps remain in the database for observability
-/// but (Codex P1) never authorize deletion.
-#[derive(Debug, Clone)]
-pub(crate) struct StsProvenanceWindow {
-    uid: Option<String>,
-}
-
 /// VCT names the CAP manifest renders (`manifest::volumes`): the sweep's
 /// claim-name shape and the controller's claim set are these two templates.
 const CAP_VCT_NAMES: [&str; 2] = ["state", "tls-state"];
 
-/// Codex P1 (non-temporal claim ownership): deletion authority for a PVC is
-/// its claim-specific, UID-pinned StatefulSet controller ownerReference —
-/// the claim's own declared lifecycle (Kubernetes GC deletes it with that
-/// set). Creation timestamps are NOT ownership proof, so temporal windows
-/// no longer authorize deletion at all; the recorded windows only say
-/// WHICH StatefulSet UIDs are proven CAP lineage for the ownerReference
-/// match. A ref pinning an unknown UID is positive evidence against this
-/// workload's lineage (a foreign same-named set's claim) and fails closed,
-/// exactly like a missing ref.
-fn classify_claim_lineage(
-    sts_owner_ref_uid: Option<&str>,
-    windows: &[StsProvenanceWindow],
-) -> ClaimLineage {
-    match sts_owner_ref_uid {
-        Some(uid) if windows.iter().any(|w| w.uid.as_deref() == Some(uid)) => ClaimLineage::Proven,
-        _ => ClaimLineage::Unproven,
-    }
-}
-
 /// Durably record a server-reported StatefulSet provenance (uid +
 /// creationTimestamp) for a deployment row. Every proven UID accumulates in
 /// `sts_proven_uids` (Codex P2 — a reclaimed deployment can re-create the
-/// set under a NEW UID, and losing that UID would leave its claims
-/// unprovable once the set is gone, stranding the cleanup marker and the
-/// storage guard); `sts_uid`/`sts_created_at` keep first-writer-wins as the
+/// set under a NEW UID, and every incarnation stays recorded);
+/// `sts_uid`/`sts_created_at` keep first-writer-wins as the
 /// primary lineage record, `observed_deleted_at` (sweep path) records the
 /// deletion edge. Callers gate WHAT is proven (CAP creation evidence) —
-/// this only records it.
+/// this only records it. (#273: this record is observability-only — it no
+/// longer feeds any deletion decision; claim deletion authority was
+/// removed from the adopted-namespace sweep entirely.)
 pub(crate) async fn persist_sts_provenance(
     pool: &sqlx::PgPool,
     app_id: Option<uuid::Uuid>,
@@ -1160,127 +1011,97 @@ pub(crate) async fn persist_sts_provenance(
     .map(|_| ())
 }
 
-/// One window per durably proven StatefulSet UID of a row: a recreated set
-/// has a NEW uid and every incarnation must stay matchable for the
-/// ownerReference proof (Codex P2). A row only counts as a proven lineage
-/// record when it carries `sts_created_at` — the paired primary record.
-fn proven_windows_for_row(
-    first_uid: Option<&str>,
-    created_at: Option<chrono::DateTime<chrono::Utc>>,
-    proven_uids: &[String],
-) -> Vec<StsProvenanceWindow> {
-    if created_at.is_none() {
-        return Vec::new();
-    }
-    let mut uids: Vec<String> = proven_uids.to_vec();
-    if let Some(first) = first_uid
-        && !uids.iter().any(|uid| uid == first)
-    {
-        uids.push(first.to_string());
-    }
-    uids.into_iter()
-        .map(|uid| StsProvenanceWindow { uid: Some(uid) })
-        .collect()
-}
-
-/// Count the name-matching claims of a StatefulSet the sweep REFUSED to
-/// delete (still live, not a CAP failed-apply leftover). Nothing may be
-/// deleted on this path — the set we refused may be backing live data and
-/// its claims with it — but the claims remain and a later resized
-/// deployment would silently adopt them at their old size once this sweep
-/// reports completion and the caller clears manifest evidence (the
-/// storage-size guard is `status <> 'failed' OR manifest_hash IS NOT
-/// NULL`). Counting each claim as a failure keeps the sweep INCOMPLETE,
-/// matching the claim policy of `sweep_statefulset_pvcs`. Fails closed
-/// (one failure) when the listing itself fails: an uninspected claim set
-/// must never look swept.
-async fn count_name_matching_claims(
+/// Orphan deletion must not let the owner reaching 404 hide running Pods.
+/// Names, not ownerReferences, identify candidates: orphaning removes refs,
+/// and retries must still find the Pods after the StatefulSet has vanished.
+/// Retain rather than delete them: cascading a Pod delete could likewise
+/// remove a tenant PVC with a forged reference to that Pod. Pods may still
+/// be running; the namespace owner must remove them (or delete the app).
+/// Until then, cleanup remains incomplete even when no PVCs exist.
+async fn sweep_statefulset_dependents(
     client: &kube::Client,
     namespace: &str,
     statefulset: &str,
     sweep_deadline: tokio::time::Instant,
 ) -> usize {
-    let api: kube::Api<k8s_openapi::api::core::v1::PersistentVolumeClaim> =
+    let claims = sweep_statefulset_pvcs(client, namespace, statefulset, sweep_deadline).await;
+    let pods: kube::Api<k8s_openapi::api::core::v1::Pod> =
         kube::Api::namespaced(client.clone(), namespace);
-    match bounded_sweep_list_all(&api, sweep_deadline).await {
-        Ok(claims) => claims
-            .iter()
-            .filter(|pvc| {
-                pvc.metadata
-                    .name
-                    .as_deref()
-                    .is_some_and(|name| is_cap_claim_name(name, statefulset, &CAP_VCT_NAMES))
-            })
-            .count(),
+    match bounded_sweep_list_all(&pods, sweep_deadline).await {
+        Ok(pods) => {
+            claims
+                + pods
+                    .iter()
+                    .filter(|pod| {
+                        pod.metadata.name.as_deref().is_some_and(|name| {
+                            name.strip_prefix(statefulset)
+                                .and_then(|suffix| suffix.strip_prefix('-'))
+                                .is_some_and(|ordinal| {
+                                    !ordinal.is_empty()
+                                        && ordinal.bytes().all(|c| c.is_ascii_digit())
+                                        && (ordinal == "0" || !ordinal.starts_with('0'))
+                                })
+                        })
+                    })
+                    .count()
+        }
         Err(error) => {
-            tracing::warn!(
-                namespace = %namespace,
-                statefulset = %statefulset,
-                error = %error,
-                "adopted-namespace sweep cannot list claims of a refused StatefulSet; failing closed"
-            );
-            1
+            tracing::warn!(%namespace, %statefulset, %error,
+                "cannot inspect orphaned Pods; retaining adopted-namespace cleanup evidence");
+            claims + 1
         }
     }
 }
 
-/// Bounded window for the StatefulSet controller to reconcile claim
-/// ownerReferences after the retention-policy flip, and the poll interval
-/// while waiting. The flip is an ordinary mutable-field patch; the
-/// controller's sync period is sub-second, so a healthy controller
-/// converges well inside the wait. The wait is best-effort latency
-/// padding only — deletion authority comes from the refs themselves, and
-/// claims still unreferenced after the wait are simply retained.
-/// Delete the PVCs this failed generation's StatefulSet created in an
-/// adopted namespace. A claim is deleted ONLY on claim-specific,
-/// non-temporal proof of CAP lineage (Codex P1 — see
-/// `classify_claim_lineage`): a controller ownerReference pinning the
-/// immutable UID of a proven CAP StatefulSet. Creation timestamps never
-/// authorize deletion — a tenant can create the predictable ownerless
-/// `<vct>-<sts>-<ordinal>` name at any moment (including the
-/// StatefulSet's birth second or the interval before a deletion edge is
-/// recorded), and a StatefulSet does not reserve that name.
+/// Inspect the name-matching PVC claims of a swept StatefulSet in an
+/// ADOPTED namespace and report how many claims keep the sweep INCOMPLETE.
+/// Since #273 this sweep DELETES NOTHING: deletion authority used to be the
+/// claim's own `ownerReferences` — a StatefulSet-kind ref pinning the UID
+/// of a StatefulSet a CAP apply created (`classify_claim_lineage`, now
+/// removed) — but in an adopted namespace every input to that proof is
+/// tenant-controllable: `ownerReferences` on the tenant's own PVCs are
+/// tenant-writable, and the live StatefulSet's UID is namespace-readable
+/// (so even requiring apiVersion/kind/name/controller/UID to match exactly
+/// what the controller stamps only raises the forgery bar — every field
+/// stays forgeable). A tenant could plant a predictable
+/// `<vct>-<sts>-<ordinal>` claim (any canonical ordinal) with a forged
+/// StatefulSet ownerRef and the sweep would delete it as "proven".
 ///
-/// Claims without that proof are RETAINED and counted as failures so the
-/// sweep reports INCOMPLETE (non-zero) while they remain — reporting zero
-/// would let the caller clear manifest evidence over retained claims,
-/// allowing a later resized deployment to silently adopt them at their
-/// old size. Note the deliberate asymmetry: the sweep NEVER manufactures
-/// this proof (grok P1 — flipping `whenDeleted: Retain` to `Delete` makes
-/// the controller ADOPT name-matching tenant claims and stamp ownerRefs
-/// onto them; the GC cascade would then delete tenant data regardless of
-/// what this classifier says). Under the manifest's Retain/Retain policy
-/// natural ownerReferences are rare, so retained claims — and the kept
-/// manifest evidence blocking storage-size changes — are the expected
-/// fail-closed state for a failed generation that had claims; app
-/// deletion is the resolution path (tracked in issue #251).
+/// Deletion authority must be CAP-recorded evidence the namespace tenant
+/// cannot manufacture, and no such evidence exists for claims here:
+/// - the recorded StatefulSet provenance proves the SET is CAP's, not the
+///   claim (the controller, not CAP, creates claims);
+/// - a CAP-observed claim-UID ledger (the issue's option 1) does not exist
+///   for these rows: apply ever only observes the ordinal-0 claims
+///   (`inspect_fresh_volume_claims`) and persists none of their UIDs, and
+///   the ownership gate confines this sweep to failed rows that never
+///   reached `watching` — so no recorded claim UID is available to
+///   authorize a delete here (option 1 is unimplemented state, not an
+///   impossible one; building it is far more machinery than option 2);
+/// - the sweep only ever runs in ADOPTED namespaces (a CAP-created
+///   namespace is deleted wholesale and its claims die with it), so
+///   restricting claim deletion to CAP-created namespaces (option 2) means
+///   this path never deletes — which is what this implements, retaining
+///   claims fail-closed exactly as the issue directs.
 ///
-/// This applies to PRE-EXISTING claims exactly as it does to unprovable
-/// ones (devin 🔴 follow-up): when no row in scope ever reached the
-/// StatefulSet step, name-matching claims are provably not CAP's — but
-/// they are still ADOPTABLE at their old size by a later resized
-/// deployment, which is the same silent-reuse hazard the paragraph above
-/// guards. Clearing evidence over them would disarm the deploy route's
-/// storage-size guard (the only resize protection) while the claim stays
-/// intact, so the sweep reports incomplete and keeps the evidence;
-/// "provably pre-existing" only changes the log wording and the
-/// resolution path (the namespace owner can safely remove the claim),
-/// never the verdict. This deliberately supersedes the earlier
-/// pre-StatefulSet carve-out that reported these claims harmless: that
-/// unblocking traded exactly this hazard away.
+/// Every name-matching claim — forged or legitimate — is therefore
+/// RETAINED and counted as a failure so the sweep reports INCOMPLETE
+/// while any remain: reporting zero would let the caller clear manifest
+/// evidence over retained claims, allowing a later resized deployment to
+/// silently adopt them at their old size (the deploy route's storage-size
+/// guard — `status <> 'failed' OR manifest_hash IS NOT NULL` — is the only
+/// resize protection and must stay armed). Owner deletion uses Orphan
+/// propagation as well: delegating deletion to Kubernetes GC would still
+/// destroy tenant PVCs carrying forged references. Orphaned Pods are also
+/// retained and counted by `sweep_statefulset_dependents`.
+/// Resolution paths for retained claims: the namespace
+/// owner removes the claim, or the app is deleted (issue #251).
 pub(crate) async fn sweep_statefulset_pvcs(
     client: &kube::Client,
     namespace: &str,
     statefulset: &str,
     sweep_deadline: tokio::time::Instant,
-    sts_proven_windows: &[StsProvenanceWindow],
-    sts_live_window: Option<StsProvenanceWindow>,
-    unproven_sts_step: bool,
 ) -> usize {
-    let mut all_windows: Vec<_> = sts_proven_windows.to_vec();
-    if let Some(live) = sts_live_window {
-        all_windows.push(live);
-    }
     let api: kube::Api<k8s_openapi::api::core::v1::PersistentVolumeClaim> =
         kube::Api::namespaced(client.clone(), namespace);
     let list = match bounded_sweep_list_all(&api, sweep_deadline).await {
@@ -1295,9 +1116,9 @@ pub(crate) async fn sweep_statefulset_pvcs(
             return 1;
         }
     };
-    // Inspect only name-matching claims, and decide the no-window outcome
-    // from what is actually retained rather than up front: an empty match
-    // set is a complete sweep even with no provenance.
+    // Inspect only name-matching claims; an empty match set is a complete
+    // sweep. Anything else is retained fail-closed (#273): no claim field
+    // is non-forgeable in an adopted namespace, so no claim is deleted.
     let matching_claims: Vec<_> = list
         .into_iter()
         .filter(|pvc| {
@@ -1310,146 +1131,13 @@ pub(crate) async fn sweep_statefulset_pvcs(
     if matching_claims.is_empty() {
         return 0;
     }
-    if all_windows.is_empty() {
-        if !unproven_sts_step {
-            // devin 🔴 follow-up (preexisting claims bypass storage-size
-            // guard): no row in scope ever reached the StatefulSet step, so
-            // no CAP apply could have created these claims — but a matching
-            // claim is still ADOPTABLE at its old size by a later resized
-            // deployment (the StatefulSet controller reuses the claim the
-            // volumeClaimTemplate name points at). Reporting the sweep
-            // complete here would clear manifest_hash over the retained
-            // claim and disarm the deploy route's storage-size guard — the
-            // only thing preventing that silent old-size adoption. Keep the
-            // claims and count the sweep incomplete: evidence stays, size
-            // changes stay blocked. Resolution paths: the namespace owner
-            // removes the claim, or the app is deleted (#251).
-            tracing::warn!(
-                namespace = %namespace,
-                statefulset = %statefulset,
-                claims = matching_claims.len(),
-                "adopted-namespace PVC sweep retains provably pre-existing claims (no row reached the StatefulSet step): they are not CAP's to delete but would be silently adopted at their old size by a resized retry; counting the sweep incomplete and keeping manifest evidence"
-            );
-            return matching_claims.len();
-        }
-        // Some row reached the StatefulSet step without recording
-        // provenance (e.g. a previous sweep deleted the sts and its
-        // provenance write failed): claims are unprovable. Touch
-        // nothing, but do NOT report the sweep complete: returning zero
-        // here would let the caller clear manifest_hash and the cleanup
-        // marker over claims that were never inspected, leaving them
-        // silently reusable by a later resized deployment.
-        tracing::warn!(
-            namespace = %namespace,
-            statefulset = %statefulset,
-            claims = matching_claims.len(),
-            "adopted-namespace PVC sweep retains name-matching claims with no proven StatefulSet lineage record; counting the sweep incomplete for retry"
-        );
-        return 1;
-    }
-    let mut failures = 0usize;
-    for pvc in matching_claims {
-        let Some(name) = pvc.metadata.name.clone() else {
-            continue;
-        };
-        // GC alignment (grok P1): the garbage collector cascades a
-        // StatefulSet deletion onto EVERY claim carrying that set's uid in
-        // `ownerReferences` — controller-flagged or not. The classifier
-        // must therefore treat any StatefulSet ownerReference pinning a
-        // proven UID as the claim's identity; classifying narrower than GC
-        // would "retain" a claim the cascade deletes anyway.
-        let sts_owner_ref_uid = pvc
-            .metadata
-            .owner_references
-            .as_ref()
-            .and_then(|owners| owners.iter().find(|owner| owner.kind == "StatefulSet"))
-            .map(|owner| owner.uid.clone());
-        match classify_claim_lineage(sts_owner_ref_uid.as_deref(), &all_windows) {
-            ClaimLineage::Proven => {}
-            ClaimLineage::Unproven => {
-                // Retain the claim and count a failure so the sweep
-                // stays INCOMPLETE: skipping it silently would let the
-                // caller clear manifest_hash / the cleanup marker while
-                // the claim remains (the silent-reuse hazard: a later
-                // resized deployment would adopt it at its old size).
-                tracing::warn!(
-                    namespace = %namespace,
-                    pvc = %name,
-                    sts_owner_ref = ?sts_owner_ref_uid,
-                    "adopted-namespace PVC sweep cannot prove claim lineage from a UID-pinned StatefulSet ownerReference; retaining the claim and counting the sweep incomplete"
-                );
-                failures += 1;
-                continue;
-            }
-        }
-        let preconditions = kube::api::Preconditions {
-            uid: pvc.metadata.uid.clone(),
-            resource_version: pvc.metadata.resource_version.clone(),
-        };
-        if tokio::time::Instant::now() >= sweep_deadline {
-            tracing::warn!(
-                namespace = %namespace,
-                pvc = %name,
-                "adopted-namespace PVC sweep hit the overall deadline; counting remaining claims as failures"
-            );
-            failures += 1;
-            continue;
-        }
-        match bounded_sweep_read(
-            sweep_deadline,
-            api.delete(
-                &name,
-                &kube::api::DeleteParams {
-                    preconditions: Some(preconditions),
-                    ..kube::api::DeleteParams::default()
-                },
-            ),
-        )
-        .await
-        {
-            Err(kube::Error::Api(error)) if error.code == 404 => {
-                // Already gone: successful cleanup, not a failure.
-                continue;
-            }
-            Err(error) => {
-                tracing::warn!(
-                    namespace = %namespace,
-                    pvc = %name,
-                    error = %error,
-                    "adopted-namespace sweep could not delete this generation's PVC; will retry via reconciliation"
-                );
-                failures += 1;
-            }
-            Ok(_) => {
-                // Accepted is not absent (Longhorn finalizers can hold a
-                // claim in Terminating): poll for confirmed 404 within the
-                // confirmation window (codex P2 — a single immediate GET
-                // would count a normally-progressing deletion incomplete),
-                // else the sweep is incomplete and retains provider-state
-                // evidence.
-                match wait_for_sweep_absence(&api, &name, sweep_deadline).await {
-                    SweepAbsence::Absent => {}
-                    SweepAbsence::StillLive => {
-                        tracing::warn!(
-                            namespace = %namespace,
-                            pvc = %name,
-                            "adopted-namespace sweep PVC delete accepted but claim still live after the confirmation window (finalizer?); counting as incomplete"
-                        );
-                        failures += 1;
-                    }
-                    SweepAbsence::Uninspectable => {
-                        tracing::warn!(
-                            namespace = %namespace,
-                            pvc = %name,
-                            "adopted-namespace sweep cannot confirm PVC absence; counting as incomplete"
-                        );
-                        failures += 1;
-                    }
-                }
-            }
-        }
-    }
-    failures
+    tracing::warn!(
+        namespace = %namespace,
+        statefulset = %statefulset,
+        claims = matching_claims.len(),
+        "adopted-namespace PVC sweep retains every name-matching claim (#273): in an adopted namespace ownerReferences are tenant-writable and the live StatefulSet UID is tenant-readable, so no claim field can authorize deletion; counting the sweep incomplete so manifest evidence (and the storage-size guard) survives"
+    );
+    matching_claims.len()
 }
 
 /// `<vct>-<statefulset>-<ordinal>` with a canonical ordinal, mirroring the
@@ -2036,63 +1724,13 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
                 namespace = %app.namespace,
                 "failed-apply cleanup sweeps published objects from adopted namespace (no creation evidence; namespace not deleted)"
             );
-            // The claim bound is the earliest StatefulSet-step start across
-            // THIS row AND every still-incomplete sibling row (a completed
-            // sweep clears those siblings' evidence — their shared-name
-            // objects, including retained claims, were converged — so
-            // their older claims must be within this sweep's deletion
-            // window). sts_apply_started_at is stamped immediately before
-            // the StatefulSet step, so a tenant claim created after
-            // apply_started_at but before that step predates the bound
-            // and can never be swept. Rows whose applies never reached
-            // the StatefulSet step (NULL sts stamp, incl. legacy rows
-            // predating the column) fall back to apply_started_at /
-            // observing_since / created_at.
-            // The claim-bound query stays solely for its fail-closed
-            // error handling: a database failure here marks the sweep
-            // incomplete for a later retry instead of letting it run
-            // without the PVC ownership bound it has to re-derive from
-            // the row set.
-            if let Err(error) = sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
-                "SELECT MIN(COALESCE(sts_apply_started_at, apply_started_at, observing_since, created_at)) FROM deployments WHERE app_id = $1 AND (id = $2 OR cleanup_sweep_incomplete)",
-            )
-            .bind(app.id)
-            .bind(failed_deployment_id)
-            .fetch_one(&state.db)
-            .await
-            {
-                    // The PVC ownership bound is load-bearing, not optional:
-                    // treating a transient query failure as "no bound"
-                    // would make sweep_statefulset_pvcs skip every claim
-                    // (created_after_apply_start false) while still
-                    // reporting zero failures — the sweep would then
-                    // declare itself complete and clear provider evidence
-                    // over retained claims. Fail the sweep instead.
-                    tracing::warn!(
-                        app_id = %app.id,
-                        deployment_id = %failed_deployment_id,
-                        error = %error,
-                        "failed-apply cleanup cannot load the PVC ownership bound; marking the sweep incomplete for a later retry"
-                    );
-                    if let Err(mark_error) = sqlx::query(
-                        "UPDATE deployments
-                         SET cleanup_sweep_incomplete = true
-                         WHERE id = $1 AND app_id = $2 AND status = 'failed'",
-                    )
-                    .bind(failed_deployment_id)
-                    .bind(app.id)
-                    .execute(&state.db)
-                    .await
-                    {
-                        tracing::warn!(
-                            app_id = %app.id,
-                            deployment_id = %failed_deployment_id,
-                            error = %mark_error,
-                            "failed-apply cleanup could not mark the row's sweep incomplete"
-                        );
-                    }
-                return CleanupFenceOutcome::ReleaseNormally;
-            }
+            // (#273) The PVC claim sweep retains every name-matching claim
+            // (tenant-writable ownerReferences can never authorize
+            // deletion in an adopted namespace), so the old fail-closed
+            // pre-fetch of the "PVC ownership bound" here is gone: no
+            // bound is derived from the row set anymore. The sweep's own
+            // listing still fails closed inside
+            // `sweep_published_objects_from_adopted_namespace`.
             match mutation
                 .guard_provider(sweep_published_objects_from_adopted_namespace(
                     state,
@@ -3142,14 +2780,13 @@ mod tests {
     }
 
     /// Codex P2 regression: a reclaimed deployment can re-create its
-    /// StatefulSet under a NEW UID. Every proven UID must accumulate and
-    /// stay matchable for the claim ownerReference proof — retaining only
-    /// the first would leave the recreated incarnation's claims unprovable
-    /// once its set is deleted, stranding the cleanup marker and the
-    /// storage guard. First-writer-wins still applies to the primary
+    /// StatefulSet under a NEW UID. Every proven UID accumulates exactly
+    /// once (observability ledger — #273: no longer a deletion authority,
+    /// but operators still read which UIDs this app's failed applies
+    /// created). First-writer-wins still applies to the primary
     /// sts_uid/sts_created_at record.
     #[tokio::test]
-    async fn recreated_statefulset_uids_all_remain_proven() {
+    async fn recreated_statefulset_uids_all_accumulate() {
         let pool = cleanup_test_pool().await;
         let app_id = insert_cleanup_app_fixture(&pool).await;
         let failed_id = Uuid::new_v4();
@@ -3212,23 +2849,6 @@ mod tests {
             proven_uids,
             vec!["uid-a".to_string(), "uid-b".to_string()],
             "every proven UID accumulates exactly once"
-        );
-
-        let windows = proven_windows_for_row(first_uid.as_deref(), first_created, &proven_uids);
-        assert_eq!(
-            classify_claim_lineage(Some("uid-b"), &windows),
-            ClaimLineage::Proven,
-            "the recreated incarnation's claims must stay provable after its set is gone"
-        );
-        assert_eq!(
-            classify_claim_lineage(Some("uid-a"), &windows),
-            ClaimLineage::Proven,
-            "the first incarnation's claims must stay provable too"
-        );
-        assert_eq!(
-            classify_claim_lineage(Some("uid-foreign"), &windows),
-            ClaimLineage::Unproven,
-            "an unknown UID stays unproven"
         );
 
         delete_cleanup_fixture(&pool, app_id).await;
@@ -3774,45 +3394,378 @@ mod tests {
         ));
     }
 
-    /// Codex P1 (non-temporal claim ownership): deletion authority is the
-    /// claim-specific, UID-pinned StatefulSet controller ownerReference —
-    /// the claim's own declared lifecycle (Kubernetes GC deletes it with
-    /// exactly that set). Creation timestamps never prove ownership: a
-    /// tenant can create the predictable ownerless name at any moment,
-    /// including the StatefulSet's birth second or the interval before a
-    /// deletion edge is recorded.
-    #[test]
-    fn claim_lineage_requires_uid_pinned_owner_ref() {
-        let window = provenance_window(Some("uid-cap-1"));
-        // The controller's own claim: ref pins a proven UID — hard proof.
-        assert_eq!(
-            classify_claim_lineage(Some("uid-cap-1"), std::slice::from_ref(&window)),
-            ClaimLineage::Proven
+    /// Owner deletion must not turn forged refs into GC deletion authority.
+    #[tokio::test]
+    async fn adopted_sweep_orphans_owner_and_retains_forged_dependents() {
+        use axum::http::{Request, Response};
+        use http_body_util::BodyExt;
+        use kube::client::Body;
+        use std::sync::{Arc, Mutex};
+        use tower::service_fn;
+
+        let delete_options = Arc::new(Mutex::new(None));
+        let observed = delete_options.clone();
+        let client = kube::Client::new(
+            service_fn(move |request: Request<Body>| {
+                let observed = observed.clone();
+                async move {
+                    let method = request.method().clone();
+                    let path = request.uri().path().to_string();
+                    let bytes = request.into_body().collect().await.unwrap().to_bytes();
+                    let (status, body) = if method == "DELETE" {
+                        assert!(
+                            path.ends_with("/statefulsets/demo"),
+                            "must not delete Pods/PVCs"
+                        );
+                        let options: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                        *observed.lock().unwrap() = Some(options.clone());
+                        // Model GC's key security consequence: cascading owner
+                        // deletion would remove the forged claim before inspection.
+                        (
+                            200,
+                            serde_json::json!({"apiVersion":"v1", "kind":"Status", "status":"Success"}),
+                        )
+                    } else if path.ends_with("/persistentvolumeclaims") {
+                        let options = observed
+                            .lock()
+                            .unwrap()
+                            .clone()
+                            .expect("owner deleted first");
+                        let items = if options["propagationPolicy"] == "Orphan" {
+                            vec![
+                                serde_json::json!({"apiVersion":"v1", "kind":"PersistentVolumeClaim",
+                            "metadata":{"name":"state-demo-999", "uid":"tenant-claim",
+                                "ownerReferences":[{"apiVersion":"apps/v1", "kind":"StatefulSet",
+                                    "name":"demo", "uid":"sts-uid", "controller":true}]}}),
+                            ]
+                        } else {
+                            vec![]
+                        };
+                        (
+                            200,
+                            serde_json::json!({"apiVersion":"v1", "kind":"PersistentVolumeClaimList", "items":items}),
+                        )
+                    } else if path.ends_with("/pods") {
+                        // Already-orphaned Pod: retry discovery cannot rely on refs.
+                        (
+                            200,
+                            serde_json::json!({"apiVersion":"v1", "kind":"PodList", "items":[
+                                {"metadata":{"name":"demo-0"}},
+                                {"metadata":{"name":"other-0"}},
+                                {"metadata":{"name":"demo-extra-0"}}
+                            ]}),
+                        )
+                    } else {
+                        assert!(path.ends_with("/statefulsets/demo"));
+                        (
+                            404,
+                            serde_json::json!({"apiVersion":"v1", "kind":"Status", "status":"Failure", "reason":"NotFound", "code":404}),
+                        )
+                    };
+                    Ok::<_, std::io::Error>(
+                        Response::builder()
+                            .status(status)
+                            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                            .unwrap(),
+                    )
+                }
+            }),
+            "default",
         );
-        // A foreign same-named set's claim: ref pins an UNKNOWN uid —
-        // positive evidence against this workload's lineage. Never delete.
+        let api: kube::Api<k8s_openapi::api::apps::v1::StatefulSet> =
+            kube::Api::namespaced(client.clone(), "cap-demo");
+        api.delete(
+            "demo",
+            &adopted_sweep_delete_params(kube::api::Preconditions {
+                uid: Some("sts-uid".into()),
+                resource_version: Some("42".into()),
+            }),
+        )
+        .await
+        .unwrap();
+        let deadline = tokio::time::Instant::now() + SWEEP_DEADLINE;
         assert_eq!(
-            classify_claim_lineage(Some("uid-foreign-sts"), std::slice::from_ref(&window)),
-            ClaimLineage::Unproven
+            wait_for_sweep_absence(&api, "demo", deadline).await,
+            SweepAbsence::Absent
         );
-        // No ref at all (the Retain/Retain era, or a tenant's ownerless
-        // claim): unprovable — retained, sweep stays incomplete.
-        assert_eq!(
-            classify_claim_lineage(None, std::slice::from_ref(&window)),
-            ClaimLineage::Unproven
+        for _ in 0..2 {
+            assert_eq!(
+                sweep_statefulset_dependents(&client, "cap-demo", "demo", deadline).await,
+                2,
+                "owner 404 must not clear evidence over a forged PVC or an orphaned Pod, including retries"
+            );
+        }
+        let options = delete_options.lock().unwrap().clone().unwrap();
+        assert_eq!(options["propagationPolicy"], "Orphan");
+        assert_eq!(options["preconditions"]["uid"], "sts-uid");
+        assert_eq!(options["preconditions"]["resourceVersion"], "42");
+    }
+
+    #[tokio::test]
+    async fn orphaned_pod_inspection_fails_closed() {
+        use axum::http::{Request, Response};
+        use http_body_util::BodyExt;
+        use kube::client::Body;
+        use tower::service_fn;
+        for pod_list_fails in [false, true] {
+            let client = kube::Client::new(
+                service_fn(move |request: Request<Body>| async move {
+                    let is_pod = request.uri().path().ends_with("/pods");
+                    let _ = request.into_body().collect().await;
+                    let (status, body) = if is_pod && pod_list_fails {
+                        (
+                            500,
+                            serde_json::json!({"apiVersion":"v1", "kind":"Status", "status":"Failure", "message":"unavailable", "code":500}),
+                        )
+                    } else {
+                        (
+                            200,
+                            serde_json::json!({"apiVersion":"v1", "kind":if is_pod {"PodList"} else {"PersistentVolumeClaimList"}, "items":[]}),
+                        )
+                    };
+                    Ok::<_, std::io::Error>(
+                        Response::builder()
+                            .status(status)
+                            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                            .unwrap(),
+                    )
+                }),
+                "default",
+            );
+            assert_eq!(
+                sweep_statefulset_dependents(
+                    &client,
+                    "cap-demo",
+                    "demo",
+                    tokio::time::Instant::now() + SWEEP_DEADLINE
+                )
+                .await,
+                usize::from(pod_list_fails)
+            );
+        }
+    }
+
+    /// #273 regression: in an adopted namespace the tenant can read the
+    /// live StatefulSet's UID (namespace-readable) and write
+    /// `ownerReferences` on their own PVCs (tenant-writable), so a forged
+    /// predictable-name claim carrying a StatefulSet-kind ownerRef pinning
+    /// that UID — even one matching apiVersion/kind/name/controller/uid
+    /// exactly, i.e. everything the interim hardening would have required
+    /// — must NOT be deleted by the sweep. No PVC delete request may be
+    /// issued at all: every name-matching claim is retained and counted,
+    /// keeping the sweep incomplete (evidence and the storage-size guard
+    /// survive; resolution paths per #251). The owner-delete propagation
+    /// is covered separately by the orphan-propagation regression.
+    #[tokio::test]
+    async fn forged_owner_ref_claims_are_retained_and_sweep_stays_incomplete() {
+        use axum::http::{Request, Response};
+        use http_body_util::BodyExt;
+        use kube::client::Body;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tower::service_fn;
+
+        let namespace = "cap-demo".to_string();
+        let statefulset = "demo".to_string();
+        // The UID of the live, proven-window StatefulSet — readable by the
+        // namespace tenant, so forgeable into their own claims' refs.
+        let live_sts_uid = "11111111-2222-3333-4444-555555555555".to_string();
+        let deletes = Arc::new(AtomicUsize::new(0));
+        let deletes_for_closure = deletes.clone();
+        let namespace_for_closure = namespace.clone();
+        let live_sts_uid_for_closure = live_sts_uid.clone();
+        let client = kube::Client::new(
+            service_fn(move |request: Request<Body>| {
+                let deletes = deletes_for_closure.clone();
+                let namespace = namespace_for_closure.clone();
+                let live_sts_uid = live_sts_uid_for_closure.clone();
+                async move {
+                    let method = request.method().clone();
+                    let path = request.uri().path().to_string();
+                    let _ = request.into_body().collect().await;
+                    if method == "DELETE" && path.contains("/persistentvolumeclaims/") {
+                        deletes.fetch_add(1, Ordering::SeqCst);
+                    }
+                    // The claim set a tenant prepares: a forged
+                    // out-of-replica-ordinal claim AND a controller-exact
+                    // legitimate-looking one, both pinning the live
+                    // (proven-window) StatefulSet UID. Under the old
+                    // classifier both classified `Proven` and were deleted.
+                    let body = serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "PersistentVolumeClaimList",
+                        "metadata": {},
+                        "items": [
+                            {
+                                "apiVersion": "v1",
+                                "kind": "PersistentVolumeClaim",
+                                "metadata": {
+                                    "name": "state-demo-999",
+                                    "namespace": namespace,
+                                    "uid": "forged-claim-uid",
+                                    "resourceVersion": "10",
+                                    "creationTimestamp": "2026-10-17T00:00:00Z",
+                                    "ownerReferences": [{
+                                        "apiVersion": "apps/v1",
+                                        "kind": "StatefulSet",
+                                        "name": "demo",
+                                        "uid": live_sts_uid,
+                                        "controller": true,
+                                        "blockOwnerDeletion": true,
+                                    }],
+                                },
+                            },
+                            {
+                                "apiVersion": "v1",
+                                "kind": "PersistentVolumeClaim",
+                                "metadata": {
+                                    "name": "tls-state-demo-0",
+                                    "namespace": namespace,
+                                    "uid": "legit-looking-claim-uid",
+                                    "resourceVersion": "11",
+                                    "creationTimestamp": "2026-10-17T00:00:01Z",
+                                    "ownerReferences": [{
+                                        "apiVersion": "apps/v1",
+                                        "kind": "StatefulSet",
+                                        "name": "demo",
+                                        "uid": live_sts_uid,
+                                        "controller": true,
+                                        "blockOwnerDeletion": true,
+                                    }],
+                                },
+                            },
+                            // Ownerless name-matching claim: the Retain/Retain
+                            // common path (the controller stamps no
+                            // ownerReferences). A later filter that only
+                            // counted ownerRef-bearing claims would pass an
+                            // ownerRef-only fixture and silently exempt this
+                            // one — it must count too.
+                            {
+                                "apiVersion": "v1",
+                                "kind": "PersistentVolumeClaim",
+                                "metadata": {
+                                    "name": "state-demo-0",
+                                    "namespace": namespace,
+                                    "uid": "ownerless-claim-uid",
+                                    "resourceVersion": "12",
+                                    "creationTimestamp": "2026-10-17T00:00:02Z",
+                                },
+                            },
+                        ],
+                    });
+                    Ok::<_, std::io::Error>(
+                        Response::builder()
+                            .status(200)
+                            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                            .unwrap(),
+                    )
+                }
+            }),
+            "default",
         );
-        // Ref to a proven UID but no lineage record in scope (e.g. the
-        // provenance write was lost): fail closed.
+
+        let failures = sweep_statefulset_pvcs(
+            &client,
+            &namespace,
+            &statefulset,
+            tokio::time::Instant::now() + SWEEP_DEADLINE,
+        )
+        .await;
         assert_eq!(
-            classify_claim_lineage(Some("uid-cap-1"), &[]),
-            ClaimLineage::Unproven
+            failures, 3,
+            "every name-matching claim (forged, legitimate-looking, or ownerless) must keep the sweep incomplete"
         );
-        // Sibling generation's proven UID counts (converging older
-        // incomplete siblings' claims under the same ref proof).
-        let sibling = provenance_window(Some("uid-cap-0"));
         assert_eq!(
-            classify_claim_lineage(Some("uid-cap-0"), &[window, sibling]),
-            ClaimLineage::Proven
+            deletes.load(Ordering::SeqCst),
+            0,
+            "no PVC delete request may be issued: in an adopted namespace tenant-writable ownerReferences are never deletion authority (#273)"
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_claim_count_fail_closed_arms() {
+        use axum::http::{Request, Response};
+        use http_body_util::BodyExt;
+        use kube::client::Body;
+        use tower::service_fn;
+
+        let namespace = "cap-demo".to_string();
+        let statefulset = "demo".to_string();
+
+        // Arm 1: a PVC list error must count as one failure, never as a
+        // complete sweep — returning 0 over an uninspected claim set is
+        // how a later edit would clear manifest evidence silently.
+        let error_client = kube::Client::new(
+            service_fn(move |request: Request<Body>| async move {
+                let _ = request.into_body().collect().await;
+                Ok::<_, std::io::Error>(
+                    Response::builder()
+                        .status(500)
+                        .body(Body::from(
+                            br#"{"kind":"Status","apiVersion":"v1","status":"Failure","message":"boom","code":500}"#.to_vec(),
+                        ))
+                        .unwrap(),
+                )
+            }),
+            "default",
+        );
+        let failures = sweep_statefulset_pvcs(
+            &error_client,
+            &namespace,
+            &statefulset,
+            tokio::time::Instant::now() + SWEEP_DEADLINE,
+        )
+        .await;
+        assert_eq!(
+            failures, 1,
+            "a PVC list error must keep the sweep incomplete"
+        );
+
+        // Arm 2: only non-matching names (foreign set, non-canonical
+        // ordinal, no name at all) is an empty match set: complete (0),
+        // proving the filter does not count every PVC. (The
+        // name-matching lock — including ownerless claims — is the forged
+        // fixture above.)
+        let body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaimList",
+            "metadata": {},
+            "items": [
+                {"apiVersion": "v1", "kind": "PersistentVolumeClaim",
+                 "metadata": {"name": "state-other-0"}},
+                {"apiVersion": "v1", "kind": "PersistentVolumeClaim",
+                 "metadata": {"name": "state-demo-00"}},
+                {"apiVersion": "v1", "kind": "PersistentVolumeClaim",
+                 "metadata": {"name": "unrelated"}},
+                {"apiVersion": "v1", "kind": "PersistentVolumeClaim",
+                 "metadata": {}},
+            ],
+        });
+        let filter_client = kube::Client::new(
+            service_fn(move |request: Request<Body>| {
+                let body = body.clone();
+                async move {
+                    let _ = request.into_body().collect().await;
+                    Ok::<_, std::io::Error>(
+                        Response::builder()
+                            .status(200)
+                            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                            .unwrap(),
+                    )
+                }
+            }),
+            "default",
+        );
+        let failures = sweep_statefulset_pvcs(
+            &filter_client,
+            &namespace,
+            &statefulset,
+            tokio::time::Instant::now() + SWEEP_DEADLINE,
+        )
+        .await;
+        assert_eq!(
+            failures, 0,
+            "claims that do not match the canonical CAP name shape must not count"
         );
     }
 
@@ -3884,12 +3837,6 @@ mod tests {
         chrono::DateTime::parse_from_rfc3339(rfc3339)
             .expect("parse bound")
             .with_timezone(&chrono::Utc)
-    }
-
-    fn provenance_window(uid: Option<&str>) -> StsProvenanceWindow {
-        StsProvenanceWindow {
-            uid: uid.map(str::to_string),
-        }
     }
 
     #[test]
