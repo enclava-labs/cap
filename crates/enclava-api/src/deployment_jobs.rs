@@ -3895,12 +3895,10 @@ async fn publish_rollout_outcome_with_mutation(
             Option<chrono::DateTime<chrono::Utc>>,
             i64,
             chrono::DateTime<chrono::Utc>,
-            bool,
         ),
     >(
         "SELECT app_id, org_id, status, manifest_hash,
-                observing_since, rollout_timeout_millis, created_at,
-                namespace_fence_provenance_incomplete
+                observing_since, rollout_timeout_millis, created_at
            FROM deployments
           WHERE id = $1
           FOR UPDATE",
@@ -3921,10 +3919,9 @@ async fn publish_rollout_outcome_with_mutation(
     // persisted rollout budget has outlived the deliberately unbounded
     // owner-wait extension: terminalize the requeue loop instead of
     // scheduling another observation attempt (#231).
-    // Migration-era attempts may have unrecorded provider writes. Keep their
-    // nonterminal jobs retryable; a later claim cannot complete that history.
+    // Incomplete migration provenance affects cleanup classification, not the
+    // observation deadline: migrated watching jobs must also terminate.
     let exhausted = !outcome.terminal
-        && !deployment.7
         && nonterminal_observation_exhausted(deployment.4, deployment.5, deployment.6);
     let exhausted_outcome;
     let outcome = if exhausted {
@@ -6858,6 +6855,58 @@ pub(crate) mod tests {
             .execute(&pool)
             .await
             .expect("delete legacy fixture");
+    }
+
+    #[tokio::test]
+    async fn incomplete_migrated_observation_publishes_terminal_exhaustion() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
+        let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim setup")
+            .expect("setup exists");
+        mark_setup_accepted(&pool, deployment_id, setup.lock_token)
+            .await
+            .expect("accept setup");
+        let apply = claim_job(&pool, "pending", "running", Some(deployment_id))
+            .await
+            .expect("claim apply")
+            .expect("apply exists");
+        sqlx::query("UPDATE deployments SET status = 'watching', manifest_hash = 'legacy', observing_since = clock_timestamp() - interval '25 hours', rollout_timeout_millis = 600000, namespace_fence_provenance_incomplete = TRUE, namespace_fence_generations = ARRAY[42]::bigint[] WHERE id = $1")
+            .bind(deployment_id).execute(&pool).await.expect("age migrated observation");
+        assert!(
+            apply_job_retries_exhausted(&pool, deployment_id)
+                .await
+                .expect("check observation horizon")
+        );
+        assert!(
+            publish_rollout_outcome_with_mutation(
+                &pool,
+                &apply,
+                &DeploymentRolloutOutcome {
+                    deploy_status: "watching",
+                    app_status: "creating",
+                    error_code: None,
+                    terminal: false,
+                    manifest_hash: "legacy".to_string(),
+                },
+                None,
+            )
+            .await
+            .expect("publish exhausted migrated observation")
+        );
+        let (status, job_state, code, incomplete, generations): (String, String, Option<String>, bool, Vec<i64>) = sqlx::query_as(
+            "SELECT d.status::text, j.state, j.last_error_code, d.namespace_fence_provenance_incomplete, d.namespace_fence_generations FROM deployments d JOIN deployment_apply_jobs j ON j.deployment_id = d.id WHERE d.id = $1",
+        ).bind(deployment_id).fetch_one(&pool).await.expect("load exhausted observation");
+        assert_eq!((status.as_str(), job_state.as_str()), ("failed", "failed"));
+        assert_eq!(code.as_deref(), Some(DEPLOYMENT_RETRY_EXHAUSTED_MESSAGE));
+        assert!(incomplete, "cleanup must retain incomplete provenance");
+        assert_eq!(generations, vec![42]);
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete observation fixture");
     }
 
     #[tokio::test]
