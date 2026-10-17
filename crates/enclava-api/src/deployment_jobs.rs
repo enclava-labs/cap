@@ -2105,7 +2105,7 @@ async fn requeue_apply_job(pool: &PgPool, job: &ClaimedJob) -> Result<(), Deploy
                 locked_until = NULL,
                 next_attempt_at = clock_timestamp() + make_interval(secs =>
                     LEAST(
-                        $1::bigint * (1::bigint << LEAST(attempts, $6::int)),
+                        $1::bigint * (1::bigint << LEAST(GREATEST(attempts - 1, 0), $6::int)),
                         $2::bigint
                     )),
                 contention_started_at = COALESCE(contention_started_at, clock_timestamp()),
@@ -4011,7 +4011,7 @@ async fn publish_rollout_outcome_with_mutation(
                     WHEN $1 THEN next_attempt_at
                     ELSE clock_timestamp() + make_interval(secs =>
                         LEAST(
-                            $2::bigint * (1::bigint << LEAST(attempts, $5::int)),
+                            $2::bigint * (1::bigint << LEAST(GREATEST(attempts - 1, 0), $5::int)),
                             $6::bigint
                         ))
                 END,

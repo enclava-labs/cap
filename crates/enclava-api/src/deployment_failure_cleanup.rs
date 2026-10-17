@@ -2401,7 +2401,7 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
 /// evidence. The unconditional self-veto cannot block a retryable sweep:
 /// `cleanup_sweep_incomplete` is only ever armed for rows with NULL
 /// `observing_since`, and a failed row can never reach watching again.
-async fn no_other_generation_owns_provider_state(
+pub(crate) async fn no_other_generation_owns_provider_state(
     pool: &sqlx::PgPool,
     app_id: Uuid,
     failed_deployment_id: Uuid,
