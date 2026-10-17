@@ -1735,8 +1735,22 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
     // generations the provider state can actually carry — an annotation
     // stamped by ANY of the deployment's attempts authorizes teardown,
     // because each of those generations was uniquely claimed by it.
-    namespace_generation_provenance: Option<Vec<MutationGeneration>>,
+    namespace_generation_provenance: Result<Option<Vec<MutationGeneration>>, sqlx::Error>,
 ) -> CleanupFenceOutcome {
+    let namespace_generation_provenance = match namespace_generation_provenance {
+        Ok(provenance) => provenance,
+        Err(lookup_error) => {
+            tracing::warn!(deployment_id = %failed_deployment_id, error = %lookup_error,
+                "namespace provenance lookup failed; retaining cleanup for reconciliation");
+            return if persist_retained_namespace_marker(mutation, app.id, failed_deployment_id)
+                .await
+            {
+                CleanupFenceOutcome::RetainNamespaceFence
+            } else {
+                CleanupFenceOutcome::ReleaseNormally
+            };
+        }
+    };
     // Devin BUG + Codex P2 (round 2, on 844184d3): a deployment whose 0078
     // stamp is incomplete may carry a PRE-LEDGER namespace generation the
     // append-only set never recorded (and no later claim restamped). The

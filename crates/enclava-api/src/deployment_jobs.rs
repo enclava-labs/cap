@@ -2646,7 +2646,7 @@ async fn compensate_after_retry_exhaustion(state: &AppState, job: &ClaimedJob, a
         job.deployment_id,
         &mut mutation,
         false,
-        namespace_provenance,
+        Ok(namespace_provenance),
     )
     .await;
     // The terminal publisher enqueued signed-policy revocation; converge it
@@ -2996,6 +2996,10 @@ async fn begin_rollout_observation(
     if result.rows_affected() != 1 {
         return Err(DeploymentJobError::LeaseLost);
     }
+    // The current running claim is the first observation attempt. Do not
+    // inherit transient apply claims into observation's exponential backoff.
+    sqlx::query("UPDATE deployment_apply_jobs SET attempts = 1 WHERE deployment_id = $1 AND lock_token = $2 AND state = 'running'")
+        .bind(job.deployment_id).bind(job.lock_token).execute(&mut **tx).await?;
     mutation.finish_in_tx(tx).await?;
     Ok(())
 }
@@ -3741,29 +3745,8 @@ async fn fail_apply_job_with_mutation(
                     enclava_engine::apply::engine::ApplyError::CreationEvidenceLost { .. }
                 ))
             ),
-            // grok-4.7 review (loop #34): the apply's own lease generation is
-            // NOT always the generation stamped on the namespace. A job whose
-            // stamp is incomplete (pre-migration stamp N, then a
-            // post-migration claim of N+1 that fails terminally BEFORE
-            // restamping — KBS reconcile runs before the namespace write)
-            // classifies Foreign against the current lease generation,
-            // releases the fences, and never retries, stranding the
-            // namespace. Load the durable append-only set — every
-            // generation this deployment's attempts claimed — instead; a
-            // lookup failure falls back to the previous behavior (current
-            // generation only).
-            match retry_exhaustion_namespace_provenance(&state.db, job.deployment_id).await {
-                Ok(provenance) => provenance,
-                Err(lookup_error) => {
-                    tracing::warn!(
-                        deployment_id = %job.deployment_id,
-                        error = %lookup_error,
-                        error_code = "immediate_cleanup_provenance_lookup_failed",
-                        "failed-apply cleanup falling back to the current lease generation"
-                    );
-                    None
-                }
-            },
+            // Preserve lookup failure as unknown, never current-generation-only.
+            retry_exhaustion_namespace_provenance(&state.db, job.deployment_id).await,
         )
         .await
             == crate::deployment_failure_cleanup::CleanupFenceOutcome::RetainNamespaceFence
@@ -6962,6 +6945,15 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn incomplete_provenance_lookup_failure_retains_retryable_namespace_fence() {
+        check_provenance_lookup_failure_retention(false).await;
+    }
+
+    #[tokio::test]
+    async fn generation_provenance_lookup_failure_retains_retryable_namespace_fence() {
+        check_provenance_lookup_failure_retention(true).await;
+    }
+
+    async fn check_provenance_lookup_failure_retention(generation_lookup_failed: bool) {
         let pool = database_test_pool().await;
         let (app, deployment_id, _, _) = insert_job_fixture(&pool).await;
         let mut state = crate::test_support::lazy_state();
@@ -6988,7 +6980,11 @@ pub(crate) mod tests {
             deployment_id,
             &mut mutation,
             false,
-            None,
+            if generation_lookup_failed {
+                Err(sqlx::Error::PoolClosed)
+            } else {
+                Ok(None)
+            },
         )
         .await;
         assert_eq!(
@@ -9040,6 +9036,11 @@ pub(crate) mod tests {
         .execute(&pool)
         .await
         .expect("stage applied manifest hash");
+        sqlx::query("UPDATE deployment_apply_jobs SET attempts = 20 WHERE deployment_id = $1")
+            .bind(waiting_deployment)
+            .execute(&pool)
+            .await
+            .expect("simulate apply retries before observing");
         let mut authority_lane = pool
             .begin()
             .await
@@ -9144,6 +9145,14 @@ pub(crate) mod tests {
         .expect("load resumable watching state");
         assert_eq!(job_state, "pending");
         assert_eq!(deployment_status, "watching");
+        let (attempts, delay): (i32, i64) = sqlx::query_as(
+            "SELECT attempts, EXTRACT(EPOCH FROM (next_attempt_at - clock_timestamp()))::bigint FROM deployment_apply_jobs WHERE deployment_id = $1",
+        ).bind(waiting_deployment).fetch_one(&pool).await.expect("load observation phase backoff");
+        assert_eq!(attempts, 1);
+        assert!(
+            (29..=30).contains(&delay),
+            "first observation must use base delay, got {delay}"
+        );
 
         peer.finish().await.expect("release peer shared fences");
         sqlx::query(
