@@ -567,22 +567,8 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
                 }
             };
             let Some(live) = live else {
-                // Absent. For the StatefulSet this may be a RETRY after a
-                // previous sweep orphaned it but could not finish its
-                // dependent sweep: inspect Pods too, and retain every
-                // name-matching claim fail-closed (#273: in an adopted
-                // namespace no claim field is non-forgeable, so claims are
-                // never deleted here; the sweep only reports how many
-                // keep it incomplete).
-                if target.kind == "StatefulSet" {
-                    failures += sweep_statefulset_dependents(
-                        &client,
-                        &app.namespace,
-                        &target.name,
-                        sweep_deadline,
-                    )
-                    .await;
-                }
+                // Dependents are inspected below even on this absent-owner
+                // retry path: orphaned Pods and PVCs can still be live.
                 break; // never created, or already deleted
             };
             let classification =
@@ -679,34 +665,9 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
                         name = %target.name,
                         "adopted-namespace sweep skips object not created by a CAP failed apply"
                     );
-                    // self-check: a StatefulSet we refuse to delete may
-                    // still be backing live data — but its name-matching
-                    // claims remain adoptable at their old size by a later
-                    // resized deployment once this sweep reports
-                    // completion and the caller clears manifest evidence
-                    // (the storage-size guard). List them (deleting
-                    // NOTHING: the set we refused owns them) and count
-                    // each as a sweep failure so completion is never
-                    // reported over an uninspected claim set.
-                    if target.kind == "StatefulSet" {
-                        let retained_claims = count_name_matching_claims(
-                            &client,
-                            &app.namespace,
-                            &target.name,
-                            sweep_deadline,
-                        )
-                        .await;
-                        if retained_claims > 0 {
-                            tracing::warn!(
-                                app_id = %app.id,
-                                namespace = %app.namespace,
-                                statefulset = %target.name,
-                                claims = retained_claims,
-                                "adopted-namespace sweep refused a live StatefulSet but its name-matching claims remain; counting them as failures so manifest evidence (and the storage-size guard) survives"
-                            );
-                            failures += retained_claims;
-                        }
-                    }
+                    // A foreign replacement must not hide orphaned Pods or
+                    // PVCs from a previous sweep. Inspect dependents below,
+                    // irrespective of the owner's classification.
                 }
                 break;
             }
@@ -836,7 +797,11 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
             );
             failures += 1;
         }
-        if deleted && target.kind == "StatefulSet" {
+        // Always inspect StatefulSet dependents, including absent owners,
+        // foreign same-name replacements, refused deletes, and conflicts.
+        // Orphaned Pods lose refs; the current owner's UID/creation evidence
+        // says nothing about whether an earlier sweep left them running.
+        if target.kind == "StatefulSet" {
             // A deleted StatefulSet leaves its PVCs behind (the manifest's
             // retention policy is Retain): inspect the name-matching
             // claims too. Since #273 the claim sweep deletes NOTHING (in
@@ -1221,47 +1186,6 @@ pub(crate) async fn persist_creation_records(
         .await?;
     }
     Ok(())
-}
-
-/// Count the name-matching claims of a StatefulSet the sweep REFUSED to
-/// delete (still live, not a CAP failed-apply leftover). Nothing may be
-/// deleted on this path — the set we refused may be backing live data and
-/// its claims with it — but the claims remain and a later resized
-/// deployment would silently adopt them at their old size once this sweep
-/// reports completion and the caller clears manifest evidence (the
-/// storage-size guard is `status <> 'failed' OR manifest_hash IS NOT
-/// NULL`). Counting each claim as a failure keeps the sweep INCOMPLETE,
-/// matching the claim policy of `sweep_statefulset_pvcs`. Fails closed
-/// (one failure) when the listing itself fails: an uninspected claim set
-/// must never look swept.
-async fn count_name_matching_claims(
-    client: &kube::Client,
-    namespace: &str,
-    statefulset: &str,
-    sweep_deadline: tokio::time::Instant,
-) -> usize {
-    let api: kube::Api<k8s_openapi::api::core::v1::PersistentVolumeClaim> =
-        kube::Api::namespaced(client.clone(), namespace);
-    match bounded_sweep_list_all(&api, sweep_deadline).await {
-        Ok(claims) => claims
-            .iter()
-            .filter(|pvc| {
-                pvc.metadata
-                    .name
-                    .as_deref()
-                    .is_some_and(|name| is_cap_claim_name(name, statefulset, &CAP_VCT_NAMES))
-            })
-            .count(),
-        Err(error) => {
-            tracing::warn!(
-                namespace = %namespace,
-                statefulset = %statefulset,
-                error = %error,
-                "adopted-namespace sweep cannot list claims of a refused StatefulSet; failing closed"
-            );
-            1
-        }
-    }
 }
 
 /// Orphan deletion must not let the owner reaching 404 hide running Pods.
