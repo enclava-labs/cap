@@ -52,6 +52,18 @@ unpinned="$(
 validate_block="$(job_block validate publish)"
 publish_block="$(job_block publish "")"
 
+# Both jobs must install into an isolated interpreter and carry its PATH
+# into later steps; pip against Ubuntu's managed Python fails with PEP 668.
+for block in "$validate_block" "$publish_block"; do
+  for required in \
+    'python3 -m venv "$RUNNER_TEMP/api-image-venv"' \
+    '"$RUNNER_TEMP/api-image-venv/bin/python3" -m pip install --disable-pip-version-check --quiet "pyyaml==6.0.2"' \
+    'printf '\''%s\n'\'' "$RUNNER_TEMP/api-image-venv/bin" >> "$GITHUB_PATH"'; do
+    grep -Fq -- "$required" <<< "$block" \
+      || fail "each job must provision the guard virtual environment: $required"
+  done
+done
+
 for required in \
   "workflow_dispatch:" \
   "version_tag:" \
@@ -103,8 +115,8 @@ done
 # way. A `run` key anywhere else (job env:, strategy.matrix:, action with:
 # inputs) is data, not shell, and an ampersand in a plain scalar is
 # just text. Invalid YAML fails closed: an unparsable workflow is rejected,
-# never silently skipped. The parser is python3 + PyYAML (preinstalled on
-# GitHub-hosted ubuntu runners); if it is missing the guard exits nonzero so
+# never silently skipped. Both CI jobs install pinned PyYAML in a virtual
+# environment and put its python3 on PATH; if it is missing the guard exits nonzero so
 # CI fails loud instead of letting the workflow through unscanned.
 scan_workflow() {
   python3 - "$1" "$2" <<'PYGUARD'
