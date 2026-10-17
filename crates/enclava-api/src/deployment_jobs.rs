@@ -2147,7 +2147,7 @@ async fn apply_job_retries_exhausted(
     deployment_id: Uuid,
 ) -> Result<bool, DeploymentJobError> {
     let exhausted = sqlx::query_scalar::<_, bool>(
-        "SELECT (
+        "SELECT NOT d.namespace_fence_provenance_incomplete AND ((
                 d.status = 'watching'::deploy_status_enum
                 AND d.observing_since IS NOT NULL
                 AND clock_timestamp() > d.observing_since
@@ -2158,7 +2158,7 @@ async fn apply_job_retries_exhausted(
                 (d.status <> 'watching'::deploy_status_enum OR d.observing_since IS NULL)
                 AND j.contention_started_at IS NOT NULL
                 AND clock_timestamp() > j.contention_started_at + make_interval(secs => $3)
-            )
+            ))
            FROM deployments AS d
            JOIN deployment_apply_jobs AS j ON j.deployment_id = d.id
           WHERE d.id = $1",
@@ -3848,10 +3848,12 @@ async fn publish_rollout_outcome_with_mutation(
             Option<chrono::DateTime<chrono::Utc>>,
             i64,
             chrono::DateTime<chrono::Utc>,
+            bool,
         ),
     >(
         "SELECT app_id, org_id, status, manifest_hash,
-                observing_since, rollout_timeout_millis, created_at
+                observing_since, rollout_timeout_millis, created_at,
+                namespace_fence_provenance_incomplete
            FROM deployments
           WHERE id = $1
           FOR UPDATE",
@@ -3872,7 +3874,10 @@ async fn publish_rollout_outcome_with_mutation(
     // persisted rollout budget has outlived the deliberately unbounded
     // owner-wait extension: terminalize the requeue loop instead of
     // scheduling another observation attempt (#231).
+    // Migration-era attempts may have unrecorded provider writes. Keep their
+    // nonterminal jobs retryable; a later claim cannot complete that history.
     let exhausted = !outcome.terminal
+        && !deployment.7
         && nonterminal_observation_exhausted(deployment.4, deployment.5, deployment.6);
     let exhausted_outcome;
     let outcome = if exhausted {
@@ -6568,6 +6573,134 @@ pub(crate) mod tests {
             .execute(&pool)
             .await
             .expect("delete foreign-fence fixture");
+    }
+
+    #[tokio::test]
+    async fn provenance_migration_marks_existing_active_rows_but_not_new_deployments() {
+        let pool = database_test_pool().await;
+        let mut tx = pool.begin().await.expect("migration test transaction");
+        // Shadow only this transaction's deployments table: exercise the actual
+        // migration against pre-column rows without rewriting the shared schema.
+        sqlx::raw_sql(
+            "CREATE TEMP TABLE deployments (status TEXT) ON COMMIT DROP;
+             INSERT INTO deployments (status) VALUES
+                 ('pending'), ('applying'), ('watching'), ('healthy'), ('failed');",
+        )
+        .execute(&mut *tx)
+        .await
+        .expect("stage pre-migration rows");
+        sqlx::raw_sql(include_str!(
+            "../migrations/0078_deployment_namespace_fence_generation.sql"
+        ))
+        .execute(&mut *tx)
+        .await
+        .expect("apply provenance migration");
+        let rows: Vec<(String, bool)> = sqlx::query_as(
+            "SELECT status, namespace_fence_provenance_incomplete
+               FROM pg_temp.deployments ORDER BY status",
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .expect("read migrated rows");
+        for (status, incomplete) in rows {
+            assert_eq!(
+                incomplete,
+                matches!(status.as_str(), "pending" | "applying" | "watching")
+            );
+        }
+        let incomplete: bool = sqlx::query_scalar(
+            "INSERT INTO pg_temp.deployments (status) VALUES ('pending')
+             RETURNING namespace_fence_provenance_incomplete",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .expect("insert post-migration deployment");
+        assert!(
+            !incomplete,
+            "new jobs record every claim from their first attempt"
+        );
+        tx.rollback()
+            .await
+            .expect("discard isolated migration fixture");
+    }
+
+    #[tokio::test]
+    async fn incomplete_migrated_provenance_keeps_both_exhaustion_paths_retryable() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
+        let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim setup")
+            .expect("setup exists");
+        mark_setup_accepted(&pool, deployment_id, setup.lock_token)
+            .await
+            .expect("accept setup");
+        let apply = claim_job(&pool, "pending", "running", Some(deployment_id))
+            .await
+            .expect("claim apply")
+            .expect("apply exists");
+        sqlx::query(
+            "UPDATE deployments SET namespace_fence_provenance_incomplete = TRUE WHERE id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("simulate migrated in-flight job");
+        // A preflight-only retry appends a NEW generation, but that does not
+        // recover the namespace generation stamped before the migration.
+        record_namespace_fence_claim(&pool, deployment_id, app.id, app.org_id, 42)
+            .await
+            .expect("append later claim");
+        sqlx::query("UPDATE deployment_apply_jobs SET contention_started_at = clock_timestamp() - interval '31 days' WHERE deployment_id = $1")
+            .bind(deployment_id).execute(&pool).await.expect("age contention");
+        assert!(
+            !requeue_or_exhaust_apply_job(&pool, &apply)
+                .await
+                .expect("requeue legacy job")
+        );
+        let apply = claim_job(&pool, "pending", "running", Some(deployment_id))
+            .await
+            .expect("reclaim")
+            .expect("legacy job remains claimable");
+        sqlx::query("UPDATE deployments SET status = 'watching', manifest_hash = 'legacy', observing_since = clock_timestamp() - interval '25 hours', rollout_timeout_millis = 600000 WHERE id = $1")
+            .bind(deployment_id).execute(&pool).await.expect("age observation");
+        assert!(
+            !apply_job_retries_exhausted(&pool, deployment_id)
+                .await
+                .expect("legacy watching exhaustion check")
+        );
+        let failed = publish_rollout_outcome_with_mutation(
+            &pool,
+            &apply,
+            &DeploymentRolloutOutcome {
+                deploy_status: "watching",
+                app_status: "creating",
+                error_code: None,
+                terminal: false,
+                manifest_hash: "legacy".to_string(),
+            },
+            None,
+        )
+        .await
+        .expect("publish legacy observation");
+        assert!(
+            !failed,
+            "incomplete provenance must not synthesize terminal failure"
+        );
+        let (status, job_state, incomplete, generations): (String, String, bool, Vec<i64>) = sqlx::query_as(
+            "SELECT d.status::text, j.state, d.namespace_fence_provenance_incomplete, d.namespace_fence_generations FROM deployments d JOIN deployment_apply_jobs j ON j.deployment_id = d.id WHERE d.id = $1",
+        ).bind(deployment_id).fetch_one(&pool).await.expect("load retryable legacy state");
+        assert_eq!(
+            (status.as_str(), job_state.as_str()),
+            ("watching", "pending")
+        );
+        assert!(incomplete);
+        assert_eq!(generations, vec![42]);
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete legacy fixture");
     }
 
     #[tokio::test]

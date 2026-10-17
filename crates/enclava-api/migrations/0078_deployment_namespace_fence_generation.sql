@@ -9,10 +9,21 @@
 -- exhausts classifies and sweeps the leftover namespace against this set
 -- — the generations the failing attempts actually could have stamped —
 -- never the fresh generation its reacquired fence carries.
--- NULL/empty on rows written before this column existed; compensation
--- then keeps the pre-existing conservative classification.
+-- Existing active deployments may already have stamped a namespace before
+-- provenance recording existed. Later claims cannot recover that history.
+-- Keep those jobs retryable instead of exhausting with an incomplete set;
+-- new deployments have complete provenance from their first claim onward.
 ALTER TABLE deployments
-    ADD COLUMN namespace_fence_generations BIGINT[];
+    ADD COLUMN namespace_fence_generations BIGINT[],
+    ADD COLUMN namespace_fence_provenance_incomplete BOOLEAN NOT NULL DEFAULT FALSE;
+
+UPDATE deployments
+   SET namespace_fence_provenance_incomplete = TRUE
+ WHERE status IN ('pending', 'applying', 'watching');
+
+-- Appending a new claim MUST NOT clear the incomplete flag. A legacy job can
+-- still complete normally, be superseded, or be deleted; automatic exhaustion
+-- cannot safely assume its unrecorded provider state has been compensated.
 
 ALTER TABLE deployments
     ADD CONSTRAINT deployments_namespace_fence_generations_positive
