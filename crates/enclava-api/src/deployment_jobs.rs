@@ -2147,7 +2147,12 @@ async fn apply_job_retries_exhausted(
     deployment_id: Uuid,
 ) -> Result<bool, DeploymentJobError> {
     let exhausted = sqlx::query_scalar::<_, bool>(
-        "SELECT NOT d.namespace_fence_provenance_incomplete AND ((
+        // Round 2 (Devin BUG): incomplete provenance no longer blocks
+        // exhaustion — cleanup now accepts the pre-ledger live annotation
+        // when the marker is set (see cleanup_after_terminal_apply_failure),
+        // so leaving such jobs on the requeue loop forever has no remaining
+        // purpose and strands every deployment in flight at 0078 time.
+        "SELECT ((
                 d.status = 'watching'::deploy_status_enum
                 AND d.observing_since IS NOT NULL
                 AND clock_timestamp() > d.observing_since
@@ -6797,7 +6802,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn incomplete_migrated_provenance_keeps_both_exhaustion_paths_retryable() {
+    async fn incomplete_migrated_provenance_exhausts_and_preserves_pre_ledger_provenance() {
         let pool = database_test_pool().await;
         let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
         let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
@@ -6825,47 +6830,27 @@ pub(crate) mod tests {
             .expect("append later claim");
         sqlx::query("UPDATE deployment_apply_jobs SET contention_started_at = clock_timestamp() - interval '31 days' WHERE deployment_id = $1")
             .bind(deployment_id).execute(&pool).await.expect("age contention");
+        // Round 2 (Devin BUG on 844184d3): incomplete provenance no longer
+        // blocks exhaustion — cleanup now accepts the pre-ledger live
+        // annotation when the marker is set, so a migrated in-flight job
+        // past its contention horizon terminalizes instead of requeueing
+        // forever.
         assert!(
-            !requeue_or_exhaust_apply_job(&pool, &apply)
+            requeue_or_exhaust_apply_job(&pool, &apply)
                 .await
-                .expect("requeue legacy job")
+                .expect("exhaust legacy job")
         );
-        let apply = claim_job(&pool, "pending", "running", Some(deployment_id))
-            .await
-            .expect("reclaim")
-            .expect("legacy job remains claimable");
-        sqlx::query("UPDATE deployments SET status = 'watching', manifest_hash = 'legacy', observing_since = clock_timestamp() - interval '25 hours', rollout_timeout_millis = 600000 WHERE id = $1")
-            .bind(deployment_id).execute(&pool).await.expect("age observation");
-        assert!(
-            !apply_job_retries_exhausted(&pool, deployment_id)
-                .await
-                .expect("legacy watching exhaustion check")
-        );
-        let failed = publish_rollout_outcome_with_mutation(
-            &pool,
-            &apply,
-            &DeploymentRolloutOutcome {
-                deploy_status: "watching",
-                app_status: "creating",
-                error_code: None,
-                terminal: false,
-                manifest_hash: "legacy".to_string(),
-            },
-            None,
-        )
-        .await
-        .expect("publish legacy observation");
-        assert!(
-            !failed,
-            "incomplete provenance must not synthesize terminal failure"
-        );
-        let (status, job_state, incomplete, generations): (String, String, bool, Vec<i64>) = sqlx::query_as(
-            "SELECT d.status::text, j.state, d.namespace_fence_provenance_incomplete, d.namespace_fence_generations FROM deployments d JOIN deployment_apply_jobs j ON j.deployment_id = d.id WHERE d.id = $1",
-        ).bind(deployment_id).fetch_one(&pool).await.expect("load retryable legacy state");
+        let (status, error_message, incomplete, generations): (String, Option<String>, bool, Vec<i64>) = sqlx::query_as(
+            "SELECT d.status::text, d.error_message, d.namespace_fence_provenance_incomplete, d.namespace_fence_generations FROM deployments d WHERE d.id = $1",
+        ).bind(deployment_id).fetch_one(&pool).await.expect("load terminalized legacy state");
+        assert_eq!(status, "failed");
         assert_eq!(
-            (status.as_str(), job_state.as_str()),
-            ("watching", "pending")
+            error_message.as_deref(),
+            Some(DEPLOYMENT_RETRY_EXHAUSTED_MESSAGE),
+            "exhaustion must publish the bounded classification"
         );
+        // The pre-ledger marker and the recorded later claim both survive:
+        // cleanup classifies the live annotation against them.
         assert!(incomplete);
         assert_eq!(generations, vec![42]);
         sqlx::query("DELETE FROM organizations WHERE id = $1")

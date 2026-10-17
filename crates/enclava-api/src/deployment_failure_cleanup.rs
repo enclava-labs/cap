@@ -1737,6 +1737,19 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
     // because each of those generations was uniquely claimed by it.
     namespace_generation_provenance: Option<Vec<MutationGeneration>>,
 ) -> CleanupFenceOutcome {
+    // Devin BUG + Codex P2 (round 2, on 844184d3): a deployment whose 0078
+    // stamp is incomplete may carry a PRE-LEDGER namespace generation the
+    // append-only set never recorded (and no later claim restamped). The
+    // incomplete marker itself is the durable proof this deployment created
+    // that state, so the live annotation — when not newer than anything
+    // this deployment could have written — authorizes teardown.
+    let provenance_incomplete: bool = sqlx::query_scalar(
+        "SELECT namespace_fence_provenance_incomplete FROM deployments WHERE id = $1",
+    )
+    .bind(failed_deployment_id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap_or(false);
     // Durably record the evidence loss BEFORE any later step: even if this
     // process dies mid-cleanup, a later sweep of any failed generation of
     // this app must still see the marker and count unmarked live targets as
@@ -1855,6 +1868,7 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
         .guard_provider(classify_failed_generation_namespace(
             app,
             &namespace_generations,
+            provenance_incomplete,
         ))
         .await
     {
@@ -2035,6 +2049,7 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
                     .guard_provider(delete_owned_namespace(
                         app,
                         &namespace_generations,
+                        provenance_incomplete,
                         uid,
                         resource_version,
                     ))
@@ -2538,6 +2553,7 @@ pub(crate) enum InitialNamespaceOwnership {
 pub(crate) fn classify_initial_namespace_get(
     result: &Result<k8s_openapi::api::core::v1::Namespace, kube::Error>,
     generations: &[MutationGeneration],
+    provenance_incomplete: bool,
 ) -> InitialNamespaceOwnership {
     match result {
         Ok(namespace) => {
@@ -2548,10 +2564,12 @@ pub(crate) fn classify_initial_namespace_get(
                         .get(enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION)
                 })
                 .and_then(|raw| raw.parse::<i64>().ok());
+            let known_max = generations.iter().map(|generation| generation.get()).max();
             if live.is_some_and(|live| {
                 generations
                     .iter()
                     .any(|generation| live == generation.get())
+                    || (provenance_incomplete && known_max.is_none_or(|max| live < max))
             }) {
                 // Last-writer proof alone is not creation proof: only the
                 // creation annotation (stamped by `apply_namespace`'s
@@ -2616,6 +2634,7 @@ pub(crate) fn classify_initial_namespace_get(
 async fn classify_failed_generation_namespace(
     app: &App,
     generations: &[MutationGeneration],
+    provenance_incomplete: bool,
 ) -> InitialNamespaceOwnership {
     let client = match kube::Client::try_default().await {
         Ok(client) => client,
@@ -2640,7 +2659,7 @@ async fn classify_failed_generation_namespace(
         .await
         .map_err(|_| kube::Error::Service("namespace ownership probe timed out".into()))
         .and_then(|inner| inner);
-    classify_initial_namespace_get(&probed, generations)
+    classify_initial_namespace_get(&probed, generations, provenance_incomplete)
 }
 
 /// Delete the namespace that ALREADY passed the ownership classification,
@@ -2668,6 +2687,7 @@ async fn classify_failed_generation_namespace(
 async fn delete_owned_namespace(
     app: &App,
     generations: &[MutationGeneration],
+    provenance_incomplete: bool,
     owned_uid: String,
     owned_resource_version: String,
 ) -> NamespaceTeardown {
@@ -2810,7 +2830,11 @@ async fn delete_owned_namespace(
                 let same_uid = live.metadata.uid.as_deref() == Some(pinned_uid.as_str());
                 let still_ours = same_uid
                     && matches!(
-                        classify_initial_namespace_get(&Ok(live.clone()), generations),
+                        classify_initial_namespace_get(
+                            &Ok(live.clone()),
+                            generations,
+                            provenance_incomplete,
+                        ),
                         InitialNamespaceOwnership::Owned { .. }
                     )
                     && live.metadata.resource_version.is_some();
@@ -3576,21 +3600,44 @@ mod tests {
                 .expect("valid sibling generation"),
         ];
         assert!(matches!(
-            classify_initial_namespace_get(&Ok(annotated_namespace(7)), &claimed),
+            classify_initial_namespace_get(&Ok(annotated_namespace(7)), &claimed, false),
             InitialNamespaceOwnership::Owned { .. }
         ));
         assert!(matches!(
-            classify_initial_namespace_get(&Ok(annotated_namespace(8)), &claimed),
+            classify_initial_namespace_get(&Ok(annotated_namespace(8)), &claimed, false),
+            InitialNamespaceOwnership::Owned { .. }
+        ));
+        // Round 2 (Devin BUG / Codex P2): a PRE-LEDGER generation the
+        // append-only set never recorded still authorizes teardown when the
+        // deployment's provenance is marked incomplete — the marker is the
+        // durable proof this deployment created that state — but only when
+        // it is OLDER than the newest known claim; a newer foreign stamp
+        // never does, and complete provenance keeps requiring set
+        // membership.
+        let newest_only = [
+            enclava_engine::apply::generation::MutationGeneration::new(8)
+                .expect("valid writer generation"),
+        ];
+        assert!(matches!(
+            classify_initial_namespace_get(&Ok(annotated_namespace(7)), &newest_only, true),
+            InitialNamespaceOwnership::Owned { .. }
+        ));
+        assert!(!matches!(
+            classify_initial_namespace_get(&Ok(annotated_namespace(7)), &newest_only, false),
+            InitialNamespaceOwnership::Owned { .. }
+        ));
+        assert!(!matches!(
+            classify_initial_namespace_get(&Ok(annotated_namespace(9)), &newest_only, true),
             InitialNamespaceOwnership::Owned { .. }
         ));
         // A generation no attempt of this deployment ever claimed — a
         // newer deployment's write or a foreign namespace — stays foreign.
         assert!(matches!(
-            classify_initial_namespace_get(&Ok(annotated_namespace(9)), &claimed),
+            classify_initial_namespace_get(&Ok(annotated_namespace(9)), &claimed, false),
             InitialNamespaceOwnership::Foreign
         ));
         assert!(matches!(
-            classify_initial_namespace_get(&Ok(annotated_namespace(6)), &claimed),
+            classify_initial_namespace_get(&Ok(annotated_namespace(6)), &claimed, false),
             InitialNamespaceOwnership::Foreign
         ));
     }
@@ -3609,6 +3656,7 @@ mod tests {
             classify_initial_namespace_get(
                 &Ok(annotated_namespace(7)),
                 std::slice::from_ref(&generation),
+                false,
             ),
             InitialNamespaceOwnership::Owned { .. }
         ));
@@ -3616,6 +3664,7 @@ mod tests {
             classify_initial_namespace_get(
                 &Ok(annotated_namespace(6)),
                 std::slice::from_ref(&generation),
+                false,
             ),
             InitialNamespaceOwnership::Foreign
         ));
@@ -3624,7 +3673,8 @@ mod tests {
         assert!(matches!(
             classify_initial_namespace_get(
                 &Ok(k8s_openapi::api::core::v1::Namespace::default()),
-                std::slice::from_ref(&generation)
+                std::slice::from_ref(&generation),
+                false,
             ),
             InitialNamespaceOwnership::Foreign
         ));
@@ -3635,6 +3685,7 @@ mod tests {
             classify_initial_namespace_get(
                 &Ok(adopted_namespace(7)),
                 std::slice::from_ref(&generation),
+                false,
             ),
             InitialNamespaceOwnership::Adopted
         ));
@@ -3654,7 +3705,7 @@ mod tests {
                 "7".to_string(),
             );
         assert!(matches!(
-            classify_initial_namespace_get(&Ok(forged), std::slice::from_ref(&generation),),
+            classify_initial_namespace_get(&Ok(forged), std::slice::from_ref(&generation), false),
             InitialNamespaceOwnership::Adopted
         ));
         // Creation evidence written by an earlier generation (the namespace
@@ -3673,7 +3724,11 @@ mod tests {
                 "7".to_string(),
             );
         assert!(matches!(
-            classify_initial_namespace_get(&Ok(recreated), std::slice::from_ref(&generation),),
+            classify_initial_namespace_get(
+                &Ok(recreated),
+                std::slice::from_ref(&generation),
+                false
+            ),
             InitialNamespaceOwnership::Owned { .. }
         ));
     }
@@ -4001,19 +4056,28 @@ mod tests {
         // delete. (devin 🔍 follow-up: the old "NotOurs → skip route
         // removal" rollout note described superseded round-3 behavior.)
         assert!(matches!(
-            classify_initial_namespace_get(&Err(api_error(404)), std::slice::from_ref(&generation),),
+            classify_initial_namespace_get(
+                &Err(api_error(404)),
+                std::slice::from_ref(&generation),
+                false
+            ),
             InitialNamespaceOwnership::AbsentBeforeDelete
         ));
         // Any non-404 inspect failure is undecided ownership (Uninspectable):
         // no provider state may be touched at all.
         assert!(matches!(
-            classify_initial_namespace_get(&Err(api_error(500)), std::slice::from_ref(&generation),),
+            classify_initial_namespace_get(
+                &Err(api_error(500)),
+                std::slice::from_ref(&generation),
+                false
+            ),
             InitialNamespaceOwnership::Uninspectable
         ));
         assert!(matches!(
             classify_initial_namespace_get(
                 &Err(kube::Error::Service("transport unavailable".into())),
-                std::slice::from_ref(&generation)
+                std::slice::from_ref(&generation),
+                false,
             ),
             InitialNamespaceOwnership::Uninspectable
         ));

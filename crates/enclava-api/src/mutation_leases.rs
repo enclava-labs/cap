@@ -1583,7 +1583,11 @@ async fn reconcile_one_retained_namespace(
                 let mut ownership_generations =
                     retained_marker_namespace_provenance(pool, operation_id).await?;
                 ownership_generations.push(generation_value);
-                match classify_initial_namespace_get(&Ok(live_namespace), &ownership_generations) {
+                match classify_initial_namespace_get(
+                    &Ok(live_namespace),
+                    &ownership_generations,
+                    false,
+                ) {
                     InitialNamespaceOwnership::Owned {
                         uid,
                         resource_version,
