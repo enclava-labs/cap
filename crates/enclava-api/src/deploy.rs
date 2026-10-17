@@ -366,15 +366,13 @@ async fn apply_all_with_tenant_image_pull_secret(
             manifest_hash.to_string(),
         );
 
-    // Codex P1: creation-specific evidence for the PVC sweep. Stamped
-    // immediately before the StatefulSet step is attempted (the final
-    // apply phase). Under Retain/Retain the controller attaches no PVC
-    // ownerReferences, so this stamp — not apply_started_at (which
-    // precedes KBS reconciliation and every Kubernetes write) — is the
-    // earliest point a claim of this workload's lineage could exist: a
-    // tenant-created same-named claim predates it and is never swept.
-    // First-writer-wins (COALESCE) so a retry of a partially-failed apply
-    // does not advance the bound past claims the first attempt created.
+    // Observability stamp: when the StatefulSet step (the final apply
+    // phase) was first attempted. #273 removed the claim-age bound this
+    // column used to feed — the adopted-namespace sweep now retains every
+    // name-matching claim regardless of age — so nothing reads it for a
+    // deletion decision anymore; it is kept (applied migration 0072) as
+    // lineage history. First-writer-wins (COALESCE) so a retry of a
+    // partially-failed apply does not advance the record.
     sqlx::query(
         "UPDATE deployments
             SET sts_apply_started_at = COALESCE(sts_apply_started_at, clock_timestamp())
@@ -402,13 +400,13 @@ async fn apply_all_with_tenant_image_pull_secret(
     let sts_live = apply_statefulset(engine, ns_name, &sts, generation).await?;
     // Persist the server-reported UID and creationTimestamp of the
     // StatefulSet object this apply produced (the POST/SSA response — not
-    // a pre-call stamp). This is the identity the claim sweep matches
-    // ownerReferences against. Grok P2: only persist when the RESPONSE
-    // itself carries CAP creation evidence (the same gate the sweep uses):
-    // an SSA patch of a PRE-EXISTING StatefulSet returns that set's UID,
-    // and recording it would let the claim sweep treat a tenant's set as
-    // proven CAP lineage. First-writer-wins keeps a retry from advancing
-    // the record past claims the first attempt created.
+    // a pre-call stamp). Observability-only since #273: no sweep or
+    // deletion decision reads this ledger. The Grok P2 gate is kept so
+    // the ledger stays honest — only persist when the RESPONSE itself
+    // carries CAP creation evidence, because an SSA patch of a
+    // PRE-EXISTING StatefulSet returns that set's UID and this record
+    // must never attribute a tenant's set to CAP. First-writer-wins
+    // keeps a retry from advancing the record.
     if crate::deployment_failure_cleanup::is_cap_created_generation_leftover(
         &sts_live,
         generation.get(),
@@ -434,14 +432,15 @@ async fn apply_all_with_tenant_image_pull_secret(
             tracing::warn!(
                 deployment_id = %deployment_id,
                 error = %error,
-                "could not persist StatefulSet provenance; PVC sweep will require a live sts observation (fail closed)"
+                "could not persist StatefulSet provenance (observability-only since #273; no sweep decision reads it)"
             );
         }
     } else {
         // No CAP creation evidence on the response (e.g. an SSA patch of a
         // pre-existing set, or a mutating admission rewrote the creation
-        // annotation): recording this UID would forge claim-deletion
-        // authority. The sweep's no-window path stays fail-closed.
+        // annotation): the observability ledger stays honest — it must
+        // never attribute a tenant's StatefulSet to CAP. Claim retention
+        // itself is unconditional since #273 and reads nothing here.
         tracing::warn!(
             deployment_id = %deployment_id,
             namespace = %ns_name,
