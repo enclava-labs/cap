@@ -2280,21 +2280,30 @@ pub(crate) mod test_support {
             if name.is_empty() {
                 return;
             }
-            let pool = self.pool.clone();
-            let admin = self.admin.clone();
-            // Drop the database from a fresh single-threaded runtime: the
-            // guard can be dropped from inside a test runtime (including
-            // while a panic unwinds), where block_on is unavailable.
-            std::thread::spawn(move || {
-                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            let options = self.admin.connect_options();
+            // Join before unwinding can finish and the test process can exit.
+            // Use a fresh connection as well as a fresh runtime: the original
+            // pools' I/O tasks may belong to the current-thread test runtime,
+            // which is blocked here waiting for this cleanup thread.
+            let cleanup = std::thread::spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
-                else {
-                    return;
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        eprintln!("failed to build cleanup runtime for {name}: {error}");
+                        return;
+                    }
                 };
                 let dropped = runtime.block_on(async {
-                    pool.close().await;
-                    drop_isolated_database(&admin, &name).await
+                    let admin = PgPoolOptions::new()
+                        .max_connections(1)
+                        .connect_with((*options).clone())
+                        .await?;
+                    let result = drop_isolated_database(&admin, &name).await;
+                    admin.close().await;
+                    result
                 });
                 if let Err(error) = dropped {
                     eprintln!(
@@ -2303,6 +2312,10 @@ pub(crate) mod test_support {
                     );
                 }
             });
+            if cleanup.join().is_err() {
+                // Drop may already be unwinding; report rather than panic again.
+                eprintln!("isolated test database cleanup thread panicked");
+            }
         }
     }
 
@@ -2459,6 +2472,34 @@ pub(crate) mod test_support {
             let no_sqlstate = sqlx::Error::Database(Box::new(FakeDatabaseError { sqlstate: None }));
             assert!(!is_insufficient_privilege(&no_sqlstate));
             assert!(!is_insufficient_privilege(&sqlx::Error::PoolClosed));
+        }
+
+        #[tokio::test]
+        async fn panic_cleanup_finishes_before_unwinding_returns() {
+            // The default current-thread runtime cannot drive its pool tasks
+            // while Drop joins the cleanup thread. Hold a live connection to
+            // also prove that cleanup force-drops around the original pool.
+            let database = IsolatedTestDatabase::provision("panic_cleanup", |_| async {
+                Ok::<(), std::convert::Infallible>(())
+            })
+            .await;
+            let name = database.name.clone();
+            let admin = database.admin.clone();
+            let connection = database.pool.acquire().await.expect("hold connection");
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let _database = database;
+                panic!("simulated test assertion failure");
+            }));
+            assert!(panic.is_err(), "test body must unwind");
+            let exists: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)")
+                    .bind(&name)
+                    .fetch_one(&admin)
+                    .await
+                    .expect("check exact database immediately after unwinding");
+            assert!(!exists, "panic cleanup must finish before Drop returns");
+            drop(connection);
+            admin.close().await;
         }
 
         #[tokio::test]
