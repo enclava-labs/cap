@@ -57,7 +57,7 @@ fn partial_create_engine(
 fn regression_manifests() -> enclava_engine::manifest::GeneratedManifests {
     let app = queued_apply_app();
     let snapshot = queued_apply_snapshot('a');
-    let spec = build_confidential_app_from_rows(
+    let mut spec = build_confidential_app_from_rows(
         &app,
         Uuid::new_v4(),
         &test_attestation_config(),
@@ -67,6 +67,8 @@ fn regression_manifests() -> enclava_engine::manifest::GeneratedManifests {
         &snapshot.resources,
     )
     .unwrap();
+    spec.attestation.local_workload_artifacts_json = Some("{}".to_string());
+    spec.attestation.local_trustee_policy_json = Some("{}".to_string());
     generate_all_manifests(&spec)
 }
 

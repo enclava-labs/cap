@@ -3251,6 +3251,14 @@ mod tests {
             .execute(pool)
             .await
             .expect("set unique retained namespace fixture");
+        // This mock UID is an actual CAP creation, not implicit timestamp
+        // trust. The forged-server UID deliberately differs and has no row.
+        sqlx::query("INSERT INTO resource_creation_ledger (app_id, kind, name, uid, mutation_generation) VALUES ($1, 'Namespace', $2, 'fixture', 1)")
+            .bind(app_id)
+            .bind(&namespace)
+            .execute(pool)
+            .await
+            .expect("record retained mock namespace creation");
         let state = state_with_pool(pool.clone());
         let operation_id = Uuid::new_v4();
         let mut fences = vec![ResourceFence::new("kubernetes_namespace", &namespace)];
