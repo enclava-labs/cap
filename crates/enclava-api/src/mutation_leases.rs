@@ -1547,136 +1547,148 @@ async fn reconcile_one_retained_namespace(
                 return Ok(false);
             }
         };
-        let absence =
-            match live {
-                None => true,
-                Some(live_namespace) => {
-                    if live_namespace.metadata.deletion_timestamp.is_some() {
-                        // A deletion is already converging (the original
-                        // attempt's or an earlier retry's): the fence releases
-                        // only on the observed 404.
-                        return Ok(false);
-                    }
-                    // Still live and NOT deleting: the retained fence's own
-                    // delete was lost or never landed, so waiting for a 404
-                    // that cannot occur would wedge every later deployment and
-                    // app deletion on permanent Busy. Retry the pinned
-                    // deletion — but only when the object still classifies as
-                    // THIS generation's CAP-created namespace (exact mutation
-                    // annotation equal to the retained fence's generation AND
-                    // creation evidence): a rewritten or replaced namespace is
-                    // never touched.
-                    let Ok(generation_value) = MutationGeneration::new(generation) else {
-                        return Ok(false);
-                    };
-                    // Codex P2 (#260 review round 5): the retained fence often
-                    // belongs to the retry-exhaustion compensation's FRESHLY
-                    // reacquired generation, while the namespace was classified
-                    // and its delete issued against the OLDER generations the
-                    // failed attempts durably recorded
-                    // (`deployments.namespace_fence_generations`). Classifying
-                    // against the fence generation alone would misread that
-                    // still-live namespace as foreign, bound the marker, and
-                    // never retry the delete — so the ownership classification
-                    // accepts the recorded set too (every member was uniquely
-                    // claimed by this marker's own deployment). A missing
-                    // deployment row keeps the fence-generation-only behavior.
-                    let mut ownership_generations =
-                        retained_marker_namespace_provenance(pool, operation_id).await?;
+        let absence = match live {
+            None => true,
+            Some(live_namespace) => {
+                if live_namespace.metadata.deletion_timestamp.is_some() {
+                    // A deletion is already converging (the original
+                    // attempt's or an earlier retry's): the fence releases
+                    // only on the observed 404.
+                    return Ok(false);
+                }
+                // Still live and NOT deleting: the retained fence's own
+                // delete was lost or never landed, so waiting for a 404
+                // that cannot occur would wedge every later deployment and
+                // app deletion on permanent Busy. Retry the pinned
+                // deletion — but only when the object still classifies as
+                // THIS generation's CAP-created namespace (exact mutation
+                // annotation equal to the retained fence's generation AND
+                // creation evidence): a rewritten or replaced namespace is
+                // never touched.
+                let Ok(generation_value) = MutationGeneration::new(generation) else {
+                    return Ok(false);
+                };
+                // Codex P2 (#260 review round 5): the retained fence often
+                // belongs to the retry-exhaustion compensation's FRESHLY
+                // reacquired generation, while the namespace was classified
+                // and its delete issued against the OLDER generations the
+                // failed attempts durably recorded
+                // (`deployments.namespace_fence_generations`). Classifying
+                // against the fence generation alone would misread that
+                // still-live namespace as foreign, bound the marker, and
+                // never retry the delete — so the ownership classification
+                // accepts the recorded set too (every member was uniquely
+                // claimed by this marker's own deployment). A missing
+                // deployment row keeps the fence-generation-only behavior.
+                let mut ownership_generations =
+                    retained_marker_namespace_provenance(pool, operation_id).await?;
 
-                    // Round 3 (Devin BUG / Codex P2): a migrated deployment's
-                    // namespace may carry a PRE-LEDGER generation the recorded
-                    // set never includes; rejecting it here bounds the retained
-                    // fence without ever retrying the delete, stranding the
-                    // namespace. Carry the deployment's incomplete marker (a
-                    // missing row keeps fence-generation-only behavior; a
-                    // lookup error propagates and retries on the next pass —
-                    // fail closed, never misclassify).
-                    let provenance_incomplete = sqlx::query_scalar::<_, bool>(
+                // Round 3 (Devin BUG / Codex P2): a migrated deployment's
+                // namespace may carry a PRE-LEDGER generation the recorded
+                // set never includes; rejecting it here bounds the retained
+                // fence without ever retrying the delete, stranding the
+                // namespace. Carry the deployment's incomplete marker (a
+                // missing row keeps fence-generation-only behavior; a
+                // lookup error propagates and retries on the next pass —
+                // fail closed, never misclassify).
+                let provenance_incomplete = sqlx::query_scalar::<_, bool>(
                     "SELECT namespace_fence_provenance_incomplete FROM deployments WHERE id = $1",
                 )
                 .bind(operation_id)
                 .fetch_optional(pool)
                 .await?
                 .unwrap_or(false);
-                    // A compensation fence was never stamped by an apply. It
-                    // cannot widen the ceiling for unrecorded migration stamps.
-                    if !provenance_incomplete {
-                        ownership_generations.push(generation_value);
-                    }
-                    // A marker may originate from an uncertain provenance read,
-                    // before cleanup could establish provider ownership. Recheck
-                    // the durable gate before any retained DELETE; watched or
-                    // healthy generations must never lose their namespace.
-                    let app_id: Option<Uuid> =
-                        sqlx::query_scalar("SELECT app_id FROM deployments WHERE id = $1")
-                            .bind(operation_id)
-                            .fetch_optional(pool)
-                            .await?;
-                    if let Some(app_id) = app_id
-                    && !crate::deployment_failure_cleanup::no_other_generation_owns_provider_state(
-                        pool, app_id, operation_id,
-                    ).await?
-                {
-                    return bound_stranded_foreign_namespace_fence(
-                        pool, api, &owner_token, &namespace, operation_id,
-                        generation, batch_deadline,
-                    ).await;
+                // A compensation fence was never stamped by an apply. It
+                // cannot widen the ceiling for unrecorded migration stamps.
+                if !provenance_incomplete {
+                    ownership_generations.push(generation_value);
                 }
-                    match classify_initial_namespace_get(
-                        &Ok(live_namespace),
-                        &ownership_generations,
-                        provenance_incomplete,
-                    ) {
-                        InitialNamespaceOwnership::Owned {
+                // A marker may originate from an uncertain provenance read,
+                // before cleanup could establish provider ownership. Recheck
+                // the durable gate before any retained DELETE; watched or
+                // healthy generations must never lose their namespace.
+                let app_id: Option<Uuid> =
+                    sqlx::query_scalar("SELECT app_id FROM deployments WHERE id = $1")
+                        .bind(operation_id)
+                        .fetch_optional(pool)
+                        .await?;
+                let provider_state_exclusive = match app_id {
+                    Some(app_id) => {
+                        crate::deployment_failure_cleanup::no_other_generation_owns_provider_state(
+                            pool,
+                            app_id,
+                            operation_id,
+                        )
+                        .await?
+                    }
+                    None => true,
+                };
+                if !provider_state_exclusive {
+                    return bound_stranded_foreign_namespace_fence(
+                        pool,
+                        api,
+                        &owner_token,
+                        &namespace,
+                        operation_id,
+                        generation,
+                        batch_deadline,
+                    )
+                    .await;
+                }
+                match classify_initial_namespace_get(
+                    &Ok(live_namespace),
+                    &ownership_generations,
+                    provenance_incomplete,
+                ) {
+                    InitialNamespaceOwnership::Owned {
+                        uid,
+                        resource_version,
+                    } => {
+                        if !retry_retained_namespace_delete(
+                            api,
+                            &namespace,
                             uid,
                             resource_version,
-                        } => {
-                            if !retry_retained_namespace_delete(
-                                api,
-                                &namespace,
-                                uid,
-                                resource_version,
-                                batch_deadline,
-                            )
-                            .await
-                            {
-                                return Ok(false);
-                            }
-                            true
+                            batch_deadline,
+                        )
+                        .await
+                        {
+                            return Ok(false);
                         }
-                        _ => {
-                            // Live, NOT deleting, and no longer provably ours
-                            // (external rewrite of the annotations, or a
-                            // same-named replacement): waiting for a 404 that
-                            // can never occur would strand the infinite fence
-                            // forever and keep the namespace name on permanent
-                            // Busy (Devin, round 7). Nothing of ours can still
-                            // be deleting this object — an accepted DELETE
-                            // stamps deletionTimestamp before it returns (the
-                            // retaining case above), this entry was selected
-                            // only after its owner's heartbeat expired, and the
-                            // settle margin outlasts any request the dead owner
-                            // still had in flight — so the marker is converted
-                            // back to the ordinary bounded reclaim quarantine.
-                            // The provider-state evidence is NOT cleared: the
-                            // namespace (or its same-named replacement) is
-                            // live. Fail closed on errors and on a not-yet-
-                            // settled marker: the entry is revisited next cycle.
-                            return bound_stranded_foreign_namespace_fence(
-                                pool,
-                                api,
-                                &owner_token,
-                                &namespace,
-                                operation_id,
-                                generation,
-                                batch_deadline,
-                            )
-                            .await;
-                        }
+                        true
+                    }
+                    _ => {
+                        // Live, NOT deleting, and no longer provably ours
+                        // (external rewrite of the annotations, or a
+                        // same-named replacement): waiting for a 404 that
+                        // can never occur would strand the infinite fence
+                        // forever and keep the namespace name on permanent
+                        // Busy (Devin, round 7). Nothing of ours can still
+                        // be deleting this object — an accepted DELETE
+                        // stamps deletionTimestamp before it returns (the
+                        // retaining case above), this entry was selected
+                        // only after its owner's heartbeat expired, and the
+                        // settle margin outlasts any request the dead owner
+                        // still had in flight — so the marker is converted
+                        // back to the ordinary bounded reclaim quarantine.
+                        // The provider-state evidence is NOT cleared: the
+                        // namespace (or its same-named replacement) is
+                        // live. Fail closed on errors and on a not-yet-
+                        // settled marker: the entry is revisited next cycle.
+                        return bound_stranded_foreign_namespace_fence(
+                            pool,
+                            api,
+                            &owner_token,
+                            &namespace,
+                            operation_id,
+                            generation,
+                            batch_deadline,
+                        )
+                        .await;
                     }
                 }
-            };
+            }
+        };
         if !absence {
             return Ok(false);
         }
