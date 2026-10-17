@@ -224,11 +224,17 @@ pub fn tenant_image_pull_secret_startup_error() -> Option<String> {
     {
         return Some("TENANT_IMAGE_PULL_SCOPE_GENERATION must be an unsigned integer".to_string());
     }
+    let username_present = env_nonempty("GHCR_USERNAME").is_some();
+    let token_present = env_nonempty("GHCR_TOKEN").is_some();
+    if username_present != token_present {
+        return Some(
+            "GHCR_USERNAME and GHCR_TOKEN must both be nonempty or both absent; refusing cleanup with incomplete credentials".to_string(),
+        );
+    }
     if tenant_image_pull_secret_config_from_env().is_some() {
         return None;
     }
-    let ghcr_configured =
-        env_nonempty("GHCR_USERNAME").is_some() && env_nonempty("GHCR_TOKEN").is_some();
+    let ghcr_configured = username_present && token_present;
     if !ghcr_configured {
         return None;
     }
@@ -1255,8 +1261,21 @@ async fn reconcile_managed_pull_secrets(
                 .as_deref()
                 .is_some_and(|name| scope.account_in_scope(name))
         })
-        .flat_map(|account| account.image_pull_secrets.iter().flatten())
-        .map(|reference| reference.name.clone())
+        .flat_map(|account| {
+            let referenced = account
+                .image_pull_secrets
+                .iter()
+                .flatten()
+                .map(|reference| reference.name.clone());
+            // Pending references for in-scope accounts are desired too. Seed
+            // them before any repairs, so an out-of-scope account processed
+            // first cannot delete a secret another account will restore.
+            let pending = pending_reference_repairs(account)
+                .into_iter()
+                .filter(|_| context == PullSecretReconcileContext::Sweep)
+                .map(|repair| repair.secret_name);
+            referenced.chain(pending)
+        })
         .collect();
     let api: Api<Secret> = Api::namespaced(engine.client().clone(), namespace);
     let mut converged = true;
@@ -7644,6 +7663,122 @@ mod tests {
     /// must refresh/adopt/restore it, not fall through to the removal path
     /// and delete valid credentials (which converged and left pod restarts
     /// unable to pull until another deployment occurred).
+    #[test]
+    fn startup_rejects_incomplete_ghcr_credentials() {
+        const CHILD: &str = "CAP_GHCR_STARTUP_CASE";
+        if let Ok(case) = std::env::var(CHILD) {
+            let error = tenant_image_pull_secret_startup_error();
+            if case == "valid" {
+                assert!(error.is_none(), "{error:?}");
+            } else {
+                assert!(
+                    error
+                        .unwrap()
+                        .contains("must both be nonempty or both absent")
+                );
+            }
+            return;
+        }
+        for (username, token, case) in [
+            ("", "", "valid"),
+            ("bot", "token", "valid"),
+            ("bot", "", "incomplete"),
+            ("", "token", "incomplete"),
+            ("bot", "   ", "incomplete"),
+            ("   ", "token", "incomplete"),
+        ] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "deploy::tests::startup_rejects_incomplete_ghcr_credentials",
+                    "--nocapture",
+                ])
+                .env(CHILD, case)
+                .env("GHCR_USERNAME", username)
+                .env("GHCR_TOKEN", token)
+                .env("TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES", "ghcr.io/team/*")
+                .env_remove("TENANT_IMAGE_PULL_CREDENTIAL_GENERATION")
+                .env_remove("TENANT_IMAGE_PULL_SCOPE_GENERATION")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn labeled_old_name_repairs_survive_cleanup_in_either_account_order() {
+        use std::sync::{Arc, Mutex};
+        for reverse in [false, true] {
+            let mut accounts = vec![
+                fake_service_account("cap-out", &[]),
+                fake_service_account("cap-in", &[]),
+            ];
+            for account in &mut accounts {
+                account.metadata.annotations = Some(std::collections::BTreeMap::from([(
+                    PENDING_PULL_SECRET_REFERENCE_REPAIRS_ANNOTATION.to_string(),
+                    "old-pull-secret=uid-old-pull-secret".to_string(),
+                )]));
+            }
+            if reverse {
+                accounts.reverse();
+            }
+            let cluster = Arc::new(Mutex::new(FakeCluster {
+                secrets: vec![fake_managed_secret(
+                    "old-pull-secret",
+                    true,
+                    "cap-bot",
+                    "ghp_old",
+                )],
+                service_accounts: accounts,
+                ..Default::default()
+            }));
+            let scope = PullSecretAccountScope {
+                namespace_in_scope: true,
+                in_scope_accounts: ["cap-in".to_string()].into_iter().collect(),
+            };
+            let engine = reconcile_engine(cluster.clone());
+            assert!(
+                reconcile_managed_pull_secrets(
+                    &engine,
+                    "tenant-ns",
+                    &["cap-out".into(), "cap-in".into()],
+                    &reconcile_settings(),
+                    &scope,
+                    PullSecretReconcileContext::Sweep,
+                )
+                .await
+                .unwrap()
+            );
+            let state = cluster.lock().unwrap();
+            assert_eq!(state.secrets.len(), 1);
+            let desired = state
+                .service_accounts
+                .iter()
+                .find(|a| a.metadata.name.as_deref() == Some("cap-in"))
+                .unwrap();
+            assert_eq!(
+                desired.image_pull_secrets.as_ref().unwrap()[0].name,
+                "old-pull-secret"
+            );
+            assert!(pending_reference_repairs(desired).is_empty());
+            let excluded = state
+                .service_accounts
+                .iter()
+                .find(|a| a.metadata.name.as_deref() == Some("cap-out"))
+                .unwrap();
+            assert!(
+                excluded
+                    .image_pull_secrets
+                    .as_ref()
+                    .is_none_or(|r| r.is_empty())
+            );
+        }
+    }
+
     #[tokio::test]
     async fn expanded_scope_restores_pending_old_name_reference() {
         use std::sync::{Arc, Mutex};
