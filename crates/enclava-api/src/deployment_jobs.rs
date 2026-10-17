@@ -1304,6 +1304,8 @@ async fn mark_setup_accepted_in_tx(
     let job = sqlx::query(
         "UPDATE deployment_apply_jobs
             SET state = 'pending',
+                attempts = 0,
+                next_attempt_at = clock_timestamp(),
                 lock_token = NULL,
                 locked_until = NULL,
                 last_error_code = NULL,
@@ -2291,16 +2293,18 @@ async fn exhaustion_claim_blocker(
                 // publication can commit underneath it. The same holds for
                 // custom-domain operations and create-time DNS. Wait out
                 // their finite quarantine exactly like shared-global
-                // contention; deployment-flow owners (`deployment_*`) of a
-                // different operation id and the app delete flow stay
-                // foreign — their own terminal paths own this
-                // deployment's convergence. An UNBOUNDED non-deployment
+                // contention. Bounded deployment_setup owners are temporary
+                // too: setup only owns DNS/KBS, not namespace/route cleanup.
+                // Other deployment-flow owners of a different operation id
+                // and app delete remain foreign: their terminal paths own
+                // this deployment's convergence. An UNBOUNDED non-deployment
                 // owner is an armed, still-live lease of the same
                 // temporary classes — waitable on the probe horizon.
                 let transient_non_deployment_owner =
                     !operation_kind.starts_with("deployment_") && operation_kind != "app_delete";
                 if !(own_abandoned
                     || (shared_global && !unbounded)
+                    || (operation_kind == "deployment_setup" && !unbounded)
                     || (!shared_global && transient_non_deployment_owner))
                 {
                     return false;
@@ -5590,6 +5594,11 @@ pub(crate) mod tests {
             .await
             .expect("claim setup")
             .expect("setup exists");
+        sqlx::query("UPDATE deployment_apply_jobs SET attempts = 20 WHERE deployment_id = $1")
+            .bind(deployment_id)
+            .execute(&pool)
+            .await
+            .expect("simulate repeated setup retries");
         mark_setup_accepted(&pool, deployment_id, setup.lock_token)
             .await
             .expect("accept setup");
@@ -5598,6 +5607,16 @@ pub(crate) mod tests {
             .expect("claim apply")
             .expect("apply exists");
 
+        assert_eq!(
+            sqlx::query_scalar::<_, i32>(
+                "SELECT attempts FROM deployment_apply_jobs WHERE deployment_id = $1"
+            )
+            .bind(deployment_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load first apply attempt"),
+            1
+        );
         // A fresh contention requeue stays fast so transient outages recover
         // quickly; the interval only doubles with the attempt count.
         requeue_apply_job(&pool, &apply)
@@ -5615,7 +5634,7 @@ pub(crate) mod tests {
         .expect("load fresh requeue delay");
         assert_eq!(job_state, "pending");
         assert!(
-            (5..=120).contains(&fresh_delay_secs),
+            (4..=6).contains(&fresh_delay_secs),
             "fresh retry must stay fast, got {fresh_delay_secs}"
         );
 
@@ -6558,6 +6577,90 @@ pub(crate) mod tests {
             .execute(&pool)
             .await
             .expect("delete live-owner fixture");
+    }
+
+    #[tokio::test]
+    async fn retry_exhaustion_compensation_retries_after_live_setup_finishes() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _setup_handle, payload) = insert_job_fixture(&pool).await;
+        let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim setup")
+            .expect("setup exists");
+        mark_setup_accepted(&pool, deployment_id, setup.lock_token)
+            .await
+            .expect("accept setup");
+        let apply = claim_job(&pool, "pending", "running", Some(deployment_id))
+            .await
+            .expect("claim apply")
+            .expect("apply exists");
+        sqlx::query("UPDATE deployment_apply_jobs SET contention_started_at = clock_timestamp() - interval '31 days' WHERE deployment_id = $1")
+            .bind(deployment_id).execute(&pool).await.expect("age contention");
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.side_effect_admission = Arc::new(tokio::sync::Semaphore::new(4));
+        // Unlike the crashed-owner test, keep this owner LIVE through terminal
+        // publication, then release well before its ordinary reclaim deadline.
+        let owner = crate::mutation_leases::claim(
+            &state,
+            app.id,
+            "deployment_setup",
+            Uuid::new_v4(),
+            false,
+            vec![crate::mutation_leases::ResourceFence::new(
+                "kbs_policy",
+                "global",
+            )],
+        )
+        .await
+        .expect("claim live setup");
+        assert!(
+            requeue_or_exhaust_apply_job(&pool, &apply)
+                .await
+                .expect("publish exhaustion under temporary owner")
+        );
+        assert!(matches!(
+            exhaustion_claim_blocker(
+                &pool,
+                app.id,
+                deployment_id,
+                &deployment_apply_resource_fences(&payload.app)
+            )
+            .await
+            .expect("inspect live owner"),
+            ExhaustionClaimBlocker::WaitableUntil(_)
+        ));
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            owner.finish().await.expect("setup finishes");
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            compensate_after_retry_exhaustion(&state, &apply, &payload.app),
+        )
+        .await
+        .expect("retry notices early release, not stale reclaim deadline");
+        release.await.expect("release task");
+        let generation: i64 = sqlx::query_scalar(
+            "SELECT generation FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1",
+        )
+        .bind(&app.namespace)
+        .fetch_one(&pool)
+        .await
+        .expect("compensation reclaimed namespace");
+        assert!(
+            generation >= 1,
+            "must retry after temporary owner releases, not return ForeignOwner"
+        );
+        sqlx::query("DELETE FROM external_resource_mutation_leases WHERE resource_key IN ('global', $1, $2, $3, $4)")
+            .bind(&app.namespace).bind(&app.domain).bind(app.tee_domain.as_deref())
+            .bind(app.custom_domain.as_deref()).execute(&pool).await.expect("remove compensation fences");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete live-setup fixture");
     }
 
     /// Codex P2 (#260 review round 5), counter-case: the app DELETE flow
