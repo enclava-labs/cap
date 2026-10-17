@@ -1537,7 +1537,10 @@ async fn reconcile_one_retained_namespace(
                 let Ok(generation_value) = MutationGeneration::new(generation) else {
                     return Ok(false);
                 };
-                match classify_initial_namespace_get(&Ok(live_namespace), generation_value) {
+                match classify_initial_namespace_get(
+                    &Ok(live_namespace),
+                    std::slice::from_ref(&generation_value),
+                ) {
                     InitialNamespaceOwnership::Owned {
                         uid,
                         resource_version,

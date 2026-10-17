@@ -2273,26 +2273,68 @@ async fn own_abandoned_apply_fences_reclaimable_at(
     reclaimable_at
 }
 
-/// The namespace-fence generation this deployment's failed apply attempts
-/// claimed, as durably recorded under the authority lane before any
-/// provider write (Devin, #260 review). The compensation's REACQUIRED fence
-/// carries a fresh generation the attempts never stamped the provider
-/// with; classifying against it would strand every partially applied
-/// namespace as foreign. `None` for rows that predate the provenance
-/// column — compensation then keeps the conservative fallback.
+/// Append one claimed namespace-fence generation to the deployment's
+/// durable provenance set. Its own transaction, committed immediately, so
+/// the record outlives any later failure of the attempt (Codex P2, #260
+/// review round 2); `array_append` never replaces earlier values, so a
+/// preflight-only attempt cannot strand an earlier writer's namespace
+/// behind a mismatched generation (Devin, #260 review round 2).
+async fn record_namespace_fence_claim(
+    pool: &sqlx::PgPool,
+    deployment_id: Uuid,
+    app_id: Uuid,
+    org_id: Uuid,
+    generation: i64,
+) -> Result<(), DeploymentJobError> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "UPDATE deployments
+            SET namespace_fence_generations =
+                    array_append(namespace_fence_generations, $2)
+          WHERE id = $1
+            AND app_id = $3
+            AND org_id = $4
+            AND status = 'applying'::deploy_status_enum",
+    )
+    .bind(deployment_id)
+    .bind(generation)
+    .bind(app_id)
+    .bind(org_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// The set of namespace-fence generations this deployment's failed apply
+/// attempts claimed, as durably appended before each attempt's provider
+/// execution (Devin + Codex, #260 review rounds 1-2). The compensation's
+/// REACQUIRED fence carries a fresh generation the attempts never stamped
+/// the provider with; classifying against it would strand every partially
+/// applied namespace as foreign. `None` for rows that predate the
+/// provenance column or recorded nothing — compensation then keeps the
+/// conservative fallback.
 async fn retry_exhaustion_namespace_provenance(
     pool: &sqlx::PgPool,
     deployment_id: Uuid,
-) -> Option<enclava_engine::apply::generation::MutationGeneration> {
-    let raw = sqlx::query_scalar::<_, i64>(
-        "SELECT namespace_fence_generation FROM deployments WHERE id = $1",
+) -> Option<Vec<enclava_engine::apply::generation::MutationGeneration>> {
+    let raw = sqlx::query_scalar::<_, Vec<i64>>(
+        "SELECT namespace_fence_generations FROM deployments WHERE id = $1",
     )
     .bind(deployment_id)
     .fetch_optional(pool)
     .await
     .ok()
     .flatten()?;
-    enclava_engine::apply::generation::MutationGeneration::new(raw).ok()
+    let generations: Vec<_> = raw
+        .into_iter()
+        .filter_map(|value| enclava_engine::apply::generation::MutationGeneration::new(value).ok())
+        .collect();
+    if generations.is_empty() {
+        None
+    } else {
+        Some(generations)
+    }
 }
 
 /// Reacquire this generation's provider fences and run the compensating
@@ -2973,19 +3015,34 @@ async fn acquire_apply_permit_and_revalidate(
         deployment_apply_resource_fences(&payload.app),
     )
     .await?;
-    // Durable provenance (Devin, #260 review): record the namespace-fence
-    // generation THIS attempt claimed before any provider write, under the
-    // same authority lane that fences the apply. The retry-exhaustion
-    // compensation reacquires fresh fences whose generations were never
-    // stamped onto the provider; this column is what lets its cleanup
-    // classify the leftover namespace against the generation the failing
-    // attempts actually wrote. Recording the claim's own generation can
-    // never authorize anything the lease did not already own: fence
-    // generations are unique per claim, so a live annotation matching this
-    // value proves this deployment's attempt was the last writer.
-    let namespace_fence_generation = mutation.resource_generation(
+    // Durable provenance (Devin + Codex, #260 review rounds 1-2): append
+    // the namespace-fence generation THIS attempt claimed, in its OWN
+    // committed transaction before this attempt executes any provider
+    // call. The retry-exhaustion compensation reacquires fresh fences
+    // whose generations were never stamped onto the provider; the
+    // append-only set is what lets its cleanup classify the leftover
+    // namespace against every generation the failing attempts could have
+    // written. Committing before provider execution means the record
+    // survives a mid-write lease loss (the authority lane's later commit
+    // cannot roll it back), and appending — never replacing — means a
+    // later attempt that exits before any namespace write cannot strand
+    // an earlier attempt's namespace behind a mismatched generation.
+    // Recording a claim's own generation can never authorize anything the
+    // lease did not already own: fence generations are unique per claim,
+    // so a live annotation matching any appended value proves this
+    // deployment's attempt was the last writer.
+    if let Some(generation) = mutation.resource_generation(
         &crate::mutation_leases::ResourceFence::new("kubernetes_namespace", &payload.app.namespace),
-    );
+    ) {
+        record_namespace_fence_claim(
+            &state.db,
+            job.deployment_id,
+            job.app_id,
+            job.org_id,
+            generation,
+        )
+        .await?;
+    }
 
     // Revalidate every mutable authority immediately before external side
     // effects while holding the global authority order. Keyring rotation,
@@ -3030,29 +3087,6 @@ async fn acquire_apply_permit_and_revalidate(
             .await?
         {
             return Ok(None);
-        }
-
-        // Durable provenance for retry-exhaustion compensation (Devin, #260
-        // review): while the lanes and fences are held, record the
-        // namespace-fence generation this attempt claimed. Committed with
-        // the same authority transaction as the apply itself; a crash
-        // before the commit rolls it back and compensation keeps the
-        // conservative fallback classification.
-        if let Some(generation) = namespace_fence_generation {
-            sqlx::query(
-                "UPDATE deployments
-                    SET namespace_fence_generation = $2
-                  WHERE id = $1
-                    AND app_id = $3
-                    AND org_id = $4
-                    AND status = 'applying'::deploy_status_enum",
-            )
-            .bind(job.deployment_id)
-            .bind(generation)
-            .bind(job.app_id)
-            .bind(job.org_id)
-            .execute(&mut *authority_lane)
-            .await?;
         }
 
         let expected_authority = crate::deploy::ExistingAppAuthoritySnapshot::new(
@@ -6056,13 +6090,6 @@ pub(crate) mod tests {
             "rows that predate the provenance column must classify conservatively"
         );
 
-        // The exhausting attempt (Devin, #260 review): it claimed this
-        // namespace's fence — generation 1 for the fresh row — recorded
-        // that generation durably exactly like every claiming attempt now
-        // does, stamped it onto the provider, and then dropped the lease.
-        // Compensation later RECLAIMS the fence at generation 2: classifying
-        // against the reacquired generation would mismatch the namespace
-        // annotation (1) and strand it as foreign forever.
         // Stage the status the acceptance path persists before the apply
         // job becomes claimable; the fixture inserts 'pending' directly.
         sqlx::query("UPDATE deployments SET status = 'applying'::deploy_status_enum WHERE id = $1")
@@ -6070,6 +6097,11 @@ pub(crate) mod tests {
             .execute(&pool)
             .await
             .expect("stage the accepted applying status");
+
+        // The writer attempt (Devin, #260 review round 1): it claimed this
+        // namespace's fence — generation 1 for the fresh row — appended
+        // that generation durably exactly like every claiming attempt now
+        // does, stamped it onto the provider, and then dropped the lease.
         let attempt = crate::mutation_leases::claim(
             &state,
             app.id,
@@ -6079,40 +6111,110 @@ pub(crate) mod tests {
             deployment_apply_resource_fences(&payload.app),
         )
         .await
-        .expect("claim the exhausting attempt's lease");
+        .expect("claim the writer attempt's lease");
         let attempt_generation = attempt
             .resource_generation(&crate::mutation_leases::ResourceFence::new(
                 "kubernetes_namespace",
                 &app.namespace,
             ))
             .expect("the attempt holds the namespace fence");
-        sqlx::query(
-            "UPDATE deployments
-                SET namespace_fence_generation = $2
-              WHERE id = $1
-                AND app_id = $3
-                AND org_id = $4
-                AND status = 'applying'::deploy_status_enum",
+        record_namespace_fence_claim(
+            &pool,
+            deployment_id,
+            app.id,
+            apply.org_id,
+            attempt_generation,
         )
-        .bind(deployment_id)
-        .bind(attempt_generation)
+        .await
+        .expect("append the writer attempt's provenance like the apply path");
+        drop(attempt);
+        // The writer's dropped rows own the fences through the reclaim
+        // quarantine; compress it so the sibling below can claim like a
+        // production attempt whose requeue backoff outlived the window.
+        sqlx::query(
+            "UPDATE app_mutation_leases
+                SET locked_until = clock_timestamp() + interval '1 second',
+                    reclaim_after = clock_timestamp() + interval '2 seconds'
+              WHERE app_id = $1
+                AND operation_kind = 'deployment_apply'
+                AND operation_id = $2
+                AND owner_token IS NOT NULL",
+        )
         .bind(app.id)
-        .bind(apply.org_id)
+        .bind(deployment_id)
         .execute(&pool)
         .await
-        .expect("record the attempt's provenance like the apply path");
-        drop(attempt);
+        .expect("shrink the writer's abandoned app lane quarantine");
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET locked_until = clock_timestamp() + interval '1 second',
+                    reclaim_after = clock_timestamp() + interval '2 seconds'
+              WHERE operation_kind = 'deployment_apply'
+                AND operation_id = $1
+                AND owner_token IS NOT NULL",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("shrink the writer's abandoned fence quarantine");
+        tokio::time::sleep(std::time::Duration::from_millis(2300)).await;
+
+        // The preflight-only sibling (Devin, #260 review round 2): a later
+        // attempt claims a FRESHER fence but its transient validation
+        // failure exits before any namespace write. It appends — never
+        // replaces — so the writer's generation stays cleanup-relevant,
+        // and a namespace still carrying the writer's older annotation
+        // must not classify as foreign.
+        {
+            let sibling = crate::mutation_leases::claim(
+                &state,
+                app.id,
+                "deployment_apply",
+                deployment_id,
+                false,
+                deployment_apply_resource_fences(&payload.app),
+            )
+            .await
+            .expect("claim the preflight-only sibling's lease");
+            let sibling_generation = sibling
+                .resource_generation(&crate::mutation_leases::ResourceFence::new(
+                    "kubernetes_namespace",
+                    &app.namespace,
+                ))
+                .expect("the sibling holds the namespace fence");
+            assert_eq!(sibling_generation, attempt_generation + 1);
+            record_namespace_fence_claim(
+                &pool,
+                deployment_id,
+                app.id,
+                apply.org_id,
+                sibling_generation,
+            )
+            .await
+            .expect("append the preflight-only sibling's provenance");
+            // The sibling's dropped rows are still owned through the
+            // reclaim quarantine; the shrink below pulls that horizon
+            // close so the compensation runs its own-lease reclaim path
+            // instead of waiting out the full window.
+        }
+        // The provenance set holds BOTH claimed generations: membership
+        // keeps the writer's annotation authoritative for cleanup while
+        // the sibling's fresher claim alone would have stranded it.
+        let provenance = retry_exhaustion_namespace_provenance(&pool, deployment_id)
+            .await
+            .expect("the recorded provenance set is non-empty");
+        assert_eq!(
+            provenance
+                .iter()
+                .map(|generation| generation.get())
+                .collect::<Vec<_>>(),
+            vec![attempt_generation, attempt_generation + 1],
+            "compensation must classify against every generation the attempts claimed, appended not replaced"
+        );
         assert!(
             requeue_or_exhaust_apply_job(&state.db, &apply)
                 .await
                 .expect("terminalize exhausted contention")
-        );
-        assert_eq!(
-            retry_exhaustion_namespace_provenance(&pool, deployment_id)
-                .await
-                .map(|generation| generation.get()),
-            Some(attempt_generation),
-            "compensation must classify against the generation the attempt stamped, not the reacquired fence's"
         );
 
         // Shrink the abandoned quarantine and run the compensation through
@@ -6158,8 +6260,8 @@ pub(crate) mod tests {
         .expect("load the compensated namespace fence");
         assert_eq!(
             namespace_generation,
-            attempt_generation + 1,
-            "compensation reclaimed the fence past the attempt's generation"
+            attempt_generation + 2,
+            "compensation reclaimed the fence past both attempts' generations"
         );
         assert!(bounded, "the reclaimed fence keeps a finite horizon");
 

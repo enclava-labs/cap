@@ -1722,17 +1722,20 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
     // its compensating restores) — forwarded to the adopted-namespace
     // sweep so unmarked live targets count as unresolved there.
     evidence_loss_unresolved: bool,
-    // Durable provenance for the namespace-fence generation the FAILED
-    // attempts claimed (Devin, #260 review). The immediate terminal path
-    // holds the apply's own lease, so its `mutation` carries the exact
-    // generation the apply stamped and passes `None`. Retry-exhaustion
-    // compensation reacquires a FRESH fence whose generation is one the
-    // failed attempts never wrote: classifying against it would always
-    // mismatch the live namespace annotation and strand the namespace as
-    // foreign. When the failed attempts durably recorded their claimed
-    // generation, pass it here so classification and the teardown sweep
-    // run against the generation the provider state actually carries.
-    namespace_generation_provenance: Option<MutationGeneration>,
+    // Durable provenance: the SET of namespace-fence generations the
+    // FAILED attempts claimed (Devin, #260 review rounds 1-2). The
+    // immediate terminal path holds the apply's own lease, so its
+    // `mutation` carries the exact generation the apply stamped and
+    // passes `None`. Retry-exhaustion compensation reacquires a FRESH
+    // fence whose generation is one the failed attempts never wrote:
+    // classifying against it would always mismatch the live namespace
+    // annotation and strand the namespace as foreign. When the failed
+    // attempts durably recorded every generation they claimed, pass the
+    // set here so classification and the teardown run against the
+    // generations the provider state can actually carry — an annotation
+    // stamped by ANY of the deployment's attempts authorizes teardown,
+    // because each of those generations was uniquely claimed by it.
+    namespace_generation_provenance: Option<Vec<MutationGeneration>>,
 ) -> CleanupFenceOutcome {
     // Durably record the evidence loss BEFORE any later step: even if this
     // process dies mid-cleanup, a later sweep of any failed generation of
@@ -1796,19 +1799,22 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
         }
     }
 
-    let namespace_generation = if let Some(provenance) = namespace_generation_provenance {
-        // Provenance generations were validated when the failed attempts'
-        // durable record was loaded; the reacquired fence's generation is
-        // deliberately NOT consulted — the failed attempts stamped the
-        // provider with the provenance generation, and every ownership
-        // probe and delete precondition must match what they wrote.
+    let namespace_generations: Vec<MutationGeneration> = if let Some(provenance) =
+        namespace_generation_provenance
+    {
+        // Provenance generations were validated when the failed
+        // attempts' durable record was loaded; the reacquired fence's
+        // generation is deliberately NOT consulted — the failed
+        // attempts stamped the provider with the provenance
+        // generations, and every ownership probe and delete
+        // precondition must match what they wrote.
         provenance
     } else {
         match mutation
             .resource_generation(&ResourceFence::new("kubernetes_namespace", &app.namespace))
         {
             Some(raw) => match MutationGeneration::new(raw) {
-                Ok(generation) => generation,
+                Ok(generation) => vec![generation],
                 Err(error) => {
                     tracing::warn!(
                         app_id = %app.id,
@@ -1848,7 +1854,7 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
     let ownership = match mutation
         .guard_provider(classify_failed_generation_namespace(
             app,
-            namespace_generation,
+            &namespace_generations,
         ))
         .await
     {
@@ -1916,7 +1922,10 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
         tracing::info!(
             app_id = %app.id,
             namespace = %app.namespace,
-            expected_generation = namespace_generation.get(),
+            expected_generations = ?namespace_generations
+                .iter()
+                .map(|generation| generation.get())
+                .collect::<Vec<_>>(),
             "failed-apply cleanup skips namespace: it does not carry this generation's mutation annotation; marking row for a later sweep to converge older leftovers"
         );
         // Codex P2: the row-level gate above already proved no OTHER
@@ -2025,7 +2034,7 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
                 match mutation
                     .guard_provider(delete_owned_namespace(
                         app,
-                        namespace_generation,
+                        &namespace_generations,
                         uid,
                         resource_version,
                     ))
@@ -2115,12 +2124,23 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
                     }
                 return CleanupFenceOutcome::ReleaseNormally;
             }
+            // The sweep's leftover bound keeps its ORDER semantics
+            // (creation-evidenced objects stamped at or below the failed
+            // deployment's newest claimed generation): the set's maximum
+            // is exactly the last generation any of its attempts could
+            // have written.
+            let sweep_bound = namespace_generations
+                .iter()
+                .map(|generation| generation.get())
+                .max()
+                .expect("the generation set is never empty");
             match mutation
                 .guard_provider(sweep_published_objects_from_adopted_namespace(
                     state,
                     app,
                     failed_deployment_id,
-                    namespace_generation,
+                    MutationGeneration::new(sweep_bound)
+                        .expect("the maximum of validated generations stays valid"),
                     evidence_loss_unresolved,
                 ))
                 .await
@@ -2507,9 +2527,17 @@ pub(crate) enum InitialNamespaceOwnership {
     Uninspectable,
 }
 
+/// Classify the pre-delete namespace GET against the SET of generations
+/// the failed deployment's attempts legitimately claimed (#260 review,
+/// round 2): retry exhaustion must accept an annotation stamped by ANY of
+/// its attempts — the last writer may be an early attempt whose later
+/// siblings claimed fresher fences but exited before any namespace write.
+/// Every listed generation was uniquely claimed by THIS deployment, so a
+/// live annotation matching any of them still proves this deployment was
+/// the last writer; anything else stays foreign.
 pub(crate) fn classify_initial_namespace_get(
     result: &Result<k8s_openapi::api::core::v1::Namespace, kube::Error>,
-    generation: enclava_engine::apply::generation::MutationGeneration,
+    generations: &[MutationGeneration],
 ) -> InitialNamespaceOwnership {
     match result {
         Ok(namespace) => {
@@ -2520,7 +2548,11 @@ pub(crate) fn classify_initial_namespace_get(
                         .get(enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION)
                 })
                 .and_then(|raw| raw.parse::<i64>().ok());
-            if live == Some(generation.get()) {
+            if live.is_some_and(|live| {
+                generations
+                    .iter()
+                    .any(|generation| live == generation.get())
+            }) {
                 // Last-writer proof alone is not creation proof: only the
                 // creation annotation (stamped by `apply_namespace`'s
                 // create POST) distinguishes a CAP-created namespace from a
@@ -2583,7 +2615,7 @@ pub(crate) fn classify_initial_namespace_get(
 /// been issued yet).
 async fn classify_failed_generation_namespace(
     app: &App,
-    generation: enclava_engine::apply::generation::MutationGeneration,
+    generations: &[MutationGeneration],
 ) -> InitialNamespaceOwnership {
     let client = match kube::Client::try_default().await {
         Ok(client) => client,
@@ -2608,7 +2640,7 @@ async fn classify_failed_generation_namespace(
         .await
         .map_err(|_| kube::Error::Service("namespace ownership probe timed out".into()))
         .and_then(|inner| inner);
-    classify_initial_namespace_get(&probed, generation)
+    classify_initial_namespace_get(&probed, generations)
 }
 
 /// Delete the namespace that ALREADY passed the ownership classification,
@@ -2635,7 +2667,7 @@ async fn classify_failed_generation_namespace(
 /// (or ambiguous ones) are `DeleteIncomplete` and retain the fence.
 async fn delete_owned_namespace(
     app: &App,
-    generation: enclava_engine::apply::generation::MutationGeneration,
+    generations: &[MutationGeneration],
     owned_uid: String,
     owned_resource_version: String,
 ) -> NamespaceTeardown {
@@ -2778,7 +2810,7 @@ async fn delete_owned_namespace(
                 let same_uid = live.metadata.uid.as_deref() == Some(pinned_uid.as_str());
                 let still_ours = same_uid
                     && matches!(
-                        classify_initial_namespace_get(&Ok(live.clone()), generation),
+                        classify_initial_namespace_get(&Ok(live.clone()), generations),
                         InitialNamespaceOwnership::Owned { .. }
                     )
                     && live.metadata.resource_version.is_some();
@@ -3529,6 +3561,40 @@ mod tests {
         }
     }
 
+    #[test]
+    fn initial_ownership_matches_any_claimed_generation_of_the_set() {
+        // Devin, #260 review round 2: a writer attempt stamped generation 7
+        // and died; a later sibling claimed generation 8 but exited before
+        // any namespace write. The exhaustion cleanup classifies against
+        // the APPEND-ONLY set of both claimed generations, so the live
+        // annotation 7 — older than the freshest claim — still authorizes
+        // teardown instead of stranding the namespace as foreign.
+        let claimed = [
+            enclava_engine::apply::generation::MutationGeneration::new(7)
+                .expect("valid writer generation"),
+            enclava_engine::apply::generation::MutationGeneration::new(8)
+                .expect("valid sibling generation"),
+        ];
+        assert!(matches!(
+            classify_initial_namespace_get(&Ok(annotated_namespace(7)), &claimed),
+            InitialNamespaceOwnership::Owned { .. }
+        ));
+        assert!(matches!(
+            classify_initial_namespace_get(&Ok(annotated_namespace(8)), &claimed),
+            InitialNamespaceOwnership::Owned { .. }
+        ));
+        // A generation no attempt of this deployment ever claimed — a
+        // newer deployment's write or a foreign namespace — stays foreign.
+        assert!(matches!(
+            classify_initial_namespace_get(&Ok(annotated_namespace(9)), &claimed),
+            InitialNamespaceOwnership::Foreign
+        ));
+        assert!(matches!(
+            classify_initial_namespace_get(&Ok(annotated_namespace(6)), &claimed),
+            InitialNamespaceOwnership::Foreign
+        ));
+    }
+
     fn api_error(code: u16) -> kube::Error {
         kube::Error::Api(Box::new(
             kube::core::Status::failure("classified", "Probe").with_code(code),
@@ -3540,11 +3606,17 @@ mod tests {
         let generation = enclava_engine::apply::generation::MutationGeneration::new(7)
             .expect("valid generation");
         assert!(matches!(
-            classify_initial_namespace_get(&Ok(annotated_namespace(7)), generation),
+            classify_initial_namespace_get(
+                &Ok(annotated_namespace(7)),
+                std::slice::from_ref(&generation),
+            ),
             InitialNamespaceOwnership::Owned { .. }
         ));
         assert!(matches!(
-            classify_initial_namespace_get(&Ok(annotated_namespace(6)), generation),
+            classify_initial_namespace_get(
+                &Ok(annotated_namespace(6)),
+                std::slice::from_ref(&generation),
+            ),
             InitialNamespaceOwnership::Foreign
         ));
         // A missing annotation (or an unparseable one) is foreign, not owned:
@@ -3552,7 +3624,7 @@ mod tests {
         assert!(matches!(
             classify_initial_namespace_get(
                 &Ok(k8s_openapi::api::core::v1::Namespace::default()),
-                generation
+                std::slice::from_ref(&generation)
             ),
             InitialNamespaceOwnership::Foreign
         ));
@@ -3560,7 +3632,10 @@ mod tests {
         // last-writer proof. Without creation evidence the namespace
         // pre-existed and was adopted — it must never be deleted.
         assert!(matches!(
-            classify_initial_namespace_get(&Ok(adopted_namespace(7)), generation),
+            classify_initial_namespace_get(
+                &Ok(adopted_namespace(7)),
+                std::slice::from_ref(&generation),
+            ),
             InitialNamespaceOwnership::Adopted
         ));
         // Codex e4Z: a tenant-authored creation marker (value present,
@@ -3579,7 +3654,7 @@ mod tests {
                 "7".to_string(),
             );
         assert!(matches!(
-            classify_initial_namespace_get(&Ok(forged), generation),
+            classify_initial_namespace_get(&Ok(forged), std::slice::from_ref(&generation),),
             InitialNamespaceOwnership::Adopted
         ));
         // Creation evidence written by an earlier generation (the namespace
@@ -3598,7 +3673,7 @@ mod tests {
                 "7".to_string(),
             );
         assert!(matches!(
-            classify_initial_namespace_get(&Ok(recreated), generation),
+            classify_initial_namespace_get(&Ok(recreated), std::slice::from_ref(&generation),),
             InitialNamespaceOwnership::Owned { .. }
         ));
     }
@@ -3926,19 +4001,19 @@ mod tests {
         // delete. (devin 🔍 follow-up: the old "NotOurs → skip route
         // removal" rollout note described superseded round-3 behavior.)
         assert!(matches!(
-            classify_initial_namespace_get(&Err(api_error(404)), generation),
+            classify_initial_namespace_get(&Err(api_error(404)), std::slice::from_ref(&generation),),
             InitialNamespaceOwnership::AbsentBeforeDelete
         ));
         // Any non-404 inspect failure is undecided ownership (Uninspectable):
         // no provider state may be touched at all.
         assert!(matches!(
-            classify_initial_namespace_get(&Err(api_error(500)), generation),
+            classify_initial_namespace_get(&Err(api_error(500)), std::slice::from_ref(&generation),),
             InitialNamespaceOwnership::Uninspectable
         ));
         assert!(matches!(
             classify_initial_namespace_get(
                 &Err(kube::Error::Service("transport unavailable".into())),
-                generation
+                std::slice::from_ref(&generation)
             ),
             InitialNamespaceOwnership::Uninspectable
         ));
