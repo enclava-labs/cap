@@ -85,6 +85,8 @@ pub struct AppStatusResponse {
     pub pod_status: Option<String>,
     pub tee_status: Option<String>,
     pub storage_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tee_error: Option<String>,
     pub observation: LiveObservation,
 }
 
@@ -117,6 +119,7 @@ struct TeeEvidenceFields {
     tee_status: Option<String>,
     storage_status: Option<String>,
     live_state: Option<String>,
+    tee_error: Option<String>,
     supplemental_fields_malformed: bool,
 }
 
@@ -135,6 +138,7 @@ pub(crate) struct ObservedAppStatus {
     tee_status: Option<String>,
     storage_status: Option<String>,
     live_state: Option<String>,
+    tee_error: Option<String>,
     runtime_failure: Option<RuntimeFailureEvidence>,
 }
 
@@ -210,6 +214,7 @@ pub async fn app_status(
         pod_status: observed.pod_status,
         tee_status: observed.tee_status,
         storage_status: observed.storage_status,
+        tee_error: observed.tee_error,
         observation: observed.observation,
     }))
 }
@@ -712,6 +717,10 @@ fn tee_evidence_fields(body: &Value) -> TeeEvidenceFields {
             .or_else(|| body.get("state"))
             .and_then(Value::as_str)
             .map(str::to_ascii_lowercase),
+        tee_error: body
+            .get("error")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         supplemental_fields_malformed,
     }
 }
@@ -742,6 +751,7 @@ fn classify_live_observation_for_deployment(
             None,
             None,
             None,
+            None,
         );
     };
     if !pod.found {
@@ -749,6 +759,7 @@ fn classify_live_observation_for_deployment(
             LiveObservationState::Partial,
             LiveObservationReason::PodNotFound,
             observed_at,
+            None,
             None,
             None,
             None,
@@ -764,6 +775,7 @@ fn classify_live_observation_for_deployment(
             observed_at,
             pod.deployment_id,
             pod.phase,
+            None,
             None,
             None,
             None,
@@ -784,6 +796,7 @@ fn classify_live_observation_for_deployment(
             None,
             None,
             None,
+            None,
             pod.runtime_failure,
         );
     }
@@ -797,6 +810,7 @@ fn classify_live_observation_for_deployment(
             observed_at,
             pod.deployment_id,
             pod.phase,
+            None,
             None,
             None,
             None,
@@ -814,6 +828,7 @@ fn classify_live_observation_for_deployment(
                 None,
                 None,
                 None,
+                None,
                 pod.runtime_failure,
             );
         }
@@ -827,6 +842,7 @@ fn classify_live_observation_for_deployment(
                 None,
                 None,
                 None,
+                None,
                 pod.runtime_failure,
             );
         }
@@ -835,6 +851,10 @@ fn classify_live_observation_for_deployment(
     if !fields.live_state.as_deref().is_some_and(|state| {
         state.eq_ignore_ascii_case("locked") || state.eq_ignore_ascii_case("unlocked")
     }) {
+        // live_state is neither locked nor unlocked (e.g. the proxy reported
+        // state="error" with an init-failure detail). The observation stays
+        // fail-closed (Partial) but we preserve the proxy error string so the
+        // recorded status explains why readiness was never reached.
         return incomplete_observation(
             LiveObservationState::Partial,
             LiveObservationReason::TeeEvidenceIncomplete,
@@ -844,6 +864,7 @@ fn classify_live_observation_for_deployment(
             fields.pod_status,
             fields.tee_status,
             fields.storage_status,
+            fields.tee_error,
             pod.runtime_failure,
         );
     }
@@ -867,6 +888,7 @@ fn classify_live_observation_for_deployment(
             fields.pod_status,
             fields.tee_status,
             fields.storage_status,
+            fields.tee_error,
             pod.runtime_failure,
         );
     }
@@ -884,6 +906,7 @@ fn classify_live_observation_for_deployment(
             fields.pod_status,
             fields.tee_status,
             fields.storage_status,
+            fields.tee_error,
             pod.runtime_failure,
         );
     }
@@ -902,6 +925,7 @@ fn classify_live_observation_for_deployment(
             fields.pod_status,
             fields.tee_status,
             fields.storage_status,
+            fields.tee_error,
             pod.runtime_failure,
         );
     }
@@ -915,6 +939,7 @@ fn classify_live_observation_for_deployment(
             fields.pod_status,
             fields.tee_status,
             fields.storage_status,
+            fields.tee_error,
             pod.runtime_failure,
         );
     }
@@ -936,6 +961,7 @@ fn classify_live_observation_for_deployment(
             tee_status: fields.tee_status,
             storage_status: fields.storage_status,
             live_state: fields.live_state,
+            tee_error: fields.tee_error,
             runtime_failure: pod.runtime_failure,
         };
     }
@@ -951,6 +977,7 @@ fn classify_live_observation_for_deployment(
         tee_status: fields.tee_status,
         storage_status: fields.storage_status,
         live_state: fields.live_state,
+        tee_error: fields.tee_error,
         runtime_failure: pod.runtime_failure,
     }
 }
@@ -965,6 +992,7 @@ fn incomplete_observation(
     pod_status: Option<String>,
     tee_status: Option<String>,
     storage_status: Option<String>,
+    tee_error: Option<String>,
     runtime_failure: Option<RuntimeFailureEvidence>,
 ) -> ObservedAppStatus {
     ObservedAppStatus {
@@ -979,6 +1007,7 @@ fn incomplete_observation(
         tee_status,
         storage_status,
         live_state: None,
+        tee_error,
         runtime_failure,
     }
 }
@@ -1308,6 +1337,32 @@ mod tests {
     }
 
     #[test]
+    fn tee_error_is_captured_from_proxy_status_error_field() {
+        let fields = tee_evidence_fields(&json!({
+            "pod_status": "Running",
+            "tee_status": "error",
+            "storage_status": "error",
+            "unlock_state": "error",
+            "error": "enclava_init_failed:last_stage=binding workload mount namespaces"
+        }));
+        assert_eq!(
+            fields.tee_error.as_deref(),
+            Some("enclava_init_failed:last_stage=binding workload mount namespaces")
+        );
+    }
+
+    #[test]
+    fn tee_error_is_none_when_proxy_status_has_no_error_field() {
+        let fields = tee_evidence_fields(&json!({
+            "pod_status": "Running",
+            "tee_status": "ready",
+            "storage_status": "unlocked",
+            "unlock_state": "unlocked"
+        }));
+        assert!(fields.tee_error.is_none());
+    }
+
+    #[test]
     fn mixed_case_locked_state_is_canonical_and_cannot_look_running() {
         let deployment_id = Uuid::new_v4();
         let tee = TeeEvidence::Available(tee_evidence_fields(&json!({
@@ -1354,6 +1409,33 @@ mod tests {
             Some(LiveObservationReason::TeeEvidenceIncomplete)
         );
         assert_eq!(observed.effective_status("running"), "partial");
+    }
+
+    #[test]
+    fn tee_error_survives_incomplete_observation_for_init_failure() {
+        // Proxy reports a definitive init failure: state="error" with the
+        // detail in the `error` field. live_state is neither locked nor
+        // unlocked, so the observation stays fail-closed
+        // (Partial/TeeEvidenceIncomplete), but the error detail must survive
+        // so the recorded status explains why readiness was never reached.
+        let tee = TeeEvidence::Available(tee_evidence_fields(&json!({
+            "pod_status": "Running",
+            "tee_status": "error",
+            "storage_status": "error",
+            "unlock_state": "error",
+            "error": "enclava_init_failed:last_stage=binding workload mount namespaces"
+        })));
+        let observed = classify_live_observation(complete_pod(Uuid::new_v4()), tee, observed_at());
+
+        assert_eq!(observed.observation.state, LiveObservationState::Partial);
+        assert_eq!(
+            observed.observation.reason,
+            Some(LiveObservationReason::TeeEvidenceIncomplete)
+        );
+        assert_eq!(
+            observed.tee_error.as_deref(),
+            Some("enclava_init_failed:last_stage=binding workload mount namespaces")
+        );
     }
 
     #[test]
