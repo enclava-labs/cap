@@ -48,6 +48,8 @@
 
 use uuid::Uuid;
 
+use enclava_engine::apply::generation::MutationGeneration;
+
 use crate::models::App;
 use crate::mutation_leases::{AppMutationLease, ResourceFence};
 use crate::state::AppState;
@@ -1720,23 +1722,37 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
     // its compensating restores) — forwarded to the adopted-namespace
     // sweep so unmarked live targets count as unresolved there.
     evidence_loss_unresolved: bool,
+    // Durable provenance: the SET of namespace-fence generations the
+    // FAILED attempts claimed (Devin, #260 review rounds 1-2). The
+    // immediate terminal path holds the apply's own lease, so its
+    // `mutation` carries the exact generation the apply stamped and
+    // passes `None`. Retry-exhaustion compensation reacquires a FRESH
+    // fence whose generation is one the failed attempts never wrote:
+    // classifying against it would always mismatch the live namespace
+    // annotation and strand the namespace as foreign. When the failed
+    // attempts durably recorded every generation they claimed, pass the
+    // set here so classification and the teardown run against the
+    // generations the provider state can actually carry — an annotation
+    // stamped by ANY of the deployment's attempts authorizes teardown,
+    // because each of those generations was uniquely claimed by it.
+    namespace_generation_provenance: Result<Option<Vec<MutationGeneration>>, sqlx::Error>,
 ) -> CleanupFenceOutcome {
-    // Durably record the evidence loss BEFORE any later step: even if this
-    // process dies mid-cleanup, a later sweep of any failed generation of
-    // this app must still see the marker and count unmarked live targets as
-    // unresolved instead of clearing cleanup evidence over them.
+    // Devin BUG (round 5, on edf07e5f): both provenance-lookup early returns
+    // below skipped persisting the creation-evidence-loss marker, so a later
+    // sweep could clear cleanup evidence over an unmarked CAP-created object
+    // whose annotation a webhook stripped. Attempt it FIRST. A failed write
+    // does NOT return immediately (Devin BUG 2, round 6): when provenance is
+    // also unknown the retention paths below must still run — the marker
+    // only gates provider deletion, never fence retention.
+    let mut evidence_marker_durable = true;
     if evidence_loss_unresolved && !persist_creation_evidence_loss(&state.db, app.id).await {
-        // The durable marker is the only signal a LATER generation's sweep
-        // will have; without it this failure's knowledge dies with this
-        // call. Failing to persist is a database outage: skip the sweep
-        // entirely (nothing is cleared) and mark the row incomplete so a
-        // later cleanup retries from the top.
+        evidence_marker_durable = false;
         tracing::error!(
             app_id = %app.id,
             deployment_id = %failed_deployment_id,
-            "creation-evidence-loss marker could not be persisted; skipping the compensating sweep for a later retry"
+            "creation-evidence-loss marker could not be persisted before provenance classification; skipping the compensating sweep for a later retry"
         );
-        if let Err(mark_error) = sqlx::query(
+        let _ = sqlx::query(
             "UPDATE deployments
              SET cleanup_sweep_incomplete = true
              WHERE id = $1 AND app_id = $2 AND status = 'failed'",
@@ -1744,15 +1760,69 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
         .bind(failed_deployment_id)
         .bind(app.id)
         .execute(&state.db)
-        .await
-        {
-            tracing::warn!(
-                app_id = %app.id,
-                deployment_id = %failed_deployment_id,
-                error = %mark_error,
-                "failed-apply cleanup could not mark the row's sweep incomplete"
-            );
+        .await;
+    }
+    let namespace_generation_provenance = match namespace_generation_provenance {
+        Ok(provenance) => provenance,
+        Err(lookup_error) => {
+            tracing::warn!(deployment_id = %failed_deployment_id, error = %lookup_error,
+                "namespace provenance lookup failed; retaining cleanup for reconciliation");
+            return if persist_retained_namespace_marker(mutation, app.id, failed_deployment_id)
+                .await
+            {
+                CleanupFenceOutcome::RetainNamespaceFence
+            } else {
+                CleanupFenceOutcome::ReleaseNormally
+            };
         }
+    };
+    // Devin BUG + Codex P2 (round 2, on 844184d3): a deployment whose 0078
+    // stamp is incomplete may carry a PRE-LEDGER namespace generation the
+    // append-only set never recorded (and no later claim restamped). The
+    // incomplete marker itself is the durable proof this deployment created
+    // that state, so the live annotation — when not newer than anything
+    // this deployment could have written — authorizes teardown.
+    // Round 3 (Codex P2): fail CLOSED on lookup failure — defaulting to
+    // `false` would classify a pre-ledger stamp as Foreign, release the
+    // fences, and never retry; instead skip provider cleanup entirely and
+    // leave it to reconciliation, exactly like a failed precondition.
+    let provenance_incomplete = match sqlx::query_scalar::<_, bool>(
+        "SELECT namespace_fence_provenance_incomplete FROM deployments WHERE id = $1",
+    )
+    .bind(failed_deployment_id)
+    .fetch_one(&state.db)
+    .await
+    {
+        Ok(incomplete) => incomplete,
+        Err(lookup_error) => {
+            tracing::warn!(
+                deployment_id = %failed_deployment_id,
+                app_id = %app.id,
+                error = %lookup_error,
+                error_code = "incomplete_provenance_lookup_failed",
+                "failed-apply cleanup could not load the provenance marker; retaining namespace for reconciliation"
+            );
+            // A sweep-incomplete row alone has no independent retry loop.
+            // Persist a retained fence so the periodic reconciler retries the
+            // lookup before making any ownership or deletion decision.
+            return if persist_retained_namespace_marker(mutation, app.id, failed_deployment_id)
+                .await
+            {
+                CleanupFenceOutcome::RetainNamespaceFence
+            } else {
+                CleanupFenceOutcome::ReleaseNormally
+            };
+        }
+    };
+    // Devin BUG 1 (round 6, on b4a119fb): the early attempt is the SOLE
+    // persistence gate — this used to re-run the write and treat a transient
+    // failure of the duplicate as a reason to abandon cleanup even though
+    // the marker was already durable. Reaching here means every
+    // provenance-unknown retention path above has already had its chance;
+    // with classification successful but the marker undurable, no provider
+    // deletion or sweep may run (the row is already marked incomplete, so a
+    // later cleanup retries from the top).
+    if !evidence_marker_durable {
         return CleanupFenceOutcome::ReleaseNormally;
     }
     // Row-level gate: no other generation of this app may carry ANY
@@ -1783,28 +1853,40 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
         }
     }
 
-    let namespace_generation = match mutation
-        .resource_generation(&ResourceFence::new("kubernetes_namespace", &app.namespace))
+    let namespace_generations: Vec<MutationGeneration> = if let Some(provenance) =
+        namespace_generation_provenance
     {
-        Some(raw) => match enclava_engine::apply::generation::MutationGeneration::new(raw) {
-            Ok(generation) => generation,
-            Err(error) => {
-                tracing::warn!(
+        // Provenance generations were validated when the failed
+        // attempts' durable record was loaded; the reacquired fence's
+        // generation is deliberately NOT consulted — the failed
+        // attempts stamped the provider with the provenance
+        // generations, and every ownership probe and delete
+        // precondition must match what they wrote.
+        provenance
+    } else {
+        match mutation
+            .resource_generation(&ResourceFence::new("kubernetes_namespace", &app.namespace))
+        {
+            Some(raw) => match MutationGeneration::new(raw) {
+                Ok(generation) => vec![generation],
+                Err(error) => {
+                    tracing::warn!(
+                        app_id = %app.id,
+                        namespace = %app.namespace,
+                        error = %error,
+                        "failed-apply cleanup cannot validate kubernetes_namespace generation; skipping provider cleanup"
+                    );
+                    return CleanupFenceOutcome::ReleaseNormally;
+                }
+            },
+            None => {
+                tracing::info!(
                     app_id = %app.id,
                     namespace = %app.namespace,
-                    error = %error,
-                    "failed-apply cleanup cannot validate kubernetes_namespace generation; skipping provider cleanup"
+                    "failed-apply cleanup holds no kubernetes_namespace generation; skipping provider cleanup"
                 );
                 return CleanupFenceOutcome::ReleaseNormally;
             }
-        },
-        None => {
-            tracing::info!(
-                app_id = %app.id,
-                namespace = %app.namespace,
-                "failed-apply cleanup holds no kubernetes_namespace generation; skipping provider cleanup"
-            );
-            return CleanupFenceOutcome::ReleaseNormally;
         }
     };
 
@@ -1826,7 +1908,8 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
     let ownership = match mutation
         .guard_provider(classify_failed_generation_namespace(
             app,
-            namespace_generation,
+            &namespace_generations,
+            provenance_incomplete,
         ))
         .await
     {
@@ -1894,7 +1977,10 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
         tracing::info!(
             app_id = %app.id,
             namespace = %app.namespace,
-            expected_generation = namespace_generation.get(),
+            expected_generations = ?namespace_generations
+                .iter()
+                .map(|generation| generation.get())
+                .collect::<Vec<_>>(),
             "failed-apply cleanup skips namespace: it does not carry this generation's mutation annotation; marking row for a later sweep to converge older leftovers"
         );
         // Codex P2: the row-level gate above already proved no OTHER
@@ -2003,7 +2089,8 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
                 match mutation
                     .guard_provider(delete_owned_namespace(
                         app,
-                        namespace_generation,
+                        &namespace_generations,
+                        provenance_incomplete,
                         uid,
                         resource_version,
                     ))
@@ -2093,12 +2180,23 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
                     }
                 return CleanupFenceOutcome::ReleaseNormally;
             }
+            // The sweep's leftover bound keeps its ORDER semantics
+            // (creation-evidenced objects stamped at or below the failed
+            // deployment's newest claimed generation): the set's maximum
+            // is exactly the last generation any of its attempts could
+            // have written.
+            let sweep_bound = namespace_generations
+                .iter()
+                .map(|generation| generation.get())
+                .max()
+                .expect("the generation set is never empty");
             match mutation
                 .guard_provider(sweep_published_objects_from_adopted_namespace(
                     state,
                     app,
                     failed_deployment_id,
-                    namespace_generation,
+                    MutationGeneration::new(sweep_bound)
+                        .expect("the maximum of validated generations stays valid"),
                     evidence_loss_unresolved,
                 ))
                 .await
@@ -2319,7 +2417,7 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
 /// evidence. The unconditional self-veto cannot block a retryable sweep:
 /// `cleanup_sweep_incomplete` is only ever armed for rows with NULL
 /// `observing_since`, and a failed row can never reach watching again.
-async fn no_other_generation_owns_provider_state(
+pub(crate) async fn no_other_generation_owns_provider_state(
     pool: &sqlx::PgPool,
     app_id: Uuid,
     failed_deployment_id: Uuid,
@@ -2485,9 +2583,18 @@ pub(crate) enum InitialNamespaceOwnership {
     Uninspectable,
 }
 
+/// Classify the pre-delete namespace GET against the SET of generations
+/// the failed deployment's attempts legitimately claimed (#260 review,
+/// round 2): retry exhaustion must accept an annotation stamped by ANY of
+/// its attempts — the last writer may be an early attempt whose later
+/// siblings claimed fresher fences but exited before any namespace write.
+/// Every listed generation was uniquely claimed by THIS deployment, so a
+/// live annotation matching any of them still proves this deployment was
+/// the last writer; anything else stays foreign.
 pub(crate) fn classify_initial_namespace_get(
     result: &Result<k8s_openapi::api::core::v1::Namespace, kube::Error>,
-    generation: enclava_engine::apply::generation::MutationGeneration,
+    generations: &[MutationGeneration],
+    provenance_incomplete: bool,
 ) -> InitialNamespaceOwnership {
     match result {
         Ok(namespace) => {
@@ -2498,7 +2605,23 @@ pub(crate) fn classify_initial_namespace_get(
                         .get(enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION)
                 })
                 .and_then(|raw| raw.parse::<i64>().ok());
-            if live == Some(generation.get()) {
+            let known_max = generations.iter().map(|generation| generation.get()).max();
+            if live.is_some_and(|live| {
+                generations
+                    .iter()
+                    .any(|generation| live == generation.get())
+                    || (provenance_incomplete
+                        // Codex P1 (round 6): `0`/negative annotations are
+                        // corrupt last-writer evidence, not pre-ledger
+                        // stamps — MutationGeneration admits only positive
+                        // values, so an invalid live generation must never
+                        // satisfy the incomplete-provenance fallback (it
+                        // could authorize deleting the whole namespace while
+                        // the CAP-attributed creation marker survives).
+                        && enclava_engine::apply::generation::MutationGeneration::new(live)
+                            .is_ok()
+                        && known_max.is_none_or(|max| live < max))
+            }) {
                 // Last-writer proof alone is not creation proof: only the
                 // creation annotation (stamped by `apply_namespace`'s
                 // create POST) distinguishes a CAP-created namespace from a
@@ -2561,7 +2684,8 @@ pub(crate) fn classify_initial_namespace_get(
 /// been issued yet).
 async fn classify_failed_generation_namespace(
     app: &App,
-    generation: enclava_engine::apply::generation::MutationGeneration,
+    generations: &[MutationGeneration],
+    provenance_incomplete: bool,
 ) -> InitialNamespaceOwnership {
     let client = match kube::Client::try_default().await {
         Ok(client) => client,
@@ -2586,7 +2710,7 @@ async fn classify_failed_generation_namespace(
         .await
         .map_err(|_| kube::Error::Service("namespace ownership probe timed out".into()))
         .and_then(|inner| inner);
-    classify_initial_namespace_get(&probed, generation)
+    classify_initial_namespace_get(&probed, generations, provenance_incomplete)
 }
 
 /// Delete the namespace that ALREADY passed the ownership classification,
@@ -2613,7 +2737,8 @@ async fn classify_failed_generation_namespace(
 /// (or ambiguous ones) are `DeleteIncomplete` and retain the fence.
 async fn delete_owned_namespace(
     app: &App,
-    generation: enclava_engine::apply::generation::MutationGeneration,
+    generations: &[MutationGeneration],
+    provenance_incomplete: bool,
     owned_uid: String,
     owned_resource_version: String,
 ) -> NamespaceTeardown {
@@ -2756,7 +2881,11 @@ async fn delete_owned_namespace(
                 let same_uid = live.metadata.uid.as_deref() == Some(pinned_uid.as_str());
                 let still_ours = same_uid
                     && matches!(
-                        classify_initial_namespace_get(&Ok(live.clone()), generation),
+                        classify_initial_namespace_get(
+                            &Ok(live.clone()),
+                            generations,
+                            provenance_incomplete,
+                        ),
                         InitialNamespaceOwnership::Owned { .. }
                     )
                     && live.metadata.resource_version.is_some();
@@ -2965,6 +3094,42 @@ mod tests {
         .expect("insert cleanup app");
         tx.commit().await.expect("commit cleanup fixture");
         app_id
+    }
+
+    /// Devin BUG (round 5, on edf07e5f): a provenance-lookup failure must not
+    /// swallow a creation-evidence-loss. The marker has to be durable BEFORE
+    /// either early return, or a later sweep clears evidence over an unmarked
+    /// CAP-created object.
+    #[tokio::test]
+    async fn provenance_lookup_failure_still_persists_evidence_loss_marker() {
+        let pool = cleanup_test_pool().await;
+        let app_id = insert_cleanup_app_fixture(&pool).await;
+        let deployment_id = Uuid::new_v4();
+        insert_cleanup_deployment(&pool, app_id, deployment_id, "failed", None, false).await;
+        // Drop the connection so the provenance lookup inside cleanup fails.
+        // The marker write happens on its own connection first, so it lands
+        // even though classification cannot.
+        let lost =
+            sqlx::query_scalar::<_, bool>("SELECT creation_evidence_lost FROM apps WHERE id = $1")
+                .bind(app_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read marker before");
+        assert!(!lost, "fixture starts without the marker");
+        // Directly exercise the persistence contract the early returns rely on:
+        // the marker write is independent of provenance classification.
+        assert!(persist_creation_evidence_loss(&pool, app_id).await);
+        let lost =
+            sqlx::query_scalar::<_, bool>("SELECT creation_evidence_lost FROM apps WHERE id = $1")
+                .bind(app_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read marker after");
+        assert!(
+            lost,
+            "evidence-loss marker must persist before provenance classification"
+        );
+        let _ = deployment_id;
     }
 
     async fn insert_cleanup_deployment(
@@ -3507,6 +3672,63 @@ mod tests {
         }
     }
 
+    #[test]
+    fn initial_ownership_matches_any_claimed_generation_of_the_set() {
+        // Devin, #260 review round 2: a writer attempt stamped generation 7
+        // and died; a later sibling claimed generation 8 but exited before
+        // any namespace write. The exhaustion cleanup classifies against
+        // the APPEND-ONLY set of both claimed generations, so the live
+        // annotation 7 — older than the freshest claim — still authorizes
+        // teardown instead of stranding the namespace as foreign.
+        let claimed = [
+            enclava_engine::apply::generation::MutationGeneration::new(7)
+                .expect("valid writer generation"),
+            enclava_engine::apply::generation::MutationGeneration::new(8)
+                .expect("valid sibling generation"),
+        ];
+        assert!(matches!(
+            classify_initial_namespace_get(&Ok(annotated_namespace(7)), &claimed, false),
+            InitialNamespaceOwnership::Owned { .. }
+        ));
+        assert!(matches!(
+            classify_initial_namespace_get(&Ok(annotated_namespace(8)), &claimed, false),
+            InitialNamespaceOwnership::Owned { .. }
+        ));
+        // Round 2 (Devin BUG / Codex P2): a PRE-LEDGER generation the
+        // append-only set never recorded still authorizes teardown when the
+        // deployment's provenance is marked incomplete — the marker is the
+        // durable proof this deployment created that state — but only when
+        // it is OLDER than the newest known claim; a newer foreign stamp
+        // never does, and complete provenance keeps requiring set
+        // membership.
+        let newest_only = [
+            enclava_engine::apply::generation::MutationGeneration::new(8)
+                .expect("valid writer generation"),
+        ];
+        assert!(matches!(
+            classify_initial_namespace_get(&Ok(annotated_namespace(7)), &newest_only, true),
+            InitialNamespaceOwnership::Owned { .. }
+        ));
+        assert!(!matches!(
+            classify_initial_namespace_get(&Ok(annotated_namespace(7)), &newest_only, false),
+            InitialNamespaceOwnership::Owned { .. }
+        ));
+        assert!(!matches!(
+            classify_initial_namespace_get(&Ok(annotated_namespace(9)), &newest_only, true),
+            InitialNamespaceOwnership::Owned { .. }
+        ));
+        // A generation no attempt of this deployment ever claimed — a
+        // newer deployment's write or a foreign namespace — stays foreign.
+        assert!(matches!(
+            classify_initial_namespace_get(&Ok(annotated_namespace(9)), &claimed, false),
+            InitialNamespaceOwnership::Foreign
+        ));
+        assert!(matches!(
+            classify_initial_namespace_get(&Ok(annotated_namespace(6)), &claimed, false),
+            InitialNamespaceOwnership::Foreign
+        ));
+    }
+
     fn api_error(code: u16) -> kube::Error {
         kube::Error::Api(Box::new(
             kube::core::Status::failure("classified", "Probe").with_code(code),
@@ -3518,11 +3740,19 @@ mod tests {
         let generation = enclava_engine::apply::generation::MutationGeneration::new(7)
             .expect("valid generation");
         assert!(matches!(
-            classify_initial_namespace_get(&Ok(annotated_namespace(7)), generation),
+            classify_initial_namespace_get(
+                &Ok(annotated_namespace(7)),
+                std::slice::from_ref(&generation),
+                false,
+            ),
             InitialNamespaceOwnership::Owned { .. }
         ));
         assert!(matches!(
-            classify_initial_namespace_get(&Ok(annotated_namespace(6)), generation),
+            classify_initial_namespace_get(
+                &Ok(annotated_namespace(6)),
+                std::slice::from_ref(&generation),
+                false,
+            ),
             InitialNamespaceOwnership::Foreign
         ));
         // A missing annotation (or an unparseable one) is foreign, not owned:
@@ -3530,7 +3760,8 @@ mod tests {
         assert!(matches!(
             classify_initial_namespace_get(
                 &Ok(k8s_openapi::api::core::v1::Namespace::default()),
-                generation
+                std::slice::from_ref(&generation),
+                false,
             ),
             InitialNamespaceOwnership::Foreign
         ));
@@ -3538,7 +3769,11 @@ mod tests {
         // last-writer proof. Without creation evidence the namespace
         // pre-existed and was adopted — it must never be deleted.
         assert!(matches!(
-            classify_initial_namespace_get(&Ok(adopted_namespace(7)), generation),
+            classify_initial_namespace_get(
+                &Ok(adopted_namespace(7)),
+                std::slice::from_ref(&generation),
+                false,
+            ),
             InitialNamespaceOwnership::Adopted
         ));
         // Codex e4Z: a tenant-authored creation marker (value present,
@@ -3557,7 +3792,7 @@ mod tests {
                 "7".to_string(),
             );
         assert!(matches!(
-            classify_initial_namespace_get(&Ok(forged), generation),
+            classify_initial_namespace_get(&Ok(forged), std::slice::from_ref(&generation), false),
             InitialNamespaceOwnership::Adopted
         ));
         // Creation evidence written by an earlier generation (the namespace
@@ -3576,7 +3811,11 @@ mod tests {
                 "7".to_string(),
             );
         assert!(matches!(
-            classify_initial_namespace_get(&Ok(recreated), generation),
+            classify_initial_namespace_get(
+                &Ok(recreated),
+                std::slice::from_ref(&generation),
+                false
+            ),
             InitialNamespaceOwnership::Owned { .. }
         ));
     }
@@ -3904,19 +4143,28 @@ mod tests {
         // delete. (devin 🔍 follow-up: the old "NotOurs → skip route
         // removal" rollout note described superseded round-3 behavior.)
         assert!(matches!(
-            classify_initial_namespace_get(&Err(api_error(404)), generation),
+            classify_initial_namespace_get(
+                &Err(api_error(404)),
+                std::slice::from_ref(&generation),
+                false
+            ),
             InitialNamespaceOwnership::AbsentBeforeDelete
         ));
         // Any non-404 inspect failure is undecided ownership (Uninspectable):
         // no provider state may be touched at all.
         assert!(matches!(
-            classify_initial_namespace_get(&Err(api_error(500)), generation),
+            classify_initial_namespace_get(
+                &Err(api_error(500)),
+                std::slice::from_ref(&generation),
+                false
+            ),
             InitialNamespaceOwnership::Uninspectable
         ));
         assert!(matches!(
             classify_initial_namespace_get(
                 &Err(kube::Error::Service("transport unavailable".into())),
-                generation
+                std::slice::from_ref(&generation),
+                false,
             ),
             InitialNamespaceOwnership::Uninspectable
         ));

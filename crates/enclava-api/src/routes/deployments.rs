@@ -563,7 +563,8 @@ const PUBLIC_DEPLOYMENT_ERROR_MESSAGE: &str = "deployment_error";
 pub(crate) fn public_deployment_error_message(error_message: Option<&str>) -> Option<String> {
     error_message.map(|error_message| match error_message {
         crate::deploy::DEPLOYMENT_SUPERSEDED_ERROR
-        | crate::deployment_jobs::CUSTOMER_CONFIG_HOLD_EXPIRED => error_message.to_string(),
+        | crate::deployment_jobs::CUSTOMER_CONFIG_HOLD_EXPIRED
+        | crate::deployment_jobs::DEPLOYMENT_RETRY_EXHAUSTED_MESSAGE => error_message.to_string(),
         _ => PUBLIC_DEPLOYMENT_ERROR_MESSAGE.to_string(),
     })
 }
@@ -2240,6 +2241,30 @@ mod tests {
             .expect("valid log encryption config")
             .expect("config returned");
         assert_eq!(validated, config);
+    }
+
+    #[test]
+    fn public_deployment_error_message_passes_bounded_codes_and_redacts_plaintext() {
+        // Bounded platform classifications cross the tenant boundary verbatim.
+        assert_eq!(
+            public_deployment_error_message(Some(
+                crate::deployment_jobs::DEPLOYMENT_RETRY_EXHAUSTED_MESSAGE
+            ))
+            .as_deref(),
+            Some(crate::deployment_jobs::DEPLOYMENT_RETRY_EXHAUSTED_MESSAGE)
+        );
+        assert_eq!(
+            public_deployment_error_message(Some(crate::deploy::DEPLOYMENT_SUPERSEDED_ERROR))
+                .as_deref(),
+            Some(crate::deploy::DEPLOYMENT_SUPERSEDED_ERROR)
+        );
+        // Arbitrary backend plaintext stays redacted.
+        assert_eq!(
+            public_deployment_error_message(Some("kubernetes: node oom-killed tenant pod"))
+                .as_deref(),
+            Some(PUBLIC_DEPLOYMENT_ERROR_MESSAGE)
+        );
+        assert_eq!(public_deployment_error_message(None), None);
     }
 
     #[test]
