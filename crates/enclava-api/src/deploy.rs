@@ -63,10 +63,8 @@ const PULL_SECRET_CREDENTIAL_GENERATION_ANNOTATION: &str =
 const PULL_SECRET_SCOPE_GENERATION_ANNOTATION: &str =
     "cap.enclava.dev/pull-secret-scope-generation";
 
-/// Operator-controlled monotonic repository-scope rollout epoch. Stamped on
-/// every managed secret this replica writes; a replica that observes a secret
-/// carrying a NEWER scope epoch defers to the newer rollout's policy instead
-/// of recreating credentials it removed (see [`newer_pull_secret_scope`]).
+/// Operator-controlled monotonic epoch; bump BEFORE broadening repository scope
+/// in a rolling deployment, after all replicas have received this fence.
 fn pull_secret_scope_generation() -> u64 {
     std::env::var("TENANT_IMAGE_PULL_SCOPE_GENERATION")
         .ok()
@@ -101,6 +99,122 @@ fn newer_pull_secret_credentials(secret: &Secret) -> bool {
         .is_some_and(|generation| generation > pull_secret_credential_generation())
 }
 
+/// Codex review on #243, P1 "fence narrowed scopes against older replicas":
+/// the scope-epoch marker lived only as an annotation on the managed Secret,
+/// so a scope-narrowing rollout that deleted it left older replicas (whose
+/// broader configuration still matches the repository) nothing to compare
+/// against — their deploy path's create-on-404 branch and the sweep's repair
+/// pass recreated the platform PAT and reattached it on the next deployment.
+/// This durable, shared-DB fence (`tenant_pull_secret_scope_fences`) records
+/// the newest [`pull_secret_scope_generation`] epoch that has made a
+/// pull-secret decision for a namespace, outside the deletable Secret.
+///
+/// Whether a namespace's recorded fence epoch defers THIS replica: a newer
+/// epoch means a newer rollout's policy owns the namespace's pull secrets, so
+/// this replica must create, refresh, and delete nothing there — it defers
+/// (deploy: requeueable `PullSecretReconcileDeferred`; sweep: not converged)
+/// instead of resurrecting credentials the newer replica removed. Same
+/// contract the on-secret annotation already documents for workload
+/// admission: stale replicas stay closed until upgraded or retired.
+fn pull_secret_scope_fence_defers(fence_epoch: i64) -> bool {
+    fence_epoch > i64::try_from(pull_secret_scope_generation()).unwrap_or(i64::MAX)
+}
+
+/// Rollout-wide pull-secret authority (Codex review on #243, round 3, P1
+/// "stop stale-scope replicas from dispatching new namespaces" + P1 "fence
+/// pull-secret creation against credential rollouts"): the per-namespace
+/// fence above only protects namespaces the NEWER replica already swept —
+/// a namespace created after that sweep has no fence row, and the credential
+/// epoch lived only on live Secret annotations, so a namespace without the
+/// configured-name Secret had no authority rejecting a stale token. Every
+/// deploy/sweep that records a per-namespace fence also raises these
+/// fleet-wide maxima; a replica whose own epoch is below either maximum
+/// defers all tenant pull-secret work — the same closed-until-upgraded
+/// admission contract, extended to namespaces the newer rollout has not
+/// reached yet. Monotonic: a stale replica can never rewind them.
+async fn raise_tenant_pull_secret_rollout_authority(
+    pool: &sqlx::PgPool,
+    scope_epoch: u64,
+    credential_epoch: u64,
+) -> Result<(i64, i64), sqlx::Error> {
+    let (max_scope_epoch, max_credential_epoch) = sqlx::query_as::<_, (i64, i64)>(
+        "UPDATE tenant_pull_secret_rollout_authority \
+         SET max_scope_epoch = GREATEST(max_scope_epoch, $1), \
+             max_credential_epoch = GREATEST(max_credential_epoch, $2), \
+             updated_at = clock_timestamp() \
+         WHERE id \
+         RETURNING max_scope_epoch, max_credential_epoch",
+    )
+    .bind(i64::try_from(scope_epoch).unwrap_or(i64::MAX))
+    .bind(i64::try_from(credential_epoch).unwrap_or(i64::MAX))
+    .fetch_one(pool)
+    .await?;
+    Ok((max_scope_epoch, max_credential_epoch))
+}
+
+/// Whether the rollout-wide authority defers THIS replica: any newer scope
+/// or credential epoch observed anywhere in the fleet means a newer rollout
+/// exists, and this replica must not create, refresh, delete, or attach
+/// tenant pull secrets in ANY namespace — including ones without a fence
+/// row yet (created after the newer replica's sweep) and ones without the
+/// configured-name Secret (where no annotation epoch exists to compare
+/// against). Callers defer (deploy: requeueable
+/// `PullSecretReconcileDeferred`; sweep: not converged).
+fn pull_secret_rollout_authority_defers(max_scope_epoch: i64, max_credential_epoch: i64) -> bool {
+    let own_scope = i64::try_from(pull_secret_scope_generation()).unwrap_or(i64::MAX);
+    let own_credential = i64::try_from(pull_secret_credential_generation()).unwrap_or(i64::MAX);
+    max_scope_epoch > own_scope || max_credential_epoch > own_credential
+}
+
+/// The newest scope epoch recorded for one namespace (`0` = never fenced).
+async fn tenant_pull_secret_scope_fence_epoch(
+    pool: &sqlx::PgPool,
+    namespace: &str,
+) -> Result<i64, sqlx::Error> {
+    Ok(sqlx::query_scalar::<_, i64>(
+        "SELECT scope_epoch FROM tenant_pull_secret_scope_fences WHERE namespace = $1",
+    )
+    .bind(namespace)
+    .fetch_optional(pool)
+    .await?
+    .unwrap_or(0))
+}
+
+/// Record this replica's scope epoch as the newest pull-secret authority for
+/// a namespace (monotonic: an existing NEWER fence is never lowered, so a
+/// stale replica can never rewind a newer rollout's authority). Returns the
+/// AUTHORITATIVE epoch the row holds after the statement (Codex review on
+/// #243, round 2, P1 "make scope-fence recording detect a newer concurrent
+/// epoch"): when a newer replica raised the epoch between the caller's read
+/// and this upsert, the monotonic guard rejects the stale stamp, the
+/// `RETURNING` clause yields no row, and the fallback re-read returns the
+/// newer epoch — callers must re-check
+/// [`pull_secret_scope_fence_defers`] against it instead of assuming the
+/// stamp succeeded.
+async fn record_tenant_pull_secret_scope_fence(
+    pool: &sqlx::PgPool,
+    namespace: &str,
+    epoch: u64,
+) -> Result<i64, sqlx::Error> {
+    let updated = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO tenant_pull_secret_scope_fences (namespace, scope_epoch) \
+         VALUES ($1, $2) \
+         ON CONFLICT (namespace) DO UPDATE \
+            SET scope_epoch = EXCLUDED.scope_epoch, updated_at = clock_timestamp() \
+          WHERE EXCLUDED.scope_epoch > tenant_pull_secret_scope_fences.scope_epoch \
+         RETURNING scope_epoch",
+    )
+    .bind(namespace)
+    .bind(i64::try_from(epoch).unwrap_or(i64::MAX))
+    .fetch_optional(pool)
+    .await?;
+    match updated {
+        Some(epoch) => Ok(epoch),
+        // The monotonic guard rejected our (older or equal) stamp: report
+        // the epoch the row actually holds.
+        None => tenant_pull_secret_scope_fence_epoch(pool, namespace).await,
+    }
+}
 /// Durable repair intent on a generated ServiceAccount (Codex review on #243,
 /// P2 "persist failed pull-secret reference restorations"): a comma-separated
 /// list of pull-secret names whose `imagePullSecrets` references this cleanup
@@ -953,6 +1067,22 @@ impl PullSecretSettings {
             .as_ref()
             .map(|(username, token)| (username.as_str(), token.as_str()))
     }
+
+    /// Config for the sweep's 404-recreate arm: the settings already carry
+    /// the configured name and credential pair (snapshotted from the env in
+    /// production, explicit in tests), so the arm must not re-read the env
+    /// and diverge from the settings this reconcile was invoked with —
+    /// `generate_tenant_image_pull_secret` only consumes the name and the
+    /// credential pair (scope epochs are stamped from the generation env).
+    fn tenant_image_pull_secret_config(&self) -> Option<TenantImagePullSecretConfig> {
+        let (username, token) = self.ghcr_credentials.as_ref()?;
+        Some(TenantImagePullSecretConfig {
+            name: self.configured_name.clone(),
+            username: username.clone(),
+            token: token.clone(),
+            allowed_repositories: Vec::new(),
+        })
+    }
 }
 
 /// Per-app scope decisions for one namespace's pull-secret reconciliation
@@ -994,19 +1124,40 @@ impl PullSecretAccountScope {
     }
 }
 
-/// Which context is reconciling one namespace's managed pull secrets.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PullSecretReconcileContext {
-    /// The namespace-wide sweep (startup and background retry): it owns the
-    /// complete app inventory of the namespace, so it also runs the durable
-    /// reference-repair pass over pending ServiceAccount intents.
-    Sweep,
-    /// A single deploy's cleanup: the deploy's own SSA of the generated
-    /// ServiceAccount is the authoritative newest decision about its
-    /// `imagePullSecrets`, so the durable repair pass is skipped here —
-    /// stale intents are discharged after the applies instead (see
-    /// [`apply_all_with_tenant_image_pull_secret`]).
-    Deploy,
+/// How a reconciliation pass deletes the managed secrets it must remove.
+#[derive(Clone, Copy, Debug)]
+enum PullSecretDeleteMode {
+    /// Per-deploy cleanup, inside the deploy's mutation lease: deleted fenced
+    /// by the deploy's mutation generation.
+    Fenced(MutationGeneration),
+    /// Startup sweep and background retry, outside any mutation lease:
+    /// deleted on the observed UID/resourceVersion preconditions instead of
+    /// the mutation-generation fence. The sweep snapshots the namespace's
+    /// kubernetes mutation generation BEFORE reading its app inventory
+    /// (review findings on #243, Devin SEC + Codex P1): any discovered secret
+    /// carrying a NEWER mutation-generation annotation was applied by a
+    /// deploy that postdates the inventory snapshot — a workload entering
+    /// scope mid-sweep — and is skipped together with its ServiceAccount
+    /// references instead of being erased.
+    Unfenced {
+        /// The `kubernetes_namespace` lease generation observed before the
+        /// sweep's app-inventory query; `0` when the namespace has no lease
+        /// row yet (only unannotated legacy secrets can predate it).
+        namespace_generation: i64,
+        /// Whether that lease was HELD by an in-flight deploy at snapshot
+        /// time (Codex review on #243, P1 "fence secret-name rollouts before
+        /// deleting new secrets"): a deploy that acquired the namespace lease
+        /// BEFORE the snapshot writes with a mutation generation EQUAL to
+        /// `namespace_generation`, so the strict `>` skip cannot protect its
+        /// newly created Secret — during a `TENANT_IMAGE_PULL_SECRET_NAME`
+        /// rollout that Secret is unreferenced residue until the deploy's
+        /// ServiceAccount apply lands, and an old replica's sweep must not
+        /// delete it out from under the in-flight deploy. While the lease is
+        /// held, the ACTIVE generation is treated as concurrent; once it is
+        /// released the strict fence resumes (a secret still unreferenced
+        /// and unkept at the SAME generation is then completed residue).
+        lease_held: bool,
+    },
 }
 
 /// Same-object delete conflicts are retried with the engine's bounded but
@@ -1038,6 +1189,18 @@ const PULL_SECRET_DELETION_POLL_DEADLINE: std::time::Duration = std::time::Durat
 /// whose healthy traversal exceeds a whole-pass budget).
 const PULL_SECRET_NAMESPACE_RECONCILE_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(180);
+
+/// The mutation generation a live Secret carries, if any (`None` covers both
+/// unannotated legacy secrets and unparsable annotation values).
+fn secret_mutation_generation(secret: &Secret) -> Option<i64> {
+    use enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION;
+    secret
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(MUTATION_GENERATION_ANNOTATION))
+        .and_then(|raw| raw.parse::<i64>().ok())
+}
 
 /// Keep/remove decision for one discovered managed pull secret (review
 /// findings on #243). A managed secret stays only while the namespace is
@@ -1236,8 +1399,8 @@ async fn adopt_managed_pull_secret(
 /// platform PAT until its app happens to redeploy, and image pulls fail
 /// outright once the old token is revoked.
 ///
-/// The sweep holds no mutation lease, so the write is protected by
-/// (a) ownership — only secrets already proven CAP-managed
+/// The sweep holds no mutation lease, so instead of the deployment fence the
+/// write is fenced by (a) ownership — only secrets already proven CAP-managed
 /// (label, or legacy shape matching the current pair) are rewritten, never a
 /// tenant look-alike under the managed name; and (b) the live object's
 /// `resourceVersion` — a concurrent deploy or writer conflicts instead of
@@ -1629,7 +1792,7 @@ async fn reconcile_managed_pull_secrets(
     service_accounts: &[String],
     settings: &PullSecretSettings,
     scope: &PullSecretAccountScope,
-    context: PullSecretReconcileContext,
+    delete_mode: PullSecretDeleteMode,
 ) -> Result<bool, DeployError> {
     let (_managed, _all_referenced_names, accounts) =
         discover_managed_pull_secrets(engine, namespace, service_accounts, settings).await?;
@@ -1659,7 +1822,7 @@ async fn reconcile_managed_pull_secrets(
         // Pending references for in-scope accounts are desired too. Seed
         // them before any repairs, so an out-of-scope account processed
         // first cannot delete a secret another account will restore.
-        if context == PullSecretReconcileContext::Sweep {
+        if matches!(delete_mode, PullSecretDeleteMode::Unfenced { .. }) {
             for repair in pending_reference_repairs(account) {
                 in_scope_referenced_names.insert(repair.secret_name.clone());
             }
@@ -1698,12 +1861,12 @@ async fn reconcile_managed_pull_secrets(
     // - a different UID lives there → a replacement → restore the reference
     //   (the earlier clear was the mistake) and discharge.
     //
-    // Sweep contexts only: the per-deploy path's own SSA of the generated
-    // ServiceAccount is the authoritative newest decision about its
-    // `imagePullSecrets` — restoring ahead of it would be pruned and the
+    // Sweep contexts only (Unfenced): the per-deploy path's own SSA of the
+    // generated ServiceAccount is the authoritative newest decision about
+    // its `imagePullSecrets` — restoring ahead of it would be pruned and the
     // record discharged — so the deploy path discharges stale intents AFTER
     // its applies instead (see `apply_all_with_tenant_image_pull_secret`).
-    if context == PullSecretReconcileContext::Sweep {
+    if let PullSecretDeleteMode::Unfenced { .. } = delete_mode {
         for account in &accounts {
             let pending = pending_reference_repairs(account);
             if pending.is_empty() {
@@ -1932,6 +2095,7 @@ async fn reconcile_managed_pull_secrets(
                                 &secret_name,
                                 settings.ghcr(),
                                 Some(cleared_uid),
+                                delete_mode,
                             )
                             .await
                             {
@@ -2018,6 +2182,33 @@ async fn reconcile_managed_pull_secrets(
                                         }
                                     }
                                 }
+                                Ok(PullSecretRemovalOutcome::Superseded) => {
+                                    // A newer deploy rewrote the same managed
+                                    // object. Restore the reference it inherits
+                                    // by name, but do not record it as a tenant
+                                    // replacement — the UID is still ours.
+                                    if let Err(error) =
+                                        restore_pull_secret_reference_to_service_account(
+                                            engine,
+                                            namespace,
+                                            account_name,
+                                            &secret_name,
+                                            None,
+                                        )
+                                        .await
+                                    {
+                                        converged = false;
+                                        tracing::warn!(
+                                            %namespace,
+                                            service_account = %account_name,
+                                            secret = %secret_name,
+                                            %error,
+                                            "tenant image pull secret reconcile: failed to \
+                                             restore a reference whose pending removal was \
+                                             superseded — durable repair intent retained"
+                                        );
+                                    }
+                                }
                                 Err(error) => {
                                     converged = false;
                                     tracing::warn!(
@@ -2096,6 +2287,69 @@ async fn reconcile_managed_pull_secrets(
                                     .await
                                 {
                                     Ok(applied) => {
+                                        // Codex review on #243, round 3, P1
+                                        // "Attribute created Secrets to the
+                                        // platform field manager": verify the
+                                        // attribution survived the POST; a
+                                        // Secret whose ownership came back
+                                        // stripped is deleted (pinned to the
+                                        // response's UID/resourceVersion) and
+                                        // the namespace is not converged — an
+                                        // unattributable platform PAT must not
+                                        // land in a tenant namespace.
+                                        let attributed = applied
+                                            .metadata
+                                            .managed_fields
+                                            .as_ref()
+                                            .is_some_and(|entries| {
+                                                entries.iter().any(|entry| {
+                                                    entry.manager.as_deref()
+                                                        == Some(
+                                                            engine.config().field_manager.as_str(),
+                                                        )
+                                                })
+                                            });
+                                        if !attributed {
+                                            let delete_params = kube::api::DeleteParams {
+                                                preconditions: Some(kube::api::Preconditions {
+                                                    uid: applied.metadata.uid.clone(),
+                                                    resource_version: applied
+                                                        .metadata
+                                                        .resource_version
+                                                        .clone(),
+                                                }),
+                                                ..Default::default()
+                                            };
+                                            if let Err(error) =
+                                                api.delete(&config.name, &delete_params).await
+                                                && !matches!(
+                                                    &error,
+                                                    kube::Error::Api(error)
+                                                        if error.code == 404
+                                                )
+                                            {
+                                                tracing::error!(
+                                                    %namespace,
+                                                    secret = %config.name,
+                                                    %error,
+                                                    "could not delete a just-recreated pull \
+                                                     secret whose field-manager attribution \
+                                                     was stripped — the platform PAT may \
+                                                     remain exposed until operator cleanup"
+                                                );
+                                            }
+                                            converged = false;
+                                            tracing::warn!(
+                                                %namespace,
+                                                secret = %config.name,
+                                                "recreated pull secret came back without the \
+                                                 platform field manager's attribution \
+                                                 (mutating admission webhook?); the object \
+                                                 was deleted and the namespace stays \
+                                                 not-converged"
+                                            );
+                                            continue;
+                                        }
                                         record_pull_secret_creation(
                                             engine,
                                             namespace,
@@ -2318,6 +2572,37 @@ async fn reconcile_managed_pull_secrets(
             // waiting for the app to redeploy. A clear failure is retried by
             // the next pass — the secret stays, so discovery keeps finding
             // both the reference and the intent.
+            //
+            // Codex review on #243, round 2, P1 "fence per-app reference
+            // clears against concurrent deploys": the per-app scope comes
+            // from the sweep's inventory snapshot. If a concurrent deploy of
+            // this app re-scoped it back in, it rewrote the Secret under a
+            // mutation generation newer than (or equal-and-active with) the
+            // snapshot and attached the reference we are about to clear.
+            // Fence the clears with the same generation/lease check the
+            // delete path uses; the next sweep — whose inventory includes
+            // the deploy — re-decides per app.
+            let concurrent_deploy_owns_secret = match delete_mode {
+                PullSecretDeleteMode::Unfenced {
+                    namespace_generation,
+                    lease_held,
+                } => secret_mutation_generation(&live).is_some_and(|actual| {
+                    actual > namespace_generation || (lease_held && actual == namespace_generation)
+                }),
+                // Per-deploy callers pass a uniform scope (every account in
+                // scope), so this loop is a no-op for them.
+                PullSecretDeleteMode::Fenced(_) => false,
+            };
+            if concurrent_deploy_owns_secret {
+                tracing::info!(
+                    %namespace,
+                    secret = %name,
+                    "tenant image pull secret reconcile: skipped per-app reference clears — a \
+                     concurrent deploy (mutation generation newer than or equal-and-active with \
+                     the sweep snapshot) owns the secret; the next sweep re-decides per app"
+                );
+                continue;
+            }
             for service_account in service_accounts {
                 if scope.account_in_scope(service_account) {
                     // Configured name: attach even to newly qualifying accounts
@@ -2418,6 +2703,45 @@ async fn reconcile_managed_pull_secrets(
             );
             continue;
         }
+        // Sweep runs must never erase a secret a NEWER deploy applied (Devin
+        // SEC + Codex P1 review findings on #243): the sweep's app inventory
+        // is a DB snapshot taken BEFORE this generation was observed, so a
+        // secret carrying a newer mutation-generation annotation was applied
+        // by a deploy the snapshot never saw — typically a workload entering
+        // the repository scope mid-sweep. Skip it and its references; the
+        // next sweep (whose snapshot includes that deploy) decides. Checked
+        // on the live object so an annotation that landed after discovery is
+        // honored too.
+        //
+        // Codex review on #243, P1 "fence secret-name rollouts before
+        // deleting new secrets": a deploy that acquired the namespace lease
+        // BEFORE the sweep snapshot writes at a mutation generation EQUAL to
+        // `namespace_generation`, which the strict `>` cannot distinguish
+        // from completed residue. While that lease was still HELD at snapshot
+        // time, the generation is concurrent (the deploy's ServiceAccount
+        // apply may not have landed — e.g. a mid-rollout new-name Secret is
+        // unreferenced residue only until then), so an equal generation is
+        // skipped too. Once the lease is released the strict fence resumes:
+        // an unreferenced, unkept secret at the same generation is then
+        // completed residue a later sweep may remove.
+        if let PullSecretDeleteMode::Unfenced {
+            namespace_generation,
+            lease_held,
+        } = delete_mode
+            && secret_mutation_generation(&live).is_some_and(|actual| {
+                actual > namespace_generation || (lease_held && actual == namespace_generation)
+            })
+        {
+            kept += 1;
+            tracing::info!(
+                %namespace,
+                secret = %name,
+                "tenant image pull secret reconcile: skipped — a mutation generation newer \
+                 than the sweep's inventory snapshot wrote it (concurrent deploy); leaving it \
+                 and its ServiceAccount references for the next sweep"
+            );
+            continue;
+        }
         // Only proven CAP-managed names are ever cleared from
         // ServiceAccounts (review finding): a tenant-owned secret under the
         // same name keeps both itself and its references.
@@ -2497,9 +2821,20 @@ async fn reconcile_managed_pull_secrets(
         // the clears are reversed: a replacement detected at deletion keeps
         // its ServiceAccount references and its pods keep registry access.
         let removal =
-            delete_managed_pull_secret(engine, namespace, name, settings.ghcr(), None).await;
+            delete_managed_pull_secret(engine, namespace, name, settings.ghcr(), None, delete_mode)
+                .await;
         let reverse_reference_clears = match &removal {
             Ok(PullSecretRemovalOutcome::Deleted | PullSecretRemovalOutcome::Missing) => false,
+            Ok(PullSecretRemovalOutcome::Superseded) => {
+                tracing::info!(
+                    %namespace,
+                    secret = %name,
+                    "tenant image pull secret reconcile: a concurrent deploy rewrote the secret \
+                     mid-cleanup (newer mutation generation) — keeping it and restoring its \
+                     ServiceAccount references; the next sweep decides"
+                );
+                true
+            }
             Ok(PullSecretRemovalOutcome::NotOurs) => {
                 tracing::warn!(
                     %namespace,
@@ -2669,13 +3004,18 @@ enum PullSecretRemovalOutcome {
     /// merely moved `resourceVersion` is NOT this outcome: it is retried and,
     /// if it never settles, reported as an error so the caller stays closed.
     NotOurs,
+    /// The live object still passes the ownership check, but carries a
+    /// mutation generation NEWER than the sweep's pre-inventory snapshot
+    /// (self-check on #243): a concurrent deploy rewrote the secret after the
+    /// reconcile-time check. Treated exactly like `NotOurs` — the secret is
+    /// kept and the already-cleared ServiceAccount references are restored —
+    /// but with distinct telemetry so the race is visible in logs.
+    Superseded,
 }
 
-/// Delete one proven managed pull secret. Every attempt re-reads the live
-/// object, re-verifies CAP ownership right before deleting, and pins the
-/// delete to exactly the object that verification saw — the observed
-/// UID/resourceVersion preconditions — so a secret replaced after that check
-/// must conflict and survive, never be deleted.
+/// Delete one proven managed pull secret, fenced by the deploy's mutation
+/// generation (per-deploy cleanup) or by the observed UID/resourceVersion
+/// alone (startup sweep and background retry — see [`PullSecretDeleteMode`]).
 ///
 /// This is the final ownership decision of the cleanup (review finding on
 /// #243): it re-reads the live secret, re-verifies CAP ownership right before
@@ -2691,6 +3031,7 @@ async fn delete_managed_pull_secret(
     name: &str,
     ghcr_credentials: Option<(&str, &str)>,
     verified_uid: Option<&str>,
+    delete_mode: PullSecretDeleteMode,
 ) -> Result<PullSecretRemovalOutcome, DeployError> {
     use enclava_engine::apply::engine::ApplyError;
     let api: Api<Secret> = Api::namespaced(engine.client().clone(), namespace);
@@ -2735,6 +3076,34 @@ async fn delete_managed_pull_secret(
                 "tenant image pull secret cleanup skipped: secret exists but is not CAP-managed"
             );
             return Ok(PullSecretRemovalOutcome::NotOurs);
+        }
+        if let PullSecretDeleteMode::Fenced(generation) = delete_mode {
+            // The same generation fence `delete_resource` applies — but checked
+            // against the object this cleanup verified, not against a fresh read
+            // that could already be a replacement.
+            ensure_pull_secret_generation_not_stale(&existing, generation, name)?;
+        }
+        if let PullSecretDeleteMode::Unfenced {
+            namespace_generation,
+            ..
+        } = delete_mode
+            && secret_mutation_generation(&existing)
+                .is_some_and(|actual| actual > namespace_generation)
+        {
+            // Self-check on #243: the reconcile-time skip can race a deploy
+            // that claims the namespace lease and rewrites the secret after
+            // it — including the rewrite that caused a 409 on a previous
+            // attempt of this very loop. The re-read object passes the
+            // ownership check but belongs to a deploy the sweep's inventory
+            // never saw, so it must be kept, exactly like the reconcile-time
+            // skip above.
+            tracing::info!(
+                namespace = %namespace,
+                secret = %name,
+                "tenant image pull secret delete skipped: a mutation generation newer \
+                 than the sweep's inventory snapshot rewrote it mid-cleanup (concurrent deploy)"
+            );
+            return Ok(PullSecretRemovalOutcome::Superseded);
         }
         // Pin the delete to the verified object's identity: a replacement that
         // lands after the ownership check conflicts (409) instead of being
@@ -3001,7 +3370,7 @@ async fn sweep_namespace_with_budget(
     service_accounts: &[String],
     settings: &PullSecretSettings,
     scope: &PullSecretAccountScope,
-    context: PullSecretReconcileContext,
+    delete_mode: PullSecretDeleteMode,
 ) -> Result<bool, DeployError> {
     match tokio::time::timeout(
         PULL_SECRET_NAMESPACE_RECONCILE_TIMEOUT,
@@ -3011,7 +3380,7 @@ async fn sweep_namespace_with_budget(
             service_accounts,
             settings,
             scope,
-            context,
+            delete_mode,
         ),
     )
     .await
@@ -3045,10 +3414,32 @@ async fn cleanup_stale_tenant_image_pull_secrets(pool: &PgPool) -> Result<bool, 
     let settings = PullSecretSettings::from_env();
     let config = tenant_image_pull_secret_config_from_env();
 
-    // Bound the inventory query: a stalled DB must not block startup
-    // indefinitely (the rest of the sweep degrades to "not converged,
-    // retried with backoff" per namespace).
+    // Snapshot the namespaces' kubernetes mutation generations BEFORE the
+    // app-inventory read (Devin SEC + Codex P1 review findings on #243): the
+    // inventory is a DB snapshot, and a deploy that enters scope after it was
+    // taken applies a pull secret the snapshot classifies as out of scope.
+    // Any secret annotated with a generation NEWER than this snapshot is
+    // skipped by the reconcile pass, so the sweep can never erase a fresh
+    // deploy's credentials; the next sweep (snapshot taken after that deploy)
+    // decides. Read once for all namespaces — one extra query per sweep.
+    // Bound both inventory queries together, separately from per-namespace
+    // reconciliation. A stalled DB must not block startup indefinitely.
     let inventory = async {
+        // Codex review on #243, P1 "fence secret-name rollouts before
+        // deleting new secrets": the snapshot also records whether the
+        // namespace's lease was HELD by an in-flight deploy at read time —
+        // an ACTIVE lease generation is concurrent (the deploy's
+        // ServiceAccount apply may not have landed), so secrets it wrote at
+        // that exact generation are skipped instead of being erased as
+        // unreferenced residue.
+        let leases: Vec<(String, i64, bool)> = sqlx::query_as(
+            "SELECT resource_key, generation, \
+                    (owner_token IS NOT NULL AND locked_until > clock_timestamp()) \
+               FROM external_resource_mutation_leases \
+              WHERE resource_scope = 'kubernetes_namespace'",
+        )
+        .fetch_all(pool)
+        .await?;
         let rows: Vec<(Uuid, String, String, Option<String>)> = sqlx::query_as(
             "SELECT apps.id, apps.namespace, apps.service_account, \
                     app_containers.image_ref \
@@ -3057,9 +3448,13 @@ async fn cleanup_stale_tenant_image_pull_secrets(pool: &PgPool) -> Result<bool, 
         )
         .fetch_all(pool)
         .await?;
-        Ok::<_, sqlx::Error>(rows)
+        Ok::<_, sqlx::Error>((leases, rows))
     };
-    let rows = match tokio::time::timeout(PULL_SECRET_NAMESPACE_RECONCILE_TIMEOUT, inventory).await
+    let (lease_rows, rows) = match tokio::time::timeout(
+        PULL_SECRET_NAMESPACE_RECONCILE_TIMEOUT,
+        inventory,
+    )
+    .await
     {
         Ok(result) => result?,
         Err(_) => {
@@ -3069,6 +3464,10 @@ async fn cleanup_stale_tenant_image_pull_secrets(pool: &PgPool) -> Result<bool, 
             return Ok(false);
         }
     };
+    let lease_rows: std::collections::BTreeMap<String, (i64, bool)> = lease_rows
+        .into_iter()
+        .map(|(namespace, generation, held)| (namespace, (generation, held)))
+        .collect();
 
     // LEFT JOIN: an app with no container rows must still be inventoried
     // (as an app with no images), or its namespace is invisible to the sweep
@@ -3152,13 +3551,106 @@ async fn cleanup_stale_tenant_image_pull_secrets(pool: &PgPool) -> Result<bool, 
                 None => Default::default(),
             },
         };
+        // Codex review on #243, P1 "fence narrowed scopes against older
+        // replicas" + round 2 P1: a NEWER recorded scope epoch owns this
+        // namespace's pull secrets — this replica's (possibly broader)
+        // policy must not create, refresh, or delete anything there, and
+        // cannot certify it converged; the newer replica's sweep converges
+        // it. The stamp is checked against the AUTHORITATIVE epoch the
+        // monotonic upsert leaves behind: a concurrent newer replica that
+        // raised the fence between the inventory read and this write wins,
+        // and this sweep defers. Otherwise this sweep acts under the
+        // current epoch and records it durably (outside the deletable
+        // Secret), so any older replica that later sweeps or deploys here
+        // defers instead of resurrecting the platform PAT a newer rollout
+        // removed.
+        let authoritative_fence_epoch = match record_tenant_pull_secret_scope_fence(
+            pool,
+            namespace,
+            pull_secret_scope_generation(),
+        )
+        .await
+        {
+            Ok(epoch) => epoch,
+            Err(error) => {
+                converged = false;
+                tracing::warn!(
+                    %namespace,
+                    %error,
+                    "tenant image pull secret cleanup sweep: failed to record the scope-epoch \
+                     fence — treating the namespace as not converged"
+                );
+                continue;
+            }
+        };
+        if pull_secret_scope_fence_defers(authoritative_fence_epoch) {
+            converged = false;
+            tracing::warn!(
+                %namespace,
+                fence_epoch = authoritative_fence_epoch,
+                replica_epoch = pull_secret_scope_generation(),
+                "tenant image pull secret cleanup sweep: a newer repository-scope epoch \
+                 owns this namespace's pull secrets — deferring to the newer policy; this \
+                 replica's sweep cannot converge or touch it"
+            );
+            continue;
+        }
+        // Codex review on #243, round 3: rollout-wide authority (see
+        // [`raise_tenant_pull_secret_rollout_authority`]). The per-namespace
+        // fence above only defers namespaces a newer replica already swept;
+        // a namespace created after that sweep has no row, and a namespace
+        // without the configured-name Secret carries no credential epoch to
+        // compare against. A replica below either fleet-wide maximum defers
+        // the whole namespace (not converged): no create-on-404, no repair,
+        // no reference restores — the newer rollout's sweep converges it.
+        let (authority_scope_epoch, authority_credential_epoch) =
+            match raise_tenant_pull_secret_rollout_authority(
+                pool,
+                pull_secret_scope_generation(),
+                pull_secret_credential_generation(),
+            )
+            .await
+            {
+                Ok(maxima) => maxima,
+                Err(error) => {
+                    converged = false;
+                    tracing::warn!(
+                        %namespace,
+                        %error,
+                        "tenant image pull secret cleanup sweep: failed to raise the \
+                         rollout-wide pull-secret authority — treating the namespace as \
+                         not converged"
+                    );
+                    continue;
+                }
+            };
+        if pull_secret_rollout_authority_defers(authority_scope_epoch, authority_credential_epoch) {
+            converged = false;
+            tracing::warn!(
+                %namespace,
+                authority_scope_epoch,
+                authority_credential_epoch,
+                replica_scope_epoch = pull_secret_scope_generation(),
+                replica_credential_epoch = pull_secret_credential_generation(),
+                "tenant image pull secret cleanup sweep: a newer pull-secret rollout \
+                 exists fleet-wide — this replica defers all tenant pull-secret work \
+                 (including namespaces without a fence row or a live Secret) until \
+                 upgraded"
+            );
+            continue;
+        }
+        let (namespace_generation, lease_held) =
+            lease_rows.get(namespace).copied().unwrap_or((0, false));
         match sweep_namespace_with_budget(
             &engine,
             namespace,
             &service_accounts,
             &settings,
             &scope,
-            PullSecretReconcileContext::Sweep,
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation,
+                lease_held,
+            },
         )
         .await
         {
@@ -3609,92 +4101,101 @@ async fn apply_scoped_pull_secret(
             MUTATION_GENERATION_ANNOTATION.to_string(),
             generation.get().to_string(),
         );
-    for _ in 0..5 {
-        match api.get(&config.name).await {
-            Ok(live) => {
-                if newer_pull_secret_scope(&live) {
-                    return Err(DeployError::PullSecretReconcileDeferred(format!(
-                        "newer repository-scope epoch owns {namespace}/{}",
-                        config.name
-                    )));
-                }
-                if newer_pull_secret_credentials(&live) {
-                    return Err(DeployError::PullSecretReconcileDeferred(format!(
-                        "newer pull-secret credential generation owns {namespace}/{}",
-                        config.name
-                    )));
-                }
-                // Codex review on #243, round 2, P1 "refuse to overwrite
-                // an unowned configured-name Secret": an adopted or
-                // otherwise pre-existing tenant namespace can hold a
-                // TENANT-owned secret at the configured name. This raw
-                // merge patch ignores SSA field ownership, so without an
-                // ownership proof it would destroy the tenant's registry
-                // credentials and stamp CAP's labels onto their object —
-                // converting it into a platform-PAT secret the later
-                // cleanup considers CAP-owned. Require the same proof the
-                // sweep demands (dedicated label, or the legacy generated
-                // shape carrying the configured pair) and fail closed.
-                if !is_managed_tenant_image_pull_secret(
-                    &live,
-                    Some((config.username.as_str(), config.token.as_str())),
-                ) {
-                    return Err(DeployError::Validation(format!(
-                        "secret {namespace}/{} exists but is not CAP-managed (neither the \
-                         dedicated pull-secret label nor the configured GHCR credential \
-                         shape); refusing to overwrite a tenant-owned object with the \
-                         platform pull secret — remove or rename it, or change \
-                         TENANT_IMAGE_PULL_SECRET_NAME",
-                        config.name
-                    )));
-                }
-                let foreign = recorded_foreign_replacement_uids(
-                    engine,
-                    namespace,
-                    service_accounts,
-                    &config.name,
-                )
-                .await?;
-                if live
-                    .metadata
-                    .uid
-                    .as_deref()
-                    .is_some_and(|uid| foreign.contains(uid))
-                {
-                    return Err(DeployError::Validation(format!(
-                        "secret {namespace}/{} is a recorded tenant replacement (uid {}); refusing \
-                         to overwrite it with the platform pull secret — remove or rename it, or \
-                         change TENANT_IMAGE_PULL_SECRET_NAME",
-                        config.name,
-                        live.metadata.uid.as_deref().unwrap_or("")
-                    )));
-                }
-                ensure_pull_secret_generation_not_stale(&live, generation, &config.name)?;
-                let Some(resource_version) = live.metadata.resource_version.as_deref() else {
-                    return Err(DeployError::Validation(
-                        "pull secret has no resourceVersion".to_string(),
-                    ));
-                };
-                let mut annotations = live.metadata.annotations.clone().unwrap_or_default();
-                annotations.extend(desired.metadata.annotations.clone().unwrap_or_default());
-                let patch = serde_json::json!({
-                    "metadata": {
-                        "resourceVersion": resource_version,
-                        "annotations": annotations,
-                        "labels": desired.metadata.labels,
-                    },
-                    "type": "kubernetes.io/dockerconfigjson",
-                    "stringData": desired.string_data,
-                });
-                match api
-                    .patch(&config.name, &PatchParams::default(), &Patch::Merge(&patch))
-                    .await
-                {
-                    Ok(_) => return Ok(()),
-                    Err(kube::Error::Api(error)) if error.code == 409 || error.code == 404 => {
-                        continue;
+    // Codex review on #243, round 2, P1 "bound the custom pull-secret apply
+    // path": every raw GET/PATCH/POST below is unbounded, and this apply runs
+    // BEFORE `reconcile_managed_pull_secrets_for_deploy`, so a Kubernetes API
+    // server that accepts a connection but stalls would hold the deploy's
+    // namespace lease and apply permit indefinitely. Bound the whole apply —
+    // reads and writes — by the shared per-namespace budget; a timeout
+    // defers (requeueable) exactly like the reconciliation paths.
+    let apply = async {
+        for _ in 0..5 {
+            match api.get(&config.name).await {
+                Ok(live) => {
+                    if newer_pull_secret_scope(&live) {
+                        return Err(DeployError::PullSecretReconcileDeferred(format!(
+                            "newer repository-scope epoch owns {namespace}/{}",
+                            config.name
+                        )));
                     }
-                    Err(error) => return Err(DeployError::Apply(error.into())),
+                    if newer_pull_secret_credentials(&live) {
+                        return Err(DeployError::PullSecretReconcileDeferred(format!(
+                            "newer pull-secret credential generation owns {namespace}/{}",
+                            config.name
+                        )));
+                    }
+                    // Codex review on #243, round 2, P1 "refuse to overwrite
+                    // an unowned configured-name Secret": an adopted or
+                    // otherwise pre-existing tenant namespace can hold a
+                    // TENANT-owned secret at the configured name. This raw
+                    // merge patch ignores SSA field ownership, so without an
+                    // ownership proof it would destroy the tenant's registry
+                    // credentials and stamp CAP's labels onto their object —
+                    // converting it into a platform-PAT secret the later
+                    // cleanup considers CAP-owned. Require the same proof the
+                    // sweep demands (dedicated label, or the legacy generated
+                    // shape carrying the configured pair) and fail closed.
+                    if !is_managed_tenant_image_pull_secret(
+                        &live,
+                        Some((config.username.as_str(), config.token.as_str())),
+                    ) {
+                        return Err(DeployError::Validation(format!(
+                            "secret {namespace}/{} exists but is not CAP-managed (neither the \
+                             dedicated pull-secret label nor the configured GHCR credential \
+                             shape); refusing to overwrite a tenant-owned object with the \
+                             platform pull secret — remove or rename it, or change \
+                             TENANT_IMAGE_PULL_SECRET_NAME",
+                            config.name
+                        )));
+                    }
+                    let foreign = recorded_foreign_replacement_uids(
+                        engine,
+                        namespace,
+                        service_accounts,
+                        &config.name,
+                    )
+                    .await?;
+                    if live
+                        .metadata
+                        .uid
+                        .as_deref()
+                        .is_some_and(|uid| foreign.contains(uid))
+                    {
+                        return Err(DeployError::Validation(format!(
+                            "secret {namespace}/{} is a recorded tenant replacement (uid {}); refusing \
+                             to overwrite it with the platform pull secret — remove or rename it, or \
+                             change TENANT_IMAGE_PULL_SECRET_NAME",
+                            config.name,
+                            live.metadata.uid.as_deref().unwrap_or("")
+                        )));
+                    }
+                    ensure_pull_secret_generation_not_stale(&live, generation, &config.name)?;
+                    let Some(resource_version) = live.metadata.resource_version.as_deref() else {
+                        return Err(DeployError::Validation(
+                            "pull secret has no resourceVersion".to_string(),
+                        ));
+                    };
+                    let mut annotations = live.metadata.annotations.clone().unwrap_or_default();
+                    annotations.extend(desired.metadata.annotations.clone().unwrap_or_default());
+                    let patch = serde_json::json!({
+                        "metadata": {
+                            "resourceVersion": resource_version,
+                            "annotations": annotations,
+                            "labels": desired.metadata.labels,
+                        },
+                        "type": "kubernetes.io/dockerconfigjson",
+                        "stringData": desired.string_data,
+                    });
+                    match api
+                        .patch(&config.name, &PatchParams::default(), &Patch::Merge(&patch))
+                        .await
+                    {
+                        Ok(_) => return Ok(()),
+                        Err(kube::Error::Api(error)) if error.code == 409 || error.code == 404 => {
+                            continue;
+                        }
+                        Err(error) => return Err(DeployError::Apply(error.into())),
+                    }
                 }
             }
             Err(kube::Error::Api(error)) if error.code == 404 => {
@@ -3721,28 +4222,86 @@ async fn apply_scoped_pull_secret(
                     .create(&pull_secret_create_params(engine), &created)
                     .await
                 {
-                    Ok(created) => {
-                        record_pull_secret_creation(engine, namespace, &created, generation.get());
+                    Ok(applied) => {
+                        // Codex review on #243, round 2, P1 "verify
+                        // creation evidence returned by the Secret POST":
+                        // a mutating admission webhook can strip the
+                        // annotation from an ACCEPTED create. The engine's
+                        // create path verifies the response and
+                        // compensates; this raw POST must too — an
+                        // unattributable platform PAT in an adopted
+                        // namespace is worse than no secret, so the
+                        // just-created object is deleted (pinned to the
+                        // response's UID/resourceVersion) and the deploy
+                        // fails closed.
+                        let stamped =
+                            applied
+                                .metadata
+                                .annotations
+                                .as_ref()
+                                .and_then(|annotations| {
+                                    annotations.get(RESOURCE_CREATED_BY_ANNOTATION)
+                                });
+                        if stamped != Some(&generation.get().to_string()) {
+                            let delete_params = kube::api::DeleteParams {
+                                preconditions: Some(kube::api::Preconditions {
+                                    uid: applied.metadata.uid.clone(),
+                                    resource_version: applied.metadata.resource_version.clone(),
+                                }),
+                                ..Default::default()
+                            };
+                            if let Err(error) = api.delete(&config.name, &delete_params).await
+                                && !matches!(
+                                    &error,
+                                    kube::Error::Api(error) if error.code == 404
+                                )
+                            {
+                                tracing::error!(
+                                    %namespace,
+                                    secret = %config.name,
+                                    %error,
+                                    "could not delete a just-created pull secret whose \
+                                     creation evidence was stripped — the platform PAT may \
+                                     remain exposed until operator cleanup"
+                                );
+                            }
+                            return Err(DeployError::Validation(format!(
+                                "created pull secret {namespace}/{} came back without its \
+                                 creation evidence (mutating admission webhook?); the object \
+                                 was deleted and the deploy fails closed — an unattributable \
+                                 platform PAT must not land in a tenant namespace",
+                                config.name
+                            )));
+                        }
+                        record_pull_secret_creation(engine, namespace, &applied, generation.get());
                         return Ok(());
                     }
                     Err(kube::Error::Api(error)) if error.code == 409 => continue,
                     Err(error) => return Err(DeployError::Apply(error.into())),
                 }
+                Err(error) => return Err(DeployError::Apply(error.into())),
             }
-            Err(error) => return Err(DeployError::Apply(error.into())),
         }
+        // Codex review on #243, P2: exhausting the immediate retries on
+        // resource-version contention (a sweep, controller, or other writer
+        // racing each GET→patch) is transient — a fresh mutation attempt
+        // converges — so defer (requeueable via
+        // `should_requeue_without_terminal_failure`) instead of terminally
+        // failing the deployment.
+        Err(DeployError::PullSecretReconcileDeferred(format!(
+            "pull-secret apply for {namespace}/{} exhausted its immediate retries on \
+             concurrent writes; retrying the deployment under a fresh mutation attempt converges",
+            config.name
+        )))
+    };
+    match tokio::time::timeout(PULL_SECRET_NAMESPACE_RECONCILE_TIMEOUT, apply).await {
+        Ok(result) => result,
+        Err(_) => Err(DeployError::PullSecretReconcileDeferred(format!(
+            "pull-secret apply for {namespace}/{} exceeded its budget (stalled Kubernetes \
+             API?); retry the deployment — the namespace lease and apply permit are released",
+            config.name
+        ))),
     }
-    // Codex review on #243, P2: exhausting the immediate retries on
-    // resource-version contention (a sweep, controller, or other writer
-    // racing each GET→patch) is transient — a fresh mutation attempt
-    // converges — so defer (requeueable via
-    // `should_requeue_without_terminal_failure`) instead of terminally
-    // failing the deployment.
-    Err(DeployError::PullSecretReconcileDeferred(format!(
-        "pull-secret apply for {namespace}/{} exhausted its immediate retries on \
-         concurrent writes; retrying the deployment under a fresh mutation attempt converges",
-        config.name
-    )))
 }
 
 /// Deployment reconciliation must release its namespace lease and apply permit
@@ -3753,7 +4312,7 @@ async fn reconcile_managed_pull_secrets_for_deploy(
     service_accounts: &[String],
     settings: &PullSecretSettings,
     scope: &PullSecretAccountScope,
-    context: PullSecretReconcileContext,
+    delete_mode: PullSecretDeleteMode,
 ) -> Result<bool, DeployError> {
     tokio::time::timeout(
         PULL_SECRET_NAMESPACE_RECONCILE_TIMEOUT,
@@ -3763,7 +4322,7 @@ async fn reconcile_managed_pull_secrets_for_deploy(
             service_accounts,
             settings,
             scope,
-            context,
+            delete_mode,
         ),
     )
     .await
@@ -4061,6 +4620,58 @@ async fn apply_all_with_tenant_image_pull_secret(
     .await?;
     tracing::info!(namespace = %ns_name, "step 1/5: namespace ready");
 
+    // Codex review on #243, P1 "fence narrowed scopes against older replicas"
+    // + round 2 P1 "detect a newer concurrent epoch": the scope-epoch marker
+    // lived only on the (deletable) managed Secret, so after a
+    // scope-narrowing rollout deleted it, an older replica running the
+    // broader configuration would take the create-on-404 path below and
+    // resurrect the platform PAT on the next deployment. The durable
+    // per-namespace fence lives in the shared DB: this deploy records the
+    // epoch it acts under and re-checks the AUTHORITATIVE epoch the row
+    // holds after the monotonic upsert — if a newer replica raised the fence
+    // concurrently, the upsert is rejected and the returned epoch defers
+    // this whole deploy (requeueable) instead of letting a stale replica
+    // re-expose credentials a newer rollout removed.
+    let authoritative_fence_epoch =
+        record_tenant_pull_secret_scope_fence(pool, ns_name, pull_secret_scope_generation())
+            .await?;
+    if pull_secret_scope_fence_defers(authoritative_fence_epoch) {
+        return Err(DeployError::PullSecretReconcileDeferred(format!(
+            "a newer repository-scope epoch ({authoritative_fence_epoch}) owns {ns_name}'s pull \
+             secrets; this replica's scope generation ({}) is older — deferring instead of \
+             re-attaching credentials a newer rollout removed",
+            pull_secret_scope_generation()
+        )));
+    }
+    // Codex review on #243, round 3, P1 "stop stale-scope replicas from
+    // dispatching new namespaces" + P1 "fence pull-secret creation against
+    // credential rollouts": the per-namespace fence above only defers
+    // namespaces the newer replica already swept. A namespace created after
+    // that sweep has NO fence row, and the credential epoch exists only on
+    // live Secret annotations — so without a rollout-wide authority an old
+    // replica could take the create-on-404 path below and stamp its broader
+    // scope / revoked token into a brand-new namespace. Raise the fleet-wide
+    // maxima with this replica's epochs and defer the whole reconcile when
+    // ANY newer epoch has been observed anywhere: the newer rollout's sweep
+    // converges the namespace; this replica stays closed until upgraded.
+    let (authority_scope_epoch, authority_credential_epoch) =
+        raise_tenant_pull_secret_rollout_authority(
+            pool,
+            pull_secret_scope_generation(),
+            pull_secret_credential_generation(),
+        )
+        .await?;
+    if pull_secret_rollout_authority_defers(authority_scope_epoch, authority_credential_epoch) {
+        return Err(DeployError::PullSecretReconcileDeferred(format!(
+            "a newer pull-secret rollout exists (scope epoch {authority_scope_epoch} / credential \
+             epoch {authority_credential_epoch} vs this replica's {}/{}); deferring all tenant \
+             pull-secret work — including namespaces without a fence row or a live Secret — \
+             until this replica is upgraded",
+            pull_secret_scope_generation(),
+            pull_secret_credential_generation()
+        )));
+    }
+
     let settings = PullSecretSettings::from_env();
     let service_accounts = manifests
         .service_account
@@ -4157,7 +4768,7 @@ async fn apply_all_with_tenant_image_pull_secret(
             reconcile_accounts,
             &settings,
             &scope,
-            PullSecretReconcileContext::Sweep,
+            PullSecretDeleteMode::Fenced(generation),
         )
         .await?;
         if !converged {
@@ -4175,14 +4786,19 @@ async fn apply_all_with_tenant_image_pull_secret(
     // it can prune the pending name/UID that is the sole ownership proof of
     // a renamed, unlabeled pre-rotation secret. Run the sweep-context repair
     // pass with the complete namespace account list first. Sweep context is
-    // required: Deploy context skips the durable repair pass.
+    // required: Deploy context skips the durable repair pass. (#278 fence
+    // union: this deploy holds the namespace lease itself, so its own
+    // generation is active, not residue.)
     let repaired = reconcile_managed_pull_secrets_for_deploy(
         engine,
         ns_name,
         reconcile_accounts,
         &settings,
         &scope,
-        PullSecretReconcileContext::Sweep,
+        PullSecretDeleteMode::Unfenced {
+            namespace_generation: generation.get(),
+            lease_held: true,
+        },
     )
     .await?;
     if !repaired {
@@ -4225,7 +4841,7 @@ async fn apply_all_with_tenant_image_pull_secret(
             &service_accounts,
             &settings,
             &PullSecretAccountScope::uniform(true),
-            PullSecretReconcileContext::Deploy,
+            PullSecretDeleteMode::Fenced(generation),
         )
         .await?;
         if !converged {
@@ -6956,6 +7572,11 @@ mod tests {
         /// Scratch counter for `delete_lingering_polls` — GETs remaining
         /// before the finalizer releases the terminating Secret.
         lingering_polls_left: u8,
+        /// Simulate a concurrent deploy rewriting the managed secret mid-
+        /// cleanup: the first delete request annotates the live object (same
+        /// UID) with a NEWER mutation generation — the self-check race on
+        /// #243, where the rewrite that causes the 409 must not be deleted.
+        annotate_generation_on_delete: Option<i64>,
         /// Simulate a stalled API server (Codex review on #243, P1 follow-up):
         /// the label-selected Secret list hangs until the caller's per-
         /// namespace budget cancels it.
@@ -6979,6 +7600,21 @@ mod tests {
         inject_secret_on_create: Option<Secret>,
         /// If set, every Secret GET returns this status instead of the object.
         secret_get_status: Option<u16>,
+        /// Simulate a mutating admission webhook that strips
+        /// RESOURCE_CREATED_BY_ANNOTATION from an ACCEPTED Secret create
+        /// (Codex review on #243, round 2, P1): the stored/returned object
+        /// carries every other annotation, so only the evidence verify
+        /// path can catch it.
+        strip_creation_evidence_on_create: bool,
+        /// Webhook simulation (Codex review on #243, round 3, P1): the create
+        /// is ACCEPTED but the field-manager attribution (`managedFields`)
+        /// is dropped from the persisted object — the recreate path must
+        /// detect an unattributable platform PAT and delete it.
+        strip_field_manager_on_create: bool,
+        /// Simulate a Kubernetes API that accepts a connection but stalls on
+        /// NAMED Secret GETs (Codex review on #243, round 2, P1): the apply
+        /// path's budget must defer instead of hanging the deploy's lease.
+        stall_secret_gets: bool,
     }
 
     fn fake_managed_secret(name: &str, labeled: bool, username: &str, token: &str) -> Secret {
@@ -7065,9 +7701,13 @@ mod tests {
                     // ends before the sleep so the future stays Send.
                     let stall = {
                         let state = cluster.lock().unwrap();
-                        state.stall_secrets_list
+                        let named_secret_get = method.as_str() == "GET"
+                            && path.contains("/secrets/")
+                            && !path.trim_end_matches('/').ends_with("/secrets");
+                        (state.stall_secrets_list
                             && method.as_str() == "GET"
-                            && path.trim_end_matches('/').ends_with("/secrets")
+                            && path.trim_end_matches('/').ends_with("/secrets"))
+                            || (state.stall_secret_gets && named_secret_get)
                     };
                     if stall {
                         tokio::time::sleep(std::time::Duration::from_secs(600)).await;
@@ -7298,6 +7938,40 @@ mod tests {
                     })
                 });
                 let mut created: Secret = serde_json::from_slice(body).unwrap();
+                // A real API server records the request's fieldManager in
+                // `managedFields` (Codex review on #243, round 3, P1): stamp
+                // it so the recreate path's attribution verify can succeed —
+                // and so the strip simulation below is the only way it fails.
+                let field_manager = query.and_then(|query| {
+                    query.split('&').find_map(|pair| {
+                        let (key, value) = pair.split_once('=')?;
+                        (key == "fieldManager").then(|| decode_query_component(value))
+                    })
+                });
+                if let Some(manager) = field_manager
+                    && !state.strip_field_manager_on_create
+                {
+                    created
+                        .metadata
+                        .managed_fields
+                        .get_or_insert_with(Default::default)
+                        .push(
+                            k8s_openapi::apimachinery::pkg::apis::meta::v1::ManagedFieldsEntry {
+                                manager: Some(manager),
+                                ..Default::default()
+                            },
+                        );
+                }
+                if state.strip_creation_evidence_on_create {
+                    // Webhook simulation (Codex review on #243, round 2, P1):
+                    // the create is ACCEPTED but the evidence annotation is
+                    // dropped from the persisted object.
+                    if let Some(annotations) = created.metadata.annotations.as_mut() {
+                        annotations.remove(
+                            enclava_engine::apply::generation::RESOURCE_CREATED_BY_ANNOTATION,
+                        );
+                    }
+                }
                 if state
                     .secrets
                     .iter()
@@ -7323,6 +7997,29 @@ mod tests {
                     // The tenant replaces the secret between the cleanup's
                     // ownership check and its delete (review finding on #243).
                     swap_secret(&mut state.secrets, replacement);
+                }
+                if let Some(generation) = state.annotate_generation_on_delete.take() {
+                    // A concurrent deploy rewrites the managed secret (same
+                    // UID) under a NEWER mutation generation mid-cleanup —
+                    // the self-check race on #243: the re-read after the 409
+                    // must keep it instead of deleting.
+                    if let Some(secret) = state
+                        .secrets
+                        .iter_mut()
+                        .find(|secret| secret.metadata.name.as_deref() == name)
+                    {
+                        secret
+                            .metadata
+                            .annotations
+                            .get_or_insert_with(Default::default)
+                            .insert(
+                                enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION
+                                    .to_string(),
+                                generation.to_string(),
+                            );
+                        secret.metadata.resource_version =
+                            Some(format!("rv-rewritten-{}", generation));
+                    }
                 }
                 if state.rv_bumps_on_delete > 0 {
                     // A concurrent writer updates the SAME managed secret
@@ -7552,7 +8249,10 @@ mod tests {
             &["cap-tenant-app".to_string()],
             &reconcile_settings(),
             &PullSecretAccountScope::uniform(false),
-            PullSecretReconcileContext::Sweep,
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 0,
+                lease_held: false,
+            },
         )
         .await
         .unwrap();
@@ -7603,7 +8303,10 @@ mod tests {
             &["cap-tenant-app".to_string()],
             &reconcile_settings(),
             &PullSecretAccountScope::uniform(true),
-            PullSecretReconcileContext::Sweep,
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 0,
+                lease_held: false,
+            },
         )
         .await
         .unwrap();
@@ -7629,7 +8332,10 @@ mod tests {
             &["cap-tenant-app".to_string()],
             &reconcile_settings(),
             &PullSecretAccountScope::uniform(true),
-            PullSecretReconcileContext::Sweep,
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 0,
+                lease_held: false,
+            },
         )
         .await
         .unwrap();
@@ -7665,7 +8371,10 @@ mod tests {
             &["cap-tenant-app".to_string()],
             &reconcile_settings(),
             &PullSecretAccountScope::uniform(false),
-            PullSecretReconcileContext::Sweep,
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 0,
+                lease_held: false,
+            },
         )
         .await
         .unwrap();
@@ -7708,7 +8417,10 @@ mod tests {
             &["cap-tenant-app".to_string()],
             &reconcile_settings(),
             &PullSecretAccountScope::uniform(true),
-            PullSecretReconcileContext::Sweep,
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 0,
+                lease_held: false,
+            },
         )
         .await
         .unwrap();
@@ -7772,7 +8484,7 @@ mod tests {
             &["cap-tenant-app".to_string()],
             &reconcile_settings(),
             &PullSecretAccountScope::uniform(false),
-            PullSecretReconcileContext::Deploy,
+            PullSecretDeleteMode::Fenced(MutationGeneration::new(1).unwrap()),
         )
         .await
         .unwrap();
@@ -7824,7 +8536,7 @@ mod tests {
             &["cap-tenant-app".to_string()],
             &reconcile_settings(),
             &PullSecretAccountScope::uniform(false),
-            PullSecretReconcileContext::Deploy,
+            PullSecretDeleteMode::Fenced(MutationGeneration::new(1).unwrap()),
         )
         .await
         .unwrap();
@@ -7882,7 +8594,10 @@ mod tests {
             &["cap-tenant-app".to_string()],
             &reconcile_settings(),
             &PullSecretAccountScope::uniform(false),
-            PullSecretReconcileContext::Sweep,
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 0,
+                lease_held: false,
+            },
         )
         .await
         .unwrap();
@@ -7927,7 +8642,10 @@ mod tests {
             &["cap-tenant-app".to_string()],
             &reconcile_settings(),
             &PullSecretAccountScope::uniform(false),
-            PullSecretReconcileContext::Sweep,
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 0,
+                lease_held: false,
+            },
         )
         .await
         .unwrap();
@@ -7970,7 +8688,7 @@ mod tests {
             &["cap-tenant-app".to_string()],
             &reconcile_settings(),
             &PullSecretAccountScope::uniform(false),
-            PullSecretReconcileContext::Deploy,
+            PullSecretDeleteMode::Fenced(MutationGeneration::new(1).unwrap()),
         )
         .await
         .unwrap();
@@ -8027,7 +8745,10 @@ mod tests {
             &["cap-tenant-app".to_string()],
             &reconcile_settings(),
             &PullSecretAccountScope::uniform(false),
-            PullSecretReconcileContext::Sweep,
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 0,
+                lease_held: false,
+            },
         )
         .await
         .unwrap();
@@ -8092,7 +8813,10 @@ mod tests {
             &["cap-tenant-app".to_string()],
             &reconcile_settings(),
             &PullSecretAccountScope::uniform(false),
-            PullSecretReconcileContext::Sweep,
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 0,
+                lease_held: false,
+            },
         )
         .await
         .unwrap();
@@ -8114,6 +8838,164 @@ mod tests {
                 .map(|references| references.len()),
             Some(1),
             "no dangling reference: the failed patch left the reference in place"
+        );
+    }
+
+    /// Codex review on #243 (P1, Devin SEC — "fence background cleanup
+    /// against concurrent deploys"): a sweep whose app-inventory snapshot
+    /// predates a deploy must not delete the pull secret that deploy applied.
+    /// The secret carries a mutation-generation annotation newer than the
+    /// generation the sweep snapshotted before its inventory read; the
+    /// reconcile pass skips it together with its ServiceAccount references.
+    #[tokio::test]
+    async fn sweep_skips_secrets_from_newer_mutation_generations() {
+        use std::sync::{Arc, Mutex};
+
+        let mut secret =
+            fake_managed_secret("enclava-registry-auth", true, "cap-bot", "ghp_platform");
+        secret.metadata.annotations = Some(std::collections::BTreeMap::from([(
+            enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION.to_string(),
+            "7".to_string(),
+        )]));
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![secret],
+            service_accounts: vec![fake_service_account(
+                "cap-tenant-app",
+                &["enclava-registry-auth"],
+            )],
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        // The sweep snapshotted generation 5; the live secret carries 7 — a
+        // deploy the sweep's inventory never saw. Out-of-scope inventory, but
+        // the newer generation wins.
+        let converged = reconcile_managed_pull_secrets(
+            &engine,
+            "tenant-ns",
+            &["cap-tenant-app".to_string()],
+            &reconcile_settings(),
+            &PullSecretAccountScope::uniform(false),
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 5,
+                lease_held: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(converged, "skipping a newer-generation secret is converged");
+
+        {
+            let state = cluster.lock().unwrap();
+            assert_eq!(
+                state.secrets.len(),
+                1,
+                "a secret applied by a newer mutation generation must survive the stale sweep"
+            );
+            assert_eq!(
+                state.service_accounts[0]
+                    .image_pull_secrets
+                    .as_ref()
+                    .map(|references| references.len()),
+                Some(1),
+                "its ServiceAccount reference must survive with it"
+            );
+        }
+
+        // A sweep whose snapshot INCLUDES that generation (snapshot >= 7)
+        // proceeds with the removal — the fence only protects secrets newer
+        // than the snapshot.
+        let converged = reconcile_managed_pull_secrets(
+            &engine,
+            "tenant-ns",
+            &["cap-tenant-app".to_string()],
+            &reconcile_settings(),
+            &PullSecretAccountScope::uniform(false),
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 7,
+                lease_held: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(converged);
+        let state = cluster.lock().unwrap();
+        assert!(
+            state.secrets.is_empty(),
+            "once the snapshot includes the generation, the stale secret is removed"
+        );
+    }
+
+    /// Self-check on #243: a deploy rewrites the managed secret under a NEWER
+    /// mutation generation AFTER the reconcile-time skip check — the rewrite
+    /// that causes the delete's 409. The delete-loop re-read must keep the
+    /// rewritten secret and restore the already-cleared ServiceAccount
+    /// reference instead of deleting it.
+    #[tokio::test(start_paused = true)]
+    async fn delete_keeps_secret_rewritten_under_newer_generation_mid_cleanup() {
+        use std::sync::{Arc, Mutex};
+
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![fake_managed_secret(
+                "enclava-registry-auth",
+                true,
+                "cap-bot",
+                "ghp_platform",
+            )],
+            service_accounts: vec![fake_service_account(
+                "cap-tenant-app",
+                &["enclava-registry-auth"],
+            )],
+            // The rewrite lands on the FIRST delete attempt: the pinned
+            // delete conflicts, and the retry's re-read sees generation 9 —
+            // newer than the sweep's snapshot of 5.
+            annotate_generation_on_delete: Some(9),
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        let converged = reconcile_managed_pull_secrets(
+            &engine,
+            "tenant-ns",
+            &["cap-tenant-app".to_string()],
+            &reconcile_settings(),
+            &PullSecretAccountScope::uniform(false),
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 5,
+                lease_held: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            converged,
+            "keeping a concurrently rewritten secret is a converged skip"
+        );
+
+        let state = cluster.lock().unwrap();
+        assert_eq!(
+            state.secrets.len(),
+            1,
+            "a secret rewritten under a newer mutation generation mid-cleanup must survive"
+        );
+        assert_eq!(
+            state.secrets[0]
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|annotations| {
+                    annotations
+                        .get(enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION)
+                })
+                .map(String::as_str),
+            Some("9"),
+            "the surviving object is the deploy's rewrite, not the original"
+        );
+        assert_eq!(
+            state.service_accounts[0]
+                .image_pull_secrets
+                .as_ref()
+                .map(|references| references.len()),
+            Some(1),
+            "the cleared ServiceAccount reference must be restored for the rewrite"
         );
     }
 
@@ -8149,7 +9031,10 @@ mod tests {
             &["cap-tenant-app".to_string()],
             &reconcile_settings(),
             &PullSecretAccountScope::uniform(false),
-            PullSecretReconcileContext::Sweep,
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 0,
+                lease_held: false,
+            },
         )
         .await
         .unwrap();
@@ -8205,7 +9090,10 @@ mod tests {
             &["cap-tenant-app".to_string()],
             &reconcile_settings(),
             &PullSecretAccountScope::uniform(false),
-            PullSecretReconcileContext::Sweep,
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 0,
+                lease_held: false,
+            },
         )
         .await
         .unwrap();
@@ -8235,7 +9123,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scoped_deploy_updates_existing_secret_with_version_preconditions() {
+    async fn scoped_deploy_updates_existing_secret_with_version_fence() {
         use std::sync::{Arc, Mutex};
         let cluster = Arc::new(Mutex::new(FakeCluster {
             secrets: vec![fake_managed_secret(
@@ -8273,18 +9161,7 @@ mod tests {
                 .0,
             expected_dockerconfigjson("cap-bot", "ghp_new").into_bytes()
         );
-        assert_eq!(
-            state.secrets[0]
-                .metadata
-                .annotations
-                .as_ref()
-                .and_then(|annotations| {
-                    annotations
-                        .get(enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION)
-                })
-                .and_then(|raw| raw.parse::<i64>().ok()),
-            Some(2)
-        );
+        assert_eq!(secret_mutation_generation(&state.secrets[0]), Some(2));
     }
 
     /// Codex review on #243, P1: the raw create POST must stamp
@@ -8402,7 +9279,7 @@ mod tests {
     }
 
     #[test]
-    fn newer_rotation_generation_skips_stale_replica_refresh() {
+    fn newer_rotation_generation_fences_stale_replica_refresh() {
         let mut secret = fake_managed_secret("enclava-registry-auth", true, "cap-bot", "new-token");
         secret
             .metadata
@@ -8444,7 +9321,10 @@ mod tests {
             &["cap-tenant-app".to_string()],
             &reconcile_settings(),
             &PullSecretAccountScope::uniform(true),
-            PullSecretReconcileContext::Sweep,
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 0,
+                lease_held: false,
+            },
         )
         .await
         .unwrap();
@@ -8487,7 +9367,10 @@ mod tests {
             &["cap-tenant-app".to_string()],
             &reconcile_settings(),
             &PullSecretAccountScope::uniform(true),
-            PullSecretReconcileContext::Sweep,
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 0,
+                lease_held: false,
+            },
         )
         .await
         .unwrap();
@@ -8530,7 +9413,10 @@ mod tests {
             &["cap-tenant-app".to_string()],
             &reconcile_settings(),
             &PullSecretAccountScope::uniform(false),
-            PullSecretReconcileContext::Sweep,
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 0,
+                lease_held: false,
+            },
         )
         .await
         .unwrap();
@@ -8549,7 +9435,10 @@ mod tests {
             &["cap-tenant-app".to_string()],
             &reconcile_settings(),
             &PullSecretAccountScope::uniform(false),
-            PullSecretReconcileContext::Sweep,
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 0,
+                lease_held: false,
+            },
         )
         .await
         .unwrap();
@@ -8600,7 +9489,10 @@ mod tests {
             &["cap-tenant-app".to_string()],
             &reconcile_settings(),
             &PullSecretAccountScope::uniform(false),
-            PullSecretReconcileContext::Sweep,
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 0,
+                lease_held: false,
+            },
         )
         .await
         .unwrap();
@@ -8640,7 +9532,10 @@ mod tests {
             &["cap-tenant-app".to_string()],
             &reconcile_settings(),
             &PullSecretAccountScope::uniform(false),
-            PullSecretReconcileContext::Sweep,
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 0,
+                lease_held: false,
+            },
         )
         .await
         .unwrap();
@@ -8690,7 +9585,10 @@ mod tests {
             &["cap-tenant-app".to_string()],
             &reconcile_settings(),
             &PullSecretAccountScope::uniform(false),
-            PullSecretReconcileContext::Sweep,
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 0,
+                lease_held: false,
+            },
         )
         .await
         .unwrap();
@@ -8751,7 +9649,10 @@ mod tests {
             &["cap-tenant-app".to_string()],
             &reconcile_settings(),
             &PullSecretAccountScope::uniform(false),
-            PullSecretReconcileContext::Sweep,
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 0,
+                lease_held: false,
+            },
         )
         .await
         .unwrap();
@@ -8791,7 +9692,10 @@ mod tests {
             &["cap-tenant-app".to_string()],
             &rotated,
             &PullSecretAccountScope::uniform(false),
-            PullSecretReconcileContext::Sweep,
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 0,
+                lease_held: false,
+            },
         )
         .await
         .unwrap();
@@ -8846,7 +9750,10 @@ mod tests {
                 &["cap-tenant-app".to_string()],
                 &reconcile_settings(),
                 &PullSecretAccountScope::uniform(true),
-                PullSecretReconcileContext::Sweep,
+                PullSecretDeleteMode::Unfenced {
+                    namespace_generation: 0,
+                    lease_held: false,
+                },
             )
             .await
             .unwrap()
@@ -8890,7 +9797,10 @@ mod tests {
             &["cap-tenant-app".to_string()],
             &settings,
             &PullSecretAccountScope::uniform(true),
-            PullSecretReconcileContext::Sweep,
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 0,
+                lease_held: false,
+            },
         )
         .await
         .unwrap();
@@ -9067,7 +9977,10 @@ mod tests {
                     &["cap-out".into(), "cap-in".into()],
                     &reconcile_settings(),
                     &scope,
-                    PullSecretReconcileContext::Sweep,
+                    PullSecretDeleteMode::Unfenced {
+                        namespace_generation: 0,
+                        lease_held: false,
+                    },
                 )
                 .await
                 .unwrap()
@@ -9127,7 +10040,10 @@ mod tests {
             &["cap-tenant-app".to_string()],
             &settings,
             &PullSecretAccountScope::uniform(true),
-            PullSecretReconcileContext::Sweep,
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 0,
+                lease_held: false,
+            },
         )
         .await
         .unwrap();
@@ -9203,7 +10119,10 @@ mod tests {
                 &service_accounts,
                 &reconcile_settings(),
                 &narrowed,
-                PullSecretReconcileContext::Sweep,
+                PullSecretDeleteMode::Unfenced {
+                    namespace_generation: 0,
+                    lease_held: false,
+                },
             )
             .await
             .unwrap()
@@ -9248,7 +10167,10 @@ mod tests {
                 &service_accounts,
                 &reconcile_settings(),
                 &PullSecretAccountScope::uniform(true),
-                PullSecretReconcileContext::Sweep,
+                PullSecretDeleteMode::Unfenced {
+                    namespace_generation: 0,
+                    lease_held: false,
+                },
             )
             .await
             .unwrap()
@@ -9302,7 +10224,10 @@ mod tests {
                 ],
                 &reconcile_settings(),
                 &scope,
-                PullSecretReconcileContext::Sweep,
+                PullSecretDeleteMode::Unfenced {
+                    namespace_generation: 0,
+                    lease_held: false,
+                },
             )
             .await
             .unwrap()
@@ -9376,7 +10301,10 @@ mod tests {
                 ],
                 &reconcile_settings(),
                 &scope,
-                PullSecretReconcileContext::Sweep,
+                PullSecretDeleteMode::Unfenced {
+                    namespace_generation: 0,
+                    lease_held: false,
+                },
             )
             .await
             .unwrap()
@@ -9402,6 +10330,94 @@ mod tests {
             "the out-of-scope account's intent survives (its reference stays \
              cleared; a broadening re-attaches)"
         );
+    }
+
+    /// Codex review on #243, P1 "fence secret-name rollouts before deleting
+    /// new secrets": a deploy that acquired the namespace lease BEFORE the
+    /// sweep snapshot writes its new-name Secret at a mutation generation
+    /// EQUAL to the snapshot's. While that lease is still HELD the Secret is
+    /// unreferenced only because the deploy's ServiceAccount apply has not
+    /// landed — the sweep must skip it. Once the lease is released, the same
+    /// still-unreferenced Secret is completed residue and is removed.
+    #[tokio::test]
+    async fn sweep_keeps_active_lease_generation_secret_until_lease_release() {
+        use std::sync::{Arc, Mutex};
+        let mut secret =
+            fake_managed_secret("pull-secret-new-name", true, "cap-bot", "ghp_platform");
+        secret
+            .metadata
+            .annotations
+            .get_or_insert_with(Default::default)
+            .insert(
+                enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION.to_string(),
+                "7".to_string(),
+            );
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![secret],
+            service_accounts: vec![fake_service_account("cap-tenant-app", &[])],
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        assert!(
+            reconcile_managed_pull_secrets(
+                &engine,
+                "tenant-ns",
+                &["cap-tenant-app".to_string()],
+                &reconcile_settings(),
+                &PullSecretAccountScope::uniform(false),
+                PullSecretDeleteMode::Unfenced {
+                    namespace_generation: 7,
+                    lease_held: true,
+                },
+            )
+            .await
+            .unwrap(),
+            "held-lease pass must converge without touching the in-flight secret"
+        );
+        {
+            let state = cluster.lock().unwrap();
+            assert_eq!(
+                state.secrets.len(),
+                1,
+                "an ACTIVE lease generation is concurrent — its Secret is skipped"
+            );
+        }
+        assert!(
+            reconcile_managed_pull_secrets(
+                &engine,
+                "tenant-ns",
+                &["cap-tenant-app".to_string()],
+                &reconcile_settings(),
+                &PullSecretAccountScope::uniform(false),
+                PullSecretDeleteMode::Unfenced {
+                    namespace_generation: 7,
+                    lease_held: false,
+                },
+            )
+            .await
+            .unwrap()
+        );
+        let state = cluster.lock().unwrap();
+        assert!(
+            state.secrets.is_empty(),
+            "once the lease is released, the unreferenced same-generation \
+             Secret is completed residue and is removed"
+        );
+    }
+
+    /// Codex review on #243, P1 "fence narrowed scopes against older
+    /// replicas": the durable scope fence defers only replicas whose
+    /// `TENANT_IMAGE_PULL_SCOPE_GENERATION` is older than the recorded epoch
+    /// (tests run with the default epoch 0), so an equal fence never blocks
+    /// the current policy and a newer one always does.
+    #[test]
+    fn pull_secret_scope_fence_defers_only_older_replicas() {
+        assert!(
+            !pull_secret_scope_fence_defers(0),
+            "an equal (or absent) fence belongs to the current policy"
+        );
+        assert!(pull_secret_scope_fence_defers(1));
+        assert!(pull_secret_scope_fence_defers(i64::MAX));
     }
 
     /// Codex review on #243, P1 per-app scoping: the scope decision struct
@@ -9474,6 +10490,83 @@ mod tests {
         );
     }
 
+    /// Codex review on #243, round 2, P1 "verify creation evidence returned
+    /// by the Secret POST": a mutating admission webhook that strips
+    /// RESOURCE_CREATED_BY_ANNOTATION from the accepted create must not
+    /// report success — the just-created object is deleted (pinned to the
+    /// response identity) and the deploy fails closed.
+    #[tokio::test]
+    async fn scoped_deploy_create_evidence_strip_deletes_secret_and_fails() {
+        use std::sync::{Arc, Mutex};
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            strip_creation_evidence_on_create: true,
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        let config = TenantImagePullSecretConfig {
+            name: "enclava-registry-auth".to_string(),
+            username: "cap-bot".to_string(),
+            token: "ghp_platform".to_string(),
+            allowed_repositories: Vec::new(),
+        };
+        let error = apply_scoped_pull_secret(
+            &engine,
+            "tenant-ns",
+            &config,
+            MutationGeneration::new(3).unwrap(),
+            &[],
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, DeployError::Validation(ref message) if message.contains("creation evidence")),
+            "stripped creation evidence must fail closed, got {error:?}"
+        );
+        let state = cluster.lock().unwrap();
+        assert!(
+            state.secrets.is_empty(),
+            "the unattributable created secret must be deleted again"
+        );
+    }
+
+    /// Codex review on #243, round 2, P1 "bound the custom pull-secret apply
+    /// path": a Kubernetes API that accepts a connection but never responds
+    /// must defer (requeueable) once the per-namespace budget elapses,
+    /// instead of holding the deploy's namespace lease and apply permit
+    /// indefinitely.
+    #[tokio::test(start_paused = true)]
+    async fn scoped_deploy_apply_stall_defers_within_budget() {
+        use std::sync::{Arc, Mutex};
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            stall_secret_gets: true,
+            secrets: vec![fake_managed_secret(
+                "enclava-registry-auth",
+                true,
+                "cap-bot",
+                "ghp_old",
+            )],
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster);
+        let config = TenantImagePullSecretConfig {
+            name: "enclava-registry-auth".to_string(),
+            username: "cap-bot".to_string(),
+            token: "ghp_new".to_string(),
+            allowed_repositories: Vec::new(),
+        };
+        assert!(matches!(
+            apply_scoped_pull_secret(
+                &engine,
+                "tenant-ns",
+                &config,
+                MutationGeneration::new(2).unwrap(),
+                &[],
+            )
+            .await,
+            Err(DeployError::PullSecretReconcileDeferred(_))
+        ));
+    }
+
     /// Codex review on #243, round 2, P2 "advance the credential epoch even
     /// when secret bytes match": matching payload bytes alone must not skip
     /// the refresh — after a credential rollback/reuse the OLD
@@ -9526,6 +10619,98 @@ mod tests {
         );
     }
 
+    /// Codex review on #243, round 2, P1 "fence per-app reference clears
+    /// against concurrent deploys": the per-app scope comes from the sweep's
+    /// inventory snapshot; a concurrent deploy that re-scoped the app back in
+    /// rewrote the Secret under an active/ newer mutation generation and
+    /// attached the reference. The kept-secret per-app clear must be fenced
+    /// by that generation until the next sweep re-decides.
+    #[tokio::test]
+    async fn per_app_clear_skipped_while_concurrent_deploy_owns_secret() {
+        use std::sync::{Arc, Mutex};
+        let mut secret =
+            fake_managed_secret("enclava-registry-auth", true, "cap-bot", "ghp_platform");
+        secret
+            .metadata
+            .annotations
+            .get_or_insert_with(Default::default)
+            .insert(
+                enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION.to_string(),
+                "7".to_string(),
+            );
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![secret],
+            service_accounts: vec![
+                fake_service_account("cap-app-in-scope", &[]),
+                fake_service_account("cap-app-out-of-scope", &["enclava-registry-auth"]),
+            ],
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        let scope = PullSecretAccountScope {
+            namespace_in_scope: true,
+            in_scope_accounts: ["cap-app-in-scope".to_string()].into_iter().collect(),
+        };
+        let service_accounts = vec![
+            "cap-app-in-scope".to_string(),
+            "cap-app-out-of-scope".to_string(),
+        ];
+        // Concurrent deploy holds the ACTIVE lease generation 7 (equal to the
+        // sweep snapshot): the per-app clear is skipped.
+        assert!(
+            reconcile_managed_pull_secrets(
+                &engine,
+                "tenant-ns",
+                &service_accounts,
+                &reconcile_settings(),
+                &scope,
+                PullSecretDeleteMode::Unfenced {
+                    namespace_generation: 7,
+                    lease_held: true,
+                },
+            )
+            .await
+            .unwrap()
+        );
+        {
+            let state = cluster.lock().unwrap();
+            assert_eq!(
+                state.service_accounts[1]
+                    .image_pull_secrets
+                    .as_ref()
+                    .map_or(0, |references| references.len()),
+                1,
+                "the concurrently attached reference survives the fenced sweep"
+            );
+            assert!(pending_reference_repairs(&state.service_accounts[1]).is_empty());
+        }
+        // Lease released: the strict fence resumes and the stale per-app
+        // reference is cleared on the next pass.
+        assert!(
+            reconcile_managed_pull_secrets(
+                &engine,
+                "tenant-ns",
+                &service_accounts,
+                &reconcile_settings(),
+                &scope,
+                PullSecretDeleteMode::Unfenced {
+                    namespace_generation: 7,
+                    lease_held: false,
+                },
+            )
+            .await
+            .unwrap()
+        );
+        let state = cluster.lock().unwrap();
+        assert!(
+            state.service_accounts[1]
+                .image_pull_secrets
+                .as_ref()
+                .is_none_or(|references| references.is_empty()),
+            "after the deploy completes, the out-of-scope app's reference is cleared"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn stalled_secret_list_defers_deployment_instead_of_holding_permit_forever() {
         use std::sync::{Arc, Mutex};
@@ -9541,7 +10726,7 @@ mod tests {
                 &[],
                 &reconcile_settings(),
                 &PullSecretAccountScope::uniform(false),
-                PullSecretReconcileContext::Deploy,
+                PullSecretDeleteMode::Fenced(MutationGeneration::new(1).unwrap()),
             )
             .await,
             Err(DeployError::PullSecretReconcileDeferred(_))
@@ -9571,7 +10756,10 @@ mod tests {
                 &["cap-tenant-app".to_string()],
                 &reconcile_settings(),
                 &PullSecretAccountScope::uniform(true),
-                PullSecretReconcileContext::Sweep,
+                PullSecretDeleteMode::Unfenced {
+                    namespace_generation: 0,
+                    lease_held: false,
+                },
             )
             .await
             .unwrap()
@@ -9628,7 +10816,10 @@ mod tests {
                 &["cap-tenant-app".to_string()],
                 &reconcile_settings(),
                 &PullSecretAccountScope::uniform(true),
-                PullSecretReconcileContext::Sweep,
+                PullSecretDeleteMode::Unfenced {
+                    namespace_generation: 0,
+                    lease_held: false,
+                },
             )
             .await
             .unwrap()
@@ -9673,7 +10864,10 @@ mod tests {
                 &["cap-tenant-app".to_string()],
                 &reconcile_settings(),
                 &PullSecretAccountScope::uniform(true),
-                PullSecretReconcileContext::Sweep,
+                PullSecretDeleteMode::Unfenced {
+                    namespace_generation: i64::MAX,
+                    lease_held: false,
+                },
             )
             .await
             .unwrap(),
@@ -9715,7 +10909,10 @@ mod tests {
                     &["cap-tenant-app".to_string()],
                     &reconcile_settings(),
                     &PullSecretAccountScope::uniform(true),
-                    PullSecretReconcileContext::Sweep,
+                    PullSecretDeleteMode::Unfenced {
+                        namespace_generation: i64::MAX,
+                        lease_held: false,
+                    },
                 )
                 .await
                 .unwrap()
@@ -9766,7 +10963,10 @@ mod tests {
                 &["cap-tenant-app".to_string(), "cap-repair-app".to_string()],
                 &reconcile_settings(),
                 &PullSecretAccountScope::uniform(true),
-                PullSecretReconcileContext::Sweep,
+                PullSecretDeleteMode::Unfenced {
+                    namespace_generation: i64::MAX,
+                    lease_held: false,
+                },
             )
             .await
             .unwrap()
@@ -10406,7 +11606,10 @@ mod tests {
                 &["cap-tenant-app".to_string()],
                 &settings,
                 &PullSecretAccountScope::uniform(true),
-                PullSecretReconcileContext::Sweep,
+                PullSecretDeleteMode::Unfenced {
+                    namespace_generation: 0,
+                    lease_held: false,
+                },
             )
             .await
             .unwrap()
@@ -10466,7 +11669,10 @@ mod tests {
                 &["cap-tenant-app".to_string()],
                 &reconcile_settings(),
                 &PullSecretAccountScope::uniform(false),
-                PullSecretReconcileContext::Sweep,
+                PullSecretDeleteMode::Unfenced {
+                    namespace_generation: i64::MAX,
+                    lease_held: false,
+                },
             )
             .await,
             Err(DeployError::PullSecretReconcileDeferred(_))
@@ -10502,7 +11708,10 @@ mod tests {
                 &["cap-tenant-app".to_string()],
                 &settings,
                 &PullSecretAccountScope::uniform(true),
-                PullSecretReconcileContext::Sweep,
+                PullSecretDeleteMode::Unfenced {
+                    namespace_generation: 0,
+                    lease_held: false,
+                },
             )
             .await
             .unwrap()
@@ -10542,7 +11751,10 @@ mod tests {
                 &["cap-tenant-app".to_string()],
                 &reconcile_settings(),
                 &PullSecretAccountScope::uniform(false),
-                PullSecretReconcileContext::Sweep,
+                PullSecretDeleteMode::Unfenced {
+                    namespace_generation: i64::MAX,
+                    lease_held: false,
+                },
             )
             .await,
             Err(DeployError::PullSecretReconcileDeferred(_))
@@ -10559,8 +11771,177 @@ mod tests {
         );
     }
 
+    /// Codex review on #243, round 3, P1 "Attribute created Secrets to the
+    /// platform field manager": the sweep's 404-recreate POST must stamp the
+    /// engine field manager (not `PostParams::default()`), and a create that
+    /// comes back WITHOUT that attribution (mutating webhook) must be
+    /// deleted (pinned) and keep the pass unconverged — an unattributable
+    /// platform PAT must not land in a tenant namespace.
+    #[tokio::test]
+    async fn sweep_recreate_attributes_and_verifies_field_manager_ownership() {
+        use std::sync::{Arc, Mutex};
+        let pending_intent = |uid: &str| {
+            let mut account = fake_service_account("cap-tenant-app", &[]);
+            account.metadata.annotations = Some(std::collections::BTreeMap::from([(
+                PENDING_PULL_SECRET_REFERENCE_REPAIRS_ANNOTATION.to_string(),
+                format!("enclava-registry-auth={uid}"),
+            )]));
+            account
+        };
+
+        // (a) Attributed create: the fake API server records the request's
+        // fieldManager; the secret is kept and the reference restored.
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![],
+            service_accounts: vec![pending_intent("uid-previous-object")],
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        let expected_manager = engine.config().field_manager.clone();
+        assert!(
+            reconcile_managed_pull_secrets(
+                &engine,
+                "tenant-ns",
+                &["cap-tenant-app".to_string()],
+                &reconcile_settings(),
+                &PullSecretAccountScope::uniform(true),
+                PullSecretDeleteMode::Unfenced {
+                    namespace_generation: 0,
+                    lease_held: false,
+                },
+            )
+            .await
+            .unwrap()
+        );
+        {
+            let state = cluster.lock().unwrap();
+            assert_eq!(
+                state.secrets.len(),
+                1,
+                "attributed recreate keeps the secret"
+            );
+            let managers: Vec<String> = state.secrets[0]
+                .metadata
+                .managed_fields
+                .as_ref()
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter_map(|entry| entry.manager.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            assert!(
+                managers.contains(&expected_manager),
+                "recreated secret must be attributed to the platform field manager \
+                 {expected_manager}, got {managers:?}"
+            );
+            assert_eq!(
+                state.service_accounts[0]
+                    .image_pull_secrets
+                    .as_ref()
+                    .unwrap()[0]
+                    .name,
+                "enclava-registry-auth"
+            );
+        }
+
+        // (b) Stripped attribution: the recreated secret is deleted and the
+        // pass stays unconverged.
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![],
+            service_accounts: vec![pending_intent("uid-previous-object")],
+            strip_field_manager_on_create: true,
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        let converged = reconcile_managed_pull_secrets(
+            &engine,
+            "tenant-ns",
+            &["cap-tenant-app".to_string()],
+            &reconcile_settings(),
+            &PullSecretAccountScope::uniform(true),
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 0,
+                lease_held: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            !converged,
+            "an unattributable platform PAT must keep the sweep unconverged"
+        );
+        let state = cluster.lock().unwrap();
+        assert!(
+            state.secrets.is_empty(),
+            "the unattributed recreated secret must be deleted"
+        );
+    }
+
+    /// Codex review on #243, round 3, P1 "Stop stale-scope replicas from
+    /// dispatching new namespaces" + P1 "Fence pull-secret creation against
+    /// credential rollouts": the rollout-wide authority is monotonic (a
+    /// stale replica can never rewind it) and defers a replica that is older
+    /// on EITHER epoch — the new-namespace hole (no per-namespace fence row
+    /// yet) and the absent-Secret credential hole (no annotation epoch to
+    /// compare against) both collapse into this check.
+    #[tokio::test]
+    async fn rollout_authority_defers_stale_replicas_and_never_rewinds() {
+        let pool = crate::test_support::database_test_pool().await;
+        let (scope, credential) = raise_tenant_pull_secret_rollout_authority(&pool, 0, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            (scope, credential),
+            (0, 0),
+            "a fresh authority starts at zero and never defers an epoch-0 replica"
+        );
+        let (scope, credential) = raise_tenant_pull_secret_rollout_authority(&pool, 5, 2)
+            .await
+            .unwrap();
+        assert_eq!((scope, credential), (5, 2));
+        let (scope, credential) = raise_tenant_pull_secret_rollout_authority(&pool, 3, 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            (scope, credential),
+            (5, 2),
+            "a stale replica's stamp must never rewind the fleet-wide maxima"
+        );
+
+        unsafe {
+            std::env::set_var("TENANT_IMAGE_PULL_SCOPE_GENERATION", "3");
+            std::env::set_var("TENANT_IMAGE_PULL_CREDENTIAL_GENERATION", "1");
+        }
+        assert!(
+            pull_secret_rollout_authority_defers(5, 2),
+            "older on both epochs"
+        );
+        assert!(
+            pull_secret_rollout_authority_defers(5, 0),
+            "a newer scope epoch alone defers — the new-namespace hole (no fence row)"
+        );
+        assert!(
+            pull_secret_rollout_authority_defers(0, 2),
+            "a newer credential epoch alone defers — the absent-Secret hole (no annotation)"
+        );
+        assert!(
+            !pull_secret_rollout_authority_defers(3, 1),
+            "the current replica proceeds"
+        );
+        assert!(
+            !pull_secret_rollout_authority_defers(2, 0),
+            "an older recorded authority never blocks a newer replica"
+        );
+        unsafe {
+            std::env::remove_var("TENANT_IMAGE_PULL_SCOPE_GENERATION");
+            std::env::remove_var("TENANT_IMAGE_PULL_CREDENTIAL_GENERATION");
+        }
+    }
+
     /// Reviewer follow-up on #243 (Critical): the per-deploy reconcile (the
-    /// Deploy context) must NOT run the repair pass — its own SSA of the
+    /// Fenced path) must NOT run the repair pass — its own SSA of the
     /// generated ServiceAccount is about to re-decide `imagePullSecrets`, so
     /// an up-front restore would be pruned and the record lost. Instead the
     /// deploy discharges stale intents after its applies.
@@ -10583,15 +11964,15 @@ mod tests {
         }));
         let engine = reconcile_engine(cluster.clone());
 
-        // The deploy-path reconcile (Deploy context) neither restores the
-        // reference nor touches the intent.
+        // The deploy-path reconcile (Fenced) neither restores the reference
+        // nor touches the intent.
         let converged = reconcile_managed_pull_secrets(
             &engine,
             "tenant-ns",
             &["cap-tenant-app".to_string()],
             &reconcile_settings(),
             &PullSecretAccountScope::uniform(false),
-            PullSecretReconcileContext::Deploy,
+            PullSecretDeleteMode::Fenced(MutationGeneration::new(1).unwrap()),
         )
         .await
         .unwrap();
