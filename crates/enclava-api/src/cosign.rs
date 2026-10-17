@@ -110,16 +110,134 @@ fn env_nonempty(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn registry_auth_from_env(registry: &str) -> Auth {
-    if let Some(token) = env_nonempty("COSIGN_REGISTRY_BEARER_TOKEN") {
-        return Auth::Bearer(token);
+const COSIGN_REGISTRY_ALLOWED_HOSTS_ENV: &str = "COSIGN_REGISTRY_ALLOWED_HOSTS";
+
+/// Hosts the operator has explicitly allowlisted to receive the platform
+/// `COSIGN_*` registry credentials (issue #225). An unset or empty list
+/// means no host is trusted, so the credentials are never attached.
+pub fn cosign_registry_allowed_hosts_from_env() -> Vec<String> {
+    env_nonempty(COSIGN_REGISTRY_ALLOWED_HOSTS_ENV)
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|host| !host.is_empty())
+                .map(str::to_ascii_lowercase)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// True when any platform `COSIGN_*` registry credential is configured.
+pub fn cosign_registry_credentials_configured() -> bool {
+    CosignRegistryCredentials::from_env().is_configured()
+}
+
+/// Canonical host form for exact-match allowlist comparison. `docker.io` and
+/// `index.docker.io` are the same registry — OCI clients rewrite the former to
+/// the latter at dial time (`resolve_registry`), so a `docker.io` allowlist
+/// entry must describe the endpoint that actually receives the credentials.
+fn canonical_registry_host(host: &str) -> &str {
+    if host == "docker.io" {
+        "index.docker.io"
+    } else {
+        host
+    }
+}
+
+/// Exact or leading-wildcard host match against an allowlist pattern.
+///
+/// Patterns: `host[:port]` matches exactly (case-insensitive), `*.example.com`
+/// matches `example.com` and any dot-separated subdomain of it, and the bare
+/// pattern `*` is an explicit operator opt-in matching every host. A wildcard
+/// never matches across a partial label (`*.example.com` does not match
+/// `notexample.com`). The host must be the one the registry client actually
+/// dials (`resolve_registry`), not a re-parse of the image reference.
+fn host_matches_allowed_pattern(host: &str, pattern: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    let host = host.to_ascii_lowercase();
+    let pattern = pattern.to_ascii_lowercase();
+    if host == pattern || canonical_registry_host(&host) == canonical_registry_host(&pattern) {
+        return true;
+    }
+    pattern.strip_prefix("*.").is_some_and(|base| {
+        host == base
+            || host
+                .strip_suffix(&format!(".{base}"))
+                .is_some_and(|label| !label.is_empty() && !label.contains('.'))
+    })
+}
+
+/// Platform `COSIGN_*` registry credentials read once from the environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CosignRegistryCredentials {
+    bearer_token: Option<String>,
+    username: Option<String>,
+    password: Option<String>,
+}
+
+impl CosignRegistryCredentials {
+    fn from_env() -> Self {
+        Self {
+            bearer_token: env_nonempty("COSIGN_REGISTRY_BEARER_TOKEN"),
+            username: env_nonempty("COSIGN_REGISTRY_USERNAME"),
+            password: env_nonempty("COSIGN_REGISTRY_PASSWORD"),
+        }
     }
 
-    if let (Some(username), Some(password)) = (
-        env_nonempty("COSIGN_REGISTRY_USERNAME"),
-        env_nonempty("COSIGN_REGISTRY_PASSWORD"),
-    ) {
-        return Auth::Basic(username, password);
+    #[cfg(test)]
+    fn basic(username: &str, password: &str) -> Self {
+        Self {
+            bearer_token: None,
+            username: Some(username.to_string()),
+            password: Some(password.to_string()),
+        }
+    }
+
+    fn is_configured(&self) -> bool {
+        self.bearer_token.is_some() || (self.username.is_some() && self.password.is_some())
+    }
+
+    fn auth(&self) -> Option<Auth> {
+        if let Some(token) = &self.bearer_token {
+            return Some(Auth::Bearer(token.clone()));
+        }
+        if let (Some(username), Some(password)) = (&self.username, &self.password) {
+            return Some(Auth::Basic(username.clone(), password.clone()));
+        }
+        None
+    }
+}
+
+/// Pure decision core of the credential-forwarding gate: platform registry
+/// credentials are only attached for allowlisted destination hosts.
+fn registry_auth_with_allowlist(
+    registry: &str,
+    credentials: Option<&CosignRegistryCredentials>,
+    allowed_hosts: &[String],
+) -> Auth {
+    // Platform registry credentials must never be forwarded to a host the
+    // tenant picked (issue #225): image references — including digest-pinned
+    // ones, which skip the registry allowlist — are attacker-controlled
+    // input, so the COSIGN_* credentials are only attached when the operator
+    // explicitly listed the destination host in COSIGN_REGISTRY_ALLOWED_HOSTS.
+    // An unset/empty allowlist fails closed to anonymous access.
+    if let Some(credentials) = credentials {
+        let host_allowed = allowed_hosts
+            .iter()
+            .any(|pattern| host_matches_allowed_pattern(registry, pattern));
+        match (credentials.auth(), host_allowed) {
+            (Some(auth), true) => return auth,
+            (Some(_), false) => {
+                tracing::warn!(
+                    registry = %registry,
+                    env = COSIGN_REGISTRY_ALLOWED_HOSTS_ENV,
+                    "platform registry credentials not attached: registry host is not allowlisted"
+                );
+            }
+            (None, _) => {}
+        }
     }
 
     if registry == "ghcr.io"
@@ -130,6 +248,130 @@ fn registry_auth_from_env(registry: &str) -> Auth {
     }
 
     Auth::Anonymous
+}
+
+fn registry_auth_from_env(registry: &str) -> Auth {
+    let credentials = CosignRegistryCredentials::from_env();
+    registry_auth_with_allowlist(
+        registry,
+        credentials.is_configured().then_some(&credentials),
+        &cosign_registry_allowed_hosts_from_env(),
+    )
+}
+
+/// Entry grammar for `COSIGN_REGISTRY_ALLOWED_HOSTS`: exactly `*`,
+/// `host[:port]`, or `*.host[:port]` over DNS labels / IPv4. Anything else
+/// (partial-label wildcards like `*ghcr.io`, repeated wildcards like
+/// `**.host`, empty labels like `ghcr..io`, paths, out-of-range ports) can
+/// never match a parsed registry name, so it is refused at startup: a typo'd
+/// pattern must fail loudly instead of quietly withholding the platform
+/// credentials from the host the operator meant to allow (same rationale as
+/// the strict tenant pull-secret scope collector).
+fn cosign_registry_host_pattern_error(pattern: &str) -> Option<&'static str> {
+    if pattern == "*" {
+        return None;
+    }
+    if pattern.is_empty() {
+        return Some("entry is empty");
+    }
+    let host = match pattern.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
+            match port.parse::<u16>() {
+                Ok(port) if port != 0 => host,
+                _ => return Some("port must be in 1..=65535"),
+            }
+        }
+        _ => pattern,
+    };
+    let base = host.strip_prefix("*.").unwrap_or(host);
+    // OCI treats bare single-label prefixes as Docker Hub namespaces, not
+    // registry endpoints; only localhost or an explicit port is addressable.
+    if !base.contains('.') && base != "localhost" && !pattern.contains(':') {
+        return Some("single-label registry hosts require an explicit port (except localhost)");
+    }
+    if base.is_empty() || base.starts_with('.') || base.ends_with('.') || base.contains("..") {
+        return Some("host must be a DNS name or IPv4 address without empty labels");
+    }
+    if !base.split('.').all(|label| {
+        !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    }) {
+        return Some("host must be a DNS name or IPv4 address (labels of letters, digits, '-')");
+    }
+    None
+}
+
+/// Codex review on #243, P2: only one of
+/// `COSIGN_REGISTRY_USERNAME`/`COSIGN_REGISTRY_PASSWORD` being set attaches no
+/// credential at all (`is_configured` stays false), so every private-registry
+/// verification silently runs anonymously — fail fast at startup instead.
+fn incomplete_basic_pair_error(username: Option<&str>, password: Option<&str>) -> Option<String> {
+    (username.is_some() != password.is_some()).then(|| {
+        "COSIGN_REGISTRY_USERNAME and COSIGN_REGISTRY_PASSWORD must be set together: an \
+         incomplete pair attaches no registry credential, so every private-registry \
+         verification would silently run anonymously"
+            .to_string()
+    })
+}
+
+/// Startup validation (issue #225): platform `COSIGN_*` registry credentials
+/// without an explicit `COSIGN_REGISTRY_ALLOWED_HOSTS` scope are refused —
+/// silently downgrading every registry to anonymous would break private-
+/// registry verification in confusing ways, so misconfiguration must be loud.
+pub fn cosign_registry_credentials_startup_error() -> Option<String> {
+    let patterns = cosign_registry_allowed_hosts_from_env();
+    if let Some(raw) = env_nonempty(COSIGN_REGISTRY_ALLOWED_HOSTS_ENV) {
+        let invalid: Vec<String> = raw
+            .split(',')
+            .map(str::trim)
+            .filter_map(|pattern| {
+                cosign_registry_host_pattern_error(pattern)
+                    .map(|reason| format!("{pattern:?} ({reason})"))
+            })
+            .collect();
+        if !invalid.is_empty() {
+            return Some(format!(
+                "COSIGN_REGISTRY_ALLOWED_HOSTS contains entries outside the allowed grammar \
+                 `*`, `host[:port]`, or `*.host[:port]`: {}; such a pattern can never match a \
+                 registry host, so startup is refused instead of silently withholding the \
+                 platform registry credentials",
+                invalid.join(", ")
+            ));
+        }
+    }
+    // Codex review on #243, P2: an incomplete basic pair attaches no
+    // credential at all (every private-registry verification would silently
+    // run anonymously), so it must surface as the fail-fast configuration
+    // error this gate exists for — not as "no credential configured".
+    if let Some(error) = incomplete_basic_pair_error(
+        env_nonempty("COSIGN_REGISTRY_USERNAME").as_deref(),
+        env_nonempty("COSIGN_REGISTRY_PASSWORD").as_deref(),
+    ) {
+        return Some(error);
+    }
+    if patterns.iter().any(|pattern| pattern == "*") {
+        tracing::warn!(
+            env = COSIGN_REGISTRY_ALLOWED_HOSTS_ENV,
+            "allowlist contains bare `*`: platform registry credentials will be forwarded to \
+             every registry host named by tenant-supplied image references"
+        );
+    }
+    if !cosign_registry_credentials_configured() {
+        return None;
+    }
+    if patterns.is_empty() {
+        return Some(
+            "COSIGN_REGISTRY_BEARER_TOKEN or COSIGN_REGISTRY_USERNAME/COSIGN_REGISTRY_PASSWORD \
+             is set but COSIGN_REGISTRY_ALLOWED_HOSTS is unset or empty; platform registry \
+             credentials are never forwarded to tenant-chosen registry hosts (issue #225), so \
+             set COSIGN_REGISTRY_ALLOWED_HOSTS to the hosts that should receive them"
+                .to_string(),
+        );
+    }
+    None
 }
 
 fn looks_like_not_signed_error(err: &str) -> bool {
@@ -321,7 +563,15 @@ pub async fn verify_image(
             CosignError::VerificationFailed(format!("failed to initialize sigstore client: {e}"))
         })?;
 
-    let auth = registry_auth_from_env(&registry);
+    // Gate the credentials on the host the client will actually dial
+    // (`resolve_registry` — the same value sigstore's OciReference uses to
+    // connect), never on `parse_image_parts`' host: the two parsers disagree
+    // on single-label three-component references (`registry/foo/bar` is
+    // Docker Hub `registry/foo/bar` to the OCI parser but host `registry` to
+    // the custom parser), and the allowlist must describe the dialed host or
+    // a tenant-chosen ref still routes the platform password somewhere the
+    // operator never allowlisted (review finding).
+    let auth = registry_auth_from_env(image.resolve_registry());
     let (_, source_image_digest) = cosign_client
         .triangulate(&image, &auth)
         .await
@@ -505,7 +755,15 @@ pub async fn fetch_portable_verification_material(
         "application/vnd.docker.distribution.manifest.list.v2+json",
     ];
 
-    let (registry, repository) = parse_image_parts(image_ref)?;
+    // Parse with the same OCI reference grammar the client dials with (not
+    // `parse_image_parts`): the two disagree on single-label three-component
+    // references, and this path must fetch — and authenticate to — exactly
+    // the host/repository `verify_image` verified (review finding).
+    let image: OciReference = image_ref
+        .parse()
+        .map_err(|e| CosignError::VerificationFailed(format!("invalid image reference: {e}")))?;
+    let registry = image.resolve_registry().to_string();
+    let repository = image.repository().to_string();
     let base_url = registry_base_url(&registry)
         .map_err(|e| CosignError::VerificationFailed(format!("unsupported registry: {e}")))?;
     let registry_url = reqwest::Url::parse(&base_url)
@@ -1206,9 +1464,10 @@ mod tests {
     async fn fetch_portable_verification_material_rejects_unguarded_destinations() {
         let guard = hermetic_egress_guard();
         let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        // Refs that parse under the OCI grammar must be stopped by the egress
+        // guard before any request is issued.
         for image in [
             "169.254.169.254/repo/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "[::ffff:10.0.5.7]/repo/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "evil.example/repo/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         ] {
             let err = fetch_portable_verification_material(&guard, image, digest)
@@ -1219,6 +1478,21 @@ mod tests {
                 "{image} must be rejected, got: {err}"
             );
         }
+        // A bracket-IPv6 literal fails the OCI reference grammar (the same
+        // parser the dialing client uses) before the egress check — still
+        // fail closed, just with the parse error.
+        let err = fetch_portable_verification_material(
+            &guard,
+            "[::ffff:10.0.5.7]/repo/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            digest,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("invalid image reference")
+                || err.to_string().contains("registry destination rejected"),
+            "bracket-IPv6 image ref must be rejected, got: {err}"
+        );
     }
 
     fn url_policy() -> VerificationPolicy {
@@ -1227,6 +1501,113 @@ mod tests {
                 "https://github.com/example/repo/.github/workflows/build.yml@refs/heads/main"
                     .to_string(),
             fulcio_issuer: "https://token.actions.githubusercontent.com".to_string(),
+        }
+    }
+
+    /// The allowlist must describe the host the registry client actually
+    /// dials. `parse_image_parts` and the OCI reference parser disagree on
+    /// single-label three-component refs (`registry/foo/bar` is host
+    /// `registry` to the custom parser but Docker Hub's `index.docker.io` to
+    /// the OCI parser), and a custom-parser allowlist match must never leak
+    /// the platform password to the host the client really connects to
+    /// (review finding on #243).
+    #[test]
+    fn allowlist_gates_the_dialed_registry_host_not_the_custom_parser() {
+        let image: OciReference = "registry/foo/bar@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            .parse()
+            .unwrap();
+        assert_eq!(image.resolve_registry(), "index.docker.io");
+        let creds = CosignRegistryCredentials::basic("cap-bot", "platform-token");
+        let allowed = ["registry".to_string()];
+        // The custom parser's host matches the allowlist (the pre-fix
+        // behavior)...
+        assert!(matches!(
+            registry_auth_with_allowlist("registry", Some(&creds), &allowed),
+            Auth::Basic(..)
+        ));
+        // ...but the client dials the OCI-resolved host, which must NOT
+        // receive the platform credentials.
+        assert!(matches!(
+            registry_auth_with_allowlist(image.resolve_registry(), Some(&creds), &allowed),
+            Auth::Anonymous
+        ));
+    }
+
+    /// `docker.io` is rewritten to `index.docker.io` at dial time, so a
+    /// `docker.io` allowlist entry must describe that real endpoint instead
+    /// of never matching (or matching some other host).
+    #[test]
+    fn docker_io_allowlist_entry_matches_the_real_hub_endpoint() {
+        let creds = CosignRegistryCredentials::basic("cap-bot", "platform-token");
+        assert!(matches!(
+            registry_auth_with_allowlist(
+                "index.docker.io",
+                Some(&creds),
+                &["docker.io".to_string()]
+            ),
+            Auth::Basic(..)
+        ));
+        assert!(matches!(
+            registry_auth_with_allowlist(
+                "index.docker.io",
+                Some(&creds),
+                &["*.docker.io".to_string()]
+            ),
+            Auth::Basic(..)
+        ));
+        assert!(matches!(
+            registry_auth_with_allowlist("notdocker.io", Some(&creds), &["docker.io".to_string()]),
+            Auth::Anonymous
+        ));
+    }
+
+    /// Issue #225 hardening: allowlist entries outside the grammar can never
+    /// match a parsed registry name and must be refused at startup, not
+    /// silently ignored (same strictness as the pull-secret scope collector).
+    #[test]
+    fn cosign_registry_host_pattern_grammar_accepts_matchable_entries() {
+        for pattern in [
+            "*",
+            "ghcr.io",
+            "ghcr.io:5000",
+            "registry:5000",
+            "localhost",
+            "localhost:5000",
+            "10.0.0.1:5000",
+            "*.corp.example",
+            "*.corp.example:5000",
+        ] {
+            assert_eq!(
+                cosign_registry_host_pattern_error(pattern),
+                None,
+                "pattern {pattern:?} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn cosign_registry_host_pattern_grammar_rejects_never_matching_entries() {
+        for pattern in [
+            "",                // empty entry (e.g. a trailing comma)
+            "*ghcr.io",        // partial-label wildcard never matches
+            "**.corp.example", // repeated wildcard never matches
+            "*.",              // empty wildcard base
+            "ghcr..io",        // empty label
+            ".ghcr.io",        // leading dot
+            "ghcr.io.",        // trailing dot
+            "ghcr.io/path",    // path, not a host
+            "registry",        // OCI interprets it as a Docker Hub namespace
+            "*.registry",      // wildcard base is not a registry endpoint
+            "ghcr.io:",        // empty port
+            "ghcr.io:0",       // port zero
+            "ghcr.io:99999",   // port out of range
+            "-bad.example",    // leading-hyphen label
+            "bad-.example",    // trailing-hyphen label
+        ] {
+            assert!(
+                cosign_registry_host_pattern_error(pattern).is_some(),
+                "pattern {pattern:?} must be rejected"
+            );
         }
     }
 
@@ -1429,6 +1810,7 @@ mod tests {
             std::env::remove_var("COSIGN_REGISTRY_BEARER_TOKEN");
             std::env::remove_var("GHCR_USERNAME");
             std::env::remove_var("GHCR_TOKEN");
+            std::env::set_var("COSIGN_REGISTRY_ALLOWED_HOSTS", "ghcr.io");
         }
 
         let auth = registry_auth_from_env("ghcr.io");
@@ -1437,6 +1819,96 @@ mod tests {
             auth,
             Auth::Basic(username, password) if username == "cap-bot" && password == "ghp_example"
         ));
+    }
+
+    /// Codex review on #243, P2: only one of USERNAME/PASSWORD being set
+    /// attaches no credential at all (`is_configured` stays false), so every
+    /// private-registry verification would silently run anonymously — the
+    /// startup gate must refuse the incomplete pair instead.
+    #[test]
+    fn incomplete_basic_credentials_are_a_startup_error() {
+        assert!(incomplete_basic_pair_error(Some("cap-bot"), None).is_some());
+        assert!(incomplete_basic_pair_error(None, Some("ghp_example")).is_some());
+        assert!(incomplete_basic_pair_error(None, None).is_none());
+        assert!(incomplete_basic_pair_error(Some("cap-bot"), Some("ghp_example")).is_none());
+    }
+
+    /// Issue #225: platform COSIGN_* credentials must never be forwarded to a
+    /// registry host the tenant picked. The allowlist gate is exercised
+    /// through the pure decision core so the env-dependent happy path above
+    /// stays the only test touching process-global environment state here.
+    #[test]
+    fn registry_credentials_are_not_forwarded_to_unlisted_hosts() {
+        let allowed = vec!["ghcr.io".to_string(), "*.corp.example".to_string()];
+        let credentials = CosignRegistryCredentials::basic("cap-bot", "ghp_example");
+
+        // Allowlisted hosts receive the credentials.
+        assert!(matches!(
+            registry_auth_with_allowlist("ghcr.io", Some(&credentials), &allowed),
+            Auth::Basic(..)
+        ));
+        assert!(matches!(
+            registry_auth_with_allowlist("registry.corp.example", Some(&credentials), &allowed),
+            Auth::Basic(..)
+        ));
+
+        // Tenant-chosen hosts do not — the exact attack from the issue.
+        for host in [
+            "attacker.example.com",
+            "evil.example.com:5000",
+            // wildcard must not leak into sibling domains
+            "notcorp.example",
+            "deep.sub.corp.example",
+        ] {
+            assert!(
+                matches!(
+                    registry_auth_with_allowlist(host, Some(&credentials), &allowed),
+                    Auth::Anonymous
+                ),
+                "credentials must not attach to {host}"
+            );
+        }
+
+        // Unset allowlist fails closed for every host.
+        assert!(matches!(
+            registry_auth_with_allowlist("ghcr.io", Some(&credentials), &[]),
+            Auth::Anonymous
+        ));
+
+        // Without credentials configured the gate is inert (anonymous anyway
+        // unless GHCR_* applies, which is separately host-bound).
+        assert!(matches!(
+            registry_auth_with_allowlist("attacker.example.com", None, &allowed),
+            Auth::Anonymous
+        ));
+    }
+
+    #[test]
+    fn host_allowlist_patterns_match_exact_and_single_level_wildcards() {
+        assert!(host_matches_allowed_pattern("ghcr.io", "ghcr.io"));
+        assert!(host_matches_allowed_pattern("GHCR.IO", "ghcr.io"));
+        assert!(host_matches_allowed_pattern(
+            "reg.example:5000",
+            "reg.example:5000"
+        ));
+        assert!(host_matches_allowed_pattern(
+            "a.corp.example",
+            "*.corp.example"
+        ));
+        assert!(host_matches_allowed_pattern(
+            "corp.example",
+            "*.corp.example"
+        ));
+        assert!(host_matches_allowed_pattern("any.host.example", "*"));
+        assert!(!host_matches_allowed_pattern(
+            "notexample.com",
+            "*.example.com"
+        ));
+        assert!(!host_matches_allowed_pattern(
+            "a.b.corp.example",
+            "*.corp.example"
+        ));
+        assert!(!host_matches_allowed_pattern("ghcr.io.evil.com", "ghcr.io"));
     }
 
     /// Regression test for issue #125: a malicious registry must not be able
