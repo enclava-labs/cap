@@ -2120,6 +2120,205 @@ pub(crate) mod test_support {
         pool
     }
 
+    /// SQLSTATE `insufficient_privilege`. `CREATE DATABASE` requires the
+    /// CREATEDB role attribute, which non-superuser roles lack by default,
+    /// so a test role without it fails provisioning with exactly this
+    /// code (Codex P2, #258 review: keep per-database isolation, but
+    /// fail fast with the remedy instead of an opaque error).
+    const INSUFFICIENT_PRIVILEGE_SQLSTATE: &str = "42501";
+
+    fn is_insufficient_privilege(error: &sqlx::Error) -> bool {
+        error.as_database_error().is_some_and(|db_error| {
+            db_error.code().as_deref() == Some(INSUFFICIENT_PRIVILEGE_SQLSTATE)
+        })
+    }
+
+    /// A migrated database isolated from every other test (Codex P2, #258
+    /// review). `#[sqlx::test]` provisions the same isolation but hard
+    /// REQUIRES the `DATABASE_URL` environment variable (or a `.env` file)
+    /// before a test body runs, which breaks the AGENTS.md-mandated bare
+    /// `cargo test --workspace` command on the default local setup. This
+    /// harness keeps that isolation — a uniquely named database created
+    /// from the same URL [`database_test_pool`] would use, including its
+    /// fallback — so tests whose fixtures must not share state (like the
+    /// KBS reconciliation singleton) stay isolated while the documented
+    /// default command remains runnable. Setup takes ownership of the
+    /// database the instant CREATE DATABASE succeeds and force-drops it
+    /// on every setup failure (connect or migration), so a failed run
+    /// never leaks a `cap_test_*` database (Devin + Codex P2, #258
+    /// review); [`Self::drop_database`] drops it inline on the passing
+    /// path and [`Drop`] stays as the assertion-panic safety net. A
+    /// hard-killed run can still leave an orphaned database, never a
+    /// silently skipped or cross-contaminated test.
+    pub(crate) struct IsolatedTestDatabase {
+        pub(crate) pool: sqlx::PgPool,
+        name: String,
+        admin: sqlx::PgPool,
+    }
+
+    impl IsolatedTestDatabase {
+        pub(crate) async fn new(label: &str) -> Self {
+            Self::provision(label, |pool| async move {
+                crate::db::pool::run_migrations(&pool).await
+            })
+            .await
+        }
+
+        /// Provisioning with an injectable migration step, so a test can
+        /// prove the cleanup guard drops the database when migrations
+        /// fail.
+        async fn provision<F, Fut, E>(label: &str, migrate: F) -> Self
+        where
+            F: FnOnce(sqlx::PgPool) -> Fut,
+            Fut: std::future::Future<Output = Result<(), E>>,
+            E: std::fmt::Display,
+        {
+            debug_assert!(
+                label
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '_'),
+                "isolated database labels must be plain identifiers"
+            );
+            let database_url = std::env::var("DATABASE_URL")
+                .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
+            let admin = sqlx::PgPool::connect(&database_url)
+                .await
+                .expect("connect test database server");
+            let name = format!("cap_test_{}_{}", label, Uuid::new_v4().simple());
+            if let Err(error) = sqlx::query(&format!(r#"CREATE DATABASE "{name}""#))
+                .execute(&admin)
+                .await
+            {
+                if is_insufficient_privilege(&error) {
+                    panic!(
+                        "create isolated test database {name}: {error}\n\
+                         hint: the role in DATABASE_URL is not allowed to create \
+                         databases (SQLSTATE {INSUFFICIENT_PRIVILEGE_SQLSTATE}); \
+                         grant it the CREATEDB attribute (ALTER ROLE \"<role>\" \
+                         WITH CREATEDB) or point DATABASE_URL at a credential \
+                         that has it — see DEV.md"
+                    );
+                }
+                panic!("create isolated test database {name}: {error}");
+            }
+            // Ownership transfers to the guard the instant the database
+            // exists, so every failure below (connect, migration)
+            // force-drops it instead of leaking a `cap_test_*` database.
+            let options = {
+                use std::str::FromStr as _;
+                sqlx::postgres::PgConnectOptions::from_str(&database_url)
+                    .expect("parse test database URL")
+            };
+            let mut database = Self {
+                pool: PgPoolOptions::new().connect_lazy_with(options.clone().database(&name)),
+                name: name.clone(),
+                admin,
+            };
+            database.pool = match PgPoolOptions::new()
+                .connect_with(options.database(&name))
+                .await
+            {
+                Ok(pool) => pool,
+                Err(error) => {
+                    database.force_drop_inline().await;
+                    panic!("connect isolated test database {name}: {error}");
+                }
+            };
+            if let Err(error) = migrate(database.pool.clone()).await {
+                database.force_drop_inline().await;
+                panic!("migrate isolated test database {name}: {error}");
+            }
+            database
+        }
+    }
+
+    impl IsolatedTestDatabase {
+        /// Teardown for the normal path: close the pool and drop the
+        /// database inline so a passing run never leaks it. A detached
+        /// thread cannot guarantee that — the test binary may exit before
+        /// it finishes — so tests call this explicitly; the `Drop` guard
+        /// below remains only as the assertion-panic safety net.
+        pub(crate) async fn drop_database(mut self) {
+            self.force_drop_inline().await;
+        }
+
+        /// Reclaim the name (making the `Drop` safety net a no-op), close
+        /// the pool, and force-drop the database inline — awaited, never
+        /// on a detached thread — so neither a failed setup step nor a
+        /// finished test can leak the database it created.
+        async fn force_drop_inline(&mut self) {
+            let name = std::mem::take(&mut self.name);
+            self.pool.close().await;
+            if let Err(error) = drop_isolated_database(&self.admin, &name).await {
+                eprintln!(
+                    "failed to drop isolated test database {name}: {error}; \
+                     leftover database must be removed manually"
+                );
+            }
+        }
+    }
+
+    async fn drop_isolated_database(admin: &sqlx::PgPool, name: &str) -> Result<(), sqlx::Error> {
+        // Postgres 13+ can force-drop around just-closed pool sockets;
+        // older servers fall back to a plain drop that may legitimately
+        // fail on a straggler connection.
+        match sqlx::query(&format!(r#"DROP DATABASE IF EXISTS "{name}" WITH (FORCE)"#))
+            .execute(admin)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(_) => sqlx::query(&format!(r#"DROP DATABASE IF EXISTS "{name}""#))
+                .execute(admin)
+                .await
+                .map(|_| ()),
+        }
+    }
+
+    impl Drop for IsolatedTestDatabase {
+        fn drop(&mut self) {
+            let name = std::mem::take(&mut self.name);
+            if name.is_empty() {
+                return;
+            }
+            let options = self.admin.connect_options();
+            // Join before unwinding can finish and the test process can exit.
+            // Use a fresh connection as well as a fresh runtime: the original
+            // pools' I/O tasks may belong to the current-thread test runtime,
+            // which is blocked here waiting for this cleanup thread.
+            let cleanup = std::thread::spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        eprintln!("failed to build cleanup runtime for {name}: {error}");
+                        return;
+                    }
+                };
+                let dropped = runtime.block_on(async {
+                    let admin = PgPoolOptions::new()
+                        .max_connections(1)
+                        .connect_with((*options).clone())
+                        .await?;
+                    let result = drop_isolated_database(&admin, &name).await;
+                    admin.close().await;
+                    result
+                });
+                if let Err(error) = dropped {
+                    eprintln!(
+                        "failed to drop isolated test database {name}: {error}; \
+                         leftover database must be removed manually"
+                    );
+                }
+            });
+            if cleanup.join().is_err() {
+                // Drop may already be unwinding; report rather than panic again.
+                eprintln!("isolated test database cleanup thread panicked");
+            }
+        }
+    }
+
     pub(crate) fn auth_context(role: Role, scopes: &[&str]) -> AuthContext {
         AuthContext {
             user_id: Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
@@ -2202,6 +2401,165 @@ pub(crate) mod test_support {
             deployment_apply_permits: Arc::new(tokio::sync::Semaphore::new(1)),
             side_effect_admission,
             internal_auth: None,
+        }
+    }
+    #[cfg(test)]
+    mod isolated_database_tests {
+        use super::*;
+
+        /// Minimal [`sqlx::error::DatabaseError`] stand-in so the SQLSTATE
+        /// classification can be unit-tested without provisioning a real
+        /// non-CREATEDB role on the server.
+        #[derive(Debug)]
+        struct FakeDatabaseError {
+            sqlstate: Option<&'static str>,
+        }
+
+        impl std::fmt::Display for FakeDatabaseError {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("permission denied to create database")
+            }
+        }
+
+        impl std::error::Error for FakeDatabaseError {}
+
+        impl sqlx::error::DatabaseError for FakeDatabaseError {
+            fn message(&self) -> &str {
+                "permission denied to create database"
+            }
+
+            fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+                self.sqlstate.map(std::borrow::Cow::Borrowed)
+            }
+
+            fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+                self
+            }
+
+            fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+                self
+            }
+
+            fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+                self
+            }
+
+            fn kind(&self) -> sqlx::error::ErrorKind {
+                sqlx::error::ErrorKind::Other
+            }
+        }
+
+        #[test]
+        fn insufficient_privilege_is_detected_from_sqlstate_42501() {
+            let insufficient_privilege = sqlx::Error::Database(Box::new(FakeDatabaseError {
+                sqlstate: Some("42501"),
+            }));
+            assert!(is_insufficient_privilege(&insufficient_privilege));
+
+            // Neighbouring SQLSTATEs must not trigger the CREATEDB hint.
+            for sqlstate in ["42502", "42601", "42P04", "08006"] {
+                let other = sqlx::Error::Database(Box::new(FakeDatabaseError {
+                    sqlstate: Some(sqlstate),
+                }));
+                assert!(
+                    !is_insufficient_privilege(&other),
+                    "SQLSTATE {sqlstate} must not read as insufficient_privilege"
+                );
+            }
+
+            // Errors without a SQLSTATE — and non-database errors — stay on
+            // the generic failure path.
+            let no_sqlstate = sqlx::Error::Database(Box::new(FakeDatabaseError { sqlstate: None }));
+            assert!(!is_insufficient_privilege(&no_sqlstate));
+            assert!(!is_insufficient_privilege(&sqlx::Error::PoolClosed));
+        }
+
+        #[tokio::test]
+        async fn panic_cleanup_finishes_before_unwinding_returns() {
+            // The default current-thread runtime cannot drive its pool tasks
+            // while Drop joins the cleanup thread. Hold a live connection to
+            // also prove that cleanup force-drops around the original pool.
+            let database = IsolatedTestDatabase::provision("panic_cleanup", |_| async {
+                Ok::<(), std::convert::Infallible>(())
+            })
+            .await;
+            let name = database.name.clone();
+            let admin = database.admin.clone();
+            let connection = database.pool.acquire().await.expect("hold connection");
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let _database = database;
+                panic!("simulated test assertion failure");
+            }));
+            assert!(panic.is_err(), "test body must unwind");
+            let exists: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)")
+                    .bind(&name)
+                    .fetch_one(&admin)
+                    .await
+                    .expect("check exact database immediately after unwinding");
+            assert!(!exists, "panic cleanup must finish before Drop returns");
+            drop(connection);
+            admin.close().await;
+        }
+
+        #[tokio::test]
+        async fn failed_migration_setup_force_drops_the_isolated_database() {
+            async fn leaked_databases(admin: &sqlx::PgPool) -> Vec<String> {
+                sqlx::query_scalar(
+                    "SELECT datname FROM pg_database \
+                     WHERE datname LIKE 'cap_test_migration_failure_%'",
+                )
+                .fetch_all(admin)
+                .await
+                .expect("list databases")
+            }
+
+            let database_url = std::env::var("DATABASE_URL")
+                .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
+            let admin = sqlx::PgPool::connect(&database_url)
+                .await
+                .expect("connect test database server");
+            let before = leaked_databases(&admin).await;
+
+            // Provisioning panics on a failed migration; run it on a
+            // dedicated thread with its own runtime so this test observes
+            // the panic and then proves the database it created was
+            // force-dropped instead of leaked.
+            let join = std::thread::spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build runtime");
+                runtime.block_on(IsolatedTestDatabase::provision(
+                    "migration_failure",
+                    |pool| async move {
+                        sqlx::query(
+                            "CREATE TABLE migration_setup_must_fail (\
+                             id integer PRIMARY KEY, id integer)",
+                        )
+                        .execute(&pool)
+                        .await
+                        .map(|_| ())
+                    },
+                ))
+            });
+            let panic = match join.join() {
+                Ok(_) => panic!("provisioning must fail when the migration fails"),
+                Err(payload) => payload,
+            };
+            let message = panic
+                .downcast_ref::<String>()
+                .expect("panic payload should carry the setup error");
+            assert!(
+                message.contains("migrate isolated test database"),
+                "unexpected panic message: {message}"
+            );
+
+            let after = leaked_databases(&admin).await;
+            assert_eq!(
+                before, after,
+                "failed setup must force-drop the database it created"
+            );
         }
     }
 }
