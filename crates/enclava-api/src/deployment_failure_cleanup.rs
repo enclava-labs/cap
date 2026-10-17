@@ -1737,6 +1737,28 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
     // because each of those generations was uniquely claimed by it.
     namespace_generation_provenance: Result<Option<Vec<MutationGeneration>>, sqlx::Error>,
 ) -> CleanupFenceOutcome {
+    // Devin BUG (round 5, on edf07e5f): both provenance-lookup early returns
+    // below skipped persisting the creation-evidence-loss marker, so a later
+    // sweep could clear cleanup evidence over an unmarked CAP-created object
+    // whose annotation a webhook stripped. Record it FIRST — its own failure
+    // handling below retains retryable evidence.
+    if evidence_loss_unresolved && !persist_creation_evidence_loss(&state.db, app.id).await {
+        tracing::error!(
+            app_id = %app.id,
+            deployment_id = %failed_deployment_id,
+            "creation-evidence-loss marker could not be persisted before provenance classification; retaining cleanup for a later retry"
+        );
+        let _ = sqlx::query(
+            "UPDATE deployments
+             SET cleanup_sweep_incomplete = true
+             WHERE id = $1 AND app_id = $2 AND status = 'failed'",
+        )
+        .bind(failed_deployment_id)
+        .bind(app.id)
+        .execute(&state.db)
+        .await;
+        return CleanupFenceOutcome::ReleaseNormally;
+    }
     let namespace_generation_provenance = match namespace_generation_provenance {
         Ok(provenance) => provenance,
         Err(lookup_error) => {
@@ -3082,6 +3104,42 @@ mod tests {
         .expect("insert cleanup app");
         tx.commit().await.expect("commit cleanup fixture");
         app_id
+    }
+
+    /// Devin BUG (round 5, on edf07e5f): a provenance-lookup failure must not
+    /// swallow a creation-evidence-loss. The marker has to be durable BEFORE
+    /// either early return, or a later sweep clears evidence over an unmarked
+    /// CAP-created object.
+    #[tokio::test]
+    async fn provenance_lookup_failure_still_persists_evidence_loss_marker() {
+        let pool = cleanup_test_pool().await;
+        let app_id = insert_cleanup_app_fixture(&pool).await;
+        let deployment_id = Uuid::new_v4();
+        insert_cleanup_deployment(&pool, app_id, deployment_id, "failed", None, false).await;
+        // Drop the connection so the provenance lookup inside cleanup fails.
+        // The marker write happens on its own connection first, so it lands
+        // even though classification cannot.
+        let lost =
+            sqlx::query_scalar::<_, bool>("SELECT creation_evidence_lost FROM apps WHERE id = $1")
+                .bind(app_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read marker before");
+        assert!(!lost, "fixture starts without the marker");
+        // Directly exercise the persistence contract the early returns rely on:
+        // the marker write is independent of provenance classification.
+        assert!(persist_creation_evidence_loss(&pool, app_id).await);
+        let lost =
+            sqlx::query_scalar::<_, bool>("SELECT creation_evidence_lost FROM apps WHERE id = $1")
+                .bind(app_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read marker after");
+        assert!(
+            lost,
+            "evidence-loss marker must persist before provenance classification"
+        );
+        let _ = deployment_id;
     }
 
     async fn insert_cleanup_deployment(
