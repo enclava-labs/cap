@@ -2252,9 +2252,24 @@ async fn exhaustion_claim_blocker(
     fences: &[crate::mutation_leases::ResourceFence],
 ) -> Result<ExhaustionClaimBlocker, sqlx::Error> {
     let mut waitable_until: Option<chrono::DateTime<chrono::Utc>> = None;
-    let mut extend = |row: Option<(String, Option<Uuid>, chrono::DateTime<chrono::Utc>, bool)>,
-                      shared_global: bool|
-     -> bool {
+    // grok-4.7 review (loop #34): timestamptz 'infinity' binary-decodes to
+    // i64::MAX microseconds, which PANICS chrono ("NaiveDateTime +
+    // TimeDelta overflowed") — and armed fences legitimately store infinity
+    // (kubernetes_namespace during provider writes, custom_domain_set for
+    // the whole ingress restart). Select infinity as NULL plus an explicit
+    // `unbounded` flag so the value never reaches the decoder, and treat
+    // still-armed owners as waitable on a bounded PROBE horizon instead of
+    // ForeignOwner: their owners release on completion, and the terminal
+    // job must retry after they finish rather than skip compensation
+    // forever.
+    const UNBOUNDED_OWNER_PROBE_SECS: i64 = 30;
+    type BlockerRow = (
+        String,
+        Option<Uuid>,
+        Option<chrono::DateTime<chrono::Utc>>,
+        bool,
+    );
+    let mut extend = |row: Option<BlockerRow>, shared_global: bool| -> bool {
         match row {
             None => true,
             Some((operation_kind, operation_id, reclaim_after, unbounded)) => {
@@ -2274,41 +2289,48 @@ async fn exhaustion_claim_blocker(
                 // contention; deployment-flow owners (`deployment_*`) of a
                 // different operation id and the app delete flow stay
                 // foreign — their own terminal paths own this
-                // deployment's convergence.
-                let transient_non_deployment_owner = !operation_kind.starts_with("deployment_")
-                    && operation_kind != "app_delete"
-                    && !unbounded;
+                // deployment's convergence. An UNBOUNDED non-deployment
+                // owner is an armed, still-live lease of the same
+                // temporary classes — waitable on the probe horizon.
+                let transient_non_deployment_owner =
+                    !operation_kind.starts_with("deployment_") && operation_kind != "app_delete";
                 if !(own_abandoned
                     || (shared_global && !unbounded)
-                    || transient_non_deployment_owner)
+                    || (!shared_global && transient_non_deployment_owner))
                 {
                     return false;
                 }
-                if waitable_until.is_none_or(|current| reclaim_after > current) {
-                    waitable_until = Some(reclaim_after);
+                let frees_at = reclaim_after.unwrap_or_else(|| {
+                    chrono::Utc::now() + chrono::Duration::seconds(UNBOUNDED_OWNER_PROBE_SECS)
+                });
+                if waitable_until.is_none_or(|current| frees_at > current) {
+                    waitable_until = Some(frees_at);
                 }
                 true
             }
         }
     };
-    let app_lane =
-        sqlx::query_as::<_, (String, Option<Uuid>, chrono::DateTime<chrono::Utc>, bool)>(
-            "SELECT operation_kind, operation_id, reclaim_after,
-                reclaim_after = 'infinity'::timestamptz
+    let app_lane = sqlx::query_as::<_, BlockerRow>(
+        "SELECT operation_kind, operation_id,
+                    CASE WHEN reclaim_after = 'infinity'::timestamptz
+                         THEN NULL ELSE reclaim_after END,
+                    reclaim_after = 'infinity'::timestamptz
            FROM app_mutation_leases
           WHERE app_id = $1
             AND owner_token IS NOT NULL
             AND reclaim_after > clock_timestamp()",
-        )
-        .bind(app_id)
-        .fetch_optional(pool)
-        .await?;
+    )
+    .bind(app_id)
+    .fetch_optional(pool)
+    .await?;
     if !extend(app_lane, false) {
         return Ok(ExhaustionClaimBlocker::ForeignOwner);
     }
     for fence in fences {
-        let row = sqlx::query_as::<_, (String, Option<Uuid>, chrono::DateTime<chrono::Utc>, bool)>(
-            "SELECT operation_kind, operation_id, reclaim_after,
+        let row = sqlx::query_as::<_, BlockerRow>(
+            "SELECT operation_kind, operation_id,
+                        CASE WHEN reclaim_after = 'infinity'::timestamptz
+                             THEN NULL ELSE reclaim_after END,
                         reclaim_after = 'infinity'::timestamptz
                    FROM external_resource_mutation_leases
                   WHERE resource_scope = $1
@@ -3710,10 +3732,29 @@ async fn fail_apply_job_with_mutation(
                     enclava_engine::apply::engine::ApplyError::CreationEvidenceLost { .. }
                 ))
             ),
-            // The immediate terminal path holds the apply's own mutation
-            // lease: its fence generations ARE the generations the apply
-            // stamped, so no separate provenance is needed.
-            None,
+            // grok-4.7 review (loop #34): the apply's own lease generation is
+            // NOT always the generation stamped on the namespace. A job whose
+            // stamp is incomplete (pre-migration stamp N, then a
+            // post-migration claim of N+1 that fails terminally BEFORE
+            // restamping — KBS reconcile runs before the namespace write)
+            // classifies Foreign against the current lease generation,
+            // releases the fences, and never retries, stranding the
+            // namespace. Load the durable append-only set — every
+            // generation this deployment's attempts claimed — instead; a
+            // lookup failure falls back to the previous behavior (current
+            // generation only).
+            match retry_exhaustion_namespace_provenance(&state.db, job.deployment_id).await {
+                Ok(provenance) => provenance,
+                Err(lookup_error) => {
+                    tracing::warn!(
+                        deployment_id = %job.deployment_id,
+                        error = %lookup_error,
+                        error_code = "immediate_cleanup_provenance_lookup_failed",
+                        "failed-apply cleanup falling back to the current lease generation"
+                    );
+                    None
+                }
+            },
         )
         .await
             == crate::deployment_failure_cleanup::CleanupFenceOutcome::RetainNamespaceFence
@@ -5951,6 +5992,49 @@ pub(crate) mod tests {
             .execute(&pool)
             .await
             .expect("delete compensation fixture");
+    }
+
+    #[tokio::test]
+    async fn exhaustion_claim_blocker_treats_armed_infinity_leases_as_waitable() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.side_effect_admission = Arc::new(tokio::sync::Semaphore::new(4));
+
+        // grok-4.7 (loop #34): armed fences legitimately store
+        // reclaim_after = 'infinity' (kubernetes_namespace during provider
+        // writes; custom_domain_set for the whole ingress restart). The
+        // blocker must neither panic decoding timestamptz infinity into
+        // chrono nor classify a still-armed temporary owner as Foreign —
+        // the terminal deployment retries on the probe horizon after that
+        // owner finishes instead of skipping compensation forever.
+        let armed = crate::mutation_leases::claim(
+            &state,
+            app.id,
+            "custom_domain_set",
+            Uuid::new_v4(),
+            false,
+            Vec::new(),
+        )
+        .await
+        .expect("claim the app lane for a custom-domain operation");
+        drop(armed);
+        sqlx::query(
+            "UPDATE app_mutation_leases
+                SET reclaim_after = 'infinity'::timestamptz
+              WHERE app_id = $1",
+        )
+        .bind(app.id)
+        .execute(&pool)
+        .await
+        .expect("arm the lease like the ingress restart does");
+        assert!(matches!(
+            exhaustion_claim_blocker(&pool, app.id, deployment_id, &[])
+                .await
+                .expect("inspect blockers"),
+            ExhaustionClaimBlocker::WaitableUntil(_)
+        ));
     }
 
     #[tokio::test]
