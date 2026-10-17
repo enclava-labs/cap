@@ -23,6 +23,7 @@ use k8s_openapi::api::core::v1::Secret;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use sqlx::{PgPool, Postgres, Transaction};
 use std::net::IpAddr;
+use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::models::{App, AppContainer, AppResources, AppStatus};
@@ -306,9 +307,114 @@ fn generate_tenant_image_pull_secret(
     }
 }
 
+/// The engine's attached creation ledger, or a throwaway empty one for
+/// engines constructed without provenance recording (tests, non-apply
+/// paths). An empty ledger enforces only the cutover rule: post-cutover
+/// objects without a recorded row never gain deletion authority from a
+/// forged stamp.
+fn engine_ledger_or_empty(
+    engine: &ApplyEngine,
+) -> Arc<enclava_engine::apply::creation_ledger::CreationLedgerBuffer> {
+    engine.creation_ledger().cloned().unwrap_or_else(|| {
+        Arc::new(enclava_engine::apply::creation_ledger::CreationLedgerBuffer::new())
+    })
+}
+
+/// Drain the creations an apply step observed and durably record them
+/// (cap#272). A persistence failure is NEVER swallowed: the just-created
+/// objects are compensated (UID-preconditioned deletes) and the apply
+/// fails closed, because an unrecorded post-cutover creation could only
+/// resurface later as a permanently unresolved sweep target. Compensation
+/// failures are warned, not retried — the failed-apply sweep then holds
+/// the object unresolved (fail closed, operator-resolvable).
+async fn persist_and_gate_creation_records(
+    engine: &ApplyEngine,
+    pool: &PgPool,
+    app_id: Uuid,
+    deployment_id: Uuid,
+    namespace: &str,
+) -> Result<(), DeployError> {
+    let Some(ledger) = engine.creation_ledger() else {
+        return Ok(());
+    };
+    let pending = ledger.drain_pending();
+    if pending.is_empty() {
+        return Ok(());
+    }
+    if let Err(error) = crate::deployment_failure_cleanup::persist_creation_records(
+        pool,
+        app_id,
+        deployment_id,
+        &pending,
+    )
+    .await
+    {
+        tracing::error!(
+            app_id = %app_id,
+            deployment_id = %deployment_id,
+            namespace = %namespace,
+            error = %error,
+            "cannot persist the creation ledger; compensating this step's created objects and failing the apply closed (cap#272)"
+        );
+        compensate_unledgered_creations(engine, &pending).await;
+        return Err(DeployError::Db(error));
+    }
+    Ok(())
+}
+
+/// Best-effort, UID-preconditioned compensation of objects a step created
+/// whose ledger rows could not be persisted. Only objects THIS apply just
+/// created (records drained from the engine's own observation of its
+/// create POSTs) are ever touched; a 404 is the already-gone success.
+async fn compensate_unledgered_creations(
+    engine: &ApplyEngine,
+    records: &[enclava_engine::apply::creation_ledger::CreationRecord],
+) {
+    for record in records {
+        let ar = crate::deployment_failure_cleanup::sweep_api_resource(&record.kind);
+        let api: kube::Api<kube::api::DynamicObject> = match &record.namespace {
+            Some(namespace) => kube::Api::namespaced_with(engine.client().clone(), namespace, &ar),
+            // Cluster-scoped creations (the namespace itself).
+            None => kube::Api::all_with(engine.client().clone(), &ar),
+        };
+        let delete_params = kube::api::DeleteParams {
+            preconditions: Some(kube::api::Preconditions {
+                uid: Some(record.uid.clone()),
+                resource_version: None,
+            }),
+            ..kube::api::DeleteParams::default()
+        };
+        let delete = api.delete(&record.name, &delete_params);
+        match enclava_engine::apply::bounded_kube_write(delete).await {
+            Ok(_) => {
+                tracing::info!(
+                    kind = %record.kind,
+                    name = %record.name,
+                    "compensated an unledgered creation (delete accepted)"
+                );
+            }
+            Err(enclava_engine::apply::engine::ApplyError::Kube(kube::Error::Api(error)))
+                if error.code == 404 =>
+            {
+                // Already gone: successful compensation.
+            }
+            Err(error) => {
+                tracing::warn!(
+                    kind = %record.kind,
+                    name = %record.name,
+                    error = %error,
+                    "could not compensate an unledgered creation; the failed-apply sweep will hold it unresolved (fail closed)"
+                );
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn apply_all_with_tenant_image_pull_secret(
     engine: &ApplyEngine,
     pool: &sqlx::PgPool,
+    app_id: Uuid,
     deployment_id: Uuid,
     manifests: &enclava_engine::manifest::GeneratedManifests,
     manifest_hash: &str,
@@ -327,11 +433,18 @@ async fn apply_all_with_tenant_image_pull_secret(
         })?;
 
     apply_namespace(engine, &manifests.namespace, generation).await?;
+    // cap#272: creations observed by a step MUST be durably recorded
+    // before the apply proceeds — an object whose ledger row cannot be
+    // persisted is compensated (deleted) and the apply fails closed, so
+    // "created but unrecorded" can never leak into cleanup as a
+    // permanently unresolved sweep target.
+    persist_and_gate_creation_records(engine, pool, app_id, deployment_id, ns_name).await?;
     tracing::info!(namespace = %ns_name, "step 1/5: namespace ready");
 
     if let Some(config) = image_pull_secret_config {
         let secret = generate_tenant_image_pull_secret(ns_name, config);
         apply_namespaced_resource(engine, ns_name, &secret, generation).await?;
+        persist_and_gate_creation_records(engine, pool, app_id, deployment_id, ns_name).await?;
         tracing::info!(
             namespace = %ns_name,
             secret = %config.name,
@@ -340,9 +453,11 @@ async fn apply_all_with_tenant_image_pull_secret(
     }
 
     apply_standard_resources(engine, manifests, generation).await?;
+    persist_and_gate_creation_records(engine, pool, app_id, deployment_id, ns_name).await?;
     tracing::info!(namespace = %ns_name, "step 2/5: standard resources applied");
 
     apply_network_policy(engine, ns_name, &manifests.network_policy, generation).await?;
+    persist_and_gate_creation_records(engine, pool, app_id, deployment_id, ns_name).await?;
     tracing::info!(namespace = %ns_name, "step 3/5: CiliumNetworkPolicy applied");
 
     apply_gateway_resources(
@@ -355,6 +470,7 @@ async fn apply_all_with_tenant_image_pull_secret(
         generation,
     )
     .await?;
+    persist_and_gate_creation_records(engine, pool, app_id, deployment_id, ns_name).await?;
     tracing::info!(namespace = %ns_name, "step 4/5: Gateway API resources applied");
 
     let mut sts = manifests.statefulset.clone();
@@ -400,6 +516,7 @@ async fn apply_all_with_tenant_image_pull_secret(
     .execute(pool)
     .await?;
     let sts_live = apply_statefulset(engine, ns_name, &sts, generation).await?;
+    persist_and_gate_creation_records(engine, pool, app_id, deployment_id, ns_name).await?;
     // Persist the server-reported UID and creationTimestamp of the
     // StatefulSet object this apply produced (the POST/SSA response — not
     // a pre-call stamp). This is the identity the claim sweep matches
@@ -412,6 +529,12 @@ async fn apply_all_with_tenant_image_pull_secret(
     if crate::deployment_failure_cleanup::is_cap_created_generation_leftover(
         &sts_live,
         generation.get(),
+        // cap#272: claim-sweep provenance follows the same ledger gate as
+        // the sweep — the engine's ledger holds this apply's own create
+        // records plus the app's preloaded durable rows, so a forged
+        // stamp on a pre-existing set never becomes claim-deletion
+        // authority. Engines without a ledger keep the cutover-only rule.
+        &engine_ledger_or_empty(engine),
     ) {
         if let (Some(uid), Some(created)) = (
             sts_live.metadata.uid.as_deref(),
@@ -3110,6 +3233,16 @@ pub async fn apply_deployment_manifests(
     }
 
     let generation = MutationGeneration::new(kubernetes_mutation_generation)?;
+    // cap#272: attach the app's durable creation ledger to the engine
+    // BEFORE any provider write. The engine records every object its own
+    // create POST produces (persisted step-by-step below) and refuses to
+    // preserve creation evidence on live objects whose lineage is neither
+    // recorded nor grandfathered by the migration cutover. A load failure
+    // fails the apply closed — nothing has been written yet.
+    let engine = {
+        let ledger = crate::deployment_failure_cleanup::load_creation_ledger(&pool, app.id).await?;
+        engine.with_creation_ledger(ledger)
+    };
     mutation
         .arm_resource_scope_until_reconciled("kubernetes_namespace")
         .await?;
@@ -3120,6 +3253,7 @@ pub async fn apply_deployment_manifests(
     apply_all_with_tenant_image_pull_secret(
         &engine,
         &pool,
+        app.id,
         deployment_id,
         &manifests,
         &hash,

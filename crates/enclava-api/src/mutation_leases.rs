@@ -1537,7 +1537,34 @@ async fn reconcile_one_retained_namespace(
                 let Ok(generation_value) = MutationGeneration::new(generation) else {
                     return Ok(false);
                 };
-                match classify_initial_namespace_get(&Ok(live_namespace), generation_value) {
+                // cap#272: the delete retry must clear the SAME
+                // ledger-gated ownership proof as the original delete, not
+                // just the annotation+manager check a namespace creator
+                // can forge. A ledger load failure retains the fence and
+                // retries next cycle (fail closed); an unproven lineage
+                // classifies as Adopted below and the fence is converted
+                // to the bounded quarantine instead of deleting.
+                let namespace_creation_ledger =
+                    match crate::deployment_failure_cleanup::load_creation_ledger_for_namespace(
+                        pool, &namespace,
+                    )
+                    .await
+                    {
+                        Ok(ledger) => ledger,
+                        Err(error) => {
+                            tracing::warn!(
+                                namespace = %namespace,
+                                error = %error,
+                                "retained-namespace fence reconciliation cannot load the creation ledger; retaining fence"
+                            );
+                            return Ok(false);
+                        }
+                    };
+                match classify_initial_namespace_get(
+                    &Ok(live_namespace),
+                    generation_value,
+                    namespace_creation_ledger.as_ref(),
+                ) {
                     InitialNamespaceOwnership::Owned {
                         uid,
                         resource_version,
@@ -2959,6 +2986,76 @@ mod tests {
     /// release compare-and-swap must survive. When `ours_generation` is set,
     /// [`MOCK_NS_OURS`] serves a namespace carrying that generation's
     /// ownership annotations.
+    /// A mock namespace API server serving exactly one namespace shape: the
+    /// tenant-forged cap#272 object — this generation's ownership
+    /// annotations inside an `enclava-platform` managed-fields entry, but
+    /// created AFTER the ledger cutover with no recorded creation row.
+    async fn mock_forged_post_cutover_namespace_server() -> (
+        String,
+        Arc<std::sync::atomic::AtomicU8>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        let mode = Arc::new(std::sync::atomic::AtomicU8::new(MOCK_NS_OURS));
+        let app = axum::Router::new().fallback(move |request: axum::extract::Request| {
+            async move {
+                let _ = request;
+                let annotations = std::collections::BTreeMap::from([
+                    (
+                        enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION
+                            .to_string(),
+                        "1".to_string(),
+                    ),
+                    (
+                        enclava_engine::apply::generation::NAMESPACE_CREATED_BY_ANNOTATION
+                            .to_string(),
+                        "1".to_string(),
+                    ),
+                ]);
+                (
+                    StatusCode::OK,
+                    axum::Json(serde_json::json!({
+                        "apiVersion": "v1", "kind": "Namespace",
+                        "metadata": {
+                            "name": "forged", "uid": "forged", "resourceVersion": "1",
+                            "creationTimestamp": "2026-10-18T00:00:00Z",
+                            "annotations": annotations,
+                            "managedFields": [{
+                                "manager": "enclava-platform",
+                                "apiVersion": "v1",
+                                "fieldsType": "FieldsV1",
+                                "fieldsV1": {
+                                    "f:metadata": {
+                                        "f:annotations": {
+                                            format!(
+                                                "f:{}",
+                                                enclava_engine::apply::generation::NAMESPACE_CREATED_BY_ANNOTATION
+                                            ): {}
+                                        }
+                                    }
+                                }
+                            }]
+                        }
+                    })),
+                )
+                    .into_response()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind forged-namespace mock API");
+        let address = listener
+            .local_addr()
+            .expect("forged-namespace mock address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve forged-namespace mock API");
+        });
+        (format!("http://{address}"), mode, server)
+    }
+
     async fn mock_namespace_api_server(
         race: Option<(PgPool, String)>,
         ours_generation: Arc<std::sync::atomic::AtomicI64>,
@@ -3051,6 +3148,10 @@ mod tests {
                                 "apiVersion": "v1", "kind": "Namespace",
                                 "metadata": {
                                     "name": name, "uid": "fixture", "resourceVersion": "1",
+                                    // Pre-ledger-cutover creation: a legacy retained
+                                    // fence whose namespace keeps the grandfathered
+                                    // annotation+manager authority (cap#272).
+                                    "creationTimestamp": "2026-10-01T00:00:00Z",
                                     "annotations": annotations,
                                     "managedFields": [{
                                         "manager": "enclava-platform",
@@ -3523,8 +3624,44 @@ mod tests {
             "no DELETE was issued against the non-matching namespace"
         );
 
+        // Cycle three (cap#272): a fresh retained fence whose namespace is
+        // served with the SAME CAP-shaped ownership annotations and
+        // managed-fields provenance but created AFTER the ledger cutover,
+        // with no recorded creation row — the tenant-forged shape. The
+        // reconciler must refuse the delete (unproven lineage), keep the
+        // fence retained for operator resolution, and issue no DELETE.
+        let (org_three, _app_three, _owner_three, namespace_three) =
+            stage_retained_namespace_fixture(&pool, Vec::new()).await;
+
+        let (forged_url, forged_mode, forged_server) =
+            mock_forged_post_cutover_namespace_server().await;
+        let forged_client = mock_kube_client(&forged_url);
+        let released = release_retained_deployment_namespace_fences_with(&pool, forged_client)
+            .await
+            .expect("reconcile retained fence against a forged post-cutover namespace");
+        assert_eq!(
+            released, 0,
+            "a forged post-cutover namespace never gains delete authority (cap#272)"
+        );
+        let three_owner: Option<Uuid> =
+            sqlx::query_scalar("SELECT owner_token FROM external_resource_mutation_leases WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1")
+                .bind(&namespace_three)
+                .fetch_one(&pool)
+                .await
+                .expect("verify forged-namespace fence owner");
+        assert!(
+            three_owner.is_some(),
+            "the forged namespace's fence stays retained (fail closed)"
+        );
+        assert_eq!(
+            forged_mode.load(std::sync::atomic::Ordering::SeqCst),
+            MOCK_NS_OURS,
+            "no DELETE was issued against the forged namespace"
+        );
+        forged_server.abort();
+
         server.abort();
-        for namespace in [&namespace_one, &namespace_two] {
+        for namespace in [&namespace_one, &namespace_two, &namespace_three] {
             sqlx::query(
                 "DELETE FROM external_resource_mutation_leases
                   WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1",
@@ -3534,7 +3671,7 @@ mod tests {
             .await
             .expect("remove retry-fixture fence");
         }
-        for org in [org_one, org_two] {
+        for org in [org_one, org_two, org_three] {
             sqlx::query("DELETE FROM organizations WHERE id = $1")
                 .bind(org)
                 .execute(&pool)

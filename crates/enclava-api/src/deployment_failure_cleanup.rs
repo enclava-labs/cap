@@ -457,6 +457,22 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
     // failed generation, or a loss surfaced on a non-job write path).
     let evidence_loss_unresolved =
         evidence_loss_unresolved || app_creation_evidence_lost(state, app.id).await;
+    // cap#272: deletion authority requires server-recorded creation
+    // lineage. Load the app's durable ledger rows fail-closed — a query
+    // failure aborts the sweep (retryable) rather than running it with an
+    // unenforced ledger.
+    let creation_ledger = match load_creation_ledger(&state.db, app.id).await {
+        Ok(ledger) => ledger,
+        Err(error) => {
+            tracing::warn!(
+                app_id = %app.id,
+                deployment_id = %failed_deployment_id,
+                error = %error,
+                "adopted-namespace sweep cannot load the creation ledger; counting the sweep as failed for retry"
+            );
+            return usize::MAX;
+        }
+    };
     let mut failures = 0usize;
     let mut targets = adopted_namespace_sweep_targets(app);
     // Codex P2 (renamed pull secrets): candidate Secret discovery must not
@@ -609,10 +625,9 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
                 }
                 break; // never created, or already deleted
             };
-            if !matches!(
-                classify_generation_leftover(&live, generation.get()),
-                GenerationLeftover::Leftover
-            ) {
+            let classification =
+                classify_generation_leftover(&live, generation.get(), &creation_ledger);
+            if !matches!(classification, GenerationLeftover::Leftover) {
                 // Codex P2: valid CAP creation evidence but a lost/unparseable
                 // generation marker (an admission webhook can drop or rewrite
                 // it on update; the update path's verify_applied_generation
@@ -622,16 +637,25 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
                 // skipping it silently would let the caller declare the sweep
                 // complete and clear evidence over a partially updated
                 // resource. Fail closed: count the failure, keep retrying.
+                //
+                // cap#272 (ProvenanceUnproven): creation evidence and manager
+                // ownership both LOOK right, but the object postdates the
+                // ledger cutover and no recorded creation row matches its
+                // UID — the forged-stamp shape. Deletion refuses and the
+                // sweep stays incomplete over it (retryable; the namespace
+                // owner resolves it by deleting their own object, exactly
+                // like a MarkerLost webhook casualty).
                 if matches!(
-                    classify_generation_leftover(&live, generation.get()),
-                    GenerationLeftover::MarkerLost
+                    classification,
+                    GenerationLeftover::MarkerLost | GenerationLeftover::ProvenanceUnproven
                 ) {
                     tracing::warn!(
                         app_id = %app.id,
                         namespace = %app.namespace,
                         kind = target.kind,
                         name = %target.name,
-                        "sweep found a CAP-created object with a lost mutation-generation marker; unresolved, keeping the sweep incomplete"
+                        unresolved = ?classification,
+                        "sweep found a CAP-evidence object with unresolved ownership (lost marker or unproven creation lineage); keeping the sweep incomplete"
                     );
                     failures += 1;
                     break;
@@ -910,6 +934,7 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
 /// older created object can only be a leftover of an earlier failed
 /// apply — exactly what must not survive generation after generation.
 /// Ownership of a live object relative to a failed generation's cleanup.
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum GenerationLeftover {
     /// CAP creation evidence plus a generation marker of this or an earlier
     /// generation: a leftover of the failed generation's apply — a sweep may
@@ -929,11 +954,22 @@ pub(crate) enum GenerationLeftover {
     /// complete and clear cleanup evidence over it, leaving a partially
     /// updated resource with no later eligibility. Fail closed instead.
     MarkerLost,
+    /// cap#272: valid-looking CAP creation evidence (annotation + manager
+    /// ownership), but the object was created after the ledger cutover and
+    /// its (name, uid) has NO recorded creation row — the exact shape a
+    /// tenant forges by pre-creating a target-named object and submitting
+    /// the write with `fieldManager=enclava-platform`. Deletion refuses;
+    /// foreign-skip would let the sweep complete and clear evidence over
+    /// an object that (in the rare unrecorded-creation case) may still be
+    /// CAP's own, so the sweep stays incomplete over it instead: fail
+    /// closed, retryable, operator-resolvable.
+    ProvenanceUnproven,
 }
 
 pub(crate) fn classify_generation_leftover<K>(
     resource: &K,
     failed_generation: i64,
+    creation_ledger: &enclava_engine::apply::creation_ledger::CreationLedgerBuffer,
 ) -> GenerationLeftover
 where
     K: kube::Resource,
@@ -975,18 +1011,47 @@ where
     });
     let live_generation = raw_generation.and_then(|raw| raw.parse::<i64>().ok());
     match live_generation {
-        Some(live) if live > 0 && live <= failed_generation => GenerationLeftover::Leftover,
+        Some(live) if live > 0 && live <= failed_generation => {
+            // cap#272: the manager string itself is client-selected, so
+            // even a manager-owned annotation is not creation proof. For a
+            // candidate LEFTOVER, deletion authority additionally requires
+            // server-recorded lineage — the live UID matches a row the
+            // control plane wrote at its own create POST, or the object
+            // predates the ledger cutover (bounded one-time migration
+            // trust). A newer generation's publication stays Foreign and
+            // an unparseable marker stays MarkerLost regardless of
+            // provenance: neither ever deletes, so provenance cannot
+            // settle them further.
+            let lineage = enclava_engine::apply::creation_ledger::creation_lineage_provenance(
+                metadata.name.as_deref(),
+                metadata.uid.as_deref(),
+                metadata
+                    .creation_timestamp
+                    .as_ref()
+                    .map(|ts| ts.0.to_string())
+                    .as_deref(),
+                Some(creation_ledger),
+            );
+            if lineage == enclava_engine::apply::creation_ledger::LineageProvenance::Unproven {
+                return GenerationLeftover::ProvenanceUnproven;
+            }
+            GenerationLeftover::Leftover
+        }
         Some(live) if live > failed_generation => GenerationLeftover::Foreign,
         _ => GenerationLeftover::MarkerLost,
     }
 }
 
-pub(crate) fn is_cap_created_generation_leftover<K>(resource: &K, failed_generation: i64) -> bool
+pub(crate) fn is_cap_created_generation_leftover<K>(
+    resource: &K,
+    failed_generation: i64,
+    creation_ledger: &enclava_engine::apply::creation_ledger::CreationLedgerBuffer,
+) -> bool
 where
     K: kube::Resource,
 {
     matches!(
-        classify_generation_leftover(resource, failed_generation),
+        classify_generation_leftover(resource, failed_generation, creation_ledger),
         GenerationLeftover::Leftover
     )
 }
@@ -1158,6 +1223,84 @@ pub(crate) async fn persist_sts_provenance(
     .execute(pool)
     .await
     .map(|_| ())
+}
+
+/// Load the app's durable creation-ledger rows (cap#272) into an
+/// engine-side [`CreationLedgerBuffer`]. Every deletion-authority check in
+/// this module (object sweep, namespace teardown, StatefulSet provenance)
+/// matches live UIDs against this set. Fails closed on a database error —
+/// the caller aborts the sweep/teardown rather than proceeding with an
+/// empty (unenforced) ledger.
+pub(crate) async fn load_creation_ledger(
+    pool: &sqlx::PgPool,
+    app_id: uuid::Uuid,
+) -> Result<std::sync::Arc<enclava_engine::apply::creation_ledger::CreationLedgerBuffer>, sqlx::Error>
+{
+    let rows: Vec<(String, String, String)> =
+        sqlx::query_as("SELECT kind, name, uid FROM resource_creation_ledger WHERE app_id = $1")
+            .bind(app_id)
+            .fetch_all(pool)
+            .await?;
+    let ledger =
+        std::sync::Arc::new(enclava_engine::apply::creation_ledger::CreationLedgerBuffer::new());
+    ledger.preload(rows);
+    Ok(ledger)
+}
+
+/// Resolve an app's creation ledger from its namespace name (used by the
+/// retained-fence reconciler, which only knows the namespace). Fails
+/// closed on lookup errors: callers retain their fence and retry.
+pub(crate) async fn load_creation_ledger_for_namespace(
+    pool: &sqlx::PgPool,
+    namespace: &str,
+) -> Result<std::sync::Arc<enclava_engine::apply::creation_ledger::CreationLedgerBuffer>, sqlx::Error>
+{
+    let app_id: Option<uuid::Uuid> = sqlx::query_scalar("SELECT id FROM apps WHERE namespace = $1")
+        .bind(namespace)
+        .fetch_optional(pool)
+        .await?;
+    match app_id {
+        Some(app_id) => load_creation_ledger(pool, app_id).await,
+        // No app row owns the namespace name anymore: nothing was ever
+        // recorded for it under this scheme; an empty ledger keeps the
+        // cutover rule as the only authority.
+        None => Ok(std::sync::Arc::new(
+            enclava_engine::apply::creation_ledger::CreationLedgerBuffer::new(),
+        )),
+    }
+}
+
+/// Durably append creation records observed by an apply (drained from the
+/// engine's ledger buffer). Idempotent per (app_id, uid): a retried apply
+/// re-observing the same creation must not fail. The apply path calls this
+/// after every apply step and MUST fail closed (compensating the created
+/// objects) when it errors — "created but unrecorded" must never leak into
+/// cleanup, where it could only surface as a permanently unresolved sweep
+/// target.
+pub(crate) async fn persist_creation_records(
+    pool: &sqlx::PgPool,
+    app_id: uuid::Uuid,
+    deployment_id: uuid::Uuid,
+    records: &[enclava_engine::apply::creation_ledger::CreationRecord],
+) -> Result<(), sqlx::Error> {
+    for record in records {
+        sqlx::query(
+            "INSERT INTO resource_creation_ledger
+                 (app_id, deployment_id, kind, name, namespace, uid, mutation_generation)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             ON CONFLICT (app_id, uid) DO NOTHING",
+        )
+        .bind(app_id)
+        .bind(deployment_id)
+        .bind(&record.kind)
+        .bind(&record.name)
+        .bind(&record.namespace)
+        .bind(&record.uid)
+        .bind(record.mutation_generation)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
 }
 
 /// One window per durably proven StatefulSet UID of a row: a recreated set
@@ -1471,8 +1614,10 @@ fn is_cap_claim_name(name: &str, statefulset: &str, vct_names: &[&str]) -> bool 
 
 /// ApiResource descriptors for every kind the sweep targets (core, apps,
 /// and the Gateway/Cilium CRDs), mirroring the constructors in
-/// `enclava-engine`'s apply modules.
-fn sweep_api_resource(kind: &str) -> kube::api::ApiResource {
+/// `enclava-engine`'s apply modules. Also covers "Namespace" for the
+/// creation-ledger compensation path (cluster-scoped; callers use
+/// `Api::all_with` for it).
+pub(crate) fn sweep_api_resource(kind: &str) -> kube::api::ApiResource {
     match kind {
         "Secret" => kube::api::ApiResource {
             group: String::new(),
@@ -1535,7 +1680,14 @@ fn sweep_api_resource(kind: &str) -> kube::api::ApiResource {
             "TLSRoute",
             "tlsroutes",
         ),
-        _ => unreachable!("statically enumerated kinds"),
+        "Namespace" => kube::api::ApiResource {
+            group: String::new(),
+            version: "v1".to_string(),
+            api_version: "v1".to_string(),
+            kind: "Namespace".to_string(),
+            plural: "namespaces".to_string(),
+        },
+        other => unreachable!("unexpected kind {other}"),
     }
 }
 
@@ -1815,6 +1967,12 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
     // routes, so the routes are compensated in every outcome where no
     // other generation owns provider state.
     //
+    // cap#272: namespace-deletion authority additionally requires the
+    // creation ledger. Loaded fail-closed BEFORE the guarded step: a
+    // database failure must not downgrade the check to unenforced — the
+    // namespace is then treated exactly like an unprobeable one (no
+    // delete issued, routes compensated, row retryable).
+    //
     // The classification GET and the teardown run as separate guarded
     // provider steps: a lease lost during the classification (or the
     // adopted-namespace sweep) released nothing harmful — no namespace
@@ -1823,22 +1981,37 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
     // releases on an observed 404; retaining would wedge every later
     // deployment of this app on permanent Busy). Only a lease lost while a
     // CAP-created namespace delete may be in flight retains the fence.
-    let ownership = match mutation
-        .guard_provider(classify_failed_generation_namespace(
-            app,
-            namespace_generation,
-        ))
-        .await
-    {
-        Ok(ownership) => ownership,
+    let namespace_creation_ledger = load_creation_ledger(&state.db, app.id).await;
+    let ownership = match &namespace_creation_ledger {
+        Ok(ledger) => {
+            match mutation
+                .guard_provider(classify_failed_generation_namespace(
+                    app,
+                    namespace_generation,
+                    ledger.as_ref(),
+                ))
+                .await
+            {
+                Ok(ownership) => ownership,
+                Err(error) => {
+                    tracing::warn!(
+                        app_id = %app.id,
+                        namespace = %app.namespace,
+                        error = %error,
+                        "failed-apply cleanup lost its mutation lease while classifying the namespace; releasing fences"
+                    );
+                    return CleanupFenceOutcome::ReleaseNormally;
+                }
+            }
+        }
         Err(error) => {
             tracing::warn!(
                 app_id = %app.id,
                 namespace = %app.namespace,
                 error = %error,
-                "failed-apply cleanup lost its mutation lease while classifying the namespace; releasing fences"
+                "failed-apply cleanup cannot load the creation ledger; treating the namespace as unprobeable (no delete, retryable)"
             );
-            return CleanupFenceOutcome::ReleaseNormally;
+            InitialNamespaceOwnership::Uninspectable
         }
     };
     if matches!(ownership, InitialNamespaceOwnership::AbsentBeforeDelete) {
@@ -2006,6 +2179,14 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
                         namespace_generation,
                         uid,
                         resource_version,
+                        // cap#272: the 409 re-check re-classifies with the
+                        // same ledger gate that authorized the delete.
+                        match &namespace_creation_ledger {
+                            Ok(ledger) => ledger.as_ref(),
+                            Err(_) => unreachable!(
+                                "namespace delete requires an owned classification, which requires the ledger"
+                            ),
+                        },
                     ))
                     .await
                 {
@@ -2488,6 +2669,7 @@ pub(crate) enum InitialNamespaceOwnership {
 pub(crate) fn classify_initial_namespace_get(
     result: &Result<k8s_openapi::api::core::v1::Namespace, kube::Error>,
     generation: enclava_engine::apply::generation::MutationGeneration,
+    creation_ledger: &enclava_engine::apply::creation_ledger::CreationLedgerBuffer,
 ) -> InitialNamespaceOwnership {
     match result {
         Ok(namespace) => {
@@ -2529,6 +2711,32 @@ pub(crate) fn classify_initial_namespace_get(
                 if !manager_proves_authorship {
                     return InitialNamespaceOwnership::Adopted;
                 }
+                // cap#272: the manager string is client-selected, so a
+                // tenant can mint the same managed-fields entry on a
+                // namespace they created. Deletion authority for the
+                // namespace — the whole-namespace delete below —
+                // additionally requires server-recorded lineage: the live
+                // UID matches a creation row CAP wrote at its own POST, or
+                // the namespace predates the ledger cutover (bounded
+                // one-time migration trust).
+                let lineage = enclava_engine::apply::creation_ledger::creation_lineage_provenance(
+                    namespace.metadata.name.as_deref(),
+                    namespace.metadata.uid.as_deref(),
+                    namespace
+                        .metadata
+                        .creation_timestamp
+                        .as_ref()
+                        .map(|ts| ts.0.to_string())
+                        .as_deref(),
+                    Some(creation_ledger),
+                );
+                if lineage == enclava_engine::apply::creation_ledger::LineageProvenance::Unproven {
+                    tracing::warn!(
+                        namespace = ?namespace.metadata.name,
+                        "namespace carries CAP-shaped creation evidence with no recorded lineage; treating it as adopted (cap#272)"
+                    );
+                    return InitialNamespaceOwnership::Adopted;
+                }
                 // The DELETE preconditions come from THIS object. A live
                 // object missing uid/resourceVersion cannot be pinned and
                 // is treated as undecidable (the API server always
@@ -2562,6 +2770,7 @@ pub(crate) fn classify_initial_namespace_get(
 async fn classify_failed_generation_namespace(
     app: &App,
     generation: enclava_engine::apply::generation::MutationGeneration,
+    creation_ledger: &enclava_engine::apply::creation_ledger::CreationLedgerBuffer,
 ) -> InitialNamespaceOwnership {
     let client = match kube::Client::try_default().await {
         Ok(client) => client,
@@ -2586,7 +2795,7 @@ async fn classify_failed_generation_namespace(
         .await
         .map_err(|_| kube::Error::Service("namespace ownership probe timed out".into()))
         .and_then(|inner| inner);
-    classify_initial_namespace_get(&probed, generation)
+    classify_initial_namespace_get(&probed, generation, creation_ledger)
 }
 
 /// Delete the namespace that ALREADY passed the ownership classification,
@@ -2616,6 +2825,7 @@ async fn delete_owned_namespace(
     generation: enclava_engine::apply::generation::MutationGeneration,
     owned_uid: String,
     owned_resource_version: String,
+    creation_ledger: &enclava_engine::apply::creation_ledger::CreationLedgerBuffer,
 ) -> NamespaceTeardown {
     let client = match kube::Client::try_default().await {
         Ok(client) => client,
@@ -2756,7 +2966,11 @@ async fn delete_owned_namespace(
                 let same_uid = live.metadata.uid.as_deref() == Some(pinned_uid.as_str());
                 let still_ours = same_uid
                     && matches!(
-                        classify_initial_namespace_get(&Ok(live.clone()), generation),
+                        classify_initial_namespace_get(
+                            &Ok(live.clone()),
+                            generation,
+                            creation_ledger
+                        ),
                         InitialNamespaceOwnership::Owned { .. }
                     )
                     && live.metadata.resource_version.is_some();
@@ -3500,6 +3714,7 @@ mod tests {
                 annotations: Some(annotations),
                 managed_fields,
                 uid: Some("00000000-0000-0000-0000-000000000001".to_string()),
+                creation_timestamp: Some(k8s_time("2026-10-01T00:00:00Z")),
                 resource_version: Some("42".to_string()),
                 ..Default::default()
             },
@@ -3518,17 +3733,17 @@ mod tests {
         let generation = enclava_engine::apply::generation::MutationGeneration::new(7)
             .expect("valid generation");
         assert!(matches!(
-            classify_initial_namespace_get(&Ok(annotated_namespace(7)), generation),
+            classify_ns_get(&Ok(annotated_namespace(7)), generation),
             InitialNamespaceOwnership::Owned { .. }
         ));
         assert!(matches!(
-            classify_initial_namespace_get(&Ok(annotated_namespace(6)), generation),
+            classify_ns_get(&Ok(annotated_namespace(6)), generation),
             InitialNamespaceOwnership::Foreign
         ));
         // A missing annotation (or an unparseable one) is foreign, not owned:
         // `delete_resource` would otherwise treat it as generation 0.
         assert!(matches!(
-            classify_initial_namespace_get(
+            classify_ns_get(
                 &Ok(k8s_openapi::api::core::v1::Namespace::default()),
                 generation
             ),
@@ -3538,7 +3753,7 @@ mod tests {
         // last-writer proof. Without creation evidence the namespace
         // pre-existed and was adopted — it must never be deleted.
         assert!(matches!(
-            classify_initial_namespace_get(&Ok(adopted_namespace(7)), generation),
+            classify_ns_get(&Ok(adopted_namespace(7)), generation),
             InitialNamespaceOwnership::Adopted
         ));
         // Codex e4Z: a tenant-authored creation marker (value present,
@@ -3557,7 +3772,7 @@ mod tests {
                 "7".to_string(),
             );
         assert!(matches!(
-            classify_initial_namespace_get(&Ok(forged), generation),
+            classify_ns_get(&Ok(forged), generation),
             InitialNamespaceOwnership::Adopted
         ));
         // Creation evidence written by an earlier generation (the namespace
@@ -3576,7 +3791,7 @@ mod tests {
                 "7".to_string(),
             );
         assert!(matches!(
-            classify_initial_namespace_get(&Ok(recreated), generation),
+            classify_ns_get(&Ok(recreated), generation),
             InitialNamespaceOwnership::Owned { .. }
         ));
     }
@@ -3619,6 +3834,7 @@ mod tests {
             metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
                 annotations: Some(annotations),
                 managed_fields,
+                creation_timestamp: Some(k8s_time("2026-10-01T00:00:00Z")),
                 ..Default::default()
             },
             types: None,
@@ -3653,7 +3869,7 @@ mod tests {
     fn sweep_requires_creation_evidence_not_last_writer_proof() {
         use enclava_engine::apply::generation as generation_annotations;
         // A CAP-created object of this failed generation: both annotations.
-        assert!(is_cap_created_generation_leftover(
+        assert!(is_cap_leftover(
             &object_meta_with_annotations(&[
                 (generation_annotations::RESOURCE_CREATED_BY_ANNOTATION, 7),
                 (generation_annotations::MUTATION_GENERATION_ANNOTATION, 7),
@@ -3662,7 +3878,7 @@ mod tests {
         ));
         // An older CAP-created leftover (an earlier failed apply's object)
         // whose last writer is still an older generation: sweep it.
-        assert!(is_cap_created_generation_leftover(
+        assert!(is_cap_leftover(
             &object_meta_with_annotations(&[
                 (generation_annotations::RESOURCE_CREATED_BY_ANNOTATION, 3),
                 (generation_annotations::MUTATION_GENERATION_ANNOTATION, 3),
@@ -3671,7 +3887,7 @@ mod tests {
         ));
         // Codex P1: SSA-patched pre-existing object — mutation annotation
         // from this apply, but NO creation evidence. Must never be deleted.
-        assert!(!is_cap_created_generation_leftover(
+        assert!(!is_cap_leftover(
             &object_meta_with_annotations(&[(
                 generation_annotations::MUTATION_GENERATION_ANNOTATION,
                 7
@@ -3679,7 +3895,7 @@ mod tests {
             7
         ));
         // A newer generation's publication: not this failure's partial state.
-        assert!(!is_cap_created_generation_leftover(
+        assert!(!is_cap_leftover(
             &object_meta_with_annotations(&[
                 (generation_annotations::RESOURCE_CREATED_BY_ANNOTATION, 9),
                 (generation_annotations::MUTATION_GENERATION_ANNOTATION, 9),
@@ -3687,13 +3903,10 @@ mod tests {
             7
         ));
         // Foreign object: no annotations at all.
-        assert!(!is_cap_created_generation_leftover(
-            &sweep_leftover_object(&[], false),
-            7
-        ));
+        assert!(!is_cap_leftover(&sweep_leftover_object(&[], false), 7));
         // Codex tGA: tenant-authored creation marker (value present, no
         // CAP managed-fields provenance) must not authorize deletion.
-        assert!(!is_cap_created_generation_leftover(
+        assert!(!is_cap_leftover(
             &sweep_leftover_object(
                 &[
                     (generation_annotations::RESOURCE_CREATED_BY_ANNOTATION, 7),
@@ -3707,10 +3920,7 @@ mod tests {
         // undecidable last-writer — never a leftover (no deletion), and the
         // sweep treats it as UNRESOLVED (MarkerLost, fail closed), not
         // foreign-skip.
-        assert!(!is_cap_created_generation_leftover(
-            &unparseable_mutation_object(),
-            7
-        ));
+        assert!(!is_cap_leftover(&unparseable_mutation_object(), 7));
     }
 
     /// Codex P2: valid CAP creation evidence paired with an absent or
@@ -3726,7 +3936,7 @@ mod tests {
         use enclava_engine::apply::generation as generation_annotations;
         // Creation evidence, marker ABSENT: unresolved.
         assert!(matches!(
-            classify_generation_leftover(
+            classify_leftover(
                 &sweep_leftover_object(
                     &[(generation_annotations::RESOURCE_CREATED_BY_ANNOTATION, 7)],
                     true
@@ -3737,12 +3947,12 @@ mod tests {
         ));
         // Creation evidence, marker present but UNPARSEABLE: unresolved.
         assert!(matches!(
-            classify_generation_leftover(&unparseable_mutation_object(), 7),
+            classify_leftover(&unparseable_mutation_object(), 7),
             GenerationLeftover::MarkerLost
         ));
         // Creation evidence, marker garbage-but-parseable (0): unresolved.
         assert!(matches!(
-            classify_generation_leftover(
+            classify_leftover(
                 &object_meta_with_annotations(&[
                     (generation_annotations::RESOURCE_CREATED_BY_ANNOTATION, 7),
                     (generation_annotations::MUTATION_GENERATION_ANNOTATION, 0),
@@ -3753,7 +3963,7 @@ mod tests {
         ));
         // The settled cases keep their attributions.
         assert!(matches!(
-            classify_generation_leftover(
+            classify_leftover(
                 &object_meta_with_annotations(&[
                     (generation_annotations::RESOURCE_CREATED_BY_ANNOTATION, 7),
                     (generation_annotations::MUTATION_GENERATION_ANNOTATION, 7),
@@ -3763,7 +3973,7 @@ mod tests {
             GenerationLeftover::Leftover
         ));
         assert!(matches!(
-            classify_generation_leftover(
+            classify_leftover(
                 &object_meta_with_annotations(&[
                     (generation_annotations::RESOURCE_CREATED_BY_ANNOTATION, 9),
                     (generation_annotations::MUTATION_GENERATION_ANNOTATION, 9),
@@ -3904,21 +4114,186 @@ mod tests {
         // delete. (devin 🔍 follow-up: the old "NotOurs → skip route
         // removal" rollout note described superseded round-3 behavior.)
         assert!(matches!(
-            classify_initial_namespace_get(&Err(api_error(404)), generation),
+            classify_ns_get(&Err(api_error(404)), generation),
             InitialNamespaceOwnership::AbsentBeforeDelete
         ));
         // Any non-404 inspect failure is undecided ownership (Uninspectable):
         // no provider state may be touched at all.
         assert!(matches!(
-            classify_initial_namespace_get(&Err(api_error(500)), generation),
+            classify_ns_get(&Err(api_error(500)), generation),
             InitialNamespaceOwnership::Uninspectable
         ));
         assert!(matches!(
-            classify_initial_namespace_get(
+            classify_ns_get(
                 &Err(kube::Error::Service("transport unavailable".into())),
                 generation
             ),
             InitialNamespaceOwnership::Uninspectable
         ));
+    }
+
+    // ------------------------------------------------------------------
+    // cap#272: creation-ledger provenance
+    // ------------------------------------------------------------------
+
+    fn k8s_time(rfc3339: &str) -> k8s_openapi::apimachinery::pkg::apis::meta::v1::Time {
+        k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+            rfc3339.parse().expect("parse fixture timestamp"),
+        )
+    }
+
+    fn empty_ledger() -> enclava_engine::apply::creation_ledger::CreationLedgerBuffer {
+        enclava_engine::apply::creation_ledger::CreationLedgerBuffer::new()
+    }
+
+    /// Legacy-signature forwarders: these tests exercise the grandfathered
+    /// (pre-cutover) semantics with an empty ledger, so they keep calling
+    /// the classifiers without spelling the ledger out at every site.
+    fn classify_leftover<K: kube::Resource>(
+        resource: &K,
+        failed_generation: i64,
+    ) -> GenerationLeftover {
+        classify_generation_leftover(resource, failed_generation, &empty_ledger())
+    }
+
+    fn is_cap_leftover<K: kube::Resource>(resource: &K, failed_generation: i64) -> bool {
+        is_cap_created_generation_leftover(resource, failed_generation, &empty_ledger())
+    }
+
+    fn classify_ns_get(
+        result: &Result<k8s_openapi::api::core::v1::Namespace, kube::Error>,
+        generation: enclava_engine::apply::generation::MutationGeneration,
+    ) -> InitialNamespaceOwnership {
+        classify_initial_namespace_get(result, generation, &empty_ledger())
+    }
+
+    /// The tenant-forged shape of cap#272: a pre-created, target-named
+    /// object whose creation annotation is owned by a managed-fields entry
+    /// submitted with `fieldManager=enclava-platform`, created AFTER the
+    /// ledger cutover. Every legacy check (annotation value, manager
+    /// ownership, generation marker) passes; only the missing ledger row
+    /// distinguishes it from CAP's own creation.
+    fn forged_post_cutover_object() -> kube::api::DynamicObject {
+        use enclava_engine::apply::generation as generation_annotations;
+        let mut forged = sweep_leftover_object(
+            &[
+                (generation_annotations::RESOURCE_CREATED_BY_ANNOTATION, 7),
+                (generation_annotations::MUTATION_GENERATION_ANNOTATION, 7),
+            ],
+            true,
+        );
+        forged.metadata.name = Some("cap-demo-pull".to_string());
+        forged.metadata.uid = Some("uid-forged".to_string());
+        forged.metadata.creation_timestamp = Some(k8s_time("2026-10-18T00:00:00Z"));
+        forged
+    }
+
+    /// cap#272 regression: a tenant pre-creates a target-shaped object with
+    /// the forged creation annotation + `fieldManager=enclava-platform`; a
+    /// failed apply targeting the same name must NOT gain deletion
+    /// authority over it. Post-cutover, deletion additionally requires a
+    /// server-recorded (name, uid) creation row observed at CAP's own
+    /// create POST; the forged shape stays UNRESOLVED (fail closed,
+    /// retryable) instead of Leftover.
+    #[test]
+    fn forged_post_cutover_stamp_is_not_deletion_authority() {
+        let forged = forged_post_cutover_object();
+        assert!(matches!(
+            classify_generation_leftover(&forged, 7, &empty_ledger()),
+            GenerationLeftover::ProvenanceUnproven
+        ));
+        assert!(!is_cap_created_generation_leftover(
+            &forged,
+            7,
+            &empty_ledger()
+        ));
+        // The identical object whose creation CAP's POST actually observed
+        // (a durable ledger row matches its UID): a provable leftover,
+        // deletable under the sweep's other gates.
+        let recorded = enclava_engine::apply::creation_ledger::CreationLedgerBuffer::new();
+        recorded.preload([(
+            "Secret".to_string(),
+            "cap-demo-pull".to_string(),
+            "uid-forged".to_string(),
+        )]);
+        assert!(matches!(
+            classify_generation_leftover(&forged, 7, &recorded),
+            GenerationLeftover::Leftover
+        ));
+        // Pre-cutover creation with no row: bounded one-time migration
+        // trust keeps the legacy annotation+manager authority.
+        let mut legacy = forged_post_cutover_object();
+        legacy.metadata.creation_timestamp = Some(k8s_time("2026-10-13T00:00:00Z"));
+        assert!(matches!(
+            classify_generation_leftover(&legacy, 7, &empty_ledger()),
+            GenerationLeftover::Leftover
+        ));
+    }
+
+    /// cap#272, namespace arm: the same forged stamp on a namespace a
+    /// tenant created post-cutover must classify ADOPTED (no namespace
+    /// delete), and a recorded creation row must keep it Owned.
+    #[test]
+    fn forged_post_cutover_namespace_is_adopted_not_owned() {
+        let generation = enclava_engine::apply::generation::MutationGeneration::new(7)
+            .expect("valid generation");
+        let mut forged = annotated_namespace(7);
+        forged.metadata.name = Some("cap-demo".to_string());
+        forged.metadata.creation_timestamp = Some(k8s_time("2026-10-18T00:00:00Z"));
+        let empty = empty_ledger();
+        assert!(matches!(
+            classify_initial_namespace_get(&Ok(forged.clone()), generation, &empty),
+            InitialNamespaceOwnership::Adopted
+        ));
+        let recorded = enclava_engine::apply::creation_ledger::CreationLedgerBuffer::new();
+        recorded.preload([(
+            "Namespace".to_string(),
+            "cap-demo".to_string(),
+            "00000000-0000-0000-0000-000000000001".to_string(),
+        )]);
+        assert!(matches!(
+            classify_initial_namespace_get(&Ok(forged), generation, &recorded),
+            InitialNamespaceOwnership::Owned { .. }
+        ));
+    }
+
+    /// cap#272 durability: creation records persist idempotently per
+    /// (app_id, uid) and load back as matchable lineage.
+    #[tokio::test]
+    async fn creation_ledger_roundtrip_is_idempotent_per_uid() {
+        let pool = cleanup_test_pool().await;
+        let app_id = insert_cleanup_app_fixture(&pool).await;
+        let deployment_id = Uuid::new_v4();
+        let record = enclava_engine::apply::creation_ledger::CreationRecord {
+            kind: "Secret".to_string(),
+            name: "cap-demo-pull".to_string(),
+            namespace: Some("cap-demo".to_string()),
+            uid: "uid-roundtrip".to_string(),
+            mutation_generation: 7,
+        };
+        persist_creation_records(&pool, app_id, deployment_id, std::slice::from_ref(&record))
+            .await
+            .expect("persist creation record");
+        // A retried apply re-observing the same creation: same uid, newer
+        // generation label — must not error or duplicate.
+        let mut reobserved = record.clone();
+        reobserved.mutation_generation = 8;
+        persist_creation_records(&pool, app_id, deployment_id, &[reobserved])
+            .await
+            .expect("persist re-observed creation record");
+        let ledger = load_creation_ledger(&pool, app_id)
+            .await
+            .expect("load creation ledger");
+        assert!(ledger.contains("Secret", "cap-demo-pull", "uid-roundtrip"));
+        assert!(!ledger.contains("Secret", "cap-demo-pull", "uid-other"));
+        assert!(ledger.contains_name_uid("cap-demo-pull", "uid-roundtrip"));
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM resource_creation_ledger WHERE app_id = $1")
+                .bind(app_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count creation rows");
+        assert_eq!(rows, 1, "one row per (app_id, uid)");
+        delete_cleanup_fixture(&pool, app_id).await;
     }
 }
