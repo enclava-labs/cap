@@ -5381,7 +5381,7 @@ pub(crate) mod tests {
         .fetch_one(&pool)
         .await
         .expect("load recovered attempt count");
-        assert_eq!(attempts, 4);
+        assert_eq!(attempts, 2, "apply attempts restart after setup acceptance");
 
         sqlx::query("DELETE FROM organizations WHERE id = $1")
             .bind(app.org_id)
