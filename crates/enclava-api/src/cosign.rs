@@ -244,6 +244,14 @@ fn registry_auth_with_allowlist(
         }
     }
 
+    // Token-only GHCR authentication is valid for VERIFICATION — Basic auth
+    // against ghcr.io with the conventional `oauth2` username. The
+    // enclava-api startup gate (`deploy::tenant_image_pull_secret_startup_error`)
+    // still requires both GHCR_USERNAME and GHCR_TOKEN: the tenant pull
+    // secret needs both, and a half-rotated pair must never reach the startup
+    // cleanup sweep (Devin review on #276). This fallback keeps the module
+    // usable for verification-only embedders and tests; a running enclava-api
+    // never sees token-only environment because the startup gate exits first.
     if registry == "ghcr.io"
         && let Some(token) = env_nonempty("GHCR_TOKEN")
     {
@@ -2019,6 +2027,44 @@ mod tests {
             auth,
             Auth::Basic(username, password) if username == "cap-bot" && password == "ghp_example"
         ));
+    }
+
+    /// Devin review on #276: token-only GHCR authentication is deliberately
+    /// accepted here for verification — Basic auth against ghcr.io with the
+    /// conventional `oauth2` username. The startup gate in deploy.rs is what
+    /// keeps this configuration out of a running enclava-api (whose
+    /// pull-secret machinery needs both values); this pins the documented
+    /// cosign-vs-startup asymmetry as intended. Runs in a child process so
+    /// the process-global env mutation cannot race the other env-reading
+    /// tests in this binary.
+    #[test]
+    fn ghcr_token_only_auth_is_valid_for_verification_only() {
+        const CHILD: &str = "CAP_COSIGN_GHCR_TOKEN_ONLY";
+        if std::env::var(CHILD).is_ok() {
+            let auth = registry_auth_with_allowlist("ghcr.io", None, &[]);
+            assert!(
+                matches!(auth, Auth::Basic(username, token)
+                    if username == "oauth2" && token == "ghp_token_only"),
+                "token-only must authenticate ghcr.io verification with the oauth2 username"
+            );
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "cosign::tests::ghcr_token_only_auth_is_valid_for_verification_only",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env_remove("GHCR_USERNAME")
+            .env("GHCR_TOKEN", "ghp_token_only")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
     }
 
     /// Codex review on #243, P2: only one of USERNAME/PASSWORD being set
