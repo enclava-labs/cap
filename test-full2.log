@@ -1,0 +1,2408 @@
+    Blocking waiting for file lock on package cache
+warning: unnecessary `unsafe` block
+   --> vendor/rdrand-0.8.3/src/lib.rs:169:18
+    |
+169 |     let cpuid0 = unsafe { arch::__cpuid(0) };
+    |                  ^^^^^^ unnecessary `unsafe` block
+    |
+    = note: `#[warn(unused_unsafe)]` (part of `#[warn(unused)]`) on by default
+
+warning: unnecessary `unsafe` block
+   --> vendor/rdrand-0.8.3/src/lib.rs:193:5
+    |
+193 |     unsafe { arch::__cpuid(7).ebx & FLAG == FLAG }
+    |     ^^^^^^ unnecessary `unsafe` block
+
+warning: unnecessary `unsafe` block
+   --> vendor/rdrand-0.8.3/src/lib.rs:211:26
+    |
+211 |               let cpuid1 = unsafe { arch::__cpuid(1) };
+    |                            ^^^^^^ unnecessary `unsafe` block
+...
+470 | / impl_rand!(
+471 | |     RdRand,
+472 | |     "rdrand",
+473 | |     arch::_rdrand16_step,
+...   |
+477 | |     maxty = u64
+478 | | );
+    | |_- in this macro invocation
+    |
+    = note: this warning originates in the macro `is_available` which comes from the expansion of the macro `impl_rand` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unnecessary `unsafe` block
+   --> vendor/rdrand-0.8.3/src/lib.rs:214:60
+    |
+214 |               cfg!(target_feature = "rdrand") || has_rdrand(&unsafe { arch::__cpuid(1) })
+    |                                                              ^^^^^^ unnecessary `unsafe` block
+...
+470 | / impl_rand!(
+471 | |     RdRand,
+472 | |     "rdrand",
+473 | |     arch::_rdrand16_step,
+...   |
+477 | |     maxty = u64
+478 | | );
+    | |_- in this macro invocation
+    |
+    = note: this warning originates in the macro `is_available` which comes from the expansion of the macro `impl_rand` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unnecessary `unsafe` block
+   --> vendor/rdrand-0.8.3/src/lib.rs:219:25
+    |
+219 |               amd_family(&unsafe { arch::__cpuid(1) }) >= FIRST_GOOD_AMD_FAMILY && has_rdseed()
+    |                           ^^^^^^ unnecessary `unsafe` block
+...
+480 | / impl_rand!(
+481 | |     RdSeed,
+482 | |     "rdseed",
+483 | |     arch::_rdseed16_step,
+...   |
+487 | |     maxty = u64
+488 | | );
+    | |_- in this macro invocation
+    |
+    = note: this warning originates in the macro `is_available` which comes from the expansion of the macro `impl_rand` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: `rdrand` (lib) generated 5 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.40s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/lib.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/enclava_api-aa17220de7c9b7f1)
+
+running 635 tests
+test acme::tests::concurrent_issuance_captures_are_independent ... ok
+test acme::tests::concurrent_issuances_share_transport_but_not_retry_metadata ... ok
+test acme::tests::dns01_challenge_is_marked_ready_after_propagation_wait ... ok
+test acme::tests::dns01_txt_lookup_falls_back_when_external_dns_is_blocked ... ok
+test acme::tests::dns01_txt_lookup_prefers_external_resolver ... ok
+test acme::tests::failure_capture_tracks_only_the_latest_exchange ... ok
+test acme::tests::issuance_diagnostics_never_contain_provider_detail_text ... ok
+test acme::tests::issuance_transport_forwards_traffic_and_captures_failure_retry_after ... ok
+test acme::tests::lookup_timings_follow_actual_order_and_do_not_log_answers_or_errors ... ok
+test acme::tests::rate_limit_classification_requires_exact_problem_type ... ok
+test acme::tests::recovered_bad_nonce_header_never_describes_later_failures ... ok
+test acme::tests::resolver_errors_fall_back_in_configured_order ... ok
+test acme::tests::resolver_success_including_negative_answers_never_falls_back ... ok
+test acme::tests::retry_after_delta_seconds_are_parsed_and_bounded ... ok
+test acme::tests::retry_after_http_dates_are_parsed_and_bounded ... ok
+test acme::tests::retry_after_malformed_values_are_rejected ... ok
+test acme::tests::timeout_drops_primary_before_fallback_and_bounds_secondary ... ok
+test acme::tests::typed_dns_error_categories_do_not_change_error_messages ... ok
+test acme::tests::unset_timeout_preserves_native_wait_and_outer_cancellation_drops_work ... ok
+test auth::api_key::tests::api_key_candidate_accepts_new_and_legacy_prefixes ... ok
+test auth::api_key::tests::generated_hmac_key_has_128_bit_prefix_and_256_bit_secret ... ok
+test auth::api_key::tests::hmac_lookup_uses_base32_prefix_only ... ok
+test auth::api_key::tests::hmac_verification_is_exact ... ok
+test auth::api_key::tests::invalid_hmac_key_lengths_are_rejected ... ok
+test auth::api_key::tests::legacy_lookup_uses_short_prefix_for_migration_window ... ok
+test auth::api_key::tests::pepper_decoding_accepts_raw_hex_and_base64_values ... ok
+test auth::email::tests::dummy_hash_is_parseable_and_rejects_common_passwords ... ok
+test auth::email::tests::login_missing_email_performs_full_argon2_work ... ok
+test auth::email::tests::signup_error_message_is_generic_for_duplicate_emails ... ok
+test auth::jwt::tests::config_token_round_trip_includes_required_claims ... ok
+test auth::jwt::tests::config_token_validator_rejects_immediately_after_signed_expiry ... ok
+test auth::jwt::tests::deterministic_config_token_matches_receipt_and_signed_expiry_exactly ... ok
+test auth::jwt::tests::issue_config_token_produces_compact_jwt ... ok
+test auth::jwt::tests::session_token_round_trip_includes_required_claims ... ok
+test auth::jwt::tests::session_validator_rejects_config_token ... ok
+test auth::jwt::tests::signer_rotation_token_rejects_changed_new_subject ... ok
+test auth::jwt::tests::signer_rotation_token_rejects_session_token ... ok
+test auth::jwt::tests::signer_rotation_token_round_trip_is_bound_to_rotation_fields ... ok
+test auth::jwt::tests::token_missing_iss_rejected ... ok
+test auth::jwt::tests::token_with_wrong_audience_rejected ... ok
+test auth::nostr::tests::reap_nip98_replay_cache_batches_are_bounded_and_drain_fully ... ok
+test auth::nostr::tests::reap_nip98_replay_cache_deletes_only_expired_rows ... ok
+test auth::nostr::tests::verify_and_consume_accepts_new_event_after_replay_rejected ... ok
+test auth::nostr::tests::verify_and_consume_accepts_same_second_resign_with_fresh_nonce ... ok
+test auth::nostr::tests::verify_and_consume_rejects_replayed_event_within_freshness_window ... ok
+test auth::nostr::tests::verify_nip98_accepts_legacy_url_tag ... ok
+test auth::nostr::tests::verify_nip98_accepts_matching_method_and_u_tag ... ok
+test auth::nostr::tests::verify_nip98_rejects_method_mismatch ... ok
+test auth::nostr::tests::verify_nip98_with_body_accepts_matching_payload_tag ... ok
+test auth::nostr::tests::verify_nip98_with_body_rejects_payload_mismatch ... ok
+test auth::nostr::tests::verify_nip98_with_body_requires_payload_tag_for_mutating_request ... ok
+test auth::nostr::tests::verify_nip98_with_body_skips_payload_check_when_body_empty ... ok
+test auth::scopes::tests::active_membership_role_read_blocks_concurrent_demotion ... ok
+test auth::scopes::tests::admin_can_modify_plain_members ... ok
+test auth::scopes::tests::admin_cannot_grant_or_remove_owner_role ... ok
+test auth::scopes::tests::admin_cannot_promote_demote_or_remove_admins ... ok
+test auth::scopes::tests::api_key_cannot_grant_scope_it_does_not_have ... ok
+test auth::scopes::tests::api_key_creation_requires_admin_and_org_admin_scope ... ok
+test auth::scopes::tests::api_key_scope_required_only_for_api_keys ... ok
+test auth::scopes::tests::app_read_requires_apps_read_scope_for_api_keys ... ok
+test auth::scopes::tests::app_write_requires_admin_role_and_apps_write_scope ... ok
+test auth::scopes::tests::config_metadata_write_requires_admin_and_config_write_scope ... ok
+test auth::scopes::tests::self_service_admin_release_is_allowed_but_self_promotion_is_not ... ok
+test clients::tests::allowlist_from_env_value_overrides_default ... ok
+test clients::tests::blocked_networks_accept_public_v4 ... ok
+test clients::tests::blocked_networks_reject_loopback_v6_and_link_local ... ok
+test clients::tests::blocked_networks_reject_private_v4 ... ok
+test clients::tests::body_limit_is_enforced_mid_stream_when_content_length_is_absent ... ok
+test clients::tests::body_limit_is_respected_with_explicit_content_length ... ok
+test clients::tests::body_under_limit_streams_fully_without_content_length ... ok
+test clients::tests::cluster_cidrs_extend_blocklist ... ok
+test clients::tests::default_allowlist_accepts_known_registries ... ok
+test clients::tests::redirect_policy_disabled_on_built_clients ... ok
+test clients::tests::registry_client_accepts_gitlab_registry ... ok
+test clients::tests::registry_client_rejects_http_scheme ... ok
+test clients::tests::registry_client_rejects_non_allowed_host ... ok
+test clients::tests::wildcard_pkg_dev_matches_subdomains ... ok
+test cosign::tests::build_constraints_email_policy_ok ... ok
+test cosign::tests::build_constraints_rejects_empty_email_issuer ... ok
+test cosign::tests::build_constraints_rejects_empty_url_subject ... ok
+test cosign::tests::build_constraints_rejects_invalid_public_key ... ok
+test cosign::tests::build_constraints_url_policy_ok ... ok
+test cosign::tests::build_pin_from_env_public_key_overrides_fulcio_vars ... ok
+test cosign::tests::build_pin_from_env_rejects_invalid_public_key_base64 ... ok
+test cosign::tests::build_pin_from_env_rejects_non_digest_image ... ok
+test cosign::tests::build_pin_from_env_url_subject_picks_url_policy ... ok
+test cosign::tests::fetch_attestation_tag_caps_oversized_registry_bodies ... ok
+test cosign::tests::parse_image_parts_handles_common_shapes ... ok
+test cosign::tests::portable_blob_buffer_stops_at_limit ... ok
+test cosign::tests::portable_signature_blobs_require_bundle_material ... ok
+test cosign::tests::registry_auth_from_env_uses_basic_credentials ... ok
+test cosign::tests::signature_lookup_source_is_digest_pinned_for_mutable_tags ... ok
+test db::pool::tests::migration_mode_defaults_to_apply_and_accepts_verify ... ok
+test db::pool::tests::prepare_schema_accepts_a_valid_purge_index ... ok
+test db::pool::tests::purge_index_guard_rejects_a_misdefined_index ... ok
+test db::pool::tests::purge_index_guard_rejects_a_missing_index ... ok
+test db::pool::tests::purge_index_guard_rejects_a_namesake_in_another_schema ... ok
+test db::pool::tests::purge_index_guard_rejects_a_namesake_on_another_table ... ok
+test db::pool::tests::purge_index_guard_rejects_an_invalid_index ... ok
+test db::pool::tests::verify_mode_requires_the_exact_successful_migration_ledger ... ok
+test deploy::tests::auto_redeploy_timeout_still_fails ... ok
+test deploy::tests::deployment_error_persistence_discards_plaintext ... ok
+test deploy::tests::descriptor_runtime_overrides_stale_primary_container_fields ... ok
+test deploy::tests::password_create_timeout_stays_watchable_for_initial_claim ... ok
+test deploy::tests::password_redeploy_timeout_stays_healthy_for_manual_unlock ... ok
+test deploy::tests::queued_apply_renders_its_captured_rows_after_later_state_changes ... ok
+test deploy::tests::rollout_watch_observes_late_owner_unlock_after_deadline ... ok
+test deploy::tests::rollout_watch_password_timeout_stays_nonterminal_for_failed_app_redeploy ... ok
+test deploy::tests::rollout_watch_password_timeout_stays_nonterminal_for_owner_wait ... ok
+test deploy::tests::rollout_watch_respects_anchored_cumulative_deadline ... ok
+test deploy::tests::rollout_watch_slice_returns_nonterminal_while_budget_remains ... ok
+test deploy::tests::signed_deploy_with_local_artifacts_still_reconciles_global_kbs_policy ... ok
+test deploy::tests::signed_descriptor_runtime_fields_match_descriptor_expectations ... ok
+test deploy::tests::signed_descriptor_without_subpath_mounts_clears_stale_storage_paths ... ok
+test deploy::tests::tagged_rows_render_the_digest_pinned_name ... ok
+test deploy::tests::tenant_image_pull_scope_parses_exact_and_prefix_repositories ... ok
+test deploy::tests::tenant_image_pull_secret_scope_requires_every_container_to_match ... ok
+test deploy::tests::tenant_image_pull_secret_uses_dockerconfigjson_shape ... ok
+test deploy::tests::tenant_image_pull_secret_without_scope_preserves_global_fallback ... ok
+test deployment_jobs::tests::artifact_binding_is_unique_and_exact_hash_mismatch_is_absent ... ok
+test deployment_jobs::tests::cleanup_is_reclaimed_after_crash_and_retried_after_transient_failure ... ok
+test deployment_jobs::tests::cross_app_and_empty_setup_payloads_are_quarantined_not_reclaimed ... ok
+test deployment_jobs::tests::cross_app_kbs_fence_contention_requeues_without_terminal_failure ... ok
+test deployment_jobs::tests::database_rejects_false_cleanup_state_and_terminal_job_stranding ... ok
+test deployment_jobs::tests::database_rejects_payload_without_relational_version_match ... ok
+test deployment_jobs::tests::deferred_gate_rejects_old_style_insert_and_accepts_same_tx_job ... ok
+test deployment_jobs::tests::deployment_identity_must_match_durable_payload ... ok
+test deployment_jobs::tests::deployment_worker_backlog_is_bounded ... ok
+test deployment_jobs::tests::dispatcher_winner_is_observed_without_duplicate_request_setup ... ok
+test deployment_jobs::tests::durable_payload_hash_binds_the_full_runtime_snapshot ... ok
+test deployment_jobs::tests::durable_payload_rejects_cross_app_rows ... ok
+test deployment_jobs::tests::existing_app_setup_failure_is_terminal_without_cleanup_marker ... ok
+test deployment_jobs::tests::expired_setup_and_apply_leases_recover_after_restart ... ok
+test deployment_jobs::tests::expired_watching_lease_is_reclaimed_and_publishes_terminal_result ... ok
+test deployment_jobs::tests::lease_heartbeat_does_not_duplicate_large_future_state ... ok
+test deployment_jobs::tests::malformed_cleanup_owned_payload_remains_reconcilable_by_relational_app_id ... ok
+test deployment_jobs::tests::nonterminal_password_rollout_preserves_authority_for_delayed_retry ... ok
+test deployment_jobs::tests::orphan_reconciler_repairs_only_exact_inactive_deployment_owner ... ok
+test deployment_jobs::tests::permit_wait_revalidates_latest_keyring_before_rendering ... ok
+test deployment_jobs::tests::publisher_and_acceptance_share_app_then_job_lock_order ... ok
+test deployment_jobs::tests::request_owned_dns_failure_preserves_typed_error_mapping ... ok
+test deployment_jobs::tests::resumed_observer_uses_accepted_payload_not_mutated_app_row ... ok
+test deployment_jobs::tests::semantic_apply_payload_failure_is_token_conditionally_quarantined ... ok
+test deployment_jobs::tests::setup_handoff_is_unowned_until_request_claim_and_dispatcher_honors_delay ... ok
+test deployment_jobs::tests::shared_dns_fence_contention_requeues_setup_without_failure ... ok
+test deployment_jobs::tests::signed_job_and_artifact_snapshots_cannot_be_downgraded_or_mutated ... ok
+test deployment_jobs::tests::stale_apply_releases_pre_provider_app_and_resource_claims ... ok
+test deployment_jobs::tests::stale_apply_token_cannot_publish_failure ... ok
+test deployment_jobs::tests::stale_apply_token_cannot_publish_rollout_success ... ok
+test deployment_jobs::tests::stale_setup_token_cannot_publish_false_acceptance ... ok
+test deployment_jobs::tests::superseded_watching_lease_cannot_publish_after_reclaim_window ... ok
+test deployment_jobs::tests::supersession_rejects_unexpired_mutator_and_accepts_expired_owner ... ok
+test deployment_jobs::tests::unsupported_future_payload_version_waits_for_compatible_worker ... ok
+test deployment_jobs::tests::watching_generation_holds_no_shared_fences_for_other_tenants ... ok
+test deployment_jobs::tests::watching_rollout_releases_admission_slot_before_observing ... ok
+test dns::tests::acme_txt_cleanup_deletes_only_its_immutable_provider_record ... ok
+test dns::tests::manages_only_configured_zone ... ok
+test dns::tests::record_type_uses_a_for_ipv4 ... ok
+test dns::tests::record_type_uses_aaaa_for_ipv6 ... ok
+test edge::tests::authoritative_rebuild_repairs_routes_and_purges_retired_deployments ... ok
+test edge::tests::authoritative_retry_replaces_stale_configmap_after_first_lease_fails ... ok
+test edge::tests::backend_name_includes_tenant_slug ... ok
+test edge::tests::backend_name_rejects_invalid_inputs ... ok
+test edge::tests::backend_name_separates_same_app_in_different_orgs ... ok
+test edge::tests::configmap_growth_over_serialized_budget_is_rejected_before_patch ... ok
+test edge::tests::delayed_old_ensure_cannot_readd_route_removed_by_new_generation ... ok
+test edge::tests::gateway_resolve_ip_ignores_missing_or_invalid_status_address ... ok
+test edge::tests::gateway_resolve_ip_reads_gateway_status_address ... ok
+test edge::tests::pending_replacement_keeps_latest_routable_app_selected ... ok
+test edge::tests::pool_two_edge_reconcile_does_not_take_nested_database_connection ... ok
+test edge::tests::remove_route_drops_backend_only_when_last_reference_goes ... ok
+test edge::tests::remove_route_keeps_shared_backend_when_other_hosts_use_it ... ok
+test edge::tests::remove_route_strips_backend_block_and_use_line ... ok
+test edge::tests::render_inserts_use_backend_before_default ... ok
+test edge::tests::render_is_idempotent ... ok
+test edge::tests::render_refreshes_shared_backend_target ... ok
+test edge::tests::render_two_routes_app_and_tee ... ok
+test edge::tests::retry_converges_after_configmap_patch_response_is_lost ... ok
+test edge::tests::retry_converges_after_daemonset_patch_response_is_lost ... ok
+test edge::tests::retry_reconciles_reload_after_configmap_success_and_daemonset_failure ... ok
+test edge::tests::rollout_requires_observed_status_and_exact_ready_owned_pods ... ok
+test edge::tests::sni_route_rejects_injection_in_backend_name ... ok
+test edge::tests::sni_route_rejects_injection_in_host ... ok
+test edge::tests::sni_route_validates_host ... ok
+test edge::tests::teardown_pending_deleting_apps_keep_their_edge_routes ... ok
+test entitlements::tests::acceptance_waits_for_n_plus_one_entitlement_revocation_and_rejects ... ok
+test entitlements::tests::candidate_resources_reject_malformed_nonpositive_and_over_limit_values ... ok
+test entitlements::tests::core_entitlement_does_not_cap_instance_count ... ok
+test entitlements::tests::storage_quantity_equality_preserves_precision ... ok
+test env_gates::tests::debug_allows_debug_only_flags ... ok
+test env_gates::tests::debug_allows_http_trustee_attestation_verify_url ... ok
+test env_gates::tests::debug_allows_internal_egress_flag_without_allow ... ok
+test env_gates::tests::debug_builds_allow_cleartext_acme_directory ... ok
+test env_gates::tests::debug_core_allows_no_hosted_secret ... ok
+test env_gates::tests::falsy_debug_only_flag_is_allowed ... ok
+test env_gates::tests::falsy_internal_egress_flag_needs_no_allow ... ok
+test env_gates::tests::release_accepts_api_key_hmac_pepper_base64 ... ok
+test env_gates::tests::release_allows_cluster_internal_http_signing_service_url ... ok
+test env_gates::tests::release_allows_https_trustee_attestation_verify_url ... ok
+test env_gates::tests::release_allows_internal_egress_flag_with_explicit_allow ... ok
+test env_gates::tests::release_allows_production_acme_with_explicit_allow ... ok
+test env_gates::tests::release_allows_staging_acme ... ok
+test env_gates::tests::release_non_truthy_internal_egress_acks_are_rejected ... ok
+test env_gates::tests::release_rejects_case_insensitive_http_trustee_attestation_verify_url ... ok
+test env_gates::tests::release_rejects_cleartext_acme_directory_urls ... ok
+test env_gates::tests::release_rejects_disabled_edge_reconciliation ... ok
+test env_gates::tests::release_rejects_http_kbs_url ... ok
+test env_gates::tests::release_rejects_http_signing_service_url ... ok
+test env_gates::tests::release_rejects_http_trustee_attestation_verify_url ... ok
+test env_gates::tests::release_rejects_insecure_tee_tls_mode ... ok
+test env_gates::tests::release_rejects_internal_caddy_tls_mode ... ok
+test env_gates::tests::release_rejects_internal_egress_flag_without_explicit_allow ... ok
+test env_gates::tests::release_rejects_legacy_bootstrap_script ... ok
+test env_gates::tests::release_rejects_production_acme_without_explicit_allow ... ok
+test env_gates::tests::release_rejects_production_tenant_caddy_acme_without_explicit_allow ... ok
+test env_gates::tests::release_rejects_skip_cosign_verify ... ok
+test env_gates::tests::release_rejects_tee_accept_invalid_certs ... ok
+test env_gates::tests::release_rejects_uppercase_scheme_tenant_caddy_acme_ca ... ok
+test env_gates::tests::release_requires_api_key_hmac_pepper ... ok
+test env_gates::tests::release_requires_trustee_policy_read_available ... ok
+test env_gates::tests::release_treats_empty_optional_acme_overrides_as_unset ... ok
+test env_gates::tests::release_truthy_internal_egress_acks_are_accepted ... ok
+test kbs::tests::binding_assignment_embedded_in_string_is_ignored ... ok
+test kbs::tests::binding_assignment_inside_raw_string_is_ignored ... ok
+test kbs::tests::braces_inside_raw_string_do_not_close_the_block ... ok
+test kbs::tests::deleting_app_keeps_authorization_only_while_teardown_pending ... ok
+test kbs::tests::duplicate_real_assignments_fail_closed ... ok
+test kbs::tests::duplicate_whole_line_markers_fail_closed ... ok
+test kbs::tests::empty_v2_policy_set_is_a_signed_fail_closed_body ... ok
+test kbs::tests::end_marker_without_begin_fails_closed ... ok
+test kbs::tests::latest_deployment_prefers_jobs_then_deterministic_legacy_identity ... ok
+test kbs::tests::managed_marker_inside_raw_string_is_not_a_splice_point ... ok
+test kbs::tests::marker_embedded_mid_line_is_not_a_splice_point ... ok
+test kbs::tests::multiple_signed_policy_artifacts_are_written_as_policy_set ... ok
+test kbs::tests::policy_generation_decisions_are_monotonic_and_content_bound ... ok
+test kbs::tests::queued_supersessions_do_not_crowd_out_live_teardown_authority ... ok
+test kbs::tests::receipt_authority_is_immutable_but_app_cascade_remains_available ... ok
+test kbs::tests::reconciliation_error_display_redacts_upstream_detail ... ok
+test kbs::tests::renders_empty_cap_section ... ok
+test kbs::tests::replaces_existing_cap_managed_section ... ok
+test kbs::tests::replaces_only_owner_bindings_block ... ok
+test kbs::tests::replaces_tls_resource_bindings_block ... ok
+test kbs::tests::rollout_without_policy_annotations_rejects_healthy_deployment ... ok
+test kbs::tests::selector_uses_current_operation_binding_and_legacy_fallback ... ok
+test kbs::tests::signed_policy_artifact_body_is_authoritative_envelope ... ok
+test kbs::tests::signed_policy_body_preserves_persisted_org_keyring_order ... ok
+test kbs::tests::signed_policy_bootstrap_generation_is_atomic_and_idempotent ... ok
+test kbs::tests::signed_policy_selection_fails_if_required_artifact_exceeds_budget ... ok
+test kbs::tests::signed_policy_selection_keeps_artifacts_without_global_retention_cap ... ok
+test kbs::tests::signed_policy_selection_prefers_first_artifact_and_dedupes_by_descriptor_hash ... ok
+test kbs::tests::signed_policy_selection_prunes_old_artifacts_to_byte_budget ... ok
+test kbs::tests::soft_delete_owner_binding_records_teardown_outcome ... ok
+test kbs::tests::soft_delete_owner_binding_waives_ever_deployed_workload_without_binding ... ok
+test kbs::tests::stale_signed_configmap_is_distinct_from_legacy_policy_without_db_history ... ok
+test kbs::tests::startup_fence_busy_spin_logs_disambiguation ... ok
+test kbs::tests::teardown_pending_authorization_survives_deployment_supersession ... ok
+test kbs::tests::teardown_pending_authorization_survives_stacked_failed_generations ... ok
+test kbs::tests::tls_splice_targets_the_resource_bindings_line_not_the_owner_suffix ... ok
+test mutation_leases::tests::desired_state_fence_scopes_to_desired_state_leases ... ok
+test mutation_leases::tests::hung_renew_cancels_provider_and_retains_reclaim_quarantine ... ok
+test mutation_leases::tests::pool_two_waiter_holds_no_connection_and_owner_can_renew ... ok
+test mutation_leases::tests::prearmed_dns_rejects_reuse_after_detached_provider_outlives_caller ... ok
+test mutation_leases::tests::prearmed_kubernetes_namespace_survives_process_loss_and_rejects_reclaim ... ok
+test mutation_leases::tests::provider_guard_does_not_duplicate_large_future_state ... ok
+test mutation_leases::tests::provider_tombstone_survives_app_delete_and_hostname_reuse ... ok
+test mutation_leases::tests::public_provider_guard_preserves_completion_and_cancellation ... ok
+test mutation_leases::tests::reclaim_quarantine_rejects_late_owner_then_allows_new_generation ... ok
+test mutation_leases::tests::successful_publication_clears_prearmed_kubernetes_namespace_atomically ... ok
+test mutation_leases::tests::terminal_release_preserves_bounded_provider_quarantine ... ok
+test platform_release::tests::bundled_not_older_than_itself_and_newer_passes ... ok
+test platform_release::tests::bundled_release_verifies_and_hashes_template ... ok
+test platform_release::tests::equal_timestamp_divergent_payload_fails_closed ... ok
+test platform_release::tests::equal_timestamp_divergent_version_fails_closed ... ok
+test platform_release::tests::fixture_root_is_detected_case_insensitively ... ok
+test platform_release::tests::hex32_root_shape_is_validated ... ok
+test platform_release::tests::newer_override_does_not_prevent_restoring_an_older_valid_override_or_bundle ... ok
+test platform_release::tests::older_than_bundle_is_refused_regardless_of_version_suffix ... ok
+test platform_release::tests::release_payload_rejects_http_acme_ca ... ok
+test platform_release::tests::release_payload_rejects_http_kbs_url ... ok
+test platform_release::tests::release_payload_rejects_internal_caddy_tls_mode ... ok
+test platform_release::tests::release_payload_rejects_non_http_acme_ca ... ok
+test platform_release::tests::release_payload_rejects_unparseable_created_at ... ok
+test platform_release::tests::release_payload_rejects_uppercase_scheme_acme_ca ... ok
+test platform_release::tests::release_payload_rejects_url_parseable_but_unrenderable_acme_ca ... ok
+test platform_release::tests::tampering_breaks_signature ... ok
+test platform_release::tests::unparseable_override_timestamp_is_rejected_not_ignored ... ok
+test platform_release::tests::valid_signature_does_not_admit_a_release_older_than_the_bundle ... ok
+test platform_release::tests::verifier_reports_mismatched_declared_root ... ok
+test ratelimit::tests::all_trusted_chain_falls_back_to_rightmost ... ok
+test ratelimit::tests::empty_trusted_list_means_no_xff_trust ... ok
+test ratelimit::tests::invalid_xff_falls_back_to_peer ... ok
+test ratelimit::tests::proxy_secret_absent_config_restores_cidr_only_trust ... ok
+test ratelimit::tests::proxy_secret_grants_header_trust_to_ingress ... ok
+test ratelimit::tests::proxy_secret_required_for_header_trust_when_configured ... ok
+test ratelimit::tests::single_address_trusted_entry ... ok
+test ratelimit::tests::spoofed_leftmost_xff_cannot_choose_bucket ... ok
+test ratelimit::tests::spoofed_trusted_range_leftmost_xff_is_skipped ... ok
+test ratelimit::tests::trusted_proxy_xff_is_used ... ok
+test ratelimit::tests::unparseable_xff_entries_are_skipped ... ok
+test ratelimit::tests::untrusted_peer_xff_is_ignored ... ok
+test ratelimit::tests::x_real_ip_fallback_when_xff_absent ... ok
+test ratelimit::tests::x_real_ip_ignored_when_peer_untrusted ... ok
+test ratelimit::tests::x_real_ip_preferred_and_unspoofable_through_ingress ... ok
+test registry::tests::advertised_digest_mismatch_is_rejected ... ok
+test registry::tests::digest_pinned_image_does_not_need_registry_lookup ... ok
+test registry::tests::hex_encoding_is_lowercase_and_dense ... ok
+test registry::tests::manifest_digest_hashing_matches_registry_content_addressing ... ok
+test registry::tests::tag_resolution_rejects_non_allowlisted_registry_before_network ... ok
+test routes::apps::tests::abandon_teardown_proceeds_past_unreachable_workload ... ok
+test routes::apps::tests::app_delete_failure_discards_secret_source_diagnostics ... ok
+test routes::apps::tests::app_delete_source_never_reads_or_formats_external_diagnostics ... ok
+test routes::apps::tests::completed_workload_teardown_skips_unreachable_retry ... ok
+test routes::apps::tests::create_app_rejects_member_before_database_access ... ok
+test routes::apps::tests::create_paths_recheck_the_stale_seed_waiver_after_insert ... ok
+test routes::apps::tests::create_request_defaults_to_password_unlock ... ok
+test routes::apps::tests::derive_identity_rejects_oversized_generated_namespace ... ok
+test routes::apps::tests::egress_allowlist_defaults_omitted_ports_to_https ... ok
+test routes::apps::tests::egress_allowlist_internal_hosts_still_validate_public_hosts ... ok
+test routes::apps::tests::egress_allowlist_rejects_internal_and_rebinding_hosts ... ok
+test routes::apps::tests::egress_allowlist_rejects_ip_hosts_and_empty_ports ... ok
+test routes::apps::tests::egress_allowlist_warn_only_audit_classifies_internal_and_rebinding_hosts ... ok
+test routes::apps::tests::egress_mode_accepts_restricted_and_public_internet ... ok
+test routes::apps::tests::failed_and_creating_apps_skip_unreachable_workload_teardown ... ok
+test routes::apps::tests::initial_set_call_omits_token ... ok
+test routes::apps::tests::internal_egress_debug_mode_ignores_production_ack ... ok
+test routes::apps::tests::internal_egress_release_mode_requires_production_ack ... ok
+test routes::apps::tests::internal_egress_truthy_parsing_matches_env_gates_helper ... ok
+test routes::apps::tests::list_apps_rejects_unscoped_api_key_before_database_access ... ok
+test routes::apps::tests::locked_running_workload_teardown_blocks_deletion_and_diagnostics_are_bounded ... ok
+test routes::apps::tests::locked_running_workload_teardown_http_status_fails_destroy ... ok
+test routes::apps::tests::rotation_call_carries_token ... ok
+test routes::apps::tests::running_apps_require_workload_teardown_endpoint ... ok
+test routes::apps::tests::signer_rotation_token_rejects_api_key_before_database_access ... ok
+test routes::apps::tests::teardown_failure_after_supersede_keeps_deleting ... ok
+test routes::apps::tests::teardown_token_instance_id_matches_attestation_proxy_owner_instance_id ... ok
+test routes::apps::tests::tenant_namespace_delete_is_bounded_when_provider_read_hangs ... ok
+test routes::apps::tests::tenant_namespace_delete_succeeds_when_already_absent ... ok
+test routes::apps::tests::unreachable_running_workload_teardown_blocks_deletion_and_diagnostics_are_bounded ... ok
+test routes::apps::tests::whitespace_only_token_is_treated_as_absent_by_handler_logic ... ok
+test routes::auth::authorization_tests::create_api_key_rejects_member_before_database_access ... ok
+test routes::auth::authorization_tests::create_api_key_rejects_scope_escalation_before_database_access ... ok
+test routes::auth::authorization_tests::nip98_db_errors_map_to_500_without_leaking_driver_diagnostics ... ok
+test routes::auth::authorization_tests::nip98_verification_failures_map_to_401 ... ok
+test routes::config::tests::config_sync_rejects_unscoped_api_key_before_database_access ... ok
+test routes::config::tests::config_token_instance_id_matches_attestation_proxy_owner_instance_id ... ok
+test routes::config::tests::config_token_url_requires_tee_domain ... ok
+test routes::config::tests::config_token_url_targets_attested_tee_domain_not_app_or_custom_domain ... ok
+test routes::deployments::classifier_tests::cap_core_source_has_no_product_specific_deployment_customizations ... ok
+test routes::deployments::classifier_tests::control_plane_supersession_code_is_preserved_across_deployment_responses ... ok
+test routes::deployments::classifier_tests::deploy_rejects_member_before_database_access ... ok
+test routes::deployments::classifier_tests::email_subject_is_email_policy ... ok
+test routes::deployments::classifier_tests::external_id_rejects_empty_or_padded_values ... ok
+test routes::deployments::classifier_tests::first_generic_deployment_setup_is_durable_and_compensated_before_error_returns ... ok
+test routes::deployments::classifier_tests::generic_config_token_rejects_unscoped_api_key_before_database_access ... ok
+test routes::deployments::classifier_tests::generic_config_token_response_exposes_whole_second_signed_lifetime_contract ... ok
+test routes::deployments::classifier_tests::generic_deployment_response_reports_current_app_status_separately ... ok
+test routes::deployments::classifier_tests::github_actions_oidc_url_with_at_is_url_policy ... ok
+test routes::deployments::classifier_tests::http_url_subject_is_url_policy ... ok
+test routes::deployments::classifier_tests::idempotent_retry_preserves_none_partial_and_full_resource_requests ... ok
+test routes::deployments::classifier_tests::idempotent_retry_requires_same_deployment_payload ... ok
+test routes::deployments::classifier_tests::incomplete_setup_marker_blocks_idempotent_success ... ok
+test routes::deployments::classifier_tests::rollback_rejects_unscoped_api_key_before_database_access ... ok
+test routes::deployments::classifier_tests::runtime_reapply_rejects_stopped_and_deleting_apps ... ok
+test routes::deployments::classifier_tests::signed_deploy_hash_validation_uses_local_artifact_delivery_mode ... ok
+test routes::deployments::classifier_tests::signed_deploy_path_ensures_app_and_tee_dns_pair ... ok
+test routes::deployments::classifier_tests::signed_deploy_required_when_policy_signing_boundary_is_configured ... ok
+test routes::deployments::classifier_tests::signed_deploy_validation_precedes_atomic_candidate_commit ... ok
+test routes::deployments::classifier_tests::signed_descriptor_profile_accepts_only_known_security_shapes ... ok
+test routes::deployments::classifier_tests::stored_error_plaintext_is_redacted_from_public_and_generic_responses ... ok
+test routes::deployments::rollback::exact_snapshot_tests::implicit_target_excludes_only_the_latest_accepted_generation ... ok
+test routes::deployments::rollback::exact_snapshot_tests::restores_exact_signed_and_unsigned_command_storage_profile_and_resources ... ok
+test routes::deployments::tests::audit_insert_failure_aborts_the_candidate_transaction ... ok
+test routes::deployments::tests::deploy_resources_without_tls_storage_serializes_legacy_form ... ok
+test routes::deployments::tests::deployment_acceptance_waits_for_membership_removal_and_rejects ... ok
+test routes::deployments::tests::existing_app_acceptance_rejects_stale_container_and_resource_rows ... ok
+test routes::deployments::tests::existing_app_acceptance_waits_for_and_rejects_concurrent_authority_change ... ok
+test routes::deployments::tests::generic_metadata_acceptance_persists_dispatchable_post_mutation_payload ... ok
+test routes::deployments::tests::log_encryption_config_accepts_public_x25519_key_metadata ... ok
+test routes::deployments::tests::log_encryption_config_rejects_hash_mismatch ... ok
+test routes::deployments::tests::log_encryption_config_rejects_unknown_algorithm ... ok
+test routes::deployments::tests::malformed_rollback_artifact_fails_before_container_or_deployment_commit ... ok
+test routes::deployments::tests::superseded_watcher_cannot_publish_over_new_manifest ... ok
+test routes::diagnostics::tests::app_without_deployments_is_unknown_with_null_identity ... ok
+test routes::diagnostics::tests::armed_namespace_fence_is_visible_as_the_blocker ... ok
+test routes::diagnostics::tests::deleting_app_is_destroying_not_terminal ... ok
+test routes::diagnostics::tests::deleting_app_with_lapsed_lease_still_waits ... ok
+test routes::diagnostics::tests::due_watch_retry_is_progressing_not_stalled ... ok
+test routes::diagnostics::tests::expired_worker_lock_is_progressing_not_stalled ... ok
+test routes::diagnostics::tests::failed_deployment_without_cleanup_job_is_terminal ... ok
+test routes::diagnostics::tests::failed_setup_cleanup_in_flight_is_progressing ... ok
+test routes::diagnostics::tests::failed_setup_cleanup_retry_is_waiting_external_not_terminal ... ok
+test routes::diagnostics::tests::foreign_lease_beats_a_scheduled_retry ... ok
+test routes::diagnostics::tests::lapsed_lock_in_reclaim_quarantine_still_blocks ... ok
+test routes::diagnostics::tests::live_setup_on_pending_deployment_is_setting_up_with_dns_reason ... ok
+test routes::diagnostics::tests::missing_app_row_is_unknown_with_null_identity ... ok
+test routes::diagnostics::tests::missing_job_with_dns_marker_keeps_setup_reason ... ok
+test routes::diagnostics::tests::nonterminal_deployment_without_job_row_is_stalled ... ok
+test routes::diagnostics::tests::own_lane_lease_never_blocks_or_populates_holder ... ok
+test routes::diagnostics::tests::poisoned_fence_blocks_without_a_deadline ... ok
+test routes::diagnostics::tests::queued_job_eligible_now_is_progressing_not_stalled ... ok
+test routes::diagnostics::tests::queued_job_not_yet_due_is_waiting_external ... ok
+test routes::diagnostics::tests::running_job_on_watching_deployment_is_watching ... ok
+test routes::diagnostics::tests::running_job_with_live_lease_is_progressing ... ok
+test routes::diagnostics::tests::superseded_deployment_is_failed_with_superseded_reason ... ok
+test routes::diagnostics::tests::terminal_failure_reason_survives_via_durable_error_token ... ok
+test routes::diagnostics::tests::terminal_rollout_failure_is_failed_even_when_job_completed ... ok
+test routes::diagnostics::tests::unknown_operation_kind_degrades_to_fixed_token ... ok
+test routes::diagnostics::tests::watch_slice_gap_is_watching_waiting_external_not_lease_expired ... ok
+test routes::domains::tests::accepts_third_party_domain ... ok
+test routes::domains::tests::rejects_inside_platform_zone ... ok
+test routes::domains::tests::rejects_invalid_fqdn ... ok
+test routes::internal::confidentiality_tests::bounded_live_runtime_error_takes_precedence_over_recorded_error ... ok
+test routes::internal::confidentiality_tests::internal_deployment_projection_preserves_safe_supersession_code ... ok
+test routes::internal::confidentiality_tests::proof_origin_accepts_only_bare_signed_https_domains ... ok
+test routes::internal::confidentiality_tests::stored_internal_deployment_errors_are_projected_without_plaintext ... ok
+test routes::internal::tests::abandoned_destroy_records_waiver_and_blocks_recreate ... ok
+test routes::internal::tests::abandoned_lease_reclaims_once_and_replays_the_committed_response ... ok
+test routes::internal::tests::app_config_token_route_replays_exactly_and_rejects_name_recreation ... ok
+test routes::internal::tests::app_delete_deferral_carries_teardown_disposition ... ok
+test routes::internal::tests::app_delete_locked_teardown_defers_and_same_key_reexecutes ... ok
+test routes::internal::tests::app_delete_partial_failure_defers_and_same_key_reexecutes ... ok
+test routes::internal::tests::app_delete_recovery_has_one_reservation_winner ... ok
+test routes::internal::tests::app_delete_retry_finishes_after_namespace_removal ... ok
+test routes::internal::tests::app_delete_retry_finishes_after_teardown_completion_marker ... ok
+test routes::internal::tests::app_delete_terminal_failure_recovery_preserves_success_and_incarnation ... ok
+test routes::internal::tests::app_mutation_busy_hint_follows_reclaim_quarantine ... ok
+test routes::internal::tests::app_mutation_busy_names_holder_and_retry_window ... ok
+test routes::internal::tests::app_mutation_busy_resolves_resource_fence_holder ... ok
+test routes::internal::tests::completed_error_is_stamped_in_returned_and_cached_body ... ok
+test routes::internal::tests::concurrent_same_key_membership_sync_has_one_mutation_and_audit ... ok
+test routes::internal::tests::concurrent_same_user_syncs_across_orgs_share_one_atomic_mapping ... ok
+test routes::internal::tests::config_token_binding_mismatch_rejects_same_key ... ok
+test routes::internal::tests::config_token_finalizers_enforce_safe_return_cutoff_and_terminal_authority ... ok
+test routes::internal::tests::config_token_finish_error_releases_exact_reservation_for_retry ... ok
+test routes::internal::tests::config_token_timeout_is_bounded_and_completion_cancellation_is_cas_safe ... ok
+test routes::internal::tests::create_app_adopts_only_the_exact_operation_after_response_loss ... ok
+test routes::internal::tests::create_app_request_without_resources_serializes_legacy_form ... ok
+test routes::internal::tests::deferred_response_is_stamped_and_leaves_row_incomplete ... ok
+test routes::internal::tests::deleted_and_rebound_config_token_routes_do_not_extend_or_mask_expiry ... ok
+test routes::internal::tests::deleted_legacy_config_token_routes_preserve_extended_terminal_proof ... ok
+test routes::internal::tests::deterministic_config_token_errors_cancel_and_live_then_stale_lease_reclaims ... ok
+test routes::internal::tests::deterministic_config_token_migration_scrubs_legacy_and_enforces_confidentiality ... ok
+test routes::internal::tests::deterministic_config_token_policy_cannot_reclaim_generic_deploy_mutation ... ok
+test routes::internal::tests::deterministic_config_token_receipt_regenerates_exact_bearer_without_plaintext ... ok
+test routes::internal::tests::deterministic_operation_identity_is_stable_and_request_bound ... ok
+test routes::internal::tests::exact_membership_replay_repairs_legacy_projection_before_success ... ok
+test routes::internal::tests::exact_org_replay_does_not_overwrite_global_display_from_another_org ... ok
+test routes::internal::tests::expiring_capability_plaintext_never_enters_idempotency_ledger ... ok
+test routes::internal::tests::five_xx_in_capability_path_defers_preserving_capability_lease ... ok
+test routes::internal::tests::five_xx_in_config_token_path_cancels_bounded_proof_reclaim_intact ... ok
+test routes::internal::tests::generic_deployment_config_token_route_replays_and_rejects_app_rebind ... ok
+test routes::internal::tests::generic_deployment_setup_pending_stays_retriable_then_adopts_exactly ... ok
+test routes::internal::tests::known_not_applied_retry_preserves_original_key_binding ... ok
+test routes::internal::tests::legacy_completed_config_token_sanitizer_preserves_extended_lease_proof ... ok
+test routes::internal::tests::legacy_config_token_receipt_uses_conservative_lease_proof ... ok
+test routes::internal::tests::live_lease_does_not_starve_a_single_connection_pool ... ok
+test routes::internal::tests::membership_idempotency_key_cannot_replay_across_tenants ... ok
+test routes::internal::tests::membership_sync_rejects_stale_or_divergent_authority_and_replays_exactly ... ok
+test routes::internal::tests::membership_transaction_rollback_does_not_strand_idempotency_reservation ... ok
+test routes::internal::tests::migration_terminalizes_only_stale_legacy_reservations_without_data_leakage ... ok
+test routes::internal::tests::ordinary_handler_error_is_completed_and_replayed_without_side_effect_retry ... ok
+test routes::internal::tests::permanent_conflicts_are_stamped_completed_and_cached ... ok
+test routes::internal::tests::pre_lease_error_bypasses_idempotency_boundary_uncached_and_unstamped ... ok
+test routes::internal::tests::recovery_deadlines_are_decided_by_the_database_clock ... ok
+test routes::internal::tests::stale_owner_and_pre_upgrade_completion_are_fenced_after_reclaim ... ok
+test routes::internal::tests::successful_teardown_persists_completion_marker ... ok
+test routes::internal::tests::unsafe_legacy_recovery_terminalizes_with_nonretryable_disposition ... ok
+test routes::internal::tests::untyped_post_lease_five_xx_fails_closed_without_reexecution ... ok
+test routes::internal::tests::whitelisted_known_not_applied_outcomes_preserve_binding_and_re_execute ... ok
+test routes::logs::tests::app_logs_parses_internal_tee_ip_socket ... ok
+test routes::logs::tests::app_logs_validates_log_query_defaults_and_bounds ... ok
+test routes::logs::tests::app_logs_validates_optional_container_name_without_reading_kubernetes ... ok
+test routes::logs::tests::resolved_tenant_tee_client_bypasses_configured_proxy ... ok
+test routes::orgs::tests::create_org_refuses_public_signups_on_paas_managed_instances ... ok
+test routes::orgs::tests::create_org_rejects_non_dns_safe_names_before_database_access ... ok
+test routes::orgs::tests::keyring_acceptance_waits_for_membership_removal_and_rejects ... ok
+test routes::orgs::tests::keyring_rotation_preserves_pinned_owner_and_one_immutable_v2_winner ... ok
+test routes::orgs::tests::list_orgs_api_key_is_limited_to_bound_org ... ok
+test routes::orgs::tests::list_orgs_session_includes_all_user_orgs ... ok
+test routes::orgs::tests::membership_privileged_role_changes_require_owner ... ok
+test routes::orgs::tests::owner_fingerprint_is_a_digest_not_the_public_key ... ok
+test routes::orgs::tests::owner_rotation_preserves_every_member_except_owner_public_key ... ok
+test routes::orgs::tests::put_keyring_response_returns_normalized_deployable_keyring ... ok
+test routes::orgs::tests::signing_readiness_requires_both_authorities_to_agree ... ok
+test routes::platform::tests::deployment_context_requires_apps_write_scope_for_api_keys ... ok
+test routes::platform::tests::deployment_context_returns_runtime_signing_key_and_broker_url ... ok
+test routes::platform::tests::deployment_context_returns_signed_platform_release_envelope_when_loaded ... ok
+test routes::status::tests::ambiguous_pods_with_runtime_failure_fail_closed ... ok
+test routes::status::tests::complete_legacy_pod_health_stays_live_without_claiming_identity ... ok
+test routes::status::tests::complete_live_evidence_is_fresh_and_identifies_exact_deployment ... ok
+test routes::status::tests::confidential_status_probe_pins_ingress_domain_to_internal_service ... ok
+test routes::status::tests::current_unlock_state_field_is_live_tee_evidence ... ok
+test routes::status::tests::deployment_identity_mismatch_is_not_fresh ... ok
+test routes::status::tests::fresh_unlocked_observation_keeps_running_app_running ... ok
+test routes::status::tests::incomplete_evidence_preserves_in_progress_lifecycle_state ... ok
+test routes::status::tests::kubernetes_failure_is_unavailable_without_raw_error_detail ... ok
+test routes::status::tests::kubernetes_probe_timeout_is_unavailable ... ok
+test routes::status::tests::labelled_rollout_does_not_attribute_unlabelled_failure_to_latest ... ok
+test routes::status::tests::legacy_unlabelled_runtime_failure_applies_to_current_deployment ... ok
+test routes::status::tests::locked_running_pod_can_be_fresh_before_readiness ... ok
+test routes::status::tests::malformed_deployment_identity_cannot_use_legacy_compatibility ... ok
+test routes::status::tests::malformed_runtime_failure_identity_never_applies_to_a_deployment ... ok
+test routes::status::tests::malformed_tee_json_is_partial ... ok
+test routes::status::tests::malformed_tee_supplemental_field_cannot_be_treated_as_omitted ... ok
+test routes::status::tests::missing_tee_pod_status_is_not_synthesized_as_running ... ok
+test routes::status::tests::mixed_case_locked_state_is_canonical_and_cannot_look_running ... ok
+test routes::status::tests::non_running_pod_cannot_be_fresh_from_unlocked_tee_evidence ... ok
+test routes::status::tests::omitted_or_null_supplemental_health_fields_remain_compatible ... ok
+test routes::status::tests::overlapping_pod_failure_prefers_the_expected_deployment_identity ... ok
+test routes::status::tests::pod_readiness_requires_ready_condition_and_all_containers ... ok
+test routes::status::tests::pure_legacy_fleet_keeps_unlabelled_failure_compatibility ... ok
+test routes::status::tests::recorded_failure_remains_safe_when_live_evidence_is_unavailable ... ok
+test routes::status::tests::serialized_internal_and_generic_live_failures_exclude_kubernetes_messages ... ok
+test routes::status::tests::stale_labelled_failure_is_not_attributed_to_expected_deployment ... ok
+test routes::status::tests::tee_error_state_cannot_produce_fresh_readiness ... ok
+test routes::status::tests::tee_probe_deadline_covers_internal_service_resolution ... ok
+test routes::status::tests::tee_probe_deadline_failure_emits_structured_warn ... ok
+test routes::status::tests::tee_probe_distinct_incarnation_keys_not_shared_after_delete ... ok
+test routes::status::tests::tee_probe_http_status_failure_emits_structured_warn ... ok
+test routes::status::tests::tee_probe_recreated_app_warns_on_first_failure_after_delete_clear ... ok
+test routes::status::tests::tee_probe_repeated_identical_failures_are_rate_limited ... ok
+test routes::status::tests::tee_probe_send_failure_emits_structured_warn ... ok
+test routes::status::tests::tee_probe_warns_again_after_signature_change_and_recovery ... ok
+test routes::status::tests::unavailable_observation_never_falls_back_to_recorded_running ... ok
+test routes::status::tests::unhealthy_tee_or_storage_field_cannot_produce_fresh_readiness ... ok
+test routes::status::tests::unlocked_running_but_unready_pod_cannot_be_fresh ... ok
+test routes::unlock::tests::ark_pin_set_matches_sev_builtin_roots ... ok
+test routes::unlock::tests::audit_failure_rolls_back_unlock_mode_runtime_receipt_and_deployment ... ok
+test routes::unlock::tests::concurrent_duplicate_transition_receipt_commits_exactly_once ... ok
+test routes::unlock::tests::deployment_insert_failure_rolls_back_unlock_mode_and_receipt ... ok
+test routes::unlock::tests::durable_job_insert_failure_rolls_back_entire_unlock_transition ... ok
+test routes::unlock::tests::invalid_artifact_authority_rejects_unlock_atomically ... ok
+test routes::unlock::tests::parses_public_unlock_mode_names ... ok
+test routes::unlock::tests::permits_only_supported_unlock_mode_transitions ... ok
+test routes::unlock::tests::rejects_transition_attestation_for_wrong_receipt_key ... ok
+test routes::unlock::tests::rejects_transition_snp_quote_for_wrong_tee_domain ... ok
+test routes::unlock::tests::rejects_transition_snp_quote_from_debug_enabled_guest ... ok
+test routes::unlock::tests::rejects_transition_snp_quote_that_differs_from_receipt_signed_evidence_hash ... ok
+test routes::unlock::tests::rejects_transition_snp_quote_when_missing ... ok
+test routes::unlock::tests::rejects_transition_snp_quote_when_report_data_is_tampered ... ok
+test routes::unlock::tests::rejects_transition_snp_quote_with_oversized_fields_before_decoding ... ok
+test routes::unlock::tests::rejects_transition_snp_quote_with_stale_crl ... ok
+test routes::unlock::tests::rejects_transition_snp_quote_with_tampered_crl ... ok
+test routes::unlock::tests::rejects_transition_snp_quote_with_unanchored_chain ... ok
+test routes::unlock::tests::rejects_transition_snp_quote_without_revocation_collateral ... ok
+test routes::unlock::tests::rejects_unlock_mode_transition_receipt_bad_signature ... ok
+test routes::unlock::tests::rejects_unlock_mode_transition_receipt_for_wrong_mode ... ok
+test routes::unlock::tests::signed_receipt_with_foreign_quote_is_rejected_by_quote_gate ... ok
+test routes::unlock::tests::transition_receipt_freshness_window_bounds_replay ... ok
+test routes::unlock::tests::unlock_mode_hash_validation_uses_local_artifact_delivery_mode ... ok
+test routes::unlock::tests::unlock_mode_transition_rejects_while_app_mutation_lease_is_live ... ok
+test routes::unlock::tests::verifies_transition_snp_quote_from_live_vcek_signed_report ... ok
+test routes::unlock::tests::verifies_unlock_mode_transition_receipt_signature_and_payload ... ok
+test routes::workload::tests::extracts_descriptor_core_hash_from_nested_claims ... ok
+test routes::workload::tests::format_error_chain_includes_sources_display_hides ... ok
+test routes::workload::tests::rejects_missing_or_malformed_hex_claims ... ok
+test routes::workload::tests::trustee_error_responses_never_carry_upstream_or_internal_detail ... ok
+test routes::workload::tests::trustee_verify_request_attaches_internal_bearer_without_replacing_workload_token ... ok
+test routes::workload::tests::upstream_log_body_is_truncated_on_multibyte_boundaries ... ok
+test routes::workload_tls::tests::broker_accepts_declared_cc_init_data_hash_when_kbs_token_omits_it ... ok
+test routes::workload_tls::tests::certificate_hostnames_are_limited_to_attested_descriptor_domains ... ok
+test routes::workload_tls::tests::csr_base64_error_response_is_a_fixed_code_without_detail ... ok
+test routes::workload_tls::tests::issuance_failure_response_contract_is_bounded_and_terminal ... ok
+test routes::workload_tls::tests::provider_secrets_never_reach_the_issuance_failure_response ... ok
+test runtime_gate_tests::gate_rejected_health_probes_still_consume_rate_limit_tokens ... ok
+test runtime_gate_tests::health_routes_are_rate_limited_on_the_production_router ... ok
+test runtime_gate_tests::internal_paas_routes_are_rate_limited_on_the_production_router ... ok
+test runtime_gate_tests::internal_routes_rate_limited_while_dispatch_gate_is_frozen ... ok
+test runtime_gate_tests::rate_limit_rejections_are_recorded_in_http_traces ... ok
+test runtime_gate_tests::router_exposes_only_liveness_until_ready_then_enforces_dispatch_gate ... ok
+test runtime_gate_tests::router_freeze_gate_blocks_encoded_and_dot_segment_variants ... ok
+test runtime_gate_tests::unregistered_writes_still_hit_dispatch_gate_with_rate_limits_on ... ok
+test runtime_gate_tests::workload_gate_classification_agrees_with_matchit_dispatch ... ok
+test runtime_gate_tests::workload_gate_classifies_raw_path_variants_fail_closed ... ok
+test runtime_gate_tests::workload_gate_is_fail_closed_for_current_and_future_writes ... ok
+test signing_service::tests::accepts_descriptor_matching_platform_binding ... ok
+test signing_service::tests::base64_artifact_form_decodes_within_the_payload_budget ... ok
+test signing_service::tests::base64_decoded_size_is_capped_exactly ... ok
+test signing_service::tests::blob_cap_boundary_is_exact ... ok
+test signing_service::tests::decode_rejects_tampered_customer_signatures ... ok
+test signing_service::tests::decodes_descriptor_and_keyring_blobs ... ok
+test signing_service::tests::from_runtime_resolves_sidecar_and_release_fields ... ok
+test signing_service::tests::from_runtime_small_memory_limit_selects_small_runtime_class ... ok
+test signing_service::tests::genpolicy_sized_agent_policy_passes_ingress_decode_caps_and_budgets ... ok
+test signing_service::tests::legacy_padded_stored_artifact_is_rejected_at_dispatch ... ok
+test signing_service::tests::legacy_render_match_pins_the_binding ... ok
+test signing_service::tests::max_legal_caps_compose_under_proof_bundle_budgets ... ok
+test signing_service::tests::max_legal_escaped_compose_under_trustee_budget ... ok
+test signing_service::tests::measured_genpolicy_size_class_fits_the_caps ... ok
+test signing_service::tests::modern_render_match_clears_the_legacy_pin ... ok
+test signing_service::tests::org_keyring_registration_budget_rejects_oversized_envelopes ... ok
+test signing_service::tests::over_budget_composition_is_rejected_at_ingress ... ok
+test signing_service::tests::platform_binding_skips_unconfigured_fields ... ok
+test signing_service::tests::policy_artifact_signing_input_matches_rev14_vector ... ok
+test signing_service::tests::rego_cap_accounts_for_json_escaping ... ok
+test signing_service::tests::rejects_customer_artifact_when_descriptor_policy_hash_is_stale ... ok
+test signing_service::tests::rejects_customer_supplied_policy_artifact_from_unconfigured_key ... ok
+test signing_service::tests::rejects_descriptor_custom_domains_not_matching_app_row ... ok
+test signing_service::tests::rejects_descriptor_for_different_api_signing_key ... ok
+test signing_service::tests::rejects_descriptor_for_different_app_signer_and_image ... ok
+test signing_service::tests::rejects_descriptor_key_signed_customer_supplied_policy_artifact ... ok
+test signing_service::tests::rejects_descriptor_platform_fields_not_matching_platform_runtime ... ok
+test signing_service::tests::rejects_descriptor_unlock_mode_that_does_not_match_app ... ok
+test signing_service::tests::rejects_descriptor_without_independent_verification_contract ... ok
+test signing_service::tests::rejects_descriptor_without_workload_command ... ok
+test signing_service::tests::rejects_full_width_firmware_measurement_under_v1_release ... ok
+test signing_service::tests::rejects_oversized_signing_blobs_before_parsing ... ok
+test signing_service::tests::rejects_partial_blobs ... ok
+test signing_service::tests::rejects_rendered_cc_init_data_hash_mismatch ... ok
+test signing_service::tests::rejects_signed_artifact_fields_exceeding_caps ... ok
+test signing_service::tests::rejects_signed_policy_artifact_random_signature ... ok
+test signing_service::tests::rejects_signed_policy_artifact_with_wrong_expected_kbs_hash ... ok
+test signing_service::tests::rejects_unknown_fields_in_signing_envelopes ... ok
+test signing_service::tests::render_mismatch_resets_the_pin_and_errors ... ok
+test signing_service::tests::signed_artifact_agent_policy_drives_cc_init_data_hash ... ok
+test signing_service::tests::signing_service_timeout_defaults_to_genpolicy_friendly_value ... ok
+test signing_service::tests::signing_service_timeout_rejects_invalid_values ... ok
+test signing_service::tests::trustee_policy_copy_omits_only_duplicated_agent_policy_text ... ok
+test signing_service::tests::validates_customer_artifact_against_canonical_agent_policy ... ok
+test signing_service::tests::validates_customer_supplied_policy_artifact_with_platform_key ... ok
+test signing_service::tests::validates_signed_policy_artifact_with_configured_key ... ok
+test signing_service::tests::verifies_signature_before_payload_comparisons ... ok
+test source_provider::tests::github_provider_rejects_gitlab_registry ... ok
+test source_provider::tests::gitlab_provider_rejects_ghcr_registry ... ok
+test source_provider::tests::source_repository_must_match_image_namespace ... ok
+test source_provider::tests::valid_github_source_context_passes ... ok
+test source_provider::tests::valid_gitlab_source_context_passes ... ok
+test source_provider::tests::wrong_issuer_is_rejected ... ok
+test state::tests::internal_auth_can_require_trusted_proxy_secret ... ok
+test state::tests::side_effect_admission_reserves_pool_headroom_before_lane_entry ... ok
+test state::tests::tee_probe_failure_cache_evicts_least_recently_used_key ... ok
+test state::tests::tee_probe_failure_cache_insert_replaces_signature_and_refreshes_recency ... ok
+test state::tests::tee_probe_failure_cache_remove_drops_the_key_and_signature ... ok
+test workload_tls_timing::tests::dns_categories_are_closed_optional_and_restricted_to_lookup_errors ... ok
+test workload_tls_timing::tests::timing_is_opt_in_closed_schema_and_never_formats_values_or_errors ... ok
+
+test result: ok. 635 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 304.63s
+
+     Running unittests src/bin/cap_migrate.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/cap_migrate-f63e19b9c932c51d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/enclava_api-19ffd3fcd545ec37)
+
+running 12 tests
+test tests::acme_dns_settings_preserve_defaults_and_validate_explicit_values ... ok
+test tests::api_startup_installs_rustls_crypto_provider ... ok
+test tests::deployment_dispatch_switch_is_strict_and_fail_closed ... ok
+test tests::edge_reconciliation_can_only_be_disabled_without_dispatch ... ok
+test tests::kbs_and_edge_authority_converge_before_dispatch_and_readiness ... ok
+test tests::management_mode_resolves_documented_values_and_rejects_typos ... ok
+test tests::platform_release_accepts_policy_validated_coco_dev_runtime_class ... ok
+test tests::platform_release_accepts_production_default_runtime_class ... ok
+test tests::platform_release_runtime_class_mismatch_fails_closed ... ok
+test tests::release_runtime_class_binding_uses_the_resolved_class ... ok
+test tests::tenant_tee_http_client_reads_configured_ca_pem ... ok
+test tests::trustee_http_client_is_https_only ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running unittests src/bin/migrate_two_hostnames.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/migrate_two_hostnames-cac7fd4baa72ad9d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/contract_files.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/contract_files-5587da0e85e1d327)
+
+running 4 tests
+test ci_and_compose_service_images_are_digest_pinned ... ok
+test ci_serializes_tests_that_share_postgres_authority ... ok
+test dockerfiles_pin_base_images_by_digest ... ok
+test paas_internal_logs_contract ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/integration_test.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/integration_test-75ed28fafd6634eb)
+
+running 41 tests
+test api_key_creation_cannot_escalate_scopes_end_to_end ... ok
+test app_logs_fail_closed_until_encrypted_streaming_exists ... ok
+test custom_domain_verified_challenge_cannot_replay_after_expiry ... ok
+test custom_domain_verified_challenge_rechecks_txt_within_window ... ok
+test deployment_diagnostics_no_deployment_app_is_unknown_not_500 ... ok
+test deployment_diagnostics_projects_live_apply_job_over_http ... ok
+test deployment_diagnostics_reports_foreign_lease_blocker ... ok
+test deployment_diagnostics_terminal_rollout_failure_is_failed_not_healthy ... ok
+test deployment_diagnostics_watch_slice_gap_is_watching_not_queued ... ok
+test desired_state_replica_convergence_stops_resumes_and_retains_configuration ... ok
+test device_login_approval_issues_cli_session_and_users_me_works ... ok
+test device_login_approved_code_is_single_use_and_still_expires ... ok
+test device_login_codes_are_stored_with_keyed_hash_and_uri_hides_user_code ... ok
+test device_login_poll_and_approve_are_not_in_start_rate_limit_bucket ... ok
+test device_login_sessions_with_legacy_hash_remain_pollable_and_approvable ... ok
+test device_login_start_is_rate_limited_per_ip ... ok
+test email_auth_enumeration_hardening ... ok
+test existing_app_storage_resize_is_refused_before_persistence ... ok
+test generic_deployment_external_id_is_idempotent_and_conflict_checked ... ok
+test generic_github_deployment_validates_and_reaches_strict_deploy_gate ... ok
+test generic_gitlab_deployment_validates_and_reaches_strict_deploy_gate ... ok
+test health_endpoint_returns_ok ... ok
+test paas_internal_agent_policy_route_reaches_cap_policy_broker ... ok
+test paas_internal_app_logs_fail_closed_after_actor_validation ... ok
+test paas_internal_config_sync_bypasses_public_paas_managed_write_guard ... ok
+test paas_internal_create_app_persists_cli_signer_identity ... ok
+test paas_internal_deploy_reuses_signed_deploy_gate ... ok
+test paas_internal_desired_state_contention_retries_with_the_same_operation_id ... ok
+test paas_internal_desired_state_contract_is_authenticated_mapped_and_idempotent ... ok
+test paas_internal_desired_state_convergence_releases_the_deployment_lane ... ok
+test paas_internal_desired_state_rechecks_failed_status_after_claim ... ok
+test paas_internal_domain_challenge_does_not_reenter_public_write_guard ... ok
+test paas_internal_generic_deployment_uses_synced_entitlement_and_signer_preconditions ... ok
+test paas_internal_org_member_and_entitlement_sync_are_idempotent ... ok
+test paas_internal_stale_desired_state_replay_does_not_undo_newer_intent ... ok
+test paas_internal_stop_waits_for_pending_deployment_observation ... ok
+test paas_managed_orgs_fail_closed_and_block_public_writes ... ok
+test purge_expired_device_login_sessions_removes_only_long_expired_rows ... ok
+test rejected_signed_deployments_leave_existing_and_candidate_container_rows_unchanged ... ok
+test signer_rotation_token_rotates_signer_end_to_end ... ok
+test standalone_cap_does_not_mount_paas_internal_routes ... ok
+
+test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 28.35s
+
+     Running unittests src/main.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/enclava_appraiser-6af5ea183b70cc0a)
+
+running 3 tests
+test tests::mutated_bundles_never_abort_the_appraiser ... ok
+test tests::receipt_signature_covers_result_context_and_expiry ... ok
+test tests::rejects_implicit_or_ambiguous_policy_selection ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.29s
+
+     Running unittests src/lib.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/enclava_cli-982298ccd3de36c8)
+
+running 155 tests
+test api_client::loopback_tests::api_origin_is_canonicalized_for_security_state ... ok
+test api_client::loopback_tests::discovered_api_url_requires_a_safe_absolute_base ... ok
+test api_client::loopback_tests::only_exact_loopback_hosts_are_plain_http ... ok
+test api_client::tests::api_error_message_carries_lane_hints_in_band ... ok
+test api_client::tests::api_error_message_carries_stale_seed_remediation ... ok
+test api_client::tests::api_error_message_prefixes_distinct_message_text ... ok
+test api_client::tests::api_error_message_prints_code_only_bodies_once ... ok
+test api_client::tests::template_instance_idempotency_key_binds_signed_artifacts ... ok
+test api_client::tests::template_instance_idempotency_key_binds_stable_endpoint_request ... ok
+test api_types::app_status_contract_tests::app_status_accepts_deployment_lifecycle_diagnostics ... ok
+test api_types::app_status_contract_tests::app_status_accepts_explicit_freshness_and_drift_contract ... ok
+test api_types::app_status_contract_tests::app_status_captures_tee_error_when_present ... ok
+test api_types::app_status_contract_tests::app_status_parses_blocked_by_operation_shape ... ok
+test api_types::app_status_contract_tests::app_status_parses_terminal_rollout_failure_shape ... ok
+test api_types::app_status_contract_tests::app_status_remains_compatible_with_legacy_hosted_response ... ok
+test api_types::app_status_contract_tests::app_status_still_parses_without_deployment_diagnostics ... ok
+test api_types::app_status_contract_tests::deployment_diagnostics_minimal_block_parses ... ok
+test api_types::tests::config_keys_accepts_live_api_array_shape ... ok
+test api_types::tests::config_keys_accepts_wrapped_shape ... ok
+test api_types::tests::config_token_accepts_live_api_shape ... ok
+test api_types::tests::ssh_command_response_accepts_required_nullable_pending_fields ... ok
+test api_types::tests::ssh_command_response_rejects_omitted_required_nullable_fields ... ok
+test api_types::tests::ssh_command_response_rejects_wrong_required_nullable_field_type ... ok
+test attestation::tests::rejects_descriptor_claim_mismatch ... ok
+test attestation::tests::rejects_descriptor_expected_cc_init_data_hash_mismatch ... ok
+test attestation::tests::rejects_host_data_mismatch ... ok
+test attestation::tests::rejects_receipt_pubkey_mismatch ... ok
+test attestation::tests::rejects_report_data_spki_mismatch ... ok
+test attestation::tests::v2_rejects_mismatch_in_measurement_tail ... ok
+test attestation::tests::verifies_local_rev14_bindings ... ok
+test descriptor::tests::canonical_bytes_include_image_ref ... ok
+test descriptor::tests::descriptor_core_excludes_chain_anchors ... ok
+test descriptor::tests::descriptor_measurement_reader_accepts_legacy_and_full_values ... ok
+test descriptor::tests::descriptor_v2_canonical_bytes_bind_all_measurement_bytes ... ok
+test descriptor::tests::env_canonicalization_is_name_sorted ... ok
+test descriptor::tests::full_signature_changes_when_chain_anchor_changes ... ok
+test descriptor::tests::json_round_trip_preserves_canonical_hash ... ok
+test descriptor::tests::signing_round_trips ... ok
+test descriptor::tests::trusted_expectation_mirrors_the_signed_descriptor ... ok
+test keyring::tests::keyring_state_uses_configured_cli_root ... ok
+test keyring::tests::keyring_store_refuses_to_replace_a_corrupt_cache ... ok
+test keyring::tests::keyring_store_refuses_version_rollback ... ok
+test keyring::tests::member_order_is_canonicalized_by_user_id ... ok
+test keyring::tests::signing_and_verifying_round_trips ... ok
+test keyring::tests::tampered_keyring_fails_verification ... ok
+test keyring::tests::wrong_owner_pubkey_rejected ... ok
+test keys::tests::app_mnemonic_store_load_list_round_trips ... ok
+test keys::tests::app_mnemonic_store_rejects_invalid_app_name_paths ... ok
+test keys::tests::encrypted_recovery_backup_carries_only_non_secret_metadata_outside_ciphertext ... ok
+test keys::tests::encrypted_recovery_backup_round_trips ... ok
+test keys::tests::encrypted_recovery_backup_round_trips_mnemonics ... ok
+test keys::tests::prepare_app_mnemonic_sink_fails_closed_when_directory_sync_fails_late ... ok
+test keys::tests::prepare_app_mnemonic_sink_fails_closed_when_directory_sync_is_rejected ... ok
+test keys::tests::prepare_app_mnemonic_sink_flushes_directory_holding_relative_state_root ... ok
+test keys::tests::prepare_app_mnemonic_sink_flushes_newly_created_directory_ancestors ... ok
+test keys::tests::prepare_app_mnemonic_sink_preserves_existing_backup_and_removes_stale_temp ... ok
+test keys::tests::prepare_app_mnemonic_sink_proves_writability_and_cleans_up ... ok
+test keys::tests::prepare_app_mnemonic_sink_rejects_directory_at_real_destination ... ok
+test keys::tests::prepare_app_mnemonic_sink_rejects_directory_at_real_temp_path ... ok
+test keys::tests::prepare_app_mnemonic_sink_rejects_invalid_app_names ... ok
+test keys::tests::prepare_app_mnemonic_sink_rejects_symlinks_at_either_real_path ... ok
+test keys::tests::prepare_app_mnemonic_sink_requires_proven_rename_durability ... ok
+test keys::tests::recovery_seed_derivation_is_deterministic_and_domain_separated ... ok
+test keys::tests::rejects_world_readable_key_file ... ok
+test keys::tests::round_trip_create_load_sign_verify ... ok
+test keys::tests::write_secret_file_relative_output_path_succeeds ... ok
+test platform_release::tests::api_release_older_than_bundle_is_refused ... ok
+test platform_release::tests::baseline_store_is_written_owner_only ... ok
+test platform_release::tests::bundled_release_uses_ghcr_digest_pinned_sidecars ... ok
+test platform_release::tests::bundled_release_verifies_and_hashes_template ... ok
+test platform_release::tests::cli_dockerfile_requires_platform_release_root_build_arg ... ok
+test platform_release::tests::fixture_root_is_detected_case_insensitively ... ok
+test platform_release::tests::hex32_root_shape_is_validated ... ok
+test platform_release::tests::malformed_baseline_fails_closed_instead_of_resetting_the_high_water_mark ... ok
+test platform_release::tests::older_override_release_is_detected ... ok
+test platform_release::tests::per_api_baseline_allows_older_than_bundle_but_refuses_api_downgrades ... ok
+test platform_release::tests::release_ordering_uses_the_signed_timestamp_not_the_version_suffix ... ok
+test platform_release::tests::release_payload_rejects_http_acme_ca ... ok
+test platform_release::tests::release_payload_rejects_http_kbs_url ... ok
+test platform_release::tests::release_payload_rejects_internal_caddy_tls_mode ... ok
+test platform_release::tests::release_payload_rejects_off_cluster_http_signing_service_url ... ok
+test platform_release::tests::release_payload_rejects_tag_only_sidecar_image ... ok
+test platform_release::tests::release_payload_rejects_unparseable_created_at ... ok
+test platform_release::tests::release_payload_rejects_uppercase_scheme_acme_ca ... ok
+test platform_release::tests::release_payload_rejects_url_parseable_but_unrenderable_acme_ca ... ok
+test platform_release::tests::tagged_cli_release_build_requires_platform_release_root_secret ... ok
+test platform_release::tests::tampering_breaks_signature ... ok
+test platform_release::tests::unparseable_baseline_timestamp_is_rejected_without_replacement ... ok
+test platform_release::tests::unparseable_candidate_timestamp_is_rejected ... ok
+test platform_release::tests::verify_envelope_with_root_pins_the_supplied_root ... ok
+test policy_artifact::tests::canonical_metadata_hash_pinned_vector ... ok
+test policy_artifact::tests::policy_artifact_signing_input_pinned_vector ... ok
+test policy_artifact::tests::sign_policy_artifact_round_trips ... ok
+test registry::tests::base_url_maps_known_registries ... ok
+test registry::tests::manifest_digest_matches_known_vector ... ok
+test tee_client::tests::absent_or_malformed_bootstrap_error_field_is_not_a_diagnostic ... ok
+test tee_client::tests::accepts_api_returned_confidential_base ... ok
+test tee_client::tests::accepts_api_returned_config_base ... ok
+test tee_client::tests::amd_kds_base_url_defaults_to_direct_amd_and_honors_override ... ok
+test tee_client::tests::amd_kds_vcek_retries_rate_limits_and_server_errors ... ok
+test tee_client::tests::attest_evidence_path_returns_quote_without_kds_crl ... ok
+test tee_client::tests::bootstrap_status_combines_claim_and_terminal_without_masking ... ok
+test tee_client::tests::builds_amd_kds_product_crl_url_from_snp_report ... ok
+test tee_client::tests::builds_amd_kds_vcek_url_from_snp_report ... ok
+test tee_client::tests::builtin_amd_ark_roots_are_pinned ... ok
+test tee_client::tests::challenge_response_accepts_live_proxy_shape ... ok
+test tee_client::tests::change_password_body_matches_attestation_proxy_contract ... ok
+test tee_client::tests::claim_response_captures_owner_seed_mnemonic_from_live_proxy_shape ... ok
+test tee_client::tests::complete_transition_quote_crl_rejects_invalid_collateral_before_mutation ... ok
+test tee_client::tests::crl_fetch_caches_per_product_and_fails_closed_on_errors ... ok
+test tee_client::tests::default_tls_mode_requires_valid_tee_certs ... ok
+test tee_client::tests::evidence_chain_with_unpinned_ark_falls_back_to_kds_and_fails_closed ... ok
+test tee_client::tests::extracts_coco_cert_chain_by_cert_type ... ok
+test tee_client::tests::extracts_coco_structured_snp_report_bytes ... ok
+test tee_client::tests::kds_retry_delay_honors_bounded_retry_after_and_jitter ... ok
+test tee_client::tests::loads_builtin_amd_snp_ca_chain_for_report_generation ... ok
+test tee_client::tests::malformed_or_unbounded_retry_after_deadlines_reject_the_diagnostic ... ok
+test tee_client::tests::normalizes_plain_domain_to_confidential_base ... ok
+test tee_client::tests::ownership_client_timeout_covers_live_rollout_budget ... ok
+test tee_client::tests::ownership_probe_client_uses_short_timeout_and_preserves_resolve_ip ... ok
+test tee_client::tests::paas_provided_edge_resolve_ip_is_preserved ... ok
+test tee_client::tests::parses_each_recognized_terminal_bootstrap_error ... ok
+test tee_client::tests::post_claim_ownership_states_mean_owner_claim_succeeded ... ok
+test tee_client::tests::preserves_elapsed_and_future_utc_retry_after_deadlines ... ok
+test tee_client::tests::private_resolve_ip_fallback_is_limited_to_tcp_connect_errors ... ok
+test tee_client::tests::recognized_terminal_body_is_parsed_from_bounded_json_slice ... ok
+test tee_client::tests::rejects_attestation_evidence_report_data_mismatch ... ok
+test tee_client::tests::rejects_json_only_attestation_evidence_by_default ... ok
+test tee_client::tests::snp_report_with_debug_policy_is_rejected ... ok
+test tee_client::tests::stable_summary_prints_only_the_code_and_validated_deadline ... ok
+test tee_client::tests::staging_tls_mode_accepts_invalid_tee_certs ... ok
+test tee_client::tests::synthetic_launch_identity_is_test_support_only ... ok
+test tee_client::tests::terminal_bootstrap_error_codes_are_the_stable_contract ... ok
+test tee_client::tests::transition_evidence_hash_binds_raw_snp_report_not_envelope ... ok
+test tee_client::tests::turin_vcek_url_uses_eight_byte_hwid_per_kds_spec ... ok
+test tee_client::tests::unanchored_ark_bytes_are_not_pinned ... ok
+test tee_client::tests::unknown_error_codes_or_non_terminal_markers_are_not_a_diagnostic ... ok
+test tee_client::tests::unlock_mode_receipt_modes_are_stable ... ok
+test tee_client::tests::vcek_cache_collapses_concurrent_same_key_fills_and_serves_warm_hits ... ok
+test tee_client::tests::vcek_cache_keeps_different_hwid_tcb_keys_separate ... ok
+test tee_client::tests::vcek_cache_never_stores_noncertificate_or_expired_bodies ... ok
+test tee_client::tests::vcek_disk_cache_rejects_oversized_files ... ok
+test tee_client::tests::vcek_disk_cache_reuses_valid_material_and_rejects_corrupt_entries ... ok
+test tee_client::tests::vcek_disk_lock_collapses_concurrent_fills_across_process_layers ... ok
+test tee_client::tests::vcek_disk_lock_pool_bounds_lock_files_across_failed_fills ... ok
+test tee_client::tests::vcek_fetch_errors_do_not_leak_url_or_hwid ... ok
+test tee_client::tests::vcek_fill_is_bounded_cancellable_and_error_responses_are_uncached ... ok
+test tee_client::tests::verifies_attestation_evidence_report_data_binding ... ok
+test tee_client::tls::tests::parse_accepts_https_default_port ... ok
+test tee_client::tls::tests::parse_accepts_https_with_explicit_port ... ok
+test tee_client::tls::tests::parse_rejects_empty_host ... ok
+test tee_client::tls::tests::parse_rejects_invalid_url ... ok
+test tee_client::tls::tests::parse_rejects_non_https_scheme ... ok
+test tee_client::tls::tests::tls_leaf_fetch_preserves_successful_handshake_spki ... ok
+test tee_client::tls::tests::tls_leaf_fetch_times_out_when_peer_stalls_handshake ... ok
+
+test result: ok. 155 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.73s
+
+     Running unittests src/main.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/enclava-89b005d0eb994d6f)
+
+running 235 tests
+test commands::app::signing::bootstrap_tests::accepts_only_policy_service_bootstrap_success_states ... ok
+test commands::app::tests::attested_locked_state_overrides_only_running_status ... ok
+test commands::app::tests::claim_recovery_sink_tests::claim_initial_ownership_gates_sink_before_any_network_claim ... ok
+test commands::app::tests::claim_recovery_sink_tests::claim_initial_ownership_halts_on_committed_incomplete_backup ... ok
+test commands::app::tests::claim_recovery_sink_tests::claim_paths_never_print_the_mnemonic_variable ... ok
+test commands::app::tests::claim_recovery_sink_tests::deploy_rejects_no_store_mnemonic_before_submitting ... ok
+test commands::app::tests::claim_recovery_sink_tests::fn_body_matches_markers_across_crlf_checkouts ... ok
+test commands::app::tests::create_unlock_mode_validation_rejects_auto_with_workaround ... ok
+test commands::app::tests::default_log_private_key_path_sanitizes_components ... ok
+test commands::app::tests::deploy_accepts_storage_password_file_flag ... ok
+test commands::app::tests::deploy_bootstrap_probe_attests_before_calling_claim_endpoint ... ok
+test commands::app::tests::deploy_bootstrap_probe_uses_short_probe_timeout_client ... ok
+test commands::app::tests::deploy_claims_fresh_created_password_app_when_unlock_status_is_unavailable ... ok
+test commands::app::tests::deploy_config_push_attests_before_setting_values ... ok
+test commands::app::tests::deploy_config_retries_only_locked_tee_responses ... ok
+test commands::app::tests::deploy_gate_follows_live_ownership_outside_creating ... ok
+test commands::app::tests::deploy_health_timeout_covers_generated_readiness_delay ... ok
+test commands::app::tests::deploy_health_timeout_is_not_reported_as_success ... ok
+test commands::app::tests::deploy_password_unlock_attests_before_reading_or_unlocking_storage ... ok
+test commands::app::tests::deploy_preflight_gate_fails_closed_on_unresolved_ownership ... ok
+test commands::app::tests::deploy_preflight_reads_live_ownership_before_the_claim_gate ... ok
+test commands::app::tests::deploy_preflights_password_input_before_remote_side_effects ... ok
+test commands::app::tests::deploy_progress_does_not_redraw_during_interactive_secret_prompts ... ok
+test commands::app::tests::deploy_runtime_direct_tee_fallback_accepts_matching_partial_observation ... ok
+test commands::app::tests::deploy_runtime_direct_tee_fallback_rejects_pod_gaps_wrong_or_drifted_deployment ... ok
+test commands::app::tests::deploy_runtime_wait_falls_back_to_attested_tee_status ... ok
+test commands::app::tests::deploy_unlocks_existing_password_storage_before_config_push ... ok
+test commands::app::tests::deploy_unlocks_existing_password_storage_even_without_config_push ... ok
+test commands::app::tests::deploy_waits_on_returned_deployment_record ... ok
+test commands::app::tests::deployment_context_platform_release_is_verified_and_selected ... ok
+test commands::app::tests::deployment_context_platform_release_tampering_fails_closed ... ok
+test commands::app::tests::deployment_requires_explicit_recoverable_setup_and_login_has_no_keyring_side_effect ... ok
+test commands::app::tests::destroy_failure_hint_covers_lane_conflicts_and_teardown_failures ... ok
+test commands::app::tests::direct_tee_status_accepts_matching_or_omitted_supplemental_fields ... ok
+test commands::app::tests::direct_tee_status_prefers_current_unlock_state ... ok
+test commands::app::tests::direct_tee_status_rejects_errors_mismatches_and_malformed_fields ... ok
+test commands::app::tests::generated_log_key_registration_keeps_private_material_local ... ok
+test commands::app::tests::generated_log_key_rejects_mismatched_registration_response ... ok
+test commands::app::tests::generated_log_key_retry_rejects_loose_private_key_permissions ... ok
+test commands::app::tests::generated_log_key_retry_reuses_matching_registered_key ... ok
+test commands::app::tests::list_org_log_keys_hits_org_endpoint ... ok
+test commands::app::tests::log_output_sanitizer_removes_terminal_control_sequences ... ok
+test commands::app::tests::logs_command_decrypts_encrypted_frames_locally ... ok
+test commands::app::tests::logs_command_points_missing_scope_to_explicit_reapproval ... ok
+test commands::app::tests::manual_deploy_keyring_always_bootstraps_the_signing_service ... ok
+test commands::app::tests::manual_deploy_keyring_always_checks_remote_state ... ok
+test commands::app::tests::optional_app_name_propagates_malformed_and_invalid_config ... ok
+test commands::app::tests::optional_app_name_suppresses_only_missing_enclava_toml ... ok
+test commands::app::tests::optional_app_name_uses_loaded_config ... ok
+test commands::app::tests::parse_config_inputs_reads_values_from_files ... ok
+test commands::app::tests::password_redeploy_wait_does_not_accept_stale_unlocked_runtime ... ok
+test commands::app::tests::revoke_org_log_key_hits_org_endpoint ... ok
+test commands::app::tests::signed_cc_hash_app_uses_api_deployment_context_without_env_exports ... ok
+test commands::app::tests::signed_cc_hash_app_uses_local_artifact_urls_like_live_apply ... ok
+test commands::app::tests::stable_ssh_endpoint_from_app_requires_debian_ssh_template_metadata ... ok
+test commands::app::tests::status_command_falls_back_to_attested_tee_status ... ok
+test commands::app::tests::status_command_surfaces_stable_ssh_endpoint_with_validating_follow_up ... ok
+test commands::app::tests::storage_password_file_trims_newlines_and_rejects_empty ... ok
+test commands::app::tests::terminal_diagnostics::attestation_reads_are_bounded_before_authentication ... ok
+test commands::app::tests::terminal_diagnostics::bootstrap_endpoint_decision_never_masks_terminal_with_claimed_state ... ok
+test commands::app::tests::terminal_diagnostics::bounded_status_read_rejects_oversized_terminal_bodies ... ok
+test commands::app::tests::terminal_diagnostics::bounded_status_rejects_error_responses_without_reading_bodies ... ok
+test commands::app::tests::terminal_diagnostics::budgeted_status_read_cuts_stalled_responses ... ok
+test commands::app::tests::terminal_diagnostics::direct_runtime_outcome_prefers_terminal_over_ready_states ... ok
+test commands::app::tests::terminal_diagnostics::health_wait_keeps_existing_deadline_when_probe_cannot_authenticate ... ok
+test commands::app::tests::terminal_diagnostics::launch_identity_binding_fixtures ... ok
+test commands::app::tests::terminal_diagnostics::malformed_attestation_response_never_leaks_content ... ok
+test commands::app::tests::terminal_diagnostics::malformed_nested_attestation_fields_never_leak_content ... ok
+test commands::app::tests::terminal_diagnostics::set_deploy_config_ignores_terminal_diagnostics_without_verified_identity ... ok
+test commands::app::tests::terminal_diagnostics::set_deploy_config_succeeds_without_diagnostic_probe ... ok
+test commands::app::tests::terminal_diagnostics::terminal_diagnostic_probe_spacing_keeps_probes_prompt_but_bounded ... ok
+test commands::app::tests::terminal_diagnostics::terminal_diagnostic_wiring_covers_every_post_claim_wait ... ok
+test commands::app::tests::terminal_diagnostics::terminal_failure_message_prints_only_code_and_validated_deadline ... ok
+test commands::app::tests::terminal_diagnostics::terminal_failure_message_without_deadline_prints_only_the_code ... ok
+test commands::app::tests::terminal_diagnostics::terminal_probe_budget_caps_stalled_cap_lookup ... ok
+test commands::app::tests::terminal_diagnostics::terminal_probe_reads_no_status_without_verified_launch_identity ... ok
+test commands::app::tests::terminal_diagnostics::unlock_wait_fails_closed_without_verified_launch_identity ... ok
+test commands::app::tests::terminal_diagnostics::unlock_wait_progresses_normally_when_diagnostics_absent_or_stale ... ok
+test commands::app::tests::terminal_diagnostics::unverified_status_response_cannot_authorize_a_terminal_decision ... ok
+test commands::auth::tests::accepts_https_device_urls ... ok
+test commands::auth::tests::approved_device_session_survives_profile_failure ... ok
+test commands::auth::tests::auth_api_url_prefers_and_validates_discovery ... ok
+test commands::auth::tests::auth_discovery_or_legacy_propagates_other_api_errors ... ok
+test commands::auth::tests::auth_discovery_or_legacy_returns_discovery_on_success ... ok
+test commands::auth::tests::auth_discovery_or_legacy_returns_transport_error ... ok
+test commands::auth::tests::auth_discovery_or_legacy_treats_404_and_405_as_unavailable ... ok
+test commands::auth::tests::auth_method_error_allows_advertised_method_and_rejects_others ... ok
+test commands::auth::tests::auth_method_error_allows_legacy_standalone_when_discovery_unavailable ... ok
+test commands::auth::tests::auth_method_error_gives_actionable_empty_methods_message ... ok
+test commands::auth::tests::auth_method_error_preserves_email_and_nostr_for_standalone_targets ... ok
+test commands::auth::tests::auth_method_error_rejects_email_and_nostr_for_device_code_only_target ... ok
+test commands::auth::tests::default_login_uses_device_flow_only_when_legacy_or_advertised ... ok
+test commands::auth::tests::nip98_login_event_gives_same_second_retry_a_fresh_event_id ... ok
+test commands::auth::tests::no_supported_method_error_is_actionable_for_empty_auth_methods ... ok
+test commands::auth::tests::rejects_cmd_metacharacters ... ok
+test commands::auth::tests::rejects_non_http_schemes ... ok
+test commands::auth::tests::rejects_semicolon_quote_backtick_and_dollar ... ok
+test commands::auth::tests::supported_methods_filters_to_advertised_choices ... ok
+test commands::auth::tests::supported_methods_returns_all_when_discovery_unavailable ... ok
+test commands::auth::tests::supported_methods_returns_empty_for_device_code_only ... ok
+test commands::config::tests::config_set_accepts_explicit_app_without_local_config ... ok
+test commands::config::tests::config_set_and_unset_print_next_boot_application_note ... ok
+test commands::config::tests::config_set_attests_before_writing_values ... ok
+test commands::config::tests::config_unset_attests_before_deleting_value ... ok
+test commands::config::tests::parse_key_value_accepts_equals_in_value ... ok
+test commands::describe::tests::observes_fixture_bundle_without_appraisal ... ok
+test commands::describe::tests::skeleton_round_trips_through_policy_parser ... ok
+test commands::describe::tests::tampered_descriptor_breaks_artifact_consistency ... ok
+test commands::describe::tests::tampered_outer_nonce_breaks_report_data_consistency ... ok
+test commands::init::tests::default_app_name_sanitizes_directory_name ... ok
+test commands::init::tests::detect_port_from_expose ... ok
+test commands::init::tests::detect_port_with_protocol ... ok
+test commands::init::tests::generated_toml_parses ... ok
+test commands::init::tests::generated_workflow_contains_cosign ... ok
+test commands::init::tests::init_rejects_names_the_platform_would_reject_and_parses_generated_toml ... ok
+test commands::init::tests::missing_dockerfile_returns_none ... ok
+test commands::init::tests::no_expose_returns_none ... ok
+test commands::key::tests::logged_out_backup_metadata_records_requested_org_name ... ok
+test commands::key::tests::restore_mnemonics_allows_matching_existing_value_without_force ... ok
+test commands::key::tests::restore_mnemonics_reject_invalid_app_name_before_writing ... ok
+test commands::key::tests::restore_mnemonics_requires_force_before_overwriting_different_existing_value ... ok
+test commands::key::tests::restore_rejects_backup_org_name_mismatch ... ok
+test commands::key::tests::setup_writes_encrypted_backup_before_remote_authority ... ok
+test commands::ownership::tests::claim_flow_gates_the_sink_before_any_network_claim ... ok
+test commands::ownership::tests::claim_session_interactivity_matrix ... ok
+test commands::ownership::tests::mnemonic_file_takes_priority_over_unreadable_local_state ... ok
+test commands::ownership::tests::ownership_module_never_prints_the_mnemonic_variable ... ok
+test commands::ownership::tests::preclaim_gate_prepares_sink_on_success ... ok
+test commands::ownership::tests::preclaim_gate_rejection_preserves_existing_backup ... ok
+test commands::ownership::tests::preclaim_gate_rejects_directory_at_either_real_destination_path ... ok
+test commands::ownership::tests::preclaim_gate_rejects_unattended_sessions ... ok
+test commands::ownership::tests::preclaim_gate_rejects_unsafe_mode_before_touching_the_keystore ... ok
+test commands::ownership::tests::preclaim_gate_rejects_unwritable_sink ... ok
+test commands::ownership::tests::prompted_claim_under_redirected_stderr_points_at_password_file ... ok
+test commands::ownership::tests::read_mnemonic_file_trims_and_rejects_empty ... ok
+test commands::ownership::tests::read_secret_file_trims_trailing_newline_and_rejects_empty ... ok
+test commands::ownership::tests::recovery_restart_guidance_covers_locked_and_persistence_failures ... ok
+test commands::ownership::tests::response_loss_and_missing_mnemonic_errors_are_incomplete_and_secret_free ... ok
+test commands::ownership::tests::secret_from_file_or_prompt_reads_file_and_names_flag_without_terminal ... ok
+test commands::ownership::tests::sink_mode_rejects_no_store_before_claim_with_guidance ... ok
+test commands::ownership::tests::store_after_claim_forced_failure_is_incomplete_and_never_leaks ... ok
+test commands::ownership::tests::store_after_claim_success_persists_to_protected_keystore ... ok
+test commands::ownership::tests::unimplemented_hosted_classification_is_exact ... ok
+test commands::ownership::tests::unlock_mode_preflight_precedes_the_tee_seal ... ok
+test commands::ownership::tests::unlock_mode_probe_contract_is_strict ... ok
+test commands::ownership::tests::verified_recovery_mnemonic_replaces_stale_local_value ... ok
+test commands::prepare::tests::prepare_creates_missing_files_without_prompt ... ok
+test commands::prepare::tests::prepare_keeps_existing_files_without_confirmation ... ok
+test commands::prepare::tests::prepare_overwrites_existing_files_when_confirmed ... ok
+test commands::template::tests::app_url_from_app_response_prefers_cap_app_domain_for_stable_ssh_lookup ... ok
+test commands::template::tests::app_url_from_template_response_cap_prefers_app_domain_and_falls_back_to_domain ... ok
+test commands::template::tests::app_url_normalizes_domain_and_root_url ... ok
+test commands::template::tests::app_url_rejects_invalid_app_domains ... ok
+test commands::template::tests::bootstrap_subphase_timings_are_nested_fixed_and_opt_in ... ok
+test commands::template::tests::chunked_oversized_ssh_txt_body_is_rejected_without_waiting_for_the_stream_to_end ... ok
+test commands::template::tests::cli_stable_ssh_human_copy_is_endpoint_first ... ok
+test commands::template::tests::config_token_refresh_honors_replacement_tee_url ... ok
+test commands::template::tests::debian_ssh_config_pairs_only_write_customer_owned_keys ... ok
+test commands::template::tests::deploy_cli_accepts_predeploy_log_encryption_options ... ok
+test commands::template::tests::deploy_cli_defers_stable_endpoint_requirement_to_debian_ssh_runtime_and_accepts_legacy_alias ... ok
+test commands::template::tests::deploy_help_names_stable_ssh_endpoint_and_legacy_alias ... ok
+test commands::template::tests::deploy_omits_stable_endpoint_by_default_and_accepts_optional_import ... ok
+test commands::template::tests::deploy_output_canonicalizes_and_validates_stable_endpoint ... ok
+test commands::template::tests::deploy_output_json_is_machine_readable ... ok
+test commands::template::tests::deploy_output_normalizes_app_url_for_stable_ssh_handoff ... ok
+test commands::template::tests::deploy_output_rejects_mismatched_endpoint_api_endpoint ... ok
+test commands::template::tests::deploy_output_surfaces_stable_ssh_details_for_humans ... ok
+test commands::template::tests::deploy_uses_server_stored_stable_endpoint_from_template_instance_response ... ok
+test commands::template::tests::managed_config_progress_reports_safe_counts ... ok
+test commands::template::tests::ngrok_tcp_url_normalizes_tcp_scheme ... ok
+test commands::template::tests::ngrok_tcp_url_rejects_non_decimal_ports ... ok
+test commands::template::tests::ngrok_tcp_url_rejects_non_ngrok_hosts ... ok
+test commands::template::tests::paas_ssh_command_api_errors_are_actionable_for_stable_ssh_contract_failures ... ok
+test commands::template::tests::paas_ssh_command_poll_retries_only_transient_api_errors ... ok
+test commands::template::tests::pending_paas_ssh_command_can_be_confirmed_from_public_app_url ... ok
+test commands::template::tests::ssh_command_endpoint_assertion_must_match_stored_metadata ... ok
+test commands::template::tests::ssh_command_endpoint_match_requires_reserved_address ... ok
+test commands::template::tests::ssh_command_help_names_stable_ssh_endpoint_and_legacy_alias ... ok
+test commands::template::tests::ssh_command_output_json_is_machine_readable ... ok
+test commands::template::tests::ssh_command_output_rejects_mismatched_endpoint_api_app_url ... ok
+test commands::template::tests::ssh_command_output_rejects_mismatched_endpoint_api_endpoint ... ok
+test commands::template::tests::ssh_command_output_rejects_noncanonical_app_url ... ok
+test commands::template::tests::ssh_command_output_rejects_reserved_endpoint_mismatch ... ok
+test commands::template::tests::ssh_command_output_surfaces_endpoint_for_humans ... ok
+test commands::template::tests::ssh_command_parser_requires_nonzero_tcp_port ... ok
+test commands::template::tests::ssh_command_progress_does_not_guess_why_readiness_is_pending ... ok
+test commands::template::tests::ssh_command_response_validation_allows_pending_and_validates_ready ... ok
+test commands::template::tests::ssh_command_uses_stored_stable_endpoint_from_app_metadata ... ok
+test commands::template::tests::ssh_command_wait_names_password_mode_relock_when_detected ... ok
+test commands::template::tests::ssh_command_wait_receives_password_mode_from_caller_metadata ... ok
+test commands::template::tests::ssh_command_wait_surfaces_progress_without_polluting_json ... ok
+test commands::template::tests::ssh_public_key_validation_requires_public_key_blob ... ok
+test commands::template::tests::stable_ssh_endpoint_accepts_frp_relay_host ... ok
+test commands::template::tests::stable_ssh_template_config_delivery_retries_only_transient_failures ... ok
+test commands::template::tests::stable_ssh_template_create_errors_are_actionable_for_missing_managed_ngrok_env ... ok
+test commands::template::tests::tee_config_url_normalizes_confidential_endpoint ... ok
+test commands::template::tests::tee_config_url_rejects_credentials_and_custom_paths ... ok
+test commands::template::tests::template_bootstrap_endpoint_rejects_decode_errors ... ok
+test commands::template::tests::template_bootstrap_endpoint_retries_only_transient_api_errors ... ok
+test commands::template::tests::template_bootstrap_endpoint_retries_without_redeploying ... ok
+test commands::template::tests::template_config_delivery_continues_past_default_budget_only_when_engaged ... ok
+test commands::template::tests::template_config_delivery_ignores_terminal_diagnostics_without_verified_identity ... ok
+test commands::template::tests::template_config_delivery_owner_wait_is_wired_to_deploy_metadata ... ok
+test commands::template::tests::template_config_delivery_probe_skips_unverified_identity ... ok
+test commands::template::tests::template_config_delivery_retry_budget_covers_live_rollout_delay ... ok
+test commands::template::tests::template_config_locked_error_detection_is_quote_delimited ... ok
+test commands::template::tests::template_config_locked_persistence_is_sticky_once_engaged ... ok
+test commands::template::tests::template_config_nested_retry_continues_honors_deadline ... ok
+test commands::template::tests::template_config_owner_wait_engages_only_on_persistent_password_mode_lock ... ok
+test commands::template::tests::template_config_slow_connect_class_and_cap ... ok
+test commands::template::tests::template_create_name_conflict_still_falls_back_to_the_existing_app ... ok
+test commands::template::tests::template_create_refusal_context_survives_transport_failures ... ok
+test commands::template::tests::template_create_refusal_surfaces_lookup_outage_with_refusal_context ... ok
+test commands::template::tests::template_create_rejection_surfaces_the_create_error_not_the_fallback_404 ... ok
+test commands::template::tests::template_deploy_claims_password_template_before_config_delivery ... ok
+test commands::template::tests::template_deploy_default_covers_managed_config_delivery ... ok
+test commands::template::tests::template_deploy_requires_requested_log_key_in_signed_policy ... ok
+test commands::template::tests::template_deploy_validates_log_key_selection_response ... ok
+test commands::template::tests::template_deploy_verifies_platform_trust_before_remote_mutation ... ok
+test commands::template::tests::template_deployment_failure_message_includes_api_error_detail ... ok
+test commands::template::tests::template_help_names_ssh_command_as_stable_ssh_endpoint_recovery ... ok
+test commands::template::tests::template_input_summary_surfaces_stable_ssh_endpoint ... ok
+test commands::template::tests::template_instance_name_uses_server_slug_rules ... ok
+test commands::template::tests::template_waits_stop_on_verified_terminal_bootstrap_diagnostics ... ok
+test commands::template::tests::timing_does_not_change_stdout_json ... ok
+test commands::template::tests::timing_flag_defaults_off_and_combines_with_json_no_wait ... ok
+test commands::template::tests::timing_no_wait_never_polls_or_reports_ssh_work ... ok
+test commands::template::tests::timing_opt_out_and_sink_failure_do_not_affect_results ... ok
+test commands::template::tests::timing_records_success_error_cancel_and_redacts ... ok
+test commands::template::tests::timing_total_captures_validation_failure_without_remote_access ... ok
+test commands::template::tests::undelivered_template_config_error_names_keys_and_recovery ... ok
+test commands::template::tests::unknown_templates_are_resolved_by_paas_before_ssh_validation ... ok
+test commands::tests::deployment_progress_formats_counts_and_deadlines ... ok
+test commands::verify::tests::accepts_only_bare_https_origins ... ok
+test tests::debug_build_allows_dev_flags ... ok
+
+test result: ok. 235 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.12s
+
+     Running tests/api_client_test.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/api_client_test-e82d7ce132076843)
+
+running 21 tests
+test api_client_refuses_to_follow_redirects ... ok
+test api_client_rejects_oversized_error_body ... ok
+test api_client_rejects_oversized_streamed_success_body_without_content_length ... ok
+test api_client_rejects_oversized_success_body ... ok
+test api_error_display ... ok
+test api_errors_preserve_paas_error_code ... ok
+test auth_discovery_gets_well_known_enclava_contract ... ok
+test auth_discovery_propagates_405_for_legacy_fallback ... ok
+test auth_discovery_rejects_malformed_success ... ok
+test auth_discovery_rejects_success_without_auth_methods ... ok
+test client_from_config ... ok
+test client_with_auth_constructs ... ok
+test client_without_auth_returns_not_authenticated ... ok
+test create_template_instance_posts_hosted_route_with_idempotency_key ... ok
+test deliver_managed_template_config_posts_hosted_paas_route ... ok
+test device_login_uses_discovered_split_host_endpoints ... ok
+test discovered_device_endpoint_rejects_remote_plain_http ... ok
+test get_template_ssh_command_uses_hosted_paas_route ... ok
+test list_templates_gets_hosted_templates_route ... ok
+test not_authenticated_error_display ... ok
+test sync_config_key_posts_metadata_callback ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.92s
+
+     Running tests/api_contract_test.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/api_contract_test-d8797ab700b7dbc2)
+
+running 20 tests
+test app_response_accepts_phase7_fields_when_server_exposes_them ... ok
+test auth_discovery_response_accepts_hosted_device_code_only ... ok
+test auth_discovery_response_accepts_standalone_email_and_nostr ... ok
+test auth_discovery_response_requires_auth_methods ... ok
+test auth_discovery_response_tolerates_optional_fields ... ok
+test auth_response_matches_server_shape ... ok
+test create_template_instance_request_can_omit_stable_endpoint_expectation ... ok
+test current_user_accepts_deploy_eligibility_fields ... ok
+test deploy_request_serializes_signed_artifact_blobs ... ok
+test deployment_entry_accepts_legacy_deployment_id_field ... ok
+test hosted_template_response_accepts_stable_ssh_endpoint_metadata ... ok
+test list_apps_deserializes_bare_array ... ok
+test list_members_deserializes_bare_array ... ok
+test list_orgs_deserializes_bare_array ... ok
+test login_request_uses_nostr_event_field_name ... ok
+test signup_request_includes_provider ... ok
+test ssh_command_response_accepts_pending_and_ready_states ... ok
+test template_instance_response_accepts_config_token_and_cap_payload ... ok
+test unlock_mode_transition_request_contains_only_mode ... ok
+test unlock_mode_transition_response_deserializes ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/app_config_test.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/app_config_test-61855dc0e1a73f9f)
+
+running 7 tests
+test load_from_file ... ok
+test load_missing_file_returns_error ... ok
+test parse_full_toml ... ok
+test parse_minimal_toml ... ok
+test parse_rejects_empty_command_arg ... ok
+test parse_rejects_empty_name ... ok
+test parse_rejects_invalid_unlock_mode ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/config_test.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/config_test-0586610ef86d1911)
+
+running 11 tests
+test auth_token_falls_back_to_api_key ... ok
+test auth_token_prefers_session_over_api_key ... ok
+test bootstrap_key_path_is_org_scoped ... ok
+test cli_paths_from_explicit_root ... ok
+test cli_state_directory_can_be_isolated ... Logged out. Local recovery keys were left in place.
+ok
+test credentials_file_has_restricted_permissions ... ok
+test ensure_dirs_creates_structure ... ok
+test load_missing_config_returns_defaults ... ok
+test save_and_load_config_round_trip ... ok
+test save_and_load_credentials_round_trip ... ok
+test save_config_restricts_state_dir_before_first_credentials_write ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/deploy_artifacts_test.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/deploy_artifacts_test-e9b4708e69188f7b)
+
+running 5 tests
+test cap_oci_runtime_spec_matches_platform_managed_ssh_relay_profile ... ok
+test cap_oci_runtime_spec_matches_rendered_app_container_fields ... ok
+test cap_oci_runtime_spec_matches_rootful_sudo_profile ... ok
+test cap_oci_runtime_spec_preserves_workload_command_as_wait_exec_args ... ok
+test deploy_descriptor_and_keyring_envelopes_serialize_for_deploy_request ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/descriptor_vectors.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/descriptor_vectors-ee08532b4388075f)
+
+running 4 tests
+test descriptor_canonical_bytes_matches_fixture ... ok
+test descriptor_core_canonical_bytes_matches_fixture ... ok
+test descriptor_core_hash_is_stable ... ok
+test independent_verification_descriptor_core_hash_is_stable ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/init_test.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/init_test-160b5349588ff489)
+
+running 1 test
+test init_generates_valid_toml ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/manual_cli_mvp_test.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/manual_cli_mvp_test-a8e0e866e91087e4)
+
+running 1 test
+test clean_state_backup_restore_recreates_owner_and_app_keys ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.96s
+
+     Running tests/tee_client_test.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/tee_client_test-893f3cb285988dc9)
+
+running 3 tests
+test tee_client_constructs_with_bare_domain ... ok
+test tee_client_constructs_with_https_prefix ... ok
+test tee_client_constructs_with_trailing_slash ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+     Running unittests src/lib.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/enclava_common-fa2af5a998440cf2)
+
+running 70 tests
+test canonical::tests::collision_test_distinguishes_boundary_shift ... ok
+test canonical::tests::decode_rejects_every_truncation ... ok
+test canonical::tests::decode_rejects_invalid_utf8_labels ... ok
+test canonical::tests::decode_round_trips_binary_values ... ok
+test canonical::tests::deterministic ... ok
+test canonical::tests::empty_records_encode_to_empty_bytes ... ok
+test canonical::tests::hash_is_sha256_of_bytes ... ok
+test canonical::tests::order_dependent ... ok
+test canonical::tests::single_record_layout_is_length_prefixed_tlv ... ok
+test crypto::tests::identity_hash_deterministic ... ok
+test crypto::tests::identity_hash_is_lowercase_hex_64_chars ... ok
+test crypto::tests::identity_hash_resists_boundary_collision ... ok
+test crypto::tests::identity_hash_sensitive_to_all_inputs ... ok
+test crypto::tests::owner_rotation_directive_is_deterministic_and_domain_separated ... ok
+test hostnames::tests::app_hostname_happy_path ... ok
+test hostnames::tests::plain_http_is_limited_to_loopback_and_cluster_hosts ... ok
+test hostnames::tests::rejects_assembled_hostname_too_long ... ok
+test hostnames::tests::rejects_injection_attempts ... ok
+test hostnames::tests::rejects_invalid_app_name ... ok
+test hostnames::tests::rejects_invalid_org_slug ... ok
+test hostnames::tests::rejects_invalid_platform_domain ... ok
+test hostnames::tests::tee_hostname_happy_path ... ok
+test log_encryption::tests::decrypt_rejects_tampered_routing_context ... ok
+test log_encryption::tests::decrypt_rejects_wrong_private_key ... ok
+test log_encryption::tests::generated_keypair_encrypts_and_decrypts_frame ... ok
+test log_encryption::tests::private_key_reconstructs_matching_public_keypair ... ok
+test orgs::tests::slug_is_eight_lowercase_hex ... ok
+test orgs::tests::slug_passes_org_slug_validator ... ok
+test registry::tests::docker_hub_official_images_normalize_to_library ... ok
+test registry::tests::escaped_quotes_survive ... ok
+test registry::tests::joined_challenges_keep_their_own_parameters ... ok
+test registry::tests::parses_docker_hub_style_challenge ... ok
+test registry::tests::parses_ghcr_style_challenge ... ok
+test registry::tests::quoted_commas_survive ... ok
+test registry::tests::realm_binding_maps_only_known_auth_services ... ok
+test registry::tests::rejects_challenge_without_realm ... ok
+test registry::tests::rejects_non_bearer_scheme ... ok
+test registry::tests::selects_bearer_among_multiple_field_values ... ok
+test registry::tests::spaced_auth_params_stay_in_their_challenge ... ok
+test registry::tests::tolerates_unquoted_params_and_unknown_keys ... ok
+test validate::tests::app_name_accepts_valid ... ok
+test validate::tests::app_name_admission_requires_a_leading_letter ... ok
+test validate::tests::app_name_rejects_oversized ... ok
+test validate::tests::app_name_rejects_reserved_and_hyphen_shapes ... ok
+test validate::tests::dns_label_accepts_all_digits ... ok
+test validate::tests::dns_label_accepts_valid ... ok
+test validate::tests::dns_label_rejects_at_sign ... ok
+test validate::tests::dns_label_rejects_empty ... ok
+test validate::tests::dns_label_rejects_leading_or_trailing_hyphen ... ok
+test validate::tests::dns_label_rejects_oversized ... ok
+test validate::tests::dns_label_rejects_path_traversal_and_control_chars ... ok
+test validate::tests::dns_label_rejects_underscore_and_dot ... ok
+test validate::tests::dns_label_rejects_unicode_and_rtl_override ... ok
+test validate::tests::dns_label_rejects_uppercase ... ok
+test validate::tests::fqdn_accepts_all_digit_label ... ok
+test validate::tests::fqdn_accepts_valid ... ok
+test validate::tests::fqdn_rejects_empty_label ... ok
+test validate::tests::fqdn_rejects_empty_or_oversized ... ok
+test validate::tests::fqdn_rejects_invalid_labels ... ok
+test validate::tests::fqdn_rejects_non_ascii_homograph ... ok
+test validate::tests::fqdn_rejects_path_and_control_chars ... ok
+test validate::tests::fqdn_rejects_punycode_idn ... ok
+test validate::tests::fqdn_rejects_trailing_or_leading_dot ... ok
+test validate::tests::image_digest_accepts_valid ... ok
+test validate::tests::image_digest_rejects_missing_prefix ... ok
+test validate::tests::image_digest_rejects_uppercase_or_non_hex ... ok
+test validate::tests::image_digest_rejects_wrong_hex_length ... ok
+test validate::tests::org_slug_accepts_8_lowercase_hex ... ok
+test validate::tests::org_slug_rejects_uppercase_or_non_hex ... ok
+test validate::tests::org_slug_rejects_wrong_length ... ok
+
+test result: ok. 70 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/crypto_test.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/crypto_test-7f27b6198df82485)
+
+running 3 tests
+test identity_hash_is_lowercase_hex_64_chars ... ok
+test identity_hash_matches_explicit_ce_v1_construction ... ok
+test identity_hash_resists_boundary_collision ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/image_test.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/image_test-67cd69bbc27f7ba1)
+
+running 8 tests
+test digest_ref_string ... ok
+test parse_bare_image ... ok
+test parse_digest_ref ... ok
+test parse_rejects_non_sha256_digest ... ok
+test parse_rejects_short_sha256_digest ... ok
+test parse_tag_ref ... ok
+test require_digest_accepts_pinned ... ok
+test require_digest_rejects_tag_only ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/enclava_engine-b867778f0df6cee4)
+
+running 32 tests
+test apply::cleanup::tests::cap_owned_pvc_names_match ... ok
+test apply::cleanup::tests::foreign_pvc_names_do_not_match ... ok
+test apply::cleanup::tests::other_statefulsets_claims_are_not_swept ... ok
+test apply::engine::public_code_tests::provider_fencing_errors_have_fixed_public_codes ... ok
+test apply::fields_v1::tests::empty_subtree_leaf_owns_whole_subtree ... ok
+test apply::fields_v1::tests::flattens_fields_and_annotations ... ok
+test apply::fields_v1::tests::unattributable_shapes_fail_closed ... ok
+test apply::generation::tests::canceled_absent_create_can_still_land_at_provider ... ok
+test apply::generation::tests::concurrent_writer_churn_cannot_terminally_fail_apply ... ok
+test apply::generation::tests::concurrent_writer_churn_cannot_terminally_fail_partial_apply ... ok
+test apply::generation::tests::conflict_retry_backoff_is_bounded ... ok
+test apply::generation::tests::detached_old_delete_cannot_remove_replacement_generation ... ok
+test apply::generation::tests::detached_old_ssa_cannot_overwrite_newer_generation ... ok
+test apply::generation::tests::dr_scale_resume_then_new_generation_apply_converges ... ok
+test apply::generation::tests::exact_trusted_update_prunes_omitted_statefulset_fields ... ok
+test apply::generation::tests::externally_owned_field_change_fails_closed_promptly ... ok
+test apply::generation::tests::foreign_write_during_escalation_deauthorizes_the_force ... ok
+test apply::generation::tests::partial_statefulset_mutations_preserve_unrelated_owned_fields ... ok
+test apply::generation::tests::replicas_owner_cannot_block_new_generation_apply ... ok
+test apply::generation::tests::server_quoted_cause_fields_classify_against_owned_subtrees ... ok
+test apply::generation::tests::stale_conflict_evidence_cannot_authorize_force ... ok
+test apply::generation::tests::trusted_update_owner_can_be_reclaimed_without_ignoring_external_managers ... ok
+test apply::generation::tests::unattributable_ownership_fails_closed_instead_of_forcing ... ok
+test manifest::cc_init_data::round19_tests::multiline_literal_round_trips_with_and_without_final_newline ... ok
+test manifest::containers::tests::legacy_shell_escape_quotes_signed_command_args ... ok
+test manifest::ingress::tests::validate_email_accepts_simple ... ok
+test manifest::ingress::tests::validate_email_rejects_injection ... ok
+test manifest::ingress::tests::validate_https_url_rejects_injection ... ok
+test manifest::shape::tests::binary_quantities_parse_to_mib ... ok
+test manifest::shape::tests::small_request_never_exceeds_limit ... ok
+test manifest::shape::tests::small_shape_selects_below_standard_request ... ok
+test manifest::shape::tests::small_shape_uses_dedicated_class ... ok
+
+test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.49s
+
+     Running tests/apply_and_watch_test.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/apply_and_watch_test-1e40e66021b04528)
+
+running 2 tests
+test apply_and_watch_completes_or_times_out ... ignored
+test apply_and_watch_rejects_invalid_app_before_any_kube_request ... ok
+
+test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/apply_cleanup_test.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/apply_cleanup_test-46f5ad177484c7be)
+
+running 5 tests
+test cleanup_handles_nonexistent_namespace ... ignored
+test cleanup_report_failure_messages ... ok
+test cleanup_report_starts_empty ... ok
+test cleanup_report_tracks_failures ... ok
+test cleanup_report_tracks_successes ... ok
+
+test result: ok. 4 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/apply_drift_test.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/apply_drift_test-35ccb8a9db6ddc5b)
+
+running 7 tests
+test check_drift_detects_missing_statefulset ... ignored
+test check_drift_no_drift_after_apply ... ignored
+test drift_result_drifted_when_hashes_differ ... ok
+test drift_result_drifted_when_no_live_hash ... ok
+test drift_result_no_drift_when_hashes_match ... ok
+test manifest_hash_changes_when_enclava_init_configmap_changes ... ok
+test manifest_hash_is_consistent_for_drift ... ok
+
+test result: ok. 5 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/apply_namespace_test.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/apply_namespace_test-5ca70179476aa998)
+
+running 3 tests
+test apply_namespace_creates_and_updates ... ignored
+test namespace_apply_does_not_force ... ok
+test namespace_apply_trusted_managers_converge_with_force ... ok
+
+test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/apply_network_policy_test.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/apply_network_policy_test-7179adf28041adfe)
+
+running 4 tests
+test apply_cilium_network_policy_creates ... ignored
+test cilium_api_resource_has_correct_group ... ok
+test value_to_dynamic_object_preserves_name_and_namespace ... ok
+test value_to_dynamic_object_rejects_missing_metadata ... ok
+
+test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/apply_orchestrator_test.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/apply_orchestrator_test-f029f493c45a014d)
+
+running 5 tests
+test apply_all_creates_full_stack ... ignored
+test apply_all_is_idempotent ... ignored
+test manifest_hash_changes_with_different_app ... ok
+test manifest_hash_is_64_hex_chars ... ok
+test manifest_hash_is_deterministic ... ok
+
+test result: ok. 3 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/apply_resources_test.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/apply_resources_test-e2166ea2beb3fcb5)
+
+running 2 tests
+test apply_configmap_creates ... ignored
+test apply_service_account_creates ... ignored
+
+test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/apply_statefulset_test.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/apply_statefulset_test-c4945cdee17e50d1)
+
+running 1 test
+test apply_statefulset_creates ... ignored
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/apply_types_test.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/apply_types_test-3989bdff0bc8f7c5)
+
+running 6 tests
+test default_timeout_is_ten_minutes ... ok
+test deploy_status_starts_as_applying ... ok
+test non_terminal_phases ... ok
+test phase_ordering_is_monotonic ... ok
+test status_with_message ... ok
+test terminal_phases ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/apply_watch_test.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/apply_watch_test-84d874d3218c0e23)
+
+running 16 tests
+test container_creating_is_not_a_runtime_failure ... ok
+test failed_pod_maps_to_failed ... ok
+test fresh_or_finalized_terminating_pod_is_not_force_deleted ... ok
+test pending_not_scheduled_maps_to_pods_scheduled ... ok
+test pending_pod_maps_to_pods_scheduled_or_tee_booting ... ok
+test pod_label_selector_matches_generated_statefulset_labels ... ok
+test running_container_ignores_recovered_last_start_error ... ok
+test running_not_ready_maps_to_attesting ... ok
+test running_pod_with_crashloop_after_start_error_reports_runtime_failure ... ok
+test running_ready_maps_to_running ... ok
+test stale_statefulset_revision_does_not_fail_replacement_rollout ... ok
+test stale_terminating_pod_after_grace_needs_force_delete ... ok
+test terminal_pod_failure_does_not_retain_workload_controlled_name ... ok
+test terminating_pod_does_not_fail_replacement_rollout ... ok
+test unknown_phase_maps_to_tee_booting ... ok
+test watch_rollout_times_out_on_missing_statefulset ... ignored
+
+test result: ok. 15 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/issue138_engine_robustness_test.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/issue138_engine_robustness_test-8a199b14a23ca791)
+
+running 20 tests
+test benign_policy_keeps_literal_block_embedding ... ok
+test cap_vct_names_match_statefulset_pvc_pattern ... ok
+test policy_text_with_carriage_returns_round_trips_via_basic_string ... ok
+test policy_text_with_control_characters_produces_valid_toml ... ok
+test policy_text_with_triple_single_quotes_cannot_break_toml ... ok
+test validate_accepts_valid_log_encryption ... ok
+test validate_matches_api_trailing_zero_normalization ... ok
+test validate_rejects_cpu_forms_the_api_never_writes ... ok
+test validate_rejects_egress_port_zero ... ok
+test validate_rejects_empty_egress_allowlist_ports ... ok
+test validate_rejects_invalid_attestation_pubkey_hex ... ok
+test validate_rejects_invalid_custom_domain ... ok
+test validate_rejects_invalid_egress_allowlist_host ... ok
+test validate_rejects_invalid_platform_domain ... ok
+test validate_rejects_invalid_resource_quantities ... ok
+test validate_rejects_invalid_storage_sizes ... ok
+test validate_rejects_invalid_tee_domain ... ok
+test validate_rejects_memory_and_storage_forms_the_api_never_writes ... ok
+test validate_rejects_mismatched_log_encryption_hash ... ok
+test validate_rejects_quantities_exceeding_api_precision_bounds ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/manifest_bootstrap_test.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/manifest_bootstrap_test-71b99c50c7b6907c)
+
+running 8 tests
+test bootstrap_configmap_has_script_data ... ok
+test bootstrap_configmap_name ... ok
+test bootstrap_configmap_namespace ... ok
+test bootstrap_proxy_wait_accepts_locked_health ... ok
+test bootstrap_script_contains_ownership_bootstrap ... ok
+test bootstrap_script_contains_secure_pv_bootstrap ... ok
+test bootstrap_script_is_non_empty ... ok
+test bootstrap_script_starts_with_shebang ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/manifest_cc_init_data_test.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/manifest_cc_init_data_test-2414de575a6beefe)
+
+running 31 tests
+test agent_policy_create_container_is_bound_to_workload_identity ... ok
+test agent_policy_fails_closed ... ok
+test data_claims_bind_root_workload_identity_and_trustee_flag ... ok
+test data_claims_include_required_rego_descriptor_anchors ... ok
+test encode_gzip_has_zero_mtime ... ok
+test encode_produces_valid_base64 ... ok
+test encode_roundtrips_through_gzip ... ok
+test log_encryption_claim_is_bound_to_cc_init_data ... ok
+test runtime_class_accepts_coco_dev_in_debug_builds ... ok
+test runtime_class_accepts_coco_dev_in_release_builds_with_escape_hatch ... ok
+test runtime_class_defaults_to_snp ... ok
+test runtime_class_rejects_unknown_values ... ok
+test runtime_class_requires_escape_hatch_for_coco_dev_in_release_builds ... ok
+test sha256_hex_is_64_lowercase_hex ... ok
+test sha256_hex_is_deterministic ... ok
+test toml_binds_coco_dev_runtime_class_when_explicitly_selected ... ok
+test toml_binds_runtime_class ... ok
+test toml_binds_sidecar_digests ... ok
+test toml_contains_aa_toml ... ok
+test toml_contains_cdh_toml ... ok
+test toml_contains_identity_toml ... ok
+test toml_contains_image_digest ... ok
+test toml_contains_namespace ... ok
+test toml_contains_policy_instance_annotation ... ok
+test toml_contains_policy_rego ... ok
+test toml_contains_service_account ... ok
+test toml_contains_workload_artifact_binding_when_present ... ok
+test toml_embeds_generated_agent_policy_when_present ... ok
+test toml_serializes_adversarial_claim_values_without_breakout ... ok
+test toml_structure_matches_python_template ... ok
+test verify_runtime_class_binding_passes_for_default_render ... ok
+
+test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/manifest_containers_test.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/manifest_containers_test-ff19a0d326168405)
+
+running 38 tests
+test app_container_does_not_use_sh_c ... ok
+test app_container_has_no_kubernetes_subpath_mounts ... ok
+test app_container_is_not_privileged ... ok
+test app_container_leaves_declared_storage_paths_for_enclava_init_bind_mounts ... ok
+test app_container_mounts_state_filesystem ... ok
+test app_container_name ... ok
+test app_container_omits_startup_mount_for_explicit_command ... ok
+test app_container_platform_managed_ssh_relay_profile_runs_root_supervisor ... ok
+test app_container_reads_seed_from_state_app ... ok
+test app_container_rootful_sudo_profile_allows_sudo_elevation ... ok
+test app_container_starts_under_wait_wrapper ... ok
+test app_container_uses_tcp_readiness_without_liveness ... ok
+test caddy_container_dns01_broker_waits_for_tls_handoff_before_starting_caddy ... ok
+test caddy_container_does_not_mount_cloudflare_token ... ok
+test caddy_container_does_not_mount_extra_tools ... ok
+test caddy_container_has_no_cf_api_token_env ... ok
+test caddy_container_internal_tls_uses_high_port ... ok
+test caddy_container_internal_tls_uses_tmp_runtime_dirs ... ok
+test caddy_container_is_unprivileged_without_bind_capabilities ... ok
+test caddy_container_mounts_runtime_handoff_for_persistence ... ok
+test caddy_container_name_and_port ... ok
+test caddy_container_reads_seed_from_state_caddy ... ok
+test caddy_container_uses_writable_caddy_runtime_dirs ... ok
+test caddy_container_waits_for_init_ready_before_starting_caddy ... ok
+test enclava_init_container_has_memory_for_unlock_verification_and_certificate_provisioning ... ok
+test enclava_init_container_is_mounter_sidecar_and_keeps_only_sys_admin ... ok
+test enclava_init_container_mounts_both_luks_devices_and_unlock_socket ... ok
+test enclava_init_container_waits_for_tenant_ingress_sentinel ... ok
+test enclava_init_container_waits_for_workloads_and_marks_ready_file ... ok
+test enclava_tools_init_container_has_resources_for_tenant_quota ... ok
+test enclava_tools_init_container_prepares_group_restricted_wait_handoff ... ok
+test password_app_container_omits_startup_probe_while_waiting_for_unlock ... ok
+test prod_strict_pinned_env_values_match_compiled_defaults ... ok
+test proxy_container_can_create_sev_guest_device_for_auto_unlock ... ok
+test proxy_container_mounts_state_filesystem_for_config_storage ... ok
+test proxy_container_mounts_unlock_socket ... ok
+test proxy_container_name_and_port ... ok
+test proxy_container_receives_workload_required_config_keys ... ok
+
+test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/manifest_enclava_init_config_test.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/manifest_enclava_init_config_test-8372fac8d8c0482d)
+
+running 12 tests
+test cm_name_is_per_app ... ok
+test config_toml_defaults_trustee_policy_read_to_false ... ok
+test config_toml_has_both_volume_blocks ... ok
+test config_toml_has_required_unlock_inputs ... ok
+test config_toml_has_runtime_ownership_and_app_bind_mounts ... ok
+test config_toml_parses ... ok
+test config_toml_places_runtime_keys_at_document_root ... ok
+test config_toml_prefers_local_verification_artifacts_when_present ... ok
+test config_toml_renders_public_log_encryption_metadata_only ... ok
+test config_toml_renders_trustee_policy_read_settings_when_enabled ... ok
+test config_toml_uses_root_app_identity_for_platform_ssh_relay ... ok
+test config_toml_uses_root_app_identity_for_rootful_sudo ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/manifest_gateway_test.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/manifest_gateway_test-3dd03593c6a1f985)
+
+running 6 tests
+test custom_domain_routes_custom_hostname ... ok
+test gateway_resources_are_instance_scoped ... ok
+test gateway_uses_tls_passthrough ... ok
+test sni_route_configmap_matches_haproxy_discovery_contract ... ok
+test tee_tls_route_routes_tee_domain_to_attestation_service_port ... ok
+test tls_route_routes_domain_to_tenant_service ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/manifest_ingress_adversarial_test.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/manifest_ingress_adversarial_test-06338ae9981b79f4)
+
+running 3 tests
+test render_rejects_injection_in_acme_url ... ok
+test render_rejects_injection_via_custom_domain ... ok
+test render_succeeds_on_validated_inputs ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/manifest_ingress_test.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/manifest_ingress_test-6273ba01701ac6b2)
+
+running 17 tests
+test caddyfile_acme_mode_disables_extra_caddy_runtime_surfaces ... ok
+test caddyfile_contains_app_port ... ok
+test caddyfile_contains_domain ... ok
+test caddyfile_defaults_to_letsencrypt_production ... ok
+test caddyfile_dns01_broker_mode_uses_static_enclave_owned_certificate ... ok
+test caddyfile_drops_dns01_cloudflare_path ... ok
+test caddyfile_has_attestation_proxy_route ... ok
+test caddyfile_has_health_route ... ok
+test caddyfile_has_unlock_route ... ok
+test caddyfile_has_well_known_confidential_routes ... ok
+test caddyfile_internal_tls_mode_skips_acme ... ok
+test caddyfile_uses_configured_acme_ca ... ok
+test caddyfile_uses_rootfs_tls_storage_path ... ok
+test custom_domain_app_uses_custom_domain ... ok
+test custom_domain_keeps_platform_domain_in_site_block ... ok
+test ingress_configmap_name ... ok
+test ingress_configmap_namespace ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/manifest_integration_test.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/manifest_integration_test-90230503ff4e01bb)
+
+running 7 tests
+test all_managed_resources_have_managed_by_label ... ok
+test all_namespaced_resources_share_namespace ... ok
+test explicit_command_app_statefulset_omits_startup_volume_and_mount ... ok
+test generate_all_manifests_returns_all_resources ... ok
+test kbs_policy_rego_integrates_with_owner_binding ... ok
+test manifests_serialize_to_yaml ... ok
+test service_account_references_image_pull_secret_when_configured ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/manifest_kbs_policy_test.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/manifest_kbs_policy_test-21eada487829db41)
+
+running 20 tests
+test full_policy_contains_owner_bindings ... ok
+test full_policy_contains_package_declaration ... ok
+test full_policy_contains_tls_resource_bindings ... ok
+test full_policy_escapes_metacharacters_in_namespace_and_service_account ... ok
+test full_policy_with_legacy_bindings ... ok
+test full_policy_without_legacy_bindings_has_empty_resource_bindings ... ok
+test hostile_namespace_cannot_inject_rego_source ... ok
+test multiple_apps_produce_multiple_bindings ... ok
+test owner_binding_has_allowed_tags ... ok
+test owner_binding_has_identity_hash ... ok
+test owner_binding_has_namespace ... ok
+test owner_binding_has_repository ... ok
+test owner_binding_has_service_account ... ok
+test owner_binding_key_uses_namespace_and_app_name_owner ... ok
+test tls_binding_anchors_image_init_data_and_signer_identity ... ok
+test tls_binding_blank_signer_identities_render_as_empty_arrays ... ok
+test tls_binding_has_namespace_service_account_and_identity_hash ... ok
+test tls_binding_has_workload_secret_seed_tag ... ok
+test tls_binding_key_uses_namespace_and_app_name_tls ... ok
+test validate_app_rejects_non_dns_namespace_and_service_account ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/manifest_namespace_test.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/manifest_namespace_test-0017a1978557d656)
+
+running 4 tests
+test namespace_has_correct_name ... ok
+test namespace_has_managed_by_label ... ok
+test namespace_has_pod_security_labels ... ok
+test namespace_serializes_to_yaml ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/manifest_network_policy_test.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/manifest_network_policy_test-61e17ebe7307915a)
+
+running 24 tests
+test cap_api_namespace_requires_an_explicit_internal_service_url ... ok
+test default_app_has_no_world_egress ... ok
+test default_egress_includes_platform_endpoints ... ok
+test dns01_broker_kubernetes_service_url_is_allowed_for_static_certificate_provisioning ... ok
+test dns01_broker_url_is_allowed_for_static_certificate_provisioning ... ok
+test egress_allowlist_renders_one_rule_per_entry ... ok
+test empty_egress_allowlist_renders_zero_extra_rules ... ok
+test generated_policy_denies_non_public_dns_results_by_default ... ok
+test internal_egress_opt_in_still_denies_metadata_and_link_local_results ... ok
+test network_policy_api_version ... ok
+test network_policy_egress_has_dns ... ok
+test network_policy_egress_has_kbs ... ok
+test network_policy_egress_has_kbs_service ... ok
+test network_policy_egress_has_same_namespace ... ok
+test network_policy_ingress_allows_cap_api_to_confidential_tls_ports ... ok
+test network_policy_ingress_allows_envoy_gateway ... ok
+test network_policy_ingress_allows_platform_edge_host_path_on_public_ports ... ok
+test network_policy_ingress_allows_same_namespace ... ok
+test network_policy_namespace ... ok
+test operator_named_cap_service_gets_relay_and_tee_rules ... ok
+test per_app_egress_extends_platform_default ... ok
+test public_internet_egress_uses_cidr_exclusions_not_world_entity ... ok
+test restricted_egress_mode_does_not_emit_public_cidr ... ok
+test world_is_never_in_default_egress ... ok
+
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/manifest_phase12_gate_test.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/manifest_phase12_gate_test-357cd07daf6073de)
+
+running 1 test
+test phase12_manifest_security_snapshot_matches ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/manifest_resource_quota_test.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/manifest_resource_quota_test-16b7f3a24c3e83a5)
+
+running 8 tests
+test resource_quota_blocks_loadbalancers_and_nodeports ... ok
+test resource_quota_has_cpu_limits ... ok
+test resource_quota_has_memory_limits ... ok
+test resource_quota_has_pods_services_secrets_configmaps ... ok
+test resource_quota_has_storage ... ok
+test resource_quota_is_unchanged_by_encrypted_log_relay ... ok
+test resource_quota_name_and_namespace ... ok
+test resource_quota_serializes_to_yaml ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/manifest_service_account_test.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/manifest_service_account_test-cc8eae03e05c35c0)
+
+running 4 tests
+test service_account_disables_automount_token ... ok
+test service_account_has_correct_name ... ok
+test service_account_has_correct_namespace ... ok
+test service_account_has_managed_by_label ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/manifest_service_test.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/manifest_service_test-19a899c2c41ee20a)
+
+running 6 tests
+test service_has_attestation_port ... ok
+test service_has_https_port ... ok
+test service_internal_tls_maps_https_to_caddy_high_port ... ok
+test service_name_and_namespace ... ok
+test service_selector_matches_app ... ok
+test service_serializes_to_yaml ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/manifest_shape_test.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/manifest_shape_test-e0c989a59a3611b7)
+
+running 6 tests
+test fractional_small_limit_quota_rounds_up ... ok
+test mixed_unit_storage_quota_covers_both_claims ... ok
+test small_app_cross_artifact_agreement ... ok
+test small_app_gateway_requests_and_placement ... ok
+test small_app_renders_small_pod_shape ... ok
+test standard_app_output_is_unchanged ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/manifest_statefulset_test.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/manifest_statefulset_test-46ecb2fd039327e3)
+
+running 23 tests
+test statefulset_configures_enclava_init_log_relay_only_with_log_key_metadata ... ok
+test statefulset_does_not_request_guest_kernel_modules ... ok
+test statefulset_has_cc_init_data_annotation ... ok
+test statefulset_has_init_data_sha256_annotation ... ok
+test statefulset_has_kata_runtime_annotation ... ok
+test statefulset_has_kernel_params_annotation ... ok
+test statefulset_has_policy_instance_annotation ... ok
+test statefulset_has_two_volume_claim_templates ... ok
+test statefulset_has_volumes ... ok
+test statefulset_name ... ok
+test statefulset_namespace ... ok
+test statefulset_node_selector ... ok
+test statefulset_phase5_uses_only_steady_state_containers ... ok
+test statefulset_pod_spec_disables_automount ... ok
+test statefulset_pod_spec_disables_service_links ... ok
+test statefulset_replicas ... ok
+test statefulset_resolves_external_and_cluster_service_names ... ok
+test statefulset_retain_policy ... ok
+test statefulset_runtime_class ... ok
+test statefulset_selector_matches_labels ... ok
+test statefulset_service_account ... ok
+test statefulset_service_name ... ok
+test statefulset_shares_process_namespace_for_in_guest_bind_mounts ... ok
+
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/manifest_verification_material_test.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/manifest_verification_material_test-2b48f7d8e75930e1)
+
+running 2 tests
+test oversized_verification_material_is_rejected ... ok
+test verification_material_is_mounted_only_into_proxy ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/manifest_volumes_test.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/manifest_volumes_test-e56a4de1379f1257)
+
+running 20 tests
+test adding_layout_marker_without_updating_policy_hash_is_rejected - should panic ... ok
+test historical_policy_replay_preserves_bootstrap_volume_layout ... ok
+test legacy_bootstrap_keeps_disk_even_with_marked_policy ... 
+running 1 test
+test legacy_bootstrap_keeps_disk_even_with_marked_policy ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 19 filtered out; finished in 0.00s
+
+ok
+test logs_emptydir_fence_clears_observed_dm_integrity_endpoint ... ok
+test only_exact_first_line_policy_marker_selects_memory ... ok
+test vcts_state_uses_block_volume_mode ... ok
+test vcts_tls_state_uses_block_volume_mode ... ok
+test vcts_use_read_write_once ... ok
+test volumes_decrypted_mountpoints_use_memory_medium_and_1mi_limit ... ok
+test volumes_do_not_include_enclava_tools_emptydir ... ok
+test volumes_does_not_mount_cloudflare_token_in_phase5_default ... ok
+test volumes_enclava_tools_uses_memory_medium_and_16mi_limit ... ok
+test volumes_has_enclava_init_config_configmap ... ok
+test volumes_has_ownership_signal ... ok
+test volumes_has_startup_fallback_configmap ... ok
+test volumes_has_tenant_ingress_caddyfile ... ok
+test volumes_has_unlock_socket_memory_emptydir ... ok
+test volumes_have_shared_decrypted_mountpoints ... ok
+test volumes_logs_emptydir_is_disk_backed_and_bounded ... ok
+test volumes_omit_startup_configmap_for_explicit_command ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/types_test.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/types_test-4d33175e7c504a24)
+
+running 6 tests
+test all_apps_have_identity_fields ... ok
+test owner_resource_path_uses_namespace_app_name_and_tag ... ok
+test primary_domain_prefers_custom ... ok
+test primary_domain_returns_platform_domain ... ok
+test sample_app_has_digest_pinned_image ... ok
+test sample_app_serializes_to_json ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/validate_test.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/validate_test-2a50bfdda205786c)
+
+running 13 tests
+test name_must_be_dns_safe ... ok
+test rejects_attestation_proxy_without_digest ... ok
+test rejects_caddy_without_digest ... ok
+test rejects_empty_identity_hash ... ok
+test rejects_empty_name ... ok
+test rejects_empty_pubkey_hash ... ok
+test rejects_no_containers ... ok
+test rejects_no_primary_container ... ok
+test rejects_non_hex_identity_hash ... ok
+test rejects_tag_only_image ... ok
+test rejects_wrong_length_identity_hash ... ok
+test valid_auto_app_passes ... ok
+test valid_password_app_passes ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/lib.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/enclava_init-a2a9b375879d3409)
+
+running 163 tests
+test chown::tests::chown_on_symlink_does_not_follow_the_link ... ok
+test chown::tests::chown_recursive_skips_symlinks ... ok
+test chown::tests::resolve_invalid ... ok
+test chown::tests::resolve_named_user_when_lookup_succeeds ... ok
+test chown::tests::resolve_numeric_takes_precedence_over_lookup ... ok
+test chown::tests::resolve_numeric_uid_gid ... ok
+test chown::tests::resolve_numeric_uid_only ... ok
+test config::tests::parses_minimal_autounlock_config ... ok
+test config::tests::parses_ownership_and_bind_mounts ... ok
+test config::tests::parses_tls_certificate_broker_config ... ok
+test kbs_fetch::body_cap_tests::fetch_wrap_key_rejects_oversized_body ... ok
+test kbs_fetch::tests::fetch_wrap_key_200_returns_bytes ... ok
+test kbs_fetch::tests::fetch_wrap_key_401_attestation_rejected ... ok
+test kbs_fetch::tests::fetch_wrap_key_403_rego_denied ... ok
+test kbs_fetch::tests::fetch_wrap_key_404_not_found ... ok
+test kbs_fetch::tests::fetch_wrap_key_wrong_length ... ok
+test log_relay::round19_relay_tests::tail_read_is_bounded_by_sampled_length ... ok
+test log_relay::tests::anchor_seed_rejects_rewritten_snapshot_window ... ok
+test log_relay::tests::client_probe_sees_live_stray_and_departed_clients ... ok
+test log_relay::tests::connection_slots_bound_concurrency_and_release_on_drop ... ok
+test log_relay::tests::delivered_sequences_set_is_bounded ... ok
+test log_relay::tests::delivery_offset_tracks_scanned_lines_not_prestale_length ... ok
+test log_relay::tests::delivery_stops_at_buffer_bound_and_resumes_losslessly ... ok
+test log_relay::tests::follow_entry_without_held_handle_resyncs_without_replay ... ok
+test log_relay::tests::forged_max_sequence_does_not_blind_new_followers ... ok
+test log_relay::tests::forged_max_sequence_does_not_suppress_later_frames ... ok
+test log_relay::tests::frame_sequence_reads_plain_envelope_field ... ok
+test log_relay::tests::loopback_binds_are_accepted ... ok
+test log_relay::tests::off_loopback_binds_are_rejected ... ok
+test log_relay::tests::over_capacity_gets_503_and_vanished_clients_release_slots ... ok
+test log_relay::tests::poll_pacing_only_applies_when_caught_up_or_stalled ... ok
+test log_relay::tests::recycled_inode_fails_fingerprint_probe_and_resyncs ... ok
+test log_relay::tests::rotation_before_first_poll_does_not_replay_pre_tail_history ... ok
+test log_relay::tests::rotation_resync_dedups_already_delivered_sequences ... ok
+test log_relay::tests::rotation_resync_drops_incomplete_tail ... ok
+test log_relay::tests::rotation_resync_drops_old_handle_before_client_write ... ok
+test log_relay::tests::rotation_resync_drops_oversized_line_without_buffering ... ok
+test log_relay::tests::rotation_resync_passes_through_non_frame_lines ... ok
+test log_relay::tests::rotation_resync_withholds_oversized_fragment ... ok
+test log_relay::tests::rotation_resync_zero_boundary_fingerprints_head ... ok
+test log_relay::tests::rotation_via_rename_resets_follow_offset ... ok
+test log_relay::tests::same_inode_append_holds_no_fd_across_client_write ... ok
+test log_relay::tests::seeded_tail_cursor_follows_without_history_replay ... ok
+test log_relay::tests::spool_paths_directly_under_the_log_dir_are_accepted ... ok
+test log_relay::tests::spool_paths_outside_the_log_dir_are_rejected ... ok
+test log_relay::tests::stalled_follow_client_times_out_and_releases_thread ... ok
+test log_relay::tests::tail_lines_holds_back_incomplete_trailing_frame ... ok
+test log_relay::tests::tail_lines_rejects_planted_symlink ... ok
+test log_relay::tests::tail_lines_returns_open_spool_handle ... ok
+test log_relay::tests::tail_snapshot_anchor_matches_the_test_construction ... ok
+test log_relay::tests::unsent_pre_cursor_sequence_cannot_suppress_after_resync ... ok
+test log_relay::tests::unsent_pre_cursor_sequence_cannot_suppress_later_append ... ok
+test luks::unit_tests::blank_probe_distinguishes_fresh_and_nonempty_devices ... ok
+test luks::unit_tests::cryptsetup_status_device_parser_allows_missing_device_line ... ok
+test luks::unit_tests::format_decision_only_formats_blank_unformatted_devices ... ok
+test luks::unit_tests::format_decision_refuses_ambiguous_or_damaged_devices ... ok
+test luks::unit_tests::luks2_header_magic_detects_only_luks2 ... ok
+test luks::unit_tests::parses_cryptsetup_status_device_line ... ok
+test safe_diagnostics::tests::broker_code_classification_is_byte_exact ... ok
+test safe_diagnostics::tests::elapsed_retry_after_is_preserved_not_erased ... ok
+test safe_diagnostics::tests::generic_failure_renders_exact_safe_contract ... ok
+test safe_diagnostics::tests::rate_limited_failure_renders_validated_deadline ... ok
+test safe_diagnostics::tests::retry_after_horizon_is_bounded_in_both_directions ... ok
+test safe_diagnostics::tests::retry_after_parsing_accepts_only_bounded_utc_rfc3339 ... ok
+test safe_diagnostics::tests::typed_broker_failure_survives_contextual_anyhow_wrappers ... ok
+test safe_diagnostics::tests::unknown_errors_degrade_to_generic_without_chain_text ... ok
+test secrets::tests::derived_seed_zeroize_wires_up ... ok
+test secrets::tests::owner_seed_zeroize_wires_up ... ok
+test secrets::tests::password_zeroize_wires_up ... ok
+test secrets::tests::wrap_key_zeroize_wires_up ... ok
+test seeds::tests::distinct_info_yields_distinct_seeds ... ok
+test seeds::tests::hkdf_known_answer_independent_recompute ... ok
+test seeds::tests::rfc5869_test_case_3_truncated_to_32 ... ok
+test seeds::tests::same_inputs_yield_same_seed ... ok
+test socket::tests::bind_creates_socket_with_mode_0600 ... ok
+test socket::tests::oversized_request_is_rejected_without_unbounded_buffer_growth ... ok
+test socket::tests::read_owner_seed_round_trip ... ok
+test socket::tests::read_password_round_trip ... ok
+test tests::all_crates_dockerfiles_use_locked_builds ... ok
+test tests::dev_builds_honor_dev_no_luks_value ... ok
+test tests::dev_builds_honor_env_overrides ... ok
+test tests::dockerfile_defaults_to_locked_release_profile ... ok
+test tests::init_image_workflow_never_pushes_debug_images ... ok
+test tests::prod_strict_cannot_skip_luks ... ok
+test tests::prod_strict_gates_host_mutable_env_overrides ... ok
+test tls_certificate::tests::broker_failure_contract_generic_code_has_null_deadline ... ok
+test tls_certificate::tests::broker_failure_contract_keeps_rate_limit_code_and_validated_deadline ... ok
+test tls_certificate::tests::broker_raw_failure_text_never_reaches_error_or_files ... ok
+test tls_certificate::tests::broker_success_status_with_malformed_body_is_safe_terminal_failure ... ok
+test tls_certificate::tests::broker_terminal_failure_reaches_provisioning_error_as_typed_diagnostic ... ok
+test tls_certificate::tests::certificate_paths_match_caddyfile_static_tls_paths ... ok
+test tls_certificate::tests::cooldown_marker_carries_non_terminal_safe_contract ... ok
+test tls_certificate::tests::dangling_symlink_at_cert_path_never_reaches_broker ... ok
+test tls_certificate::tests::dangling_symlink_at_key_path_with_retained_certificate_fails_closed ... ok
+test tls_certificate::tests::directory_at_cert_path_never_reaches_broker ... ok
+test tls_certificate::tests::directory_at_key_path_with_retained_certificate_fails_closed ... ok
+test tls_certificate::tests::elapsed_broker_deadline_keeps_terminal_rate_limit_failure ... ok
+test tls_certificate::tests::generated_key_is_persisted_and_reused_for_csrs ... ok
+test tls_certificate::tests::local_cc_init_data_hash_reads_signed_runtime_toml ... ok
+test tls_certificate::tests::mismatched_persisted_deadline_is_dropped_and_ignored ... ok
+test tls_certificate::tests::missing_cert_with_retained_key_retries_issuance_with_same_key ... ok
+test tls_certificate::tests::oversized_broker_body_is_rejected_before_buffering_or_surfacing ... ok
+test tls_certificate::tests::persisted_deadline_resumes_wait_before_new_order ... ok
+test tls_certificate::tests::production_public_roots_reject_synthetic_and_staging_like_chains ... ok
+test tls_certificate::tests::rate_limited_beyond_wait_bound_stays_terminal ... ok
+test tls_certificate::tests::rate_limited_cooldown_waits_then_retries_to_success ... ok
+test tls_certificate::tests::rate_limited_rounds_are_bounded_then_terminal ... ok
+test tls_certificate::tests::rate_limited_without_deadline_stays_terminal_without_waiting ... ok
+test tls_certificate::tests::retained_certificate_without_private_key_fails_closed ... ok
+test tls_certificate::tests::retained_chain_from_untrusted_root_fails_closed ... ok
+test tls_certificate::tests::retained_chain_missing_its_intermediate_fails_closed ... ok
+test tls_certificate::tests::retained_expired_certificate_fails_closed_without_reissue_or_key_replacement ... ok
+test tls_certificate::tests::retained_expired_intermediate_fails_closed ... ok
+test tls_certificate::tests::retained_hostname_mismatch_fails_closed ... ok
+test tls_certificate::tests::retained_key_mismatch_fails_closed_without_key_replacement ... ok
+test tls_certificate::tests::retained_leaf_only_chain_missing_intermediate_fails_closed ... ok
+test tls_certificate::tests::retained_malformed_certificate_chain_fails_closed ... ok
+test tls_certificate::tests::retained_not_yet_valid_certificate_fails_closed ... ok
+test tls_certificate::tests::retained_self_signed_leaf_chain_fails_closed ... ok
+test tls_certificate::tests::retained_valid_anchored_certificate_is_reused_repeatedly_without_broker_calls ... ok
+test tls_certificate::tests::retained_valid_chain_with_intermediate_and_root_validates_anchored ... ok
+test tls_certificate::tests::retained_wrong_eku_leaf_fails_closed ... ok
+test tls_certificate::tests::symlink_at_key_path_blocks_issuance_before_broker_contact ... ok
+test tls_certificate::tests::symlink_to_regular_certificate_is_rejected ... ok
+test tls_certificate::tests::unknown_malformed_and_secret_bearing_broker_bodies_fail_safe ... ok
+test tls_certificate::tests::waitable_rate_limit_predicate_is_exact ... ok
+test trustee_verify::tests::artifact_fetcher_reads_compact_policy_set_and_selects_matching_artifact ... ok
+test trustee_verify::tests::artifact_fetcher_reads_file_urls ... ok
+test trustee_verify::tests::artifact_fetcher_reads_policy_set_and_selects_matching_artifact ... ok
+test trustee_verify::tests::ce_v1_byte_parity_with_enclava_common ... ok
+test trustee_verify::tests::descriptor_core_hash_excludes_expected_fields ... ok
+test trustee_verify::tests::end_to_end_chain_accepts_platform_signed_artifact_with_signing_service_key ... ok
+test trustee_verify::tests::end_to_end_chain_passes_for_customer_signed_artifact_without_fallback ... ok
+test trustee_verify::tests::end_to_end_chain_rejects_active_policy_not_in_artifact_bundle ... ok
+test trustee_verify::tests::end_to_end_chain_rejects_descriptor_signed_artifact_when_signing_service_key_is_configured ... ok
+test trustee_verify::tests::end_to_end_chain_rejects_policy_pubkey_mismatch ... ok
+test trustee_verify::tests::end_to_end_chain_rejects_rego_mismatch ... ok
+test trustee_verify::tests::end_to_end_chain_rejects_tampered_descriptor ... ok
+test trustee_verify::tests::end_to_end_chain_rejects_wrong_keyring_fingerprint ... ok
+test trustee_verify::tests::fetch_json_accepts_small_http_body ... ok
+test trustee_verify::tests::fetch_json_rejects_oversized_body_when_file_grows_after_metadata ... ok
+test trustee_verify::tests::fetch_json_rejects_oversized_chunked_http_body ... ok
+test trustee_verify::tests::fetch_json_rejects_oversized_file_body ... ok
+test trustee_verify::tests::fetch_json_rejects_oversized_http_body ... ok
+test trustee_verify::tests::fetch_policy_rejects_oversized_policy_body_file ... ok
+test trustee_verify::tests::parse_kbs_attestation_token_payload_accepts_token ... ok
+test trustee_verify::tests::parse_kbs_attestation_token_payload_rejects_missing_token ... ok
+test trustee_verify::tests::parse_trustee_policy_body_rejects_hostile_array_without_value_expansion ... ok
+test trustee_verify::tests::policy_artifact_signing_input_matches_cap_vector ... ok
+test trustee_verify::tests::policy_body_cap_is_endpoint_specific ... ok
+test trustee_verify::tests::policy_envelope_signature_round_trip ... ok
+test trustee_verify::tests::policy_envelope_tampered_rego_rejected ... ok
+test trustee_verify::tests::resolve_kbs_attestation_token_prefers_env_token ... ok
+test trustee_verify::tests::skipped_chain_is_fatal ... ok
+test unlock::tests::argon2id_deterministic ... ok
+test unlock::tests::argon2id_different_password_yields_different_seed ... ok
+test unlock::tests::argon2id_known_answer_via_independent_recompute ... ok
+test unlock::tests::rate_limit_resets_after_window ... ok
+test unlock::tests::rate_limit_triggers_at_sixth_attempt_within_window ... ok
+test writes::tests::atomic_write_creates_file_with_mode ... ok
+test writes::tests::atomic_write_ignores_existing_predictable_tmp_symlink ... ok
+test writes::tests::atomic_write_no_partial_on_simulated_kill ... ok
+test writes::tests::atomic_write_replaces_existing_atomically ... ok
+
+test result: ok. 163 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.24s
+
+     Running unittests src/main.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/enclava_init-e11d364238a48d84)
+
+running 50 tests
+test init_stats::tests::json_is_fixed_numeric_schema ... ok
+test init_stats::tests::meminfo_parser_reads_named_field ... ok
+test init_stats::tests::stats_path_is_ready_file_sibling ... ok
+test tests::attestation_proxy_bind_plan_is_empty_even_with_app_data_binds ... ok
+test tests::caddy_runtime_certificate_is_published_and_refreshed ... ok
+test tests::caddy_runtime_handoff_reowns_copied_tree_for_caddy ... ok
+test tests::caddy_runtime_sync_copies_nested_files_and_skips_symlinks ... ok
+test tests::caddy_tls_bind_source_is_below_tls_state_root ... ok
+test tests::container_sentinel_names_are_single_path_components ... ok
+test tests::container_sentinel_names_reject_record_injection_characters ... ok
+test tests::failure_surfaces_render_safe_json_and_stage_markers_stay_in_stage_file ... ok
+test tests::generic_bootstrap_failures_render_generic_safe_code ... ok
+test tests::kbs_fetch_retry_logging_carries_only_safe_bounded_metadata ... ok
+test tests::kbs_proxy_health_accepts_ready_statuses ... ok
+test tests::kbs_proxy_health_url_strips_cdh_resource_suffix ... ok
+test tests::local_kbs_proxy_detection_matches_loopback_8081 ... ok
+test tests::log_encryption_handoff_uses_single_cc_init_data_snapshot ... ok
+test tests::managed_config_dir_can_be_prepared_root_only_for_platform_supervisor ... ok
+test tests::managed_config_dir_is_prepared_for_proxy_writes_and_workload_reads ... ok
+test tests::namespace_bind_chroots_to_workload_proc_root ... ok
+test tests::namespace_bind_detaches_proc_source_before_setns ... ok
+test tests::namespace_bind_uses_init_proc_source_and_chrooted_workload_target ... ok
+test tests::parses_structured_and_legacy_sentinel_records ... ok
+test tests::password_mode_signed_cc_init_data_binds_mode_claim ... ok
+test tests::password_unlock_socket_is_reached_before_waiting_on_workload_namespaces ... ok
+test tests::public_tls_certificate_handoff_is_optional_and_public_only ... ok
+test tests::ready_probe_reflects_ready_file_state ... ok
+test tests::recovery_clears_stale_failure_file ... ok
+test tests::same_object_check_detects_identical_and_distinct_dirs ... ok
+test tests::sentinel_group_writable_mode_is_rejected ... ok
+test tests::sentinel_matching_owner_gid_and_read_only_mode_is_accepted ... ok
+test tests::sentinel_record_rejects_pid_reuse_start_time_mismatch ... ok
+test tests::sentinel_record_validates_name_identity_env_and_start_time ... ok
+test tests::sentinel_with_wrong_owner_gid_is_rejected ... ok
+test tests::signed_cc_init_data_claims_bind_configmap_critical_values ... ok
+test tests::signed_cc_init_data_mismatch_rejects_changed_bind_mount ... ok
+test tests::signed_cc_init_data_mismatch_rejects_changed_mode ... ok
+test tests::signed_cc_init_data_mismatch_rejects_configmap_transport ... ok
+test tests::signed_cc_init_data_mismatch_rejects_device_path ... ok
+test tests::signed_cc_init_data_rejects_dotdot_bind_mount_path ... ok
+test tests::signed_cc_init_data_rejects_root_bind_mount_path ... ok
+test tests::signed_cc_init_data_rejects_slash_only_bind_mount_path ... ok
+test tests::static_broker_tls_does_not_back_sync_ephemeral_caddy_runtime ... ok
+test tests::tenant_ingress_bind_plan_uses_shared_tls_mount_not_namespace_bind ... ok
+test tests::termination_log_write_is_in_place_like_a_mounted_file ... ok
+test tests::trustee_policy_unavailable_skip_requires_missing_cc_init_data_path ... ok
+test tests::trustee_policy_unavailable_still_binds_host_fields_when_cc_init_data_present ... ok
+test tests::workload_identity_matches_sidecar_runtime_users ... ok
+test tests::workload_pid_fallback_finds_wait_exec_process_by_container_name ... ok
+test tests::workload_pid_fallback_rejects_missing_mount_namespace ... ok
+
+test result: ok. 50 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.36s
+
+     Running unittests src/bin/enclava-log-relay.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/enclava_log_relay-ae0f35ab47de3aae)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/enclava_verifier-25d9e34aebb96f3a)
+
+running 46 tests
+test amd::tests::enforces_fresh_stale_expired_missing_and_revoked_crl_states ... ok
+test amd::tests::hand_rolled_pss_interops_with_the_rsa_crate ... ok
+test amd::tests::pss_declared_parameters_are_enforced ... ok
+test amd::tests::pss_params_parse_live_amd_certificates_and_crl ... ok
+test amd::tests::rejects_untrusted_root_and_mutated_report ... ok
+test amd::tests::rejects_vcek_for_a_different_chip_or_tcb ... ok
+test amd::tests::revocation_rejects_unpinned_ark_before_any_rsa_math ... ok
+test amd::tests::rsa_pss_rejects_oversized_modulus_and_exponent_quickly ... ok
+test amd::tests::rsa_pss_rejects_zero_unused_bits_without_panicking ... ok
+test amd::tests::validates_live_amd_chain_and_report_signature ... ok
+test artifacts::tests::compact_trustee_policy_must_match_every_retained_field ... ok
+test artifacts::tests::descriptor_must_opt_in_and_match_keyring_org ... ok
+test artifacts::tests::relationships_bind_cc_init_data_to_snp_host_data ... ok
+test bundle::tests::accepts_realistic_raw_genpolicy_material_within_static_limit ... ok
+test bundle::tests::parses_fixed_order_bundle ... ok
+test bundle::tests::rejects_reordered_fields ... ok
+test evidence::tests::endorsements_are_fixed_order ... ok
+test evidence::tests::host_case_is_normalized_in_the_report_data_domain ... ok
+test evidence::tests::receipt_key_rotation_requires_replacement_report_data ... ok
+test evidence::tests::report_binding_changes_with_every_external_input ... ok
+test receipt::tests::accepts_independently_pinned_rotation_overlap_key ... ok
+test receipt::tests::pinned_verification_rejects_attacker_chosen_policy_nonce_origin ... ok
+test receipt::tests::rejects_response_only_expired_and_revoked_keys ... ok
+test result::tests::canonical_hash_changes_with_context_check ... ok
+test result::tests::canonical_hash_distinguishes_absent_and_empty_values ... ok
+test sigstore::tests::accepts_one_trusted_signature_among_multiple_blobs ... ok
+test sigstore::tests::certificate_time_comes_from_the_verified_tlog_entry ... ok
+test sigstore::tests::der_string_rejects_trailing_bytes ... ok
+test sigstore::tests::merkle_inclusion_proof_matches_reference_implementation ... ok
+test sigstore::tests::oversized_tree_size_is_rejected_without_overflow ... ok
+test sigstore::tests::pae_is_unambiguous ... ok
+test sigstore::tests::provenance_blob_must_belong_to_a_trusted_attestation_manifest ... ok
+test sigstore::tests::provenance_must_cover_every_deployable_index_child ... ok
+test sigstore::tests::provenance_supports_single_image_manifests ... ok
+test snp::tests::key_info_must_describe_a_vcek_signed_report ... ok
+test snp::tests::parses_live_genoa_report_without_truncating_measurement ... ok
+test snp::tests::rejects_mutated_reserved_and_security_fields ... ok
+test supply_chain::tests::verifies_every_preserved_digest ... ok
+test tests::artifact_failures_identify_the_failed_check ... ok
+test tests::expected_origin_with_path_fails_target_origin_binding ... ok
+test tests::incomplete_policy_fails_closed ... ok
+test tests::malformed_fixture_has_stable_cross_runtime_hash ... ok
+test tests::mixed_case_expected_origin_is_not_rejected ... ok
+test tests::non_bare_origin_urls_fail_closed ... ok
+test tests::nonce_mismatch_fails_closed ... ok
+test tests::revocation_failures_emit_distinct_stable_reason_codes ... ok
+
+test result: ok. 46 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.93s
+
+     Running tests/live_bundle.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/live_bundle-39c4b30c96416f04)
+
+running 7 tests
+test absent_deployment_allowlist_preserves_the_broad_identity_contract ... ok
+test empty_or_malformed_deployment_allowlists_reject_every_deployment ... ok
+test every_security_critical_bundle_field_fails_after_one_byte_mutation ... ok
+test explicit_null_or_non_array_deployment_ids_is_malformed_policy ... ok
+test independently_selected_policy_and_channel_context_fail_closed ... ok
+test live_portable_fixture_passes_offline ... ok
+test pinned_deployment_id_admits_only_the_exact_retained_deployment ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.18s
+
+     Running unittests src/lib.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/enclava_verifier_wasm-152114e5e3e33f8b)
+
+running 3 tests
+test tests::appraisal_export_requires_every_relying_party_binding ... ok
+test tests::mutated_bundles_never_panic_the_wasm_entry_point ... ok
+test tests::rejects_malformed_context_before_verification ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.33s
+
+     Running unittests src/main.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/enclava_wait_exec-07b995ae60a4b58d)
+
+running 37 tests
+test round19_tests::rotation_temps_are_random_and_exclusive ... ok
+test tests::blank_records_are_preserved_and_boundary_newlines_fabricate_none ... ok
+test tests::command_defaults_to_startup_script ... ok
+test tests::command_preserves_argv ... ok
+test tests::concurrent_forwarders_keep_spool_order_monotonic_in_sequence ... ok
+test tests::dev_builds_honor_env_overrides ... ok
+test tests::encrypted_log_config_absent_by_default ... ok
+test tests::encrypted_log_config_requires_and_reads_routing_context ... ok
+test tests::initial_spool_sequence_does_not_wrap_on_forged_max ... ok
+test tests::initial_spool_sequence_resumes_above_surviving_frames ... ok
+test tests::initial_spool_sequence_skips_oversized_and_incomplete_records ... ok
+test tests::initial_spool_sequence_stays_monotonic_past_u32_ceiling ... ok
+test tests::prod_strict_pins_readiness_paths_to_compiled_defaults ... ok
+test tests::read_capped_record_consumes_crlf_at_chunk_boundary ... ok
+test tests::read_capped_record_consumes_crlf_at_exact_chunk_boundary ... ok
+test tests::read_capped_record_handles_split_crlf_at_cap ... ok
+test tests::read_capped_record_keeps_content_cr_before_boundary_lf ... ok
+test tests::read_capped_record_lone_cr_at_boundary_stays_capped ... ok
+test tests::read_capped_record_marks_cr_at_chunk_boundary_as_content ... ok
+test tests::read_capped_record_pending_cr_at_eof_is_discarded_not_a_record ... ok
+test tests::read_capped_record_pending_cr_resolved_as_content ... ok
+test tests::read_capped_record_splits_oversized_lines ... ok
+test tests::read_capped_record_strips_crlf_when_cr_fills_last_cap_byte ... ok
+test tests::read_capped_record_strips_terminators_on_complete_records ... ok
+test tests::ready_file_requires_ready_content ... ok
+test tests::rejects_path_like_sentinel_names ... ok
+test tests::rejects_record_injection_sentinel_names ... ok
+test tests::sequence_allocation_saturates_instead_of_wrapping ... ok
+test tests::signal_started_creates_named_sentinel ... ok
+test tests::signal_started_normalizes_sentinel_gid_under_setgid_dir ... ok
+test tests::signal_started_renormalizes_reused_sentinel_mode ... ok
+test tests::signal_started_writes_owner_only_sentinel ... ok
+test tests::spool_rotation_bounds_file_and_keeps_newest_frames ... ok
+test tests::spool_rotation_is_noop_below_threshold ... ok
+test tests::spool_rotation_projects_incoming_frame ... ok
+test tests::stat_parser_reads_start_time_ticks ... ok
+test tests::status_parser_reads_effective_uid_and_gid ... ok
+
+test result: ok. 37 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.91s
+
+     Running tests/no_recipient_stdio_backpressure.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/no_recipient_stdio_backpressure-b66353002d06a709)
+
+running 1 test
+test no_recipient_stdio_is_discarded_not_backpressured ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/signal_forwarding.rs (/home/user/enclava-worktrees/.cargo-target-loop11-90/debug/deps/signal_forwarding-3111d66070a93c00)
+
+running 2 tests
+test disabled_logging_does_not_block_on_unread_host_pipes ... ok
+test encrypted_log_wrapper_forwards_sigterm_to_child ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.29s
+
+   Doc-tests enclava_api
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests enclava_cli
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests enclava_common
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests enclava_engine
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests enclava_init
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests enclava_verifier
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests enclava_verifier_wasm
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+TEST_EXIT=0
