@@ -1743,10 +1743,15 @@ fn observe_configured_pull_secret(
 }
 
 /// Create the configured pull secret and attach it to in-scope accounts when
-/// no managed secret remains kept after repairs and cleanup. Use the outcome
-/// of this pass, not the pre-repair discovery snapshot: deleting a stale
-/// old-name object or discharging an intent must not postpone creation until
-/// the next sweep while admission reports convergence.
+/// no managed secret remains kept after repairs and cleanup (Codex review
+/// on #276, P1). A narrowing that already deleted the secret and discharged
+/// its pending repair leaves a later expansion with no managed object and no
+/// intent; reporting convergence then opens admission while private
+/// workloads still cannot pull. Use the outcome of this pass, not the
+/// pre-repair discovery snapshot: deleting a stale old-name object or
+/// discharging an intent must not postpone creation until the next sweep
+/// while admission reports convergence.
+#[allow(clippy::too_many_arguments)]
 async fn ensure_configured_pull_secret_for_in_scope_accounts(
     engine: &ApplyEngine,
     namespace: &str,
