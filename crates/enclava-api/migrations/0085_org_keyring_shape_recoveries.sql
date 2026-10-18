@@ -65,7 +65,7 @@ DO $$
 DECLARE
     captured record;
 BEGIN
-    IF to_regclass('public.org_keyring_shape_recoveries') IS NULL THEN
+    IF to_regclass('org_keyring_shape_recoveries') IS NULL THEN
         FOR captured IN
             DELETE FROM org_keyrings k
              WHERE EXISTS (
