@@ -114,6 +114,13 @@ pub async fn apply_namespace(
                                 .await;
                             return Err(verify_error);
                         }
+                        // cap#272: record the namespace creation at the only
+                        // moment it is provable — this POST's own response —
+                        // so namespace-deletion authority can match the live
+                        // UID against a server-side row.
+                        super::generation::record_created_object(
+                            engine, &created, None, generation,
+                        );
                         tracing::info!(namespace = %name, created = true, "namespace created via POST");
                         return Ok(created);
                     }

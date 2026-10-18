@@ -14,6 +14,7 @@ use kube::{
 use serde::{Serialize, de::DeserializeOwned};
 use std::{fmt::Debug, time::Duration};
 
+use super::creation_ledger::{CreationRecord, LineageProvenance, creation_lineage_provenance};
 use super::engine::{ApplyEngine, ApplyError};
 use super::fields_v1::flatten_owned_paths;
 
@@ -376,6 +377,74 @@ const CREATION_EVIDENCE_KEYS: [&str; 2] = [
     RESOURCE_CREATED_BY_ANNOTATION,
     NAMESPACE_CREATED_BY_ANNOTATION,
 ];
+
+/// Settle the live object's creation lineage against the engine's ledger
+/// (cap#272). `None` when no ledger is attached: the caller then keeps the
+/// legacy annotation+manager trust (deletion authority is enforced in the
+/// API's ledger-gated sweep, not here).
+fn attached_lineage_provenance<K>(engine: &ApplyEngine, live: &K) -> Option<LineageProvenance>
+where
+    K: Resource,
+{
+    let ledger = engine.creation_ledger()?;
+    let meta = live.meta();
+    Some(creation_lineage_provenance(
+        meta.name.as_deref(),
+        meta.uid.as_deref(),
+        meta.creation_timestamp
+            .as_ref()
+            .map(|ts| ts.0.to_string())
+            .as_deref(),
+        Some(ledger.as_ref()),
+    ))
+}
+
+/// Record an object this apply just created via its own POST — the only
+/// moment creation is provable (cap#272). The control plane drains and
+/// durably persists these records after each apply step; an object whose
+/// row cannot be persisted is compensated by the caller.
+pub(crate) fn record_created_object<K>(
+    engine: &ApplyEngine,
+    created: &K,
+    namespace: Option<&str>,
+    generation: MutationGeneration,
+) where
+    K: Resource + Serialize,
+{
+    let Some(ledger) = engine.creation_ledger() else {
+        return;
+    };
+    let meta = created.meta();
+    let (Some(name), Some(uid)) = (meta.name.clone(), meta.uid.clone()) else {
+        tracing::warn!(
+            kind = kind::<K>(),
+            "created object response lacks name/uid; cannot record creation provenance (cap#272)"
+        );
+        return;
+    };
+    // DynamicObject (CiliumNetworkPolicy, Gateway, TLSRoute, EnvoyProxy)
+    // round-trips its TypeMeta, so the real Kubernetes kind is recoverable
+    // from the response; typed k8s-openapi structs drop it and fall back
+    // to the Rust type name, which equals the Kubernetes kind for every
+    // typed resource this crate applies.
+    let kind = serde_json::to_value(created)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .filter(|kind| !kind.is_empty())
+        .unwrap_or_else(|| kind::<K>());
+    ledger.record(CreationRecord {
+        kind,
+        name,
+        namespace: namespace.map(str::to_string),
+        uid,
+        mutation_generation: generation.get(),
+    });
+}
 
 /// The creation-evidence pairs `preserve_creation_evidence` stamps for this
 /// live object: only keys whose annotation the CAP field manager owns on
@@ -874,9 +943,33 @@ where
             // fabricated evidence. Only evidence read from THIS live object
             // — the one the write is preconditioned on — survives.
             strip_creation_evidence(&mut desired);
-            let expected_evidence =
-                preserved_creation_evidence(&current, &engine.config().field_manager);
-            preserve_creation_evidence(&mut desired, &current, &engine.config().field_manager);
+            // cap#272: creation evidence observed on a live object is only
+            // preservable when the object's lineage is provable — a
+            // recorded ledger row or grandfathered by the migration
+            // cutover. A tenant-forged annotation backed by a
+            // client-selected field-manager name is NOT preserved: the
+            // apply then omits the key it owns and SSA prunes the forged
+            // stamp, so the object settles as adopted instead of carrying
+            // fabricated creation authority. Engines without an attached
+            // ledger keep the legacy trust.
+            let expected_evidence = match attached_lineage_provenance(engine, &current) {
+                Some(LineageProvenance::Unproven) => {
+                    tracing::warn!(
+                        kind = kind::<K>(),
+                        name,
+                        "live creation evidence has no recorded lineage and is not grandfathered; refusing to preserve it (cap#272)"
+                    );
+                    Vec::new()
+                }
+                _ => preserved_creation_evidence(&current, &engine.config().field_manager),
+            };
+            // Preservation and verification use the SAME (possibly empty)
+            // pair set: an unproven lineage stamps nothing, so the apply
+            // omits the key this manager owns and SSA prunes the forged
+            // stamp instead of re-stamping it with fresh authority.
+            if !expected_evidence.is_empty() {
+                preserve_creation_evidence(&mut desired, &current, &engine.config().field_manager);
+            }
             let applied = if exact_when_trusted && trusted {
                 super::bounded_kube_write(api.replace(name, &post_params, &desired)).await
             } else {
@@ -1012,6 +1105,10 @@ where
                         compensate_created_object(api, name, &applied).await;
                         return Err(verify_error);
                     }
+                    // cap#272: record the creation at the only moment it is
+                    // provable — this POST's own response. The control plane
+                    // persists the record before the apply may proceed.
+                    record_created_object(engine, &applied, api.namespace(), generation);
                     return Ok(applied);
                 }
                 Err(ApplyError::Kube(kube::Error::Api(error))) if error.code == 409 => {
