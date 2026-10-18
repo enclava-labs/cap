@@ -176,7 +176,16 @@ pub async fn check_egress_destination(
     blocked: &BlockedNetworks,
     allowlist: Option<&AllowList>,
 ) -> Result<(), ClientError> {
-    if url.scheme() != "https" {
+    check_egress_destination_with_http(url, blocked, allowlist, false).await
+}
+
+async fn check_egress_destination_with_http(
+    url: &reqwest::Url,
+    blocked: &BlockedNetworks,
+    allowlist: Option<&AllowList>,
+    allow_http: bool,
+) -> Result<(), ClientError> {
+    if url.scheme() != "https" && !(allow_http && url.scheme() == "http") {
         return Err(ClientError::SchemeNotAllowed(url.scheme().to_string()));
     }
     let host = url.host_str().ok_or(ClientError::MissingHost)?;
@@ -337,6 +346,23 @@ impl EgressGuard {
     pub async fn check_registry_url(&self, url: &reqwest::Url) -> Result<(), ClientError> {
         check_egress_destination(url, &self.blocked, Some(&self.allowlist)).await
     }
+
+    /// Cosign's explicit development HTTP opt-in changes only the scheme
+    /// policy, never host, DNS or blocked-network validation. Release builds
+    /// remain HTTPS-only even if a caller requests HTTP.
+    pub(crate) async fn check_cosign_registry_url(
+        &self,
+        url: &reqwest::Url,
+        allow_http: bool,
+    ) -> Result<(), ClientError> {
+        check_egress_destination_with_http(
+            url,
+            &self.blocked,
+            Some(&self.allowlist),
+            cfg!(debug_assertions) && allow_http,
+        )
+        .await
+    }
 }
 /// Read a response body into memory while enforcing `limit` against the
 /// bytes actually received, not just the advertised Content-Length: a
@@ -392,6 +418,52 @@ mod tests {
             proxy: crate::egress_proxy::EgressProxy::new(Arc::clone(&blocked)),
             blocked,
             allowlist: AllowList::from_env_or_default(None),
+        }
+    }
+
+    #[tokio::test]
+    async fn cosign_http_opt_in_preserves_destination_policy() {
+        let guard = hermetic_egress_guard();
+        let public = reqwest::Url::parse("http://8.8.8.8:5000/v2/").unwrap();
+        assert!(matches!(
+            guard.check_cosign_registry_url(&public, false).await,
+            Err(ClientError::SchemeNotAllowed(_))
+        ));
+        assert!(matches!(
+            guard.check_registry_url(&public).await,
+            Err(ClientError::SchemeNotAllowed(_))
+        ));
+        let guard = EgressGuard {
+            allowlist: AllowList::from_env_or_default(Some(
+                "8.8.8.8,127.0.0.1,10.0.0.1,localhost".into(),
+            )),
+            ..guard
+        };
+        let result = guard.check_cosign_registry_url(&public, true).await;
+        if cfg!(debug_assertions) {
+            result.unwrap();
+            for url in [
+                "http://127.0.0.1:5000",
+                "http://10.0.0.1:5000",
+                "http://localhost:5000",
+            ] {
+                assert!(matches!(
+                    guard
+                        .check_cosign_registry_url(&url.parse().unwrap(), true)
+                        .await,
+                    Err(ClientError::BlockedAddress(_))
+                ));
+            }
+            let restricted = EgressGuard {
+                allowlist: AllowList::from_env_or_default(Some("ghcr.io".into())),
+                ..guard
+            };
+            assert!(matches!(
+                restricted.check_cosign_registry_url(&public, true).await,
+                Err(ClientError::HostNotAllowed(_))
+            ));
+        } else {
+            assert!(matches!(result, Err(ClientError::SchemeNotAllowed(_))));
         }
     }
 
