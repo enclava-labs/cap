@@ -55,7 +55,10 @@ Note on `0064`'s in-file comment: the SQL comment inside
 checksums applied migration bytes, and this file's checksum is already
 recorded in databases), and it describes the earlier intent-row waiver that
 `0066` superseded. Do not read it as current semantics. An intent row is
-proof of presentation only: it never mints, grants, or blocks recovery. The
+proof of presentation only: it never grants an authority or freshness waiver.
+New distinct presentations are capped at 50 per org per rolling hour (HTTP
+429); exact replays of recorded directive/keyring digests remain exempt, so
+the quota does not block retrying an already-recorded recovery. The
 expired-retry waiver is granted exclusively by a matching
 `org_rotation_upstream_receipts` row (see `expired_rotation_waived_by_receipt`
 in `routes/orgs.rs`); a captured or unactioned presentation is inert.
@@ -94,6 +97,55 @@ Cutover notes for `0066`:
   not proof of upstream success.
 - Keep historical intent/directive/keyring rows and applied migration files
   unchanged; do not repair recovery by rewriting ledgers or checksums.
+
+## Quarantined Org Reinitialization
+
+Migration `0061_org_keyring_payload_shape.sql` archives removed keyrings in
+`org_keyring_repairs`. If the CURRENT keyring is malformed, it removes every
+keyring version of that org; a clean current version that survives retains
+its authority. Migration `0085_org_keyring_shape_recoveries.sql` records orgs
+that lost all versions in the durable `org_keyring_shape_recoveries` table,
+including the highest quarantined version needed to resolve the displaced
+signer. The archive is provenance, not the recovery gate: removing archive
+rows does not remove the marker or make the org a fresh initialization.
+
+For a marked org, `PUT .../keyring` with version 1 must pass the fenced
+recovery path under the org signing-authority lane:
+
+- When a live signing-service owner exists, the replacement keyring signer
+  must match that owner. A different signer receives HTTP `409`.
+- With no live owner registration, or with no configured service and no
+  rotation history, the signer must match the highest quarantined version's
+  signing key, resolved through `org_keyring_repairs.signing_key_id` and
+  `user_signing_keys`. A mismatch receives `409`; unavailable provenance
+  receives `503`.
+- A configured but unreachable or malformed service fails closed rather
+  than falling back to the archive. Rotation history without a configured
+  service also fails closed (`503`); restore the service configuration first.
+- The caller must still be an active org owner, and the replacement envelope
+  must be validly signed by an active signing key registered to that caller.
+
+The accepted recovery deletes the **marker**, not the archive, in the same
+transaction immediately before inserting the replacement version 1. A failed
+insert rolls the marker deletion back. Migration `0085` installs the database
+`BEFORE INSERT` fence `org_keyrings_fence_quarantine_recovery`, which rejects
+any keyring insertion while the marker remains. Older binaries cannot bypass
+recovery by uploading an unrestricted first version after the migration.
+
+On upgrades without an existing marker table, `0085` also removes unfenced
+replacement rows inserted between `0061` and `0085` when all live versions
+collide with archived versions, then backfills the marker. It preserves orgs
+with a clean surviving version absent from the archive. Inspect migration
+notices and expect affected orgs to require a new fenced version-1 upload.
+Drain old API replicas before resuming writes; the database fence is a
+fail-closed guard, not support for mixed-version operation or reader rollback.
+
+Preserve the archive, marker, signing-key provenance, and applied migration
+bytes. Do not manually delete recovery state or disable the trigger to force
+initialization. If the required signing key is lost or no active caller-owned
+registration is available, normal reinitialization cannot proceed. Escalate
+for operator-assisted recovery based on verified out-of-band owner intent;
+there is no supported archive-deletion bypass.
 
 ## Internal Keyring API Deferred Responses
 
