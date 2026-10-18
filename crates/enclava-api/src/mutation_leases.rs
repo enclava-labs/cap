@@ -744,6 +744,30 @@ pub async fn claim_resources(
     })
 }
 
+/// Sweep snapshot of every `kubernetes_namespace` lease.
+///
+/// Returns `(resource_key, generation, lease_held)`. `lease_held` is retained
+/// ownership, not a live heartbeat: after renewal is lost, `locked_until`
+/// expires while quarantine keeps `owner_token` through `reclaim_after`
+/// (including `'infinity'`), because an accepted Kubernetes request may still
+/// complete. A sweep that marks that window inactive treats the equal-generation
+/// Secret as completed residue and can clear or delete it mid-completion.
+/// The boolean is computed in SQL so an infinite `reclaim_after` is never
+/// decoded into `chrono`.
+pub(crate) async fn snapshot_namespace_mutation_leases(
+    pool: &PgPool,
+) -> Result<Vec<(String, i64, bool)>, sqlx::Error> {
+    let leases: Vec<(String, i64, bool)> = sqlx::query_as(
+        "SELECT resource_key, generation, \
+                (owner_token IS NOT NULL AND reclaim_after > clock_timestamp()) \
+           FROM external_resource_mutation_leases \
+          WHERE resource_scope = 'kubernetes_namespace'",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(leases)
+}
+
 /// Whether a desired-state stop/start is converging under a live app
 /// mutation lease — the one mutation class that runs its Kubernetes
 /// convergence with the app deployment lane released and then publishes a
@@ -1860,7 +1884,7 @@ async fn assert_current_rows(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use axum::{Json, Router, extract::State, routing::get};
     use serde_json::{Value, json};
@@ -1875,10 +1899,22 @@ mod tests {
     use tokio::sync::{Mutex, Notify};
 
     fn test_app_mutation_lease(heartbeat_lost: watch::Receiver<bool>) -> AppMutationLease {
-        AppMutationLease {
-            pool: PgPoolOptions::new()
+        test_app_mutation_lease_for_pool(
+            PgPoolOptions::new()
                 .connect_lazy("postgresql://stack-size.invalid/enclava")
                 .expect("lazy pool does not connect"),
+            heartbeat_lost,
+        )
+    }
+
+    /// Shared with `crate::deploy` tests that need a lease whose DB calls
+    /// reach the real test pool.
+    pub(crate) fn test_app_mutation_lease_for_pool(
+        pool: PgPool,
+        heartbeat_lost: watch::Receiver<bool>,
+    ) -> AppMutationLease {
+        AppMutationLease {
+            pool,
             app_id: Uuid::nil(),
             token: Uuid::nil(),
             generation: 1,

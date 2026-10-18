@@ -717,19 +717,43 @@ where
         if entry.manager.as_deref() != Some(field_manager) {
             return false;
         }
-        entry
-            .fields_v1
-            .as_ref()
-            .is_some_and(|fields| owns_annotation_path(&fields.0, annotation_key))
+        entry.fields_v1.as_ref().is_some_and(|fields| {
+            owns_metadata_key_path(&fields.0, "f:annotations", annotation_key)
+        })
     })
 }
 
-/// Walk f:metadata -> f:annotations -> f:<key> within one FieldsV1
-/// document, ignoring every other branch.
-fn owns_annotation_path(fields_v1: &serde_json::Value, annotation_key: &str) -> bool {
+/// Label ownership must be proven on the exact managed-fields path, not just a manager entry.
+pub fn label_owned_by_manager<K>(resource: &K, label_key: &str, field_manager: &str) -> bool
+where
+    K: Resource,
+{
+    let Some(entries) = resource.meta().managed_fields.as_ref() else {
+        return false;
+    };
+    if entries.is_empty() {
+        return false;
+    }
+    entries.iter().any(|entry| {
+        if entry.subresource.as_deref() == Some("status") {
+            return false;
+        }
+        if entry.manager.as_deref() != Some(field_manager) {
+            return false;
+        }
+        entry
+            .fields_v1
+            .as_ref()
+            .is_some_and(|fields| owns_metadata_key_path(&fields.0, "f:labels", label_key))
+    })
+}
+
+/// Follow only the requested metadata field path; sibling ownership is irrelevant.
+fn owns_metadata_key_path(fields_v1: &serde_json::Value, section: &str, key: &str) -> bool {
     fields_v1
-        .pointer("/f:metadata/f:annotations")
-        .and_then(|annotations| annotations.get(format!("f:{annotation_key}")))
+        .get("f:metadata")
+        .and_then(|metadata| metadata.get(section))
+        .and_then(|entries| entries.get(format!("f:{key}")))
         .is_some()
 }
 
