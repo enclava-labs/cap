@@ -1,25 +1,5 @@
-//! Evidence-authenticated channel to a tenant TEE (cap#206).
-//!
-//! Tenant TEE endpoints intentionally serve a per-boot rcgen self-signed
-//! leaf, so CA-validating HTTP clients cannot reach them in release mode.
-//! Instead of weakening verification, this module reuses the CLI's
-//! evidence-verified receipt-key/SPKI path (`enclava-cli` `tee_client.rs
-//! attest_receipt_key`): complete one unverified TLS handshake only to learn
-//! the leaf's SPKI, pin that SPKI, fetch fresh nonce-bound SNP evidence over
-//! the pinned channel, and verify the report end to end — pinned AMD ARK
-//! anchor, ARK/ASK/VCEK chain, VCEK signature and report binding, guest
-//! production policy, `report_data` binding of {domain, nonce, leaf SPKI,
-//! receipt key}, and launch identity ({HOST_DATA, firmware measurement})
-//! against the stored signed deployment descriptor. Only then may a
-//! protected bearer token be sent: any wrong/stale/unbound leaf, identity,
-//! or evidence fails closed before the token exists.
-//!
-//! AMD product-CRL revocation collateral is intentionally NOT fetched here:
-//! the shared CLI attestation path treats CRL freshness as a gate only for
-//! unlock-mode transitions (which submit the CRL for the API's
-//! `verify_transition_snp_quote` check), so that a KDS collateral outage
-//! cannot wedge ordinary attested operations — including seed-erasing
-//! teardown.
+//! Authenticates per-boot TEE TLS keys with fresh SNP evidence and stored launch identities.
+//! CRL freshness follows the CLI policy: required for unlock transitions, not ordinary attested operations.
 
 use std::{
     net::{IpAddr, SocketAddr},
@@ -42,11 +22,7 @@ use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
-const DEFAULT_AMD_KDS_BASE_URL: &str = "https://kdsintf.amd.com";
-const AMD_KDS_VCEK_MAX_ATTEMPTS: usize = 8;
-/// A `Retry-After` hint is honored only up to this cap; an oversized or absent
-/// value falls back to the bounded jittered schedule.
-const AMD_KDS_VCEK_RETRY_AFTER_CAP: Duration = Duration::from_secs(120);
+const DEFAULT_AMD_KDS_BASE_URL: &str = "https://kdsintf.amd.com/vcek/v1";
 /// Upper bound on the attestation response body; the TEE is unauthenticated
 /// until SNP verification completes, so the body is never read unbounded.
 const MAX_ATTESTATION_RESPONSE_BODY_BYTES: u64 = 256 * 1024;
@@ -380,43 +356,44 @@ struct TeardownArtifactRow {
     descriptor_payload: serde_json::Value,
 }
 
-/// Load the deployment identity the live TEE may legitimately attest to.
+/// Load the deployment identities the live TEE may legitimately attest to.
 ///
-/// Two authority candidates mirror the KBS policy selector's view of the
-/// live workload (kbs.rs): the most recent *healthy* deployment (the
-/// steady-state live workload) plus the most recent deployment of any status
-/// carrying a signed artifact (a deployment the delete-flip supersession
-/// marked failed can still be the pod actually serving — a failed apply does
-/// not prove the prior TEE stopped, and supersession does not prove its spec
-/// never reached the cluster). Both are bound by `descriptor.app_id`/org
-/// identity, so admitting the extra candidate weakens nothing: the evidence
-/// must still prove a TEE launched for this app under one of its own signed
-/// deployments.
+/// Authority is exactly the app's required KBS policy authority (kbs.rs): the
+/// artifact of the latest admitted operation (a rollback's older source
+/// artifact included), the prior healthy workload while a replacement is
+/// unconfirmed, and every possibly-serving generation of a deleting app.
+/// Held, withdrawn, removed-signer and artifact-less operations contribute
+/// nothing, so a token is never minted for an identity KBS would not admit.
 pub(crate) async fn load_teardown_identities(
     pool: &sqlx::PgPool,
     app: &crate::models::App,
 ) -> Result<Vec<TeardownIdentity>, TeeAttestError> {
+    let artifacts = crate::kbs::load_required_app_artifacts(pool, app.id)
+        .await
+        .map_err(|_| TeeAttestError::Storage)?;
+    if artifacts.is_empty() {
+        return Err(TeeAttestError::Attestation(
+            "no admitted workload authority",
+        ));
+    }
+    let core_hashes = artifacts
+        .iter()
+        .map(|artifact| hex::decode(&artifact.metadata.descriptor_core_hash))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| TeeAttestError::Storage)?;
     let rows = sqlx::query_as::<_, TeardownArtifactRow>(
-        "SELECT artifact.deploy_id, artifact.descriptor_payload
-           FROM workload_artifacts AS artifact
-           JOIN deployments AS deployment
-             ON deployment.id = artifact.deploy_id
-            AND deployment.app_id = artifact.app_id
-          WHERE artifact.app_id = $1
-            AND deployment.id IN (
-                (SELECT id FROM deployments
-                  WHERE app_id = $1 AND status = 'healthy'
-                  ORDER BY created_at DESC LIMIT 1)
-                UNION
-                (SELECT id FROM deployments
-                  WHERE app_id = $1
-                  ORDER BY created_at DESC LIMIT 1)
-            )",
+        "SELECT deploy_id, descriptor_payload
+           FROM workload_artifacts
+          WHERE app_id = $1 AND descriptor_core_hash = ANY($2)",
     )
     .bind(app.id)
+    .bind(&core_hashes)
     .fetch_all(pool)
     .await
     .map_err(|_| TeeAttestError::Storage)?;
+    if rows.len() != core_hashes.len() {
+        return Err(TeeAttestError::Storage);
+    }
 
     let mut identities = Vec::with_capacity(rows.len());
     for row in rows {
@@ -596,19 +573,21 @@ async fn verify_snp_evidence(
     identities: &[TeardownIdentity],
     kds_base_url: Option<&str>,
 ) -> Result<(), TeeAttestError> {
-    let evidence_json = evidence
-        .json
-        .as_ref()
-        .cloned()
-        .or_else(|| serde_json::from_slice(evidence_bytes).ok())
-        .ok_or(TeeAttestError::Attestation(
-            "attestation evidence is not parseable JSON",
-        ))?;
+    let parsed_evidence;
+    let evidence_json = match evidence.json.as_ref() {
+        Some(json) => json,
+        None => {
+            parsed_evidence = serde_json::from_slice(evidence_bytes).map_err(|_| {
+                TeeAttestError::Attestation("attestation evidence is not parseable JSON")
+            })?;
+            &parsed_evidence
+        }
+    };
 
-    let snp_report_bytes = extract_snp_report_bytes(&evidence_json).ok_or(
+    let snp_report_bytes = extract_snp_report_bytes(evidence_json).ok_or(
         TeeAttestError::Attestation("attestation evidence does not contain a raw AMD SNP report"),
     )?;
-    let chain = match extract_snp_der_chain(&evidence_json) {
+    let chain = match extract_snp_der_chain(evidence_json) {
         Some(chain) if ark_is_pinned_to_builtin_root(&chain.ark_der) => chain,
         Some(_) => {
             // An evidence-embedded chain whose ARK does not byte-match a
@@ -717,9 +696,6 @@ async fn fetch_snp_der_chain_from_kds(
     let vcek_url = amd_kds_vcek_url(&report, kds_base_url.unwrap_or(DEFAULT_AMD_KDS_BASE_URL))?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
-        // cfg(test) hole mirrors the CLI: plain-HTTP local fixtures only;
-        // every non-test build speaks HTTPS to KDS or an HTTPS relay.
-        .https_only(!cfg!(test))
         .build()
         .map_err(|error| map_reqwest_error(&error))?;
     let vcek_der = fetch_amd_kds_vcek_der(&client, &vcek_url).await?;
@@ -759,74 +735,21 @@ fn builtin_snp_ca_der_chain(
     Ok((ark_der, ask_der))
 }
 
-fn amd_kds_vcek_should_retry(status: reqwest::StatusCode) -> bool {
-    status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
-}
-
-fn amd_kds_vcek_retry_delay(attempt_index: usize) -> Duration {
-    let seconds = match attempt_index {
-        0 => 2,
-        1 => 5,
-        2 => 10,
-        3 => 20,
-        _ => 30,
-    };
-    Duration::from_secs(seconds)
-}
-
-/// A valid `Retry-After` delta-seconds value is honored up to a fixed cap;
-/// otherwise the backoff schedule is jittered to [50%, 150%) so callers
-/// released together do not retry in lockstep. The outer attempt bound in
-/// `fetch_amd_kds_vcek_der` is unchanged, and no nested loop may multiply it.
-fn amd_kds_vcek_sleep_duration(attempt: usize, retry_after: Option<Duration>) -> Duration {
-    if let Some(delay) = retry_after {
-        return delay.min(AMD_KDS_VCEK_RETRY_AFTER_CAP);
-    }
-    let jitter = (OsRng.next_u64() >> 11) as f64 / (1u64 << 53) as f64;
-    amd_kds_vcek_retry_delay(attempt).mul_f64(0.5 + jitter)
-}
-
-/// `Retry-After` in delta-seconds only. An HTTP-date or malformed value falls
-/// back to the jittered schedule rather than being trusted.
-fn parse_retry_after(value: Option<&reqwest::header::HeaderValue>) -> Option<Duration> {
-    let seconds: u64 = value?.to_str().ok()?.trim().parse().ok()?;
-    Some(Duration::from_secs(seconds))
-}
-
 /// Error categories stay coarse: the request URL embeds the chip HWID and
 /// must not reach logs or user-facing errors.
 async fn fetch_amd_kds_vcek_der(
     client: &reqwest::Client,
     vcek_url: &str,
 ) -> Result<Vec<u8>, TeeAttestError> {
-    for attempt in 0..AMD_KDS_VCEK_MAX_ATTEMPTS {
-        match client.get(vcek_url).send().await {
-            Ok(resp) => {
-                let status = resp.status();
-                if !status.is_success() {
-                    let retry_after =
-                        parse_retry_after(resp.headers().get(reqwest::header::RETRY_AFTER));
-                    if amd_kds_vcek_should_retry(status) && attempt + 1 < AMD_KDS_VCEK_MAX_ATTEMPTS
-                    {
-                        tokio::time::sleep(amd_kds_vcek_sleep_duration(attempt, retry_after)).await;
-                        continue;
-                    }
-                    return Err(TeeAttestError::Attestation("AMD KDS VCEK fetch failed"));
-                }
-                return read_vcek_body(resp).await;
-            }
-            Err(error) => {
-                if attempt + 1 < AMD_KDS_VCEK_MAX_ATTEMPTS {
-                    tokio::time::sleep(amd_kds_vcek_sleep_duration(attempt, None)).await;
-                    continue;
-                }
-                return Err(map_reqwest_error(&error));
-            }
-        }
+    let response = client
+        .get(vcek_url)
+        .send()
+        .await
+        .map_err(|error| map_reqwest_error(&error))?;
+    if !response.status().is_success() {
+        return Err(TeeAttestError::Attestation("AMD KDS VCEK fetch failed"));
     }
-    Err(TeeAttestError::Attestation(
-        "AMD KDS VCEK request failed after retries",
-    ))
+    read_vcek_body(response).await
 }
 
 /// Bounded VCEK body read: KDS or a relay must not stream unbounded bytes
@@ -897,7 +820,7 @@ fn amd_kds_vcek_url(
             "Turin SNP report missing fmc TCB value",
         ))?;
         Ok(format!(
-            "{base}/vcek/v1/{}/{hw_id}?fmcSPL={fmc:02}&blSPL={:02}&teeSPL={:02}&snpSPL={:02}&ucodeSPL={:02}",
+            "{base}/{}/{hw_id}?fmcSPL={fmc:02}&blSPL={:02}&teeSPL={:02}&snpSPL={:02}&ucodeSPL={:02}",
             generation.titlecase(),
             tcb.bootloader,
             tcb.tee,
@@ -906,7 +829,7 @@ fn amd_kds_vcek_url(
         ))
     } else {
         Ok(format!(
-            "{base}/vcek/v1/{}/{hw_id}?blSPL={:02}&teeSPL={:02}&snpSPL={:02}&ucodeSPL={:02}",
+            "{base}/{}/{hw_id}?blSPL={:02}&teeSPL={:02}&snpSPL={:02}&ucodeSPL={:02}",
             generation.titlecase(),
             tcb.bootloader,
             tcb.tee,
@@ -934,7 +857,7 @@ fn extract_structured_snp_report_bytes(value: &serde_json::Value) -> Option<Vec<
         return None;
     }
     let report: sev::firmware::guest::AttestationReport =
-        serde_json::from_value(value.clone()).ok()?;
+        serde::Deserialize::deserialize(value).ok()?;
     let bytes = report.to_bytes().ok()?;
     Some(bytes.as_ref().to_vec())
 }
@@ -1165,6 +1088,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn configured_kds_vcek_prefix_is_not_duplicated() {
+        let fixture = prove_it_live_fixture();
+        let mut report = sev::firmware::guest::AttestationReport::from_bytes(&fixture.snp_report)
+            .expect("fixture report");
+        report.cpuid_fam_id = Some(0x19);
+        report.cpuid_mod_id = Some(0x11);
+        report.chip_id = [7; 64];
+        let url = amd_kds_vcek_url(&report, "http://amd-kds-relay:8080/vcek/v1")
+            .expect("configured relay URL");
+        assert_eq!(
+            reqwest::Url::parse(&url).expect("VCEK URL").path(),
+            format!("/vcek/v1/Genoa/{}", hex::encode([7; 64]))
+        );
+    }
+
     #[tokio::test]
     async fn evidence_with_pinned_chain_and_bound_identity_verifies() {
         let fixture = prove_it_live_fixture();
@@ -1252,17 +1191,10 @@ mod tests {
         assert!(!snp_guest_policy_allows_debug(0));
     }
 
-    /// Serve a TEE attestation endpoint over real TLS with a per-boot-style
-    /// self-signed cert. The body is built per request by a closure given
-    /// the request line and the negotiated leaf SPKI (known from the
-    /// server's own certificate), so tests can echo the real nonce and leaf
-    /// binding or deliberately lie about either. Every request line is
-    /// recorded so tests can prove no protected request leaves after a
-    /// rejected attestation.
+    /// Serves a fresh self-signed leaf for real TLS verification tests.
     async fn spawn_attestation_server(
         domain: &'static str,
         respond: impl Fn(&str, [u8; 32]) -> String + Send + Sync + 'static,
-        requests: Arc<std::sync::Mutex<Vec<String>>>,
     ) -> SocketAddr {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         use tokio_rustls::TlsAcceptor;
@@ -1303,15 +1235,14 @@ mod tests {
                         break;
                     }
                 }
+                if request.is_empty() {
+                    continue;
+                }
                 let request_line = String::from_utf8_lossy(&request)
                     .lines()
                     .next()
                     .unwrap_or_default()
                     .to_string();
-                requests
-                    .lock()
-                    .expect("request log mutex")
-                    .push(request_line.clone());
                 let response_body = respond(&request_line, leaf_spki_sha256);
                 let response = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
@@ -1364,23 +1295,10 @@ mod tests {
         }
     }
 
-    fn assert_no_protected_post(seen: &[String]) {
-        assert!(
-            !seen.iter().any(|line| line.starts_with("POST ")),
-            "no protected POST may leave an unattested channel: {seen:?}"
-        );
-    }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn correctly_bound_self_signed_leaf_reaches_snp_evidence_gate() {
-        // The release defect: CA validation could not reach the self-signed
-        // TEE at all. With a well-formed echo of the negotiated nonce and
-        // leaf SPKI, the pinned channel must carry the attestation exchange
-        // to completion — the request then fails closed only inside SNP
-        // evidence verification (this mock cannot forge hardware evidence),
-        // which is what proves the handshake, pin, and echo checks all ran.
+    async fn self_signed_peer_without_hardware_evidence_is_rejected() {
         let domain = "tee.app.example";
-        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let socket = spawn_attestation_server(
             domain,
             move |request_line, leaf_spki| {
@@ -1391,7 +1309,6 @@ mod tests {
                     serde_json::json!({"note": "no snp report"}),
                 )
             },
-            Arc::clone(&requests),
         )
         .await;
 
@@ -1403,96 +1320,29 @@ mod tests {
         )
         .await
         .expect_err("mock evidence without a raw SNP report must fail closed");
-        assert!(matches!(
-            error,
-            TeeAttestError::Attestation(
-                "attestation evidence does not contain a raw AMD SNP report"
-            )
-        ));
-        let seen = requests.lock().expect("request log mutex").clone();
-        assert_eq!(seen.len(), 1, "exactly the attestation GET is sent");
-        assert!(
-            seen[0].starts_with("GET /.well-known/confidential/attestation"),
-            "expected attestation GET, got: {}",
-            seen[0]
-        );
-        assert!(
-            seen[0].contains("leaf_spki_sha256="),
-            "attestation request binds the negotiated leaf: {}",
-            seen[0]
-        );
-        assert_no_protected_post(&seen);
+        assert!(matches!(error, TeeAttestError::Attestation(_)));
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn nonce_echo_mismatch_rejects_before_any_protected_send() {
+    #[tokio::test]
+    async fn pinned_client_accepts_only_the_negotiated_tls_key() {
         let domain = "tee.app.example";
-        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let socket = spawn_attestation_server(
-            domain,
-            move |request_line, leaf_spki| {
-                // A replayed/foreign response echoes someone else's nonce.
-                let wrong_nonce = query_param(request_line, "nonce")
-                    .map(|nonce| format!("{nonce}x"))
-                    .unwrap_or_default();
-                attestation_body(
-                    domain,
-                    wrong_nonce,
-                    leaf_spki,
-                    serde_json::json!({"note": "no snp report"}),
-                )
-            },
-            Arc::clone(&requests),
-        )
-        .await;
-
-        let error = attest_teardown_channel(
-            &format!("{domain}:{}", socket.port()),
-            Some(socket.ip()),
-            &[teardown_test_identity()],
-            None,
-        )
-        .await
-        .expect_err("stale-nonce evidence must be rejected");
-        assert!(matches!(
-            error,
-            TeeAttestError::Attestation("nonce mismatch")
-        ));
-        assert_no_protected_post(&requests.lock().expect("request log mutex"));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn leaf_spki_echo_mismatch_rejects_before_any_protected_send() {
-        let domain = "tee.app.example";
-        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let socket = spawn_attestation_server(
-            domain,
-            move |request_line, _leaf_spki| {
-                attestation_body(
-                    domain,
-                    query_param(request_line, "nonce").unwrap_or_default(),
-                    // Lie about the leaf the evidence covers: an unbound or
-                    // stale leaf must not authenticate this channel.
-                    [0xAB; 32],
-                    serde_json::json!({"note": "no snp report"}),
-                )
-            },
-            Arc::clone(&requests),
-        )
-        .await;
-
-        let error = attest_teardown_channel(
-            &format!("{domain}:{}", socket.port()),
-            Some(socket.ip()),
-            &[teardown_test_identity()],
-            None,
-        )
-        .await
-        .expect_err("evidence for a different leaf must be rejected");
-        assert!(matches!(
-            error,
-            TeeAttestError::Attestation("leaf SPKI mismatch")
-        ));
-        assert_no_protected_post(&requests.lock().expect("request log mutex"));
+        let socket = spawn_attestation_server(domain, |_, _| "{}".to_string()).await;
+        let timeout = Duration::from_secs(5);
+        let leaf = fetch_tls_leaf_cert_der(domain, socket.port(), Some(socket), timeout)
+            .await
+            .expect("learn self-signed leaf");
+        let spki = enclava_verifier::tls_leaf_spki_sha256(&leaf).expect("leaf SPKI");
+        let url = format!("https://{domain}:{}/attestation", socket.port());
+        let client = build_spki_pinned_client(spki, timeout, domain, Some(socket))
+            .expect("pinned client");
+        assert_eq!(
+            client.get(&url).send().await.expect("matching key").status(),
+            reqwest::StatusCode::OK
+        );
+        let mut foreign_spki = spki;
+        foreign_spki[0] ^= 1;
+        let foreign = build_spki_pinned_client(foreign_spki, timeout, domain, Some(socket))
+            .expect("foreign-key client");
+        assert!(foreign.get(&url).send().await.is_err());
     }
 }

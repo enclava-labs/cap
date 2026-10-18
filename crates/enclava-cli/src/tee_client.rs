@@ -1035,31 +1035,16 @@ fn tee_tls_report_data(
     leaf_spki_sha256: &[u8; 32],
     receipt_pubkey_sha256: &[u8; 32],
 ) -> [u8; 64] {
-    // Shared binding contract lives in enclava-verifier so the API gate and
-    // the TEE-channel attestation path compute the identical report_data
-    // (the verifier hashes the raw receipt key to the same digest this
-    // caller already holds).
-    enclava_verifier::expected_report_data_with_pubkey_sha256(
-        &format!("https://{domain}"),
-        nonce,
-        leaf_spki_sha256,
-        receipt_pubkey_sha256,
-    )
-    .unwrap_or_else(|_| {
-        // `domain` is the already-normalized TLS host; keep the literal
-        // transcript formula for a host url::Url would reject rather than
-        // failing attestation on a parse detail.
-        let transcript_hash = tee_tls_transcript_hash(domain, nonce, leaf_spki_sha256);
-        let binding_hash = ce_v1_hash(&[
-            ("purpose", b"enclava-tee-report-data-v1"),
-            ("transcript_hash", &transcript_hash),
-            ("receipt_pubkey_sha256", receipt_pubkey_sha256),
-        ]);
-        let binding_hex = hex::encode(binding_hash);
-        let mut report_data = [0u8; 64];
-        report_data.copy_from_slice(binding_hex.as_bytes());
-        report_data
-    })
+    let transcript_hash = tee_tls_transcript_hash(domain, nonce, leaf_spki_sha256);
+    let binding_hash = ce_v1_hash(&[
+        ("purpose", b"enclava-tee-report-data-v1"),
+        ("transcript_hash", &transcript_hash),
+        ("receipt_pubkey_sha256", receipt_pubkey_sha256),
+    ]);
+    let binding_hex = hex::encode(binding_hash);
+    let mut report_data = [0u8; 64];
+    report_data.copy_from_slice(binding_hex.as_bytes());
+    report_data
 }
 
 fn verify_receipt_matches_attestation(

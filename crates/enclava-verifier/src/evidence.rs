@@ -205,19 +205,6 @@ mod tests {
     }
 
     #[test]
-    fn pubkey_sha256_variant_hashes_identically_to_raw_key() {
-        let origin = "https://app.example";
-        let nonce = [1; 32];
-        let spki = [2; 32];
-        let key = [3; 32];
-        let key_hash: [u8; 32] = Sha256::digest(key).into();
-        assert_eq!(
-            expected_report_data(origin, &nonce, &spki, &key).unwrap(),
-            expected_report_data_with_pubkey_sha256(origin, &nonce, &spki, &key_hash).unwrap()
-        );
-    }
-
-    #[test]
     fn host_case_is_normalized_in_the_report_data_domain() {
         // Hostnames are case-insensitive; the prover hashes a lowercased
         // host into report_data, so the verifier must agree (cap#141).

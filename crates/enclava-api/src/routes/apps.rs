@@ -397,18 +397,7 @@ async fn request_workload_teardown(
 
     let domain = app.tee_domain.as_deref().unwrap_or(&app.domain);
 
-    // The tenant TEE serves an intentional per-boot rcgen self-signed leaf,
-    // so CA-validating clients can never reach it in release (cap#206).
-    // Instead of weakening verification, the token is sent only over a
-    // channel whose leaf is bound by fresh nonce-bound SNP evidence to this
-    // app's stored signed deployment identity (enclava-cli
-    // `attest_receipt_key` reuse). Attestation runs BEFORE the protected
-    // bearer is even issued, and there is no unauthenticated fallback: the
-    // token must never transit a channel whose TEE is unproven.
-    //
-    // The staging/insecure env gate keeps its historical behavior for the
-    // environments that deploy it: their shared/resolved clients carry the
-    // relax flag already. Release deployments always take the attested path.
+    // The per-boot leaf must be attested before a teardown token is issued.
     let tee_http_client = if crate::routes::logs::accepts_invalid_tenant_tee_certs() {
         let mut relaxed = state.tee_http_client.clone();
         // The public tee origin is unreachable from inside the cluster on
