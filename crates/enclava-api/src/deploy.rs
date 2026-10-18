@@ -3958,6 +3958,7 @@ async fn clear_pull_secret_reference_from_service_account(
                             namespace,
                             service_account,
                             secret_name,
+                            None,
                         )
                         .await?;
                         return Err(DeployError::PullSecretReconcileDeferred(format!(
@@ -11124,6 +11125,7 @@ mod tests {
                 "tenant-ns",
                 &config,
                 MutationGeneration::new(3).unwrap(),
+                &[],
                 None,
             )
             .await
@@ -11158,6 +11160,7 @@ mod tests {
             "tenant-ns",
             &config,
             MutationGeneration::new(3).unwrap(),
+            &[],
             None,
         )
         .await
@@ -11189,6 +11192,7 @@ mod tests {
                 "tenant-ns",
                 &config,
                 MutationGeneration::new(generation).unwrap(),
+                &[],
                 None,
             )
             .await
@@ -11219,6 +11223,7 @@ mod tests {
             "tenant-ns",
             &config,
             MutationGeneration::new(5).unwrap(),
+            &[],
             None,
         )
         .await
