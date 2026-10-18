@@ -1755,6 +1755,7 @@ async fn ensure_configured_pull_secret_for_in_scope_accounts(
     scope: &PullSecretAccountScope,
     api: &Api<Secret>,
     foreign_replacements: &BTreeMap<String, BTreeSet<String>>,
+    delete_mode: PullSecretDeleteMode,
 ) -> Result<bool, DeployError> {
     if !scope.namespace_in_scope {
         return Ok(true);
@@ -1842,6 +1843,7 @@ async fn ensure_configured_pull_secret_for_in_scope_accounts(
             account,
             name,
             live_uid.as_deref(),
+            delete_mode,
         )
         .await
         {
@@ -2479,6 +2481,43 @@ async fn reconcile_managed_pull_secrets(
                         );
                     }
                 }
+            }
+        }
+    }
+    // Codex review on #276, P1: in-scope reconciliation must create the
+    // configured secret and attach it to qualifying accounts when discovery
+    // returned no managed object and no pending intent remains. A discovered
+    // old-name secret or a pending repair already owns that credential; creating
+    // a second object there would duplicate the platform PAT.
+    let pending_intent = accounts
+        .iter()
+        .any(|account| !pending_reference_repairs(account).is_empty());
+    if scope.namespace_in_scope && managed.is_empty() && !pending_intent {
+        match ensure_configured_pull_secret_for_in_scope_accounts(
+            engine,
+            namespace,
+            service_accounts,
+            settings,
+            scope,
+            &api,
+            &foreign_replacements,
+            delete_mode,
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => converged = false,
+            Err(DeployError::PullSecretReconcileDeferred(message)) => {
+                return Err(DeployError::PullSecretReconcileDeferred(message));
+            }
+            Err(error) => {
+                converged = false;
+                tracing::warn!(
+                    %namespace,
+                    %error,
+                    "tenant image pull secret reconcile: failed to recreate the configured secret \
+                     after scope expansion"
+                );
             }
         }
     }
@@ -12019,7 +12058,10 @@ mod tests {
             &["in-scope".to_string(), "out-of-scope".to_string()],
             &reconcile_settings(),
             &scope,
-            PullSecretReconcileContext::Sweep,
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: i64::MAX,
+                lease_held: false,
+            },
         )
         .await
         .unwrap();
@@ -12256,7 +12298,10 @@ mod tests {
             &["in-scope".to_string()],
             &reconcile_settings(),
             &PullSecretAccountScope::uniform(true),
-            PullSecretReconcileContext::Sweep,
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: i64::MAX,
+                lease_held: false,
+            },
         )
         .await
         .unwrap();
