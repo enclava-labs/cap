@@ -2467,8 +2467,7 @@ async fn reconcile_managed_pull_secrets(
                                                 }),
                                                 ..Default::default()
                                             };
-                                            match api.delete(&config.name, &delete_params).await
-                                            {
+                                            match api.delete(&config.name, &delete_params).await {
                                                 Ok(_) => {
                                                     // Codex review on #278,
                                                     // P2 "wait for sweep
@@ -2482,13 +2481,12 @@ async fn reconcile_managed_pull_secrets(
                                                     // discovered next pass.
                                                     // Only a 404 means the
                                                     // compensation converged.
-                                                    if let Err(error) =
-                                                        wait_for_secret_removal(
-                                                            &api,
-                                                            namespace,
-                                                            &config.name,
-                                                        )
-                                                        .await
+                                                    if let Err(error) = wait_for_secret_removal(
+                                                        &api,
+                                                        namespace,
+                                                        &config.name,
+                                                    )
+                                                    .await
                                                     {
                                                         tracing::error!(
                                                             %namespace,
@@ -4508,78 +4506,78 @@ async fn apply_scoped_pull_secret(
                         Err(error) => return Err(DeployError::Apply(error.into())),
                     }
                 }
-            Err(kube::Error::Api(error)) if error.code == 404 => {
-                // Devin review on #278: the secret is gone, so no annotation
-                // epoch can fence this create. A narrowing rollout may have
-                // deleted it and raised the fleet authority after this
-                // replica passed its pre-write check. Re-check before POST.
-                if let Some(pool) = authority {
-                    ensure_pull_secret_rollout_authority_current(pool).await?;
-                }
-                // Stamp the engine's creation evidence on this raw POST (the
-                // applied-resource path does the same in `annotate_created`;
-                // Codex review on #243, P1): the adopted-namespace
-                // compensating sweep classifies leftovers by
-                // `RESOURCE_CREATED_BY_ANNOTATION`, so an unstamped Secret is
-                // classified as foreign, skipped by cleanup, and its evidence
-                // can be cleared — leaving the platform PAT refreshed in a
-                // tenant namespace forever. Stamped ONLY on the create branch:
-                // the patch path must not claim creation of an object that
-                // already existed.
-                let mut created = desired.clone();
-                created
-                    .metadata
-                    .annotations
-                    .get_or_insert_with(Default::default)
-                    .insert(
-                        RESOURCE_CREATED_BY_ANNOTATION.to_string(),
-                        generation.get().to_string(),
-                    );
-                match api
-                    .create(&pull_secret_create_params(engine), &created)
-                    .await
-                {
-                    Ok(applied) => {
-                        // Codex review on #243, round 2, P1 "verify
-                        // creation evidence returned by the Secret POST":
-                        // a mutating admission webhook can strip the
-                        // annotation from an ACCEPTED create. The engine's
-                        // create path verifies the response and
-                        // compensates; this raw POST must too — an
-                        // unattributable platform PAT in an adopted
-                        // namespace is worse than no secret, so the
-                        // just-created object is deleted (pinned to the
-                        // response's UID/resourceVersion) and the deploy
-                        // fails closed.
-                        let stamped =
-                            applied
-                                .metadata
-                                .annotations
-                                .as_ref()
-                                .and_then(|annotations| {
-                                    annotations.get(RESOURCE_CREATED_BY_ANNOTATION)
-                                });
-                        if stamped != Some(&generation.get().to_string())
-                            || !annotation_owned_by_manager(
-                                &applied,
-                                RESOURCE_CREATED_BY_ANNOTATION,
-                                &engine.config().field_manager,
-                            )
-                        {
-                            let delete_params = kube::api::DeleteParams {
-                                preconditions: Some(kube::api::Preconditions {
-                                    uid: applied.metadata.uid.clone(),
-                                    resource_version: applied.metadata.resource_version.clone(),
-                                }),
-                                ..Default::default()
-                            };
-                            match api.delete(&config.name, &delete_params).await {
-                                Ok(_) => {
-                                    // DELETE acceptance leaves the PAT readable when a
-                                    // finalizer holds the object. Only a subsequent 404
-                                    // permits terminal failure; otherwise retain the
-                                    // durable deployment retry instead of claiming removal.
-                                    wait_for_secret_removal(&api, namespace, &config.name)
+                Err(kube::Error::Api(error)) if error.code == 404 => {
+                    // Devin review on #278: the secret is gone, so no annotation
+                    // epoch can fence this create. A narrowing rollout may have
+                    // deleted it and raised the fleet authority after this
+                    // replica passed its pre-write check. Re-check before POST.
+                    if let Some(pool) = authority {
+                        ensure_pull_secret_rollout_authority_current(pool).await?;
+                    }
+                    // Stamp the engine's creation evidence on this raw POST (the
+                    // applied-resource path does the same in `annotate_created`;
+                    // Codex review on #243, P1): the adopted-namespace
+                    // compensating sweep classifies leftovers by
+                    // `RESOURCE_CREATED_BY_ANNOTATION`, so an unstamped Secret is
+                    // classified as foreign, skipped by cleanup, and its evidence
+                    // can be cleared — leaving the platform PAT refreshed in a
+                    // tenant namespace forever. Stamped ONLY on the create branch:
+                    // the patch path must not claim creation of an object that
+                    // already existed.
+                    let mut created = desired.clone();
+                    created
+                        .metadata
+                        .annotations
+                        .get_or_insert_with(Default::default)
+                        .insert(
+                            RESOURCE_CREATED_BY_ANNOTATION.to_string(),
+                            generation.get().to_string(),
+                        );
+                    match api
+                        .create(&pull_secret_create_params(engine), &created)
+                        .await
+                    {
+                        Ok(applied) => {
+                            // Codex review on #243, round 2, P1 "verify
+                            // creation evidence returned by the Secret POST":
+                            // a mutating admission webhook can strip the
+                            // annotation from an ACCEPTED create. The engine's
+                            // create path verifies the response and
+                            // compensates; this raw POST must too — an
+                            // unattributable platform PAT in an adopted
+                            // namespace is worse than no secret, so the
+                            // just-created object is deleted (pinned to the
+                            // response's UID/resourceVersion) and the deploy
+                            // fails closed.
+                            let stamped =
+                                applied
+                                    .metadata
+                                    .annotations
+                                    .as_ref()
+                                    .and_then(|annotations| {
+                                        annotations.get(RESOURCE_CREATED_BY_ANNOTATION)
+                                    });
+                            if stamped != Some(&generation.get().to_string())
+                                || !annotation_owned_by_manager(
+                                    &applied,
+                                    RESOURCE_CREATED_BY_ANNOTATION,
+                                    &engine.config().field_manager,
+                                )
+                            {
+                                let delete_params = kube::api::DeleteParams {
+                                    preconditions: Some(kube::api::Preconditions {
+                                        uid: applied.metadata.uid.clone(),
+                                        resource_version: applied.metadata.resource_version.clone(),
+                                    }),
+                                    ..Default::default()
+                                };
+                                match api.delete(&config.name, &delete_params).await {
+                                    Ok(_) => {
+                                        // DELETE acceptance leaves the PAT readable when a
+                                        // finalizer holds the object. Only a subsequent 404
+                                        // permits terminal failure; otherwise retain the
+                                        // durable deployment retry instead of claiming removal.
+                                        wait_for_secret_removal(&api, namespace, &config.name)
                                         .await
                                         .map_err(|error| {
                                             DeployError::PullSecretReconcileDeferred(format!(
@@ -4589,36 +4587,41 @@ async fn apply_scoped_pull_secret(
                                                 config.name
                                             ))
                                         })?;
-                                }
-                                Err(kube::Error::Api(error)) if error.code == 404 => {}
-                                Err(error) => {
-                                    return Err(DeployError::PullSecretReconcileDeferred(
-                                        format!(
-                                            "could not delete pull secret {namespace}/{} with \
+                                    }
+                                    Err(kube::Error::Api(error)) if error.code == 404 => {}
+                                    Err(error) => {
+                                        return Err(DeployError::PullSecretReconcileDeferred(
+                                            format!(
+                                                "could not delete pull secret {namespace}/{} with \
                                              untrusted creation evidence: {error}; retry deployment \
                                              while the PAT may remain readable",
-                                            config.name
-                                        ),
-                                    ));
+                                                config.name
+                                            ),
+                                        ));
+                                    }
                                 }
-                            }
-                            return Err(DeployError::Validation(format!(
-                                "created pull secret {namespace}/{} came back without trusted \
+                                return Err(DeployError::Validation(format!(
+                                    "created pull secret {namespace}/{} came back without trusted \
                                  creation evidence (annotation value or field ownership; \
                                  mutating admission webhook?); deletion was confirmed and the \
                                  deploy fails closed — an unattributable platform PAT must not \
                                  land in a tenant namespace",
-                                config.name
-                            )));
+                                    config.name
+                                )));
+                            }
+                            record_pull_secret_creation(
+                                engine,
+                                namespace,
+                                &applied,
+                                generation.get(),
+                            );
+                            return Ok(());
                         }
-                        record_pull_secret_creation(engine, namespace, &applied, generation.get());
-                        return Ok(());
+                        Err(kube::Error::Api(error)) if error.code == 409 => continue,
+                        Err(error) => return Err(DeployError::Apply(error.into())),
                     }
-                    Err(kube::Error::Api(error)) if error.code == 409 => continue,
-                    Err(error) => return Err(DeployError::Apply(error.into())),
                 }
-            }
-            Err(error) => return Err(DeployError::Apply(error.into())),
+                Err(error) => return Err(DeployError::Apply(error.into())),
             }
         }
         // Codex review on #243, P2: exhausting the immediate retries on
@@ -8424,12 +8427,7 @@ mod tests {
                     if let Some(labels) = created.metadata.labels.as_mut() {
                         labels.remove(TENANT_PULL_SECRET_LABEL);
                     }
-                    for entry in created
-                        .metadata
-                        .managed_fields
-                        .iter_mut()
-                        .flatten()
-                    {
+                    for entry in created.metadata.managed_fields.iter_mut().flatten() {
                         if let Some(fields) = entry.fields_v1.as_mut()
                             && let Some(labels) = fields
                                 .0
@@ -13623,12 +13621,11 @@ mod tests {
         sqlx::query("UPDATE tenant_pull_secret_rollout_authority SET max_scope_epoch = 0, max_credential_epoch = 0")
             .execute(&pool).await.unwrap();
         let mut guard = pull_secret_mutation_guard(&pool).await.unwrap();
-        let (timeout,): (String,) = sqlx::query_as(
-            "SELECT current_setting('idle_in_transaction_session_timeout')",
-        )
-        .fetch_one(&mut *guard)
-        .await
-        .unwrap();
+        let (timeout,): (String,) =
+            sqlx::query_as("SELECT current_setting('idle_in_transaction_session_timeout')")
+                .fetch_one(&mut *guard)
+                .await
+                .unwrap();
         assert_eq!(
             timeout, "0",
             "the guard transaction must not be killable by \
