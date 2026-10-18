@@ -153,11 +153,6 @@ pub struct PlatformRelease {
     pub platform_release_version: String,
     pub signing_service_url: String,
     pub signing_service_pubkey_hex: String,
-    /// Dedicated in-TEE policy authority key. Empty for releases signed
-    /// before the field existed — the trustee slot then collapses to the
-    /// signing-service key (the legacy `legacy_collapsed_trustee_key`
-    /// behavior), which is the state those releases pin.
-    #[serde(default)]
     pub platform_trustee_policy_pubkey_hex: String,
     pub policy_template_id: String,
     pub policy_template_sha256: String,
@@ -413,16 +408,7 @@ pub fn canonical_platform_release_bytes(
         "signing_service_pubkey_hex",
         &release.signing_service_pubkey_hex,
     )?;
-    // The trustee policy key is signed when present — but only then:
-    // releases signed before the field existed carry no such record and
-    // must keep verifying byte-for-byte, so the record is emitted exactly
-    // when the payload carries a non-empty value. Its slot sits between
-    // signing_service_pubkey and policy_template_id in the canonical order.
-    let platform_trustee_policy_pubkey = if release.platform_trustee_policy_pubkey_hex.is_empty() {
-        None
-    } else {
-        Some(release.platform_trustee_policy_pubkey_bytes()?)
-    };
+    let platform_trustee_policy_pubkey = release.platform_trustee_policy_pubkey_bytes()?;
     let policy_template_sha256 = release.policy_template_sha256_bytes()?;
     let expected_firmware_measurement = release.expected_firmware_measurement_bytes()?;
     let mut records: Vec<(&str, &[u8])> = vec![
@@ -437,6 +423,10 @@ pub fn canonical_platform_release_bytes(
             release.signing_service_url.as_bytes(),
         ),
         ("signing_service_pubkey", &signing_service_pubkey),
+        (
+            "platform_trustee_policy_pubkey",
+            &platform_trustee_policy_pubkey,
+        ),
         ("policy_template_id", release.policy_template_id.as_bytes()),
         ("policy_template_sha256", &policy_template_sha256),
         (
@@ -474,15 +464,6 @@ pub fn canonical_platform_release_bytes(
         ),
         ("genpolicy_version", release.genpolicy_version.as_bytes()),
     ];
-    if let Some(ref platform_trustee_policy_pubkey) = platform_trustee_policy_pubkey {
-        records.insert(
-            5,
-            (
-                "platform_trustee_policy_pubkey",
-                platform_trustee_policy_pubkey.as_slice(),
-            ),
-        );
-    }
     // The seal-rollout claim is signed when present (cap#244 review), but
     // only then: releases signed before the field existed carry no such
     // record and must keep verifying byte-for-byte, so the record is
@@ -577,10 +558,8 @@ pub fn validate_release_payload(release: &PlatformRelease) -> Result<(), Platfor
         "signing_service_pubkey_hex",
         &release.signing_service_pubkey_hex,
     )?;
-    if !release.platform_trustee_policy_pubkey_hex.is_empty()
-        && release.platform_trustee_policy_pubkey_bytes()?
-            == release.signing_service_pubkey_bytes()?
-    {
+    let platform_trustee_policy_pubkey = release.platform_trustee_policy_pubkey_bytes()?;
+    if platform_trustee_policy_pubkey == release.signing_service_pubkey_bytes()? {
         return Err(PlatformReleaseError::InvalidField {
             field: "platform_trustee_policy_pubkey_hex",
             message: "platform trustee policy key must be distinct from the signing-service key (two trust domains must not share one key)".to_string(),
@@ -1377,27 +1356,6 @@ mod tests {
         let err =
             verify_envelope(stripped).expect_err("stripping the field must break the signature");
         assert!(matches!(err, PlatformReleaseError::BadSignature(_)));
-    }
-
-    /// Releases signed before `platform_trustee_policy_pubkey_hex` existed
-    /// carry no such record in the canonical bytes; they must keep verifying
-    /// byte-for-byte (the trustee slot then reads as the legacy collapsed
-    /// signing-service key).
-    #[test]
-    fn pre_trustee_field_release_still_verifies() {
-        let mut payload = valid_test_payload("r-old", "2026-09-01T00:00:00Z");
-        payload.platform_trustee_policy_pubkey_hex = String::new();
-        let mut value = serde_json::to_value(&payload).unwrap();
-        value
-            .as_object_mut()
-            .unwrap()
-            .remove("platform_trustee_policy_pubkey_hex")
-            .unwrap();
-        let payload: PlatformRelease = serde_json::from_value(value).unwrap();
-        assert!(payload.platform_trustee_policy_pubkey_hex.is_empty());
-
-        let envelope = sign_with_dev_fixture_key(payload);
-        verify_envelope(envelope).expect("pre-trustee-field envelope must keep verifying");
     }
 
     /// cap#244: releases signed before the field existed (no record in the
