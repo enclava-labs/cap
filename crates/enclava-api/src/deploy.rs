@@ -3815,17 +3815,14 @@ async fn service_account_preserving_pull_secret_records(
     // annotation, so the early return below used to feed an out-of-scope
     // ServiceAccount — with no imagePullSecrets — into SSA, which pruned the
     // tenant's still-valid reference. Record the live UID the same way the
-    // mid-cleanup replacement path does, and keep the reference. CAP-owned
-    // secrets are not recorded; reconcile owns those.
+    // mid-cleanup replacement path does, and keep the reference. A stale
+    // `name=old-uid` entry is not enough: the annotation allows several UIDs
+    // per name, and merge keeps the reference only while a recorded UID still
+    // matches the live object. CAP-owned secrets are not recorded; reconcile
+    // owns those.
     let secrets_api: Api<Secret> = Api::namespaced(engine.client().clone(), namespace);
     let ownership_settings = PullSecretSettings::from_env();
     for reference in existing.image_pull_secrets.iter().flatten() {
-        if foreign
-            .as_deref()
-            .is_some_and(|value| foreign_annotation_records_name(value, &reference.name))
-        {
-            continue;
-        }
         let live = match secrets_api.get(&reference.name).await {
             Ok(live) => live,
             Err(kube::Error::Api(error)) if error.code == 404 => continue,
@@ -3880,19 +3877,21 @@ async fn service_account_preserving_pull_secret_records(
     Ok(preserved)
 }
 
-fn foreign_annotation_records_name(annotation: &str, name: &str) -> bool {
+fn foreign_annotation_records_pair(annotation: &str, name: &str, uid: &str) -> bool {
     annotation.split(',').any(|entry| {
         entry
             .trim()
             .split_once('=')
-            .is_some_and(|(recorded, uid)| recorded == name && !uid.is_empty())
+            .is_some_and(|(recorded, recorded_uid)| recorded == name && recorded_uid == uid)
     })
 }
 
 fn append_foreign_replacement_record(annotation: &mut Option<String>, name: &str, uid: &str) {
+    // Another UID for this name is not this object. The annotation stores
+    // several UIDs per name; merge drops the ones that no longer match.
     if annotation
         .as_deref()
-        .is_some_and(|value| foreign_annotation_records_name(value, name))
+        .is_some_and(|value| foreign_annotation_records_pair(value, name, uid))
     {
         return;
     }
@@ -10925,6 +10924,51 @@ mod tests {
         assert_eq!(
             desired.metadata.annotations.unwrap()[FOREIGN_PULL_SECRET_REPLACEMENTS_ANNOTATION],
             "enclava-registry-auth=uid-tenant-replacement,tenant-extra=uid-tenant-extra"
+        );
+    }
+
+    /// A stale foreign UID for the name must not hide the live tenant object.
+    /// Merge keeps the reference only while a recorded UID matches; the live
+    /// UID has to be written even when another UID is already recorded.
+    #[tokio::test]
+    async fn stale_foreign_record_does_not_drop_recreated_tenant_reference() {
+        let mut live =
+            fake_managed_secret("enclava-registry-auth", false, "tenant", "tenant-token");
+        live.metadata.uid = Some("uid-live".to_string());
+        let mut platform = fake_managed_secret("old-platform", true, "cap-bot", "ghp_platform");
+        platform.metadata.uid = Some("uid-platform-new".to_string());
+        let mut existing =
+            fake_service_account("deploying", &["enclava-registry-auth", "old-platform"]);
+        existing.metadata.annotations = Some(BTreeMap::from([(
+            FOREIGN_PULL_SECRET_REPLACEMENTS_ANNOTATION.to_string(),
+            "enclava-registry-auth=uid-stale,old-platform=uid-platform-old".to_string(),
+        )]));
+        let engine = reconcile_engine(Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![live, platform],
+            service_accounts: vec![existing],
+            ..Default::default()
+        })));
+        let desired = service_account_preserving_pull_secret_records(
+            &engine,
+            "tenant-ns",
+            &fake_service_account("deploying", &[]),
+        )
+        .await
+        .unwrap();
+        let names: Vec<_> = desired
+            .image_pull_secrets
+            .unwrap()
+            .into_iter()
+            .map(|reference| reference.name)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["enclava-registry-auth"],
+            "the live tenant UID must survive; a recreated CAP secret must not"
+        );
+        assert_eq!(
+            desired.metadata.annotations.unwrap()[FOREIGN_PULL_SECRET_REPLACEMENTS_ANNOTATION],
+            "enclava-registry-auth=uid-live"
         );
     }
 
