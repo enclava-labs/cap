@@ -190,7 +190,16 @@ async fn pull_secret_mutation_guard(
     sqlx::query("SELECT pg_advisory_xact_lock_shared(278225)")
         .execute(&mut *guard)
         .await?;
-    ensure_pull_secret_rollout_authority_current(pool).await?;
+    let (scope, credential): (i64, i64) = sqlx::query_as(
+        "SELECT max_scope_epoch, max_credential_epoch FROM tenant_pull_secret_rollout_authority WHERE id",
+    )
+    .fetch_one(&mut *guard)
+    .await?;
+    if pull_secret_rollout_authority_defers(scope, credential) {
+        return Err(DeployError::PullSecretReconcileDeferred(
+            "a newer pull-secret rollout owns the fleet; refusing guarded mutation".to_string(),
+        ));
+    }
     Ok(guard)
 }
 
