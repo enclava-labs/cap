@@ -11977,7 +11977,7 @@ mod tests {
     async fn empty_fleet_publishes_rollout_authority_before_inventory() {
         let pool = crate::test_support::database_test_pool().await;
         sqlx::query(
-            "UPDATE tenant_pull_secret_rollout_authority SET scope_epoch = 0, credential_epoch = 0",
+            "UPDATE tenant_pull_secret_rollout_authority SET max_scope_epoch = 0, max_credential_epoch = 0",
         )
         .execute(&pool)
         .await
@@ -11998,7 +11998,7 @@ mod tests {
             .unwrap();
         assert_eq!(maxima, (8, 4));
         sqlx::query(
-            "UPDATE tenant_pull_secret_rollout_authority SET scope_epoch = 0, credential_epoch = 0",
+            "UPDATE tenant_pull_secret_rollout_authority SET max_scope_epoch = 0, max_credential_epoch = 0",
         )
         .execute(&pool)
         .await
