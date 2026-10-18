@@ -1299,6 +1299,66 @@ fn concurrent_deploy_owns_pull_secret(mode: PullSecretDeleteMode, actual: i64) -
     }
 }
 
+/// Missing or unparsable markers skip [`generation_blocks_pull_secret_removal`].
+/// A mutating admission webhook can strip `enclava.dev/cap-provider-mutation-generation`
+/// from a concurrent deploy's Secret write while the snapshot lease is still
+/// held. Treat that object as fenced, not as completed residue. Once the lease
+/// is released, an unannotated legacy secret remains removable.
+fn observed_generation_blocks_removal(mode: PullSecretDeleteMode, actual: Option<i64>) -> bool {
+    match actual {
+        Some(actual) => generation_blocks_pull_secret_removal(mode, actual),
+        None => matches!(
+            mode,
+            PullSecretDeleteMode::Unfenced {
+                lease_held: true,
+                ..
+            }
+        ),
+    }
+}
+
+/// Same fail-closed rule for per-app reference clears. A stripped marker must
+/// not let a stale sweep detach a reference the held lease's deploy just
+/// attached.
+fn observed_concurrent_deploy_owns(mode: PullSecretDeleteMode, actual: Option<i64>) -> bool {
+    match actual {
+        Some(actual) => concurrent_deploy_owns_pull_secret(mode, actual),
+        None => matches!(
+            mode,
+            PullSecretDeleteMode::Unfenced {
+                lease_held: true,
+                ..
+            }
+        ),
+    }
+}
+
+/// Mode passed to a namespace reconcile from the pre-inventory lease snapshot.
+///
+/// A missing row is not the same as generation 0 after a completed deploy.
+/// Migration 0042 did not backfill existing namespaces, and the sweep itself
+/// stamps [`SWEEP_CREATED_PULL_SECRET_GENERATION`] (1) when it creates the
+/// configured Secret. Passing `(0, false)` then classifies that stamp as a
+/// concurrent deploy on every pass. Publishing a released row at generation 1
+/// and reconciling under that generation keeps the sweep's own lineage from
+/// closing admission forever, without exempting a real generation-1 deploy:
+/// if the insert loses a race, `published_missing_row` is false and `actual > 0`
+/// still protects the claim that appeared after the snapshot.
+fn unfenced_pull_secret_delete_mode(
+    snapshot: Option<(i64, bool)>,
+    published_missing_row: bool,
+) -> PullSecretDeleteMode {
+    let (namespace_generation, lease_held) = match (snapshot, published_missing_row) {
+        (Some((generation, held)), _) => (generation, held),
+        (None, true) => (SWEEP_CREATED_PULL_SECRET_GENERATION, false),
+        (None, false) => (0, false),
+    };
+    PullSecretDeleteMode::Unfenced {
+        namespace_generation,
+        lease_held,
+    }
+}
+
 /// Same-object delete conflicts are retried with the engine's bounded but
 /// patient budget (see `enclava_engine::apply::generation`, staging incident
 /// 2026-09-13): three immediate attempts terminally failed live cleanup
@@ -1793,6 +1853,80 @@ fn record_pull_secret_creation(
         uid,
         mutation_generation: generation,
     });
+}
+
+/// Trusted creation evidence for a pull Secret this process POSTed: both
+/// generation markers match, the platform manager owns each annotation path,
+/// and the dedicated label is owned. A webhook that strips or rewrites either
+/// marker fails this check.
+fn pull_secret_create_evidence_trusted(
+    engine: &ApplyEngine,
+    secret: &Secret,
+    generation: i64,
+) -> bool {
+    use enclava_engine::apply::generation::{
+        MUTATION_GENERATION_ANNOTATION, RESOURCE_CREATED_BY_ANNOTATION, annotation_owned_by_manager,
+    };
+    let expected = generation.to_string();
+    let manager = engine.config().field_manager.as_str();
+    let created_by = secret
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(RESOURCE_CREATED_BY_ANNOTATION));
+    created_by == Some(&expected)
+        && secret_mutation_generation(secret) == Some(generation)
+        && annotation_owned_by_manager(secret, RESOURCE_CREATED_BY_ANNOTATION, manager)
+        && annotation_owned_by_manager(secret, MUTATION_GENERATION_ANNOTATION, manager)
+        && pull_secret_label_owned(engine, secret)
+}
+
+/// Re-read after an apply budget timeout that may have dropped an accepted
+/// Secret POST. Recording trusted evidence lets the caller persist the ledger
+/// row (returning `Ok` continues into that gate). An accepted create whose
+/// marker was stripped is compensated before the deferred error, so a later
+/// patch retry cannot leave an unledgered platform PAT. A timeout that never
+/// entered the create arm does not delete whatever object is there.
+async fn recover_ambiguous_pull_secret_create(
+    engine: &ApplyEngine,
+    api: &Api<Secret>,
+    namespace: &str,
+    name: &str,
+    generation: MutationGeneration,
+    create_submitted: bool,
+) -> Result<(), DeployError> {
+    let deferred = || {
+        DeployError::PullSecretReconcileDeferred(format!(
+            "pull-secret apply for {namespace}/{name} exceeded its budget (stalled Kubernetes \
+             API?); retry the deployment — the namespace lease and apply permit are released"
+        ))
+    };
+    if !create_submitted {
+        return Err(deferred());
+    }
+    for attempt in 0..3 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        let live =
+            match tokio::time::timeout(std::time::Duration::from_secs(30), api.get(name)).await {
+                Ok(Ok(live)) => live,
+                Ok(Err(kube::Error::Api(error))) if error.code == 404 => continue,
+                Ok(Err(_)) | Err(_) => return Err(deferred()),
+            };
+        if pull_secret_create_evidence_trusted(engine, &live, generation.get()) {
+            record_pull_secret_creation(engine, namespace, &live, generation.get());
+            return Ok(());
+        }
+        // Only compensate an object that carries the platform label. A tenant
+        // secret that won the create race is unlabeled and must be left alone;
+        // the retry takes the existing-object path and fails closed there.
+        if is_labeled_managed_pull_secret(&live) {
+            remove_untrusted_created_pull_secret(api, namespace, name, &live).await?;
+        }
+        return Err(deferred());
+    }
+    Err(deferred())
 }
 
 /// Whether failure cleanup must leave this Secret for a sibling app. The
@@ -2759,8 +2893,8 @@ async fn reconcile_managed_pull_secrets(
             // Fence the clears with the same generation/lease check the
             // delete path uses; the next sweep — whose inventory includes
             // the deploy — re-decides per app.
-            let concurrent_deploy_owns_secret = secret_mutation_generation(&live)
-                .is_some_and(|actual| concurrent_deploy_owns_pull_secret(delete_mode, actual));
+            let concurrent_deploy_owns_secret =
+                observed_concurrent_deploy_owns(delete_mode, secret_mutation_generation(&live));
             if concurrent_deploy_owns_secret {
                 // Uniform in-scope deploy callers have no clears to defer.
                 // Mixed-scope sweeps cannot certify the skipped cleanup.
@@ -2901,9 +3035,7 @@ async fn reconcile_managed_pull_secrets(
         // skipped too. Once the lease is released the strict fence resumes:
         // an unreferenced, unkept secret at the same generation is then
         // completed residue a later sweep may remove.
-        if secret_mutation_generation(&live)
-            .is_some_and(|actual| generation_blocks_pull_secret_removal(delete_mode, actual))
-        {
+        if observed_generation_blocks_removal(delete_mode, secret_mutation_generation(&live)) {
             converged = false;
             kept += 1;
             tracing::info!(
@@ -3259,9 +3391,7 @@ async fn delete_managed_pull_secret(
             // that could already be a replacement.
             ensure_pull_secret_generation_not_stale(&existing, generation, name)?;
         }
-        if secret_mutation_generation(&existing)
-            .is_some_and(|actual| generation_blocks_pull_secret_removal(delete_mode, actual))
-        {
+        if observed_generation_blocks_removal(delete_mode, secret_mutation_generation(&existing)) {
             // Self-check on #243: the reconcile-time skip can race a deploy
             // that claims the namespace lease and rewrites the secret after
             // it — including the rewrite that caused a 409 on a previous
@@ -3483,6 +3613,29 @@ async fn compensate_unledgered_creations(
             }
         }
     }
+}
+
+/// Insert a released `kubernetes_namespace` lease at the sweep-created
+/// generation when the snapshot has no row. Returns whether this call
+/// inserted it. `ON CONFLICT DO NOTHING` loses to a deploy that claimed the
+/// namespace after the snapshot; that caller must keep the conservative
+/// no-row mode. A released row does not hold the lease, so the next claim
+/// increments generation and a real deploy write stays strictly newer.
+async fn publish_missing_namespace_pull_secret_lease(
+    pool: &PgPool,
+    namespace: &str,
+) -> Result<bool, sqlx::Error> {
+    let inserted = sqlx::query(
+        "INSERT INTO external_resource_mutation_leases(\
+            resource_scope, resource_key, generation) \
+         VALUES ('kubernetes_namespace', $1, $2) \
+         ON CONFLICT (resource_scope, resource_key) DO NOTHING",
+    )
+    .bind(namespace)
+    .bind(SWEEP_CREATED_PULL_SECRET_GENERATION)
+    .execute(pool)
+    .await?;
+    Ok(inserted.rows_affected() == 1)
 }
 
 /// One sweep attempt for stale tenant image pull secrets (review findings on
@@ -3837,18 +3990,36 @@ async fn cleanup_stale_tenant_image_pull_secrets(pool: &PgPool) -> Result<bool, 
                 continue;
             }
         };
-        let (namespace_generation, lease_held) =
-            lease_rows.get(namespace).copied().unwrap_or((0, false));
+        let snapshot = lease_rows.get(namespace).copied();
+        // Codex review on #278, P1: a namespace with no lease row (migration
+        // 0042 did not backfill) must not reconcile under generation 0 after
+        // this sweep stamps generation 1. Publish a released row first. A
+        // lost insert means a deploy claimed the namespace after the
+        // snapshot; keep generation 0 so that write stays protected.
+        let published_missing_row = if snapshot.is_none() {
+            match publish_missing_namespace_pull_secret_lease(pool, namespace).await {
+                Ok(inserted) => inserted,
+                Err(error) => {
+                    converged = false;
+                    tracing::warn!(
+                        %namespace,
+                        %error,
+                        "tenant image pull secret cleanup sweep: failed to publish a released \
+                         lease for a namespace with no row — treating it as not converged"
+                    );
+                    continue;
+                }
+            }
+        } else {
+            false
+        };
         match sweep_namespace_with_budget(
             &engine,
             namespace,
             &service_accounts,
             &settings,
             &scope,
-            PullSecretDeleteMode::Unfenced {
-                namespace_generation,
-                lease_held,
-            },
+            unfenced_pull_secret_delete_mode(snapshot, published_missing_row),
         )
         .await
         {
@@ -3970,9 +4141,10 @@ async fn clear_pull_secret_reference_from_service_account(
         let secret_api: Api<Secret> = Api::namespaced(engine.client().clone(), namespace);
         match secret_api.get(secret_name).await {
             Ok(live)
-                if secret_mutation_generation(&live).is_some_and(|actual| {
-                    concurrent_deploy_owns_pull_secret(delete_mode, actual)
-                }) =>
+                if observed_concurrent_deploy_owns(
+                    delete_mode,
+                    secret_mutation_generation(&live),
+                ) =>
             {
                 tracing::info!(
                     namespace = %namespace,
@@ -4032,9 +4204,10 @@ async fn clear_pull_secret_reference_from_service_account(
                 let secret_api: Api<Secret> = Api::namespaced(engine.client().clone(), namespace);
                 match secret_api.get(secret_name).await {
                     Ok(live)
-                        if secret_mutation_generation(&live).is_some_and(|actual| {
-                            concurrent_deploy_owns_pull_secret(delete_mode, actual)
-                        }) =>
+                        if observed_concurrent_deploy_owns(
+                            delete_mode,
+                            secret_mutation_generation(&live),
+                        ) =>
                     {
                         restore_pull_secret_reference_to_service_account(
                             engine,
@@ -4346,7 +4519,7 @@ async fn apply_scoped_pull_secret(
     authority: Option<&PgPool>,
 ) -> Result<(), DeployError> {
     use enclava_engine::apply::generation::{
-        MUTATION_GENERATION_ANNOTATION, RESOURCE_CREATED_BY_ANNOTATION, annotation_owned_by_manager,
+        MUTATION_GENERATION_ANNOTATION, RESOURCE_CREATED_BY_ANNOTATION,
     };
     let api: Api<Secret> = Api::namespaced(engine.client().clone(), namespace);
     let mut desired = generate_tenant_image_pull_secret(namespace, config);
@@ -4365,6 +4538,8 @@ async fn apply_scoped_pull_secret(
     // namespace lease and apply permit indefinitely. Bound the whole apply —
     // reads and writes — by the shared per-namespace budget; a timeout
     // defers (requeueable) exactly like the reconciliation paths.
+    let create_submitted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let create_submitted_in_apply = std::sync::Arc::clone(&create_submitted);
     let apply = async {
         for _ in 0..5 {
             match api.get(&config.name).await {
@@ -4464,7 +4639,26 @@ async fn apply_scoped_pull_secret(
                         .patch(&config.name, &PatchParams::default(), &Patch::Merge(&patch))
                         .await
                     {
-                        Ok(_) => return Ok(()),
+                        Ok(patched) => {
+                            // Codex review on #278, P1: a webhook can strip the
+                            // mutation-generation marker from an accepted patch.
+                            // Do not treat that write as success — the caller
+                            // would attach a ServiceAccount reference the stale
+                            // sweep then clears. Merge-patch responses are not
+                            // required to carry managedFields (this patch does
+                            // not set a field manager); the marker value is the
+                            // evidence this response can prove.
+                            if secret_mutation_generation(&patched) != Some(generation.get()) {
+                                return Err(DeployError::PullSecretReconcileDeferred(format!(
+                                    "pull secret {namespace}/{} was written but came back without \
+                                     mutation generation {}; refusing to attach a ServiceAccount \
+                                     reference to an unmarked platform PAT",
+                                    config.name,
+                                    generation.get()
+                                )));
+                            }
+                            return Ok(());
+                        }
                         Err(kube::Error::Api(error)) if error.code == 409 || error.code == 404 => {
                             continue;
                         }
@@ -4498,6 +4692,7 @@ async fn apply_scoped_pull_secret(
                             RESOURCE_CREATED_BY_ANNOTATION.to_string(),
                             generation.get().to_string(),
                         );
+                    create_submitted_in_apply.store(true, std::sync::atomic::Ordering::SeqCst);
                     match api
                         .create(&pull_secret_create_params(engine), &created)
                         .await
@@ -4514,22 +4709,11 @@ async fn apply_scoped_pull_secret(
                             // just-created object is deleted (pinned to the
                             // response's UID/resourceVersion) and the deploy
                             // fails closed.
-                            let stamped =
-                                applied
-                                    .metadata
-                                    .annotations
-                                    .as_ref()
-                                    .and_then(|annotations| {
-                                        annotations.get(RESOURCE_CREATED_BY_ANNOTATION)
-                                    });
-                            if stamped != Some(&generation.get().to_string())
-                                || !annotation_owned_by_manager(
-                                    &applied,
-                                    RESOURCE_CREATED_BY_ANNOTATION,
-                                    &engine.config().field_manager,
-                                )
-                                || !pull_secret_label_owned(engine, &applied)
-                            {
+                            if !pull_secret_create_evidence_trusted(
+                                engine,
+                                &applied,
+                                generation.get(),
+                            ) {
                                 remove_untrusted_created_pull_secret(
                                     &api,
                                     namespace,
@@ -4575,11 +4759,17 @@ async fn apply_scoped_pull_secret(
     };
     match tokio::time::timeout(PULL_SECRET_NAMESPACE_RECONCILE_TIMEOUT, apply).await {
         Ok(result) => result,
-        Err(_) => Err(DeployError::PullSecretReconcileDeferred(format!(
-            "pull-secret apply for {namespace}/{} exceeded its budget (stalled Kubernetes \
-             API?); retry the deployment — the namespace lease and apply permit are released",
-            config.name
-        ))),
+        Err(_) => {
+            recover_ambiguous_pull_secret_create(
+                engine,
+                &api,
+                namespace,
+                &config.name,
+                generation,
+                create_submitted.load(std::sync::atomic::Ordering::SeqCst),
+            )
+            .await
+        }
     }
 }
 
@@ -7933,6 +8123,14 @@ mod tests {
         /// NAMED Secret GETs (Codex review on #243, round 2, P1): the apply
         /// path's budget must defer instead of hanging the deploy's lease.
         stall_secret_gets: bool,
+        /// POST is accepted (object stored) and then the response stalls until
+        /// the caller's budget drops the future. Recovery must re-read the
+        /// stored Secret rather than treating the timeout as "nothing landed".
+        stall_after_accepting_secret_create: bool,
+        /// Webhook strips the mutation-generation annotation from an accepted
+        /// create or patch while leaving other fields intact.
+        strip_mutation_generation_on_create: bool,
+        strip_mutation_generation_on_patch: bool,
         /// Deploy attaches a reference after the sweep's generation check.
         fresh_reference_after_secret_gets: Option<FreshReferenceAfterSecretGets>,
         /// One-shot: before answering a named Secret GET, raise the fleet
@@ -8022,6 +8220,31 @@ mod tests {
                     let path = request.uri().path().to_string();
                     let query = request.uri().query().map(str::to_string);
                     let body = request.into_body().collect().await.unwrap().to_bytes();
+                    let accept_then_stall = {
+                        let state = cluster.lock().unwrap();
+                        state.stall_after_accepting_secret_create
+                            && method.as_str() == "POST"
+                            && path.contains("/secrets")
+                    };
+                    if accept_then_stall {
+                        let (status, value) = {
+                            let mut state = cluster.lock().unwrap();
+                            route_fake_cluster(
+                                &mut state,
+                                method.as_str(),
+                                &path,
+                                query.as_deref(),
+                                &body,
+                            )
+                        };
+                        tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+                        return Ok::<_, std::io::Error>(
+                            Response::builder()
+                                .status(status)
+                                .body(Body::from(serde_json::to_vec(&value).unwrap()))
+                                .unwrap(),
+                        );
+                    }
                     // Stalled-API-server simulation (Codex review on #243, P1
                     // follow-up): the label-selected Secret list hangs far
                     // beyond the per-namespace reconcile budget, until the
@@ -8274,6 +8497,12 @@ mod tests {
                     "{}-patch",
                     secret.metadata.resource_version.as_deref().unwrap_or("1")
                 ));
+                if state.strip_mutation_generation_on_patch
+                    && let Some(annotations) = secret.metadata.annotations.as_mut()
+                {
+                    annotations
+                        .remove(enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION);
+                }
                 (200, serde_json::to_value(secret).unwrap())
             }
             ("secrets", "POST") => {
@@ -8389,6 +8618,12 @@ mod tests {
                     .metadata
                     .resource_version
                     .get_or_insert_with(|| "1".to_string());
+                if state.strip_mutation_generation_on_create
+                    && let Some(annotations) = created.metadata.annotations.as_mut()
+                {
+                    annotations
+                        .remove(enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION);
+                }
                 state.secrets.push(created);
                 (
                     201,
@@ -9465,13 +9700,22 @@ mod tests {
     async fn delete_keeps_secret_rewritten_under_equal_active_generation_mid_cleanup() {
         use std::sync::{Arc, Mutex};
 
+        let mut secret =
+            fake_managed_secret("enclava-registry-auth", true, "cap-bot", "ghp_platform");
+        // The precheck now fail-closes on a missing marker while the lease is
+        // held, so this race starts from an older parsable generation that the
+        // precheck allows through. The deploy rewrite to the equal active
+        // generation lands on the delete itself.
+        secret
+            .metadata
+            .annotations
+            .get_or_insert_with(Default::default)
+            .insert(
+                enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION.to_string(),
+                "4".to_string(),
+            );
         let cluster = Arc::new(Mutex::new(FakeCluster {
-            secrets: vec![fake_managed_secret(
-                "enclava-registry-auth",
-                true,
-                "cap-bot",
-                "ghp_platform",
-            )],
+            secrets: vec![secret],
             service_accounts: vec![fake_service_account(
                 "cap-tenant-app",
                 &["enclava-registry-auth"],
@@ -12724,6 +12968,401 @@ mod tests {
                 .as_ref()
                 .is_none_or(|refs| refs.is_empty())
         );
+    }
+
+    #[test]
+    fn missing_lease_row_uses_sweep_generation_only_after_publish() {
+        assert!(matches!(
+            unfenced_pull_secret_delete_mode(None, true),
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: SWEEP_CREATED_PULL_SECRET_GENERATION,
+                lease_held: false,
+            }
+        ));
+        assert!(matches!(
+            unfenced_pull_secret_delete_mode(None, false),
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 0,
+                lease_held: false,
+            }
+        ));
+        assert!(matches!(
+            unfenced_pull_secret_delete_mode(Some((7, true)), true),
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 7,
+                lease_held: true,
+            }
+        ));
+    }
+
+    /// Codex review on #278, P1: with no lease row the sweep stamps generation
+    /// 1, then `(0, false)` classifies that stamp as a concurrent deploy and
+    /// never clears mixed-scope references. After the missing row is published,
+    /// the same object is this sweep's lineage and must converge. A strictly
+    /// newer marker is still someone else's.
+    #[tokio::test]
+    async fn published_missing_lease_row_does_not_treat_sweep_generation_as_concurrent() {
+        use std::sync::{Arc, Mutex};
+
+        fn stamped(generation: i64) -> Secret {
+            let mut secret =
+                fake_managed_secret("enclava-registry-auth", true, "cap-bot", "ghp_platform");
+            secret
+                .metadata
+                .annotations
+                .get_or_insert_with(Default::default)
+                .insert(
+                    enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION.to_string(),
+                    generation.to_string(),
+                );
+            secret
+        }
+        let accounts = ["cap-in".to_string(), "cap-out".to_string()];
+        let mixed = PullSecretAccountScope {
+            namespace_in_scope: true,
+            in_scope_accounts: ["cap-in".to_string()].into_iter().collect(),
+        };
+        let run = |secret: Secret, mode: PullSecretDeleteMode| {
+            let accounts = accounts.clone();
+            let mixed = mixed.clone();
+            async move {
+                let cluster = Arc::new(Mutex::new(FakeCluster {
+                    secrets: vec![secret],
+                    service_accounts: vec![
+                        fake_service_account("cap-in", &["enclava-registry-auth"]),
+                        fake_service_account("cap-out", &["enclava-registry-auth"]),
+                    ],
+                    ..Default::default()
+                }));
+                let engine = reconcile_engine(cluster.clone());
+                let converged = reconcile_managed_pull_secrets(
+                    &engine,
+                    "tenant-ns",
+                    &accounts,
+                    &reconcile_settings(),
+                    &mixed,
+                    mode,
+                )
+                .await
+                .unwrap();
+                let out_refs = cluster.lock().unwrap().service_accounts[1]
+                    .image_pull_secrets
+                    .as_ref()
+                    .map(|references| references.len())
+                    .unwrap_or(0);
+                (converged, out_refs)
+            }
+        };
+
+        let (converged, out_refs) = run(
+            stamped(SWEEP_CREATED_PULL_SECRET_GENERATION),
+            unfenced_pull_secret_delete_mode(None, false),
+        )
+        .await;
+        assert!(
+            !converged && out_refs == 1,
+            "generation 0 with no row must still protect a positive marker, got converged={converged} refs={out_refs}"
+        );
+
+        let (converged, out_refs) = run(
+            stamped(SWEEP_CREATED_PULL_SECRET_GENERATION),
+            unfenced_pull_secret_delete_mode(None, true),
+        )
+        .await;
+        assert!(
+            converged && out_refs == 0,
+            "a published missing row must let the sweep clear its own generation-1 secret, got converged={converged} refs={out_refs}"
+        );
+
+        let (converged, out_refs) = run(
+            stamped(SWEEP_CREATED_PULL_SECRET_GENERATION + 1),
+            unfenced_pull_secret_delete_mode(None, true),
+        )
+        .await;
+        assert!(
+            !converged && out_refs == 1,
+            "a deploy that claimed after publish and wrote generation 2 must still be deferred"
+        );
+    }
+
+    /// Codex review on #278, P1: a missing or unparsable mutation-generation
+    /// marker must not be treated as safe to remove while the snapshot lease
+    /// is held. After the lease is released, an unannotated legacy secret is
+    /// removable again.
+    #[tokio::test]
+    async fn held_lease_defers_unmarked_pull_secret_removal() {
+        use std::sync::{Arc, Mutex};
+
+        async fn reconcile_unmarked(marker: Option<&str>, lease_held: bool) -> (bool, usize) {
+            let mut secret =
+                fake_managed_secret("enclava-registry-auth", true, "cap-bot", "ghp_platform");
+            if let Some(marker) = marker {
+                secret
+                    .metadata
+                    .annotations
+                    .get_or_insert_with(Default::default)
+                    .insert(
+                        enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION
+                            .to_string(),
+                        marker.to_string(),
+                    );
+            }
+            let cluster = Arc::new(Mutex::new(FakeCluster {
+                secrets: vec![secret],
+                service_accounts: vec![fake_service_account(
+                    "cap-tenant-app",
+                    &["enclava-registry-auth"],
+                )],
+                ..Default::default()
+            }));
+            let engine = reconcile_engine(cluster.clone());
+            let converged = reconcile_managed_pull_secrets(
+                &engine,
+                "tenant-ns",
+                &["cap-tenant-app".to_string()],
+                &reconcile_settings(),
+                &PullSecretAccountScope::uniform(false),
+                PullSecretDeleteMode::Unfenced {
+                    namespace_generation: 5,
+                    lease_held,
+                },
+            )
+            .await
+            .unwrap();
+            let remaining = cluster.lock().unwrap().secrets.len();
+            (converged, remaining)
+        }
+
+        let (converged, remaining) = reconcile_unmarked(None, true).await;
+        assert!(
+            !converged && remaining == 1,
+            "missing marker while the lease is held"
+        );
+        let (converged, remaining) = reconcile_unmarked(Some("not-a-generation"), true).await;
+        assert!(
+            !converged && remaining == 1,
+            "unparsable marker while the lease is held"
+        );
+        let (converged, remaining) = reconcile_unmarked(None, false).await;
+        assert!(
+            converged && remaining == 0,
+            "an unmarked secret is legacy residue once the lease is released"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_deploy_patch_missing_generation_marker_defers() {
+        use std::sync::{Arc, Mutex};
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![fake_managed_secret(
+                "enclava-registry-auth",
+                true,
+                "cap-bot",
+                "ghp_platform",
+            )],
+            strip_mutation_generation_on_patch: true,
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        let config = TenantImagePullSecretConfig {
+            name: "enclava-registry-auth".to_string(),
+            username: "cap-bot".to_string(),
+            token: "ghp_platform".to_string(),
+            allowed_repositories: Vec::new(),
+        };
+        let error = apply_scoped_pull_secret(
+            &engine,
+            "tenant-ns",
+            &config,
+            MutationGeneration::new(4).unwrap(),
+            &[],
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, DeployError::PullSecretReconcileDeferred(_)),
+            "a stripped patch marker must not be treated as a successful write: {error:?}"
+        );
+        assert_eq!(
+            cluster.lock().unwrap().secrets.len(),
+            1,
+            "a pre-existing secret is not deleted when its patch response is unmarked"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_deploy_create_missing_generation_marker_compensates() {
+        use std::sync::{Arc, Mutex};
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            strip_mutation_generation_on_create: true,
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        let config = TenantImagePullSecretConfig {
+            name: "enclava-registry-auth".to_string(),
+            username: "cap-bot".to_string(),
+            token: "ghp_platform".to_string(),
+            allowed_repositories: Vec::new(),
+        };
+        let error = apply_scoped_pull_secret(
+            &engine,
+            "tenant-ns",
+            &config,
+            MutationGeneration::new(3).unwrap(),
+            &[],
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, DeployError::Validation(_)),
+            "a create response without the mutation-generation marker must fail closed: {error:?}"
+        );
+        assert!(
+            cluster.lock().unwrap().secrets.is_empty(),
+            "the unmarked created PAT must be compensated"
+        );
+    }
+
+    /// Codex review on #278, P1: the API can accept the Secret POST and stall
+    /// the response until the apply budget drops the future. Re-read the
+    /// accepted object and record its UID so the caller's ledger gate persists
+    /// it. A stripped marker on that same object is compensated instead.
+    #[tokio::test(start_paused = true)]
+    async fn scoped_deploy_create_timeout_records_accepted_secret() {
+        use std::sync::{Arc, Mutex};
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            stall_after_accepting_secret_create: true,
+            ..Default::default()
+        }));
+        let ledger = Arc::new(enclava_engine::apply::creation_ledger::CreationLedgerBuffer::new());
+        let engine = reconcile_engine(cluster.clone()).with_creation_ledger(Arc::clone(&ledger));
+        let config = TenantImagePullSecretConfig {
+            name: "enclava-registry-auth".to_string(),
+            username: "cap-bot".to_string(),
+            token: "ghp_platform".to_string(),
+            allowed_repositories: Vec::new(),
+        };
+        apply_scoped_pull_secret(
+            &engine,
+            "tenant-ns",
+            &config,
+            MutationGeneration::new(3).unwrap(),
+            &[],
+            None,
+        )
+        .await
+        .expect("accepted create whose response stalled must be recovered");
+        let pending = ledger.drain_pending();
+        assert_eq!(pending.len(), 1, "the recovered UID must be ledgered");
+        assert_eq!(pending[0].kind, "Secret");
+        assert_eq!(pending[0].mutation_generation, 3);
+        assert_eq!(cluster.lock().unwrap().secrets.len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scoped_deploy_create_timeout_compensates_stripped_marker() {
+        use std::sync::{Arc, Mutex};
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            stall_after_accepting_secret_create: true,
+            strip_mutation_generation_on_create: true,
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        let config = TenantImagePullSecretConfig {
+            name: "enclava-registry-auth".to_string(),
+            username: "cap-bot".to_string(),
+            token: "ghp_platform".to_string(),
+            allowed_repositories: Vec::new(),
+        };
+        let error = apply_scoped_pull_secret(
+            &engine,
+            "tenant-ns",
+            &config,
+            MutationGeneration::new(3).unwrap(),
+            &[],
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, DeployError::PullSecretReconcileDeferred(_)),
+            "an accepted but unmarked create must not be reported as success: {error:?}"
+        );
+        assert!(
+            cluster.lock().unwrap().secrets.is_empty(),
+            "the unmarked accepted PAT must be compensated before the deferred error"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_missing_namespace_lease_does_not_clobber_a_claim() {
+        let pool = crate::test_support::database_test_pool().await;
+        let fresh = format!("pub{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+        let held = format!("hld{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+        let owner = uuid::Uuid::new_v4();
+        let operation_id = uuid::Uuid::new_v4();
+        let cleanup = async {
+            sqlx::query(
+                "DELETE FROM external_resource_mutation_leases \
+                 WHERE resource_scope = 'kubernetes_namespace' \
+                   AND resource_key IN ($1, $2)",
+            )
+            .bind(&fresh)
+            .bind(&held)
+            .execute(&pool)
+            .await
+            .ok();
+        };
+        let inserted = publish_missing_namespace_pull_secret_lease(&pool, &fresh)
+            .await
+            .expect("publish missing lease");
+        assert!(inserted, "first publish inserts the released row");
+        let again = publish_missing_namespace_pull_secret_lease(&pool, &fresh)
+            .await
+            .expect("second publish");
+        assert!(!again, "a second publish must not bump or replace the row");
+        let (generation, owner_token): (i64, Option<uuid::Uuid>) = sqlx::query_as(
+            "SELECT generation, owner_token FROM external_resource_mutation_leases \
+             WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1",
+        )
+        .bind(&fresh)
+        .fetch_one(&pool)
+        .await
+        .expect("load published lease");
+        assert_eq!(generation, SWEEP_CREATED_PULL_SECRET_GENERATION);
+        assert!(owner_token.is_none(), "the published row is released");
+
+        sqlx::query(
+            "INSERT INTO external_resource_mutation_leases(\
+                resource_scope, resource_key, generation, owner_token, \
+                operation_kind, operation_id, locked_until, reclaim_after) \
+             VALUES (\
+                'kubernetes_namespace', $1, 5, $2, 'deployment_apply', $3, \
+                clock_timestamp() + interval '30 seconds', \
+                clock_timestamp() + interval '90 seconds')",
+        )
+        .bind(&held)
+        .bind(owner)
+        .bind(operation_id)
+        .execute(&pool)
+        .await
+        .expect("insert held lease");
+        let raced = publish_missing_namespace_pull_secret_lease(&pool, &held)
+            .await
+            .expect("publish against a claim");
+        assert!(!raced, "a held claim wins the insert race");
+        let held_generation: i64 = sqlx::query_scalar(
+            "SELECT generation FROM external_resource_mutation_leases \
+             WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1",
+        )
+        .bind(&held)
+        .fetch_one(&pool)
+        .await
+        .expect("load held lease");
+        assert_eq!(held_generation, 5);
+        cleanup.await;
     }
 
     /// Codex review on #278, P1: the deploy that just wrote the configured
