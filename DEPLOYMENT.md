@@ -132,20 +132,16 @@ insert rolls the marker deletion back. Migration `0085` installs the database
 any keyring insertion while the marker remains. Older binaries cannot bypass
 recovery by uploading an unrestricted first version after the migration.
 
-On upgrades without an existing marker table, `0085` treats any live version
-that collides with `org_keyring_repairs` as evidence the migration window
-captured the org. It then removes every live generation of that org, including
-a version the old writer appended after the colliding replacement, and
-backfills the marker. It preserves orgs whose live versions are all absent
-from the archive (a clean survivor). Inspect migration notices and expect
-affected orgs to require a new fenced version-1 upload.
-On upgrades carrying the earlier divergent `0061` marker table, table
-existence is not proof of fenced recovery: that migration had no INSERT
-trigger. `0085` removes every live generation for orgs whose marker remains,
-including colliding replacements and appended versions, and retains their
-original recovery provenance. It preserves marker-free orgs, including
-already-authorized recoveries whose new version 1 collides with the archive;
-a completed fenced recovery consumed its marker atomically.
+`0085` checks both remaining markers and live/archive version collisions,
+regardless of whether the earlier divergent `0061` marker table exists. It
+removes every live generation of an affected org and restores or retains its
+marker from the original archive. Marker absence is not proof of authorization:
+earlier successor handlers could consume a marker after an unfenced version-1
+capture. Even legitimate recoveries with archive-colliding versions must repeat
+the fenced upload, because this migration cannot distinguish them from those
+captures. Clean survivors without a marker or archive collision remain intact.
+Inspect migration notices and expect affected orgs to need a fresh fenced
+version-1 upload.
 Drain old API replicas before resuming writes; the database fence is a
 fail-closed guard, not support for mixed-version operation or reader rollback.
 

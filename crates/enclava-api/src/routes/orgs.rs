@@ -3354,8 +3354,8 @@ mod tests {
             .execute(&pool)
             .await
             .expect("restore divergent 0061 markers");
-            // A completed fenced recovery consumed its marker. Its new v1
-            // can collide with archived v1 without being a window capture.
+            // Older successor handlers could clear the marker after an
+            // unfenced v1. Marker absence cannot authorize a colliding row.
             crate::db::orgs::insert_org_pool(
                 &pool,
                 recovered_org,
@@ -3379,15 +3379,15 @@ mod tests {
             sqlx::query(
                 "INSERT INTO org_keyrings
                      (org_id, version, keyring_payload, signature, signing_key_id)
-                 VALUES ($1, 1, $2, $3, $4)",
+                 VALUES ($1, 1, $2, $3, $4), ($1, 2, $2, $3, $4)",
             )
             .bind(recovered_org)
             .bind(&well_formed)
             .bind(&signature)
-            .bind(alice_signing_key_id)
+            .bind(bob_signing_key_id)
             .execute(&pool)
             .await
-            .expect("insert already-fenced recovery");
+            .expect("insert capture whose successor cleared the marker");
         } else {
             sqlx::query("DROP TABLE org_keyring_shape_recoveries")
                 .execute(&pool)
@@ -3401,21 +3401,21 @@ mod tests {
         .await
         .expect("replay production 0085 migration");
         if existing_markers {
-            let recovered_version: i64 =
-                sqlx::query_scalar("SELECT version FROM org_keyrings WHERE org_id = $1")
+            let captured_rows: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM org_keyrings WHERE org_id = $1")
                     .bind(recovered_org)
                     .fetch_one(&pool)
                     .await
-                    .expect("preserve already-fenced recovery");
-            assert_eq!(recovered_version, 1);
-            let marker_count: i64 = sqlx::query_scalar(
-                "SELECT count(*) FROM org_keyring_shape_recoveries WHERE org_id = $1",
+                    .expect("count marker-free captured rows");
+            assert_eq!(captured_rows, 0);
+            let marker: i64 = sqlx::query_scalar(
+                "SELECT quarantined_latest_version FROM org_keyring_shape_recoveries WHERE org_id = $1",
             )
             .bind(recovered_org)
             .fetch_one(&pool)
             .await
-            .expect("read already-consumed marker");
-            assert_eq!(marker_count, 0);
+            .expect("restore marker consumed by an unfenced successor");
+            assert_eq!(marker, 3);
         }
 
         let captured_rows: i64 =

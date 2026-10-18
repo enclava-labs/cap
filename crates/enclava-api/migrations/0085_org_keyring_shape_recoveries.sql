@@ -52,58 +52,44 @@
 -- archives only rows it deletes, and the preserved current version stays
 -- live and absent from the archive.
 --
--- Divergent 0061 created the marker table but did not install an INSERT
--- fence. Old writers can therefore capture authority even with that table
--- present. A remaining marker proves recovery was never fenced: quarantine
--- every live generation for that org, including any archive collisions.
--- Conversely, a recovery through the new handler consumes its marker. With
--- the divergent table present, preserve marker-free rows even when v1
--- collides with the archive: that can be an already-authorized recovery.
+-- Divergent 0061 created the marker table but no INSERT fence. Neither
+-- table existence nor marker absence proves recovery was authorized: an
+-- earlier successor handler could consume the marker after an unfenced v1.
+-- Inspect both markers and archive collisions for every schema history.
+-- A legitimate recovery can also collide; conservatively re-quarantine it
+-- and require fresh signer authorization rather than trusting ambiguous state.
 LOCK TABLE org_keyrings, org_keyring_repairs IN ACCESS EXCLUSIVE MODE;
-
-DO $$
-DECLARE
-    captured record;
-BEGIN
-    IF to_regclass('org_keyring_shape_recoveries') IS NULL THEN
-        FOR captured IN
-            DELETE FROM org_keyrings k
-             WHERE EXISTS (
-                   SELECT 1
-                     FROM org_keyrings live
-                     JOIN org_keyring_repairs archived
-                       ON archived.org_id = live.org_id
-                      AND archived.version = live.version
-                    WHERE live.org_id = k.org_id
-               )
-             RETURNING k.org_id, k.version
-        LOOP
-            RAISE NOTICE 'migration 0085: quarantined live keyring v% for org % (a live version collides with org_keyring_repairs, so every live generation was removed); the displaced signer must restore authority through the fenced first-version path',
-                captured.version, captured.org_id;
-        END LOOP;
-    ELSE
-        -- Lock the existing markers too, so cleanup and trigger installation
-        -- observe one stable recovery state throughout this migration.
-        LOCK TABLE org_keyring_shape_recoveries IN ACCESS EXCLUSIVE MODE;
-        FOR captured IN
-            DELETE FROM org_keyrings k
-             WHERE EXISTS (
-                   SELECT 1 FROM org_keyring_shape_recoveries r
-                    WHERE r.org_id = k.org_id
-               )
-             RETURNING k.org_id, k.version
-        LOOP
-            RAISE NOTICE 'migration 0085: quarantined live keyring v% for org % (recovery marker still present); the displaced signer must restore authority through the fenced first-version path',
-                captured.version, captured.org_id;
-        END LOOP;
-    END IF;
-END $$;
 
 CREATE TABLE IF NOT EXISTS org_keyring_shape_recoveries (
     org_id                     uuid PRIMARY KEY REFERENCES organizations(id) ON DELETE CASCADE,
     quarantined_latest_version bigint NOT NULL,
     recorded_at                timestamptz NOT NULL DEFAULT now()
 );
+LOCK TABLE org_keyring_shape_recoveries IN ACCESS EXCLUSIVE MODE;
+
+DO $$
+DECLARE
+    captured record;
+BEGIN
+    FOR captured IN
+        DELETE FROM org_keyrings k
+         WHERE EXISTS (
+               SELECT 1 FROM org_keyring_shape_recoveries r
+                WHERE r.org_id = k.org_id
+           ) OR EXISTS (
+               SELECT 1
+                 FROM org_keyrings live
+                 JOIN org_keyring_repairs archived
+                   ON archived.org_id = live.org_id
+                  AND archived.version = live.version
+                WHERE live.org_id = k.org_id
+           )
+         RETURNING k.org_id, k.version
+    LOOP
+        RAISE NOTICE 'migration 0085: quarantined live keyring v% for org % (recovery marker or live/archive collision); the displaced signer must restore authority through the fenced first-version path',
+            captured.version, captured.org_id;
+    END LOOP;
+END $$;
 
 INSERT INTO org_keyring_shape_recoveries (org_id, quarantined_latest_version)
 SELECT r.org_id, max(r.version)
