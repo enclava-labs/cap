@@ -1598,6 +1598,20 @@ pub async fn rotate_org_owner(
     // race-sensitive (missing keyring, version too high -- both can be
     // legalized by a concurrent commit before the lane is acquired) stays
     // post-lane and authoritative.
+    //
+    // Two accepted tradeoffs of this fail-closed posture (documented after
+    // review; identical to #185, whose contract this branch keeps):
+    // 1. A directive signed more than PRECHECK_CLOCK_SKEW_SECONDS into the
+    //    future is rejected at presentation even if the request could queue
+    //    until the timestamp becomes valid. Honest client clocks sit well
+    //    inside the 300s allowance; a timestamp beyond it violates the
+    //    signing contract, the rejection is deterministic, and the lane
+    //    re-checks authoritatively for anything that reaches it.
+    // 2. An expired retry that overlaps the commit of its matching receipt
+    //    (a concurrent in-flight first presentation) can be rejected here
+    //    before the receipt row exists. Receipts are never deleted, so the
+    //    idempotent retry after that commit hits the receipted-expired
+    //    waiver and recovers through the lane.
     {
         let precheck_now = Utc::now();
         // The lane reads its clock after queueing, which can outlast any
