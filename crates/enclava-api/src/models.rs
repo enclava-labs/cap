@@ -123,6 +123,9 @@ pub struct App {
     pub signer_identity_subject: Option<String>,
     pub signer_identity_issuer: Option<String>,
     pub signer_identity_set_at: Option<DateTime<Utc>>,
+    // Live authority metadata must not alter persisted deployment payload hashes.
+    #[serde(skip)]
+    pub signer_rotation_generation: i64,
     pub source_provider: Option<String>,
     pub source_repository: Option<String>,
     pub egress_allowlist: Json<Vec<EgressRule>>,

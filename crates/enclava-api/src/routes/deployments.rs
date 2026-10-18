@@ -564,24 +564,86 @@ pub struct DeploymentResponse {
 const PUBLIC_DEPLOYMENT_ERROR_MESSAGE: &str = "deployment_error";
 
 /// Bounded failure classifications that may cross the API boundary verbatim.
-/// The control-plane pair is the historical passthrough set. The pull-secret
-/// codes are admitted so a stored row is not redacted, in lockstep with the
-/// 0087 CHECK. They are not written today: `pull_secret_reconcile_deferred`
-/// is a non-terminal requeue (`requeue_apply_job` clears `last_error_code`
-/// for every transient reason, and the deployment stays non-terminal), and
-/// `pull_secret_delete_conflict` is a terminal apply failure published as
-/// `deployment_apply_failed` like every other apply error. The specific
-/// classification stays in logs via `DeployError::public_code`. Anything
-/// else is redacted.
+/// These are `&'static str` codes produced by `DeploymentJobError::code`,
+/// `DeployError::public_code`, `ApplyError::public_code`, and the fixed
+/// setup/apply constants — never free-form backend or runtime plaintext.
+/// Anything not in this list is redacted to `deployment_error`.
+///
+/// The pull-secret pair is admitted in lockstep with the 0087 CHECK so a
+/// stored row is not redacted; they are not written today
+/// (`pull_secret_reconcile_deferred` is a non-terminal requeue and
+/// `pull_secret_delete_conflict` is published as `deployment_apply_failed`).
 const PUBLIC_DEPLOYMENT_ERROR_CODES: &[&str] = &[
+    // control-plane codes
     crate::deploy::DEPLOYMENT_SUPERSEDED_ERROR,
     crate::deployment_jobs::CUSTOMER_CONFIG_HOLD_EXPIRED,
+    crate::deployment_jobs::DEPLOYMENT_SETUP_FAILED_MESSAGE,
+    "deployment_apply_failed",
+    "deployment_rollout_failed",
+    "deployment_authority_changed",
+    "deployment_validation_error",
+    // provider/engine codes (ApplyError::public_code)
+    "kubernetes_api_error",
+    "provider_write_timeout",
+    "invalid_mutation_generation",
+    "invalid_live_mutation_generation",
+    "stale_mutation_generation",
+    "provider_generation_not_applied",
+    // engine codes inherited from main's P2 evidence work (0075): both are
+    // bounded ApplyError classifications and must pass through verbatim
+    "creation_evidence_lost",
+    "missing_resource_identity",
+    "resource_not_found",
+    "resource_vanished",
+    "mutation_conflict_exhausted",
+    "namespace_not_ready",
+    "rollout_timeout",
+    "rollout_failed",
+    "cleanup_failed",
+    "manifest_generation_error",
+    "serialization_error",
+    // deploy-level codes (DeployError::public_code)
+    "database_error",
+    "no_containers",
+    "image_parse_error",
+    "image_digest_required",
+    "deploy_runtime_not_configured",
+    "kbs_policy_error",
+    "signed_policy_budget_exceeded",
+    "app_not_deployed",
+    "edge_route_error",
+    "mutation_fence_error",
+    // job-level codes (DeploymentJobError::code)
+    "dns_setup_error",
+    "invalid_job_payload",
+    "unsupported_job_payload_version",
+    "artifact_invalid",
+    "lease_lost",
+    "apply_limiter_closed",
+    "side_effect_admission_closed",
+    // preflight volume-evidence code (main): requeue-only today, listed so
+    // the widening invariant holds if it ever terminalizes
+    "volume_evidence_unavailable",
+    // DNS setup codes
+    "dns_not_configured",
+    "dns_outside_managed_zone",
+    "dns_hostname_in_use",
+    "dns_provider_error",
+    "dns_transport_error",
+    // mutation-lease codes
+    "app_mutation_busy",
+    "app_mutation_lease_lost",
+    "app_mutation_unavailable",
+    // pull-secret codes (see the 0087 CHECK note above)
+    crate::deployment_jobs::DEPLOYMENT_RETRY_EXHAUSTED_MESSAGE,
     "pull_secret_reconcile_deferred",
     "pull_secret_delete_conflict",
 ];
 
 /// Project a stored deployment error across an API boundary without exposing
-/// arbitrary backend, runtime, or workload-controlled plaintext.
+/// arbitrary backend, runtime, or workload-controlled plaintext. Bounded
+/// classification codes pass through verbatim so operators and users can see
+/// *why* a deployment failed (#18); unknown strings are redacted.
 pub(crate) fn public_deployment_error_message(error_message: Option<&str>) -> Option<String> {
     error_message.map(|error_message| {
         if PUBLIC_DEPLOYMENT_ERROR_CODES.contains(&error_message) {
@@ -849,6 +911,29 @@ async fn build_accepted_apply_payload(
         delete_app_on_setup_failure,
     ))
 }
+
+/// The app-insert statement behind generic `app.create_if_missing` creates
+/// (AppMutation::Insert). Its target column list, SELECT placeholder list,
+/// and the caller's bind order must stay aligned: an added column without
+/// its SELECT placeholder makes PostgreSQL reject every such insert before
+/// execution (Codex P1 against 8fdebfd), and sqlx only checks the bind
+/// count at runtime. The statement is shared with the regression that
+/// executes it against real PostgreSQL.
+const APP_INSERT_SQL: &str = "INSERT INTO apps (
+    id, org_id, name, namespace, instance_id, tenant_id, service_account,
+    bootstrap_owner_pubkey_hash, tenant_instance_identity_hash, unlock_mode,
+    domain, tee_domain, custom_domain, status, signer_identity_subject,
+    signer_identity_issuer, signer_identity_set_at, signer_rotation_generation,
+    source_provider,
+    source_repository, egress_allowlist, egress_mode, created_at, updated_at
+ )
+ SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10::unlock_enum,
+    $11, $12, $13, $14::app_status_enum, $15, $16, $17, $18,
+    $19, $20, $21, $22, $23, $24
+ WHERE NOT EXISTS (
+     SELECT 1 FROM kbs_owner_seed_waivers
+      WHERE binding_key = $25
+ )";
 
 async fn insert_transaction_audit(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -1648,57 +1733,43 @@ async fn deploy_app_candidate(
             }
         }
         AppMutation::Insert => {
-            sqlx::query(
-                "INSERT INTO apps (
-                    id, org_id, name, namespace, instance_id, tenant_id, service_account,
-                    bootstrap_owner_pubkey_hash, tenant_instance_identity_hash, unlock_mode,
-                    domain, tee_domain, custom_domain, status, signer_identity_subject,
-                    signer_identity_issuer, signer_identity_set_at, source_provider,
-                    source_repository, egress_allowlist, egress_mode, created_at, updated_at
-                 )
-                 SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10::unlock_enum,
-                    $11, $12, $13, $14::app_status_enum, $15, $16, $17, $18,
-                    $19, $20, $21, $22, $23
-                 WHERE NOT EXISTS (
-                     SELECT 1 FROM kbs_owner_seed_waivers
-                      WHERE binding_key = $24
-                 )",
-            )
-            .bind(app.id)
-            .bind(app.org_id)
-            .bind(&app.name)
-            .bind(&app.namespace)
-            .bind(&app.instance_id)
-            .bind(&app.tenant_id)
-            .bind(&app.service_account)
-            .bind(&app.bootstrap_owner_pubkey_hash)
-            .bind(&app.tenant_instance_identity_hash)
-            .bind(app.unlock_mode)
-            .bind(&app.domain)
-            .bind(app.tee_domain.as_deref())
-            .bind(app.custom_domain.as_deref())
-            .bind(app.status)
-            .bind(app.signer_identity_subject.as_deref())
-            .bind(app.signer_identity_issuer.as_deref())
-            .bind(app.signer_identity_set_at)
-            .bind(app.source_provider.as_deref())
-            .bind(app.source_repository.as_deref())
-            .bind(&app.egress_allowlist)
-            .bind(&app.egress_mode)
-            .bind(app.created_at)
-            .bind(app.updated_at)
-            .bind(crate::kbs::owner_binding_key_for(&app.namespace, &app.name))
-            .execute(&mut *tx)
-            .await
-            .map_err(|error| {
-                if error.to_string().contains("duplicate key")
-                    || error.to_string().contains("unique")
-                {
-                    json_error(StatusCode::CONFLICT, "app name already taken in this org")
-                } else {
-                    json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
-                }
-            })?;
+            sqlx::query(APP_INSERT_SQL)
+                .bind(app.id)
+                .bind(app.org_id)
+                .bind(&app.name)
+                .bind(&app.namespace)
+                .bind(&app.instance_id)
+                .bind(&app.tenant_id)
+                .bind(&app.service_account)
+                .bind(&app.bootstrap_owner_pubkey_hash)
+                .bind(&app.tenant_instance_identity_hash)
+                .bind(app.unlock_mode)
+                .bind(&app.domain)
+                .bind(app.tee_domain.as_deref())
+                .bind(app.custom_domain.as_deref())
+                .bind(app.status)
+                .bind(app.signer_identity_subject.as_deref())
+                .bind(app.signer_identity_issuer.as_deref())
+                .bind(app.signer_identity_set_at)
+                .bind(app.signer_rotation_generation)
+                .bind(app.source_provider.as_deref())
+                .bind(app.source_repository.as_deref())
+                .bind(&app.egress_allowlist)
+                .bind(&app.egress_mode)
+                .bind(app.created_at)
+                .bind(app.updated_at)
+                .bind(crate::kbs::owner_binding_key_for(&app.namespace, &app.name))
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| {
+                    if error.to_string().contains("duplicate key")
+                        || error.to_string().contains("unique")
+                    {
+                        json_error(StatusCode::CONFLICT, "app name already taken in this org")
+                    } else {
+                        json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
+                    }
+                })?;
             // The waiver guard runs before this transaction, and under READ
             // COMMITTED the insert's NOT EXISTS is evaluated on its statement
             // snapshot — an abandoned destroy committing while the insert
@@ -2247,6 +2318,60 @@ mod tests {
             .expect("delete setup test organization");
     }
 
+    #[tokio::test]
+    async fn generic_app_insert_statement_accepts_every_bound_column() {
+        let pool = database_test_pool().await;
+        let mut app = insert_setup_test_app(&pool).await;
+        // Execute the exact AppMutation::Insert statement with the handler's
+        // bind order: an added column without its SELECT placeholder makes
+        // PostgreSQL reject every generic create before execution (Codex P1
+        // against 8fdebfd), and sqlx only checks bind counts at runtime.
+        app.id = Uuid::new_v4();
+        app.name = format!("insert-{}", Uuid::new_v4().simple());
+        app.namespace = format!("cap-{}", app.name);
+        app.instance_id = format!("instance-{}", app.name);
+        app.service_account = format!("{}-sa", app.name);
+        app.domain = format!("{}.enclava.dev", app.name);
+        app.tee_domain = Some(format!("{}.tee.enclava.dev", app.name));
+        app.custom_domain = None;
+        sqlx::query(APP_INSERT_SQL)
+            .bind(app.id)
+            .bind(app.org_id)
+            .bind(&app.name)
+            .bind(&app.namespace)
+            .bind(&app.instance_id)
+            .bind(&app.tenant_id)
+            .bind(&app.service_account)
+            .bind(&app.bootstrap_owner_pubkey_hash)
+            .bind(&app.tenant_instance_identity_hash)
+            .bind(app.unlock_mode)
+            .bind(&app.domain)
+            .bind(app.tee_domain.as_deref())
+            .bind(app.custom_domain.as_deref())
+            .bind(app.status)
+            .bind(app.signer_identity_subject.as_deref())
+            .bind(app.signer_identity_issuer.as_deref())
+            .bind(app.signer_identity_set_at)
+            .bind(app.signer_rotation_generation)
+            .bind(app.source_provider.as_deref())
+            .bind(app.source_repository.as_deref())
+            .bind(&app.egress_allowlist)
+            .bind(&app.egress_mode)
+            .bind(app.created_at)
+            .bind(app.updated_at)
+            .bind(crate::kbs::owner_binding_key_for(&app.namespace, &app.name))
+            .execute(&pool)
+            .await
+            .expect("the generic app insert must accept its full column and bind shape");
+        let inserted: i64 = sqlx::query_scalar("SELECT count(*) FROM apps WHERE id = $1")
+            .bind(app.id)
+            .fetch_one(&pool)
+            .await
+            .expect("read inserted generic app");
+        assert_eq!(inserted, 1, "the generic app insert must commit its row");
+        delete_setup_test_org(&pool, app.org_id).await;
+    }
+
     fn valid_log_encryption_config() -> LogEncryptionConfig {
         LogEncryptionConfig {
             algorithm: LOG_ENCRYPTION_ALGORITHM_X25519_HPKE_V1.to_string(),
@@ -2263,6 +2388,30 @@ mod tests {
             .expect("valid log encryption config")
             .expect("config returned");
         assert_eq!(validated, config);
+    }
+
+    #[test]
+    fn public_deployment_error_message_passes_bounded_codes_and_redacts_plaintext() {
+        // Bounded platform classifications cross the tenant boundary verbatim.
+        assert_eq!(
+            public_deployment_error_message(Some(
+                crate::deployment_jobs::DEPLOYMENT_RETRY_EXHAUSTED_MESSAGE
+            ))
+            .as_deref(),
+            Some(crate::deployment_jobs::DEPLOYMENT_RETRY_EXHAUSTED_MESSAGE)
+        );
+        assert_eq!(
+            public_deployment_error_message(Some(crate::deploy::DEPLOYMENT_SUPERSEDED_ERROR))
+                .as_deref(),
+            Some(crate::deploy::DEPLOYMENT_SUPERSEDED_ERROR)
+        );
+        // Arbitrary backend plaintext stays redacted.
+        assert_eq!(
+            public_deployment_error_message(Some("kubernetes: node oom-killed tenant pod"))
+                .as_deref(),
+            Some(PUBLIC_DEPLOYMENT_ERROR_MESSAGE)
+        );
+        assert_eq!(public_deployment_error_message(None), None);
     }
 
     #[test]

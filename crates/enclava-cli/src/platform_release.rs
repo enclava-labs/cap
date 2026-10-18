@@ -668,8 +668,16 @@ mod tests {
             schema_version: "v1".into(),
             platform_release_version: version.into(),
             signing_service_url: "https://signing.example".into(),
-            signing_service_pubkey_hex: "00".repeat(32),
-            platform_trustee_policy_pubkey_hex: "01".repeat(32),
+            signing_service_pubkey_hex: hex::encode(
+                ed25519_dalek::SigningKey::from_bytes(&[0xd0; 32])
+                    .verifying_key()
+                    .as_bytes(),
+            ),
+            platform_trustee_policy_pubkey_hex: hex::encode(
+                ed25519_dalek::SigningKey::from_bytes(&[0xe0; 32])
+                    .verifying_key()
+                    .as_bytes(),
+            ),
             policy_template_id: "t".into(),
             policy_template_sha256: "00".repeat(32),
             policy_template_text: "".into(),
