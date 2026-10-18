@@ -187,6 +187,17 @@ async fn pull_secret_mutation_guard(
     pool: &PgPool,
 ) -> Result<sqlx::Transaction<'_, sqlx::Postgres>, DeployError> {
     let mut guard = pool.begin().await?;
+    // Codex review on #278, P1 "keep the advisory guard transaction alive":
+    // this transaction stays idle while the Kubernetes Secret/ServiceAccount
+    // mutations it protects run on other connections. A nonzero
+    // idle_in_transaction_session_timeout would abort the session mid-mutation
+    // and release the shared advisory lock, letting a waiting epoch transition
+    // publish authority and sweep while this stale replica still writes.
+    // Disable the timeout for this transaction only — SET LOCAL cannot
+    // outlive the guard.
+    sqlx::query("SET LOCAL idle_in_transaction_session_timeout = 0")
+        .execute(&mut *guard)
+        .await?;
     sqlx::query("SELECT pg_advisory_xact_lock_shared(278225)")
         .execute(&mut *guard)
         .await?;
@@ -1936,7 +1947,7 @@ async fn reconcile_managed_pull_secrets(
     scope: &PullSecretAccountScope,
     delete_mode: PullSecretDeleteMode,
 ) -> Result<bool, DeployError> {
-    let (_managed, _all_referenced_names, accounts) =
+    let (managed, _all_referenced_names, accounts) =
         discover_managed_pull_secrets(engine, namespace, service_accounts, settings).await?;
     // Per-app scope decisions (Codex review on #243, P1 "reconcile pull-secret
     // references per app in shared namespaces"): only an IN-SCOPE app's
@@ -2400,7 +2411,7 @@ async fn reconcile_managed_pull_secrets(
                             // A previous delete finished after scope expanded. Recreate
                             // before reattaching; never declare a missing desired
                             // credential converged merely because refresh saw 404.
-                            if let Some(config) = tenant_image_pull_secret_config_from_env() {
+                            if let Some(config) = settings.tenant_image_pull_secret_config() {
                                 let mut desired =
                                     generate_tenant_image_pull_secret(namespace, &config);
                                 stamp_sweep_created_pull_secret_lineage(&mut desired);
@@ -2419,18 +2430,32 @@ async fn reconcile_managed_pull_secrets(
                                         // the namespace is not converged — an
                                         // unattributable platform PAT must not
                                         // land in a tenant namespace.
-                                        let attributed = applied
-                                            .metadata
-                                            .managed_fields
-                                            .as_ref()
-                                            .is_some_and(|entries| {
-                                                entries.iter().any(|entry| {
-                                                    entry.manager.as_deref()
-                                                        == Some(
-                                                            engine.config().field_manager.as_str(),
-                                                        )
-                                                })
-                                            });
+                                        // Codex review on #278, P1 "verify
+                                        // ownership of the recreated secret
+                                        // marker": a mutating admission
+                                        // webhook can strip the dedicated
+                                        // pull-secret label while other
+                                        // fields stay attributed to the
+                                        // platform manager — a manager ENTRY
+                                        // alone is not ownership. Require
+                                        // the platform manager to actually
+                                        // own TENANT_PULL_SECRET_LABEL on
+                                        // the returned object; without it the
+                                        // recreated PAT is neither
+                                        // label-discoverable nor
+                                        // legacy-shape-matching after the
+                                        // next rotation and would be kept
+                                        // forever.
+                                        let attributed = enclava_engine::apply::generation::label_owned_by_manager(
+                                            &applied,
+                                            TENANT_PULL_SECRET_LABEL,
+                                            &engine.config().field_manager,
+                                        ) && applied.metadata.labels.as_ref().is_some_and(
+                                            |labels| {
+                                                labels.get(TENANT_PULL_SECRET_LABEL).map(String::as_str)
+                                                    == Some(TENANT_PULL_SECRET_LABEL_VALUE)
+                                            },
+                                        );
                                         if !attributed {
                                             let delete_params = kube::api::DeleteParams {
                                                 preconditions: Some(kube::api::Preconditions {
@@ -2442,23 +2467,53 @@ async fn reconcile_managed_pull_secrets(
                                                 }),
                                                 ..Default::default()
                                             };
-                                            if let Err(error) =
-                                                api.delete(&config.name, &delete_params).await
-                                                && !matches!(
-                                                    &error,
-                                                    kube::Error::Api(error)
-                                                        if error.code == 404
-                                                )
+                                            match api.delete(&config.name, &delete_params).await
                                             {
-                                                tracing::error!(
-                                                    %namespace,
-                                                    secret = %config.name,
-                                                    %error,
-                                                    "could not delete a just-recreated pull \
-                                                     secret whose field-manager attribution \
-                                                     was stripped — the platform PAT may \
-                                                     remain exposed until operator cleanup"
-                                                );
+                                                Ok(_) => {
+                                                    // Codex review on #278,
+                                                    // P2 "wait for sweep
+                                                    // compensation to reach
+                                                    // 404": DELETE acceptance
+                                                    // leaves the PAT readable
+                                                    // when a finalizer holds
+                                                    // the object — and a
+                                                    // still-labeled
+                                                    // terminating Secret is
+                                                    // discovered next pass.
+                                                    // Only a 404 means the
+                                                    // compensation converged.
+                                                    if let Err(error) =
+                                                        wait_for_secret_removal(
+                                                            &api,
+                                                            namespace,
+                                                            &config.name,
+                                                        )
+                                                        .await
+                                                    {
+                                                        tracing::error!(
+                                                            %namespace,
+                                                            secret = %config.name,
+                                                            %error,
+                                                            "compensating deletion of a \
+                                                             just-recreated pull secret has not \
+                                                             converged — the platform PAT may \
+                                                             remain exposed"
+                                                        );
+                                                    }
+                                                }
+                                                Err(kube::Error::Api(error))
+                                                    if error.code == 404 => {}
+                                                Err(error) => {
+                                                    tracing::error!(
+                                                        %namespace,
+                                                        secret = %config.name,
+                                                        %error,
+                                                        "could not delete a just-recreated pull \
+                                                         secret whose field-manager attribution \
+                                                         was stripped — the platform PAT may \
+                                                         remain exposed until operator cleanup"
+                                                    );
+                                                }
                                             }
                                             converged = false;
                                             tracing::warn!(
@@ -2768,7 +2823,7 @@ async fn reconcile_managed_pull_secrets(
                     // already reference them or have a pending repair, so a
                     // rename can still drop the old credential (Codex review
                     // on #276, P2).
-                    if context == PullSecretReconcileContext::Sweep
+                    if runs_durable_pull_secret_repair(delete_mode)
                         && kept_pull_secret_should_attach(
                             name,
                             &settings.configured_name,
@@ -3102,6 +3157,7 @@ async fn reconcile_managed_pull_secrets(
             scope,
             &api,
             &foreign_replacements,
+            delete_mode,
         )
         .await
         {
@@ -4452,7 +4508,6 @@ async fn apply_scoped_pull_secret(
                         Err(error) => return Err(DeployError::Apply(error.into())),
                     }
                 }
-            }
             Err(kube::Error::Api(error)) if error.code == 404 => {
                 // Devin review on #278: the secret is gone, so no annotation
                 // epoch can fence this create. A narrowing rollout may have
@@ -4562,7 +4617,8 @@ async fn apply_scoped_pull_secret(
                     Err(kube::Error::Api(error)) if error.code == 409 => continue,
                     Err(error) => return Err(DeployError::Apply(error.into())),
                 }
-                Err(error) => return Err(DeployError::Apply(error.into())),
+            }
+            Err(error) => return Err(DeployError::Apply(error.into())),
             }
         }
         // Codex review on #243, P2: exhausting the immediate retries on
@@ -7924,6 +7980,12 @@ mod tests {
         /// is dropped from the persisted object — the recreate path must
         /// detect an unattributable platform PAT and delete it.
         strip_field_manager_on_create: bool,
+        /// Webhook simulation (Codex review on #278, P1): the create is
+        /// ACCEPTED and the platform manager entry still exists, but the
+        /// dedicated pull-secret LABEL is stripped (value and ownership) —
+        /// the recreate path must detect an unmarked platform PAT and delete
+        /// it instead of treating any manager entry as ownership.
+        strip_pull_secret_label_on_create: bool,
         /// Override POST managedFields to model a webhook retaining the
         /// annotation value but moving its ownership to an untrusted entry.
         creation_managed_fields_override: Option<serde_json::Value>,
@@ -8171,6 +8233,7 @@ mod tests {
                             "reason": "LookupFailed", "code": status,
                         }),
                     );
+                }
                 if let Some(hook) = state.fresh_reference_after_secret_gets.as_mut() {
                     hook.named_secret_gets = hook.named_secret_gets.saturating_add(1);
                     if hook.named_secret_gets >= hook.arm_after_named_secret_gets {
@@ -8324,7 +8387,13 @@ mod tests {
                                                     .into_iter()
                                                     .flat_map(|annotations| annotations.keys())
                                                     .map(|key| (format!("f:{key}"), serde_json::json!({})))
-                                                    .collect::<serde_json::Map<_, _>>()
+                                                    .collect::<serde_json::Map<_, _>>(),
+                                                "f:labels": created.metadata.labels
+                                                    .as_ref()
+                                                    .into_iter()
+                                                    .flat_map(|labels| labels.keys())
+                                                    .map(|key| (format!("f:{key}"), serde_json::json!({})))
+                                                    .collect::<serde_json::Map<_, _>>(),
                                             }
                                         }),
                                     ),
@@ -8345,6 +8414,30 @@ mod tests {
                         annotations.remove(
                             enclava_engine::apply::generation::RESOURCE_CREATED_BY_ANNOTATION,
                         );
+                    }
+                }
+                if state.strip_pull_secret_label_on_create {
+                    // Webhook simulation (Codex review on #278, P1): the
+                    // create is ACCEPTED with the manager entry intact but
+                    // the dedicated label removed — from the object and from
+                    // the manager's owned paths.
+                    if let Some(labels) = created.metadata.labels.as_mut() {
+                        labels.remove(TENANT_PULL_SECRET_LABEL);
+                    }
+                    for entry in created
+                        .metadata
+                        .managed_fields
+                        .iter_mut()
+                        .flatten()
+                    {
+                        if let Some(fields) = entry.fields_v1.as_mut()
+                            && let Some(labels) = fields
+                                .0
+                                .pointer_mut("/f:metadata/f:labels")
+                                .and_then(|labels| labels.as_object_mut())
+                        {
+                            labels.remove(&format!("f:{TENANT_PULL_SECRET_LABEL}"));
+                        }
                     }
                 }
                 if state
@@ -12314,7 +12407,10 @@ mod tests {
                     &["in-scope".into()],
                     &reconcile_settings(),
                     &PullSecretAccountScope::uniform(true),
-                    PullSecretReconcileContext::Sweep,
+                    PullSecretDeleteMode::Unfenced {
+                        namespace_generation: 0,
+                        lease_held: false,
+                    },
                 )
                 .await
                 .unwrap()
@@ -12358,10 +12454,14 @@ mod tests {
             namespace_in_scope: true,
             in_scope_accounts: ["qualifying".to_string()].into(),
         };
-        for context in [
-            PullSecretReconcileContext::Deploy,
-            PullSecretReconcileContext::Sweep,
+        for delete_mode in [
+            PullSecretDeleteMode::Fenced(MutationGeneration::new(1).unwrap()),
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 0,
+                lease_held: false,
+            },
         ] {
+            let repair_runs = runs_durable_pull_secret_repair(delete_mode);
             assert!(
                 reconcile_managed_pull_secrets(
                     &engine,
@@ -12369,14 +12469,14 @@ mod tests {
                     &["qualifying".into(), "excluded".into()],
                     &reconcile_settings(),
                     &scope,
-                    context,
+                    delete_mode,
                 )
                 .await
                 .unwrap()
             );
             let state = cluster.lock().unwrap();
             assert_eq!(state.secrets[0].data, original_data);
-            if context == PullSecretReconcileContext::Deploy {
+            if !repair_runs {
                 assert!(!pending_reference_repairs(&state.service_accounts[0]).is_empty());
             } else {
                 assert!(pending_reference_repairs(&state.service_accounts[0]).is_empty());
@@ -12423,7 +12523,10 @@ mod tests {
                     namespace_in_scope: true,
                     in_scope_accounts: ["existing".into(), "newly-qualified".into()].into(),
                 },
-                PullSecretReconcileContext::Sweep,
+                PullSecretDeleteMode::Unfenced {
+                    namespace_generation: 0,
+                    lease_held: false,
+                },
             )
             .await
             .unwrap()
@@ -13227,6 +13330,77 @@ mod tests {
             state.secrets.is_empty(),
             "the unattributed recreated secret must be deleted"
         );
+
+        // (c) Stripped label, retained manager entry (Codex review on #278,
+        // P1): a manager ENTRY alone is not ownership — the dedicated label
+        // must be present AND owned by the platform manager, or the
+        // recreated PAT would be kept invisible to discovery.
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![],
+            service_accounts: vec![pending_intent("uid-previous-object")],
+            strip_pull_secret_label_on_create: true,
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        let converged = reconcile_managed_pull_secrets(
+            &engine,
+            "tenant-ns",
+            &["cap-tenant-app".to_string()],
+            &reconcile_settings(),
+            &PullSecretAccountScope::uniform(true),
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 0,
+                lease_held: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            !converged,
+            "a recreated PAT missing the dedicated pull-secret label must keep \
+             the sweep unconverged even when the platform manager entry survives"
+        );
+        let state = cluster.lock().unwrap();
+        assert!(
+            state.secrets.is_empty(),
+            "the unlabeled recreated secret must be deleted"
+        );
+
+        // (d) Finalizer on the compensation delete (Codex review on #278,
+        // P2): DELETE acceptance leaves the object terminating and readable.
+        // The pass must wait for the confirming 404 before reporting
+        // convergence.
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![],
+            service_accounts: vec![pending_intent("uid-previous-object")],
+            strip_pull_secret_label_on_create: true,
+            delete_lingering_polls: 2,
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        let converged = reconcile_managed_pull_secrets(
+            &engine,
+            "tenant-ns",
+            &["cap-tenant-app".to_string()],
+            &reconcile_settings(),
+            &PullSecretAccountScope::uniform(true),
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 0,
+                lease_held: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            !converged,
+            "an unlabeled recreated secret is still deleted; the pass is \
+             unconverged because the namespace never gained the credential"
+        );
+        let state = cluster.lock().unwrap();
+        assert!(
+            state.secrets.is_empty(),
+            "the compensation must wait out the finalizer to a real 404"
+        );
     }
 
     #[tokio::test]
@@ -13437,6 +13611,33 @@ mod tests {
         pool.close().await;
     }
 
+    /// Codex review on #278, P1 "keep the advisory guard transaction alive":
+    /// the guard transaction idles while protected Kubernetes work runs, so
+    /// a nonzero idle_in_transaction_session_timeout would abort it and
+    /// release the shared lock mid-mutation. The guard must disable that
+    /// timeout for its own transaction.
+    #[tokio::test]
+    async fn pull_secret_mutation_guard_disables_idle_transaction_timeout() {
+        let _reset = ResetStaleRolloutAuthority;
+        let pool = crate::test_support::database_test_pool().await;
+        sqlx::query("UPDATE tenant_pull_secret_rollout_authority SET max_scope_epoch = 0, max_credential_epoch = 0")
+            .execute(&pool).await.unwrap();
+        let mut guard = pull_secret_mutation_guard(&pool).await.unwrap();
+        let (timeout,): (String,) = sqlx::query_as(
+            "SELECT current_setting('idle_in_transaction_session_timeout')",
+        )
+        .fetch_one(&mut *guard)
+        .await
+        .unwrap();
+        assert_eq!(
+            timeout, "0",
+            "the guard transaction must not be killable by \
+             idle_in_transaction_session_timeout while Kubernetes work runs"
+        );
+        guard.rollback().await.unwrap();
+        pool.close().await;
+    }
+
     #[tokio::test]
     async fn stale_replica_does_not_recreate_secret_deleted_by_newer_rollout() {
         let _reset = ResetStaleRolloutAuthority;
@@ -13470,14 +13671,19 @@ mod tests {
             token: "ghp_broad".to_string(),
             allowed_repositories: Vec::new(),
         };
+        let (_lost_tx, lost_rx) = tokio::sync::watch::channel(false);
+        let mutation =
+            crate::mutation_leases::tests::test_app_mutation_lease_for_pool(pool.clone(), lost_rx);
         let error = apply_all_with_tenant_image_pull_secret(
             &engine,
             &pool,
+            Uuid::nil(),
             Uuid::nil(),
             &manifests,
             "hash",
             Some(&config),
             MutationGeneration::new(2).unwrap(),
+            &mutation,
         )
         .await
         .unwrap_err();
@@ -13612,7 +13818,10 @@ mod tests {
                 namespace_in_scope: true,
                 in_scope_accounts: ["broad-in-scope".into()].into(),
             },
-            PullSecretReconcileContext::Sweep,
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 0,
+                lease_held: false,
+            },
         )
         .await
         .expect_err("a newer scope epoch after create conflict must defer");
@@ -13670,7 +13879,10 @@ mod tests {
                     namespace_in_scope: true,
                     in_scope_accounts: ["in-scope".into()].into(),
                 },
-                PullSecretReconcileContext::Sweep,
+                PullSecretDeleteMode::Unfenced {
+                    namespace_generation: 0,
+                    lease_held: false,
+                },
             )
             .await
             .unwrap()
@@ -13723,7 +13935,10 @@ mod tests {
             &accounts,
             &settings,
             &scope,
-            PullSecretReconcileContext::Sweep,
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 0,
+                lease_held: false,
+            },
         )
         .await
         .unwrap();
@@ -13757,7 +13972,10 @@ mod tests {
                 &accounts,
                 &settings,
                 &scope,
-                PullSecretReconcileContext::Sweep,
+                PullSecretDeleteMode::Unfenced {
+                    namespace_generation: 0,
+                    lease_held: false,
+                },
             )
             .await
             .unwrap(),
@@ -13821,7 +14039,10 @@ mod tests {
                 &accounts,
                 &reconcile_settings(),
                 &scope,
-                PullSecretReconcileContext::Sweep,
+                PullSecretDeleteMode::Unfenced {
+                    namespace_generation: 0,
+                    lease_held: false,
+                },
             )
             .await
             .unwrap()
@@ -13874,7 +14095,10 @@ mod tests {
                 &accounts,
                 &reconcile_settings(),
                 &scope,
-                PullSecretReconcileContext::Sweep,
+                PullSecretDeleteMode::Unfenced {
+                    namespace_generation: 0,
+                    lease_held: false,
+                },
             )
             .await
             .unwrap()

@@ -1884,7 +1884,7 @@ async fn assert_current_rows(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use axum::{Json, Router, extract::State, routing::get};
     use serde_json::{Value, json};
@@ -1899,10 +1899,22 @@ mod tests {
     use tokio::sync::{Mutex, Notify};
 
     fn test_app_mutation_lease(heartbeat_lost: watch::Receiver<bool>) -> AppMutationLease {
-        AppMutationLease {
-            pool: PgPoolOptions::new()
+        test_app_mutation_lease_for_pool(
+            PgPoolOptions::new()
                 .connect_lazy("postgresql://stack-size.invalid/enclava")
                 .expect("lazy pool does not connect"),
+            heartbeat_lost,
+        )
+    }
+
+    /// Shared with `crate::deploy` tests that need a lease whose DB calls
+    /// reach the real test pool.
+    pub(crate) fn test_app_mutation_lease_for_pool(
+        pool: PgPool,
+        heartbeat_lost: watch::Receiver<bool>,
+    ) -> AppMutationLease {
+        AppMutationLease {
+            pool,
             app_id: Uuid::nil(),
             token: Uuid::nil(),
             generation: 1,

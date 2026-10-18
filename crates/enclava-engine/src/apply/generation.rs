@@ -720,16 +720,46 @@ where
         entry
             .fields_v1
             .as_ref()
-            .is_some_and(|fields| owns_annotation_path(&fields.0, annotation_key))
+            .is_some_and(|fields| owns_metadata_key_path(&fields.0, "annotations", annotation_key))
     })
 }
 
-/// Walk f:metadata -> f:annotations -> f:<key> within one FieldsV1
-/// document, ignoring every other branch.
-fn owns_annotation_path(fields_v1: &serde_json::Value, annotation_key: &str) -> bool {
+/// True when a managed-fields entry authored by `field_manager` (non-status)
+/// owns `metadata.labels.<key>` on the live object — the same walk as
+/// [`annotation_owned_by_manager`] under `f:labels`. Fails closed when
+/// managed fields are absent: a manager ENTRY alone is not ownership, so a
+/// mutating admission webhook that strips the label but leaves other fields
+/// attributed stays detectable (Codex review on #278, P1).
+pub fn label_owned_by_manager<K>(resource: &K, label_key: &str, field_manager: &str) -> bool
+where
+    K: Resource,
+{
+    let Some(entries) = resource.meta().managed_fields.as_ref() else {
+        return false;
+    };
+    if entries.is_empty() {
+        return false;
+    }
+    entries.iter().any(|entry| {
+        if entry.subresource.as_deref() == Some("status") {
+            return false;
+        }
+        if entry.manager.as_deref() != Some(field_manager) {
+            return false;
+        }
+        entry
+            .fields_v1
+            .as_ref()
+            .is_some_and(|fields| owns_metadata_key_path(&fields.0, "labels", label_key))
+    })
+}
+
+/// Walk f:metadata -> f:<section> -> f:<key> within one FieldsV1 document,
+/// ignoring every other branch.
+fn owns_metadata_key_path(fields_v1: &serde_json::Value, section: &str, key: &str) -> bool {
     fields_v1
-        .pointer("/f:metadata/f:annotations")
-        .and_then(|annotations| annotations.get(format!("f:{annotation_key}")))
+        .pointer(&format!("/f:metadata/f:{section}"))
+        .and_then(|entries| entries.get(format!("f:{key}")))
         .is_some()
 }
 
