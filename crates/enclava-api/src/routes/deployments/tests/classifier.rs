@@ -26,6 +26,7 @@ fn idempotency_app() -> App {
         ),
         signer_identity_issuer: Some("https://token.actions.githubusercontent.com".to_string()),
         signer_identity_set_at: Some(chrono::Utc::now()),
+        signer_rotation_generation: 1,
         source_provider: Some("github".to_string()),
         source_repository: Some("acme/confidential-app".to_string()),
         egress_allowlist: sqlx::types::Json(Vec::new()),
