@@ -457,6 +457,10 @@ supersede its delivery. Release or expiry permits the next operation;
 explicit deletion remains available. Expiry never applies the replacement
 and preserves the running workload's signed or legacy KBS authority.
 
+CLI 0.1.1 allows each config key up to 240 seconds for retryable first-boot
+initialization, matching template deployment. Terminal bootstrap errors still
+fail immediately; a ready config store adds no delay.
+
 Deploy the PaaS response contract first: every held response, including a
 replay, must carry a fresh CAP database-clock
 `customer_config_hold_remaining_ms`. The CLI anchors it before sending
@@ -514,6 +518,20 @@ Roll out and recover as follows:
    treating the rollout as accepted. CI alone does not establish runtime
    compatibility.
 
+
+## TEE Teardown Authentication
+
+The TEE leaf is self-signed and boot-scoped. Before minting a teardown bearer
+token, the API verifies fresh nonce-bound SNP evidence under pinned AMD roots,
+binding the TLS SPKI and receipt-key hash to the app's admitted init-data and
+firmware identity. Its app-scoped KBS authority includes rollback and prior
+healthy deployments, but excludes held, withdrawn, and removed-signer artifacts.
+
+`AMD_KDS_BASE_URL` includes `/vcek/v1`; its default is
+`https://kdsintf.amd.com/vcek/v1`. An internal HTTP collateral relay is supported
+without relaxing AMD certificate-chain, HWID/TCB, or debug-policy checks.
+Ordinary teardown attestation does not add CRL freshness checking; unlock
+transition verification remains separate.
 
 ## Keyring Revocation Completion
 

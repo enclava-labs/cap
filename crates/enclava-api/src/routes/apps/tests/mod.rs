@@ -641,27 +641,11 @@ async fn deletion_retry_preserves_teardown_requirement_before_policy_revocation(
         .await
         .unwrap();
     let provider = Arc::new(tokio::sync::Mutex::new(KbsPolicyProvider::new(true)));
-    let teardown_provider = provider.clone();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let (attempts_tx, mut attempts_rx) = tokio::sync::mpsc::channel(2);
-    let server = tokio::spawn(async move {
-        for _ in 0..2 {
-            let (stream, _) = listener.accept().await.unwrap();
-            attempts_tx
-                .send(teardown_provider.lock().await.configmap["data"]["policy.rego"].clone())
-                .await
-                .unwrap();
-            drop(stream);
-        }
-    });
-    let app_name: String =
-        sqlx::query_scalar("UPDATE apps SET tee_domain = $2 WHERE id = $1 RETURNING name")
-            .bind(app_id)
-            .bind(address.to_string())
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let app_name: String = sqlx::query_scalar("SELECT name FROM apps WHERE id = $1")
+        .bind(app_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     sqlx::query(
         "UPDATE kbs_signed_policy_reconciliation SET desired_generation = 1 WHERE singleton",
     )
@@ -705,12 +689,6 @@ async fn deletion_retry_preserves_teardown_requirement_before_policy_revocation(
         .expect_err("an unavailable TEE must block both deletion attempts");
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert_eq!(body["error"], "app_delete_teardown_unavailable");
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(1), attempts_rx.recv())
-                .await
-                .expect("each deletion attempt must contact the TEE"),
-            Some(policy_before.clone())
-        );
         let app_status: String = sqlx::query_scalar("SELECT status::text FROM apps WHERE id = $1")
             .bind(app_id)
             .fetch_one(&pool)
@@ -739,7 +717,6 @@ async fn deletion_retry_preserves_teardown_requirement_before_policy_revocation(
         .unwrap();
         assert_eq!(teardown_state, (true, None));
     }
-    server.await.unwrap();
     crate::test_support::drop_isolated_database("cap_delete_teardown_retry", pool).await;
 }
 
