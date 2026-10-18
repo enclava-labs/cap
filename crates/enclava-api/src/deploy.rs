@@ -2183,31 +2183,11 @@ async fn reconcile_managed_pull_secrets(
                                     }
                                 }
                                 Ok(PullSecretRemovalOutcome::Superseded) => {
-                                    // A newer deploy rewrote the same managed
-                                    // object. Restore the reference it inherits
-                                    // by name, but do not record it as a tenant
-                                    // replacement — the UID is still ours.
-                                    if let Err(error) =
-                                        restore_pull_secret_reference_to_service_account(
-                                            engine,
-                                            namespace,
-                                            account_name,
-                                            &secret_name,
-                                            None,
-                                        )
-                                        .await
-                                    {
-                                        converged = false;
-                                        tracing::warn!(
-                                            %namespace,
-                                            service_account = %account_name,
-                                            secret = %secret_name,
-                                            %error,
-                                            "tenant image pull secret reconcile: failed to \
-                                             restore a reference whose pending removal was \
-                                             superseded — durable repair intent retained"
-                                        );
-                                    }
+                                    // This is still the UID-proven managed object,
+                                    // not a replacement. Let the active deploy
+                                    // attach its own reference; preserve the only
+                                    // durable discovery proof for the next sweep.
+                                    converged = false;
                                 }
                                 Err(error) => {
                                     converged = false;
@@ -2594,6 +2574,14 @@ async fn reconcile_managed_pull_secrets(
                 PullSecretDeleteMode::Fenced(_) => false,
             };
             if concurrent_deploy_owns_secret {
+                // Uniform in-scope deploy callers have no clears to defer.
+                // Mixed-scope sweeps cannot certify the skipped cleanup.
+                if service_accounts
+                    .iter()
+                    .any(|account| !scope.account_in_scope(account))
+                {
+                    converged = false;
+                }
                 tracing::info!(
                     %namespace,
                     secret = %name,
@@ -11729,6 +11717,139 @@ mod tests {
                 .name,
             "old-pull-secret",
             "the recorded old-name reference is restored"
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_uid_proven_unlabeled_removal_retains_discovery_intent() {
+        use std::sync::{Arc, Mutex};
+        let mut secret = fake_managed_secret("old-pull-secret", false, "cap-bot", "ghp_revoked");
+        secret
+            .metadata
+            .annotations
+            .get_or_insert_with(Default::default)
+            .insert(
+                enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION.to_string(),
+                "5".to_string(),
+            );
+        let mut account = fake_service_account("cap-tenant-app", &[]);
+        account.metadata.annotations = Some(std::collections::BTreeMap::from([(
+            PENDING_PULL_SECRET_REFERENCE_REPAIRS_ANNOTATION.to_string(),
+            "old-pull-secret=uid-old-pull-secret".to_string(),
+        )]));
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![secret],
+            service_accounts: vec![account],
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        for lease_held in [true, false] {
+            let converged = reconcile_managed_pull_secrets(
+                &engine,
+                "tenant-ns",
+                &["cap-tenant-app".to_string()],
+                &reconcile_settings(),
+                &PullSecretAccountScope::uniform(false),
+                PullSecretDeleteMode::Unfenced {
+                    namespace_generation: 5,
+                    lease_held,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(converged, !lease_held);
+            let state = cluster.lock().unwrap();
+            assert!(
+                state.service_accounts[0]
+                    .image_pull_secrets
+                    .as_ref()
+                    .is_none_or(|refs| refs.is_empty())
+            );
+            assert_eq!(state.secrets.len(), usize::from(lease_held));
+            assert_eq!(
+                pending_reference_repairs(&state.service_accounts[0]).len(),
+                usize::from(lease_held)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_scope_concurrent_clear_defers_but_uniform_deploy_converges() {
+        use std::sync::{Arc, Mutex};
+        let mut secret =
+            fake_managed_secret("enclava-registry-auth", true, "cap-bot", "ghp_platform");
+        secret
+            .metadata
+            .annotations
+            .get_or_insert_with(Default::default)
+            .insert(
+                enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION.to_string(),
+                "5".to_string(),
+            );
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![secret],
+            service_accounts: vec![
+                fake_service_account("cap-in", &["enclava-registry-auth"]),
+                fake_service_account("cap-out", &["enclava-registry-auth"]),
+            ],
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        let accounts = ["cap-in".to_string(), "cap-out".to_string()];
+        let mixed = PullSecretAccountScope {
+            namespace_in_scope: true,
+            in_scope_accounts: ["cap-in".to_string()].into_iter().collect(),
+        };
+        for (scope, expected) in [
+            (&mixed, false),
+            (&PullSecretAccountScope::uniform(true), true),
+        ] {
+            assert_eq!(
+                reconcile_managed_pull_secrets(
+                    &engine,
+                    "tenant-ns",
+                    &accounts,
+                    &reconcile_settings(),
+                    scope,
+                    PullSecretDeleteMode::Unfenced {
+                        namespace_generation: 5,
+                        lease_held: true
+                    },
+                )
+                .await
+                .unwrap(),
+                expected
+            );
+            let state = cluster.lock().unwrap();
+            assert_eq!(
+                state.service_accounts[1]
+                    .image_pull_secrets
+                    .as_ref()
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        assert!(
+            reconcile_managed_pull_secrets(
+                &engine,
+                "tenant-ns",
+                &accounts,
+                &reconcile_settings(),
+                &mixed,
+                PullSecretDeleteMode::Unfenced {
+                    namespace_generation: 5,
+                    lease_held: false
+                },
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            cluster.lock().unwrap().service_accounts[1]
+                .image_pull_secrets
+                .as_ref()
+                .is_none_or(|refs| refs.is_empty())
         );
     }
 
