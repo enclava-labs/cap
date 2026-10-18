@@ -1233,11 +1233,66 @@ enum PullSecretDeleteMode {
         /// rollout that Secret is unreferenced residue until the deploy's
         /// ServiceAccount apply lands, and an old replica's sweep must not
         /// delete it out from under the in-flight deploy. While the lease is
-        /// held, the ACTIVE generation is treated as concurrent; once it is
-        /// released the strict fence resumes (a secret still unreferenced
-        /// and unkept at the SAME generation is then completed residue).
+        /// held — including reclaim quarantine, where `owner_token` is retained
+        /// through `reclaim_after` after `locked_until` expires — the ACTIVE
+        /// generation is treated as concurrent; once ownership is released the
+        /// strict fence resumes (a secret still unreferenced and unkept at the
+        /// SAME generation is then completed residue).
         lease_held: bool,
     },
+    /// The deploy that holds the namespace lease and has just written
+    /// `generation`. Runs the durable repair pass (fenced deploy cleanup
+    /// skips it), but that generation is this caller's authoritative write,
+    /// not a concurrent deploy a background sweep must defer to. A strictly
+    /// newer marker still belongs to someone else.
+    DeployOwned { generation: i64 },
+}
+
+/// Sweep and deploy-owned passes both run the durable repair pass. Fenced
+/// per-deploy cleanup does not: its ServiceAccount SSA is the authoritative
+/// `imagePullSecrets` decision.
+fn runs_durable_pull_secret_repair(mode: PullSecretDeleteMode) -> bool {
+    matches!(
+        mode,
+        PullSecretDeleteMode::Unfenced { .. } | PullSecretDeleteMode::DeployOwned { .. }
+    )
+}
+
+/// A mutation generation this pass must not delete as completed residue.
+///
+/// Background sweeps protect a strictly newer generation, and an equal
+/// generation while the snapshot lease is still owned (live heartbeat or
+/// reclaim quarantine). The deploy's own pass wrote `generation` and must
+/// not delete that object as residue either; a strictly newer rewrite is
+/// still someone else's.
+fn generation_blocks_pull_secret_removal(mode: PullSecretDeleteMode, actual: i64) -> bool {
+    match mode {
+        PullSecretDeleteMode::Unfenced {
+            namespace_generation,
+            lease_held,
+        } => actual > namespace_generation || (lease_held && actual == namespace_generation),
+        PullSecretDeleteMode::DeployOwned { generation } => actual >= generation,
+        PullSecretDeleteMode::Fenced(_) => false,
+    }
+}
+
+/// Whether a kept secret's per-app reference clear must wait for another deploy.
+///
+/// Distinct from [`generation_blocks_pull_secret_removal`]: the deploy that
+/// just wrote `generation` has the authoritative scope and must clear
+/// out-of-scope accounts. A background sweep must not clear references a
+/// concurrent owner — including one still inside reclaim quarantine —
+/// attached at the snapshot generation.
+fn concurrent_deploy_owns_pull_secret(mode: PullSecretDeleteMode, actual: i64) -> bool {
+    match mode {
+        PullSecretDeleteMode::Unfenced {
+            namespace_generation,
+            lease_held,
+        } => actual > namespace_generation || (lease_held && actual == namespace_generation),
+        // Equal generation is this caller. A strictly newer marker is someone else.
+        PullSecretDeleteMode::DeployOwned { generation } => actual > generation,
+        PullSecretDeleteMode::Fenced(_) => false,
+    }
 }
 
 /// Same-object delete conflicts are retried with the engine's bounded but
@@ -1909,7 +1964,7 @@ async fn reconcile_managed_pull_secrets(
         // Pending references for in-scope accounts are desired too. Seed
         // them before any repairs, so an out-of-scope account processed
         // first cannot delete a secret another account will restore.
-        if matches!(delete_mode, PullSecretDeleteMode::Unfenced { .. }) {
+        if runs_durable_pull_secret_repair(delete_mode) {
             for repair in pending_reference_repairs(account) {
                 in_scope_referenced_names.insert(repair.secret_name.clone());
             }
@@ -1953,7 +2008,7 @@ async fn reconcile_managed_pull_secrets(
     // its `imagePullSecrets` — restoring ahead of it would be pruned and the
     // record discharged — so the deploy path discharges stale intents AFTER
     // its applies instead (see `apply_all_with_tenant_image_pull_secret`).
-    if let PullSecretDeleteMode::Unfenced { .. } = delete_mode {
+    if runs_durable_pull_secret_repair(delete_mode) {
         for account in &accounts {
             let pending = pending_reference_repairs(account);
             if pending.is_empty() {
@@ -2686,17 +2741,8 @@ async fn reconcile_managed_pull_secrets(
             // Fence the clears with the same generation/lease check the
             // delete path uses; the next sweep — whose inventory includes
             // the deploy — re-decides per app.
-            let concurrent_deploy_owns_secret = match delete_mode {
-                PullSecretDeleteMode::Unfenced {
-                    namespace_generation,
-                    lease_held,
-                } => secret_mutation_generation(&live).is_some_and(|actual| {
-                    actual > namespace_generation || (lease_held && actual == namespace_generation)
-                }),
-                // Per-deploy callers pass a uniform scope (every account in
-                // scope), so this loop is a no-op for them.
-                PullSecretDeleteMode::Fenced(_) => false,
-            };
+            let concurrent_deploy_owns_secret = secret_mutation_generation(&live)
+                .is_some_and(|actual| concurrent_deploy_owns_pull_secret(delete_mode, actual));
             if concurrent_deploy_owns_secret {
                 // Uniform in-scope deploy callers have no clears to defer.
                 // Mixed-scope sweeps cannot certify the skipped cleanup.
@@ -2837,13 +2883,8 @@ async fn reconcile_managed_pull_secrets(
         // skipped too. Once the lease is released the strict fence resumes:
         // an unreferenced, unkept secret at the same generation is then
         // completed residue a later sweep may remove.
-        if let PullSecretDeleteMode::Unfenced {
-            namespace_generation,
-            lease_held,
-        } = delete_mode
-            && secret_mutation_generation(&live).is_some_and(|actual| {
-                actual > namespace_generation || (lease_held && actual == namespace_generation)
-            })
+        if secret_mutation_generation(&live)
+            .is_some_and(|actual| generation_blocks_pull_secret_removal(delete_mode, actual))
         {
             converged = false;
             kept += 1;
@@ -3199,13 +3240,8 @@ async fn delete_managed_pull_secret(
             // that could already be a replacement.
             ensure_pull_secret_generation_not_stale(&existing, generation, name)?;
         }
-        if let PullSecretDeleteMode::Unfenced {
-            namespace_generation,
-            lease_held,
-        } = delete_mode
-            && secret_mutation_generation(&existing).is_some_and(|actual| {
-                actual > namespace_generation || (lease_held && actual == namespace_generation)
-            })
+        if secret_mutation_generation(&existing)
+            .is_some_and(|actual| generation_blocks_pull_secret_removal(delete_mode, actual))
         {
             // Self-check on #243: the reconcile-time skip can race a deploy
             // that claims the namespace lease and rewrites the secret after
@@ -3570,14 +3606,7 @@ async fn cleanup_stale_tenant_image_pull_secrets(pool: &PgPool) -> Result<bool, 
         // ServiceAccount apply may not have landed), so secrets it wrote at
         // that exact generation are skipped instead of being erased as
         // unreferenced residue.
-        let leases: Vec<(String, i64, bool)> = sqlx::query_as(
-            "SELECT resource_key, generation, \
-                    (owner_token IS NOT NULL AND locked_until > clock_timestamp()) \
-               FROM external_resource_mutation_leases \
-              WHERE resource_scope = 'kubernetes_namespace'",
-        )
-        .fetch_all(pool)
-        .await?;
+        let leases = crate::mutation_leases::snapshot_namespace_mutation_leases(pool).await?;
         let rows: Vec<(Uuid, String, String, Option<String>)> = sqlx::query_as(
             "SELECT apps.id, apps.namespace, apps.service_account, \
                     app_containers.image_ref \
@@ -3918,16 +3947,12 @@ async fn clear_pull_secret_reference_from_service_account(
     // ServiceAccount, so its resourceVersion cannot see that the scope
     // decision is stale. Re-read the secret AFTER this ServiceAccount GET
     // and refuse the clear when a concurrent deploy now owns it.
-    if let PullSecretDeleteMode::Unfenced {
-        namespace_generation,
-        lease_held,
-    } = delete_mode
-    {
+    if runs_durable_pull_secret_repair(delete_mode) {
         let secret_api: Api<Secret> = Api::namespaced(engine.client().clone(), namespace);
         match secret_api.get(secret_name).await {
             Ok(live)
                 if secret_mutation_generation(&live).is_some_and(|actual| {
-                    actual > namespace_generation || (lease_held && actual == namespace_generation)
+                    concurrent_deploy_owns_pull_secret(delete_mode, actual)
                 }) =>
             {
                 tracing::info!(
@@ -3984,17 +4009,12 @@ async fn clear_pull_secret_reference_from_service_account(
         .await
     {
         Ok(_) => {
-            if let PullSecretDeleteMode::Unfenced {
-                namespace_generation,
-                lease_held,
-            } = delete_mode
-            {
+            if runs_durable_pull_secret_repair(delete_mode) {
                 let secret_api: Api<Secret> = Api::namespaced(engine.client().clone(), namespace);
                 match secret_api.get(secret_name).await {
                     Ok(live)
                         if secret_mutation_generation(&live).is_some_and(|actual| {
-                            actual > namespace_generation
-                                || (lease_held && actual == namespace_generation)
+                            concurrent_deploy_owns_pull_secret(delete_mode, actual)
                         }) =>
                     {
                         restore_pull_secret_reference_to_service_account(
@@ -5064,19 +5084,18 @@ async fn apply_all_with_tenant_image_pull_secret(
     // ServiceAccount apply preserves only the annotations copied below, so
     // it can prune the pending name/UID that is the sole ownership proof of
     // a renamed, unlabeled pre-rotation secret. Run the sweep-context repair
-    // pass with the complete namespace account list first. Sweep context is
-    // required: Deploy context skips the durable repair pass. (#278 fence
-    // union: this deploy holds the namespace lease itself, so its own
-    // generation is active, not residue.)
+    // pass with the complete namespace account list first. The durable repair
+    // pass runs here (`DeployOwned`), but this generation is the caller's own
+    // write — not a background-sweep snapshot — so mixed-scope per-app clears
+    // still happen. A strictly newer marker remains someone else's.
     let repaired = reconcile_managed_pull_secrets_for_deploy(
         engine,
         ns_name,
         reconcile_accounts,
         &settings,
         &scope,
-        PullSecretDeleteMode::Unfenced {
-            namespace_generation: generation.get(),
-            lease_held: true,
+        PullSecretDeleteMode::DeployOwned {
+            generation: generation.get(),
         },
     )
     .await?;
@@ -10901,6 +10920,149 @@ mod tests {
         );
     }
 
+    /// Codex review on #278, P1: quarantine retains `owner_token` through
+    /// `reclaim_after` after `locked_until` expires, because an accepted
+    /// Kubernetes request may still complete. The sweep snapshot must keep
+    /// that lease marked held so the equal-generation Secret is not deleted.
+    #[tokio::test]
+    async fn sweep_keeps_quarantined_lease_equal_generation_secret() {
+        use std::sync::{Arc, Mutex};
+
+        let pool = crate::test_support::database_test_pool().await;
+        let namespace = format!("quar{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+        let owner = uuid::Uuid::new_v4();
+        let operation_id = uuid::Uuid::new_v4();
+        struct DeleteQuarantineLease {
+            namespace: String,
+        }
+        impl Drop for DeleteQuarantineLease {
+            fn drop(&mut self) {
+                let url = std::env::var("DATABASE_URL")
+                    .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
+                let _ = std::process::Command::new("psql")
+                    .env("PGPASSWORD", "test")
+                    .arg(&url)
+                    .arg("-v")
+                    .arg("ON_ERROR_STOP=1")
+                    .arg("-c")
+                    .arg(format!(
+                        "DELETE FROM external_resource_mutation_leases \
+                         WHERE resource_scope = 'kubernetes_namespace' \
+                           AND resource_key = '{}'",
+                        self.namespace
+                    ))
+                    .output();
+            }
+        }
+        let _cleanup = DeleteQuarantineLease {
+            namespace: namespace.clone(),
+        };
+        sqlx::query(
+            "INSERT INTO external_resource_mutation_leases(\
+                resource_scope, resource_key, generation, owner_token, \
+                operation_kind, operation_id, locked_until, reclaim_after) \
+             VALUES (\
+                'kubernetes_namespace', $1, 7, $2, 'deployment_apply', $3, \
+                clock_timestamp() - interval '30 seconds', \
+                clock_timestamp() + interval '300 seconds')",
+        )
+        .bind(&namespace)
+        .bind(owner)
+        .bind(operation_id)
+        .execute(&pool)
+        .await
+        .expect("insert quarantined namespace lease");
+
+        let snapshot = crate::mutation_leases::snapshot_namespace_mutation_leases(&pool)
+            .await
+            .expect("snapshot namespace leases");
+        let (generation, lease_held) = snapshot
+            .iter()
+            .find(|(key, _, _)| key == &namespace)
+            .map(|(_, generation, held)| (*generation, *held))
+            .expect("quarantined namespace is in the sweep snapshot");
+        assert_eq!(generation, 7);
+
+        let mut secret =
+            fake_managed_secret("pull-secret-new-name", true, "cap-bot", "ghp_platform");
+        secret
+            .metadata
+            .annotations
+            .get_or_insert_with(Default::default)
+            .insert(
+                enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION.to_string(),
+                generation.to_string(),
+            );
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![secret],
+            service_accounts: vec![fake_service_account("cap-tenant-app", &[])],
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        let converged = reconcile_managed_pull_secrets(
+            &engine,
+            "tenant-ns",
+            &["cap-tenant-app".to_string()],
+            &reconcile_settings(),
+            &PullSecretAccountScope::uniform(false),
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: generation,
+                lease_held,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            cluster.lock().unwrap().secrets.len(),
+            1,
+            "sweep deleted the quarantined lease's equal-generation Secret \
+             (lease_held={lease_held}; locked_until expired, reclaim_after still future)"
+        );
+        assert!(
+            !converged,
+            "a quarantined equal generation must stay unconverged; lease_held={lease_held}"
+        );
+
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases \
+                SET reclaim_after = clock_timestamp() - interval '1 second' \
+              WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1",
+        )
+        .bind(&namespace)
+        .execute(&pool)
+        .await
+        .expect("expire reclaim quarantine");
+        let snapshot = crate::mutation_leases::snapshot_namespace_mutation_leases(&pool)
+            .await
+            .expect("snapshot after quarantine");
+        let lease_held = snapshot
+            .iter()
+            .find(|(key, _, _)| key == &namespace)
+            .map(|(_, _, held)| *held)
+            .expect("row remains until reclaimed");
+        assert!(
+            !lease_held,
+            "expired reclaim_after releases the sweep fence"
+        );
+        assert!(
+            reconcile_managed_pull_secrets(
+                &engine,
+                "tenant-ns",
+                &["cap-tenant-app".to_string()],
+                &reconcile_settings(),
+                &PullSecretAccountScope::uniform(false),
+                PullSecretDeleteMode::Unfenced {
+                    namespace_generation: generation,
+                    lease_held,
+                },
+            )
+            .await
+            .unwrap(),
+            "after quarantine the equal-generation Secret is completed residue"
+        );
+        assert!(cluster.lock().unwrap().secrets.is_empty());
+    }
+
     /// Both rollout dimensions must fit PostgreSQL's signed BIGINT domain.
     #[test]
     fn pull_secret_epoch_startup_enforces_bigint_range() {
@@ -12524,6 +12686,116 @@ mod tests {
                 .image_pull_secrets
                 .as_ref()
                 .is_none_or(|refs| refs.is_empty())
+        );
+    }
+
+    /// Codex review on #278, P1: the deploy that just wrote the configured
+    /// Secret at this generation must not treat that marker as a concurrent
+    /// deploy. In a mixed-scope namespace the out-of-scope account's reference
+    /// has to be cleared, or `repaired` becomes a terminal validation error
+    /// and every retry repeats it.
+    #[tokio::test]
+    async fn deploy_owned_generation_clears_mixed_scope_out_of_scope_reference() {
+        use std::sync::{Arc, Mutex};
+
+        let mut secret =
+            fake_managed_secret("enclava-registry-auth", true, "cap-bot", "ghp_platform");
+        secret
+            .metadata
+            .annotations
+            .get_or_insert_with(Default::default)
+            .insert(
+                enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION.to_string(),
+                "5".to_string(),
+            );
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![secret],
+            service_accounts: vec![
+                fake_service_account("cap-in", &["enclava-registry-auth"]),
+                fake_service_account("cap-out", &["enclava-registry-auth"]),
+            ],
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        let accounts = ["cap-in".to_string(), "cap-out".to_string()];
+        let mixed = PullSecretAccountScope {
+            namespace_in_scope: true,
+            in_scope_accounts: ["cap-in".to_string()].into_iter().collect(),
+        };
+        assert!(
+            reconcile_managed_pull_secrets(
+                &engine,
+                "tenant-ns",
+                &accounts,
+                &reconcile_settings(),
+                &mixed,
+                PullSecretDeleteMode::DeployOwned { generation: 5 },
+            )
+            .await
+            .unwrap(),
+            "the deploy's own generation must not defer mixed-scope cleanup"
+        );
+        {
+            let state = cluster.lock().unwrap();
+            assert_eq!(state.secrets.len(), 1, "the configured secret stays");
+            assert_eq!(
+                state.service_accounts[0]
+                    .image_pull_secrets
+                    .as_ref()
+                    .map(|references| references.len()),
+                Some(1),
+                "the in-scope account keeps its reference"
+            );
+            assert!(
+                state.service_accounts[1]
+                    .image_pull_secrets
+                    .as_ref()
+                    .is_none_or(|references| references.is_empty()),
+                "the out-of-scope account's reference is cleared"
+            );
+        }
+
+        // A strictly newer marker is still someone else, even on the deploy's
+        // own pass.
+        let mut newer =
+            fake_managed_secret("enclava-registry-auth", true, "cap-bot", "ghp_platform");
+        newer
+            .metadata
+            .annotations
+            .get_or_insert_with(Default::default)
+            .insert(
+                enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION.to_string(),
+                "9".to_string(),
+            );
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![newer],
+            service_accounts: vec![
+                fake_service_account("cap-in", &["enclava-registry-auth"]),
+                fake_service_account("cap-out", &["enclava-registry-auth"]),
+            ],
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        assert!(
+            !reconcile_managed_pull_secrets(
+                &engine,
+                "tenant-ns",
+                &accounts,
+                &reconcile_settings(),
+                &mixed,
+                PullSecretDeleteMode::DeployOwned { generation: 5 },
+            )
+            .await
+            .unwrap(),
+            "a newer generation is still a concurrent deploy"
+        );
+        assert_eq!(
+            cluster.lock().unwrap().service_accounts[1]
+                .image_pull_secrets
+                .as_ref()
+                .map(|references| references.len()),
+            Some(1),
+            "the newer generation's out-of-scope reference is left for the next sweep"
         );
     }
 
