@@ -2058,21 +2058,22 @@ async fn process_apply_job(
             // The reconciliation timed out or encountered a newer rollout.
             // The provider may have accepted earlier writes in this attempt:
             // retain the mutation fence's quarantine before another worker
-            // retries the same durable deployment, rather than terminalizing it.
-            if let Err(requeue_error) = requeue_apply_job(&state.db, &job, error.code()).await {
-                tracing::error!(deployment_id = %deployment_id,
-                    error_code = requeue_error.code(),
-                    "failed to requeue deferred pull-secret reconciliation");
-            }
-            if let Err(release_error) = mutation.release_after_provider_quarantine().await {
-                tracing::error!(deployment_id = %deployment_id,
-                    error_code = DeploymentJobError::from(release_error).code(),
-                    "failed to quarantine deferred deployment mutation");
-            }
+            // retries the same durable deployment, rather than terminalizing
+            // it — unless every legitimate #231 retry window has elapsed, in
+            // which case the already-held lease drives the terminal cleanup.
+            requeue_or_exhaust_deferred_apply_job(&state, &job, &error, mutation, &payload.app)
+                .await;
         }
         Ok(Ok(JobApplyOutcome::ApplyFailed(error, mutation))) => {
-            fail_apply_job_with_mutation(&state, &job, &error, Some(mutation), Some(&payload.app))
-                .await;
+            fail_apply_job_with_mutation(
+                &state,
+                &job,
+                &error,
+                Some(mutation),
+                Some(&payload.app),
+                DEPLOYMENT_APPLY_FAILED_MESSAGE,
+            )
+            .await;
         }
         Ok(Err(error)) if error.should_requeue_without_terminal_failure() => {
             match requeue_or_exhaust_apply_job(&state.db, &job).await {
@@ -2217,6 +2218,65 @@ async fn requeue_or_exhaust_apply_job(
     }
     requeue_apply_job(pool, job, "apply_retry").await?;
     Ok(false)
+}
+
+/// Deferred pull-secret reconciliations requeue WITH their mutation lease
+/// quarantined instead of terminalizing — but that loop is bounded by the
+/// same #231 horizons as the lease-less contention requeue path above.
+/// Codex P2 (e0d8f88d follow-up): this held-lease requeue previously never
+/// consulted `apply_job_retries_exhausted`, so a deployment whose provider
+/// kept deferring reconciliation stayed pending forever past the contention
+/// horizon while only the lease-less path exhausted. Once every legitimate
+/// retry window has elapsed, terminalize through the ALREADY-HELD lease —
+/// `fail_apply_job_with_mutation` publishes the retry-exhausted code and
+/// runs the same fence-guarded compensating cleanup an immediate terminal
+/// failure gets. Returns true when the job was terminalized.
+async fn requeue_or_exhaust_deferred_apply_job(
+    state: &AppState,
+    job: &ClaimedJob,
+    error: &DeploymentJobError,
+    mutation: crate::mutation_leases::AppMutationLease,
+    app: &App,
+) -> bool {
+    let exhausted = apply_job_retries_exhausted(&state.db, job.deployment_id).await;
+    if let Ok(true) = exhausted {
+        tracing::warn!(
+            deployment_id = %job.deployment_id,
+            original_error_code = error.code(),
+            error_code = DEPLOYMENT_RETRY_EXHAUSTED_MESSAGE,
+            "terminalized deferred pull-secret reconciliation after the contention horizon"
+        );
+        fail_apply_job_with_mutation(
+            state,
+            job,
+            error,
+            Some(mutation),
+            Some(app),
+            DEPLOYMENT_RETRY_EXHAUSTED_MESSAGE,
+        )
+        .await;
+        return true;
+    }
+    if let Err(lookup_error) = exhausted {
+        // Fail open to the historical requeue behavior: a broken exhaustion
+        // lookup must not itself terminalize a legitimately retrying job.
+        tracing::error!(
+            deployment_id = %job.deployment_id,
+            error_code = lookup_error.code(),
+            "failed to evaluate retry exhaustion for deferred pull-secret reconciliation; requeueing"
+        );
+    }
+    if let Err(requeue_error) = requeue_apply_job(&state.db, job, error.code()).await {
+        tracing::error!(deployment_id = %job.deployment_id,
+            error_code = requeue_error.code(),
+            "failed to requeue deferred pull-secret reconciliation");
+    }
+    if let Err(release_error) = mutation.release_after_provider_quarantine().await {
+        tracing::error!(deployment_id = %job.deployment_id,
+            error_code = DeploymentJobError::from(release_error).code(),
+            "failed to quarantine deferred deployment mutation");
+    }
+    false
 }
 
 /// The provider fences a durable deployment apply claims, in the canonical
@@ -3632,7 +3692,15 @@ async fn deployment_is_terminal(
 }
 
 async fn fail_apply_job(state: &AppState, job: &ClaimedJob, error: &DeploymentJobError) {
-    fail_apply_job_with_mutation(state, job, error, None, None).await;
+    fail_apply_job_with_mutation(
+        state,
+        job,
+        error,
+        None,
+        None,
+        DEPLOYMENT_APPLY_FAILED_MESSAGE,
+    )
+    .await;
 }
 
 async fn reconcile_pending_kbs_with_mutation(
@@ -3695,25 +3763,22 @@ async fn fail_apply_job_with_mutation(
     error: &DeploymentJobError,
     mut mutation: Option<crate::mutation_leases::AppMutationLease>,
     failed_app: Option<&App>,
+    failure_code: &'static str,
 ) {
-    let published = match publish_apply_failure_with_mutation(
-        &state.db,
-        job,
-        mutation.as_mut(),
-        DEPLOYMENT_APPLY_FAILED_MESSAGE,
-    )
-    .await
-    {
-        Ok(()) => true,
-        Err(db_error) => {
-            tracing::error!(
-                deployment_id = %job.deployment_id,
-                error_code = db_error.code(),
-                "failed to atomically publish durable deployment failure"
-            );
-            false
-        }
-    };
+    let published =
+        match publish_apply_failure_with_mutation(&state.db, job, mutation.as_mut(), failure_code)
+            .await
+        {
+            Ok(()) => true,
+            Err(db_error) => {
+                tracing::error!(
+                    deployment_id = %job.deployment_id,
+                    error_code = db_error.code(),
+                    "failed to atomically publish durable deployment failure"
+                );
+                false
+            }
+        };
     // devin 🔴 round 9: when the terminal publication itself failed, the
     // structured `CreationEvidenceLost` classification dies with this
     // call — a retried apply's precondition GET observes the
@@ -5812,6 +5877,106 @@ pub(crate) mod tests {
             .execute(&pool)
             .await
             .expect("delete exhaustion fixture");
+    }
+
+    #[tokio::test]
+    async fn deferred_requeue_exhaustion_terminalizes_held_mutation_loops() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
+        let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim setup")
+            .expect("setup exists");
+        mark_setup_accepted(&pool, deployment_id, setup.lock_token)
+            .await
+            .expect("accept setup");
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+
+        // The deferred pull-secret class holds a REAL mutation lease while it
+        // requeues (quarantined) — the Codex P2 loop: that requeue used to
+        // never consult the #231 horizons, so it stayed pending forever.
+        let apply = claim_job(&pool, "pending", "running", Some(deployment_id))
+            .await
+            .expect("claim deferred apply")
+            .expect("deferred apply exists");
+        sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET contention_started_at = clock_timestamp() - '31 days'::interval
+              WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("age deferred contention past the horizon");
+        let mutation = crate::mutation_leases::claim(
+            &state,
+            app.id,
+            "deployment_apply",
+            deployment_id,
+            false,
+            deployment_apply_resource_fences(&app),
+        )
+        .await
+        .expect("hold the deferred branch's mutation lease");
+        let deferred =
+            DeploymentJobError::Apply(crate::deploy::DeployError::PullSecretReconcileDeferred(
+                "newer scope generation".to_string(),
+            ));
+        assert!(
+            requeue_or_exhaust_deferred_apply_job(&state, &apply, &deferred, mutation, &app).await
+        );
+        let (deployment_status, deployment_error, job_state, job_error): (
+            String,
+            Option<String>,
+            String,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT deployment.status::text, deployment.error_message,
+                    job.state, job.last_error_code
+               FROM deployments AS deployment
+               JOIN deployment_apply_jobs AS job ON job.deployment_id = deployment.id
+              WHERE deployment.id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load terminalized deferred requeue state");
+        assert_eq!(deployment_status, "failed");
+        assert_eq!(
+            deployment_error.as_deref(),
+            Some("deployment_retry_exhausted")
+        );
+        assert_eq!(job_state, "failed");
+        assert_eq!(job_error.as_deref(), Some("deployment_retry_exhausted"));
+
+        // r6 leak-free teardown: the terminal path may legitimately retain a
+        // fence (fake providers in lazy_state make compensating cleanup fail
+        // closed), and the apply claims SHARED global keys (kbs_policy,
+        // edge_config) — scrub exactly the fences this apply claimed plus the
+        // app lane so later serialized tests don't inherit a Busy.
+        for fence in deployment_apply_resource_fences(&app) {
+            sqlx::query(
+                "DELETE FROM external_resource_mutation_leases
+                  WHERE resource_scope = $1 AND resource_key = $2",
+            )
+            .bind(&fence.scope)
+            .bind(&fence.key)
+            .execute(&pool)
+            .await
+            .expect("scrub claimed fence row");
+        }
+        sqlx::query("DELETE FROM app_mutation_leases WHERE app_id = $1")
+            .bind(app.id)
+            .execute(&pool)
+            .await
+            .expect("scrub app lane lease row");
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete deferred exhaustion fixture");
     }
 
     #[test]
