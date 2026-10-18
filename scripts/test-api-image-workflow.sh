@@ -662,7 +662,7 @@ for required in \
   "ARG ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX" \
   "COPY scripts/require-platform-release-root.sh scripts/require-platform-release-root.sh" \
   "bash scripts/require-platform-release-root.sh --allow-dev-fixture" \
-  "--example platform-release -- verify" \
+  "--example platform-release -- verify-baseline" \
   "ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX must be provided as a build-arg"; do
   grep -Fq -- "$required" "$DOCKERFILE" \
     || fail "API image Dockerfile is missing: $required"

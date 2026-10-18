@@ -75,9 +75,9 @@ RUN printf "%s  crates/enclava-api/trust-roots/sigstore-public-good-1.root.json\
       6494e21ea73fa7ee769f85f57d5a3e6a08725eae1e38c755fc3517c9e6bc0b66 \
       | sha256sum -c >/dev/null
 
-# The shell gate only compares pubkeys; verify the full envelope signature
-# and payload invariants before the release binaries are compiled.
-RUN cargo run --locked --release -p enclava-cli --example platform-release -- verify \
+# The bundled signed envelope is only a downgrade floor. Pre-trustee bytes
+# remain valid for this floor, never for the mounted runtime release.
+RUN cargo run --locked --release -p enclava-cli --example platform-release -- verify-baseline \
     crates/enclava-cli/platform-release.json "$ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX"
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \

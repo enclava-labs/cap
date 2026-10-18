@@ -31,10 +31,10 @@ use std::process::ExitCode;
 use ed25519_dalek::{Signer, SigningKey};
 use enclava_cli::platform_release::{
     PlatformRelease, PlatformReleaseEnvelope, canonical_platform_release_bytes,
-    verify_envelope_with_root,
+    verify_envelope_with_root, verify_signed_baseline_with_root,
 };
 
-const USAGE: &str = "usage: platform-release sign <payload.json> <root-seed-hex-on-stdin>\n       platform-release verify <envelope.json> <root-pubkey-hex>";
+const USAGE: &str = "usage: platform-release sign <payload.json> <root-seed-hex-on-stdin>\n       platform-release verify <envelope.json> <root-pubkey-hex>\n       platform-release verify-baseline <envelope.json> <root-pubkey-hex>";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -44,6 +44,7 @@ fn main() -> ExitCode {
         }
         Some("sign") => sign(args.get(2)),
         Some("verify") => verify(args.get(2), args.get(3)),
+        Some("verify-baseline") => verify_baseline(args.get(2), args.get(3)),
         _ => Err(USAGE.to_string()),
     };
     match result {
@@ -112,5 +113,22 @@ fn verify(envelope_path: Option<&String>, root_hex: Option<&String>) -> Result<(
         .map_err(|err| format!("{envelope_path}: {err}"))?
         .platform_release_version;
     println!("{envelope_path}: {version} verifies against the pinned root");
+    Ok(())
+}
+
+fn verify_baseline(
+    envelope_path: Option<&String>,
+    root_hex: Option<&String>,
+) -> Result<(), String> {
+    let envelope_path = envelope_path.ok_or(USAGE)?;
+    let root_hex = root_hex.ok_or(USAGE)?;
+    let raw = std::fs::read_to_string(envelope_path)
+        .map_err(|err| format!("read {envelope_path}: {err}"))?;
+    let baseline = verify_signed_baseline_with_root(&raw, root_hex)
+        .map_err(|err| format!("{envelope_path}: {err}"))?;
+    println!(
+        "{envelope_path}: signed baseline {} verifies against the pinned root",
+        baseline.platform_release_version
+    );
     Ok(())
 }
