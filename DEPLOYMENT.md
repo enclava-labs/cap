@@ -129,6 +129,10 @@ fall back to annotation-only scoping. Drain pre-fence API writers before the
 cutover: those binaries cannot honor the database authority. Scope epochs are
 monotonic; never lower them to permit an older writer. The shared mutation guard
 disables `idle_in_transaction_session_timeout` for its own transaction only.
+Created pull Secrets must retain the dedicated managed label and its field
+ownership. Missing evidence triggers UID/resourceVersion-conditional deletion;
+admission stays closed until removal is observed as 404. A tenant replacement
+at the configured name never satisfies platform-credential convergence.
 
 ## Common Defaults
 

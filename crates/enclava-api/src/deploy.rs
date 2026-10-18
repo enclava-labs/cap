@@ -1679,6 +1679,62 @@ fn pull_secret_create_params(engine: &ApplyEngine) -> kube::api::PostParams {
     }
 }
 
+fn pull_secret_label_owned(engine: &ApplyEngine, secret: &Secret) -> bool {
+    is_labeled_managed_pull_secret(secret)
+        && enclava_engine::apply::generation::label_owned_by_manager(
+            secret,
+            TENANT_PULL_SECRET_LABEL,
+            &engine.config().field_manager,
+        )
+}
+
+async fn remove_untrusted_created_pull_secret(
+    api: &Api<Secret>,
+    namespace: &str,
+    name: &str,
+    created: &Secret,
+) -> Result<(), DeployError> {
+    let (Some(uid), Some(resource_version)) = (
+        created.metadata.uid.as_ref().filter(|uid| !uid.is_empty()),
+        created
+            .metadata
+            .resource_version
+            .as_ref()
+            .filter(|version| !version.is_empty()),
+    ) else {
+        return Err(DeployError::PullSecretReconcileDeferred(format!(
+            "cannot safely remove untrusted pull secret {namespace}/{name} without UID and \
+             resourceVersion; the platform PAT may remain readable"
+        )));
+    };
+    let params = kube::api::DeleteParams {
+        preconditions: Some(kube::api::Preconditions {
+            uid: Some(uid.clone()),
+            resource_version: Some(resource_version.clone()),
+        }),
+        ..Default::default()
+    };
+    match api.delete(name, &params).await {
+        Ok(_) => {
+            // Finalizers can leave the PAT readable after DELETE acceptance.
+            wait_for_secret_removal(api, namespace, name).await.map_err(|error| {
+                DeployError::PullSecretReconcileDeferred(format!(
+                    "compensating deletion of pull secret {namespace}/{name} has not converged: \
+                     {error}; the platform PAT may remain readable"
+                ))
+            })?;
+        }
+        Err(kube::Error::Api(error)) if error.code == 404 => {}
+        Err(error) => {
+            return Err(DeployError::PullSecretReconcileDeferred(format!(
+                "could not delete pull secret {namespace}/{name} with untrusted creation evidence: \
+                 {error}; the platform PAT may remain readable"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Stamp the engine's creation evidence on a pull secret this process is
 /// creating outside `apply_resource`. Adopted-namespace failure cleanup
 /// deletes only objects whose `RESOURCE_CREATED_BY_ANNOTATION` is owned by
@@ -1852,6 +1908,11 @@ async fn ensure_configured_pull_secret_for_in_scope_accounts(
                 .await
             {
                 Ok(created) => {
+                    if !pull_secret_label_owned(engine, &created) {
+                        remove_untrusted_created_pull_secret(api, namespace, name, &created)
+                            .await?;
+                        return Ok(false);
+                    }
                     record_pull_secret_creation(
                         engine,
                         namespace,
@@ -2413,98 +2474,20 @@ async fn reconcile_managed_pull_secrets(
                                     .await
                                 {
                                     Ok(applied) => {
-                                        // Codex review on #243, round 3, P1
-                                        // "Attribute created Secrets to the
-                                        // platform field manager": verify the
-                                        // attribution survived the POST; a
-                                        // Secret whose ownership came back
-                                        // stripped is deleted (pinned to the
-                                        // response's UID/resourceVersion) and
-                                        // the namespace is not converged — an
-                                        // unattributable platform PAT must not
-                                        // land in a tenant namespace.
-                                        // Codex review on #278, P1 "verify
-                                        // ownership of the recreated secret
-                                        // marker": a mutating admission
-                                        // webhook can strip the dedicated
-                                        // pull-secret label while other
-                                        // fields stay attributed to the
-                                        // platform manager — a manager ENTRY
-                                        // alone is not ownership. Require
-                                        // the platform manager to actually
-                                        // own TENANT_PULL_SECRET_LABEL on
-                                        // the returned object; without it the
-                                        // recreated PAT is neither
-                                        // label-discoverable nor
-                                        // legacy-shape-matching after the
-                                        // next rotation and would be kept
-                                        // forever.
-                                        let attributed = enclava_engine::apply::generation::label_owned_by_manager(
-                                            &applied,
-                                            TENANT_PULL_SECRET_LABEL,
-                                            &engine.config().field_manager,
-                                        ) && applied.metadata.labels.as_ref().is_some_and(
-                                            |labels| {
-                                                labels.get(TENANT_PULL_SECRET_LABEL).map(String::as_str)
-                                                    == Some(TENANT_PULL_SECRET_LABEL_VALUE)
-                                            },
-                                        );
-                                        if !attributed {
-                                            let delete_params = kube::api::DeleteParams {
-                                                preconditions: Some(kube::api::Preconditions {
-                                                    uid: applied.metadata.uid.clone(),
-                                                    resource_version: applied
-                                                        .metadata
-                                                        .resource_version
-                                                        .clone(),
-                                                }),
-                                                ..Default::default()
-                                            };
-                                            match api.delete(&config.name, &delete_params).await {
-                                                Ok(_) => {
-                                                    // Finalizers can keep the PAT readable after DELETE acceptance.
-                                                    if let Err(error) = wait_for_secret_removal(
-                                                        &api,
-                                                        namespace,
-                                                        &config.name,
-                                                    )
-                                                    .await
-                                                    {
-                                                        tracing::error!(
-                                                            %namespace,
-                                                            secret = %config.name,
-                                                            %error,
-                                                            "compensating deletion of a \
-                                                             just-recreated pull secret has not \
-                                                             converged — the platform PAT may \
-                                                             remain exposed"
-                                                        );
-                                                    }
-                                                }
-                                                Err(kube::Error::Api(error))
-                                                    if error.code == 404 => {}
-                                                Err(error) => {
-                                                    tracing::error!(
-                                                        %namespace,
-                                                        secret = %config.name,
-                                                        %error,
-                                                        "could not delete a just-recreated pull \
-                                                         secret whose field-manager attribution \
-                                                         was stripped — the platform PAT may \
-                                                         remain exposed until operator cleanup"
-                                                    );
-                                                }
+                                        if !pull_secret_label_owned(engine, &applied) {
+                                            if let Err(error) =
+                                                remove_untrusted_created_pull_secret(
+                                                    &api,
+                                                    namespace,
+                                                    &config.name,
+                                                    &applied,
+                                                )
+                                                .await
+                                            {
+                                                tracing::error!(%namespace, secret = %config.name, %error,
+                                                    "untrusted pull-secret cleanup has not converged");
                                             }
                                             converged = false;
-                                            tracing::warn!(
-                                                %namespace,
-                                                secret = %config.name,
-                                                "recreated pull secret came back without the \
-                                                 platform field manager's attribution \
-                                                 (mutating admission webhook?); the object \
-                                                 was deleted and the namespace stays \
-                                                 not-converged"
-                                            );
                                             continue;
                                         }
                                         record_pull_secret_creation(
@@ -2618,7 +2601,7 @@ async fn reconcile_managed_pull_secrets(
     }
     // Repairs can adopt previously undiscoverable old-name objects. Refresh
     // discovery before deciding which credentials remain available.
-    let (managed, _, _) =
+    let (managed, _, accounts) =
         discover_managed_pull_secrets(engine, namespace, service_accounts, settings).await?;
     for secret in &managed {
         let Some(name) = secret.metadata.name.as_deref() else {
@@ -2630,7 +2613,6 @@ async fn reconcile_managed_pull_secrets(
             &settings.configured_name,
             &in_scope_referenced_names,
         ) {
-            kept += 1;
             // Adoption and pending-repair refresh both advance resourceVersion.
             // Always re-read before a second write, and re-prove ownership on
             // that live object rather than reusing the discovery snapshot.
@@ -2687,6 +2669,7 @@ async fn reconcile_managed_pull_secrets(
                 );
                 continue;
             }
+            kept += 1;
             let terminating = live.metadata.deletion_timestamp.is_some();
             if terminating {
                 // Do not attach, and do not clear. A clear would record this
@@ -4545,43 +4528,15 @@ async fn apply_scoped_pull_secret(
                                     RESOURCE_CREATED_BY_ANNOTATION,
                                     &engine.config().field_manager,
                                 )
+                                || !pull_secret_label_owned(engine, &applied)
                             {
-                                let delete_params = kube::api::DeleteParams {
-                                    preconditions: Some(kube::api::Preconditions {
-                                        uid: applied.metadata.uid.clone(),
-                                        resource_version: applied.metadata.resource_version.clone(),
-                                    }),
-                                    ..Default::default()
-                                };
-                                match api.delete(&config.name, &delete_params).await {
-                                    Ok(_) => {
-                                        // DELETE acceptance leaves the PAT readable when a
-                                        // finalizer holds the object. Only a subsequent 404
-                                        // permits terminal failure; otherwise retain the
-                                        // durable deployment retry instead of claiming removal.
-                                        wait_for_secret_removal(&api, namespace, &config.name)
-                                        .await
-                                        .map_err(|error| {
-                                            DeployError::PullSecretReconcileDeferred(format!(
-                                                "compensating deletion of pull secret \
-                                                 {namespace}/{} has not converged: {error}; \
-                                                 retry deployment while the PAT may remain readable",
-                                                config.name
-                                            ))
-                                        })?;
-                                    }
-                                    Err(kube::Error::Api(error)) if error.code == 404 => {}
-                                    Err(error) => {
-                                        return Err(DeployError::PullSecretReconcileDeferred(
-                                            format!(
-                                                "could not delete pull secret {namespace}/{} with \
-                                             untrusted creation evidence: {error}; retry deployment \
-                                             while the PAT may remain readable",
-                                                config.name
-                                            ),
-                                        ));
-                                    }
-                                }
+                                remove_untrusted_created_pull_secret(
+                                    &api,
+                                    namespace,
+                                    &config.name,
+                                    &applied,
+                                )
+                                .await?;
                                 return Err(DeployError::Validation(format!(
                                     "created pull secret {namespace}/{} came back without trusted \
                                  creation evidence (annotation value or field ownership; \
@@ -11811,7 +11766,6 @@ mod tests {
         );
         {
             let state = cluster.lock().unwrap();
-            assert_eq!(state.secrets.len(), 1, "the replacement survives");
             assert_eq!(
                 state.secrets[0].data, original_data,
                 "the tenant replacement's credentials must never be overwritten with the platform PAT"
@@ -11888,7 +11842,7 @@ mod tests {
         let engine = reconcile_engine(cluster.clone());
         for _ in 0..2 {
             assert!(
-                reconcile_managed_pull_secrets(
+                !reconcile_managed_pull_secrets(
                     &engine,
                     "tenant-ns",
                     &["cap-tenant-app".to_string()],
@@ -12443,7 +12397,7 @@ mod tests {
         ] {
             let repair_runs = runs_durable_pull_secret_repair(delete_mode);
             assert!(
-                reconcile_managed_pull_secrets(
+                !reconcile_managed_pull_secrets(
                     &engine,
                     "tenant-ns",
                     &["qualifying".into(), "excluded".into()],
@@ -13204,12 +13158,61 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn empty_namespace_rejects_unmarked_created_pull_secret() {
+        use std::sync::{Arc, Mutex};
+
+        for (strip_label, strip_manager, lingering_polls) in
+            [(true, false, 0), (false, true, 0), (true, false, 2)]
+        {
+            let cluster = Arc::new(Mutex::new(FakeCluster {
+                service_accounts: vec![fake_service_account("cap-tenant-app", &[])],
+                strip_pull_secret_label_on_create: strip_label,
+                strip_field_manager_on_create: strip_manager,
+                delete_lingering_polls: lingering_polls,
+                ..Default::default()
+            }));
+            let engine = reconcile_engine(cluster);
+            let converged = reconcile_managed_pull_secrets(
+                &engine,
+                "tenant-ns",
+                &["cap-tenant-app".to_string()],
+                &reconcile_settings(),
+                &PullSecretAccountScope::uniform(true),
+                PullSecretDeleteMode::Unfenced {
+                    namespace_generation: i64::MAX,
+                    lease_held: false,
+                },
+            )
+            .await
+            .unwrap();
+            assert!(!converged);
+            let secrets: Api<Secret> = Api::namespaced(engine.client().clone(), "tenant-ns");
+            assert!(
+                secrets
+                    .get_opt("enclava-registry-auth")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let accounts: Api<ServiceAccount> =
+                Api::namespaced(engine.client().clone(), "tenant-ns");
+            let account = accounts.get("cap-tenant-app").await.unwrap();
+            assert!(
+                account
+                    .image_pull_secrets
+                    .as_ref()
+                    .is_none_or(Vec::is_empty)
+            );
+        }
+    }
     /// Codex review on #243, round 3, P1 "Attribute created Secrets to the
     /// platform field manager": the sweep's 404-recreate POST must stamp the
     /// engine field manager (not `PostParams::default()`), and a create that
     /// comes back WITHOUT that attribution (mutating webhook) must be
     /// deleted (pinned) and keep the pass unconverged — an unattributable
     /// platform PAT must not land in a tenant namespace.
+
     #[tokio::test]
     async fn sweep_recreate_attributes_and_verifies_field_manager_ownership() {
         use std::sync::{Arc, Mutex};
