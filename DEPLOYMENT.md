@@ -139,6 +139,13 @@ a version the old writer appended after the colliding replacement, and
 backfills the marker. It preserves orgs whose live versions are all absent
 from the archive (a clean survivor). Inspect migration notices and expect
 affected orgs to require a new fenced version-1 upload.
+On upgrades carrying the earlier divergent `0061` marker table, table
+existence is not proof of fenced recovery: that migration had no INSERT
+trigger. `0085` removes every live generation for orgs whose marker remains,
+including colliding replacements and appended versions, and retains their
+original recovery provenance. It preserves marker-free orgs, including
+already-authorized recoveries whose new version 1 collides with the archive;
+a completed fenced recovery consumed its marker atomically.
 Drain old API replicas before resuming writes; the database fence is a
 fail-closed guard, not support for mixed-version operation or reader rollback.
 
