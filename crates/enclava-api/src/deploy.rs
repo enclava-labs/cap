@@ -2732,6 +2732,7 @@ async fn reconcile_managed_pull_secrets(
                 actual > namespace_generation || (lease_held && actual == namespace_generation)
             })
         {
+            converged = false;
             kept += 1;
             tracing::info!(
                 %namespace,
@@ -2826,6 +2827,7 @@ async fn reconcile_managed_pull_secrets(
         let reverse_reference_clears = match &removal {
             Ok(PullSecretRemovalOutcome::Deleted | PullSecretRemovalOutcome::Missing) => false,
             Ok(PullSecretRemovalOutcome::Superseded) => {
+                converged = false;
                 tracing::info!(
                     %namespace,
                     secret = %name,
@@ -3085,10 +3087,11 @@ async fn delete_managed_pull_secret(
         }
         if let PullSecretDeleteMode::Unfenced {
             namespace_generation,
-            ..
+            lease_held,
         } = delete_mode
-            && secret_mutation_generation(&existing)
-                .is_some_and(|actual| actual > namespace_generation)
+            && secret_mutation_generation(&existing).is_some_and(|actual| {
+                actual > namespace_generation || (lease_held && actual == namespace_generation)
+            })
         {
             // Self-check on #243: the reconcile-time skip can race a deploy
             // that claims the namespace lease and rewrites the secret after
@@ -3413,6 +3416,27 @@ type NamespacePullSecretInventory =
 async fn cleanup_stale_tenant_image_pull_secrets(pool: &PgPool) -> Result<bool, DeployError> {
     let settings = PullSecretSettings::from_env();
     let config = tenant_image_pull_secret_config_from_env();
+
+    // Publish the rollout even for an empty fleet, before any inventory can
+    // stall or omit namespaces created by concurrent older replicas. Retain
+    // the per-namespace recheck below to observe subsequent authority raises.
+    let (scope_epoch, credential_epoch) = tokio::time::timeout(
+        PULL_SECRET_NAMESPACE_RECONCILE_TIMEOUT,
+        raise_tenant_pull_secret_rollout_authority(
+            pool,
+            pull_secret_scope_generation(),
+            pull_secret_credential_generation(),
+        ),
+    )
+    .await
+    .map_err(|_| {
+        DeployError::PullSecretReconcileDeferred(
+            "timed out publishing rollout-wide pull-secret authority".to_string(),
+        )
+    })??;
+    if pull_secret_rollout_authority_defers(scope_epoch, credential_epoch) {
+        return Ok(false);
+    }
 
     // Snapshot the namespaces' kubernetes mutation generations BEFORE the
     // app-inventory read (Devin SEC + Codex P1 review findings on #243): the
@@ -8882,7 +8906,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(converged, "skipping a newer-generation secret is converged");
+        assert!(!converged, "a deferred secret must keep admission closed");
 
         {
             let state = cluster.lock().unwrap();
@@ -8966,8 +8990,8 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            converged,
-            "keeping a concurrently rewritten secret is a converged skip"
+            !converged,
+            "keeping a concurrently rewritten secret must defer convergence"
         );
 
         let state = cluster.lock().unwrap();
@@ -8987,6 +9011,76 @@ mod tests {
                 })
                 .map(String::as_str),
             Some("9"),
+            "the surviving object is the deploy's rewrite, not the original"
+        );
+        assert_eq!(
+            state.service_accounts[0]
+                .image_pull_secrets
+                .as_ref()
+                .map(|references| references.len()),
+            Some(1),
+            "the cleared ServiceAccount reference must be restored for the rewrite"
+        );
+    }
+
+    // Equal active generations must also survive a write after the precheck.
+    #[tokio::test(start_paused = true)]
+    async fn delete_keeps_secret_rewritten_under_equal_active_generation_mid_cleanup() {
+        use std::sync::{Arc, Mutex};
+
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![fake_managed_secret(
+                "enclava-registry-auth",
+                true,
+                "cap-bot",
+                "ghp_platform",
+            )],
+            service_accounts: vec![fake_service_account(
+                "cap-tenant-app",
+                &["enclava-registry-auth"],
+            )],
+            // The rewrite lands on the FIRST delete attempt: the pinned
+            // delete conflicts, and the retry's re-read sees generation 5 —
+            // equal to the active sweep snapshot of 5.
+            annotate_generation_on_delete: Some(5),
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        let converged = reconcile_managed_pull_secrets(
+            &engine,
+            "tenant-ns",
+            &["cap-tenant-app".to_string()],
+            &reconcile_settings(),
+            &PullSecretAccountScope::uniform(false),
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 5,
+                lease_held: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            !converged,
+            "keeping a concurrently rewritten secret must defer convergence"
+        );
+
+        let state = cluster.lock().unwrap();
+        assert_eq!(
+            state.secrets.len(),
+            1,
+            "a secret rewritten under an equal active mutation generation mid-cleanup must survive"
+        );
+        assert_eq!(
+            state.secrets[0]
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|annotations| {
+                    annotations
+                        .get(enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION)
+                })
+                .map(String::as_str),
+            Some("5"),
             "the surviving object is the deploy's rewrite, not the original"
         );
         assert_eq!(
@@ -10359,7 +10453,7 @@ mod tests {
         }));
         let engine = reconcile_engine(cluster.clone());
         assert!(
-            reconcile_managed_pull_secrets(
+            !reconcile_managed_pull_secrets(
                 &engine,
                 "tenant-ns",
                 &["cap-tenant-app".to_string()],
@@ -10372,7 +10466,7 @@ mod tests {
             )
             .await
             .unwrap(),
-            "held-lease pass must converge without touching the in-flight secret"
+            "held-lease pass must remain unconverged without touching the in-flight secret"
         );
         {
             let state = cluster.lock().unwrap();
@@ -11877,6 +11971,38 @@ mod tests {
             state.secrets.is_empty(),
             "the unattributed recreated secret must be deleted"
         );
+    }
+
+    #[tokio::test]
+    async fn empty_fleet_publishes_rollout_authority_before_inventory() {
+        let pool = crate::test_support::database_test_pool().await;
+        sqlx::query(
+            "UPDATE tenant_pull_secret_rollout_authority SET scope_epoch = 0, credential_epoch = 0",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        unsafe {
+            std::env::set_var("TENANT_IMAGE_PULL_SCOPE_GENERATION", "8");
+            std::env::set_var("TENANT_IMAGE_PULL_CREDENTIAL_GENERATION", "4");
+        }
+        // A missing local kubeconfig may fail the sweep; publication must
+        // already have happened regardless of any subsequent inventory/work.
+        let _ = cleanup_stale_tenant_image_pull_secrets(&pool).await;
+        unsafe {
+            std::env::remove_var("TENANT_IMAGE_PULL_SCOPE_GENERATION");
+            std::env::remove_var("TENANT_IMAGE_PULL_CREDENTIAL_GENERATION");
+        }
+        let maxima = raise_tenant_pull_secret_rollout_authority(&pool, 0, 0)
+            .await
+            .unwrap();
+        assert_eq!(maxima, (8, 4));
+        sqlx::query(
+            "UPDATE tenant_pull_secret_rollout_authority SET scope_epoch = 0, credential_epoch = 0",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
     }
 
     /// Codex review on #243, round 3, P1 "Stop stale-scope replicas from
