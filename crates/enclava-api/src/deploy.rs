@@ -10738,9 +10738,9 @@ mod tests {
             "cap-app-out-of-scope".to_string(),
         ];
         // Concurrent deploy holds the ACTIVE lease generation 7 (equal to the
-        // sweep snapshot): the per-app clear is skipped.
+        // sweep snapshot): the per-app clear is skipped, not converged.
         assert!(
-            reconcile_managed_pull_secrets(
+            !reconcile_managed_pull_secrets(
                 &engine,
                 "tenant-ns",
                 &service_accounts,
