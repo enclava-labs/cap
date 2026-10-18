@@ -558,13 +558,26 @@ pub struct DeploymentResponse {
 
 const PUBLIC_DEPLOYMENT_ERROR_MESSAGE: &str = "deployment_error";
 
+/// Bounded failure classifications that may cross the API boundary verbatim.
+/// The control-plane pair is the historical passthrough set; the pull-secret
+/// codes are `DeployError::public_code` classifications from #276 and must
+/// stay in lockstep with the 0087 CHECK. Anything else is redacted.
+const PUBLIC_DEPLOYMENT_ERROR_CODES: &[&str] = &[
+    crate::deploy::DEPLOYMENT_SUPERSEDED_ERROR,
+    crate::deployment_jobs::CUSTOMER_CONFIG_HOLD_EXPIRED,
+    "pull_secret_reconcile_deferred",
+    "pull_secret_delete_conflict",
+];
+
 /// Project a stored deployment error across an API boundary without exposing
 /// arbitrary backend, runtime, or workload-controlled plaintext.
 pub(crate) fn public_deployment_error_message(error_message: Option<&str>) -> Option<String> {
-    error_message.map(|error_message| match error_message {
-        crate::deploy::DEPLOYMENT_SUPERSEDED_ERROR
-        | crate::deployment_jobs::CUSTOMER_CONFIG_HOLD_EXPIRED => error_message.to_string(),
-        _ => PUBLIC_DEPLOYMENT_ERROR_MESSAGE.to_string(),
+    error_message.map(|error_message| {
+        if PUBLIC_DEPLOYMENT_ERROR_CODES.contains(&error_message) {
+            error_message.to_string()
+        } else {
+            PUBLIC_DEPLOYMENT_ERROR_MESSAGE.to_string()
+        }
     })
 }
 

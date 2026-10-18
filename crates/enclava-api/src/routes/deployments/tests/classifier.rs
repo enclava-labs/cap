@@ -189,6 +189,24 @@ fn control_plane_supersession_code_is_preserved_across_deployment_responses() {
     }
 }
 
+#[test]
+fn pull_secret_error_codes_pass_through_public_projection() {
+    let app = idempotency_app();
+    for code in [
+        "pull_secret_reconcile_deferred",
+        "pull_secret_delete_conflict",
+    ] {
+        assert!(
+            super::PUBLIC_DEPLOYMENT_ERROR_CODES.contains(&code),
+            "missing public allowlist entry `{code}`"
+        );
+        let mut deployment = idempotency_deployment(&app);
+        deployment.error_message = Some(code.to_string());
+        let public = DeploymentResponse::from_deployment(deployment, &app);
+        assert_eq!(public.error_message.as_deref(), Some(code));
+    }
+}
+
 fn idempotency_request(app_name: &str) -> GenericDeploymentRequest {
     GenericDeploymentRequest {
             external_id: Some("deploy-123".to_string()),
