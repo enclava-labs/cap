@@ -1454,11 +1454,15 @@ async fn load_teardown_policy_unit(
              AND deployment.app_id = job.app_id
              AND deployment.org_id = job.org_id
             WHERE job.app_id = $1
+              AND NOT (
+                  job.customer_config_hold
+                  AND job.customer_config_released_at IS NULL
+              )
         ),
         max_completed AS (
             SELECT MAX(generation) AS generation
-              FROM ranked_job_operations
-             WHERE job_state = 'completed'
+              FROM deployment_apply_jobs
+             WHERE app_id = $1 AND state = 'completed'
         ),
         picked AS (
             SELECT artifact_deployment_id, artifact_descriptor_core_hash
@@ -1477,7 +1481,7 @@ async fn load_teardown_policy_unit(
                )
         ),
         job_unit AS (
-            SELECT artifact.signed_policy_artifact
+            SELECT artifact.descriptor_core_hash, artifact.signed_policy_artifact
               FROM picked
               JOIN workload_artifacts AS artifact
                 ON artifact.app_id = $1
@@ -1495,12 +1499,7 @@ async fn load_teardown_policy_unit(
                 ) AS current_operation_rank
             FROM deployments AS deployment
             WHERE deployment.app_id = $1
-              -- Mirror the selector's legacy eligibility (Codex review on
-              -- 0c678f57): legacy authority is retired by a durable healthy
-              -- job-backed replacement, not by the existence of any apply
-              -- job. A failed job-backed replacement keeps the pre-job
-              -- healthy workload required, so its artifact belongs to this
-              -- app's teardown unit and must count in admission.
+              -- Failed or held replacements do not retire legacy authority.
               AND NOT EXISTS (
                   SELECT 1
                     FROM ranked_job_operations AS operation
@@ -1513,17 +1512,45 @@ async fn load_teardown_policy_unit(
               )
         ),
         legacy_unit AS (
-            SELECT artifact.signed_policy_artifact
+            SELECT artifact.descriptor_core_hash, artifact.signed_policy_artifact
               FROM ranked_legacy_operations AS legacy
               JOIN workload_artifacts AS artifact
                 ON artifact.app_id = $1
                AND artifact.deploy_id = legacy.deployment_id
              WHERE legacy.current_operation_rank = 1
                AND legacy.deployment_status = 'healthy'
+        ),
+        teardown_unit AS (
+            SELECT descriptor_core_hash, signed_policy_artifact FROM job_unit
+            UNION
+            SELECT descriptor_core_hash, signed_policy_artifact FROM legacy_unit
+        ),
+        current_keyring AS (
+            SELECT keyring_payload
+              FROM org_keyrings
+             WHERE org_id = (SELECT org_id FROM apps WHERE id = $1)
+             ORDER BY version DESC
+             LIMIT 1
         )
-        SELECT signed_policy_artifact FROM job_unit
-        UNION
-        SELECT signed_policy_artifact FROM legacy_unit
+        SELECT unit.signed_policy_artifact
+          FROM teardown_unit AS unit
+         WHERE NOT EXISTS (
+             SELECT 1
+               FROM withdrawn_signer_artifacts AS withdrawn
+              WHERE withdrawn.descriptor_core_hash = unit.descriptor_core_hash
+         )
+           AND EXISTS (
+               SELECT 1
+                 FROM current_keyring,
+                 jsonb_array_elements(
+                     convert_from(keyring_payload, 'UTF8')::jsonb->'members'
+                 ) AS member
+                WHERE member.value->>'role' IN ('owner', 'admin', 'deployer')
+                  AND lower(member.value->>'pubkey') = lower(
+                      unit.signed_policy_artifact
+                          ->'metadata'->>'descriptor_signing_pubkey'
+                  )
+           )
         "#,
     )
     .bind(app_id)
@@ -4073,6 +4100,22 @@ resource_bindings := {
         .expect("mark KBS test workload spec published");
     }
 
+    /// Descriptor hash for a DB fixture artifact: workload_artifacts is keyed
+    /// by descriptor_core_hash globally, so a bare repeated byte collides
+    /// across tests (and leaked rows) on the shared test database. The prefix
+    /// byte keeps fixture intent readable; the deployment id keeps it unique.
+    fn unique_test_descriptor_hash(hash_byte: &str, deployment_id: Uuid) -> String {
+        hex::encode(Sha256::digest(
+            &[
+                hex::decode(hash_byte)
+                    .expect("decode fixture hash byte")
+                    .as_slice(),
+                deployment_id.as_bytes().as_slice(),
+            ]
+            .concat(),
+        ))
+    }
+
     async fn insert_test_artifact(
         pool: &PgPool,
         app_id: Uuid,
@@ -4093,6 +4136,8 @@ resource_bindings := {
         signer_hex: &str,
     ) -> crate::signing_service::SignedPolicyArtifact {
         let mut artifact = test_signed_policy_artifact(hash_byte, 16);
+        artifact.metadata.descriptor_core_hash =
+            unique_test_descriptor_hash(hash_byte, deployment_id);
         artifact.metadata.app_id = app_id.to_string();
         artifact.metadata.deploy_id = deployment_id.to_string();
         artifact.metadata.descriptor_signing_pubkey = signer_hex.repeat(32);
@@ -4165,6 +4210,25 @@ resource_bindings := {
         version: i64,
         member_pubkeys: &[&str],
     ) -> (Uuid, Uuid) {
+        let members: Vec<(&str, &str)> = member_pubkeys
+            .iter()
+            .enumerate()
+            .map(|(index, pubkey)| (*pubkey, if index == 0 { "owner" } else { "deployer" }))
+            .collect();
+        insert_test_keyring_with_roles(pool, org_id, version, &members).await
+    }
+
+    /// Insert one append-only org keyring version whose member roles are
+    /// chosen per member, so fixtures can exercise the non-deploy-role
+    /// exclusion. The first member's pubkey signs the keyring row; the raw
+    /// signature bytes are irrelevant to candidate selection. Returns the
+    /// ids of the user and signing key rows it created.
+    async fn insert_test_keyring_with_roles(
+        pool: &PgPool,
+        org_id: Uuid,
+        version: i64,
+        members_with_roles: &[(&str, &str)],
+    ) -> (Uuid, Uuid) {
         let user_id = Uuid::new_v4();
         sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'kbs keyring member')")
             .bind(user_id)
@@ -4175,18 +4239,17 @@ resource_bindings := {
         sqlx::query("INSERT INTO user_signing_keys (id, user_id, pubkey) VALUES ($1, $2, $3)")
             .bind(signing_key_id)
             .bind(user_id)
-            .bind(hex::decode(member_pubkeys[0]).expect("decode owner keyring pubkey"))
+            .bind(hex::decode(members_with_roles[0].0).expect("decode owner keyring pubkey"))
             .execute(pool)
             .await
             .expect("insert KBS keyring signing key");
-        let members: Vec<serde_json::Value> = member_pubkeys
+        let members: Vec<serde_json::Value> = members_with_roles
             .iter()
-            .enumerate()
-            .map(|(index, pubkey)| {
+            .map(|(pubkey, role)| {
                 serde_json::json!({
                     "user_id": user_id,
                     "pubkey": pubkey,
-                    "role": if index == 0 { "owner" } else { "deployer" },
+                    "role": role,
                     "added_at": "2026-01-01T00:00:00Z",
                 })
             })
@@ -6845,13 +6908,21 @@ resource_bindings := {
     /// convergence.
     #[tokio::test]
     async fn teardown_admission_refuses_a_unit_that_exceeds_the_shared_budget() {
-        let pool = crate::test_support::database_test_pool().await;
+        // The budget check sums required candidates across every app, so a
+        // sibling test's live fixtures would shift the byte math; run on a
+        // per-process database.
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_teardown_over_budget").await;
         let now = Utc::now();
 
         // Mid-upgrade delete: the unit pins the last completed workload plus
         // the newer published generation, growing the required set by the
         // older artifact.
         let (org_id, app_id) = insert_test_app(&pool, "running").await;
+        // The teardown unit loader and the deleting selector filter artifacts
+        // by current keyring membership (issue #130), so the fixture signer
+        // (bb repeated) must be a current member.
+        insert_test_keyring_version(&pool, org_id, 1, &["bb".repeat(32).as_str()]).await;
         let completed = Uuid::new_v4();
         insert_test_deployment(&pool, org_id, app_id, completed, "healthy", now).await;
         let completed_artifact = insert_test_artifact(&pool, app_id, completed, "aa").await;
@@ -6910,11 +6981,7 @@ resource_bindings := {
             "a teardown unit that would overflow the shared byte budget must be refused"
         );
 
-        sqlx::query("DELETE FROM organizations WHERE id = $1")
-            .bind(org_id)
-            .execute(&pool)
-            .await
-            .expect("delete teardown budget fixture organization");
+        crate::test_support::drop_isolated_database("cap_teardown_over_budget", pool).await;
     }
 
     /// Other apps' pending teardown pins already occupy the budget: admitting
@@ -6922,10 +6989,17 @@ resource_bindings := {
     /// isolation.
     #[tokio::test]
     async fn teardown_admission_counts_other_apps_pending_pins() {
-        let pool = crate::test_support::database_test_pool().await;
+        // The budget check counts required candidates across every app, so
+        // run on a per-process database.
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_teardown_pin_bytes").await;
         let now = Utc::now();
 
         let (pin_org, pin_app) = insert_test_app(&pool, "deleting").await;
+        // Both loaders filter by current keyring membership (issue #130):
+        // the pin artifact stays authorized only while its fixture signer
+        // (bb repeated) is a current member of the pin org's keyring.
+        insert_test_keyring_version(&pool, pin_org, 1, &["bb".repeat(32).as_str()]).await;
         sqlx::query("UPDATE apps SET workload_teardown_required = true WHERE id = $1")
             .bind(pin_app)
             .execute(&pool)
@@ -6945,6 +7019,7 @@ resource_bindings := {
         .await;
 
         let (org_id, app_id) = insert_test_app(&pool, "running").await;
+        insert_test_keyring_version(&pool, org_id, 1, &["bb".repeat(32).as_str()]).await;
         let completed = Uuid::new_v4();
         insert_test_deployment(&pool, org_id, app_id, completed, "healthy", now).await;
         let completed_artifact = insert_test_artifact(&pool, app_id, completed, "aa").await;
@@ -7008,13 +7083,7 @@ resource_bindings := {
             "a teardown unit must be admitted once every required artifact fits"
         );
 
-        for cleanup_org in [pin_org, org_id] {
-            sqlx::query("DELETE FROM organizations WHERE id = $1")
-                .bind(cleanup_org)
-                .execute(&pool)
-                .await
-                .expect("delete teardown pin-count fixture organization");
-        }
+        crate::test_support::drop_isolated_database("cap_teardown_pin_bytes", pool).await;
     }
 
     /// A delete that does not grow the required set must never be refused —
@@ -7027,6 +7096,10 @@ resource_bindings := {
         let now = Utc::now();
 
         let (org_id, app_id) = insert_test_app(&pool, "running").await;
+        // The teardown unit loader and the deleting selector filter artifacts
+        // by current keyring membership (issue #130), so the fixture signer
+        // (bb repeated) must be a current member.
+        insert_test_keyring_version(&pool, org_id, 1, &["bb".repeat(32).as_str()]).await;
         let deployment_id = Uuid::new_v4();
         insert_test_deployment(&pool, org_id, app_id, deployment_id, "healthy", now).await;
         let artifact = insert_test_artifact(&pool, app_id, deployment_id, "dd").await;
@@ -7073,6 +7146,9 @@ resource_bindings := {
         let now = Utc::now();
 
         let (org_id, app_id) = insert_test_app(&pool, "deleting").await;
+        // Keep the fixture signer (bb repeated) in the current keyring so the
+        // completed-teardown artifacts remain eligible if the bypass regresses.
+        insert_test_keyring_version(&pool, org_id, 1, &["bb".repeat(32).as_str()]).await;
         sqlx::query(
             "UPDATE apps
                 SET workload_teardown_required = true,
@@ -7146,10 +7222,17 @@ resource_bindings := {
     /// authority the delete will actually pin.
     #[tokio::test]
     async fn teardown_admission_counts_mixed_legacy_authority() {
-        let pool = crate::test_support::database_test_pool().await;
+        // The budget check sums required candidates across every app, so
+        // run on a per-process database.
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_teardown_mixed").await;
         let now = Utc::now();
 
         let (org_id, app_id) = insert_test_app(&pool, "running").await;
+        // The teardown unit loader filters both the job unit and the legacy
+        // unit by current keyring membership (issue #130), so the fixture
+        // signer (bb repeated) must be a current member.
+        insert_test_keyring_version(&pool, org_id, 1, &["bb".repeat(32).as_str()]).await;
         // The pre-job healthy workload: a deployment with no apply job rows.
         let legacy = Uuid::new_v4();
         insert_test_deployment(&pool, org_id, app_id, legacy, "healthy", now).await;
@@ -7202,11 +7285,376 @@ resource_bindings := {
              not disappear merely because an apply job exists"
         );
 
-        sqlx::query("DELETE FROM organizations WHERE id = $1")
-            .bind(org_id)
+        crate::test_support::drop_isolated_database("cap_teardown_mixed", pool).await;
+    }
+
+    /// Selector-vs-projection regression: the admission projection must pin
+    /// exactly the authority the deleting selector will require. Both sides
+    /// filter by current-keyring deploy-role membership (case-insensitive)
+    /// and drop withdrawn artifacts, and neither treats an unreleased
+    /// customer-config hold as the newest operation — a drift in either
+    /// predicate undercounts (teardown denied live authority) or inflates
+    /// (phantom 409) the projected unit.
+    async fn teardown_projection(pool: &PgPool, app_id: Uuid) -> HashSet<String> {
+        load_teardown_policy_unit(pool, app_id)
+            .await
+            .expect("project teardown unit")
+            .into_iter()
+            .map(|artifact| artifact.metadata.descriptor_core_hash)
+            .collect()
+    }
+
+    async fn deleting_selector_authority(pool: &PgPool, app_id: Uuid) -> HashSet<String> {
+        load_signed_policy_candidates(pool, 1)
+            .await
+            .expect("load deleting selector candidates")
+            .into_iter()
+            .filter(|candidate| candidate.required)
+            .filter(|candidate| candidate.artifact.metadata.app_id == app_id.to_string())
+            .map(|candidate| candidate.artifact.metadata.descriptor_core_hash)
+            .collect()
+    }
+
+    async fn assert_projection_matches_selector(pool: &PgPool, app_id: Uuid, label: &str) {
+        assert_eq!(
+            teardown_projection(pool, app_id).await,
+            deleting_selector_authority(pool, app_id).await,
+            "{label}: the teardown-unit projection must match the authority the deleting selector requires"
+        );
+    }
+
+    async fn insert_teardown_pending_app(pool: &PgPool) -> (Uuid, Uuid) {
+        let (org_id, app_id) = insert_test_app(pool, "deleting").await;
+        sqlx::query("UPDATE apps SET workload_teardown_required = true WHERE id = $1")
+            .bind(app_id)
+            .execute(pool)
+            .await
+            .expect("mark workload teardown pending");
+        (org_id, app_id)
+    }
+
+    /// A deleting app whose newest completed job-backed deployment carries
+    /// the given signer. Returns the hash both sides must agree on.
+    async fn insert_job_teardown_authority(
+        pool: &PgPool,
+        org_id: Uuid,
+        app_id: Uuid,
+        signer: &str,
+    ) -> crate::signing_service::SignedPolicyArtifact {
+        let live = Uuid::new_v4();
+        insert_test_deployment(pool, org_id, app_id, live, "healthy", Utc::now()).await;
+        let artifact = insert_test_artifact_signed_by(pool, app_id, live, "aa", signer).await;
+        insert_test_job(pool, org_id, app_id, live, live, Some((live, &artifact))).await;
+        artifact
+    }
+
+    /// A deleting app whose only authority is a pre-job healthy deployment.
+    async fn insert_legacy_teardown_authority(
+        pool: &PgPool,
+        org_id: Uuid,
+        app_id: Uuid,
+        signer: &str,
+    ) -> crate::signing_service::SignedPolicyArtifact {
+        let legacy = Uuid::new_v4();
+        insert_test_deployment(pool, org_id, app_id, legacy, "healthy", Utc::now()).await;
+        insert_test_artifact_signed_by(pool, app_id, legacy, "aa", signer).await
+    }
+
+    async fn withdraw_fixture_artifact(
+        pool: &PgPool,
+        artifact: &crate::signing_service::SignedPolicyArtifact,
+        app_id: Uuid,
+    ) {
+        sqlx::query(
+            "INSERT INTO withdrawn_signer_artifacts (descriptor_core_hash, app_id)
+             VALUES ($1, $2) ON CONFLICT DO NOTHING",
+        )
+        .bind(hex::decode(&artifact.metadata.descriptor_core_hash).unwrap())
+        .bind(app_id)
+        .execute(pool)
+        .await
+        .expect("withdraw teardown artifact");
+    }
+
+    async fn delete_fixture_orgs(pool: &PgPool, orgs: &[Uuid]) {
+        for org in orgs {
+            sqlx::query("DELETE FROM organizations WHERE id = $1")
+                .bind(org)
+                .execute(pool)
+                .await
+                .expect("delete selector-parity fixture organization");
+        }
+    }
+
+    /// Job-backed teardown authority: for every keyring shape and withdrawal
+    /// state, the projected unit must equal the required set the deleting
+    /// selector admits.
+    #[tokio::test]
+    async fn teardown_unit_projection_matches_deleting_selector_for_job_authority() {
+        let pool = crate::test_support::database_test_pool().await;
+        let signer = "bb";
+
+        // Missing keyring: nothing is authorized on either side.
+        let (no_keyring_org, no_keyring_app) = insert_teardown_pending_app(&pool).await;
+        insert_job_teardown_authority(&pool, no_keyring_org, no_keyring_app, signer).await;
+
+        // Current member: both sides admit the artifact.
+        let (current_org, current_app) = insert_teardown_pending_app(&pool).await;
+        insert_test_keyring_version(&pool, current_org, 1, &[signer.repeat(32).as_str()]).await;
+        let current_artifact =
+            insert_job_teardown_authority(&pool, current_org, current_app, signer).await;
+
+        // Rotated-out signer: version 2 drops bb, so both sides drop it.
+        let (rotated_org, rotated_app) = insert_teardown_pending_app(&pool).await;
+        insert_test_keyring_version(&pool, rotated_org, 1, &[signer.repeat(32).as_str()]).await;
+        insert_test_keyring_version(&pool, rotated_org, 2, &["ab".repeat(32).as_str()]).await;
+        insert_job_teardown_authority(&pool, rotated_org, rotated_app, signer).await;
+
+        // Non-deploy role: a 'viewer' member never authorizes artifacts.
+        let (viewer_org, viewer_app) = insert_teardown_pending_app(&pool).await;
+        insert_test_keyring_with_roles(
+            &pool,
+            viewer_org,
+            1,
+            &[(signer.repeat(32).as_str(), "viewer")],
+        )
+        .await;
+        insert_job_teardown_authority(&pool, viewer_org, viewer_app, signer).await;
+
+        // Uppercase member pubkey: membership compares case-insensitively,
+        // so both sides still admit the lowercase-signed artifact.
+        let (upper_org, upper_app) = insert_teardown_pending_app(&pool).await;
+        insert_test_keyring_version(&pool, upper_org, 1, &["BB".repeat(32).as_str()]).await;
+        let upper_artifact =
+            insert_job_teardown_authority(&pool, upper_org, upper_app, signer).await;
+
+        // Withdrawn artifact: both sides must refuse it.
+        let (withdrawn_org, withdrawn_app) = insert_teardown_pending_app(&pool).await;
+        insert_test_keyring_version(&pool, withdrawn_org, 1, &[signer.repeat(32).as_str()]).await;
+        let withdrawn_artifact =
+            insert_job_teardown_authority(&pool, withdrawn_org, withdrawn_app, signer).await;
+        withdraw_fixture_artifact(&pool, &withdrawn_artifact, withdrawn_app).await;
+
+        assert_projection_matches_selector(&pool, no_keyring_app, "job authority without keyring")
+            .await;
+        assert_eq!(teardown_projection(&pool, no_keyring_app).await.len(), 0);
+        assert_projection_matches_selector(&pool, current_app, "job authority with current member")
+            .await;
+        assert_eq!(
+            teardown_projection(&pool, current_app).await,
+            HashSet::from([current_artifact.metadata.descriptor_core_hash.clone()])
+        );
+        assert_projection_matches_selector(&pool, rotated_app, "job authority after rotation")
+            .await;
+        assert_eq!(teardown_projection(&pool, rotated_app).await.len(), 0);
+        assert_projection_matches_selector(&pool, viewer_app, "job authority with non-deploy role")
+            .await;
+        assert_eq!(teardown_projection(&pool, viewer_app).await.len(), 0);
+        assert_projection_matches_selector(&pool, upper_app, "job authority with uppercase member")
+            .await;
+        assert_eq!(
+            teardown_projection(&pool, upper_app).await,
+            HashSet::from([upper_artifact.metadata.descriptor_core_hash.clone()])
+        );
+        assert_projection_matches_selector(&pool, withdrawn_app, "job authority withdrawn").await;
+        assert_eq!(teardown_projection(&pool, withdrawn_app).await.len(), 0);
+
+        delete_fixture_orgs(
+            &pool,
+            &[
+                no_keyring_org,
+                current_org,
+                rotated_org,
+                viewer_org,
+                upper_org,
+                withdrawn_org,
+            ],
+        )
+        .await;
+    }
+
+    /// Legacy (pre-job) teardown authority: same selector/projection parity
+    /// on the legacy arm, plus an unreleased customer-config hold, which the
+    /// selector excludes before ranking and the projection must too.
+    #[tokio::test]
+    async fn teardown_unit_projection_matches_deleting_selector_for_legacy_authority() {
+        let pool = crate::test_support::database_test_pool().await;
+        let signer = "bb";
+
+        // Missing keyring.
+        let (no_keyring_org, no_keyring_app) = insert_teardown_pending_app(&pool).await;
+        insert_legacy_teardown_authority(&pool, no_keyring_org, no_keyring_app, signer).await;
+
+        // Current member.
+        let (current_org, current_app) = insert_teardown_pending_app(&pool).await;
+        insert_test_keyring_version(&pool, current_org, 1, &[signer.repeat(32).as_str()]).await;
+        let current_artifact =
+            insert_legacy_teardown_authority(&pool, current_org, current_app, signer).await;
+
+        // Rotated-out signer.
+        let (rotated_org, rotated_app) = insert_teardown_pending_app(&pool).await;
+        insert_test_keyring_version(&pool, rotated_org, 1, &[signer.repeat(32).as_str()]).await;
+        insert_test_keyring_version(&pool, rotated_org, 2, &["ab".repeat(32).as_str()]).await;
+        insert_legacy_teardown_authority(&pool, rotated_org, rotated_app, signer).await;
+
+        // Non-deploy role.
+        let (viewer_org, viewer_app) = insert_teardown_pending_app(&pool).await;
+        insert_test_keyring_with_roles(
+            &pool,
+            viewer_org,
+            1,
+            &[(signer.repeat(32).as_str(), "viewer")],
+        )
+        .await;
+        insert_legacy_teardown_authority(&pool, viewer_org, viewer_app, signer).await;
+
+        // Uppercase member pubkey.
+        let (upper_org, upper_app) = insert_teardown_pending_app(&pool).await;
+        insert_test_keyring_version(&pool, upper_org, 1, &["BB".repeat(32).as_str()]).await;
+        let upper_artifact =
+            insert_legacy_teardown_authority(&pool, upper_org, upper_app, signer).await;
+
+        // Withdrawn artifact.
+        let (withdrawn_org, withdrawn_app) = insert_teardown_pending_app(&pool).await;
+        insert_test_keyring_version(&pool, withdrawn_org, 1, &[signer.repeat(32).as_str()]).await;
+        let withdrawn_artifact =
+            insert_legacy_teardown_authority(&pool, withdrawn_org, withdrawn_app, signer).await;
+        withdraw_fixture_artifact(&pool, &withdrawn_artifact, withdrawn_app).await;
+
+        // Unreleased hold: the only apply job is held pending, so the
+        // selector ranks nothing and the projection must be empty too.
+        let (held_org, held_app) = insert_teardown_pending_app(&pool).await;
+        insert_test_keyring_version(&pool, held_org, 1, &[signer.repeat(32).as_str()]).await;
+        let held = Uuid::new_v4();
+        insert_test_deployment(&pool, held_org, held_app, held, "healthy", Utc::now()).await;
+        let held_artifact =
+            insert_test_artifact_signed_by(&pool, held_app, held, "aa", signer).await;
+        insert_test_job(
+            &pool,
+            held_org,
+            held_app,
+            held,
+            held,
+            Some((held, &held_artifact)),
+        )
+        .await;
+        sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET state = 'setup_pending',
+                    customer_config_hold = true,
+                    customer_config_hold_until = clock_timestamp() + interval '1 hour',
+                    next_attempt_at = 'infinity'::timestamptz
+              WHERE deployment_id = $1",
+        )
+        .bind(held)
+        .execute(&pool)
+        .await
+        .expect("hold the teardown job");
+        // Nonterminal deployments require a nonterminal durable job.
+        sqlx::query("UPDATE deployments SET status = 'pending' WHERE id = $1")
+            .bind(held)
             .execute(&pool)
             .await
-            .expect("delete mixed legacy fixture organization");
+            .expect("mark the held deployment pending after its durable job exists");
+
+        // Released hold: the same job counts again on both sides.
+        let (released_org, released_app) = insert_teardown_pending_app(&pool).await;
+        insert_test_keyring_version(&pool, released_org, 1, &[signer.repeat(32).as_str()]).await;
+        let released = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            released_org,
+            released_app,
+            released,
+            "healthy",
+            Utc::now(),
+        )
+        .await;
+        let released_artifact =
+            insert_test_artifact_signed_by(&pool, released_app, released, "aa", signer).await;
+        insert_test_job(
+            &pool,
+            released_org,
+            released_app,
+            released,
+            released,
+            Some((released, &released_artifact)),
+        )
+        .await;
+        sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET customer_config_hold = true,
+                    customer_config_hold_until = clock_timestamp() - interval '1 hour',
+                    customer_config_released_at = clock_timestamp()
+              WHERE deployment_id = $1",
+        )
+        .bind(released)
+        .execute(&pool)
+        .await
+        .expect("release the teardown job hold");
+
+        assert_projection_matches_selector(
+            &pool,
+            no_keyring_app,
+            "legacy authority without keyring",
+        )
+        .await;
+        assert_eq!(teardown_projection(&pool, no_keyring_app).await.len(), 0);
+        assert_projection_matches_selector(
+            &pool,
+            current_app,
+            "legacy authority with current member",
+        )
+        .await;
+        assert_eq!(
+            teardown_projection(&pool, current_app).await,
+            HashSet::from([current_artifact.metadata.descriptor_core_hash.clone()])
+        );
+        assert_projection_matches_selector(&pool, rotated_app, "legacy authority after rotation")
+            .await;
+        assert_eq!(teardown_projection(&pool, rotated_app).await.len(), 0);
+        assert_projection_matches_selector(
+            &pool,
+            viewer_app,
+            "legacy authority with non-deploy role",
+        )
+        .await;
+        assert_eq!(teardown_projection(&pool, viewer_app).await.len(), 0);
+        assert_projection_matches_selector(
+            &pool,
+            upper_app,
+            "legacy authority with uppercase member",
+        )
+        .await;
+        assert_eq!(
+            teardown_projection(&pool, upper_app).await,
+            HashSet::from([upper_artifact.metadata.descriptor_core_hash.clone()])
+        );
+        assert_projection_matches_selector(&pool, withdrawn_app, "legacy authority withdrawn")
+            .await;
+        assert_eq!(teardown_projection(&pool, withdrawn_app).await.len(), 0);
+        assert_projection_matches_selector(&pool, held_app, "unreleased hold").await;
+        assert_eq!(teardown_projection(&pool, held_app).await.len(), 0);
+        assert_projection_matches_selector(&pool, released_app, "released hold").await;
+        assert_eq!(
+            teardown_projection(&pool, released_app).await,
+            HashSet::from([released_artifact.metadata.descriptor_core_hash.clone()])
+        );
+
+        delete_fixture_orgs(
+            &pool,
+            &[
+                no_keyring_org,
+                current_org,
+                rotated_org,
+                viewer_org,
+                upper_org,
+                withdrawn_org,
+                held_org,
+                released_org,
+            ],
+        )
+        .await;
     }
 
     /// Codex review on 0c678f57 (over-budget republication): when the required
@@ -7219,6 +7667,10 @@ resource_bindings := {
         let now = Utc::now();
 
         let (org_id, app_id) = insert_test_app(&pool, "running").await;
+        // The production unit loader filters by current keyring membership
+        // (issue #130); the fixture signer (bb repeated) must be a member or
+        // load_teardown_policy_unit below returns an empty unit.
+        insert_test_keyring_version(&pool, org_id, 1, &["bb".repeat(32).as_str()]).await;
         let legacy = Uuid::new_v4();
         insert_test_deployment(&pool, org_id, app_id, legacy, "healthy", now).await;
         let legacy_artifact = insert_test_artifact(&pool, app_id, legacy, "1e").await;
@@ -7384,7 +7836,10 @@ resource_bindings := {
 
     #[tokio::test]
     async fn teardown_pending_authorization_survives_deployment_supersession() {
-        let pool = crate::test_support::database_test_pool().await;
+        // Asserts the exact size of the global candidate set, so run on a
+        // per-process database.
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_teardown_supersede").await;
         let now = Utc::now();
         let (org_id, app_id) = insert_test_app(&pool, "deleting").await;
 
@@ -7439,6 +7894,7 @@ resource_bindings := {
         // reference are deferred FKs.
         let pending = Uuid::new_v4();
         let mut pending_artifact = test_signed_policy_artifact("cd", 16);
+        pending_artifact.metadata.descriptor_core_hash = unique_test_descriptor_hash("cd", pending);
         pending_artifact.metadata.app_id = app_id.to_string();
         pending_artifact.metadata.deploy_id = pending.to_string();
         let pending_hash = hex::decode(&pending_artifact.metadata.descriptor_core_hash).unwrap();
@@ -7527,11 +7983,7 @@ resource_bindings := {
             "a long-dead historical operation's artifact must not re-enter the policy"
         );
 
-        sqlx::query("DELETE FROM organizations WHERE id = $1")
-            .bind(org_id)
-            .execute(&pool)
-            .await
-            .expect("delete supersession fixture organization");
+        crate::test_support::drop_isolated_database("cap_teardown_supersede", pool).await;
     }
 
     async fn seed_owner_binding_for_app(pool: &PgPool, app_id: Uuid) {
@@ -7844,7 +8296,10 @@ resource_bindings := {
 
     #[tokio::test]
     async fn teardown_pending_authorization_survives_stacked_failed_generations() {
-        let pool = crate::test_support::database_test_pool().await;
+        // Asserts the exact size of the global candidate set, so run on a
+        // per-process database.
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_teardown_stacked").await;
         let now = Utc::now();
         let (org_id, app_id) = insert_test_app(&pool, "deleting").await;
 
@@ -8022,18 +8477,23 @@ resource_bindings := {
         );
         assert_eq!(retained_hashes.len(), 2);
 
-        sqlx::query("DELETE FROM organizations WHERE id = $1")
-            .bind(org_id)
-            .execute(&pool)
-            .await
-            .expect("delete stacked-failures fixture organization");
+        crate::test_support::drop_isolated_database("cap_teardown_stacked", pool).await;
     }
 
     #[tokio::test]
     async fn newer_published_spec_bounds_teardown_authority() {
-        let pool = crate::test_support::database_test_pool().await;
+        // Asserts the exact size of the global candidate set, so run on a
+        // per-process database.
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_teardown_bounded").await;
         let now = Utc::now();
         let (org_id, app_id) = insert_test_app(&pool, "deleting").await;
+        // The candidates query filters artifacts by current keyring
+        // membership (issue #130), so the fixture org needs a keyring whose
+        // member set still contains the fixture signer pubkey (test_signed_
+        // policy_artifact signs with bb repeated 32 times) for its artifacts
+        // to stay authorized.
+        insert_test_keyring_version(&pool, org_id, 1, &["bb".repeat(32).as_str()]).await;
         sqlx::query("UPDATE apps SET workload_teardown_required = true WHERE id = $1")
             .bind(app_id)
             .execute(&pool)
@@ -8108,11 +8568,7 @@ resource_bindings := {
             "only the last completed workload and the newest publication"
         );
 
-        sqlx::query("DELETE FROM organizations WHERE id = $1")
-            .bind(org_id)
-            .execute(&pool)
-            .await
-            .expect("delete published-bound fixture organization");
+        crate::test_support::drop_isolated_database("cap_teardown_bounded", pool).await;
     }
 
     async fn insert_failed_apply_job(
@@ -8147,7 +8603,10 @@ resource_bindings := {
 
     #[tokio::test]
     async fn queued_supersessions_do_not_crowd_out_live_teardown_authority() {
-        let pool = crate::test_support::database_test_pool().await;
+        // Asserts the exact size of the global candidate set, so run on a
+        // per-process database.
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_teardown_queued").await;
         let now = Utc::now();
         let (org_id, app_id) = insert_test_app(&pool, "deleting").await;
 
@@ -8187,6 +8646,8 @@ resource_bindings := {
         for index in 0..4u32 {
             let queued = Uuid::new_v4();
             let mut artifact = test_signed_policy_artifact(&format!("{index:x}0"), 16);
+            artifact.metadata.descriptor_core_hash =
+                unique_test_descriptor_hash(&format!("{index:x}0"), queued);
             artifact.metadata.app_id = app_id.to_string();
             artifact.metadata.deploy_id = queued.to_string();
             let hash = hex::decode(&artifact.metadata.descriptor_core_hash).unwrap();
@@ -8272,16 +8733,16 @@ resource_bindings := {
             );
         }
 
-        sqlx::query("DELETE FROM organizations WHERE id = $1")
-            .bind(org_id)
-            .execute(&pool)
-            .await
-            .expect("delete queued-supersessions fixture organization");
+        crate::test_support::drop_isolated_database("cap_teardown_queued", pool).await;
     }
 
     #[tokio::test]
     async fn unreleased_signed_customer_config_hold_defers_an_empty_policy() {
-        let pool = crate::test_support::database_test_pool().await;
+        // Asserts exact emptiness on the global hold-deferral probe and the
+        // global candidate set, and sweeps every app's hold, so run on a
+        // per-process database.
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_signed_hold_deferral").await;
         let (org_id, app_id) = insert_test_app(&pool, "running").await;
         // The candidates query filters artifacts by current keyring
         // membership (issue #130), so the fixture org needs a keyring whose
@@ -8312,6 +8773,7 @@ resource_bindings := {
         // The signed artifact the hold will withhold; its row lands in the
         // same transaction (artifact -> deployment FK is checked at commit).
         let mut artifact = test_signed_policy_artifact("09", 16);
+        artifact.metadata.descriptor_core_hash = unique_test_descriptor_hash("09", held);
         artifact.metadata.app_id = app_id.to_string();
         artifact.metadata.deploy_id = held.to_string();
         let artifact_hash = hex::decode(&artifact.metadata.descriptor_core_hash).unwrap();
@@ -8419,6 +8881,7 @@ resource_bindings := {
         // deferring the empty publish after the job turns terminal.
         let held2 = Uuid::new_v4();
         let mut artifact2 = test_signed_policy_artifact("0b", 16);
+        artifact2.metadata.descriptor_core_hash = unique_test_descriptor_hash("0b", held2);
         artifact2.metadata.app_id = app_id.to_string();
         artifact2.metadata.deploy_id = held2.to_string();
         let artifact2_hash = hex::decode(&artifact2.metadata.descriptor_core_hash).unwrap();
@@ -8539,16 +9002,15 @@ resource_bindings := {
             "a newer durable operation ends the expired hold's protection"
         );
 
-        sqlx::query("DELETE FROM organizations WHERE id = $1")
-            .bind(org_id)
-            .execute(&pool)
-            .await
-            .expect("delete held fixture organization");
+        crate::test_support::drop_isolated_database("cap_signed_hold_deferral", pool).await;
     }
 
     #[tokio::test]
     async fn unrelated_unsigned_hold_does_not_defer_an_empty_policy() {
-        let pool = crate::test_support::database_test_pool().await;
+        // Asserts on the global hold-deferral probe, so run on a per-process
+        // database.
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_unsigned_hold_probe").await;
         let (org_id, app_id) = insert_test_app(&pool, "running").await;
         // The candidates query filters artifacts by current keyring
         // membership (issue #130), so the fixture org needs a keyring whose
@@ -8598,16 +9060,15 @@ resource_bindings := {
             "an unsigned hold withholds no authority and must not defer policy convergence"
         );
 
-        sqlx::query("DELETE FROM organizations WHERE id = $1")
-            .bind(org_id)
-            .execute(&pool)
-            .await
-            .expect("delete unsigned held fixture organization");
+        crate::test_support::drop_isolated_database("cap_unsigned_hold_probe", pool).await;
     }
 
     #[tokio::test]
     async fn expired_signed_hold_preserves_legacy_policy_until_lifecycle_advances() {
-        let pool = crate::test_support::database_test_pool().await;
+        // Sweeps holds and bumps the kbs_signed_policy_reconciliation
+        // singleton globally, so run on a per-process database.
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_teardown_hold_sweep").await;
         let (org_id, app_id) = insert_test_app(&pool, "running").await;
 
         // The still-running workload the hold preserved: a healthy legacy
@@ -8619,6 +9080,7 @@ resource_bindings := {
         // terminalizes it without ever applying the workload.
         let held = Uuid::new_v4();
         let mut artifact = test_signed_policy_artifact("0d", 16);
+        artifact.metadata.descriptor_core_hash = unique_test_descriptor_hash("0d", held);
         artifact.metadata.app_id = app_id.to_string();
         artifact.metadata.deploy_id = held.to_string();
         let artifact_hash = hex::decode(&artifact.metadata.descriptor_core_hash).unwrap();
@@ -8772,11 +9234,7 @@ resource_bindings := {
             "stopping the app must let the pending reconciliation publish"
         );
 
-        sqlx::query("DELETE FROM organizations WHERE id = $1")
-            .bind(org_id)
-            .execute(&pool)
-            .await
-            .expect("delete expired hold fixture organization");
+        crate::test_support::drop_isolated_database("cap_teardown_hold_sweep", pool).await;
     }
 
     #[test]

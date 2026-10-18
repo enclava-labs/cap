@@ -9345,6 +9345,10 @@ mod tests {
 
     async fn app_delete_fixture() -> (AppState, AuthContext, String, Uuid) {
         let pool = database_test_pool().await;
+        app_delete_fixture_on(pool).await
+    }
+
+    async fn app_delete_fixture_on(pool: sqlx::PgPool) -> (AppState, AuthContext, String, Uuid) {
         let org_id = Uuid::new_v4();
         let user_id = Uuid::new_v4();
         let app_id = Uuid::new_v4();
@@ -9590,7 +9594,14 @@ mod tests {
 
     #[tokio::test]
     async fn app_delete_deferral_carries_teardown_disposition() {
-        let (state, auth, app_name, _) = app_delete_fixture().await;
+        // An isolated per-test database: this test only asserts the deferral
+        // body shape, but the shared test database's global state (the
+        // signed-policy singleton, orphaned global fences, and the migration
+        // advisory lock a sibling CI worktree can hold on the same server)
+        // makes the fixture's pool acquisition and lane claims nondeterministic.
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_delete_disposition").await;
+        let (state, auth, app_name, _) = app_delete_fixture_on(pool.clone()).await;
         let key = format!("disposition-delete-{}", Uuid::new_v4());
         let headers = idempotency_headers(&key);
         let path = format!("/internal/paas/orgs/{}/apps/{app_name}", auth.org_id);
@@ -9618,7 +9629,7 @@ mod tests {
         // A locked teardown (423) carries the same disposition — the handler
         // attaches `reason` for every deferral-worthy teardown status — and
         // must keep its `cause` too.
-        let (state, auth, app_name, _) = app_delete_fixture().await;
+        let (state, auth, app_name, _) = app_delete_fixture_on(pool.clone()).await;
         let key = format!("disposition-locked-{}", Uuid::new_v4());
         let headers = idempotency_headers(&key);
         let path = format!("/internal/paas/orgs/{}/apps/{app_name}", auth.org_id);
@@ -9640,6 +9651,8 @@ mod tests {
             deferred.1.0["reason"], "app_restored",
             "locked teardowns keep the app disposition on the deferral"
         );
+
+        crate::test_support::drop_isolated_database("cap_delete_disposition", pool).await;
     }
 
     #[tokio::test]

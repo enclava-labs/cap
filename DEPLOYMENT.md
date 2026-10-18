@@ -488,6 +488,13 @@ after the filtered KBS policy has converged. A `503` response with code
 `keyring_policy_reconciliation_pending` means the keyring change committed, but
 policy publication is still unconfirmed. It does not mean the keyring rolled back.
 
+Confidential teardown admission uses the same signer eligibility as policy
+publication: only owner/admin/deployer keys in the latest org keyring qualify,
+withdrawn artifacts stay excluded, and unreleased customer-config holds add no
+authority. Deletion does not restore revoked signer authority. Its projected
+required policy must fit the shared byte budget unless deletion leaves that
+policy the same size or smaller.
+
 Retry the same request after restoring KBS availability. Internal PaaS callers
 must retain the same idempotency key when the response is stamped `deferred`.
 For CLI owner-rotation recovery, reuse the encrypted replacement backup:
