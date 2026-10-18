@@ -44,6 +44,25 @@ pub async fn apply_standard_resources(
     manifests: &crate::manifest::GeneratedManifests,
     generation: MutationGeneration,
 ) -> Result<(), ApplyError> {
+    apply_standard_resources_with_service_account(
+        engine,
+        manifests,
+        &manifests.service_account,
+        generation,
+    )
+    .await
+}
+
+/// Like [`apply_standard_resources`], but applies `service_account` instead of
+/// the manifest's ServiceAccount. Deploy uses this to carry annotations the
+/// generated manifest does not know about (a recorded tenant pull-secret
+/// replacement) into the SSA desired object, so the apply does not prune them.
+pub async fn apply_standard_resources_with_service_account(
+    engine: &ApplyEngine,
+    manifests: &crate::manifest::GeneratedManifests,
+    service_account: &k8s_openapi::api::core::v1::ServiceAccount,
+    generation: MutationGeneration,
+) -> Result<(), ApplyError> {
     let ns = manifests
         .namespace
         .metadata
@@ -51,7 +70,7 @@ pub async fn apply_standard_resources(
         .as_deref()
         .ok_or_else(|| ApplyError::NamespaceNotReady("namespace has no name".to_string()))?;
 
-    apply_namespaced_resource(engine, ns, &manifests.service_account, generation).await?;
+    apply_namespaced_resource(engine, ns, service_account, generation).await?;
     apply_namespaced_resource(engine, ns, &manifests.resource_quota, generation).await?;
     apply_namespaced_resource(engine, ns, &manifests.service, generation).await?;
     apply_namespaced_resource(engine, ns, &manifests.sni_route_configmap, generation).await?;
