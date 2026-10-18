@@ -5537,7 +5537,7 @@ impl DeployError {
             Self::MissingAttestationConfig => "deploy_runtime_not_configured",
             Self::Apply(error) => error.public_code(),
             Self::NotDeployed(_) => "app_not_deployed",
-            Self::KbsPolicy(_) => "kbs_policy_error",
+            Self::KbsPolicy(error) => error.public_code(),
             Self::EdgeRoute(_) => "edge_route_error",
             Self::Mutation(_) => "mutation_fence_error",
             Self::PullSecretReconcileDeferred(_) => "pull_secret_reconcile_deferred",
