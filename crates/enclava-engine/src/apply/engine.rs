@@ -110,12 +110,21 @@ impl ApplyError {
 pub struct ApplyEngine {
     client: Client,
     config: ApplyConfig,
+    /// Server-recorded creation provenance (cap#272). `None` on engines
+    /// used outside the control-plane apply path (CLI, tests): those keep
+    /// the legacy evidence-preservation behavior, and every DELETION
+    /// authority that matters lives in the API's ledger-gated cleanup.
+    creation_ledger: Option<std::sync::Arc<super::creation_ledger::CreationLedgerBuffer>>,
 }
 
 impl ApplyEngine {
     /// Create an ApplyEngine from an existing kube::Client.
     pub fn new(client: Client, config: ApplyConfig) -> Self {
-        Self { client, config }
+        Self {
+            client,
+            config,
+            creation_ledger: None,
+        }
     }
 
     /// Create an ApplyEngine using the default kubeconfig (from KUBECONFIG env
@@ -125,13 +134,37 @@ impl ApplyEngine {
         Ok(Self {
             client,
             config: ApplyConfig::default(),
+            creation_ledger: None,
         })
     }
 
     /// Create an ApplyEngine with custom config using default kubeconfig.
     pub async fn try_with_config(config: ApplyConfig) -> Result<Self, ApplyError> {
         let client = Client::try_default().await?;
-        Ok(Self { client, config })
+        Ok(Self {
+            client,
+            config,
+            creation_ledger: None,
+        })
+    }
+
+    /// Attach a creation ledger (cap#272). The engine records every object
+    /// its own create POST produces into it and refuses to preserve
+    /// creation evidence observed on live objects whose lineage is neither
+    /// recorded nor grandfathered by the migration cutover.
+    pub fn with_creation_ledger(
+        mut self,
+        ledger: std::sync::Arc<super::creation_ledger::CreationLedgerBuffer>,
+    ) -> Self {
+        self.creation_ledger = Some(ledger);
+        self
+    }
+
+    /// The attached creation ledger, when this engine records provenance.
+    pub fn creation_ledger(
+        &self,
+    ) -> Option<&std::sync::Arc<super::creation_ledger::CreationLedgerBuffer>> {
+        self.creation_ledger.as_ref()
     }
 
     /// Returns a reference to the underlying kube::Client.

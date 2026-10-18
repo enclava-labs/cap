@@ -592,7 +592,8 @@ impl DeploymentJobError {
     fn should_requeue_without_terminal_failure(&self) -> bool {
         matches!(
             self,
-            Self::Db(_)
+            Self::Apply(crate::deploy::DeployError::PullSecretReconcileDeferred(_))
+                | Self::Db(_)
                 | Self::LeaseLost
                 | Self::ApplyLimiterClosed
                 | Self::SideEffectAdmissionClosed
@@ -2024,6 +2025,24 @@ async fn process_apply_job(
                     error_code = error.code(),
                     "failed to complete terminal durable deployment job"
                 );
+            }
+        }
+        Ok(Ok(JobApplyOutcome::ApplyFailed(error, mutation)))
+            if error.should_requeue_without_terminal_failure() =>
+        {
+            // The reconciliation timed out or encountered a newer rollout.
+            // The provider may have accepted earlier writes in this attempt:
+            // retain the mutation fence's quarantine before another worker
+            // retries the same durable deployment, rather than terminalizing it.
+            if let Err(requeue_error) = requeue_apply_job(&state.db, &job, error.code()).await {
+                tracing::error!(deployment_id = %deployment_id,
+                    error_code = requeue_error.code(),
+                    "failed to requeue deferred pull-secret reconciliation");
+            }
+            if let Err(release_error) = mutation.release_after_provider_quarantine().await {
+                tracing::error!(deployment_id = %deployment_id,
+                    error_code = DeploymentJobError::from(release_error).code(),
+                    "failed to quarantine deferred deployment mutation");
             }
         }
         Ok(Ok(JobApplyOutcome::ApplyFailed(error, mutation))) => {
@@ -3618,6 +3637,16 @@ pub(crate) mod tests {
                 .with_code(code)
                 .boxed(),
         )
+    }
+
+    #[test]
+    fn deferred_pull_secret_reconciliation_requeues_after_apply() {
+        let deferred =
+            DeploymentJobError::Apply(crate::deploy::DeployError::PullSecretReconcileDeferred(
+                "newer scope generation".to_string(),
+            ));
+        assert!(deferred.should_requeue_without_terminal_failure());
+        assert_eq!(deferred.code(), "pull_secret_reconcile_deferred");
     }
 
     /// Preflight volume-evidence lookups classify Kubernetes failures

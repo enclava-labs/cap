@@ -563,6 +563,11 @@ const PUBLIC_DEPLOYMENT_ERROR_MESSAGE: &str = "deployment_error";
 /// `DeployError::public_code`, `ApplyError::public_code`, and the fixed
 /// setup/apply constants — never free-form backend or runtime plaintext.
 /// Anything not in this list is redacted to `deployment_error`.
+///
+/// The pull-secret pair is admitted in lockstep with the 0087 CHECK so a
+/// stored row is not redacted; they are not written today
+/// (`pull_secret_reconcile_deferred` is a non-terminal requeue and
+/// `pull_secret_delete_conflict` is published as `deployment_apply_failed`).
 const PUBLIC_DEPLOYMENT_ERROR_CODES: &[&str] = &[
     // control-plane codes
     crate::deploy::DEPLOYMENT_SUPERSEDED_ERROR,
@@ -624,6 +629,9 @@ const PUBLIC_DEPLOYMENT_ERROR_CODES: &[&str] = &[
     "app_mutation_busy",
     "app_mutation_lease_lost",
     "app_mutation_unavailable",
+    // pull-secret codes (see the 0087 CHECK note above)
+    "pull_secret_reconcile_deferred",
+    "pull_secret_delete_conflict",
 ];
 
 /// Project a stored deployment error across an API boundary without exposing
@@ -1437,15 +1445,14 @@ async fn deploy_app_candidate(
         )
     })?;
 
-    let (provenance, sbom) = crate::cosign::fetch_attestations(
-        &state.cosign_egress,
-        &state.http_client,
-        &body.image,
-        &image_digest,
-        state.outbound_body_limit,
-    )
-    .await
-    .unwrap_or((None, None));
+    // Legacy .att/.sbom tags are mutable and neither the image signature nor
+    // the index-bound portable provenance authenticates these independent
+    // manifest responses. Do not persist or surface them as verified-adjacent
+    // metadata. The portable provenance is checked separately by the offline
+    // verifier; a signed/subject-bound metadata ingestion path is required
+    // before these nullable fields can safely be populated again.
+    let provenance: Option<serde_json::Value> = None;
+    let sbom: Option<serde_json::Value> = None;
 
     let source_provider = body.source_provider.map(SourceProvider::as_str);
     let spec_snapshot = serde_json::json!({
