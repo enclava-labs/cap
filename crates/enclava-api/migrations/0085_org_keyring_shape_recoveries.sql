@@ -52,10 +52,13 @@
 -- archives only rows it deletes, and the preserved current version stays
 -- live and absent from the archive.
 --
--- Skip that delete when the marker table already exists.  Divergent 0061
--- created it in the same transaction as the quarantine, so a keyring beside
--- an existing marker is a fenced recovery or a clean survivor, not an
--- unfenced window capture.
+-- Divergent 0061 created the marker table but did not install an INSERT
+-- fence. Old writers can therefore capture authority even with that table
+-- present. A remaining marker proves recovery was never fenced: quarantine
+-- every live generation for that org, including any archive collisions.
+-- Conversely, a recovery through the new handler consumes its marker. With
+-- the divergent table present, preserve marker-free rows even when v1
+-- collides with the archive: that can be an already-authorized recovery.
 LOCK TABLE org_keyrings, org_keyring_repairs IN ACCESS EXCLUSIVE MODE;
 
 DO $$
@@ -76,6 +79,21 @@ BEGIN
              RETURNING k.org_id, k.version
         LOOP
             RAISE NOTICE 'migration 0085: quarantined live keyring v% for org % (a live version collides with org_keyring_repairs, so every live generation was removed); the displaced signer must restore authority through the fenced first-version path',
+                captured.version, captured.org_id;
+        END LOOP;
+    ELSE
+        -- Lock the existing markers too, so cleanup and trigger installation
+        -- observe one stable recovery state throughout this migration.
+        LOCK TABLE org_keyring_shape_recoveries IN ACCESS EXCLUSIVE MODE;
+        FOR captured IN
+            DELETE FROM org_keyrings k
+             WHERE EXISTS (
+                   SELECT 1 FROM org_keyring_shape_recoveries r
+                    WHERE r.org_id = k.org_id
+               )
+             RETURNING k.org_id, k.version
+        LOOP
+            RAISE NOTICE 'migration 0085: quarantined live keyring v% for org % (recovery marker still present); the displaced signer must restore authority through the fenced first-version path',
                 captured.version, captured.org_id;
         END LOOP;
     END IF;
