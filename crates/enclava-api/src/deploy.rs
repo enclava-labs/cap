@@ -9,7 +9,7 @@ use enclava_engine::apply::{
     namespace::apply_namespace,
     network_policy::apply_network_policy,
     orchestrator::{MANIFEST_HASH_ANNOTATION, manifest_hash},
-    resources::{apply_namespaced_resource, apply_standard_resources},
+    resources::{apply_namespaced_resource, apply_standard_resources_with_service_account},
     statefulset::apply_statefulset,
     types::{DeployPhase, DeployStatus as EngineDeployStatus},
     watch::watch_rollout,
@@ -114,6 +114,17 @@ fn newer_pull_secret_credentials(secret: &Secret) -> bool {
 /// from the surviving pull secret.
 const PENDING_PULL_SECRET_REFERENCE_REPAIRS_ANNOTATION: &str =
     "cap.enclava.dev/pending-pull-secret-reference-repairs";
+
+/// Durable proof that a live Secret UID is a tenant replacement, not the
+/// object a pending repair cleared (Codex review on #276, P1 "preserve UID
+/// mismatch protection across replacement repairs"). Written in the same
+/// ServiceAccount patch that restores the reference and discharges the pending
+/// intent, so a later sweep still has the UID after the pending annotation is
+/// gone. Entries are `name=uid`, comma-separated; a name may record more than
+/// one UID. SSA of the generated ServiceAccount must copy this annotation into
+/// the desired object or the apply prunes it.
+const FOREIGN_PULL_SECRET_REPLACEMENTS_ANNOTATION: &str =
+    "cap.enclava.dev/foreign-pull-secret-replacements";
 pub(crate) const PERSISTED_DEPLOYMENT_ERROR_MESSAGE: &str = "deployment_error";
 
 #[derive(Debug, Clone)]
@@ -852,6 +863,41 @@ fn namespace_keeps_tenant_image_pull_secret(
         .any(|images| app_keeps_tenant_image_pull_secret(config, images.as_ref()))
 }
 
+/// One app's pull-secret qualification inputs for a shared-namespace deploy
+/// (Codex review on #276, P1 "reconcile shared namespaces before completing
+/// out-of-scope deploys").
+struct NamespacePullSecretApp {
+    app_id: Uuid,
+    service_account: String,
+    /// `None` means a stored image ref failed to parse, so the app never
+    /// qualifies.
+    images: Option<Vec<ImageRef>>,
+}
+
+/// Scope for an out-of-scope deploy in a shared namespace. The deploying app
+/// is forced out of scope even when its stored image rows still match: those
+/// rows can lag the snapshot this deploy is applying. Other apps keep the
+/// secret only while their stored images still qualify.
+fn scope_for_shared_namespace_out_of_scope_deploy(
+    config: Option<&TenantImagePullSecretConfig>,
+    deploying_app_id: Uuid,
+    apps: &[NamespacePullSecretApp],
+) -> PullSecretAccountScope {
+    let Some(config) = config else {
+        return PullSecretAccountScope::uniform(false);
+    };
+    let in_scope_accounts: BTreeSet<String> = apps
+        .iter()
+        .filter(|app| app.app_id != deploying_app_id)
+        .filter(|app| app_keeps_tenant_image_pull_secret(config, app.images.as_ref()))
+        .map(|app| app.service_account.clone())
+        .collect();
+    PullSecretAccountScope {
+        namespace_in_scope: !in_scope_accounts.is_empty(),
+        in_scope_accounts,
+    }
+}
+
 /// Environment-derived pull-secret settings for one reconciliation pass.
 struct PullSecretSettings {
     /// The tenant image pull secret name CAP generates under the current
@@ -1266,23 +1312,10 @@ async fn reconcile_managed_pull_secrets(
     // namespace, and its reference is cleared while the secret stays for the
     // still-matching apps.
     //
-    // Devin review on #276 (security): the union built here drives only the
-    // KEEP/REMOVE decision. Platform-credential writes in the keep loop
-    // below are gated separately on stronger evidence: a name justified
-    // solely by a pending repair intent (no live `imagePullSecrets`
-    // reference) must prove, through the UID the intent recorded, that the
-    // object behind the name is still the one the intent was recorded for —
-    // a different UID is a replacement, and the sweep must never label it
-    // or write the platform PAT into it.
+    // KEEP/REMOVE decision only. Credential writes are gated on the durable
+    // foreign-replacement UID record (Codex review on #276, P1), not on
+    // whether a pending intent or a live reference mentions the name.
     let mut in_scope_referenced_names: BTreeSet<String> = BTreeSet::new();
-    // Live references only — snapshotted before the repair pass runs, so a
-    // reference the repair pass restores below cannot retroactively make a
-    // replacement's name platform-credential-eligible in the same sweep.
-    let mut in_scope_live_referenced_names: BTreeSet<String> = BTreeSet::new();
-    // Pending repair intents of in-scope accounts (sweep only), by secret
-    // name, keeping each intent's UID proof for the keep loop.
-    let mut in_scope_pending_repairs: BTreeMap<String, Vec<PendingReferenceRepair>> =
-        BTreeMap::new();
     for account in &accounts {
         if !account
             .metadata
@@ -1294,7 +1327,6 @@ async fn reconcile_managed_pull_secrets(
         }
         for reference in account.image_pull_secrets.iter().flatten() {
             in_scope_referenced_names.insert(reference.name.clone());
-            in_scope_live_referenced_names.insert(reference.name.clone());
         }
         // Pending references for in-scope accounts are desired too. Seed
         // them before any repairs, so an out-of-scope account processed
@@ -1302,10 +1334,6 @@ async fn reconcile_managed_pull_secrets(
         if context == PullSecretReconcileContext::Sweep {
             for repair in pending_reference_repairs(account) {
                 in_scope_referenced_names.insert(repair.secret_name.clone());
-                in_scope_pending_repairs
-                    .entry(repair.secret_name.clone())
-                    .or_default()
-                    .push(repair);
             }
         }
     }
@@ -1313,6 +1341,20 @@ async fn reconcile_managed_pull_secrets(
     let mut converged = true;
     let mut removed = 0usize;
     let mut kept = 0usize;
+    // Codex review on #276, P1: a UID mismatch proves the live object is a
+    // tenant replacement. Seed from annotations written by earlier sweeps,
+    // then add UIDs observed in this pass so the keep loop cannot refresh
+    // them even before the annotation write is visible on a re-read.
+    let mut foreign_replacements: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for account in &accounts {
+        for entry in foreign_pull_secret_replacements(account) {
+            note_foreign_replacement(
+                &mut foreign_replacements,
+                &entry.secret_name,
+                entry.cleared_uid.as_deref(),
+            );
+        }
+    }
     // Durable repair pass (Codex review on #243, P2 "persist failed pull-
     // secret reference restorations" + reviewer follow-up): a ServiceAccount
     // carrying the pending-repairs annotation records a reference an earlier
@@ -1387,12 +1429,30 @@ async fn reconcile_managed_pull_secrets(
                                 continue;
                             }
                             if !cleared_uid_matches {
+                                let Some(replacement_uid) =
+                                    live.metadata.uid.clone().filter(|uid| !uid.is_empty())
+                                else {
+                                    converged = false;
+                                    tracing::warn!(
+                                        %namespace,
+                                        secret = %secret_name,
+                                        "tenant image pull secret reconcile: UID mismatch but the \
+                                         replacement has no UID; retaining the repair intent"
+                                    );
+                                    continue;
+                                };
+                                note_foreign_replacement(
+                                    &mut foreign_replacements,
+                                    &secret_name,
+                                    Some(&replacement_uid),
+                                );
                                 if let Err(error) =
                                     restore_pull_secret_reference_to_service_account(
                                         engine,
                                         namespace,
                                         account_name,
                                         &secret_name,
+                                        Some(&replacement_uid),
                                     )
                                     .await
                                 {
@@ -1446,12 +1506,30 @@ async fn reconcile_managed_pull_secrets(
                             // may be a tenant replacement: restore its reference by name,
                             // but never label it or overwrite it with the platform PAT.
                             if !cleared_uid_matches {
+                                let Some(replacement_uid) =
+                                    live.metadata.uid.clone().filter(|uid| !uid.is_empty())
+                                else {
+                                    converged = false;
+                                    tracing::warn!(
+                                        %namespace,
+                                        secret = %secret_name,
+                                        "tenant image pull secret reconcile: UID mismatch but the \
+                                         replacement has no UID; retaining the repair intent"
+                                    );
+                                    continue;
+                                };
+                                note_foreign_replacement(
+                                    &mut foreign_replacements,
+                                    &secret_name,
+                                    Some(&replacement_uid),
+                                );
                                 if let Err(error) =
                                     restore_pull_secret_reference_to_service_account(
                                         engine,
                                         namespace,
                                         account_name,
                                         &secret_name,
+                                        Some(&replacement_uid),
                                     )
                                     .await
                                 {
@@ -1483,6 +1561,7 @@ async fn reconcile_managed_pull_secrets(
                                 namespace,
                                 account_name,
                                 &secret_name,
+                                None,
                             )
                             .await
                             {
@@ -1552,27 +1631,63 @@ async fn reconcile_managed_pull_secrets(
                                     }
                                 }
                                 Ok(PullSecretRemovalOutcome::NotOurs) => {
-                                    // A different object won the name: restore
-                                    // the reference it inherits by name.
-                                    if let Err(error) =
-                                        restore_pull_secret_reference_to_service_account(
-                                            engine,
-                                            namespace,
-                                            account_name,
-                                            &secret_name,
-                                        )
-                                        .await
-                                    {
-                                        converged = false;
-                                        tracing::warn!(
-                                            %namespace,
-                                            service_account = %account_name,
-                                            secret = %secret_name,
-                                            %error,
-                                            "tenant image pull secret reconcile: failed to \
-                                             restore a reference whose pending removal was \
-                                             superseded — durable repair intent retained"
-                                        );
+                                    // A different object won the name. Record
+                                    // its UID before discharging the pending
+                                    // intent, or the next sweep refreshes it.
+                                    match api.get(&secret_name).await {
+                                        Ok(replacement) => {
+                                            let Some(uid) = replacement
+                                                .metadata
+                                                .uid
+                                                .clone()
+                                                .filter(|uid| !uid.is_empty())
+                                            else {
+                                                converged = false;
+                                                tracing::warn!(
+                                                    %namespace,
+                                                    secret = %secret_name,
+                                                    "tenant image pull secret reconcile: replacement \
+                                                     has no UID; retaining the repair intent"
+                                                );
+                                                continue;
+                                            };
+                                            note_foreign_replacement(
+                                                &mut foreign_replacements,
+                                                &secret_name,
+                                                Some(&uid),
+                                            );
+                                            if let Err(error) =
+                                                restore_pull_secret_reference_to_service_account(
+                                                    engine,
+                                                    namespace,
+                                                    account_name,
+                                                    &secret_name,
+                                                    Some(&uid),
+                                                )
+                                                .await
+                                            {
+                                                converged = false;
+                                                tracing::warn!(
+                                                    %namespace,
+                                                    service_account = %account_name,
+                                                    secret = %secret_name,
+                                                    %error,
+                                                    "tenant image pull secret reconcile: failed to \
+                                                     restore a reference whose pending removal was \
+                                                     superseded — durable repair intent retained"
+                                                );
+                                            }
+                                        }
+                                        Err(error) => {
+                                            converged = false;
+                                            tracing::warn!(
+                                                %namespace,
+                                                secret = %secret_name,
+                                                %error,
+                                                "tenant image pull secret reconcile: failed to re-read \
+                                                 a replacement before recording its UID"
+                                            );
+                                        }
                                     }
                                 }
                                 Err(error) => {
@@ -1590,15 +1705,39 @@ async fn reconcile_managed_pull_secrets(
                             }
                         } else {
                             // A replacement (or a UID-less legacy record)
-                            // lives under the name: the earlier clear was the
-                            // mistake — restore the reference. `live` is only
-                            // needed for the UID comparison above.
-                            let _ = live;
+                            // lives under the name. A recorded cleared UID
+                            // that does not match is proof the live object is
+                            // not ours: record that UID in the same patch that
+                            // discharges the intent. A UID-less legacy record
+                            // has no such proof.
+                            let foreign_uid = if repair.cleared_uid.is_some() {
+                                live.metadata.uid.clone().filter(|uid| !uid.is_empty())
+                            } else {
+                                None
+                            };
+                            if repair.cleared_uid.is_some() && foreign_uid.is_none() {
+                                converged = false;
+                                tracing::warn!(
+                                    %namespace,
+                                    secret = %secret_name,
+                                    "tenant image pull secret reconcile: UID mismatch but the \
+                                     replacement has no UID; retaining the repair intent"
+                                );
+                                continue;
+                            }
+                            if let Some(uid) = foreign_uid.as_deref() {
+                                note_foreign_replacement(
+                                    &mut foreign_replacements,
+                                    &secret_name,
+                                    Some(uid),
+                                );
+                            }
                             if let Err(error) = restore_pull_secret_reference_to_service_account(
                                 engine,
                                 namespace,
                                 account_name,
                                 &secret_name,
+                                foreign_uid.as_deref(),
                             )
                             .await
                             {
@@ -1639,6 +1778,7 @@ async fn reconcile_managed_pull_secrets(
                                                     namespace,
                                                     account_name,
                                                     &secret_name,
+                                                    None,
                                                 )
                                                 .await
                                         {
@@ -1721,73 +1861,55 @@ async fn reconcile_managed_pull_secrets(
                     "newer repository-scope epoch owns {namespace}/{name}"
                 )));
             }
-            // Devin review on #276 (security): a secret whose name the keep
-            // decision owes ONLY to a pending repair intent — an old name
-            // with no live in-scope `imagePullSecrets` reference — receives
-            // platform credentials only when the live object's UID still
-            // matches a UID an intent recorded. A different UID is a proven
-            // replacement: the repair pass above restores its reference by
-            // name but never relabels or overwrites it, and an adopt or
-            // refresh here would hand that replacement the platform PAT on
-            // the strength of the name alone. The configured name stays
-            // eligible: the deploy path re-proves ownership of that name on
-            // every scoped SSA write, so the label/shape proof here carries
-            // the same trust it always did. Once the repair pass discharges
-            // the intent (reference restored), the label is the ownership
-            // proof exactly as everywhere else in the sweep.
-            let pending_only_without_uid_proof = name != settings.configured_name
-                && !in_scope_live_referenced_names.contains(name)
-                && !in_scope_pending_repairs.get(name).is_some_and(|repairs| {
-                    repairs.iter().any(|repair| {
-                        repair
-                            .cleared_uid
-                            .as_deref()
-                            .is_some_and(|uid| live.metadata.uid.as_deref() == Some(uid))
-                    })
-                });
-            if pending_only_without_uid_proof {
+            // Codex review on #276, P1: a recorded mismatched UID excludes this
+            // object from adoption and credential refresh whether it sits at
+            // the configured name, is already referenced by an in-scope
+            // account, or only became referenced because the repair pass
+            // restored it. Clearing an out-of-scope reference would detach
+            // the tenant from their own secret, so skip that too.
+            if uid_is_foreign_replacement(&foreign_replacements, name, live.metadata.uid.as_deref())
+            {
                 tracing::info!(
                     %namespace,
                     secret = %name,
                     "tenant image pull secret reconcile: kept without adopting or refreshing — \
-                     the name is desired only through a pending repair whose recorded UID does \
-                     not match this object (a replacement); the platform credential is never \
-                     written into an object the intent itself proves is not ours"
+                     this object's UID is a recorded tenant replacement; the platform credential \
+                     is never written into it"
                 );
-            } else {
-                if !is_labeled_managed_pull_secret(&live)
-                    && let Err(error) = adopt_managed_pull_secret(engine, namespace, &live).await
-                {
-                    converged = false;
-                    tracing::warn!(%namespace, secret = %name, %error,
+                continue;
+            }
+            if !is_labeled_managed_pull_secret(&live)
+                && let Err(error) = adopt_managed_pull_secret(engine, namespace, &live).await
+            {
+                converged = false;
+                tracing::warn!(%namespace, secret = %name, %error,
                         "failed to label a kept legacy pull secret — will retry");
-                    continue;
-                }
-                if let Some(expected) = settings.configured_secret_data.as_deref() {
-                    match api.get(name).await {
-                        Ok(live) if is_managed_tenant_image_pull_secret(&live, settings.ghcr()) => {
-                            // Old-name secrets still referenced by another app need
-                            // rotated credentials too, even if the configured name changed.
-                            if let Err(error) = refresh_managed_pull_secret_credentials(
-                                engine, namespace, &live, expected,
-                            )
-                            .await
-                            {
-                                converged = false;
-                                tracing::warn!(%namespace, secret = %name, %error,
-                                    "failed to refresh kept pull secret — will retry");
-                            }
-                        }
-                        Ok(_) => {
-                            converged = false;
-                            tracing::warn!(%namespace, secret = %name,
-                                "kept pull secret changed ownership after discovery");
-                        }
-                        Err(error) => {
+                continue;
+            }
+            if let Some(expected) = settings.configured_secret_data.as_deref() {
+                match api.get(name).await {
+                    Ok(live) if is_managed_tenant_image_pull_secret(&live, settings.ghcr()) => {
+                        // Old-name secrets still referenced by another app need
+                        // rotated credentials too, even if the configured name changed.
+                        if let Err(error) = refresh_managed_pull_secret_credentials(
+                            engine, namespace, &live, expected,
+                        )
+                        .await
+                        {
                             converged = false;
                             tracing::warn!(%namespace, secret = %name, %error,
-                                "failed to re-read kept pull secret");
+                                    "failed to refresh kept pull secret — will retry");
                         }
+                    }
+                    Ok(_) => {
+                        converged = false;
+                        tracing::warn!(%namespace, secret = %name,
+                                "kept pull secret changed ownership after discovery");
+                    }
+                    Err(error) => {
+                        converged = false;
+                        tracing::warn!(%namespace, secret = %name, %error,
+                                "failed to re-read kept pull secret");
                     }
                 }
             }
@@ -1870,6 +1992,14 @@ async fn reconcile_managed_pull_secrets(
             );
             continue;
         }
+        if uid_is_foreign_replacement(&foreign_replacements, name, live.metadata.uid.as_deref()) {
+            tracing::info!(
+                %namespace,
+                secret = %name,
+                "tenant image pull secret reconcile: not deleting a recorded tenant replacement"
+            );
+            continue;
+        }
         // Only proven CAP-managed names are ever cleared from
         // ServiceAccounts (review finding): a tenant-owned secret under the
         // same name keeps both itself and its references.
@@ -1923,6 +2053,7 @@ async fn reconcile_managed_pull_secrets(
                     namespace,
                     service_account,
                     name,
+                    None,
                 )
                 .await
                 {
@@ -1974,12 +2105,38 @@ async fn reconcile_managed_pull_secrets(
             }
         };
         if reverse_reference_clears {
+            let replacement_uid = match api.get(name).await {
+                Ok(replacement) => replacement.metadata.uid.filter(|uid| !uid.is_empty()),
+                Err(error) => {
+                    converged = false;
+                    tracing::warn!(
+                        %namespace,
+                        secret = %name,
+                        %error,
+                        "tenant image pull secret reconcile: failed to re-read a mid-cleanup \
+                         replacement before recording its UID; references stay cleared"
+                    );
+                    continue;
+                }
+            };
+            let Some(replacement_uid) = replacement_uid else {
+                converged = false;
+                tracing::warn!(
+                    %namespace,
+                    secret = %name,
+                    "tenant image pull secret reconcile: mid-cleanup replacement has no UID; \
+                     references stay cleared until it can be recorded"
+                );
+                continue;
+            };
+            note_foreign_replacement(&mut foreign_replacements, name, Some(&replacement_uid));
             for service_account in &cleared_references {
                 match restore_pull_secret_reference_to_service_account(
                     engine,
                     namespace,
                     service_account,
                     name,
+                    Some(&replacement_uid),
                 )
                 .await
                 {
@@ -2714,22 +2871,91 @@ async fn clear_pull_secret_reference_from_service_account(
     }
 }
 
+/// `name=uid` entries on [`FOREIGN_PULL_SECRET_REPLACEMENTS_ANNOTATION`].
+/// Entries without a UID are ignored: a name alone is not proof that a live
+/// object is a tenant replacement.
+fn foreign_pull_secret_replacements(account: &ServiceAccount) -> Vec<PendingReferenceRepair> {
+    account
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(FOREIGN_PULL_SECRET_REPLACEMENTS_ANNOTATION))
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter_map(|entry| {
+                    let (name, uid) = entry.split_once('=')?;
+                    if name.is_empty() || uid.is_empty() {
+                        return None;
+                    }
+                    Some(PendingReferenceRepair {
+                        secret_name: name.to_string(),
+                        cleared_uid: Some(uid.to_string()),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn render_foreign_pull_secret_replacements(entries: &[PendingReferenceRepair]) -> String {
+    entries
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .cleared_uid
+                .as_ref()
+                .map(|uid| format!("{}={}", entry.secret_name, uid))
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn note_foreign_replacement(
+    foreign: &mut BTreeMap<String, BTreeSet<String>>,
+    name: &str,
+    uid: Option<&str>,
+) {
+    if let Some(uid) = uid.filter(|uid| !uid.is_empty()) {
+        foreign
+            .entry(name.to_string())
+            .or_default()
+            .insert(uid.to_string());
+    }
+}
+
+fn uid_is_foreign_replacement(
+    foreign: &BTreeMap<String, BTreeSet<String>>,
+    name: &str,
+    uid: Option<&str>,
+) -> bool {
+    uid.is_some_and(|uid| foreign.get(name).is_some_and(|uids| uids.contains(uid)))
+}
+
 /// Re-add `secret_name` to a ServiceAccount's `imagePullSecrets` after a
 /// reference clear turned out to rest on stale ownership information (review
 /// finding on #243): when the delete detects that the secret was replaced
 /// mid-cleanup, the replacement survives and must keep the reference it
 /// inherits by name — otherwise its pods lose registry access. No-op when the
-/// ServiceAccount is gone or already references the secret. The patch mirrors
+/// ServiceAccount is gone or already references the secret and no foreign-UID
+/// record is outstanding. The patch mirrors
 /// [`clear_pull_secret_reference_from_service_account`]: attributed to the
 /// engine field manager and pinned to the observed resourceVersion. It also
 /// discharges the name's durable repair intent — a proven restore is exactly
 /// what the pending-repairs annotation was waiting for (Codex review on #243,
 /// P2).
+///
+/// `foreign_replacement_uid`, when set, is written into
+/// [`FOREIGN_PULL_SECRET_REPLACEMENTS_ANNOTATION`] in the same patch that
+/// discharges the pending intent (Codex review on #276, P1). The pending
+/// annotation is the only other copy of that UID; discharging it without
+/// recording the replacement would let the next sweep refresh the object.
 async fn restore_pull_secret_reference_to_service_account(
     engine: &ApplyEngine,
     namespace: &str,
     service_account: &str,
     secret_name: &str,
+    foreign_replacement_uid: Option<&str>,
 ) -> Result<(), DeployError> {
     use k8s_openapi::api::core::v1::ServiceAccount;
     use kube::api::{Patch, PatchParams};
@@ -2741,6 +2967,13 @@ async fn restore_pull_secret_reference_to_service_account(
         Err(error) => return Err(DeployError::Apply(error.into())),
     };
     let pending = pending_reference_repairs(&existing);
+    let foreign = foreign_pull_secret_replacements(&existing);
+    let foreign_uid = foreign_replacement_uid.filter(|uid| !uid.is_empty());
+    let needs_foreign_record = foreign_uid.is_some_and(|uid| {
+        !foreign.iter().any(|entry| {
+            entry.secret_name == secret_name && entry.cleared_uid.as_deref() == Some(uid)
+        })
+    });
     let mut references: Vec<serde_json::Value> = existing
         .image_pull_secrets
         .iter()
@@ -2750,7 +2983,10 @@ async fn restore_pull_secret_reference_to_service_account(
     let already_referenced = references
         .iter()
         .any(|r| r.get("name").and_then(|name| name.as_str()) == Some(secret_name));
-    if already_referenced && !pending.iter().any(|entry| entry.secret_name == secret_name) {
+    if already_referenced
+        && !pending.iter().any(|entry| entry.secret_name == secret_name)
+        && !needs_foreign_record
+    {
         return Ok(());
     }
     if !already_referenced {
@@ -2780,6 +3016,17 @@ async fn restore_pull_secret_reference_to_service_account(
         annotations.insert(
             PENDING_PULL_SECRET_REFERENCE_REPAIRS_ANNOTATION.to_string(),
             discharged,
+        );
+    }
+    if needs_foreign_record && let Some(uid) = foreign_uid {
+        let mut recorded = foreign;
+        recorded.push(PendingReferenceRepair {
+            secret_name: secret_name.to_string(),
+            cleared_uid: Some(uid.to_string()),
+        });
+        annotations.insert(
+            FOREIGN_PULL_SECRET_REPLACEMENTS_ANNOTATION.to_string(),
+            serde_json::Value::String(render_foreign_pull_secret_replacements(&recorded)),
         );
     }
     let patch = serde_json::json!({
@@ -2869,11 +3116,37 @@ async fn forget_pending_reference_repair(
     }
 }
 
+async fn recorded_foreign_replacement_uids(
+    engine: &ApplyEngine,
+    namespace: &str,
+    service_accounts: &[String],
+    secret_name: &str,
+) -> Result<BTreeSet<String>, DeployError> {
+    let api: Api<ServiceAccount> = Api::namespaced(engine.client().clone(), namespace);
+    let mut uids = BTreeSet::new();
+    for account in service_accounts {
+        let existing = match api.get(account).await {
+            Ok(existing) => existing,
+            Err(kube::Error::Api(error)) if error.code == 404 => continue,
+            Err(error) => return Err(DeployError::Apply(error.into())),
+        };
+        for entry in foreign_pull_secret_replacements(&existing) {
+            if entry.secret_name == secret_name
+                && let Some(uid) = entry.cleared_uid
+            {
+                uids.insert(uid);
+            }
+        }
+    }
+    Ok(uids)
+}
+
 async fn apply_scoped_pull_secret(
     engine: &ApplyEngine,
     namespace: &str,
     config: &TenantImagePullSecretConfig,
     generation: MutationGeneration,
+    service_accounts: &[String],
 ) -> Result<(), DeployError> {
     use enclava_engine::apply::generation::{
         MUTATION_GENERATION_ANNOTATION, RESOURCE_CREATED_BY_ANNOTATION,
@@ -2925,6 +3198,27 @@ async fn apply_scoped_pull_secret(
                          platform pull secret — remove or rename it, or change \
                          TENANT_IMAGE_PULL_SECRET_NAME",
                         config.name
+                    )));
+                }
+                let foreign = recorded_foreign_replacement_uids(
+                    engine,
+                    namespace,
+                    service_accounts,
+                    &config.name,
+                )
+                .await?;
+                if live
+                    .metadata
+                    .uid
+                    .as_deref()
+                    .is_some_and(|uid| foreign.contains(uid))
+                {
+                    return Err(DeployError::Validation(format!(
+                        "secret {namespace}/{} is a recorded tenant replacement (uid {}); refusing \
+                         to overwrite it with the platform pull secret — remove or rename it, or \
+                         change TENANT_IMAGE_PULL_SECRET_NAME",
+                        config.name,
+                        live.metadata.uid.as_deref().unwrap_or("")
                     )));
                 }
                 ensure_pull_secret_generation_not_stale(&live, generation, &config.name)?;
@@ -3029,6 +3323,99 @@ async fn reconcile_managed_pull_secrets_for_deploy(
     })?
 }
 
+async fn load_namespace_pull_secret_apps(
+    pool: &PgPool,
+    namespace: &str,
+) -> Result<Vec<NamespacePullSecretApp>, DeployError> {
+    let rows: Vec<(Uuid, String, Option<String>)> = sqlx::query_as(
+        "SELECT apps.id, apps.service_account, app_containers.image_ref \
+           FROM apps \
+           LEFT JOIN app_containers ON app_containers.app_id = apps.id \
+          WHERE apps.namespace = $1",
+    )
+    .bind(namespace)
+    .fetch_all(pool)
+    .await?;
+    let mut apps: BTreeMap<Uuid, NamespacePullSecretApp> = BTreeMap::new();
+    for (app_id, service_account, image_ref) in rows {
+        let entry = apps
+            .entry(app_id)
+            .or_insert_with(|| NamespacePullSecretApp {
+                app_id,
+                service_account,
+                images: Some(Vec::new()),
+            });
+        let Some(images) = entry.images.as_mut() else {
+            continue;
+        };
+        let Some(image_ref) = image_ref else {
+            continue;
+        };
+        match ImageRef::parse(&image_ref) {
+            Ok(image) => images.push(image),
+            Err(error) => {
+                tracing::warn!(
+                    %namespace,
+                    %image_ref,
+                    %error,
+                    "tenant image pull secret deploy: unparsable stored image; treating the app as out of scope"
+                );
+                entry.images = None;
+            }
+        }
+    }
+    Ok(apps.into_values().collect())
+}
+
+fn with_deploy_service_accounts(
+    namespace_accounts: &[String],
+    deploy_accounts: &[String],
+) -> Vec<String> {
+    let mut accounts = namespace_accounts.to_vec();
+    for account in deploy_accounts {
+        if !accounts.iter().any(|known| known == account) {
+            accounts.push(account.clone());
+        }
+    }
+    accounts
+}
+
+async fn service_account_preserving_foreign_replacements(
+    engine: &ApplyEngine,
+    namespace: &str,
+    desired: &ServiceAccount,
+) -> Result<ServiceAccount, DeployError> {
+    let Some(name) = desired.metadata.name.as_deref() else {
+        return Ok(desired.clone());
+    };
+    let api: Api<ServiceAccount> = Api::namespaced(engine.client().clone(), namespace);
+    let existing = match api.get(name).await {
+        Ok(existing) => existing,
+        Err(kube::Error::Api(error)) if error.code == 404 => return Ok(desired.clone()),
+        Err(error) => return Err(DeployError::Apply(error.into())),
+    };
+    let Some(foreign) = existing
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(FOREIGN_PULL_SECRET_REPLACEMENTS_ANNOTATION))
+        .filter(|value| !value.is_empty())
+        .cloned()
+    else {
+        return Ok(desired.clone());
+    };
+    let mut preserved = desired.clone();
+    preserved
+        .metadata
+        .annotations
+        .get_or_insert_with(Default::default)
+        .insert(
+            FOREIGN_PULL_SECRET_REPLACEMENTS_ANNOTATION.to_string(),
+            foreign,
+        );
+    Ok(preserved)
+}
+
 /// Settle provenance even when a batched step fails after earlier creates.
 /// Preserve the provider error (including structured evidence loss) after the
 /// persistence/compensation future has run; gate errors fail successful steps.
@@ -3093,8 +3480,22 @@ async fn apply_all_with_tenant_image_pull_secret(
             .bind(ns_name)
             .fetch_one(pool)
             .await?;
+    let namespace_service_accounts: Vec<String> =
+        sqlx::query_scalar("SELECT service_account FROM apps WHERE namespace = $1")
+            .bind(ns_name)
+            .fetch_all(pool)
+            .await?;
+    let namespace_service_accounts =
+        with_deploy_service_accounts(&namespace_service_accounts, &service_accounts);
     if let Some(config) = image_pull_secret_config {
-        apply_scoped_pull_secret(engine, ns_name, config, generation).await?;
+        apply_scoped_pull_secret(
+            engine,
+            ns_name,
+            config,
+            generation,
+            &namespace_service_accounts,
+        )
+        .await?;
         // A previous out-of-scope sweep may still have a same-UID removal
         // intent. Once this deploy has applied the desired credential, restore
         // its reference and discharge that intent before any later step can
@@ -3105,6 +3506,7 @@ async fn apply_all_with_tenant_image_pull_secret(
                 ns_name,
                 account,
                 &config.name,
+                None,
             )
             .await?;
         }
@@ -3120,24 +3522,39 @@ async fn apply_all_with_tenant_image_pull_secret(
             secret = %config.name,
             "tenant image pull secret applied"
         );
-    } else if !shared_namespace {
-        // Only a single-app namespace can be cleaned from this deploy's
-        // ServiceAccount inventory. Shared namespaces are swept with ALL apps.
-        // Skipping the apply is not enough: a pull secret applied by an
-        // earlier deployment would survive here with the platform credential
-        // still readable by namespace readers, so reconcile the whole managed
-        // inventory down to nothing — every CAP-managed secret, under any
-        // name, together with its ServiceAccount references (review findings
-        // on #243). This runs before the standard resources so a later apply
-        // failure cannot leave the token behind, and a cleanup that cannot
-        // converge fails the deploy instead of proceeding with a stale
-        // platform token in the namespace.
+    } else {
+        // Codex review on #276, P1: a shared namespace whose last qualifying
+        // app is redeployed out of scope must not wait for the periodic
+        // sweep. Query the namespace inventory, force THIS deploy's app out
+        // of scope (its stored rows can still show the old images), and
+        // require cleanup convergence before continuing. Other apps that
+        // still qualify keep the secret; this app's reference is cleared.
+        let scope = if shared_namespace {
+            let deploying_app_id: Uuid =
+                sqlx::query_scalar("SELECT app_id FROM deployments WHERE id = $1")
+                    .bind(deployment_id)
+                    .fetch_one(pool)
+                    .await?;
+            let apps = load_namespace_pull_secret_apps(pool, ns_name).await?;
+            scope_for_shared_namespace_out_of_scope_deploy(
+                tenant_image_pull_secret_config_from_env().as_ref(),
+                deploying_app_id,
+                &apps,
+            )
+        } else {
+            PullSecretAccountScope::uniform(false)
+        };
+        let cleanup_accounts = if shared_namespace {
+            namespace_service_accounts.as_slice()
+        } else {
+            service_accounts.as_slice()
+        };
         let converged = reconcile_managed_pull_secrets_for_deploy(
             engine,
             ns_name,
-            &service_accounts,
+            cleanup_accounts,
             &settings,
-            &PullSecretAccountScope::uniform(false),
+            &scope,
             PullSecretReconcileContext::Deploy,
         )
         .await?;
@@ -3175,7 +3592,19 @@ async fn apply_all_with_tenant_image_pull_secret(
             "pending pull-secret repair did not converge before ServiceAccount apply".to_string(),
         ));
     }
-    let step = apply_standard_resources(engine, manifests, generation).await;
+    let preserved_service_account = service_account_preserving_foreign_replacements(
+        engine,
+        ns_name,
+        &manifests.service_account,
+    )
+    .await?;
+    let step = apply_standard_resources_with_service_account(
+        engine,
+        manifests,
+        &preserved_service_account,
+        generation,
+    )
+    .await;
     complete_creation_step(
         step,
         persist_and_gate_creation_records(engine, pool, app_id, deployment_id, ns_name, mutation),
@@ -7065,6 +7494,7 @@ mod tests {
             "tenant-ns",
             &config,
             MutationGeneration::new(2).unwrap(),
+            &[],
         )
         .await
         .unwrap();
@@ -7115,6 +7545,7 @@ mod tests {
             "tenant-ns",
             &config,
             MutationGeneration::new(4).unwrap(),
+            &[],
         )
         .await
         .unwrap();
@@ -7158,6 +7589,7 @@ mod tests {
             "tenant-ns",
             &config,
             MutationGeneration::new(2).unwrap(),
+            &[],
         )
         .await
         .unwrap_err();
@@ -7196,6 +7628,7 @@ mod tests {
                 "tenant-ns",
                 &config,
                 MutationGeneration::new(2).unwrap(),
+                &[],
             )
             .await
             .is_err()
@@ -8243,6 +8676,7 @@ mod tests {
             "tenant-ns",
             &config,
             MutationGeneration::new(2).unwrap(),
+            &[],
         )
         .await
         .unwrap_err();
@@ -8424,26 +8858,219 @@ mod tests {
             .await
             .unwrap()
         );
+        {
+            let state = cluster.lock().unwrap();
+            assert_eq!(state.secrets.len(), 1, "the replacement survives");
+            assert_eq!(
+                state.secrets[0].data, original_data,
+                "the tenant replacement's credentials must never be overwritten with the platform PAT"
+            );
+            assert_eq!(
+                state.secrets[0].metadata.annotations, original_annotations,
+                "no credential or scope epoch may be stamped onto the replacement"
+            );
+            assert_eq!(
+                state.service_accounts[0]
+                    .image_pull_secrets
+                    .as_ref()
+                    .unwrap()[0]
+                    .name,
+                "old-pull-secret",
+                "the repair pass still restores the reference the name inherits"
+            );
+            assert!(pending_reference_repairs(&state.service_accounts[0]).is_empty());
+            assert_eq!(
+                state.service_accounts[0]
+                    .metadata
+                    .annotations
+                    .as_ref()
+                    .unwrap()
+                    .get(FOREIGN_PULL_SECRET_REPLACEMENTS_ANNOTATION)
+                    .map(String::as_str),
+                Some("old-pull-secret=uid-old-pull-secret"),
+                "the mismatched UID is recorded before the pending intent is discharged"
+            );
+        }
+        assert!(
+            reconcile_managed_pull_secrets(
+                &engine,
+                "tenant-ns",
+                &["cap-tenant-app".to_string()],
+                &reconcile_settings(),
+                &PullSecretAccountScope::uniform(true),
+                PullSecretReconcileContext::Sweep,
+            )
+            .await
+            .unwrap(),
+            "the next sweep still converges"
+        );
         let state = cluster.lock().unwrap();
-        assert_eq!(state.secrets.len(), 1, "the replacement survives");
         assert_eq!(
             state.secrets[0].data, original_data,
-            "the tenant replacement's credentials must never be overwritten with the platform PAT"
+            "the next sweep must not refresh the replacement after the pending intent is gone"
         );
-        assert_eq!(
-            state.secrets[0].metadata.annotations, original_annotations,
-            "no credential or scope epoch may be stamped onto the replacement"
-        );
+    }
+
+    /// Codex review on #276, P1: a labeled replacement at the configured name
+    /// is kept by name alone. The mismatched UID must still block adoption and
+    /// credential refresh, including on the sweep after the repair intent is
+    /// discharged.
+    #[tokio::test]
+    async fn configured_name_replacement_never_receives_platform_credentials() {
+        use std::sync::{Arc, Mutex};
+        let mut account = fake_service_account("cap-tenant-app", &[]);
+        account.metadata.annotations = Some(std::collections::BTreeMap::from([(
+            PENDING_PULL_SECRET_REFERENCE_REPAIRS_ANNOTATION.to_string(),
+            "enclava-registry-auth=uid-cleared-object".to_string(),
+        )]));
+        let replacement =
+            fake_managed_secret("enclava-registry-auth", true, "tenant-user", "tenant-token");
+        let original_data = replacement.data.clone();
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![replacement],
+            service_accounts: vec![account],
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        for _ in 0..2 {
+            assert!(
+                reconcile_managed_pull_secrets(
+                    &engine,
+                    "tenant-ns",
+                    &["cap-tenant-app".to_string()],
+                    &reconcile_settings(),
+                    &PullSecretAccountScope::uniform(true),
+                    PullSecretReconcileContext::Sweep,
+                )
+                .await
+                .unwrap()
+            );
+        }
+        let state = cluster.lock().unwrap();
+        assert_eq!(state.secrets[0].data, original_data);
         assert_eq!(
             state.service_accounts[0]
-                .image_pull_secrets
+                .metadata
+                .annotations
                 .as_ref()
-                .unwrap()[0]
-                .name,
-            "old-pull-secret",
-            "the repair pass still restores the reference the name inherits"
+                .unwrap()
+                .get(FOREIGN_PULL_SECRET_REPLACEMENTS_ANNOTATION)
+                .map(String::as_str),
+            Some("enclava-registry-auth=uid-enclava-registry-auth")
         );
         assert!(pending_reference_repairs(&state.service_accounts[0]).is_empty());
+    }
+
+    /// Codex review on #276, P1: a replacement already referenced by another
+    /// in-scope account used to fall through the pending-only predicate and
+    /// receive the platform PAT on the first sweep.
+    #[tokio::test]
+    async fn referenced_replacement_never_receives_platform_credentials() {
+        use std::sync::{Arc, Mutex};
+        let mut repair_account = fake_service_account("cap-repair-app", &[]);
+        repair_account.metadata.annotations = Some(std::collections::BTreeMap::from([(
+            PENDING_PULL_SECRET_REFERENCE_REPAIRS_ANNOTATION.to_string(),
+            "old-pull-secret=uid-cleared-object".to_string(),
+        )]));
+        let replacement =
+            fake_managed_secret("old-pull-secret", true, "tenant-user", "tenant-token");
+        let original_data = replacement.data.clone();
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![replacement],
+            service_accounts: vec![
+                fake_service_account("cap-tenant-app", &["old-pull-secret"]),
+                repair_account,
+            ],
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        assert!(
+            reconcile_managed_pull_secrets(
+                &engine,
+                "tenant-ns",
+                &["cap-tenant-app".to_string(), "cap-repair-app".to_string()],
+                &reconcile_settings(),
+                &PullSecretAccountScope::uniform(true),
+                PullSecretReconcileContext::Sweep,
+            )
+            .await
+            .unwrap()
+        );
+        let state = cluster.lock().unwrap();
+        assert_eq!(state.secrets[0].data, original_data);
+        assert!(
+            state.service_accounts.iter().any(|account| {
+                account
+                    .metadata
+                    .annotations
+                    .as_ref()
+                    .and_then(|annotations| {
+                        annotations.get(FOREIGN_PULL_SECRET_REPLACEMENTS_ANNOTATION)
+                    })
+                    .is_some_and(|value| value.contains("uid-old-pull-secret"))
+            }),
+            "the mismatched UID is recorded on the account that observed it"
+        );
+    }
+
+    #[test]
+    fn shared_namespace_out_of_scope_deploy_uses_namespace_inventory() {
+        let deploying = Uuid::from_u128(1);
+        let other = Uuid::from_u128(2);
+        let config = TenantImagePullSecretConfig {
+            name: "enclava-registry-auth".to_string(),
+            username: "cap-bot".to_string(),
+            token: "ghp_platform".to_string(),
+            allowed_repositories: vec![
+                parse_image_pull_repository_scope("ghcr.io/company/private").unwrap(),
+            ],
+        };
+        let in_scope = ImageRef::parse("ghcr.io/company/private:latest").unwrap();
+        let out_of_scope = ImageRef::parse("ghcr.io/other/public:latest").unwrap();
+        let stored_in_scope = [
+            NamespacePullSecretApp {
+                app_id: deploying,
+                service_account: "deploying".to_string(),
+                images: Some(vec![in_scope.clone()]),
+            },
+            NamespacePullSecretApp {
+                app_id: other,
+                service_account: "other".to_string(),
+                images: Some(vec![out_of_scope.clone()]),
+            },
+        ];
+        let last_qualifying = scope_for_shared_namespace_out_of_scope_deploy(
+            Some(&config),
+            deploying,
+            &stored_in_scope,
+        );
+        assert!(
+            !last_qualifying.namespace_in_scope,
+            "stored in-scope images on the deploying app must not keep the secret"
+        );
+        let still_shared = scope_for_shared_namespace_out_of_scope_deploy(
+            Some(&config),
+            deploying,
+            &[
+                NamespacePullSecretApp {
+                    app_id: deploying,
+                    service_account: "deploying".to_string(),
+                    images: Some(vec![out_of_scope]),
+                },
+                NamespacePullSecretApp {
+                    app_id: other,
+                    service_account: "other".to_string(),
+                    images: Some(vec![in_scope]),
+                },
+            ],
+        );
+        assert!(still_shared.namespace_in_scope);
+        assert!(!still_shared.account_in_scope("deploying"));
+        assert!(still_shared.account_in_scope("other"));
+        assert!(
+            !scope_for_shared_namespace_out_of_scope_deploy(None, deploying, &stored_in_scope)
+                .namespace_in_scope
+        );
     }
 
     /// Devin review on #276, positive half: when the live object's UID still
