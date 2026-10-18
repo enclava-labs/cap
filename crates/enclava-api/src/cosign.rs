@@ -468,8 +468,22 @@ fn cosign_registry_base_url(registry: &str) -> Result<String, CosignError> {
     } else {
         registry
     };
-    let base = registry_base_url(registry)
-        .map_err(|e| CosignError::VerificationFailed(format!("unsupported registry: {e}")))?;
+    // The shared mapper only recognizes dotted hosts. OCI also treats an
+    // explicitly ported single-label host (e.g. registry:5000) as a registry,
+    // not a Hub namespace. Keep this exception local and validate the entire
+    // authority so paths, userinfo, wildcards, and invalid ports cannot enter
+    // the precheck/token-discovery URL.
+    let ported_single_label = registry.rsplit_once(':').is_some_and(|(host, _)| {
+        !host.contains('.')
+            && !host.contains('*')
+            && cosign_registry_host_pattern_error(registry).is_none()
+    });
+    let base = if ported_single_label {
+        format!("https://{registry}")
+    } else {
+        registry_base_url(registry)
+            .map_err(|e| CosignError::VerificationFailed(format!("unsupported registry: {e}")))?
+    };
     Ok(if env_flag("COSIGN_ALLOW_HTTP_REGISTRY") {
         base.replacen("https://", "http://", 1)
     } else {
@@ -560,14 +574,15 @@ pub fn cosign_registry_credentials_startup_error() -> Option<String> {
             ));
         }
     }
-    // Codex review on #243, P2: an incomplete basic pair attaches no
-    // credential at all (every private-registry verification would silently
-    // run anonymously), so it must surface as the fail-fast configuration
-    // error this gate exists for — not as "no credential configured".
-    if let Some(error) = incomplete_basic_pair_error(
-        env_nonempty("COSIGN_REGISTRY_USERNAME").as_deref(),
-        env_nonempty("COSIGN_REGISTRY_PASSWORD").as_deref(),
-    ) {
+    // Match auth() precedence: a nonempty bearer token wins over Basic, so
+    // unused partial Basic settings must not reject valid bearer deployments.
+    let credentials = CosignRegistryCredentials::from_env();
+    if credentials.bearer_token.is_none()
+        && let Some(error) = incomplete_basic_pair_error(
+            credentials.username.as_deref(),
+            credentials.password.as_deref(),
+        )
+    {
         return Some(error);
     }
     if patterns.iter().any(|pattern| pattern == "*") {
@@ -2106,6 +2121,123 @@ mod tests {
         assert!(incomplete_basic_pair_error(None, Some("ghp_example")).is_some());
         assert!(incomplete_basic_pair_error(None, None).is_none());
         assert!(incomplete_basic_pair_error(Some("cap-bot"), Some("ghp_example")).is_none());
+    }
+
+    #[test]
+    fn ported_single_label_registry_base_url() {
+        const CHILD: &str = "CAP_COSIGN_PORTED_REGISTRY";
+        if let Ok(scheme) = std::env::var(CHILD) {
+            for registry in [
+                "registry:5000",
+                "localhost:5000",
+                "registry:1",
+                "registry:65535",
+            ] {
+                assert_eq!(
+                    cosign_registry_host_pattern_error(registry),
+                    None,
+                    "allowlist grammar must agree with base URL support"
+                );
+                assert_eq!(
+                    cosign_registry_base_url(registry).unwrap(),
+                    format!("{scheme}://{registry}")
+                );
+                let image: OciReference = format!("{registry}/org/app:latest").parse().unwrap();
+                assert_eq!(image.resolve_registry(), registry);
+            }
+            for registry in ["docker.io", "index.docker.io"] {
+                assert_eq!(
+                    cosign_registry_base_url(registry).unwrap(),
+                    format!("{scheme}://registry-1.docker.io")
+                );
+            }
+            for invalid in [
+                "registry",
+                "registry:0",
+                "registry:65536",
+                "registry:abc",
+                "registry:",
+                "registry/path:5000",
+                "user@registry:5000",
+                "*:5000",
+                "-registry:5000",
+            ] {
+                assert!(cosign_registry_base_url(invalid).is_err(), "{invalid}");
+            }
+            return;
+        }
+        for (scheme, allow_http) in [("https", "0"), ("http", "1")] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cosign::tests::ported_single_label_registry_base_url",
+                    "--nocapture",
+                ])
+                .env(CHILD, scheme)
+                .env("COSIGN_ALLOW_HTTP_REGISTRY", allow_http)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn bearer_precedence_in_startup_validation() {
+        const CHILD: &str = "CAP_COSIGN_BEARER_STARTUP";
+        if let Ok(expected) = std::env::var(CHILD) {
+            let error = cosign_registry_credentials_startup_error();
+            match expected.as_str() {
+                "ok" => {
+                    assert_eq!(error, None);
+                    assert!(
+                        matches!(registry_auth_from_env("registry:5000"), Auth::Bearer(token) if token == "selected-token")
+                    );
+                }
+                "pair" => assert!(error.unwrap().contains("must be set together")),
+                "scope" => assert!(error.unwrap().contains("unset or empty")),
+                "grammar" => assert!(error.unwrap().contains("outside the allowed grammar")),
+                _ => panic!("unexpected child mode"),
+            }
+            return;
+        }
+        // Child processes isolate environment settings from parallel tests.
+        for (username, password) in [("stale-user", ""), ("", "stale-password")] {
+            for (bearer, hosts, expected) in [
+                (" selected-token ", "registry:5000", "ok"),
+                ("", "registry:5000", "pair"),
+                ("   ", "registry:5000", "pair"),
+                ("selected-token", "", "scope"),
+                ("selected-token", "registry/path:5000", "grammar"),
+            ] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "cosign::tests::bearer_precedence_in_startup_validation",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, expected)
+                    .env("COSIGN_REGISTRY_BEARER_TOKEN", bearer)
+                    .env("COSIGN_REGISTRY_USERNAME", username)
+                    .env("COSIGN_REGISTRY_PASSWORD", password)
+                    .env("COSIGN_REGISTRY_ALLOWED_HOSTS", hosts)
+                    .env("COSIGN_ALLOW_HTTP_REGISTRY", "0")
+                    .env_remove("GHCR_TOKEN")
+                    .env_remove("GHCR_USERNAME")
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{expected}: {}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
     }
 
     /// Issue #225: platform COSIGN_* credentials must never be forwarded to a

@@ -1322,10 +1322,10 @@ fn configured_pull_secret_from_settings(
 }
 
 /// Create the configured pull secret and attach it to in-scope accounts when
-/// discovery found nothing to keep (Codex review on #276, P1). A narrowing
-/// that already deleted the secret and discharged its pending repair leaves
-/// a later expansion with no managed object and no intent; reporting
-/// convergence then opens admission while private workloads still cannot pull.
+/// no managed secret remains kept after repairs and cleanup. Use the outcome
+/// of this pass, not the pre-repair discovery snapshot: deleting a stale
+/// old-name object or discharging an intent must not postpone creation until
+/// the next sweep while admission reports convergence.
 async fn ensure_configured_pull_secret_for_in_scope_accounts(
     engine: &ApplyEngine,
     namespace: &str,
@@ -1437,7 +1437,7 @@ async fn reconcile_managed_pull_secrets(
     scope: &PullSecretAccountScope,
     context: PullSecretReconcileContext,
 ) -> Result<bool, DeployError> {
-    let (managed, _all_referenced_names, accounts) =
+    let (_managed, _all_referenced_names, accounts) =
         discover_managed_pull_secrets(engine, namespace, service_accounts, settings).await?;
     // Per-app scope decisions (Codex review on #243, P1 "reconcile pull-secret
     // references per app in shared namespaces"): only an IN-SCOPE app's
@@ -1966,42 +1966,10 @@ async fn reconcile_managed_pull_secrets(
             }
         }
     }
-    // Codex review on #276, P1: in-scope reconciliation must create the
-    // configured secret and attach it to qualifying accounts when discovery
-    // returned no managed object and no pending intent remains. A discovered
-    // old-name secret or a pending repair already owns that credential; creating
-    // a second object there would duplicate the platform PAT.
-    let pending_intent = accounts
-        .iter()
-        .any(|account| !pending_reference_repairs(account).is_empty());
-    if scope.namespace_in_scope && managed.is_empty() && !pending_intent {
-        match ensure_configured_pull_secret_for_in_scope_accounts(
-            engine,
-            namespace,
-            service_accounts,
-            settings,
-            scope,
-            &api,
-            &foreign_replacements,
-        )
-        .await
-        {
-            Ok(true) => {}
-            Ok(false) => converged = false,
-            Err(DeployError::PullSecretReconcileDeferred(message)) => {
-                return Err(DeployError::PullSecretReconcileDeferred(message));
-            }
-            Err(error) => {
-                converged = false;
-                tracing::warn!(
-                    %namespace,
-                    %error,
-                    "tenant image pull secret reconcile: failed to recreate the configured secret \
-                     after scope expansion"
-                );
-            }
-        }
-    }
+    // Repairs can adopt previously undiscoverable old-name objects. Refresh
+    // discovery before deciding which credentials remain available.
+    let (managed, _, _) =
+        discover_managed_pull_secrets(engine, namespace, service_accounts, settings).await?;
     for secret in &managed {
         let Some(name) = secret.metadata.name.as_deref() else {
             continue;
@@ -2097,6 +2065,21 @@ async fn reconcile_managed_pull_secrets(
             // both the reference and the intent.
             for service_account in service_accounts {
                 if scope.account_in_scope(service_account) {
+                    // Scope expansion may cover accounts that never held this
+                    // secret, so no pending repair exists to restore them.
+                    if let Err(error) = restore_pull_secret_reference_to_service_account(
+                        engine,
+                        namespace,
+                        service_account,
+                        name,
+                        None,
+                    )
+                    .await
+                    {
+                        converged = false;
+                        tracing::warn!(%namespace, %service_account, secret = %name, %error,
+                            "failed to attach kept pull secret to an in-scope account");
+                    }
                     continue;
                 }
                 match clear_pull_secret_reference_from_service_account(
@@ -2348,6 +2331,36 @@ async fn reconcile_managed_pull_secrets(
                          intent of a completed removal"
                     );
                 }
+            }
+        }
+    }
+    // Use post-repair/removal outcomes, never the discovery snapshot.
+    // Kept old-name credentials already serve the qualifying accounts.
+    if scope.namespace_in_scope && kept == 0 && converged {
+        match ensure_configured_pull_secret_for_in_scope_accounts(
+            engine,
+            namespace,
+            service_accounts,
+            settings,
+            scope,
+            &api,
+            &foreign_replacements,
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => converged = false,
+            Err(DeployError::PullSecretReconcileDeferred(message)) => {
+                return Err(DeployError::PullSecretReconcileDeferred(message));
+            }
+            Err(error) => {
+                converged = false;
+                tracing::warn!(
+                    %namespace,
+                    %error,
+                    "tenant image pull secret reconcile: failed to recreate the configured secret \
+                     after scope expansion"
+                );
             }
         }
     }
@@ -3599,7 +3612,8 @@ async fn service_account_preserving_pull_secret_records(
     // A UID-mismatch repair restores the tenant's reference and discharges the
     // pending intent in the same patch. SSA of the generated ServiceAccount
     // would then drop that name, and nothing would put it back. Keep every
-    // foreign-replacement name on imagePullSecrets.
+    // foreign-replacement name on imagePullSecrets only while its recorded UID
+    // still identifies the live Secret.
     let foreign_for_references = preserved
         .metadata
         .annotations
@@ -3607,14 +3621,19 @@ async fn service_account_preserving_pull_secret_records(
         .and_then(|annotations| annotations.get(FOREIGN_PULL_SECRET_REPLACEMENTS_ANNOTATION))
         .cloned();
     if let Some(foreign) = foreign_for_references.as_deref() {
-        merge_foreign_pull_secret_references(&mut preserved, foreign);
+        let secrets: Api<Secret> = Api::namespaced(engine.client().clone(), namespace);
+        merge_foreign_pull_secret_references(&secrets, &mut preserved, foreign).await?;
     }
     Ok(preserved)
 }
 
-fn merge_foreign_pull_secret_references(desired: &mut ServiceAccount, foreign_annotation: &str) {
+async fn merge_foreign_pull_secret_references(
+    secrets: &Api<Secret>,
+    desired: &mut ServiceAccount,
+    foreign_annotation: &str,
+) -> Result<(), DeployError> {
     use k8s_openapi::api::core::v1::LocalObjectReference;
-    let mut references = desired.image_pull_secrets.take().unwrap_or_default();
+    let mut retained = Vec::new();
     for entry in foreign_annotation.split(',') {
         let Some((name, uid)) = entry.trim().split_once('=') else {
             continue;
@@ -3622,16 +3641,47 @@ fn merge_foreign_pull_secret_references(desired: &mut ServiceAccount, foreign_an
         if name.is_empty() || uid.is_empty() {
             continue;
         }
-        if references.iter().any(|reference| reference.name == name) {
-            continue;
+        let live = match secrets.get(name).await {
+            Ok(live) => live,
+            Err(kube::Error::Api(error)) if error.code == 404 => continue,
+            Err(error) => return Err(DeployError::Apply(error.into())),
+        };
+        // A remembered tenant replacement is proof only for that exact object,
+        // not a later managed Secret recreated at the same configured name.
+        if live.metadata.uid.as_deref() == Some(uid) {
+            retained.push((name, uid));
         }
-        references.push(LocalObjectReference {
-            name: name.to_string(),
-        });
+    }
+    // Do not change the desired object until every lookup succeeded. API
+    // failures must stop SSA rather than preserve unverified references.
+    let mut references = desired.image_pull_secrets.take().unwrap_or_default();
+    for (name, _) in &retained {
+        if !references.iter().any(|reference| reference.name == *name) {
+            references.push(LocalObjectReference {
+                name: (*name).to_string(),
+            });
+        }
     }
     if !references.is_empty() {
         desired.image_pull_secrets = Some(references);
     }
+    let annotations = desired
+        .metadata
+        .annotations
+        .get_or_insert_with(Default::default);
+    if retained.is_empty() {
+        annotations.remove(FOREIGN_PULL_SECRET_REPLACEMENTS_ANNOTATION);
+    } else {
+        annotations.insert(
+            FOREIGN_PULL_SECRET_REPLACEMENTS_ANNOTATION.to_string(),
+            retained
+                .into_iter()
+                .map(|(name, uid)| format!("{name}={uid}"))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+    }
+    Ok(())
 }
 
 /// Settle provenance even when a batched step fails after earlier creates.
@@ -8760,9 +8810,18 @@ mod tests {
             .unwrap()
         );
         let state = cluster.lock().unwrap();
-        assert!(
-            state.secrets.is_empty(),
-            "an out-of-scope app's reference does not keep the secret"
+        assert_eq!(state.secrets.len(), 1);
+        assert_eq!(
+            state.secrets[0].metadata.name.as_deref(),
+            Some("enclava-registry-auth")
+        );
+        assert_eq!(
+            state.service_accounts[0]
+                .image_pull_secrets
+                .as_ref()
+                .unwrap()[0]
+                .name,
+            "enclava-registry-auth"
         );
         assert!(
             state.service_accounts[1]
@@ -8772,8 +8831,10 @@ mod tests {
             "the out-of-scope app's reference is cleared with the removal"
         );
         assert!(
-            pending_reference_repairs(&state.service_accounts[1]).is_empty(),
-            "the completed removal discharged its intent"
+            !pending_reference_repairs(&state.service_accounts[1])
+                .iter()
+                .any(|repair| repair.secret_name == "old-pull-secret"),
+            "the completed old-name removal discharged its intent"
         );
     }
 
@@ -9006,7 +9067,7 @@ mod tests {
         }));
         let engine = reconcile_engine(cluster.clone());
         assert!(
-            reconcile_managed_pull_secrets(
+            !reconcile_managed_pull_secrets(
                 &engine,
                 "tenant-ns",
                 &["cap-tenant-app".to_string()],
@@ -9330,27 +9391,201 @@ mod tests {
         );
     }
 
-    #[test]
-    fn foreign_replacement_reference_survives_service_account_apply() {
-        use k8s_openapi::api::core::v1::LocalObjectReference;
-        let mut desired = fake_service_account("deploying", &["enclava-registry-auth"]);
-        merge_foreign_pull_secret_references(
-            &mut desired,
-            "old-secret=uid-tenant,enclava-registry-auth=uid-other",
-        );
+    #[tokio::test]
+    async fn foreign_replacement_reference_survives_service_account_apply() {
+        let mut old = fake_managed_secret("old-secret", false, "tenant", "token");
+        old.metadata.uid = Some("uid-tenant".to_string());
+        let mut configured = fake_managed_secret("enclava-registry-auth", false, "tenant", "token");
+        configured.metadata.uid = Some("uid-other".to_string());
+        let mut existing = fake_service_account("deploying", &["old-secret"]);
+        existing.metadata.annotations = Some(BTreeMap::from([(
+            FOREIGN_PULL_SECRET_REPLACEMENTS_ANNOTATION.to_string(),
+            "old-secret=uid-tenant,enclava-registry-auth=uid-other".to_string(),
+        )]));
+        let engine = reconcile_engine(Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![old, configured],
+            service_accounts: vec![existing],
+            ..Default::default()
+        })));
+        let desired = service_account_preserving_pull_secret_records(
+            &engine,
+            "tenant-ns",
+            &fake_service_account("deploying", &["enclava-registry-auth"]),
+        )
+        .await
+        .unwrap();
         let names: Vec<_> = desired
             .image_pull_secrets
             .unwrap()
             .into_iter()
-            .map(|reference: LocalObjectReference| reference.name)
+            .map(|reference| reference.name)
             .collect();
+        assert_eq!(names, vec!["enclava-registry-auth", "old-secret"]);
         assert_eq!(
-            names,
-            vec![
-                "enclava-registry-auth".to_string(),
-                "old-secret".to_string()
-            ]
+            desired.metadata.annotations.unwrap()[FOREIGN_PULL_SECRET_REPLACEMENTS_ANNOTATION],
+            "old-secret=uid-tenant,enclava-registry-auth=uid-other"
         );
+    }
+
+    #[tokio::test]
+    async fn foreign_replacement_merge_discards_stale_records_before_out_of_scope_apply() {
+        // The annotation remembers tenant uid-A. Neither a managed uid-B at
+        // that configured name, a missing object, nor an object without a UID
+        // may cause an out-of-scope desired account to regain the reference.
+        for live_uid in [Some("uid-A"), Some("uid-B"), None, Some("missing")] {
+            let mut configured =
+                fake_managed_secret("enclava-registry-auth", true, "platform", "token");
+            configured.metadata.uid = live_uid.map(str::to_string);
+            let mut tenant = fake_managed_secret("tenant-secret", false, "tenant", "token");
+            tenant.metadata.uid = Some("uid-tenant".to_string());
+            let mut existing =
+                fake_service_account("deploying", &["enclava-registry-auth", "tenant-secret"]);
+            existing.metadata.annotations = Some(BTreeMap::from([
+                (
+                    FOREIGN_PULL_SECRET_REPLACEMENTS_ANNOTATION.to_string(),
+                    "enclava-registry-auth=uid-A,tenant-secret=uid-tenant,missing-secret=uid-gone,invalid,=uid,empty=".to_string(),
+                ),
+                (
+                    PENDING_PULL_SECRET_REFERENCE_REPAIRS_ANNOTATION.to_string(),
+                    "pending-secret=uid-pending".to_string(),
+                ),
+            ]));
+            let mut secrets = vec![tenant];
+            if live_uid != Some("missing") {
+                secrets.push(configured);
+            }
+            let engine = reconcile_engine(Arc::new(Mutex::new(FakeCluster {
+                secrets,
+                service_accounts: vec![existing],
+                ..Default::default()
+            })));
+            let desired = service_account_preserving_pull_secret_records(
+                &engine,
+                "tenant-ns",
+                &fake_service_account("deploying", &[]),
+            )
+            .await
+            .unwrap();
+            let names: Vec<_> = desired
+                .image_pull_secrets
+                .unwrap()
+                .into_iter()
+                .map(|reference| reference.name)
+                .collect();
+            let annotations = desired.metadata.annotations.unwrap();
+            if live_uid == Some("uid-A") {
+                assert_eq!(names, vec!["enclava-registry-auth", "tenant-secret"]);
+                assert_eq!(
+                    annotations[FOREIGN_PULL_SECRET_REPLACEMENTS_ANNOTATION],
+                    "enclava-registry-auth=uid-A,tenant-secret=uid-tenant"
+                );
+            } else {
+                assert_eq!(names, vec!["tenant-secret"], "live UID: {live_uid:?}");
+                assert_eq!(
+                    annotations[FOREIGN_PULL_SECRET_REPLACEMENTS_ANNOTATION],
+                    "tenant-secret=uid-tenant"
+                );
+            }
+            assert_eq!(
+                annotations[PENDING_PULL_SECRET_REFERENCE_REPAIRS_ANNOTATION],
+                "pending-secret=uid-pending"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn foreign_replacement_merge_removes_annotation_when_all_records_are_stale() {
+        let engine = reconcile_engine(Arc::new(Mutex::new(FakeCluster::default())));
+        let secrets = Api::<Secret>::namespaced(engine.client().clone(), "tenant-ns");
+        let mut desired = fake_service_account("deploying", &["explicit-desired-secret"]);
+        desired.metadata.annotations = Some(BTreeMap::from([(
+            FOREIGN_PULL_SECRET_REPLACEMENTS_ANNOTATION.to_string(),
+            "missing-secret=uid-gone".to_string(),
+        )]));
+        merge_foreign_pull_secret_references(
+            &secrets,
+            &mut desired,
+            "missing-secret=uid-gone,invalid,=uid,empty=",
+        )
+        .await
+        .unwrap();
+        assert!(
+            !desired
+                .metadata
+                .annotations
+                .unwrap()
+                .contains_key(FOREIGN_PULL_SECRET_REPLACEMENTS_ANNOTATION)
+        );
+        assert_eq!(
+            desired.image_pull_secrets.unwrap()[0].name,
+            "explicit-desired-secret",
+            "stale foreign proof must not override explicit desired references"
+        );
+    }
+
+    #[tokio::test]
+    async fn foreign_replacement_merge_fails_closed_on_secret_lookup_errors() {
+        use axum::http::{Request, Response};
+        use kube::client::Body;
+        use tower::service_fn;
+
+        for status in [403, 500] {
+            let mut existing = fake_service_account("deploying", &[]);
+            existing.metadata.annotations = Some(BTreeMap::from([(
+                FOREIGN_PULL_SECRET_REPLACEMENTS_ANNOTATION.to_string(),
+                "tenant-secret=uid-tenant-secret".to_string(),
+            )]));
+            let client = kube::Client::new(
+                service_fn(move |request: Request<Body>| {
+                    let existing = existing.clone();
+                    async move {
+                        let (code, value) = if request.uri().path().contains("/serviceaccounts/") {
+                            (200, serde_json::to_value(existing).unwrap())
+                        } else {
+                            (
+                                status,
+                                serde_json::json!({
+                                    "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                                    "reason": "LookupFailed", "code": status,
+                                }),
+                            )
+                        };
+                        Ok::<_, std::io::Error>(
+                            Response::builder()
+                                .status(code)
+                                .body(Body::from(serde_json::to_vec(&value).unwrap()))
+                                .unwrap(),
+                        )
+                    }
+                }),
+                "default",
+            );
+            let engine =
+                ApplyEngine::new(client, enclava_engine::apply::types::ApplyConfig::default());
+            assert!(
+                service_account_preserving_pull_secret_records(
+                    &engine,
+                    "tenant-ns",
+                    &fake_service_account("deploying", &[]),
+                )
+                .await
+                .is_err(),
+                "Secret GET {status} must prevent service-account apply"
+            );
+            let secrets = Api::<Secret>::namespaced(engine.client().clone(), "tenant-ns");
+            let mut desired = fake_service_account("deploying", &["explicit-desired-secret"]);
+            let before = desired.clone();
+            assert!(
+                merge_foreign_pull_secret_references(
+                    &secrets,
+                    &mut desired,
+                    "tenant-secret=uid-tenant-secret",
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(desired, before, "failed validation must not mutate desired");
+        }
     }
 
     /// Codex review on #276, P1: after a narrowing deleted the configured
@@ -9412,6 +9647,113 @@ mod tests {
                 .as_ref()
                 .is_none_or(|references| references.is_empty()),
             "an out-of-scope account must not gain the recreated platform secret"
+        );
+    }
+
+    #[tokio::test]
+    async fn in_scope_reconcile_uses_post_cleanup_inventory() {
+        use std::sync::{Arc, Mutex};
+        for pending in [false, true] {
+            let mut account = fake_service_account("in-scope", &[]);
+            if pending {
+                account.metadata.annotations = Some(BTreeMap::from([(
+                    PENDING_PULL_SECRET_REFERENCE_REPAIRS_ANNOTATION.to_string(),
+                    "already-deleted=uid-already-deleted".to_string(),
+                )]));
+            }
+            let cluster = Arc::new(Mutex::new(FakeCluster {
+                secrets: if pending {
+                    vec![]
+                } else {
+                    vec![fake_managed_secret(
+                        "stale-old-name",
+                        true,
+                        "cap-bot",
+                        "ghp_old",
+                    )]
+                },
+                service_accounts: vec![account],
+                ..Default::default()
+            }));
+            assert!(
+                reconcile_managed_pull_secrets(
+                    &reconcile_engine(cluster.clone()),
+                    "tenant-ns",
+                    &["in-scope".into()],
+                    &reconcile_settings(),
+                    &PullSecretAccountScope::uniform(true),
+                    PullSecretReconcileContext::Sweep,
+                )
+                .await
+                .unwrap()
+            );
+            let state = cluster.lock().unwrap();
+            assert_eq!(state.secrets.len(), 1);
+            assert_eq!(
+                state.secrets[0].metadata.name.as_deref(),
+                Some("enclava-registry-auth")
+            );
+            assert_eq!(
+                state.service_accounts[0]
+                    .image_pull_secrets
+                    .as_ref()
+                    .unwrap()[0]
+                    .name,
+                "enclava-registry-auth"
+            );
+            assert!(pending_reference_repairs(&state.service_accounts[0]).is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn kept_secret_attaches_newly_in_scope_account_without_repair() {
+        use std::sync::{Arc, Mutex};
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![fake_managed_secret(
+                "enclava-registry-auth",
+                true,
+                "cap-bot",
+                "ghp_old",
+            )],
+            service_accounts: vec![
+                fake_service_account("existing", &["enclava-registry-auth"]),
+                fake_service_account("newly-qualified", &[]),
+                fake_service_account("excluded", &[]),
+            ],
+            ..Default::default()
+        }));
+        assert!(
+            reconcile_managed_pull_secrets(
+                &reconcile_engine(cluster.clone()),
+                "tenant-ns",
+                &[
+                    "existing".into(),
+                    "newly-qualified".into(),
+                    "excluded".into()
+                ],
+                &reconcile_settings(),
+                &PullSecretAccountScope {
+                    namespace_in_scope: true,
+                    in_scope_accounts: ["existing".into(), "newly-qualified".into()].into(),
+                },
+                PullSecretReconcileContext::Sweep,
+            )
+            .await
+            .unwrap()
+        );
+        let state = cluster.lock().unwrap();
+        assert_eq!(state.secrets.len(), 1);
+        for account in &state.service_accounts[..2] {
+            assert_eq!(
+                account.image_pull_secrets.as_ref().unwrap()[0].name,
+                "enclava-registry-auth"
+            );
+        }
+        assert!(
+            state.service_accounts[2]
+                .image_pull_secrets
+                .as_ref()
+                .is_none_or(Vec::is_empty)
         );
     }
 
