@@ -117,7 +117,18 @@ fn newer_pull_secret_credentials(secret: &Secret) -> bool {
 /// contract the on-secret annotation already documents for workload
 /// admission: stale replicas stay closed until upgraded or retired.
 fn pull_secret_scope_fence_defers(fence_epoch: i64) -> bool {
-    fence_epoch > i64::try_from(pull_secret_scope_generation()).unwrap_or(i64::MAX)
+    i128::from(fence_epoch) > i128::from(pull_secret_scope_generation())
+}
+
+/// PostgreSQL stores rollout epochs as BIGINT. Never collapse distinct epochs
+/// above its range onto the same fence value, even if startup was bypassed.
+fn pull_secret_epoch_for_db(epoch: u64, name: &str) -> Result<i64, sqlx::Error> {
+    i64::try_from(epoch).map_err(|_| {
+        sqlx::Error::Protocol(format!(
+            "{name} must be an unsigned integer no greater than {}",
+            i64::MAX
+        ))
+    })
 }
 
 /// Rollout-wide pull-secret authority (Codex review on #243, round 3, P1
@@ -137,6 +148,22 @@ async fn raise_tenant_pull_secret_rollout_authority(
     scope_epoch: u64,
     credential_epoch: u64,
 ) -> Result<(i64, i64), sqlx::Error> {
+    let scope_epoch = pull_secret_epoch_for_db(scope_epoch, "TENANT_IMAGE_PULL_SCOPE_GENERATION")?;
+    let credential_epoch =
+        pull_secret_epoch_for_db(credential_epoch, "TENANT_IMAGE_PULL_CREDENTIAL_GENERATION")?;
+    // Same-epoch rechecks must not wait on our own shared mutation guard.
+    let current: (i64, i64) = sqlx::query_as(
+        "SELECT max_scope_epoch, max_credential_epoch FROM tenant_pull_secret_rollout_authority WHERE id",
+    )
+    .fetch_one(pool)
+    .await?;
+    if current.0 >= scope_epoch && current.1 >= credential_epoch {
+        return Ok(current);
+    }
+    let mut transition = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(278225)")
+        .execute(&mut *transition)
+        .await?;
     let (max_scope_epoch, max_credential_epoch) = sqlx::query_as::<_, (i64, i64)>(
         "UPDATE tenant_pull_secret_rollout_authority \
          SET max_scope_epoch = GREATEST(max_scope_epoch, $1), \
@@ -145,11 +172,26 @@ async fn raise_tenant_pull_secret_rollout_authority(
          WHERE id \
          RETURNING max_scope_epoch, max_credential_epoch",
     )
-    .bind(i64::try_from(scope_epoch).unwrap_or(i64::MAX))
-    .bind(i64::try_from(credential_epoch).unwrap_or(i64::MAX))
-    .fetch_one(pool)
+    .bind(scope_epoch)
+    .bind(credential_epoch)
+    .fetch_one(&mut *transition)
     .await?;
+    transition.commit().await?;
     Ok((max_scope_epoch, max_credential_epoch))
+}
+
+/// Hold through all Secret and ServiceAccount writes, including sweep recreation.
+/// An epoch transition takes the exclusive side before publishing authority, so
+/// it cannot finish its narrowing sweep ahead of an older in-flight mutation.
+async fn pull_secret_mutation_guard(
+    pool: &PgPool,
+) -> Result<sqlx::Transaction<'_, sqlx::Postgres>, DeployError> {
+    let mut guard = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock_shared(278225)")
+        .execute(&mut *guard)
+        .await?;
+    ensure_pull_secret_rollout_authority_current(pool).await?;
+    Ok(guard)
 }
 
 /// Whether the rollout-wide authority defers THIS replica: any newer scope
@@ -161,9 +203,9 @@ async fn raise_tenant_pull_secret_rollout_authority(
 /// against). Callers defer (deploy: requeueable
 /// `PullSecretReconcileDeferred`; sweep: not converged).
 fn pull_secret_rollout_authority_defers(max_scope_epoch: i64, max_credential_epoch: i64) -> bool {
-    let own_scope = i64::try_from(pull_secret_scope_generation()).unwrap_or(i64::MAX);
-    let own_credential = i64::try_from(pull_secret_credential_generation()).unwrap_or(i64::MAX);
-    max_scope_epoch > own_scope || max_credential_epoch > own_credential
+    let own_scope = i128::from(pull_secret_scope_generation());
+    let own_credential = i128::from(pull_secret_credential_generation());
+    i128::from(max_scope_epoch) > own_scope || i128::from(max_credential_epoch) > own_credential
 }
 
 /// Re-read the fleet rollout authority immediately before a Kubernetes write
@@ -222,6 +264,7 @@ async fn record_tenant_pull_secret_scope_fence(
     namespace: &str,
     epoch: u64,
 ) -> Result<i64, sqlx::Error> {
+    let epoch = pull_secret_epoch_for_db(epoch, "TENANT_IMAGE_PULL_SCOPE_GENERATION")?;
     let updated = sqlx::query_scalar::<_, i64>(
         "INSERT INTO tenant_pull_secret_scope_fences (namespace, scope_epoch) \
          VALUES ($1, $2) \
@@ -231,7 +274,7 @@ async fn record_tenant_pull_secret_scope_fence(
          RETURNING scope_epoch",
     )
     .bind(namespace)
-    .bind(i64::try_from(epoch).unwrap_or(i64::MAX))
+    .bind(epoch)
     .fetch_optional(pool)
     .await?;
     match updated {
@@ -363,17 +406,19 @@ fn configured_tenant_image_pull_secret_name() -> Option<String> {
 /// explicit, valid `TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES` scope are refused.
 /// The platform GHCR PAT must never default into every tenant namespace.
 pub fn tenant_image_pull_secret_startup_error() -> Option<String> {
-    if let Ok(raw) = std::env::var("TENANT_IMAGE_PULL_CREDENTIAL_GENERATION")
-        && raw.parse::<u64>().is_err()
-    {
-        return Some(
-            "TENANT_IMAGE_PULL_CREDENTIAL_GENERATION must be an unsigned integer".to_string(),
-        );
-    }
-    if let Ok(raw) = std::env::var("TENANT_IMAGE_PULL_SCOPE_GENERATION")
-        && raw.parse::<u64>().is_err()
-    {
-        return Some("TENANT_IMAGE_PULL_SCOPE_GENERATION must be an unsigned integer".to_string());
+    for name in [
+        "TENANT_IMAGE_PULL_CREDENTIAL_GENERATION",
+        "TENANT_IMAGE_PULL_SCOPE_GENERATION",
+    ] {
+        if let Ok(raw) = std::env::var(name) {
+            let epoch = raw.parse::<u64>().ok();
+            if epoch.is_none_or(|epoch| pull_secret_epoch_for_db(epoch, name).is_err()) {
+                return Some(format!(
+                    "{name} must be an unsigned integer no greater than {}",
+                    i64::MAX
+                ));
+            }
+        }
     }
     let username_present = env_nonempty("GHCR_USERNAME").is_some();
     let token_present = env_nonempty("GHCR_TOKEN").is_some();
@@ -3679,6 +3724,18 @@ async fn cleanup_stale_tenant_image_pull_secrets(pool: &PgPool) -> Result<bool, 
             );
             continue;
         }
+        let _mutation_guard = match tokio::time::timeout(
+            PULL_SECRET_NAMESPACE_RECONCILE_TIMEOUT,
+            pull_secret_mutation_guard(pool),
+        )
+        .await
+        {
+            Ok(Ok(guard)) => guard,
+            _ => {
+                converged = false;
+                continue;
+            }
+        };
         let (namespace_generation, lease_held) =
             lease_rows.get(namespace).copied().unwrap_or((0, false));
         match sweep_namespace_with_budget(
@@ -3874,6 +3931,36 @@ async fn clear_pull_secret_reference_from_service_account(
         .await
     {
         Ok(_) => {
+            if let PullSecretDeleteMode::Unfenced {
+                namespace_generation,
+                lease_held,
+            } = delete_mode
+            {
+                let secret_api: Api<Secret> = Api::namespaced(engine.client().clone(), namespace);
+                match secret_api.get(secret_name).await {
+                    Ok(live)
+                        if secret_mutation_generation(&live).is_some_and(|actual| {
+                            actual > namespace_generation
+                                || (lease_held && actual == namespace_generation)
+                        }) =>
+                    {
+                        restore_pull_secret_reference_to_service_account(
+                            engine,
+                            namespace,
+                            service_account,
+                            secret_name,
+                        )
+                        .await?;
+                        return Err(DeployError::PullSecretReconcileDeferred(format!(
+                            "concurrent deploy rewrote {namespace}/{secret_name} during reference \
+                             clear; restored {service_account}'s reference and deferred"
+                        )));
+                    }
+                    Ok(_) => {}
+                    Err(kube::Error::Api(error)) if error.code == 404 => {}
+                    Err(error) => return Err(DeployError::Apply(error.into())),
+                }
+            }
             tracing::info!(
                 namespace = %namespace,
                 service_account = %service_account,
@@ -4166,7 +4253,7 @@ async fn apply_scoped_pull_secret(
     authority: Option<&PgPool>,
 ) -> Result<(), DeployError> {
     use enclava_engine::apply::generation::{
-        MUTATION_GENERATION_ANNOTATION, RESOURCE_CREATED_BY_ANNOTATION,
+        MUTATION_GENERATION_ANNOTATION, RESOURCE_CREATED_BY_ANNOTATION, annotation_owned_by_manager,
     };
     let api: Api<Secret> = Api::namespaced(engine.client().clone(), namespace);
     let mut desired = generate_tenant_image_pull_secret(namespace, config);
@@ -4247,6 +4334,17 @@ async fn apply_scoped_pull_secret(
                         )));
                     }
                     ensure_pull_secret_generation_not_stale(&live, generation, &config.name)?;
+                    // A previous compensating DELETE may still be held by a
+                    // finalizer. Keep the durable deployment retry alive: a
+                    // merge patch of this readable PAT must not turn the next
+                    // attempt into success before deletion reaches 404.
+                    if live.metadata.deletion_timestamp.is_some() {
+                        return Err(DeployError::PullSecretReconcileDeferred(format!(
+                            "pull secret {namespace}/{} is still terminating; retry after \
+                             compensating deletion has converged",
+                            config.name
+                        )));
+                    }
                     // Devin review on #278: a narrowing rollout can raise the
                     // fleet epoch after this replica's pre-write check. Re-check
                     // immediately before overwriting the live secret.
@@ -4332,7 +4430,13 @@ async fn apply_scoped_pull_secret(
                                 .and_then(|annotations| {
                                     annotations.get(RESOURCE_CREATED_BY_ANNOTATION)
                                 });
-                        if stamped != Some(&generation.get().to_string()) {
+                        if stamped != Some(&generation.get().to_string())
+                            || !annotation_owned_by_manager(
+                                &applied,
+                                RESOURCE_CREATED_BY_ANNOTATION,
+                                &engine.config().field_manager,
+                            )
+                        {
                             let delete_params = kube::api::DeleteParams {
                                 preconditions: Some(kube::api::Preconditions {
                                     uid: applied.metadata.uid.clone(),
@@ -4340,26 +4444,41 @@ async fn apply_scoped_pull_secret(
                                 }),
                                 ..Default::default()
                             };
-                            if let Err(error) = api.delete(&config.name, &delete_params).await
-                                && !matches!(
-                                    &error,
-                                    kube::Error::Api(error) if error.code == 404
-                                )
-                            {
-                                tracing::error!(
-                                    %namespace,
-                                    secret = %config.name,
-                                    %error,
-                                    "could not delete a just-created pull secret whose \
-                                     creation evidence was stripped — the platform PAT may \
-                                     remain exposed until operator cleanup"
-                                );
+                            match api.delete(&config.name, &delete_params).await {
+                                Ok(_) => {
+                                    // DELETE acceptance leaves the PAT readable when a
+                                    // finalizer holds the object. Only a subsequent 404
+                                    // permits terminal failure; otherwise retain the
+                                    // durable deployment retry instead of claiming removal.
+                                    wait_for_secret_removal(&api, namespace, &config.name)
+                                        .await
+                                        .map_err(|error| {
+                                            DeployError::PullSecretReconcileDeferred(format!(
+                                                "compensating deletion of pull secret \
+                                                 {namespace}/{} has not converged: {error}; \
+                                                 retry deployment while the PAT may remain readable",
+                                                config.name
+                                            ))
+                                        })?;
+                                }
+                                Err(kube::Error::Api(error)) if error.code == 404 => {}
+                                Err(error) => {
+                                    return Err(DeployError::PullSecretReconcileDeferred(
+                                        format!(
+                                            "could not delete pull secret {namespace}/{} with \
+                                             untrusted creation evidence: {error}; retry deployment \
+                                             while the PAT may remain readable",
+                                            config.name
+                                        ),
+                                    ));
+                                }
                             }
                             return Err(DeployError::Validation(format!(
-                                "created pull secret {namespace}/{} came back without its \
-                                 creation evidence (mutating admission webhook?); the object \
-                                 was deleted and the deploy fails closed — an unattributable \
-                                 platform PAT must not land in a tenant namespace",
+                                "created pull secret {namespace}/{} came back without trusted \
+                                 creation evidence (annotation value or field ownership; \
+                                 mutating admission webhook?); deletion was confirmed and the \
+                                 deploy fails closed — an unattributable platform PAT must not \
+                                 land in a tenant namespace",
                                 config.name
                             )));
                         }
@@ -4762,6 +4881,16 @@ async fn apply_all_with_tenant_image_pull_secret(
         )));
     }
 
+    let _mutation_guard = tokio::time::timeout(
+        PULL_SECRET_NAMESPACE_RECONCILE_TIMEOUT,
+        pull_secret_mutation_guard(pool),
+    )
+    .await
+    .map_err(|_| {
+        DeployError::PullSecretReconcileDeferred(
+            "timed out waiting for pull-secret rollout mutation guard".to_string(),
+        )
+    })??;
     let settings = PullSecretSettings::from_env();
     let service_accounts = manifests
         .service_account
@@ -7722,6 +7851,9 @@ mod tests {
         /// is dropped from the persisted object — the recreate path must
         /// detect an unattributable platform PAT and delete it.
         strip_field_manager_on_create: bool,
+        /// Override POST managedFields to model a webhook retaining the
+        /// annotation value but moving its ownership to an untrusted entry.
+        creation_managed_fields_override: Option<serde_json::Value>,
         /// Simulate a Kubernetes API that accepts a connection but stalls on
         /// NAMED Secret GETs (Codex review on #243, round 2, P1): the apply
         /// path's budget must defer instead of hanging the deploy's lease.
@@ -8109,9 +8241,28 @@ mod tests {
                         .push(
                             k8s_openapi::apimachinery::pkg::apis::meta::v1::ManagedFieldsEntry {
                                 manager: Some(manager),
+                                fields_type: Some("FieldsV1".to_string()),
+                                fields_v1: Some(
+                                    k8s_openapi::apimachinery::pkg::apis::meta::v1::FieldsV1(
+                                        serde_json::json!({
+                                            "f:metadata": {
+                                                "f:annotations": created.metadata.annotations
+                                                    .as_ref()
+                                                    .into_iter()
+                                                    .flat_map(|annotations| annotations.keys())
+                                                    .map(|key| (format!("f:{key}"), serde_json::json!({})))
+                                                    .collect::<serde_json::Map<_, _>>()
+                                            }
+                                        }),
+                                    ),
+                                ),
                                 ..Default::default()
                             },
                         );
+                }
+                if let Some(fields) = &state.creation_managed_fields_override {
+                    created.metadata.managed_fields =
+                        Some(serde_json::from_value(fields.clone()).unwrap());
                 }
                 if state.strip_creation_evidence_on_create {
                     // Webhook simulation (Codex review on #243, round 2, P1):
@@ -9482,6 +9633,14 @@ mod tests {
             Some(&"4".to_string()),
             "the create POST must stamp creation evidence"
         );
+        assert!(
+            enclava_engine::apply::generation::annotation_owned_by_manager(
+                &state.secrets[0],
+                RESOURCE_CREATED_BY_ANNOTATION,
+                &engine.config().field_manager,
+            ),
+            "cleanup must be able to attribute the creation marker to CAP"
+        );
     }
 
     /// Codex review on #243, P2: resource-version contention between each GET
@@ -10688,11 +10847,108 @@ mod tests {
         );
     }
 
-    /// Codex review on #243, P1 "fence narrowed scopes against older
-    /// replicas": the durable scope fence defers only replicas whose
-    /// `TENANT_IMAGE_PULL_SCOPE_GENERATION` is older than the recorded epoch
-    /// (tests run with the default epoch 0), so an equal fence never blocks
-    /// the current policy and a newer one always does.
+    /// Both rollout dimensions must fit PostgreSQL's signed BIGINT domain.
+    #[test]
+    fn pull_secret_epoch_startup_enforces_bigint_range() {
+        const CHILD: &str = "CAP_PULL_SECRET_EPOCH_STARTUP_CASE";
+        if let Ok(expected) = std::env::var(CHILD) {
+            let error = tenant_image_pull_secret_startup_error();
+            if expected == "valid" {
+                assert!(error.is_none(), "{error:?}");
+            } else {
+                let error = error.expect("invalid epochs must refuse startup");
+                assert!(error.contains(&expected), "{error}");
+                assert!(error.contains(&i64::MAX.to_string()), "{error}");
+            }
+            return;
+        }
+        for name in [
+            "TENANT_IMAGE_PULL_SCOPE_GENERATION",
+            "TENANT_IMAGE_PULL_CREDENTIAL_GENERATION",
+        ] {
+            for (value, valid) in [
+                (None, true),
+                (Some("0".to_string()), true),
+                (Some(i64::MAX.to_string()), true),
+                (Some((i64::MAX as u64 + 1).to_string()), false),
+                (Some(u64::MAX.to_string()), false),
+                (Some("18446744073709551616".to_string()), false),
+                (Some("-1".to_string()), false),
+                (Some("invalid".to_string()), false),
+            ] {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args([
+                        "--exact",
+                        "deploy::tests::pull_secret_epoch_startup_enforces_bigint_range",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, if valid { "valid" } else { name })
+                    .env_remove("GHCR_USERNAME")
+                    .env_remove("GHCR_TOKEN")
+                    .env_remove("TENANT_IMAGE_PULL_SCOPE_GENERATION")
+                    .env_remove("TENANT_IMAGE_PULL_CREDENTIAL_GENERATION");
+                if let Some(value) = &value {
+                    command.env(name, value);
+                }
+                let output = command.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{name}={value:?}: {}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pull_secret_epoch_db_conversion_preserves_boundaries() {
+        for epoch in [0, 1, i64::MAX as u64] {
+            assert_eq!(
+                pull_secret_epoch_for_db(epoch, "test epoch").unwrap(),
+                epoch as i64
+            );
+        }
+        for epoch in [i64::MAX as u64 + 1, u64::MAX] {
+            let error = pull_secret_epoch_for_db(epoch, "test epoch").unwrap_err();
+            assert!(matches!(error, sqlx::Error::Protocol(_)));
+            assert!(error.to_string().contains("test epoch"));
+        }
+    }
+
+    #[tokio::test]
+    async fn pull_secret_epoch_db_writes_reject_overflow_before_querying() {
+        // A closed lazy pool proves that rejection happens before any DB access.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/unused")
+            .unwrap();
+        pool.close().await;
+        for epoch in [i64::MAX as u64 + 1, u64::MAX] {
+            for (scope, credential, name) in [
+                (epoch, 0, "TENANT_IMAGE_PULL_SCOPE_GENERATION"),
+                (0, epoch, "TENANT_IMAGE_PULL_CREDENTIAL_GENERATION"),
+            ] {
+                let error = raise_tenant_pull_secret_rollout_authority(&pool, scope, credential)
+                    .await
+                    .unwrap_err();
+                assert!(matches!(error, sqlx::Error::Protocol(_)));
+                assert!(error.to_string().contains(name));
+            }
+            let error = record_tenant_pull_secret_scope_fence(&pool, "unused", epoch)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, sqlx::Error::Protocol(_)));
+            assert!(
+                error
+                    .to_string()
+                    .contains("TENANT_IMAGE_PULL_SCOPE_GENERATION")
+            );
+        }
+    }
+
+    /// The durable scope fence defers only replicas whose configured epoch is
+    /// older than the recorded epoch (tests run with the default epoch 0).
     #[test]
     fn pull_secret_scope_fence_defers_only_older_replicas() {
         assert!(
@@ -10812,6 +11068,156 @@ mod tests {
             state.secrets.is_empty(),
             "the unattributable created secret must be deleted again"
         );
+    }
+
+    /// A matching annotation string is insufficient: cleanup also requires
+    /// ownership of its exact path by CAP in a non-status managed-fields entry.
+    #[tokio::test]
+    async fn scoped_deploy_create_untrusted_marker_ownership_compensates() {
+        use enclava_engine::apply::generation::RESOURCE_CREATED_BY_ANNOTATION;
+        let marker_fields = serde_json::json!({
+            "f:metadata": {"f:annotations": {
+                format!("f:{RESOURCE_CREATED_BY_ANNOTATION}"): {}
+            }}
+        });
+        let cases = [
+            ("absent managedFields", serde_json::json!([])),
+            (
+                "manager without marker path",
+                serde_json::json!([{"manager": "enclava-platform", "fieldsV1": {
+                    "f:metadata": {"f:annotations": {"f:other": {}}}
+                }}]),
+            ),
+            (
+                "foreign owner",
+                serde_json::json!([{"manager": "admission-webhook", "fieldsV1": marker_fields}]),
+            ),
+            (
+                "status-only owner",
+                serde_json::json!([{"manager": "enclava-platform", "subresource": "status",
+                    "fieldsV1": marker_fields}]),
+            ),
+        ];
+        for (case, fields) in cases {
+            let cluster = Arc::new(Mutex::new(FakeCluster {
+                creation_managed_fields_override: Some(fields),
+                ..Default::default()
+            }));
+            let engine = reconcile_engine(cluster.clone());
+            let config = TenantImagePullSecretConfig {
+                name: "enclava-registry-auth".to_string(),
+                username: "cap-bot".to_string(),
+                token: "ghp_platform".to_string(),
+                allowed_repositories: Vec::new(),
+            };
+            let error = apply_scoped_pull_secret(
+                &engine,
+                "tenant-ns",
+                &config,
+                MutationGeneration::new(3).unwrap(),
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(error, DeployError::Validation(ref message) if message.contains("creation evidence")),
+                "{case}: untrusted ownership must fail closed, got {error:?}"
+            );
+            assert!(
+                cluster.lock().unwrap().secrets.is_empty(),
+                "{case}: the unattributable PAT must be removed"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scoped_deploy_create_compensation_waits_for_finalizer() {
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            strip_creation_evidence_on_create: true,
+            delete_lingering_polls: 2,
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        let config = TenantImagePullSecretConfig {
+            name: "enclava-registry-auth".to_string(),
+            username: "cap-bot".to_string(),
+            token: "ghp_platform".to_string(),
+            allowed_repositories: Vec::new(),
+        };
+        let error = apply_scoped_pull_secret(
+            &engine,
+            "tenant-ns",
+            &config,
+            MutationGeneration::new(3).unwrap(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, DeployError::Validation(_)));
+        assert!(
+            cluster.lock().unwrap().secrets.is_empty(),
+            "terminal failure requires observing actual removal, not DELETE acceptance"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scoped_deploy_create_compensation_stuck_finalizer_keeps_retrying() {
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            strip_creation_evidence_on_create: true,
+            delete_lingering_polls: u8::MAX,
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        let config = TenantImagePullSecretConfig {
+            name: "enclava-registry-auth".to_string(),
+            username: "cap-bot".to_string(),
+            token: "ghp_platform".to_string(),
+            allowed_repositories: Vec::new(),
+        };
+        for generation in [3, 4] {
+            let error = apply_scoped_pull_secret(
+                &engine,
+                "tenant-ns",
+                &config,
+                MutationGeneration::new(generation).unwrap(),
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(error, DeployError::PullSecretReconcileDeferred(_)),
+                "the durable deployment job must retry while the PAT remains readable: {error:?}"
+            );
+            let state = cluster.lock().unwrap();
+            assert_eq!(state.secrets.len(), 1);
+            assert!(state.secrets[0].metadata.deletion_timestamp.is_some());
+            assert_eq!(
+                secret_mutation_generation(&state.secrets[0]),
+                Some(3),
+                "a retry must not refresh or adopt the terminating PAT"
+            );
+        }
+        // Once the finalizer releases, a fresh attempt can create an
+        // attributable Secret rather than patching the old terminating one.
+        {
+            let mut state = cluster.lock().unwrap();
+            state.lingering_polls_left = 0;
+            state.delete_lingering_polls = 0;
+            state.strip_creation_evidence_on_create = false;
+        }
+        apply_scoped_pull_secret(
+            &engine,
+            "tenant-ns",
+            &config,
+            MutationGeneration::new(5).unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+        let state = cluster.lock().unwrap();
+        assert_eq!(state.secrets.len(), 1);
+        assert!(state.secrets[0].metadata.deletion_timestamp.is_none());
+        assert_eq!(secret_mutation_generation(&state.secrets[0]), Some(5));
     }
 
     /// Codex review on #243, round 2, P1 "bound the custom pull-secret apply
@@ -12192,6 +12598,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generation_rewrite_during_reference_patch_restores_and_defers() {
+        use std::sync::{Arc, Mutex};
+        for (actual, lease_held) in [(9, false), (5, true)] {
+            let mut secret =
+                fake_managed_secret("enclava-registry-auth", true, "cap-bot", "ghp_platform");
+            let mut rewritten = secret.clone();
+            let key = enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION;
+            secret
+                .metadata
+                .annotations
+                .get_or_insert_with(Default::default)
+                .insert(key.to_string(), "1".to_string());
+            rewritten
+                .metadata
+                .annotations
+                .get_or_insert_with(Default::default)
+                .insert(key.to_string(), actual.to_string());
+            let cluster = Arc::new(Mutex::new(FakeCluster {
+                secrets: vec![secret],
+                service_accounts: vec![fake_service_account("cap-out", &["enclava-registry-auth"])],
+                // Same UID, no ServiceAccount resourceVersion change: deploy's
+                // reference apply was a no-op while its Secret write landed.
+                replace_on_sa_patch: Some(rewritten),
+                ..Default::default()
+            }));
+            let engine = reconcile_engine(cluster.clone());
+            assert!(matches!(
+                clear_pull_secret_reference_from_service_account(
+                    &engine,
+                    "tenant-ns",
+                    "cap-out",
+                    "enclava-registry-auth",
+                    Some("uid-enclava-registry-auth"),
+                    PullSecretDeleteMode::Unfenced {
+                        namespace_generation: 5,
+                        lease_held
+                    },
+                )
+                .await,
+                Err(DeployError::PullSecretReconcileDeferred(_))
+            ));
+            let state = cluster.lock().unwrap();
+            assert!(
+                state.service_accounts[0]
+                    .image_pull_secrets
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .any(|reference| reference.name == "enclava-registry-auth")
+            );
+            assert!(pending_reference_repairs(&state.service_accounts[0]).is_empty());
+        }
+    }
+
+    #[tokio::test]
     async fn pending_repair_from_newer_scope_keeps_uid_proof_and_reference_cleared() {
         use std::sync::{Arc, Mutex};
         let mut secret =
@@ -12595,6 +13056,51 @@ mod tests {
     /// then a narrowing rollout deletes the secret and raises the epoch. The
     /// later create-on-404 must re-check that epoch and must not recreate the
     /// platform secret.
+    #[tokio::test]
+    async fn rollout_transition_waits_for_deploy_and_sweep_mutation_guards() {
+        let _reset = ResetStaleRolloutAuthority;
+        let pool = crate::test_support::database_test_pool().await;
+        sqlx::query("UPDATE tenant_pull_secret_rollout_authority SET max_scope_epoch = 0, max_credential_epoch = 0")
+            .execute(&pool).await.unwrap();
+        // Deploy and sweep both hold this guard across Secret writes and
+        // reference repairs, including the sweep's create-on-404 path.
+        let deploy = pull_secret_mutation_guard(&pool).await.unwrap();
+        let sweep = pull_secret_mutation_guard(&pool).await.unwrap();
+        let other_pool = pool.clone();
+        let mut transition = tokio::spawn(async move {
+            raise_tenant_pull_secret_rollout_authority(&other_pool, 9, 9).await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut transition)
+                .await
+                .is_err()
+        );
+        deploy.rollback().await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut transition)
+                .await
+                .is_err()
+        );
+        // Same-epoch rechecks do not deadlock behind the waiting transition.
+        ensure_pull_secret_rollout_authority_current(&pool)
+            .await
+            .unwrap();
+        sweep.rollback().await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), transition)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            (9, 9)
+        );
+        assert!(matches!(
+            pull_secret_mutation_guard(&pool).await,
+            Err(DeployError::PullSecretReconcileDeferred(_))
+        ));
+        pool.close().await;
+    }
+
     #[tokio::test]
     async fn stale_replica_does_not_recreate_secret_deleted_by_newer_rollout() {
         let _reset = ResetStaleRolloutAuthority;
