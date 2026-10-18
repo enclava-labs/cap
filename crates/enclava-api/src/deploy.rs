@@ -1999,6 +1999,27 @@ async fn reconcile_managed_pull_secrets(
                     "newer repository-scope epoch owns {namespace}/{name}"
                 )));
             }
+            // Even post-apply cleanup must not refresh a replacement before
+            // a sweep has converted its pending UID proof into a durable
+            // foreign record. Keep the intent intact in Deploy context.
+            for account in &accounts {
+                for repair in pending_reference_repairs(account) {
+                    if repair.secret_name == name
+                        && repair.cleared_uid.as_deref().is_some_and(|uid| {
+                            live.metadata
+                                .uid
+                                .as_deref()
+                                .is_some_and(|live_uid| live_uid != uid)
+                        })
+                    {
+                        note_foreign_replacement(
+                            &mut foreign_replacements,
+                            name,
+                            live.metadata.uid.as_deref(),
+                        );
+                    }
+                }
+            }
             // Codex review on #276, P1: a recorded mismatched UID excludes this
             // object from adoption and credential refresh whether it sits at
             // the configured name, is already referenced by an in-scope
@@ -2067,14 +2088,15 @@ async fn reconcile_managed_pull_secrets(
                 if scope.account_in_scope(service_account) {
                     // Scope expansion may cover accounts that never held this
                     // secret, so no pending repair exists to restore them.
-                    if let Err(error) = restore_pull_secret_reference_to_service_account(
-                        engine,
-                        namespace,
-                        service_account,
-                        name,
-                        None,
-                    )
-                    .await
+                    if context == PullSecretReconcileContext::Sweep
+                        && let Err(error) = restore_pull_secret_reference_to_service_account(
+                            engine,
+                            namespace,
+                            service_account,
+                            name,
+                            None,
+                        )
+                        .await
                     {
                         converged = false;
                         tracing::warn!(%namespace, %service_account, secret = %name, %error,
@@ -3822,13 +3844,15 @@ async fn apply_all_with_tenant_image_pull_secret(
         // sweep. The scope above already forces THIS deploy's app out of
         // scope (its stored rows can still show the old images). Other apps
         // that still qualify keep the secret; this app's reference is cleared.
+        // This is a pre-apply inventory pass, not post-apply cleanup. Repair
+        // pending UID evidence before any kept-object credential refresh.
         let converged = reconcile_managed_pull_secrets_for_deploy(
             engine,
             ns_name,
             reconcile_accounts,
             &settings,
             &scope,
-            PullSecretReconcileContext::Deploy,
+            PullSecretReconcileContext::Sweep,
         )
         .await?;
         if !converged {
@@ -9702,6 +9726,61 @@ mod tests {
                 "enclava-registry-auth"
             );
             assert!(pending_reference_repairs(&state.service_accounts[0]).is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn deploy_then_sweep_preserves_pending_replacement_uid_proof() {
+        use std::sync::{Arc, Mutex};
+        let mut account = fake_service_account("qualifying", &[]);
+        account.metadata.annotations = Some(BTreeMap::from([(
+            PENDING_PULL_SECRET_REFERENCE_REPAIRS_ANNOTATION.to_string(),
+            "enclava-registry-auth=uid-deleted-platform-object".to_string(),
+        )]));
+        let replacement =
+            fake_managed_secret("enclava-registry-auth", true, "tenant", "tenant-token");
+        let original_data = replacement.data.clone();
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![replacement],
+            service_accounts: vec![account, fake_service_account("excluded", &[])],
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        let scope = PullSecretAccountScope {
+            namespace_in_scope: true,
+            in_scope_accounts: ["qualifying".to_string()].into(),
+        };
+        for context in [
+            PullSecretReconcileContext::Deploy,
+            PullSecretReconcileContext::Sweep,
+        ] {
+            assert!(
+                reconcile_managed_pull_secrets(
+                    &engine,
+                    "tenant-ns",
+                    &["qualifying".into(), "excluded".into()],
+                    &reconcile_settings(),
+                    &scope,
+                    context,
+                )
+                .await
+                .unwrap()
+            );
+            let state = cluster.lock().unwrap();
+            assert_eq!(state.secrets[0].data, original_data);
+            if context == PullSecretReconcileContext::Deploy {
+                assert!(!pending_reference_repairs(&state.service_accounts[0]).is_empty());
+            } else {
+                assert!(pending_reference_repairs(&state.service_accounts[0]).is_empty());
+                assert!(
+                    state.service_accounts[0]
+                        .metadata
+                        .annotations
+                        .as_ref()
+                        .unwrap()
+                        .contains_key(FOREIGN_PULL_SECRET_REPLACEMENTS_ANNOTATION)
+                );
+            }
         }
     }
 
