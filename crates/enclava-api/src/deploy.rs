@@ -8422,7 +8422,7 @@ mod tests {
                                 generation.to_string(),
                             );
                         secret.metadata.resource_version =
-                            Some(format!("rv-rewritten-{}", generation));
+                            Some(format!("rv-rewritten-{generation}"));
                     }
                 }
                 if state.rv_bumps_on_delete > 0 {

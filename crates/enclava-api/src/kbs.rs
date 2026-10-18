@@ -4140,7 +4140,7 @@ resource_bindings := {
     /// byte keeps fixture intent readable; the deployment id keeps it unique.
     fn unique_test_descriptor_hash(hash_byte: &str, deployment_id: Uuid) -> String {
         hex::encode(Sha256::digest(
-            &[
+            [
                 hex::decode(hash_byte)
                     .expect("decode fixture hash byte")
                     .as_slice(),

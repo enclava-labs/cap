@@ -59,10 +59,7 @@ pub fn customer_config_roll_hold_applies(
     rollout_in_flight: bool,
     tee_domain: Option<&str>,
 ) -> bool {
-    if is_new_app
-        || rollout_in_flight
-        || !tee_domain.is_some_and(|domain| !domain.trim().is_empty())
-    {
+    if is_new_app || rollout_in_flight || tee_domain.is_none_or(|domain| domain.trim().is_empty()) {
         return false;
     }
     match live_app_status {
