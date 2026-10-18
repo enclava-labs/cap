@@ -2990,18 +2990,19 @@ pub(crate) async fn rotate_signer_commit(
             ));
         }
 
-        // The apps UPDATE above fired migration 0052's
+        // The apps UPDATE above fired migration 0067's
         // apps_signer_rotation_withdrawal trigger inside this transaction:
         // it withdrew the retained artifacts signed under the previous
         // identity, carried the new identity into kbs_tls_bindings (the
         // legacy Rego render source), and owed one deferred
         // withdrawal_bumps_owed generation bump while signed-policy mode is
-        // active (issue #119).  The withdrawal/enqueue logic deliberately
-        // lives in the database, not here, so a pre-0052 replica committing
-        // the same UPDATE during the rollout window is fenced identically.
-        // Fail-closed semantics: signed artifacts are immutable, so the app
-        // leaves the signed-policy set until the next deployment commits an
-        // artifact signed under the new identity.
+        // active (issue #119).  The jti insert above is what satisfies the
+        // deferred consumption fence: a pre-0067 replica that runs only the
+        // UPDATE cannot commit the rotation, so the single-use token cannot
+        // be spent off-ledger and replayed after a rotate-back.  Fail-closed
+        // semantics: signed artifacts are immutable, so the app leaves the
+        // signed-policy set until the next deployment commits an artifact
+        // signed under the new identity.
     }
 
     // Audit. In signed mode rotation withdraws the previous signer's

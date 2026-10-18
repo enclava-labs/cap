@@ -132,11 +132,13 @@ insert rolls the marker deletion back. Migration `0085` installs the database
 any keyring insertion while the marker remains. Older binaries cannot bypass
 recovery by uploading an unrestricted first version after the migration.
 
-On upgrades without an existing marker table, `0085` also removes unfenced
-replacement rows inserted between `0061` and `0085` when all live versions
-collide with archived versions, then backfills the marker. It preserves orgs
-with a clean surviving version absent from the archive. Inspect migration
-notices and expect affected orgs to require a new fenced version-1 upload.
+On upgrades without an existing marker table, `0085` treats any live version
+that collides with `org_keyring_repairs` as evidence the migration window
+captured the org. It then removes every live generation of that org, including
+a version the old writer appended after the colliding replacement, and
+backfills the marker. It preserves orgs whose live versions are all absent
+from the archive (a clean survivor). Inspect migration notices and expect
+affected orgs to require a new fenced version-1 upload.
 Drain old API replicas before resuming writes; the database fence is a
 fail-closed guard, not support for mixed-version operation or reader rollback.
 
@@ -158,10 +160,14 @@ idempotency record is checkpointed and the caller receives
 409 `idempotency_request_in_progress` with `retryable: true`,
 `disposition: retry_same_key`, `idempotency_disposition: "deferred"` and
 `cause: keyring_policy_reconciliation_pending`. A retry with the same
-idempotency key resumes the deferred request -- the checkpoint keeps it out
-of the fail-closed disposition -- and re-confirms publication instead of
-repeating the mutation. The checkpointed lease is the short (~5 s) retry
-interval, not a terminal outcome.
+idempotency key resumes the deferred request -- the checkpoint keeps that
+pending code out of the fail-closed disposition -- and re-confirms publication
+instead of repeating the mutation. An unrelated 5xx on that reclaim is not
+rewritten as publication-pending. Authority mismatches and uncertain upstream
+writes terminalize as `idempotency_recovery_required`
+(`reconcile_then_retry_with_new_key`) so the same key cannot re-issue the
+mutation. The checkpointed lease is the short (~5 s) retry interval, not a
+terminal outcome.
 
 Cross-project rollout gate (AGENTS.md): the CAP internal API response shape
 changed, so update and test enclava-paas against this response **before**
@@ -518,10 +524,14 @@ disposition. Repeating that key replays the same terminal result; it does not
 re-execute the mutation or retry indefinitely. Reconcile the app's current signer
 and policy publication before choosing a recovery request with a new key.
 
-The database trigger tracks identity updates from older SQL writers as well.
-Drain old API replicas before relying on these semantics: older checkpoint
-readers do not understand the new generation, so mixed-version operation and
-reader rollback are unsupported.
+The database withdrawal trigger tracks every identity update that commits.
+A separate deferred constraint trigger rejects a non-initial identity change
+unless the same transaction inserted the rotation token's jti into
+`consumed_signer_rotation_tokens`. Older replicas verify the JWT and update
+`apps` without that insert, so their rotation fails closed instead of
+consuming the token off-ledger. Drain old API replicas before relying on
+these semantics: older checkpoint readers do not understand the new
+generation, so mixed-version operation and reader rollback are unsupported.
 
 A currently authorized org owner may confirm an already committed signer
 identity without a new rotation token. The stateless public endpoint confirms

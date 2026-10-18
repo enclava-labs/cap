@@ -1777,18 +1777,31 @@ async fn complete_app_delete_result(
 
 const KEYRING_POLICY_RECONCILIATION_PENDING_CODE: &str = "keyring_policy_reconciliation_pending";
 
-/// A confirmed pending checkpoint also survives an unrelated transient 5xx on
-/// a reclaimed retry: the keyring mutation is already known to have committed.
-/// Fresh requests without that evidence still use the generic fail-closed path.
+/// A confirmed publication-pending checkpoint survives reclaim. An unrelated
+/// 5xx on that reclaim is not rewritten as publication-pending: authority
+/// mismatches and uncertain upstream writes must terminalize instead of
+/// staying re-executable under a committed-publication cause.
 async fn complete_keyring_result(
     lease: IdempotencyLease,
     result: Result<IdempotencyResponse, InternalRouteError>,
 ) -> Result<IdempotencyResponse, InternalRouteError> {
-    if let Err((status, body)) = &result
-        && ((*status == StatusCode::SERVICE_UNAVAILABLE
+    if lease.committed_keyring_checkpoint
+        && let Err((status, body)) = &result
+        && status.is_server_error()
+        && !(*status == StatusCode::SERVICE_UNAVAILABLE
             && body.get("code").and_then(serde_json::Value::as_str)
                 == Some(KEYRING_POLICY_RECONCILIATION_PENDING_CODE))
-            || (lease.committed_keyring_checkpoint && status.is_server_error()))
+    {
+        tracing::warn!(
+            idempotency_key = %lease.key,
+            %status,
+            "reclaimed keyring publication checkpoint saw an unrelated server error; not relabeling it as publication-pending"
+        );
+    }
+    if let Err((status, body)) = &result
+        && *status == StatusCode::SERVICE_UNAVAILABLE
+        && body.get("code").and_then(serde_json::Value::as_str)
+            == Some(KEYRING_POLICY_RECONCILIATION_PENDING_CODE)
     {
         let checkpoint = (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -12560,50 +12573,28 @@ mod tests {
             .expect_err("committed keyring defers");
         assert_eq!(deferred.1.0["idempotency_disposition"], "deferred");
 
-        for _ in 0..2 {
-            expire_idempotency_lease(&pool, &key).await;
-            let reclaimed =
-                expect_idempotency_execution(begin().await.expect("reclaim checkpoint"));
-            assert!(reclaimed.committed_keyring_checkpoint);
-            let transient = complete_keyring_result(
-                reclaimed,
-                Err(json_error(
-                    StatusCode::BAD_GATEWAY,
-                    "unrelated database failure",
-                )),
-            )
-            .await
-            .expect_err("transient retry failure must defer");
-            assert_eq!(transient.1.0["idempotency_disposition"], "deferred");
-            assert_eq!(
-                transient.1.0["cause"],
-                KEYRING_POLICY_RECONCILIATION_PENDING_CODE
-            );
-            let receipt: (Option<i32>, Option<serde_json::Value>, bool) = sqlx::query_as(
-                "SELECT response_status, response_body, completed_at IS NULL
-                   FROM cap_internal_idempotency WHERE idempotency_key = $1",
-            )
-            .bind(&key)
-            .fetch_one(&pool)
-            .await
-            .expect("inspect retained checkpoint");
-            assert_eq!(receipt.0, Some(503));
-            assert_eq!(
-                receipt.1.unwrap()["code"],
-                KEYRING_POLICY_RECONCILIATION_PENDING_CODE
-            );
-            assert!(receipt.2);
-        }
         expire_idempotency_lease(&pool, &key).await;
-        let confirmed = expect_idempotency_execution(begin().await.expect("reclaim after failure"));
-        complete_keyring_result(
-            confirmed,
-            Ok((StatusCode::OK, serde_json::json!({"version": 1}))),
+        let reclaimed = expect_idempotency_execution(begin().await.expect("reclaim checkpoint"));
+        assert!(reclaimed.committed_keyring_checkpoint);
+        let unrelated = complete_keyring_result(
+            reclaimed,
+            Err(json_error(
+                StatusCode::BAD_GATEWAY,
+                "unrelated upstream failure",
+            )),
         )
         .await
-        .expect("confirmed publication completes same key");
-        let replay = expect_idempotency_replay(begin().await.expect("replay confirmation"));
-        assert_eq!(replay.0, StatusCode::OK);
+        .expect_err("an unrelated 5xx must not stay publication-pending");
+        assert_eq!(unrelated.0, StatusCode::CONFLICT);
+        assert_eq!(unrelated.1.0["error"], "idempotency_recovery_required");
+        assert_eq!(unrelated.1.0["retryable"], false);
+        assert_ne!(
+            unrelated.1.0["cause"],
+            KEYRING_POLICY_RECONCILIATION_PENDING_CODE
+        );
+        let replay = expect_idempotency_replay(begin().await.expect("replay terminal 5xx"));
+        assert_eq!(replay.0, StatusCode::CONFLICT);
+        assert_eq!(replay.1["error"], "idempotency_recovery_required");
     }
 
     #[tokio::test]
@@ -14200,10 +14191,11 @@ mod tests {
                     // Both futures run on this task: the test kube client is
                     // task-local, and the retry must park inside its publication
                     // while a later writer changes authority underneath it. The
-                    // interleaved writer is raw SQL with no token ledger or
-                    // audit entry, like a pre-generation replica: only the
-                    // trigger-backed generation distinguishes its rotate-back
-                    // from the parked retry's own commit.
+                    // interleaved writer records a token in the same transaction
+                    // as the identity change: a token-less update is rejected by
+                    // the 0067 consumption fence, and only the trigger-backed
+                    // generation distinguishes this rotate-back from the parked
+                    // retry's own commit.
                     let retry_state = state.clone();
                     let retry_paas_org_id = paas_org_id.clone();
                     let retry_app_name = app_name.clone();
@@ -14229,6 +14221,10 @@ mod tests {
                                 (intervening_subject, intervening_issuer),
                                 (pending_subject, pending_issuer),
                             ] {
+                                let mut tx = interleave_pool
+                                    .begin()
+                                    .await
+                                    .expect("begin interleaved rotation");
                                 sqlx::query(
                                     "UPDATE apps
                                         SET signer_identity_subject = $2,
@@ -14238,9 +14234,24 @@ mod tests {
                                 .bind(app_id)
                                 .bind(subject)
                                 .bind(issuer)
-                                .execute(&interleave_pool)
+                                .execute(&mut *tx)
                                 .await
-                                .expect("write the interleaved identity directly");
+                                .expect("stage the interleaved identity");
+                                sqlx::query(
+                                    "INSERT INTO consumed_signer_rotation_tokens (
+                                         jti, user_id, org_id, app_id, subject, issuer, expires_at
+                                     ) VALUES ($1, $2, $3, $4, $5, $6, now() + interval '1 hour')",
+                                )
+                                .bind(Uuid::new_v4().to_string())
+                                .bind(user_id)
+                                .bind(org_id)
+                                .bind(app_id)
+                                .bind(subject)
+                                .bind(issuer)
+                                .execute(&mut *tx)
+                                .await
+                                .expect("consume the interleaved rotation token");
+                                tx.commit().await.expect("commit the interleaved identity");
                             }
                             release_tx.send(()).expect("release the parked publication");
                         }
@@ -14258,7 +14269,8 @@ mod tests {
 
                     assert_eq!(
                         signer_rotation_receipts(&pool, app_id, org_id).await,
-                        (1, 1)
+                        (3, 1),
+                        "the parked rotation and both interleaved rotations consume a token; only the route writes an audit row"
                     );
                 },
             )
@@ -14271,6 +14283,14 @@ mod tests {
         let subject =
             "https://github.com/enclava/rotated/.github/workflows/build.yml@refs/heads/main";
         let issuer = "https://rotated-issuer.example.test";
+        let mut tx = pool.begin().await.expect("begin signer seed");
+        let org_id: Uuid = sqlx::query_scalar("SELECT org_id FROM apps WHERE id = $1")
+            .bind(app_id)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("load app org for the seeded rotation");
+        // The fixture already has a signer. A later identity change is a
+        // rotation and must consume a token in the same transaction.
         sqlx::query(
             "UPDATE apps
                 SET signer_identity_subject = $2,
@@ -14280,9 +14300,26 @@ mod tests {
         .bind(app_id)
         .bind(subject)
         .bind(issuer)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
-        .expect("commit the pending signer identity");
+        .expect("stage the pending signer identity");
+        sqlx::query(
+            "INSERT INTO consumed_signer_rotation_tokens (
+                 jti, user_id, org_id, app_id, subject, issuer, expires_at
+             ) VALUES ($1, $2, $3, $4, $5, $6, now() + interval '1 hour')",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(Uuid::new_v4())
+        .bind(org_id)
+        .bind(app_id)
+        .bind(subject)
+        .bind(issuer)
+        .execute(&mut *tx)
+        .await
+        .expect("consume the seeded rotation token");
+        tx.commit()
+            .await
+            .expect("commit the pending signer identity");
         sqlx::query_scalar("SELECT signer_rotation_generation FROM apps WHERE id = $1")
             .bind(app_id)
             .fetch_one(pool)

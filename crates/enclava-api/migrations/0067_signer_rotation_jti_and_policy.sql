@@ -141,6 +141,16 @@ UPDATE kbs_signed_policy_reconciliation
 -- Deploy, unlock, rollback and app-delete paths can still bump generations
 -- directly. Preserve Recreate ordering: drain old APIs before starting the
 -- new reconciler, rather than running both binary versions concurrently.
+--
+-- Draining is not enough for the single-use token ledger. A pre-0067
+-- rotate_signer verifies the JWT and updates apps without inserting the
+-- jti. If that rotation commits, rotating the identity back before the
+-- token expires lets the new binary accept the same jti again. The
+-- deferred constraint trigger below rejects any non-initial identity
+-- change unless this transaction inserted a consumed_signer_rotation_tokens
+-- row for the new identity. The new writer inserts that row before commit;
+-- an old replica cannot, so its rotation fails closed. Initial assignment
+-- (both old identities NULL) is not a token use and stays allowed.
 CREATE FUNCTION enforce_signer_rotation_withdrawal() RETURNS trigger
 AS $$
 BEGIN
@@ -184,3 +194,44 @@ CREATE TRIGGER apps_signer_rotation_withdrawal
         OR OLD.signer_identity_issuer IS DISTINCT FROM NEW.signer_identity_issuer
     )
     EXECUTE FUNCTION enforce_signer_rotation_withdrawal();
+
+-- Reject a signer rotation that does not consume its token in the same
+-- transaction. Deferred so the handler may update apps and then insert the
+-- jti (the production order); the check runs at commit and sees that insert.
+-- xmin matches only a row written by this transaction, so a jti consumed by
+-- an earlier rotation cannot authorize a later identity change. Old replicas
+-- never write the ledger, so they cannot commit a rotation after this
+-- migration. Replay of this file drops the trigger first.
+CREATE OR REPLACE FUNCTION enforce_signer_rotation_token_consumption()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+          FROM consumed_signer_rotation_tokens AS consumed
+         WHERE consumed.app_id = NEW.id
+           AND consumed.subject = NEW.signer_identity_subject
+           AND consumed.issuer = NEW.signer_identity_issuer
+           AND consumed.xmin = pg_current_xact_id()::xid
+    ) THEN
+        RAISE EXCEPTION 'signer identity rotation requires atomic rotation-token consumption'
+            USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NULL;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS apps_signer_rotation_token_consumption ON apps;
+CREATE CONSTRAINT TRIGGER apps_signer_rotation_token_consumption
+    AFTER UPDATE OF signer_identity_subject, signer_identity_issuer ON apps
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW
+    WHEN (
+        (OLD.signer_identity_subject IS NOT NULL OR OLD.signer_identity_issuer IS NOT NULL)
+        AND (
+            OLD.signer_identity_subject IS DISTINCT FROM NEW.signer_identity_subject
+            OR OLD.signer_identity_issuer IS DISTINCT FROM NEW.signer_identity_issuer
+        )
+    )
+    EXECUTE FUNCTION enforce_signer_rotation_token_consumption();

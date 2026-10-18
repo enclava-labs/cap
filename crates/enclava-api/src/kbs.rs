@@ -4489,16 +4489,31 @@ resource_bindings := {
 
         // The same interleaving on the withdrawal channel: a signer
         // rotation committed mid-run and the apps trigger owed it a
-        // withdrawal bump.  The stale CAS fails again.
+        // withdrawal bump.  The stale CAS fails again. The consumption
+        // row is what lets the identity change commit under the 0067 fence.
+        let mut rotation = pool.begin().await.unwrap();
         sqlx::query(
             "UPDATE apps
                 SET signer_identity_subject = 'new-subject'
               WHERE id = $1",
         )
         .bind(app_id)
-        .execute(&pool)
+        .execute(&mut *rotation)
         .await
         .unwrap();
+        sqlx::query(
+            "INSERT INTO consumed_signer_rotation_tokens (
+                 jti, user_id, org_id, app_id, subject, issuer, expires_at
+             ) VALUES ($1, $2, $3, $4, 'new-subject', 'old-issuer', now() + interval '1 hour')",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(uuid::Uuid::new_v4())
+        .bind(org_id)
+        .bind(app_id)
+        .execute(&mut *rotation)
+        .await
+        .unwrap();
+        rotation.commit().await.unwrap();
         assert_eq!(
             consume_deferred_policy_debts(&pool, 9, 2, 1).await.unwrap(),
             None,

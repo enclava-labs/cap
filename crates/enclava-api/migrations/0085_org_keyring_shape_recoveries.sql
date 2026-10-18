@@ -38,17 +38,19 @@
 -- Window capture (review finding): 0061 commits and releases ACCESS
 -- EXCLUSIVE before this migration runs (0062..0084 sit in between, and the
 -- documented rollout keeps a pre-0061 replica live).  That replica's
--- unrestricted first-version path inserts a replacement v1.  The backfill's
--- NOT EXISTS (org_keyrings) filter is the post-quarantine empty state, which
--- the replacement no longer has, so the marker was never created and
--- fence_quarantined_keyring_recovery never compared the replacement to the
--- displaced signer.  A replacement is distinguishable from a clean survivor:
--- 0061 archives only rows it deletes, the first-version path requires
--- version 1, and every quarantined org's v1 was archived, so the live v1
--- collides with the archive.  A preserved version is live and absent from
--- the archive.  Delete the colliding re-inserts (the archived payload stays
--- in org_keyring_repairs) before the backfill, so the empty-state filter
--- records the marker and the next upload takes the fenced path.
+-- unrestricted first-version path inserts a replacement v1, and it can
+-- then append a later version before this migration runs.  The backfill's
+-- NOT EXISTS (org_keyrings) filter is the post-quarantine empty state.
+-- Deleting only archive-colliding rows is not enough: an appended version
+-- was never archived, so a "no unarchived live version" predicate treats
+-- it as a clean survivor, leaves the colliding v1 in place, and the
+-- backfill writes no marker.  Any live/archive version collision is
+-- evidence the window captured the org.  Quarantine every live generation
+-- of that org (the archived payload stays in org_keyring_repairs) before
+-- the backfill, so the empty-state filter records the marker and the next
+-- upload takes the fenced path.  A clean survivor has no collision: 0061
+-- archives only rows it deletes, and the preserved current version stays
+-- live and absent from the archive.
 --
 -- Skip that delete when the marker table already exists.  Divergent 0061
 -- created it in the same transaction as the quarantine, so a keyring beside
@@ -63,23 +65,17 @@ BEGIN
     IF to_regclass('public.org_keyring_shape_recoveries') IS NULL THEN
         FOR captured IN
             DELETE FROM org_keyrings k
-             USING org_keyring_repairs r
-             WHERE k.org_id = r.org_id
-               AND k.version = r.version
-               AND NOT EXISTS (
+             WHERE EXISTS (
                    SELECT 1
                      FROM org_keyrings live
+                     JOIN org_keyring_repairs archived
+                       ON archived.org_id = live.org_id
+                      AND archived.version = live.version
                     WHERE live.org_id = k.org_id
-                      AND NOT EXISTS (
-                          SELECT 1
-                            FROM org_keyring_repairs archived
-                           WHERE archived.org_id = live.org_id
-                             AND archived.version = live.version
-                      )
                )
              RETURNING k.org_id, k.version
         LOOP
-            RAISE NOTICE 'migration 0085: removed unfenced keyring v% for quarantined org % (inserted before the recovery marker); the displaced signer must restore authority through the fenced first-version path',
+            RAISE NOTICE 'migration 0085: quarantined live keyring v% for org % (a live version collides with org_keyring_repairs, so every live generation was removed); the displaced signer must restore authority through the fenced first-version path',
                 captured.version, captured.org_id;
         END LOOP;
     END IF;

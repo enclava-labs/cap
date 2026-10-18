@@ -877,6 +877,49 @@ async fn insert_signer_rotation_app(
     (org_id, user_id, app_id)
 }
 
+/// Commit an identity change the way the new writer does: update apps, then
+/// insert the token jti, in one transaction. Production order matters — the
+/// consumption fence is a deferred constraint trigger and must see the insert
+/// at commit, not before the update.
+async fn commit_rotation_with_token(
+    pool: &sqlx::PgPool,
+    org_id: uuid::Uuid,
+    app_id: uuid::Uuid,
+    subject: &str,
+    issuer: &str,
+) {
+    let mut tx = pool.begin().await.expect("begin fenced signer rotation");
+    sqlx::query(
+        "UPDATE apps
+            SET signer_identity_subject = $1,
+                signer_identity_issuer  = $2,
+                signer_identity_set_at  = now(),
+                updated_at              = now()
+          WHERE id = $3",
+    )
+    .bind(subject)
+    .bind(issuer)
+    .bind(app_id)
+    .execute(&mut *tx)
+    .await
+    .expect("identity update before token consumption");
+    sqlx::query(
+        "INSERT INTO consumed_signer_rotation_tokens (
+             jti, user_id, org_id, app_id, subject, issuer, expires_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, now() + interval '1 hour')",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(uuid::Uuid::new_v4())
+    .bind(org_id)
+    .bind(app_id)
+    .bind(subject)
+    .bind(issuer)
+    .execute(&mut *tx)
+    .await
+    .expect("consume rotation token in the identity transaction");
+    tx.commit().await.expect("commit fenced signer rotation");
+}
+
 /// A retained workload artifact whose signed descriptor carries the given
 /// signer identity: exactly what a rotated-out signer leaves behind.
 async fn insert_signed_artifact_for_identity(
@@ -1942,8 +1985,10 @@ async fn old_binary_signer_rotation_via_direct_sql_is_fenced_by_the_apps_trigger
     .await
     .expect("enter signed-policy mode");
 
-    // The pre-0052 rotation: a bare apps identity rewrite, nothing else.
-    sqlx::query(
+    // The pre-0067 rotation: a bare apps identity rewrite, nothing else.
+    // The consumption fence must reject it. A committed token-less rotation
+    // would let the same jti be accepted again after a rotate-back.
+    let rejected = sqlx::query(
         "UPDATE apps
             SET signer_identity_subject = $1,
                 signer_identity_issuer  = $2,
@@ -1955,8 +2000,36 @@ async fn old_binary_signer_rotation_via_direct_sql_is_fenced_by_the_apps_trigger
     .bind(new_issuer)
     .bind(app_id)
     .execute(&pool)
-    .await
-    .expect("old-binary signer rotation");
+    .await;
+    let rejection = rejected.expect_err("a token-less rotation must not commit");
+    assert!(
+        rejection
+            .to_string()
+            .contains("atomic rotation-token consumption"),
+        "unexpected rejection: {rejection}"
+    );
+    let unchanged_subject: Option<String> =
+        sqlx::query_scalar("SELECT signer_identity_subject FROM apps WHERE id = $1")
+            .bind(app_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load subject after the rejected rotation");
+    assert_eq!(unchanged_subject.as_deref(), Some(previous_subject));
+    let withdrawn_before: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM withdrawn_signer_artifacts WHERE app_id = $1")
+            .bind(app_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count withdrawals after the rejected rotation");
+    assert_eq!(
+        withdrawn_before, 0,
+        "a rejected rotation must withdraw nothing"
+    );
+
+    // The new writer updates apps and then inserts the jti. The deferred
+    // fence sees that insert at commit, and the withdrawal trigger still
+    // runs for the committed change.
+    commit_rotation_with_token(&pool, org_id, app_id, new_subject, new_issuer).await;
 
     let withdrawn: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM withdrawn_signer_artifacts
@@ -2112,7 +2185,9 @@ async fn migration_backfill_repairs_stale_legacy_tls_bindings() {
     // the apps row changes, the binding does not.
     sqlx::raw_sql(
         "DROP TRIGGER apps_signer_rotation_withdrawal ON apps;
+         DROP TRIGGER IF EXISTS apps_signer_rotation_token_consumption ON apps;
          DROP FUNCTION enforce_signer_rotation_withdrawal();
+         DROP FUNCTION IF EXISTS enforce_signer_rotation_token_consumption();
          DROP TABLE consumed_signer_rotation_tokens;
          DROP TABLE withdrawn_signer_artifacts;
          ALTER TABLE kbs_signed_policy_reconciliation DROP COLUMN withdrawal_bumps_owed;",
@@ -2246,24 +2321,43 @@ async fn rotate_back_to_withheld_signer_fails_closed_permanently() {
         .expect("load admitted legacy tls bindings");
     assert_eq!(admitted.len(), 1, "the live signer must start admitted");
 
-    // A -> B, then the rotate-back B -> A. The direct UPDATEs are the exact
-    // statement an old writer runs; migration 0052's trigger performs the
-    // artifact withdrawal and the binding carry on both changes.
+    // A token-less rotate-back is the migration-window replay: an old writer
+    // already changed the identity without recording the jti, so the new
+    // binary would accept that jti again. The consumption fence rejects it
+    // before any withdrawal or binding change.
+    let rejected = sqlx::query(
+        "UPDATE apps
+            SET signer_identity_subject = $1,
+                signer_identity_issuer  = $2,
+                signer_identity_set_at  = now(),
+                updated_at              = now()
+          WHERE id = $3",
+    )
+    .bind(subject_b)
+    .bind(issuer_b)
+    .bind(app_id)
+    .execute(&pool)
+    .await;
+    let rejection = rejected.expect_err("a token-less rotation must not commit");
+    assert!(
+        rejection
+            .to_string()
+            .contains("atomic rotation-token consumption"),
+        "unexpected rejection: {rejection}"
+    );
+    let still_a: Option<String> =
+        sqlx::query_scalar("SELECT signer_identity_subject FROM apps WHERE id = $1")
+            .bind(app_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load subject after the rejected rotate");
+    assert_eq!(still_a.as_deref(), Some(subject_a));
+
+    // A -> B, then the rotate-back B -> A, each with a same-transaction token
+    // consumption (the new writer's order). The withdrawal trigger still
+    // performs the artifact withdrawal and the binding carry on both changes.
     for (subject, issuer) in [(subject_b, issuer_b), (subject_a, issuer_a)] {
-        sqlx::query(
-            "UPDATE apps
-                SET signer_identity_subject = $1,
-                    signer_identity_issuer  = $2,
-                    signer_identity_set_at  = now(),
-                    updated_at              = now()
-              WHERE id = $3",
-        )
-        .bind(subject)
-        .bind(issuer)
-        .bind(app_id)
-        .execute(&pool)
-        .await
-        .expect("signer rotation via direct sql");
+        commit_rotation_with_token(&pool, org_id, app_id, subject, issuer).await;
     }
 
     // The binding tracks the committed identity ...
@@ -2454,7 +2548,8 @@ async fn never_withdrawn_signer_identities_still_admit_immediately_in_legacy_mod
 }
 
 // Pause the production migration after its backfill, before trigger installation.
-// An old signer writer must wait and then execute under the new trigger.
+// An old signer writer must wait on the migration lock, then fail closed: after
+// 0067 commits, a token-less identity update is rejected.
 #[tokio::test]
 async fn migration_backfill_window_is_fenced_by_the_apps_write_exclusion_lock() {
     let (_db_cleanup, pool) =
@@ -2485,7 +2580,9 @@ async fn migration_backfill_window_is_fenced_by_the_apps_write_exclusion_lock() 
 
     sqlx::raw_sql(
         "DROP TRIGGER apps_signer_rotation_withdrawal ON apps;
+         DROP TRIGGER IF EXISTS apps_signer_rotation_token_consumption ON apps;
          DROP FUNCTION enforce_signer_rotation_withdrawal();
+         DROP FUNCTION IF EXISTS enforce_signer_rotation_token_consumption();
          DROP TABLE consumed_signer_rotation_tokens;
          DROP TABLE withdrawn_signer_artifacts;
          ALTER TABLE kbs_signed_policy_reconciliation DROP COLUMN withdrawal_bumps_owed;",
@@ -2578,7 +2675,6 @@ async fn migration_backfill_window_is_fenced_by_the_apps_write_exclusion_lock() 
         .bind(app_id)
         .execute(&mut *writer_connection)
         .await
-        .expect("old-binary signer rotation");
     });
     wait_for_blocker(&pool, writer_pid, migration_pid).await;
     gate.commit().await.unwrap();
@@ -2587,20 +2683,28 @@ async fn migration_backfill_window_is_fenced_by_the_apps_write_exclusion_lock() 
         .expect("migration finishes once its gate opens")
         .expect("migration task panics propagate");
 
-    tokio::time::timeout(std::time::Duration::from_secs(5), writer)
+    let writer_result = tokio::time::timeout(std::time::Duration::from_secs(5), writer)
         .await
-        .expect("blocked rotation completes after the migration commits")
+        .expect("blocked rotation finishes after the migration commits")
         .expect("rotation task panics propagate");
+    let rejection =
+        writer_result.expect_err("a token-less rotation queued across 0067 must be rejected");
+    assert!(
+        rejection
+            .to_string()
+            .contains("atomic rotation-token consumption"),
+        "unexpected rejection: {rejection}"
+    );
     let rotated_subject: Option<String> =
         sqlx::query_scalar("SELECT signer_identity_subject FROM apps WHERE id = $1")
             .bind(app_id)
             .fetch_one(&pool)
             .await
-            .expect("load app subject after the fenced rotation");
+            .expect("load app subject after the rejected rotation");
     assert_eq!(
         rotated_subject.as_deref(),
-        Some(new_subject),
-        "the rotation behind the lock must eventually commit"
+        Some(previous_subject),
+        "the rotation behind the lock must not commit without a token"
     );
     let withdrawn: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM withdrawn_signer_artifacts
@@ -2610,15 +2714,15 @@ async fn migration_backfill_window_is_fenced_by_the_apps_write_exclusion_lock() 
     .bind(app_id)
     .fetch_one(&pool)
     .await
-    .expect("count withdrawn artifacts after the fenced rotation");
+    .expect("count withdrawn artifacts after the rejected rotation");
     assert_eq!(
-        withdrawn, 1,
-        "the resumed rotation must fire the trigger the migration installed"
+        withdrawn, 0,
+        "a rejected rotation must not withdraw the live signer"
     );
     assert_eq!(
         read_withdrawal_reconciliation_state(&pool).await,
-        (1, 0, 1),
-        "the resumed rotation must owe the deferred withdrawal bump"
+        (1, 0, 0),
+        "a rejected rotation must not owe a withdrawal bump"
     );
 
     crate::test_support::drop_isolated_database("cap119_backfill_window", pool).await;

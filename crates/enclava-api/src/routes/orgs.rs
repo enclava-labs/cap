@@ -3289,6 +3289,41 @@ mod tests {
         .execute(&pool)
         .await
         .expect("insert surviving clean keyring");
+        // The old writer can append a version that 0061 never archived after
+        // inserting the colliding v1. That unarchived row must not be treated
+        // as a clean survivor: every live generation of the colliding org is
+        // quarantined.
+        let appended_org = Uuid::new_v4();
+        let appended_name = format!("keyring-appended-q-{}", appended_org.simple());
+        crate::db::orgs::insert_org_pool(&pool, appended_org, &appended_name, None, false)
+            .await
+            .expect("insert appended org");
+        sqlx::query(
+            "INSERT INTO org_keyring_repairs
+                 (org_id, version, keyring_payload, signature, signing_key_id, created_at)
+             VALUES ($1, 1, $2, $3, $4, now()),
+                    ($1, 3, $2, $3, $4, now())",
+        )
+        .bind(appended_org)
+        .bind(&well_formed)
+        .bind(&signature)
+        .bind(alice_signing_key_id)
+        .execute(&pool)
+        .await
+        .expect("archive appended-org versions");
+        sqlx::query(
+            "INSERT INTO org_keyrings
+                 (org_id, version, keyring_payload, signature, signing_key_id)
+             VALUES ($1, 1, $2, $3, $4),
+                    ($1, 2, $2, $3, $4)",
+        )
+        .bind(appended_org)
+        .bind(&well_formed)
+        .bind(&signature)
+        .bind(bob_signing_key_id)
+        .execute(&pool)
+        .await
+        .expect("insert colliding v1 and unarchived v2");
 
         // Replay 0085 as it runs on a database that does not yet have the
         // marker table (canonical 0061 does not create it).
@@ -3359,6 +3394,28 @@ mod tests {
         assert_eq!(
             survivor_marker, 0,
             "a clean survivor must not get a recovery marker"
+        );
+        let appended_rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM org_keyrings WHERE org_id = $1")
+                .bind(appended_org)
+                .fetch_one(&pool)
+                .await
+                .expect("count appended keyrings");
+        assert_eq!(
+            appended_rows, 0,
+            "an unarchived version appended after a colliding v1 must be quarantined with it"
+        );
+        let appended_marker: Option<i64> = sqlx::query_scalar(
+            "SELECT quarantined_latest_version FROM org_keyring_shape_recoveries WHERE org_id = $1",
+        )
+        .bind(appended_org)
+        .fetch_optional(&pool)
+        .await
+        .expect("read appended recovery marker");
+        assert_eq!(
+            appended_marker,
+            Some(3),
+            "the appended window capture must still record the archived latest version"
         );
 
         let mut state = crate::test_support::lazy_state();
