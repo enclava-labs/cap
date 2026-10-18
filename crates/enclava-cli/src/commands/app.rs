@@ -723,7 +723,8 @@ async fn set_deploy_config(
     value: &str,
     token: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + Duration::from_secs(60);
+    // First-boot encrypted storage can still be initializing after the ownership claim.
+    let deadline = Instant::now() + Duration::from_secs(240);
     loop {
         match tee.config_set(key, value, token).await {
             Err(error) if should_retry_deploy_config(&error) && Instant::now() < deadline => {

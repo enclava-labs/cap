@@ -5232,24 +5232,27 @@ resource_bindings := {
             .expect("fail the artifact-less operation");
         // An unreleased hold is not authority either.
         let held = Uuid::new_v4();
-        insert_test_deployment(&pool, org_id, app_id, held, "pending", at(5)).await;
+        insert_test_deployment(&pool, org_id, app_id, held, "failed", at(5)).await;
         let held_artifact = insert_test_artifact(&pool, app_id, held, "8d").await;
         insert_test_job(
             &pool,
             org_id,
             app_id,
             held,
-            rollback,
+            held,
             Some((held, &held_artifact)),
         )
         .await;
         sqlx::query(
-            "UPDATE deployment_apply_jobs
+            "WITH held_deployment AS (
+                 UPDATE deployments SET status = 'pending' WHERE id = $1 RETURNING id
+             )
+             UPDATE deployment_apply_jobs
                 SET state = 'setup_pending',
                     customer_config_hold = true,
                     customer_config_hold_until = clock_timestamp() + interval '1 hour',
                     next_attempt_at = 'infinity'::timestamptz
-              WHERE deployment_id = $1",
+              WHERE deployment_id IN (SELECT id FROM held_deployment)",
         )
         .bind(held)
         .execute(&pool)
