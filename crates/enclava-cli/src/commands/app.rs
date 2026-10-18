@@ -2686,8 +2686,141 @@ pub async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> 
             println!("Evidence: {reason}");
         }
     }
+    if let Some(deployment) = &status.deployment {
+        print_deployment_diagnostics(deployment);
+    }
 
     Ok(())
+}
+
+/// One owner-facing sentence for the common lifecycle states (#90). The
+/// strings are fixed tokens from the API contract; only timing context is
+/// appended, never provider or workload text.
+fn deployment_condition_action(
+    condition: &str,
+    phase: Option<&str>,
+    reason: Option<&str>,
+) -> &'static str {
+    if phase == Some("destroying") {
+        // Deletion has no durable background job: the API distinguishes
+        // finite lease quarantine (app_deleting) from poisoned fences
+        // (app_deletion_blocked_by_poisoned_fence). Use the reason to
+        // select the correct action.
+        return match (condition, reason) {
+            ("blocked_by_operation", _) => {
+                "deletion stalled after the delete request ended; run the delete again to resume teardown"
+            }
+            ("waiting_external", Some("app_deletion_blocked_by_poisoned_fence")) => {
+                "deletion blocked by a poisoned resource fence; contact support to clear namespace finalizers"
+            }
+            ("waiting_external", Some("app_deletion_abandoned_waiting_on_foreign_fence")) => {
+                "deletion request expired while a foreign operation still holds the namespace; wait for the Blocked: deadline to pass, then re-run delete to resume"
+            }
+            ("waiting_external", _) => {
+                "deletion in progress; wait for teardown to complete before creating it again"
+            }
+            _ => "the app is being deleted; wait for teardown to complete before creating it again",
+        };
+    }
+    match condition {
+        "progressing" => "wait; the deployment is making progress",
+        "waiting_external" => {
+            "wait; the platform will pick this deployment up automatically at the scheduled time"
+        }
+        "blocked_by_operation" => {
+            "another operation owns this app's mutation lane; wait for it to finish or retry after it completes"
+        }
+        "stalled" => "no worker or retry schedule is recorded; contact support if this persists",
+        "terminal" => match phase {
+            Some("healthy") => "the deployment completed successfully",
+            Some("cancelled") => "the deployment was superseded by a newer deployment",
+            Some("rolled_back") => "the deployment was rolled back to a previous version",
+            Some("failed") => {
+                "the deployment failed; wait for any rollback to finish, then redeploy to try again"
+            }
+            _ => "the deployment failed; redeploy to try again",
+        },
+        _ => "lifecycle details are unavailable from this API instance",
+    }
+}
+
+/// "3m ago" / "in 25s" style relative age for owner-facing timestamps.
+/// Falls back to the raw timestamp when it cannot be parsed.
+fn relative_time(timestamp: &str) -> String {
+    let parsed = chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|parsed| parsed.with_timezone(&chrono::Utc));
+    match parsed {
+        Ok(parsed) => {
+            let delta = chrono::Utc::now().signed_duration_since(parsed);
+            let seconds = delta.num_seconds();
+            if seconds >= 0 {
+                if seconds < 60 {
+                    format!("{timestamp} ({seconds}s ago)")
+                } else if seconds < 3600 {
+                    format!("{timestamp} ({}m ago)", seconds / 60)
+                } else {
+                    format!("{timestamp} ({}h ago)", seconds / 3600)
+                }
+            } else {
+                let seconds = -seconds;
+                if seconds < 60 {
+                    format!("{timestamp} (in {seconds}s)")
+                } else if seconds < 3600 {
+                    format!("{timestamp} (in {}m)", seconds / 60)
+                } else {
+                    format!("{timestamp} (in {}h)", seconds / 3600)
+                }
+            }
+        }
+        Err(_) => timestamp.to_string(),
+    }
+}
+
+fn print_deployment_diagnostics(deployment: &DeploymentDiagnostics) {
+    use colored::Colorize;
+    let phase_colored = match deployment.condition.as_str() {
+        "terminal" if deployment.phase == "failed" => deployment.phase.red().to_string(),
+        "terminal" if deployment.phase == "healthy" => deployment.phase.green().to_string(),
+        "progressing" | "waiting_external" => deployment.phase.yellow().to_string(),
+        "stalled" | "blocked_by_operation" => deployment.phase.red().to_string(),
+        _ => deployment.phase.yellow().to_string(),
+    };
+    println!("Deploy:   {phase_colored} ({})", deployment.condition);
+    if let Some(reason) = &deployment.reason {
+        println!("Reason:   {reason}");
+    }
+    if let Some(last_progress_at) = &deployment.last_progress_at {
+        println!("Progress: {}", relative_time(last_progress_at));
+    }
+    if let Some(attempts) = deployment.attempts {
+        println!("Attempts: {attempts}");
+    }
+    if let Some(next_retry_at) = &deployment.next_retry_at {
+        println!("Retry:    {}", relative_time(next_retry_at));
+    }
+    if let Some(blocked_until) = &deployment.blocked_until {
+        println!(
+            "Blocked:  mutation lane admits retries after {}",
+            relative_time(blocked_until)
+        );
+    }
+    if let Some(blocking_operation) = &deployment.blocking_operation {
+        println!("Holder:   {blocking_operation}");
+    }
+    if let Some(observing_since) = &deployment.observing_since {
+        println!(
+            "Watching: observing since {}",
+            relative_time(observing_since)
+        );
+    }
+    println!(
+        "Action:   {}",
+        deployment_condition_action(
+            &deployment.condition,
+            Some(&deployment.phase),
+            deployment.reason.as_deref()
+        )
+    );
 }
 
 #[derive(Debug, PartialEq, Eq)]

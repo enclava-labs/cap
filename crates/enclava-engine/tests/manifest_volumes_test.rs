@@ -116,57 +116,16 @@ fn volumes_decrypted_mountpoints_use_memory_medium_and_1mi_limit() {
 
 #[test]
 fn volumes_logs_emptydir_is_disk_backed_and_bounded() {
-    let vols = build_volumes(&memory_app());
-    let v = vols.iter().find(|v| v.name == "logs").unwrap();
-    let ed = v.empty_dir.as_ref().unwrap();
-    // #138: disk medium with an explicit node-side bound. #223: the bound
-    // must also clear the volume's second writer — kata's dm-integrity
-    // staging file — pinned against its observed endpoint below.
-    assert!(ed.medium.is_none());
-    assert_eq!(ed.size_limit.as_ref().map(|q| q.0.as_str()), Some("4Gi"));
-}
-
-/// Parse a Kubernetes binary quantity ("4Gi", "64Mi") into bytes.
-fn quantity_bytes(value: &str) -> Option<u64> {
-    let (number, suffix) = value.split_at(value.find(|c: char| c.is_ascii_alphabetic())?);
-    let multiplier = match suffix {
-        "Ki" => 1024u64,
-        "Mi" => 1024u64.pow(2),
-        "Gi" => 1024u64.pow(3),
-        "Ti" => 1024u64.pow(4),
-        _ => return None,
-    };
-    let n: u64 = number.trim().parse().ok()?;
-    n.checked_mul(multiplier)
-}
-
-/// #223 basis for the fence size. Two sampled pod generations growing at
-/// very different rates (52 vs 70 MB/s) ended at an identical ~2.3–2.4 GB
-/// of real usage, consistent with the staging write phase completing
-/// there (n=2, unproven — no pod survived past that point under the old
-/// fence). This pins only that: the fence must stay above the largest
-/// observed endpoint plus a generous allowance for the log spool
-/// (~42 MiB today). It deliberately does NOT claim first-deploy survival
-/// if growth never settles — at 52–70 MB/s this fence is crossed in
-/// ~60–85 s, inside the convergence window; that case needs a >12 GiB
-/// fence or the kata-side root fix, both tracked in #223. A post-rollout
-/// 15-minute first-deploy usage watch decides which regime holds.
-#[test]
-fn logs_emptydir_fence_clears_observed_dm_integrity_endpoint() {
-    const OBSERVED_STAGING_ENDPOINT_BYTES: u64 = 2_360_000_000; // largest final sample, #223
-    const SPOOL_ALLOWANCE_BYTES: u64 = 256 * 1024 * 1024;
-
-    let vols = build_volumes(&memory_app());
-    let logs = vols.iter().find(|v| v.name == "logs").unwrap();
-    let ed = logs.empty_dir.as_ref().unwrap();
-    let limit = quantity_bytes(ed.size_limit.as_ref().map(|q| q.0.as_str()).unwrap())
-        .expect("logs sizeLimit parses as a binary quantity");
-
-    assert!(
-        limit > OBSERVED_STAGING_ENDPOINT_BYTES + SPOOL_ALLOWANCE_BYTES,
-        "fence {limit} B must clear the observed staging endpoint \
-         {OBSERVED_STAGING_ENDPOINT_BYTES} B plus spool allowance"
-    );
+    // Both bootstrap layouts share this disk-backed volume with Kata staging.
+    // #223 observed ~2.4 GiB of real blocks before readiness; 64Mi evicted
+    // first deployments. Retain at least 4Gi until staging is relocated.
+    for app in [sample_app(), memory_app()] {
+        let vols = build_volumes(&app);
+        let v = vols.iter().find(|v| v.name == "logs").unwrap();
+        let ed = v.empty_dir.as_ref().unwrap();
+        assert!(ed.medium.is_none());
+        assert_eq!(ed.size_limit.as_ref().map(|q| q.0.as_str()), Some("4Gi"));
+    }
 }
 
 #[test]
