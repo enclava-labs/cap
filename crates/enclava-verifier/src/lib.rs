@@ -24,8 +24,8 @@ pub use bundle::{
     BundleError, MAX_PROOF_BUNDLE_BYTES, PROOF_BUNDLE_MEDIA_TYPE, ProofBundle, parse_proof_bundle,
 };
 pub use evidence::{
-    AmdEndorsements, EvidenceError, expected_report_data, parse_amd_endorsements,
-    report_data_matches, tls_leaf_spki_sha256,
+    AmdEndorsements, EvidenceError, expected_report_data, expected_report_data_with_pubkey_sha256,
+    parse_amd_endorsements, report_data_matches, tls_leaf_spki_sha256,
 };
 pub use policy::{AppraiserKeyPolicy, AppraiserPolicy, SigstorePolicy, TrustPolicy};
 pub use receipt::{

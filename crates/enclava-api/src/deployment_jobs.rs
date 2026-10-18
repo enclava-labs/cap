@@ -4068,6 +4068,7 @@ async fn publish_rollout_outcome(
 async fn publish_apply_failure_with_mutation(
     pool: &PgPool,
     job: &ClaimedJob,
+
     failure_code: &'static str,
     mutation: Option<&mut crate::mutation_leases::AppMutationLease>,
 ) -> Result<(), DeploymentJobError> {

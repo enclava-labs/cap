@@ -21,6 +21,7 @@ pub mod routes;
 pub mod signing_service;
 pub mod source_provider;
 pub mod state;
+mod tee_attestation;
 mod workload_tls_timing;
 
 use axum::{

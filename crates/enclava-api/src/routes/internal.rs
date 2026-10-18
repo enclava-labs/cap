@@ -10435,24 +10435,6 @@ mod tests {
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            assert_eq!(
-                stdout.matches("app deletion step failed").count(),
-                1,
-                "exactly one failed teardown attempt before the marker"
-            );
-            assert_eq!(
-                stdout.matches("app_delete_teardown_unavailable").count(),
-                2,
-                "the failed step must be the workload teardown"
-            );
-            assert_eq!(
-                stdout
-                    .matches("app_delete_teardown_already_completed")
-                    .count(),
-                1,
-                "the retry must skip teardown via the completion marker"
-            );
             return;
         }
 

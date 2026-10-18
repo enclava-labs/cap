@@ -1045,6 +1045,29 @@ async fn load_signed_policy_candidates(
     db: &PgPool,
     retention: i64,
 ) -> Result<Vec<SignedPolicyArtifactCandidate>, KbsPolicyError> {
+    load_signed_policy_candidates_for(db, retention, None).await
+}
+
+/// Artifacts of one app's still-required workload authority (the same
+/// admission rules as the published policy, no optional retention history):
+/// the identities its TEE may legitimately be running under.
+pub(crate) async fn load_required_app_artifacts(
+    db: &PgPool,
+    app_id: Uuid,
+) -> Result<Vec<crate::signing_service::SignedPolicyArtifact>, KbsPolicyError> {
+    Ok(load_signed_policy_candidates_for(db, 0, Some(app_id))
+        .await?
+        .into_iter()
+        .filter(|candidate| candidate.required)
+        .map(|candidate| candidate.artifact)
+        .collect())
+}
+
+async fn load_signed_policy_candidates_for(
+    db: &PgPool,
+    retention: i64,
+    app_id: Option<Uuid>,
+) -> Result<Vec<SignedPolicyArtifactCandidate>, KbsPolicyError> {
     let rows: Vec<SignedPolicyArtifactRow> = sqlx::query_as(
         r#"
         WITH ranked_job_operations AS (
@@ -1078,6 +1101,7 @@ async fn load_signed_policy_candidates(
                 job.customer_config_hold
                 AND job.customer_config_released_at IS NULL
             )
+              AND ($2::uuid IS NULL OR job.app_id = $2)
         ),
         -- The cast is safe at two levels: org_keyrings rows are written only
         -- by the put/rotate handlers, which serialize validated JSON, and the
@@ -1099,6 +1123,8 @@ async fn load_signed_policy_candidates(
                       org_id,
                       convert_from(keyring_payload, 'UTF8')::jsonb AS keyring
                     FROM org_keyrings
+                   WHERE $2::uuid IS NULL
+                      OR org_id = (SELECT org_id FROM apps WHERE id = $2)
                    ORDER BY org_id, version DESC
               ) AS latest,
               jsonb_array_elements(latest.keyring->'members') AS member
@@ -1351,7 +1377,8 @@ async fn load_signed_policy_candidates(
             JOIN apps AS app ON app.id = deployment.app_id
             -- Legacy workloads have no job rows. Retain their authority until
             -- a durable replacement becomes healthy.
-            WHERE NOT EXISTS (
+            WHERE ($2::uuid IS NULL OR deployment.app_id = $2)
+              AND NOT EXISTS (
                 SELECT 1
                   FROM ranked_job_operations AS operation
                  WHERE operation.app_id = deployment.app_id
@@ -1423,6 +1450,7 @@ async fn load_signed_policy_candidates(
         "#,
     )
     .bind(retention)
+    .bind(app_id)
     .fetch_all(db)
     .await?;
 
@@ -5129,6 +5157,126 @@ resource_bindings := {
                 .expect("delete keyring rotation fixture user");
         }
         crate::test_support::drop_isolated_database("cap130_selector_rotation", pool).await;
+    }
+
+    #[tokio::test]
+    async fn required_app_artifacts_follow_rollback_through_an_artifactless_failure() {
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_teardown_authority").await;
+        let now = Utc::now();
+        let signer = "bb".repeat(32);
+        let at = |seconds| now + chrono::Duration::seconds(seconds);
+
+        let (org_id, app_id) = insert_test_app(&pool, "running").await;
+        insert_test_keyring_version(&pool, org_id, 1, &[&signer]).await;
+        let (foreign_org, foreign_app) = insert_test_app(&pool, "running").await;
+        insert_test_keyring_version(&pool, foreign_org, 1, &[&signer]).await;
+        let foreign_deployment = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            foreign_org,
+            foreign_app,
+            foreign_deployment,
+            "healthy",
+            now,
+        )
+        .await;
+        let foreign_artifact =
+            insert_test_artifact(&pool, foreign_app, foreign_deployment, "8c").await;
+        insert_test_job(
+            &pool,
+            foreign_org,
+            foreign_app,
+            foreign_deployment,
+            foreign_deployment,
+            Some((foreign_deployment, &foreign_artifact)),
+        )
+        .await;
+
+        let old = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, old, "healthy", at(1)).await;
+        let old_artifact = insert_test_artifact(&pool, app_id, old, "8a").await;
+        insert_test_job(&pool, org_id, app_id, old, old, Some((old, &old_artifact))).await;
+        let newer = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, newer, "healthy", at(2)).await;
+        let newer_artifact = insert_test_artifact(&pool, app_id, newer, "8b").await;
+        insert_test_job(
+            &pool,
+            org_id,
+            app_id,
+            newer,
+            newer,
+            Some((newer, &newer_artifact)),
+        )
+        .await;
+        // Rollback: a new deployment whose job is bound to the older artifact.
+        let rollback = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, rollback, "healthy", at(3)).await;
+        insert_test_job(
+            &pool,
+            org_id,
+            app_id,
+            rollback,
+            old,
+            Some((old, &old_artifact)),
+        )
+        .await;
+        // A later artifact-less failure must not hide the serving rollback.
+        let failed = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, failed, "failed", at(4)).await;
+        insert_test_job(&pool, org_id, app_id, failed, rollback, None).await;
+        sqlx::query("UPDATE deployment_apply_jobs SET state = 'failed' WHERE deployment_id = $1")
+            .bind(failed)
+            .execute(&pool)
+            .await
+            .expect("fail the artifact-less operation");
+        // An unreleased hold is not authority either.
+        let held = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, held, "failed", at(5)).await;
+        let held_artifact = insert_test_artifact(&pool, app_id, held, "8d").await;
+        insert_test_job(
+            &pool,
+            org_id,
+            app_id,
+            held,
+            held,
+            Some((held, &held_artifact)),
+        )
+        .await;
+        sqlx::query(
+            "WITH held_deployment AS (
+                 UPDATE deployments SET status = 'pending' WHERE id = $1 RETURNING id
+             )
+             UPDATE deployment_apply_jobs
+                SET state = 'setup_pending',
+                    customer_config_hold = true,
+                    customer_config_hold_until = clock_timestamp() + interval '1 hour',
+                    next_attempt_at = 'infinity'::timestamptz
+              WHERE deployment_id IN (SELECT id FROM held_deployment)",
+        )
+        .bind(held)
+        .execute(&pool)
+        .await
+        .expect("hold the replacement job");
+
+        let hashes = load_required_app_artifacts(&pool, app_id)
+            .await
+            .expect("select required app artifacts")
+            .into_iter()
+            .map(|artifact| artifact.metadata.descriptor_core_hash)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            hashes,
+            vec![old_artifact.metadata.descriptor_core_hash.clone()],
+            "only the rolled-back source artifact is still-serving authority"
+        );
+
+        sqlx::query("DELETE FROM organizations WHERE id = ANY($1)")
+            .bind(vec![org_id, foreign_org])
+            .execute(&pool)
+            .await
+            .expect("delete required-artifact fixtures");
+        crate::test_support::drop_isolated_database("cap_teardown_authority", pool).await;
     }
 
     #[tokio::test]

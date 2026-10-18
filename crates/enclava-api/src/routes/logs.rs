@@ -312,24 +312,20 @@ fn parse_socket_addr(target: &str) -> Option<SocketAddr> {
     Some(SocketAddr::new(ip, port))
 }
 
-/// Resolve the instance tenant Gateway and build the IP-pinned,
-/// SNI-preserving client for an in-cluster TEE call, falling back to the
-/// caller's shared public client on every failure mode.
-///
-/// Bounded by a short outer timeout: a hung Kubernetes API read must not
-/// stall the caller's mutation lane (deletion holds leases and resource
-/// fences across this call) — every failure degrades to the pre-Gateway
-/// public-origin behavior instead. Warns carry the server-assigned
+/// Resolve the instance tenant Gateway dataplane IP for in-cluster TEE
+/// calls, bounded by a short outer timeout: a hung Kubernetes API read must
+/// not stall the caller's mutation lane (deletion holds leases and resource
+/// fences across this call). Returns `None` on every failure mode; the
+/// caller decides whether fallback is safe. Warns carry the server-assigned
 /// `app_id` for correlation under concurrent deletes (never the
 /// tenant-controlled name/namespace/domain, which the app-deletion
 /// diagnostics contract forbids at warn level).
-pub(crate) async fn resolved_tenant_tee_client(
+pub(crate) async fn resolve_tenant_gateway_ip(
     app_id: uuid::Uuid,
     app_name: &str,
     namespace: &str,
-    confidential_domain: &str,
-) -> Option<reqwest::Client> {
-    let address = match tokio::time::timeout(
+) -> Option<IpAddr> {
+    match tokio::time::timeout(
         std::time::Duration::from_secs(5),
         crate::edge::resolve_gateway_address(app_name, namespace),
     )
@@ -341,7 +337,7 @@ pub(crate) async fn resolved_tenant_tee_client(
                 code = "tenant_tee_gateway_unavailable",
                 "tenant Gateway resolution timed out; in-cluster TEE call uses public origin"
             );
-            return None;
+            None
         }
         Ok(Err(_)) => {
             tracing::warn!(
@@ -349,7 +345,7 @@ pub(crate) async fn resolved_tenant_tee_client(
                 code = "tenant_tee_gateway_unavailable",
                 "tenant Gateway resolution failed; in-cluster TEE call uses public origin"
             );
-            return None;
+            None
         }
         Ok(Ok(None)) => {
             tracing::debug!(
@@ -357,10 +353,22 @@ pub(crate) async fn resolved_tenant_tee_client(
                 namespace = %namespace,
                 "no tenant Gateway for app; in-cluster TEE call uses public origin"
             );
-            return None;
+            None
         }
-        Ok(Ok(Some(ip))) => ip,
-    };
+        Ok(Ok(Some(ip))) => Some(ip),
+    }
+}
+
+/// Resolve the instance tenant Gateway and build the IP-pinned,
+/// SNI-preserving client for an in-cluster TEE call, falling back to the
+/// caller's shared public client on every failure mode.
+pub(crate) async fn resolved_tenant_tee_client(
+    app_id: uuid::Uuid,
+    app_name: &str,
+    namespace: &str,
+    confidential_domain: &str,
+) -> Option<reqwest::Client> {
+    let address = resolve_tenant_gateway_ip(app_id, app_name, namespace).await?;
     match build_resolved_tenant_tee_http_client(confidential_domain, SocketAddr::new(address, 443))
     {
         Ok(client) => Some(client),
@@ -423,7 +431,10 @@ fn build_resolved_tenant_tee_http_client_with_builder(
     builder.build()
 }
 
-fn accepts_invalid_tenant_tee_certs() -> bool {
+/// Whether tenant-TEE TLS verification is explicitly relaxed for this
+/// deployment (staging/insecure environments only). Release runs leave it
+/// unset, which selects the evidence-authenticated channel instead.
+pub(crate) fn accepts_invalid_tenant_tee_certs() -> bool {
     std::env::var("TENANT_TEE_TLS_MODE")
         .map(|mode| matches!(mode.as_str(), "staging" | "insecure"))
         .unwrap_or(false)
