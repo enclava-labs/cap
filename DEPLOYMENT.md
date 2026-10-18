@@ -123,6 +123,13 @@ For production deploys with policy-read mode enabled:
 
 Rollout coordination: the registry-credential scope gates (`TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES`, `COSIGN_REGISTRY_ALLOWED_HOSTS`) are startup-fatal whenever the corresponding `GHCR_*`/`COSIGN_REGISTRY_*` credentials are set. Land these variables in the environment manifests (e.g. `enclava-ops-manifests`) before or together with this image — an existing environment that carries the credentials without the scopes will crash-loop on this version (AGENTS.md cross-project dependency schema).
 
+Apply `0088_tenant_pull_secret_scope_fences.sql` before starting this API,
+including on a fresh database. The API requires both fence tables; it does not
+fall back to annotation-only scoping. Drain pre-fence API writers before the
+cutover: those binaries cannot honor the database authority. Scope epochs are
+monotonic; never lower them to permit an older writer. The shared mutation guard
+disables `idle_in_transaction_session_timeout` for its own transaction only.
+
 ## Common Defaults
 
 | Variable | Default | Purpose |

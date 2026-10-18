@@ -187,14 +187,7 @@ async fn pull_secret_mutation_guard(
     pool: &PgPool,
 ) -> Result<sqlx::Transaction<'_, sqlx::Postgres>, DeployError> {
     let mut guard = pool.begin().await?;
-    // Codex review on #278, P1 "keep the advisory guard transaction alive":
-    // this transaction stays idle while the Kubernetes Secret/ServiceAccount
-    // mutations it protects run on other connections. A nonzero
-    // idle_in_transaction_session_timeout would abort the session mid-mutation
-    // and release the shared advisory lock, letting a waiting epoch transition
-    // publish authority and sweep while this stale replica still writes.
-    // Disable the timeout for this transaction only — SET LOCAL cannot
-    // outlive the guard.
+    // Kubernetes writes use other connections; keep this guard's lock alive while idle.
     sqlx::query("SET LOCAL idle_in_transaction_session_timeout = 0")
         .execute(&mut *guard)
         .await?;
@@ -2469,18 +2462,7 @@ async fn reconcile_managed_pull_secrets(
                                             };
                                             match api.delete(&config.name, &delete_params).await {
                                                 Ok(_) => {
-                                                    // Codex review on #278,
-                                                    // P2 "wait for sweep
-                                                    // compensation to reach
-                                                    // 404": DELETE acceptance
-                                                    // leaves the PAT readable
-                                                    // when a finalizer holds
-                                                    // the object — and a
-                                                    // still-labeled
-                                                    // terminating Secret is
-                                                    // discovered next pass.
-                                                    // Only a 404 means the
-                                                    // compensation converged.
+                                                    // Finalizers can keep the PAT readable after DELETE acceptance.
                                                     if let Err(error) = wait_for_secret_removal(
                                                         &api,
                                                         namespace,
@@ -13323,16 +13305,12 @@ mod tests {
             !converged,
             "an unattributable platform PAT must keep the sweep unconverged"
         );
-        let state = cluster.lock().unwrap();
         assert!(
-            state.secrets.is_empty(),
+            cluster.lock().unwrap().secrets.is_empty(),
             "the unattributed recreated secret must be deleted"
         );
 
-        // (c) Stripped label, retained manager entry (Codex review on #278,
-        // P1): a manager ENTRY alone is not ownership — the dedicated label
-        // must be present AND owned by the platform manager, or the
-        // recreated PAT would be kept invisible to discovery.
+        // Admission can strip the dedicated label while leaving the manager entry.
         let cluster = Arc::new(Mutex::new(FakeCluster {
             secrets: vec![],
             service_accounts: vec![pending_intent("uid-previous-object")],
@@ -13358,16 +13336,12 @@ mod tests {
             "a recreated PAT missing the dedicated pull-secret label must keep \
              the sweep unconverged even when the platform manager entry survives"
         );
-        let state = cluster.lock().unwrap();
         assert!(
-            state.secrets.is_empty(),
+            cluster.lock().unwrap().secrets.is_empty(),
             "the unlabeled recreated secret must be deleted"
         );
 
-        // (d) Finalizer on the compensation delete (Codex review on #278,
-        // P2): DELETE acceptance leaves the object terminating and readable.
-        // The pass must wait for the confirming 404 before reporting
-        // convergence.
+        // DELETE acceptance does not prove absence while a finalizer holds the Secret.
         let cluster = Arc::new(Mutex::new(FakeCluster {
             secrets: vec![],
             service_accounts: vec![pending_intent("uid-previous-object")],
@@ -13609,29 +13583,47 @@ mod tests {
         pool.close().await;
     }
 
-    /// Codex review on #278, P1 "keep the advisory guard transaction alive":
-    /// the guard transaction idles while protected Kubernetes work runs, so
-    /// a nonzero idle_in_transaction_session_timeout would abort it and
-    /// release the shared lock mid-mutation. The guard must disable that
-    /// timeout for its own transaction.
     #[tokio::test]
-    async fn pull_secret_mutation_guard_disables_idle_transaction_timeout() {
+    async fn pull_secret_mutation_guard_keeps_its_lock_while_idle() {
         let _reset = ResetStaleRolloutAuthority;
         let pool = crate::test_support::database_test_pool().await;
         sqlx::query("UPDATE tenant_pull_secret_rollout_authority SET max_scope_epoch = 0, max_credential_epoch = 0")
             .execute(&pool).await.unwrap();
-        let mut guard = pull_secret_mutation_guard(&pool).await.unwrap();
-        let (timeout,): (String,) =
-            sqlx::query_as("SELECT current_setting('idle_in_transaction_session_timeout')")
-                .fetch_one(&mut *guard)
-                .await
-                .unwrap();
-        assert_eq!(
-            timeout, "0",
-            "the guard transaction must not be killable by \
-             idle_in_transaction_session_timeout while Kubernetes work runs"
+        let guarded_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .after_connect(|connection, _| {
+                Box::pin(async move {
+                    sqlx::query("SET idle_in_transaction_session_timeout = '50ms'")
+                        .execute(connection)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect_with((*pool.connect_options()).clone())
+            .await
+            .unwrap();
+        let guard = pull_secret_mutation_guard(&guarded_pool).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let mut transition = pool.begin().await.unwrap();
+        let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(278225)")
+            .fetch_one(&mut *transition)
+            .await
+            .unwrap();
+        assert!(
+            !acquired,
+            "idle timeout released authority during a mutation"
         );
         guard.rollback().await.unwrap();
+        let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(278225)")
+            .fetch_one(&mut *transition)
+            .await
+            .unwrap();
+        assert!(
+            acquired,
+            "authority transition remained blocked after mutation"
+        );
+        transition.rollback().await.unwrap();
+        guarded_pool.close().await;
         pool.close().await;
     }
 
@@ -13962,6 +13954,7 @@ mod tests {
             );
             state.secrets.clear();
         }
+        // Recovery uses the next sweep's completed namespace-lease snapshot.
         assert!(
             reconcile_managed_pull_secrets(
                 &engine,
@@ -13970,7 +13963,7 @@ mod tests {
                 &settings,
                 &scope,
                 PullSecretDeleteMode::Unfenced {
-                    namespace_generation: 0,
+                    namespace_generation: 1,
                     lease_held: false,
                 },
             )

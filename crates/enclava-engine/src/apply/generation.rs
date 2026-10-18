@@ -717,19 +717,13 @@ where
         if entry.manager.as_deref() != Some(field_manager) {
             return false;
         }
-        entry
-            .fields_v1
-            .as_ref()
-            .is_some_and(|fields| owns_metadata_key_path(&fields.0, "annotations", annotation_key))
+        entry.fields_v1.as_ref().is_some_and(|fields| {
+            owns_metadata_key_path(&fields.0, "f:annotations", annotation_key)
+        })
     })
 }
 
-/// True when a managed-fields entry authored by `field_manager` (non-status)
-/// owns `metadata.labels.<key>` on the live object — the same walk as
-/// [`annotation_owned_by_manager`] under `f:labels`. Fails closed when
-/// managed fields are absent: a manager ENTRY alone is not ownership, so a
-/// mutating admission webhook that strips the label but leaves other fields
-/// attributed stays detectable (Codex review on #278, P1).
+/// Label ownership must be proven on the exact managed-fields path, not just a manager entry.
 pub fn label_owned_by_manager<K>(resource: &K, label_key: &str, field_manager: &str) -> bool
 where
     K: Resource,
@@ -750,15 +744,15 @@ where
         entry
             .fields_v1
             .as_ref()
-            .is_some_and(|fields| owns_metadata_key_path(&fields.0, "labels", label_key))
+            .is_some_and(|fields| owns_metadata_key_path(&fields.0, "f:labels", label_key))
     })
 }
 
-/// Walk f:metadata -> f:<section> -> f:<key> within one FieldsV1 document,
-/// ignoring every other branch.
+/// Follow only the requested metadata field path; sibling ownership is irrelevant.
 fn owns_metadata_key_path(fields_v1: &serde_json::Value, section: &str, key: &str) -> bool {
     fields_v1
-        .pointer(&format!("/f:metadata/f:{section}"))
+        .get("f:metadata")
+        .and_then(|metadata| metadata.get(section))
         .and_then(|entries| entries.get(format!("f:{key}")))
         .is_some()
 }
