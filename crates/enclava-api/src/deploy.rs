@@ -3596,7 +3596,42 @@ async fn service_account_preserving_pull_secret_records(
             pending,
         );
     }
+    // A UID-mismatch repair restores the tenant's reference and discharges the
+    // pending intent in the same patch. SSA of the generated ServiceAccount
+    // would then drop that name, and nothing would put it back. Keep every
+    // foreign-replacement name on imagePullSecrets.
+    let foreign_for_references = preserved
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(FOREIGN_PULL_SECRET_REPLACEMENTS_ANNOTATION))
+        .cloned();
+    if let Some(foreign) = foreign_for_references.as_deref() {
+        merge_foreign_pull_secret_references(&mut preserved, foreign);
+    }
     Ok(preserved)
+}
+
+fn merge_foreign_pull_secret_references(desired: &mut ServiceAccount, foreign_annotation: &str) {
+    use k8s_openapi::api::core::v1::LocalObjectReference;
+    let mut references = desired.image_pull_secrets.take().unwrap_or_default();
+    for entry in foreign_annotation.split(',') {
+        let Some((name, uid)) = entry.trim().split_once('=') else {
+            continue;
+        };
+        if name.is_empty() || uid.is_empty() {
+            continue;
+        }
+        if references.iter().any(|reference| reference.name == name) {
+            continue;
+        }
+        references.push(LocalObjectReference {
+            name: name.to_string(),
+        });
+    }
+    if !references.is_empty() {
+        desired.image_pull_secrets = Some(references);
+    }
 }
 
 /// Settle provenance even when a batched step fails after earlier creates.
@@ -9292,6 +9327,29 @@ mod tests {
         assert!(
             !scope.account_in_scope("stale-stored"),
             "stored out-of-scope images must not keep the deploying app's old account in scope"
+        );
+    }
+
+    #[test]
+    fn foreign_replacement_reference_survives_service_account_apply() {
+        use k8s_openapi::api::core::v1::LocalObjectReference;
+        let mut desired = fake_service_account("deploying", &["enclava-registry-auth"]);
+        merge_foreign_pull_secret_references(
+            &mut desired,
+            "old-secret=uid-tenant,enclava-registry-auth=uid-other",
+        );
+        let names: Vec<_> = desired
+            .image_pull_secrets
+            .unwrap()
+            .into_iter()
+            .map(|reference: LocalObjectReference| reference.name)
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "enclava-registry-auth".to_string(),
+                "old-secret".to_string()
+            ]
         );
     }
 
