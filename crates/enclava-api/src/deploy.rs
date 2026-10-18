@@ -166,6 +166,32 @@ fn pull_secret_rollout_authority_defers(max_scope_epoch: i64, max_credential_epo
     max_scope_epoch > own_scope || max_credential_epoch > own_credential
 }
 
+/// Re-read the fleet rollout authority immediately before a Kubernetes write
+/// that can create or refresh a tenant pull secret (Devin review on #278,
+/// "Stale rollout resurrects narrowed credentials"). Passing
+/// [`raise_tenant_pull_secret_rollout_authority`] once at the start of a
+/// deploy is not a fence for later writes: a narrowing rollout can raise the
+/// epoch and delete credentials after that check returns, and the create-on-404
+/// path then has no live Secret annotation to compare against.
+async fn ensure_pull_secret_rollout_authority_current(pool: &PgPool) -> Result<(), DeployError> {
+    let (scope_epoch, credential_epoch) = raise_tenant_pull_secret_rollout_authority(
+        pool,
+        pull_secret_scope_generation(),
+        pull_secret_credential_generation(),
+    )
+    .await?;
+    if pull_secret_rollout_authority_defers(scope_epoch, credential_epoch) {
+        return Err(DeployError::PullSecretReconcileDeferred(format!(
+            "a newer pull-secret rollout exists (scope epoch {scope_epoch} / credential \
+             epoch {credential_epoch} vs this replica's {}/{}); deferring the Kubernetes \
+             write so a stale replica cannot recreate credentials a newer rollout removed",
+            pull_secret_scope_generation(),
+            pull_secret_credential_generation()
+        )));
+    }
+    Ok(())
+}
+
 /// The newest scope epoch recorded for one namespace (`0` = never fenced).
 async fn tenant_pull_secret_scope_fence_epoch(
     pool: &sqlx::PgPool,
@@ -2626,6 +2652,7 @@ async fn reconcile_managed_pull_secrets(
                     service_account,
                     name,
                     live.metadata.uid.as_deref(),
+                    delete_mode,
                 )
                 .await
                 {
@@ -2754,6 +2781,7 @@ async fn reconcile_managed_pull_secrets(
                 // intent: it is what lets a later pass tell an unfinished
                 // removal apart from a replacement (reviewer finding on #243).
                 live.metadata.uid.as_deref(),
+                delete_mode,
             )
             .await
             {
@@ -3758,6 +3786,7 @@ async fn clear_pull_secret_reference_from_service_account(
     service_account: &str,
     secret_name: &str,
     cleared_uid: Option<&str>,
+    delete_mode: PullSecretDeleteMode,
 ) -> Result<bool, DeployError> {
     use k8s_openapi::api::core::v1::ServiceAccount;
     use kube::api::{Patch, PatchParams};
@@ -3773,6 +3802,41 @@ async fn clear_pull_secret_reference_from_service_account(
     };
     if !references.iter().any(|r| r.name == secret_name) {
         return Ok(false);
+    }
+    // Devin review on #278: the sweep's generation check already passed, then
+    // a deploy attached this reference. The clear reads the latest
+    // ServiceAccount, so its resourceVersion cannot see that the scope
+    // decision is stale. Re-read the secret AFTER this ServiceAccount GET
+    // and refuse the clear when a concurrent deploy now owns it.
+    if let PullSecretDeleteMode::Unfenced {
+        namespace_generation,
+        lease_held,
+    } = delete_mode
+    {
+        let secret_api: Api<Secret> = Api::namespaced(engine.client().clone(), namespace);
+        match secret_api.get(secret_name).await {
+            Ok(live)
+                if secret_mutation_generation(&live).is_some_and(|actual| {
+                    actual > namespace_generation || (lease_held && actual == namespace_generation)
+                }) =>
+            {
+                tracing::info!(
+                    namespace = %namespace,
+                    service_account = %service_account,
+                    secret = %secret_name,
+                    "tenant image pull secret reconcile: refused to clear a ServiceAccount \
+                     reference — a concurrent deploy rewrote the secret after the sweep's \
+                     generation check"
+                );
+                return Err(DeployError::PullSecretReconcileDeferred(format!(
+                    "concurrent deploy owns {namespace}/{secret_name}; refusing to clear \
+                     {service_account}'s reference attached after the sweep snapshot"
+                )));
+            }
+            Ok(_) => {}
+            Err(kube::Error::Api(error)) if error.code == 404 => {}
+            Err(error) => return Err(DeployError::Apply(error.into())),
+        }
     }
     let kept: Vec<serde_json::Value> = references
         .iter()
@@ -4099,6 +4163,7 @@ async fn apply_scoped_pull_secret(
     config: &TenantImagePullSecretConfig,
     generation: MutationGeneration,
     service_accounts: &[String],
+    authority: Option<&PgPool>,
 ) -> Result<(), DeployError> {
     use enclava_engine::apply::generation::{
         MUTATION_GENERATION_ANNOTATION, RESOURCE_CREATED_BY_ANNOTATION,
@@ -4182,6 +4247,12 @@ async fn apply_scoped_pull_secret(
                         )));
                     }
                     ensure_pull_secret_generation_not_stale(&live, generation, &config.name)?;
+                    // Devin review on #278: a narrowing rollout can raise the
+                    // fleet epoch after this replica's pre-write check. Re-check
+                    // immediately before overwriting the live secret.
+                    if let Some(pool) = authority {
+                        ensure_pull_secret_rollout_authority_current(pool).await?;
+                    }
                     let Some(resource_version) = live.metadata.resource_version.as_deref() else {
                         return Err(DeployError::Validation(
                             "pull secret has no resourceVersion".to_string(),
@@ -4211,6 +4282,13 @@ async fn apply_scoped_pull_secret(
                 }
             }
             Err(kube::Error::Api(error)) if error.code == 404 => {
+                // Devin review on #278: the secret is gone, so no annotation
+                // epoch can fence this create. A narrowing rollout may have
+                // deleted it and raised the fleet authority after this
+                // replica passed its pre-write check. Re-check before POST.
+                if let Some(pool) = authority {
+                    ensure_pull_secret_rollout_authority_current(pool).await?;
+                }
                 // Stamp the engine's creation evidence on this raw POST (the
                 // applied-resource path does the same in `annotate_created`;
                 // Codex review on #243, P1): the adopted-namespace
@@ -4732,14 +4810,20 @@ async fn apply_all_with_tenant_image_pull_secret(
         service_accounts.as_slice()
     };
     if let Some(config) = image_pull_secret_config {
+        ensure_pull_secret_rollout_authority_current(pool).await?;
         apply_scoped_pull_secret(
             engine,
             ns_name,
             config,
             generation,
             &namespace_service_accounts,
+            Some(pool),
         )
         .await?;
+        // The create/patch re-checked authority, but the reference restore is
+        // another Kubernetes write. A newer rollout that landed between them
+        // must still defer this replica.
+        ensure_pull_secret_rollout_authority_current(pool).await?;
         // A previous out-of-scope sweep may still have a same-UID removal
         // intent. Once this deploy has applied the desired credential, restore
         // its reference and discharge that intent before any later step can
@@ -7559,6 +7643,21 @@ mod tests {
     /// `replace_*` hooks model a tenant replacing the pull secret mid-cleanup
     /// at the exact windows the review asked to be tested: as the
     /// ServiceAccount patch lands, and as the delete lands.
+    ///
+    /// A deploy that follows the sweep's generation check: after N named
+    /// Secret GETs, the next GET of `service_account` attaches `secret_name`
+    /// and stamps that secret with `generation`. The clear then reads this
+    /// latest ServiceAccount, so its own resourceVersion cannot tell the
+    /// scope decision is stale.
+    struct FreshReferenceAfterSecretGets {
+        arm_after_named_secret_gets: u8,
+        named_secret_gets: u8,
+        armed: bool,
+        service_account: String,
+        secret_name: String,
+        generation: i64,
+    }
+
     #[derive(Default)]
     struct FakeCluster {
         secrets: Vec<Secret>,
@@ -7627,6 +7726,16 @@ mod tests {
         /// NAMED Secret GETs (Codex review on #243, round 2, P1): the apply
         /// path's budget must defer instead of hanging the deploy's lease.
         stall_secret_gets: bool,
+        /// Deploy attaches a reference after the sweep's generation check.
+        fresh_reference_after_secret_gets: Option<FreshReferenceAfterSecretGets>,
+        /// One-shot: before answering a named Secret GET, raise the fleet
+        /// rollout authority. Models a narrowing rollout that deleted the
+        /// secret after this replica passed its pre-write check.
+        raise_rollout_authority_on_secret_get: Option<(i64, i64)>,
+        rollout_authority_pool: Option<PgPool>,
+        /// When set, cluster-scoped Namespace GET/PATCH echo this mutation
+        /// generation so deploy-path tests can pass `apply_namespace`.
+        echo_namespace_generation: Option<i64>,
     }
 
     fn fake_managed_secret(name: &str, labeled: bool, username: &str, token: &str) -> Secret {
@@ -7724,6 +7833,30 @@ mod tests {
                     if stall {
                         tokio::time::sleep(std::time::Duration::from_secs(600)).await;
                     }
+                    let named_secret_get = method.as_str() == "GET"
+                        && path.contains("/secrets/")
+                        && !path.trim_end_matches('/').ends_with("/secrets");
+                    if named_secret_get {
+                        let raise = {
+                            let mut state = cluster.lock().unwrap();
+                            state
+                                .raise_rollout_authority_on_secret_get
+                                .take()
+                                .zip(state.rollout_authority_pool.clone())
+                        };
+                        if let Some(((scope_epoch, credential_epoch), pool)) = raise {
+                            sqlx::query(
+                                "UPDATE tenant_pull_secret_rollout_authority \
+                                 SET max_scope_epoch = GREATEST(max_scope_epoch, $1), \
+                                     max_credential_epoch = GREATEST(max_credential_epoch, $2)",
+                            )
+                            .bind(scope_epoch)
+                            .bind(credential_epoch)
+                            .execute(&pool)
+                            .await
+                            .expect("raise rollout authority from the fake");
+                        }
+                    }
                     let mut state = cluster.lock().unwrap();
                     let (status, value) = route_fake_cluster(
                         &mut state,
@@ -7782,6 +7915,7 @@ mod tests {
             ["api", "v1", "namespaces", _, "serviceaccounts", name] => {
                 ("serviceaccounts", Some(*name))
             }
+            ["api", "v1", "namespaces", name] => ("namespaces", Some(*name)),
             _ => return not_found(),
         };
         match (kind, method) {
@@ -7832,6 +7966,11 @@ mod tests {
                             "reason": "LookupFailed", "code": status,
                         }),
                     );
+                if let Some(hook) = state.fresh_reference_after_secret_gets.as_mut() {
+                    hook.named_secret_gets = hook.named_secret_gets.saturating_add(1);
+                    if hook.named_secret_gets >= hook.arm_after_named_secret_gets {
+                        hook.armed = true;
+                    }
                 }
                 let index = state
                     .secrets
@@ -8094,14 +8233,51 @@ mod tests {
                     }),
                 )
             }
-            ("serviceaccounts", "GET") => match state
-                .service_accounts
-                .iter()
-                .find(|account| account.metadata.name.as_deref() == name)
-            {
-                Some(account) => (200, serde_json::to_value(account).unwrap()),
-                None => not_found(),
-            },
+            ("serviceaccounts", "GET") => {
+                if let Some(hook) = state.fresh_reference_after_secret_gets.as_ref()
+                    && hook.armed
+                    && name == Some(hook.service_account.as_str())
+                {
+                    let secret_name = hook.secret_name.clone();
+                    let generation = hook.generation;
+                    let account_name = hook.service_account.clone();
+                    state.fresh_reference_after_secret_gets = None;
+                    if let Some(secret) = state.secrets.iter_mut().find(|secret| {
+                        secret.metadata.name.as_deref() == Some(secret_name.as_str())
+                    }) {
+                        secret
+                            .metadata
+                            .annotations
+                            .get_or_insert_with(Default::default)
+                            .insert(
+                                enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION
+                                    .to_string(),
+                                generation.to_string(),
+                            );
+                    }
+                    if let Some(account) = state.service_accounts.iter_mut().find(|account| {
+                        account.metadata.name.as_deref() == Some(account_name.as_str())
+                    }) {
+                        use k8s_openapi::api::core::v1::LocalObjectReference;
+                        let references = account.image_pull_secrets.get_or_insert_with(Vec::new);
+                        if !references
+                            .iter()
+                            .any(|reference| reference.name == secret_name)
+                        {
+                            references.push(LocalObjectReference { name: secret_name });
+                        }
+                        account.metadata.resource_version = Some("fresh-deploy".to_string());
+                    }
+                }
+                match state
+                    .service_accounts
+                    .iter()
+                    .find(|account| account.metadata.name.as_deref() == name)
+                {
+                    Some(account) => (200, serde_json::to_value(account).unwrap()),
+                    None => not_found(),
+                }
+            }
             ("serviceaccounts", "PATCH") => {
                 if state.sa_patch_fails {
                     // Codex review on #243 (P2): the ServiceAccount patch
@@ -8186,6 +8362,27 @@ mod tests {
                     }
                 }
                 (200, serde_json::to_value(account).unwrap())
+            }
+            ("namespaces", "GET" | "PATCH") => {
+                let Some(generation) = state.echo_namespace_generation else {
+                    return not_found();
+                };
+                let name = name.unwrap_or("namespace");
+                (
+                    200,
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Namespace",
+                        "metadata": {
+                            "name": name,
+                            "uid": format!("uid-{name}"),
+                            "resourceVersion": "1",
+                            "annotations": {
+                                "enclava.dev/cap-provider-mutation-generation": generation.to_string(),
+                            }
+                        }
+                    }),
+                )
             }
             _ => not_found(),
         }
@@ -9229,6 +9426,7 @@ mod tests {
             &config,
             MutationGeneration::new(2).unwrap(),
             &[],
+            None,
         )
         .await
         .unwrap();
@@ -9269,6 +9467,7 @@ mod tests {
             &config,
             MutationGeneration::new(4).unwrap(),
             &[],
+            None,
         )
         .await
         .unwrap();
@@ -9313,6 +9512,7 @@ mod tests {
             &config,
             MutationGeneration::new(2).unwrap(),
             &[],
+            None,
         )
         .await
         .unwrap_err();
@@ -9352,6 +9552,7 @@ mod tests {
                 &config,
                 MutationGeneration::new(2).unwrap(),
                 &[],
+                None,
             )
             .await
             .is_err()
@@ -10550,6 +10751,7 @@ mod tests {
             &config,
             MutationGeneration::new(2).unwrap(),
             &[],
+            None,
         )
         .await
         .unwrap_err();
@@ -10597,6 +10799,7 @@ mod tests {
             &config,
             MutationGeneration::new(3).unwrap(),
             &[],
+            None,
         )
         .await
         .unwrap_err();
@@ -10643,6 +10846,7 @@ mod tests {
                 &config,
                 MutationGeneration::new(2).unwrap(),
                 &[],
+                None,
             )
             .await,
             Err(DeployError::PullSecretReconcileDeferred(_))
@@ -11853,6 +12057,140 @@ mod tests {
         );
     }
 
+    /// Devin review on #278 (SEC, "Out-of-scope app regains platform credential",
+    /// review 5560886851 on 00b72ae0). A concurrent deploy rewrites the
+    /// UID-proven pending-repair Secret, so the delete returns `Superseded`.
+    /// The object is still platform-managed. Restoring the out-of-scope
+    /// account's reference would hand it the platform credential despite the
+    /// narrowed scope. 7dd5cb32 stopped that restore; this pins it.
+    #[tokio::test(start_paused = true)]
+    async fn superseded_pending_repair_does_not_restore_out_of_scope_platform_credential() {
+        use std::sync::{Arc, Mutex};
+        let mut secret =
+            fake_managed_secret("enclava-registry-auth", true, "cap-bot", "ghp_platform");
+        secret
+            .metadata
+            .annotations
+            .get_or_insert_with(Default::default)
+            .insert(
+                enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION.to_string(),
+                "1".to_string(),
+            );
+        let mut account = fake_service_account("cap-out", &[]);
+        account.metadata.annotations = Some(std::collections::BTreeMap::from([(
+            PENDING_PULL_SECRET_REFERENCE_REPAIRS_ANNOTATION.to_string(),
+            "enclava-registry-auth=uid-enclava-registry-auth".to_string(),
+        )]));
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![secret],
+            service_accounts: vec![account],
+            annotate_generation_on_delete: Some(9),
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        let converged = reconcile_managed_pull_secrets(
+            &engine,
+            "tenant-ns",
+            &["cap-out".to_string()],
+            &reconcile_settings(),
+            &PullSecretAccountScope::uniform(false),
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 5,
+                lease_held: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            !converged,
+            "a superseded pending removal must stay open for the next sweep"
+        );
+        let state = cluster.lock().unwrap();
+        assert_eq!(
+            state.secrets.len(),
+            1,
+            "the rewritten object is still the platform-managed secret"
+        );
+        assert!(
+            state.service_accounts[0]
+                .image_pull_secrets
+                .as_ref()
+                .is_none_or(|refs| refs.is_empty()),
+            "Superseded must not restore the out-of-scope account's reference"
+        );
+        assert_eq!(
+            pending_reference_repairs(&state.service_accounts[0]).len(),
+            1,
+            "the durable discovery proof must be retained"
+        );
+    }
+
+    /// Devin review on #278 (bug, "Fresh deployment reference cleared mid-sweep").
+    /// The generation check passes, then a deploy attaches the reference. The
+    /// clear reads that latest ServiceAccount, so its resourceVersion cannot
+    /// detect the stale scope decision.
+    #[tokio::test]
+    async fn fresh_deploy_reference_attached_after_generation_check_is_not_cleared() {
+        use std::sync::{Arc, Mutex};
+        let mut secret =
+            fake_managed_secret("enclava-registry-auth", true, "cap-bot", "ghp_platform");
+        secret.metadata.annotations = Some(std::collections::BTreeMap::from([(
+            enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION.to_string(),
+            "1".to_string(),
+        )]));
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![secret],
+            service_accounts: vec![
+                fake_service_account("cap-in", &["enclava-registry-auth"]),
+                fake_service_account("cap-out", &[]),
+            ],
+            fresh_reference_after_secret_gets: Some(FreshReferenceAfterSecretGets {
+                arm_after_named_secret_gets: 1,
+                named_secret_gets: 0,
+                armed: false,
+                service_account: "cap-out".to_string(),
+                secret_name: "enclava-registry-auth".to_string(),
+                generation: 9,
+            }),
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        let scope = PullSecretAccountScope {
+            namespace_in_scope: true,
+            in_scope_accounts: ["cap-in".to_string()].into_iter().collect(),
+        };
+        let converged = reconcile_managed_pull_secrets(
+            &engine,
+            "tenant-ns",
+            &["cap-in".to_string(), "cap-out".to_string()],
+            &reconcile_settings(),
+            &scope,
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 5,
+                lease_held: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            !converged,
+            "clearing a reference attached after the generation check must defer"
+        );
+        let state = cluster.lock().unwrap();
+        let out = state
+            .service_accounts
+            .iter()
+            .find(|account| account.metadata.name.as_deref() == Some("cap-out"))
+            .unwrap();
+        assert!(
+            out.image_pull_secrets.as_ref().is_some_and(|refs| {
+                refs.iter()
+                    .any(|reference| reference.name == "enclava-registry-auth")
+            }),
+            "a reference attached after the generation check must survive the sweep"
+        );
+    }
+
     #[tokio::test]
     async fn pending_repair_from_newer_scope_keeps_uid_proof_and_reference_cleared() {
         use std::sync::{Arc, Mutex};
@@ -12185,6 +12523,127 @@ mod tests {
             std::env::remove_var("TENANT_IMAGE_PULL_SCOPE_GENERATION");
             std::env::remove_var("TENANT_IMAGE_PULL_CREDENTIAL_GENERATION");
         }
+    }
+
+    fn stale_rollout_manifests(namespace: &str) -> enclava_engine::manifest::GeneratedManifests {
+        use k8s_openapi::api::apps::v1::StatefulSet;
+        use k8s_openapi::api::core::v1::{ConfigMap, ResourceQuota, Service};
+        enclava_engine::manifest::GeneratedManifests {
+            namespace: k8s_openapi::api::core::v1::Namespace {
+                metadata: ObjectMeta {
+                    name: Some(namespace.to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            service_account: ServiceAccount {
+                metadata: ObjectMeta {
+                    name: Some("cap-tenant-app".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            network_policy: serde_json::Value::Null,
+            resource_quota: ResourceQuota::default(),
+            service: Service::default(),
+            sni_route_configmap: ConfigMap::default(),
+            envoy_proxy: serde_json::Value::Null,
+            gateway: serde_json::Value::Null,
+            tls_route: serde_json::Value::Null,
+            tee_tls_route: serde_json::Value::Null,
+            bootstrap_configmap: ConfigMap::default(),
+            startup_configmap: ConfigMap::default(),
+            ingress_configmap: ConfigMap::default(),
+            enclava_init_configmap: ConfigMap::default(),
+            verification_material_configmap: None,
+            statefulset: StatefulSet::default(),
+            kbs_owner_binding: (String::new(), serde_json::Value::Null),
+        }
+    }
+
+    fn reset_stale_rollout_authority_blocking() {
+        unsafe {
+            std::env::remove_var("TENANT_IMAGE_PULL_SCOPE_GENERATION");
+            std::env::remove_var("TENANT_IMAGE_PULL_CREDENTIAL_GENERATION");
+        }
+        let url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
+        let _ = std::process::Command::new("psql")
+            .env("PGPASSWORD", "test")
+            .arg(&url)
+            .arg("-v")
+            .arg("ON_ERROR_STOP=1")
+            .arg("-c")
+            .arg(
+                "UPDATE tenant_pull_secret_rollout_authority \
+                 SET max_scope_epoch = 0, max_credential_epoch = 0; \
+                 DELETE FROM tenant_pull_secret_scope_fences \
+                 WHERE namespace = 'devin-stale-rollout-ns'",
+            )
+            .output();
+    }
+
+    struct ResetStaleRolloutAuthority;
+    impl Drop for ResetStaleRolloutAuthority {
+        fn drop(&mut self) {
+            reset_stale_rollout_authority_blocking();
+        }
+    }
+
+    /// Devin review on #278 (SEC, "Stale rollout resurrects narrowed credentials").
+    /// An older replica passes `raise_tenant_pull_secret_rollout_authority`,
+    /// then a narrowing rollout deletes the secret and raises the epoch. The
+    /// later create-on-404 must re-check that epoch and must not recreate the
+    /// platform secret.
+    #[tokio::test]
+    async fn stale_replica_does_not_recreate_secret_deleted_by_newer_rollout() {
+        let _reset = ResetStaleRolloutAuthority;
+        let pool = crate::test_support::database_test_pool().await;
+        sqlx::query(
+            "UPDATE tenant_pull_secret_rollout_authority SET max_scope_epoch = 0, max_credential_epoch = 0",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM tenant_pull_secret_scope_fences WHERE namespace = $1")
+            .bind("devin-stale-rollout-ns")
+            .execute(&pool)
+            .await
+            .unwrap();
+        unsafe {
+            std::env::set_var("TENANT_IMAGE_PULL_SCOPE_GENERATION", "1");
+            std::env::set_var("TENANT_IMAGE_PULL_CREDENTIAL_GENERATION", "1");
+        }
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            echo_namespace_generation: Some(2),
+            raise_rollout_authority_on_secret_get: Some((9, 9)),
+            rollout_authority_pool: Some(pool.clone()),
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        let manifests = stale_rollout_manifests("devin-stale-rollout-ns");
+        let config = TenantImagePullSecretConfig {
+            name: "enclava-registry-auth".to_string(),
+            username: "cap-bot".to_string(),
+            token: "ghp_broad".to_string(),
+            allowed_repositories: Vec::new(),
+        };
+        let error = apply_all_with_tenant_image_pull_secret(
+            &engine,
+            &pool,
+            Uuid::nil(),
+            &manifests,
+            "hash",
+            Some(&config),
+            MutationGeneration::new(2).unwrap(),
+        )
+        .await
+        .unwrap_err();
+        let secret_count = cluster.lock().unwrap().secrets.len();
+        assert!(
+            matches!(error, DeployError::PullSecretReconcileDeferred(_)) && secret_count == 0,
+            "a newer epoch published after the pre-write check must defer the create, got {error:?}; secrets={secret_count}"
+        );
     }
 
     /// Reviewer follow-up on #243 (Critical): the per-deploy reconcile (the
