@@ -62,6 +62,19 @@ CI and API image workflow concurrency is scoped by workflow and pull-request
 number, falling back to the Git ref for non-PR events. New runs supersede older
 runs for the same PR; unrelated PRs must not cancel each other's checks.
 
+## Shared signed API image
+
+The API image pins the platform-release root and verifies its bundled signed
+envelope as a downgrade floor at build time. A pre-trustee-key envelope may
+serve only as that floor; it is never a usable runtime release. Each environment
+mounts its own current-schema, root-signed envelope at
+`ENCLAVA_PLATFORM_RELEASE_PATH`. Startup rejects a missing or invalid trustee
+policy key and refuses releases older than the image's verified floor. A new
+envelope must have a later signed `created_at` than a different bundled floor.
+Do not replace the shared CI envelope with one environment's release or
+remove the floor to make a build pass. Deploying a new image requires a
+compatible signed runtime envelope in every target environment.
+
 ## Local API
 
 ```bash
