@@ -1043,13 +1043,27 @@ async fn public_error_codes_are_persistable_job_codes() {
 /// the full emitter range — including variants that cannot be constructed in
 /// a unit test (sqlx/kube/reqwest sources).
 fn emitter_error_codes() -> Vec<&'static str> {
-    fn body_after<'a>(source: &'a str, anchor: &str) -> &'a str {
-        let start = source
-            .find(anchor)
-            .unwrap_or_else(|| panic!("anchor `{anchor}` not found in emitter source"));
-        let rest = &source[start..];
-        let end = rest.find("\n}\n").map(|i| i + 2).unwrap_or(rest.len());
-        &rest[..end]
+    fn bodies_after<'a>(source: &'a str, anchor: &str) -> Vec<&'a str> {
+        // An emitter type may carry several `impl` blocks (kbs.rs grew a
+        // second `impl KbsPolicyError` for the in-flight-write helper before
+        // the `public_code` block); enumerate every block the anchor names,
+        // not just its first occurrence.
+        let mut bodies = Vec::new();
+        let mut rest = source;
+        while let Some(pos) = rest.find(anchor) {
+            let segment = &rest[pos..];
+            let end = segment
+                .find("\n}\n")
+                .map(|i| i + 2)
+                .unwrap_or(segment.len());
+            bodies.push(&segment[..end]);
+            rest = &segment[end..];
+        }
+        assert!(
+            !bodies.is_empty(),
+            "anchor `{anchor}` not found in emitter source"
+        );
+        bodies
     }
 
     let mut codes = Vec::new();
@@ -1065,11 +1079,9 @@ fn emitter_error_codes() -> Vec<&'static str> {
         (kbs, "impl KbsPolicyError {"),
         (apply_engine, "impl ApplyError {"),
     ] {
-        let body = body_after(source, anchor);
-        let found: Vec<&str> = body
-            .split('"')
-            .skip(1)
-            .step_by(2)
+        let found: Vec<&str> = bodies_after(source, anchor)
+            .iter()
+            .flat_map(|body| body.split('"').skip(1).step_by(2))
             .filter(|literal| {
                 !literal.is_empty()
                     && literal
