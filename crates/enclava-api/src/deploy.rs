@@ -874,28 +874,45 @@ struct NamespacePullSecretApp {
     images: Option<Vec<ImageRef>>,
 }
 
-/// Scope for an out-of-scope deploy in a shared namespace. The deploying app
-/// is forced out of scope even when its stored image rows still match: those
-/// rows can lag the snapshot this deploy is applying. Other apps keep the
-/// secret only while their stored images still qualify.
-fn scope_for_shared_namespace_out_of_scope_deploy(
+/// Scope for one deploy in a shared namespace. The deploying app is forced
+/// in or out from THIS deploy's images: stored rows can lag the snapshot
+/// being applied. Other apps keep their stored-image decision.
+fn scope_for_shared_namespace_deploy(
     config: Option<&TenantImagePullSecretConfig>,
     deploying_app_id: Uuid,
+    deploying_in_scope: bool,
     apps: &[NamespacePullSecretApp],
+    deploy_service_accounts: &[String],
 ) -> PullSecretAccountScope {
     let Some(config) = config else {
         return PullSecretAccountScope::uniform(false);
     };
-    let in_scope_accounts: BTreeSet<String> = apps
+    let mut in_scope_accounts: std::collections::BTreeSet<String> = apps
         .iter()
         .filter(|app| app.app_id != deploying_app_id)
         .filter(|app| app_keeps_tenant_image_pull_secret(config, app.images.as_ref()))
         .map(|app| app.service_account.clone())
         .collect();
+    if deploying_in_scope {
+        in_scope_accounts.extend(deploy_service_accounts.iter().cloned());
+    }
     PullSecretAccountScope {
         namespace_in_scope: !in_scope_accounts.is_empty(),
         in_scope_accounts,
     }
+}
+
+/// Scope for an out-of-scope deploy in a shared namespace. The deploying app
+/// is forced out of scope even when its stored image rows still match: those
+/// rows can lag the snapshot this deploy is applying. Other apps keep the
+/// secret only while their stored images still qualify.
+#[cfg(test)]
+fn scope_for_shared_namespace_out_of_scope_deploy(
+    config: Option<&TenantImagePullSecretConfig>,
+    deploying_app_id: Uuid,
+    apps: &[NamespacePullSecretApp],
+) -> PullSecretAccountScope {
+    scope_for_shared_namespace_deploy(config, deploying_app_id, false, apps, &[])
 }
 
 /// Environment-derived pull-secret settings for one reconciliation pass.
@@ -1286,6 +1303,123 @@ async fn refresh_managed_pull_secret_credentials(
         ))),
         Err(error) => Err(DeployError::Apply(error.into())),
     }
+}
+
+/// Build the configured pull secret from the settings snapshot this pass
+/// already derived, so a sweep can recreate it without a second env read.
+fn configured_pull_secret_from_settings(
+    namespace: &str,
+    settings: &PullSecretSettings,
+) -> Option<Secret> {
+    let (username, token) = settings.ghcr()?;
+    let config = TenantImagePullSecretConfig {
+        name: settings.configured_name.clone(),
+        username: username.to_string(),
+        token: token.to_string(),
+        allowed_repositories: Vec::new(),
+    };
+    Some(generate_tenant_image_pull_secret(namespace, &config))
+}
+
+/// Create the configured pull secret and attach it to in-scope accounts when
+/// discovery found nothing to keep (Codex review on #276, P1). A narrowing
+/// that already deleted the secret and discharged its pending repair leaves
+/// a later expansion with no managed object and no intent; reporting
+/// convergence then opens admission while private workloads still cannot pull.
+async fn ensure_configured_pull_secret_for_in_scope_accounts(
+    engine: &ApplyEngine,
+    namespace: &str,
+    service_accounts: &[String],
+    settings: &PullSecretSettings,
+    scope: &PullSecretAccountScope,
+    api: &Api<Secret>,
+    foreign_replacements: &BTreeMap<String, BTreeSet<String>>,
+) -> Result<bool, DeployError> {
+    if !scope.namespace_in_scope {
+        return Ok(true);
+    }
+    let name = settings.configured_name.as_str();
+    let Some(desired) = configured_pull_secret_from_settings(namespace, settings) else {
+        return Ok(false);
+    };
+    let placeable = |live: &Secret| {
+        !uid_is_foreign_replacement(foreign_replacements, name, live.metadata.uid.as_deref())
+            && is_managed_tenant_image_pull_secret(live, settings.ghcr())
+    };
+    let live_uid = match api.get(name).await {
+        Ok(live) => {
+            if newer_pull_secret_scope(&live) {
+                return Err(DeployError::PullSecretReconcileDeferred(format!(
+                    "newer repository-scope epoch owns {namespace}/{name}"
+                )));
+            }
+            if !placeable(&live) {
+                tracing::warn!(
+                    %namespace,
+                    secret = %name,
+                    "tenant image pull secret reconcile: configured name is a tenant replacement \
+                     or is not CAP-managed; refusing to overwrite it or declare convergence"
+                );
+                return Ok(false);
+            }
+            live.metadata.uid.filter(|uid| !uid.is_empty())
+        }
+        Err(kube::Error::Api(error)) if error.code == 404 => {
+            match api
+                .create(&kube::api::PostParams::default(), &desired)
+                .await
+            {
+                Ok(created) => created.metadata.uid.filter(|uid| !uid.is_empty()),
+                Err(kube::Error::Api(error)) if error.code == 409 => match api.get(name).await {
+                    Ok(live) if placeable(&live) => live.metadata.uid.filter(|uid| !uid.is_empty()),
+                    Ok(_) => return Ok(false),
+                    Err(kube::Error::Api(error)) if error.code == 404 => return Ok(false),
+                    Err(error) => return Err(DeployError::Apply(error.into())),
+                },
+                Err(error) => return Err(DeployError::Apply(error.into())),
+            }
+        }
+        Err(error) => return Err(DeployError::Apply(error.into())),
+    };
+    let mut ok = true;
+    for account in service_accounts {
+        if scope.account_in_scope(account) {
+            if let Err(error) = restore_pull_secret_reference_to_service_account(
+                engine, namespace, account, name, None,
+            )
+            .await
+            {
+                ok = false;
+                tracing::warn!(
+                    %namespace,
+                    service_account = %account,
+                    secret = %name,
+                    %error,
+                    "tenant image pull secret reconcile: failed to attach the configured secret \
+                     to an in-scope account"
+                );
+            }
+        } else if let Err(error) = clear_pull_secret_reference_from_service_account(
+            engine,
+            namespace,
+            account,
+            name,
+            live_uid.as_deref(),
+        )
+        .await
+        {
+            ok = false;
+            tracing::warn!(
+                %namespace,
+                service_account = %account,
+                secret = %name,
+                %error,
+                "tenant image pull secret reconcile: failed to keep an out-of-scope account \
+                 detached from the recreated configured secret"
+            );
+        }
+    }
+    Ok(ok)
 }
 
 /// Reconcile the managed tenant pull secrets of one namespace to the set CAP
@@ -1829,6 +1963,42 @@ async fn reconcile_managed_pull_secrets(
                         );
                     }
                 }
+            }
+        }
+    }
+    // Codex review on #276, P1: in-scope reconciliation must create the
+    // configured secret and attach it to qualifying accounts when discovery
+    // returned no managed object and no pending intent remains. A discovered
+    // old-name secret or a pending repair already owns that credential; creating
+    // a second object there would duplicate the platform PAT.
+    let pending_intent = accounts
+        .iter()
+        .any(|account| !pending_reference_repairs(account).is_empty());
+    if scope.namespace_in_scope && managed.is_empty() && !pending_intent {
+        match ensure_configured_pull_secret_for_in_scope_accounts(
+            engine,
+            namespace,
+            service_accounts,
+            settings,
+            scope,
+            &api,
+            &foreign_replacements,
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => converged = false,
+            Err(DeployError::PullSecretReconcileDeferred(message)) => {
+                return Err(DeployError::PullSecretReconcileDeferred(message));
+            }
+            Err(error) => {
+                converged = false;
+                tracing::warn!(
+                    %namespace,
+                    %error,
+                    "tenant image pull secret reconcile: failed to recreate the configured secret \
+                     after scope expansion"
+                );
             }
         }
     }
@@ -3380,7 +3550,7 @@ fn with_deploy_service_accounts(
     accounts
 }
 
-async fn service_account_preserving_foreign_replacements(
+async fn service_account_preserving_pull_secret_records(
     engine: &ApplyEngine,
     namespace: &str,
     desired: &ServiceAccount,
@@ -3394,25 +3564,38 @@ async fn service_account_preserving_foreign_replacements(
         Err(kube::Error::Api(error)) if error.code == 404 => return Ok(desired.clone()),
         Err(error) => return Err(DeployError::Apply(error.into())),
     };
-    let Some(foreign) = existing
-        .metadata
-        .annotations
-        .as_ref()
+    let annotations = existing.metadata.annotations.as_ref();
+    let foreign = annotations
         .and_then(|annotations| annotations.get(FOREIGN_PULL_SECRET_REPLACEMENTS_ANNOTATION))
         .filter(|value| !value.is_empty())
-        .cloned()
-    else {
+        .cloned();
+    // Retained pending repairs are the only ownership proof of a renamed,
+    // unlabeled pre-rotation secret the repair pass deliberately kept. SSA of
+    // the generated ServiceAccount must copy them or it prunes that proof.
+    let pending = annotations
+        .and_then(|annotations| annotations.get(PENDING_PULL_SECRET_REFERENCE_REPAIRS_ANNOTATION))
+        .filter(|value| !value.is_empty())
+        .cloned();
+    if foreign.is_none() && pending.is_none() {
         return Ok(desired.clone());
-    };
+    }
     let mut preserved = desired.clone();
-    preserved
+    let dest = preserved
         .metadata
         .annotations
-        .get_or_insert_with(Default::default)
-        .insert(
+        .get_or_insert_with(Default::default);
+    if let Some(foreign) = foreign {
+        dest.insert(
             FOREIGN_PULL_SECRET_REPLACEMENTS_ANNOTATION.to_string(),
             foreign,
         );
+    }
+    if let Some(pending) = pending {
+        dest.insert(
+            PENDING_PULL_SECRET_REFERENCE_REPAIRS_ANNOTATION.to_string(),
+            pending,
+        );
+    }
     Ok(preserved)
 }
 
@@ -3487,6 +3670,32 @@ async fn apply_all_with_tenant_image_pull_secret(
             .await?;
     let namespace_service_accounts =
         with_deploy_service_accounts(&namespace_service_accounts, &service_accounts);
+    // Shared namespaces need the real per-account scope before SSA. A uniform
+    // decision would either restore every account or delete secrets another
+    // app still needs. The deploying app is forced from this snapshot; stored
+    // rows can lag.
+    let scope = if shared_namespace {
+        let deploying_app_id: Uuid =
+            sqlx::query_scalar("SELECT app_id FROM deployments WHERE id = $1")
+                .bind(deployment_id)
+                .fetch_one(pool)
+                .await?;
+        let apps = load_namespace_pull_secret_apps(pool, ns_name).await?;
+        scope_for_shared_namespace_deploy(
+            tenant_image_pull_secret_config_from_env().as_ref(),
+            deploying_app_id,
+            image_pull_secret_config.is_some(),
+            &apps,
+            &service_accounts,
+        )
+    } else {
+        PullSecretAccountScope::uniform(image_pull_secret_config.is_some())
+    };
+    let reconcile_accounts = if shared_namespace {
+        namespace_service_accounts.as_slice()
+    } else {
+        service_accounts.as_slice()
+    };
     if let Some(config) = image_pull_secret_config {
         apply_scoped_pull_secret(
             engine,
@@ -3525,34 +3734,13 @@ async fn apply_all_with_tenant_image_pull_secret(
     } else {
         // Codex review on #276, P1: a shared namespace whose last qualifying
         // app is redeployed out of scope must not wait for the periodic
-        // sweep. Query the namespace inventory, force THIS deploy's app out
-        // of scope (its stored rows can still show the old images), and
-        // require cleanup convergence before continuing. Other apps that
-        // still qualify keep the secret; this app's reference is cleared.
-        let scope = if shared_namespace {
-            let deploying_app_id: Uuid =
-                sqlx::query_scalar("SELECT app_id FROM deployments WHERE id = $1")
-                    .bind(deployment_id)
-                    .fetch_one(pool)
-                    .await?;
-            let apps = load_namespace_pull_secret_apps(pool, ns_name).await?;
-            scope_for_shared_namespace_out_of_scope_deploy(
-                tenant_image_pull_secret_config_from_env().as_ref(),
-                deploying_app_id,
-                &apps,
-            )
-        } else {
-            PullSecretAccountScope::uniform(false)
-        };
-        let cleanup_accounts = if shared_namespace {
-            namespace_service_accounts.as_slice()
-        } else {
-            service_accounts.as_slice()
-        };
+        // sweep. The scope above already forces THIS deploy's app out of
+        // scope (its stored rows can still show the old images). Other apps
+        // that still qualify keep the secret; this app's reference is cleared.
         let converged = reconcile_managed_pull_secrets_for_deploy(
             engine,
             ns_name,
-            cleanup_accounts,
+            reconcile_accounts,
             &settings,
             &scope,
             PullSecretReconcileContext::Deploy,
@@ -3567,37 +3755,30 @@ async fn apply_all_with_tenant_image_pull_secret(
         }
     }
 
-    // Complete surviving UID-proven removals BEFORE SSA can prune their
-    // ServiceAccount annotation. The configured secret (if desired) was
-    // already applied and its own stale intent discharged above. In-scope
-    // residue and old renamed secrets must converge before further writes.
-    let repaired = if shared_namespace {
-        true // namespace-wide sweeper has the complete ServiceAccount inventory
-    } else {
-        // Sweep context on purpose: this deploy sees all accounts of the
-        // namespace, so the durable repair pass must run before SSA can
-        // prune its ServiceAccount annotations.
-        reconcile_managed_pull_secrets_for_deploy(
-            engine,
-            ns_name,
-            &service_accounts,
-            &settings,
-            &PullSecretAccountScope::uniform(image_pull_secret_config.is_some()),
-            PullSecretReconcileContext::Sweep,
-        )
-        .await?
-    };
+    // Codex review on #276, P1: do not assume the background sweeper has
+    // already finished pending repairs. A shared-namespace deploy's
+    // ServiceAccount apply preserves only the annotations copied below, so
+    // it can prune the pending name/UID that is the sole ownership proof of
+    // a renamed, unlabeled pre-rotation secret. Run the sweep-context repair
+    // pass with the complete namespace account list first. Sweep context is
+    // required: Deploy context skips the durable repair pass.
+    let repaired = reconcile_managed_pull_secrets_for_deploy(
+        engine,
+        ns_name,
+        reconcile_accounts,
+        &settings,
+        &scope,
+        PullSecretReconcileContext::Sweep,
+    )
+    .await?;
     if !repaired {
         return Err(DeployError::Validation(
             "pending pull-secret repair did not converge before ServiceAccount apply".to_string(),
         ));
     }
-    let preserved_service_account = service_account_preserving_foreign_replacements(
-        engine,
-        ns_name,
-        &manifests.service_account,
-    )
-    .await?;
+    let preserved_service_account =
+        service_account_preserving_pull_secret_records(engine, ns_name, &manifests.service_account)
+            .await?;
     let step = apply_standard_resources_with_service_account(
         engine,
         manifests,
@@ -3774,9 +3955,9 @@ async fn apply_all_with_tenant_image_pull_secret(
         "step 5/5: StatefulSet applied"
     );
 
-    // Only the just-applied configured name was discharged above. Other
-    // pending UID-proven removals (including renamed, unlabeled old-PAT
-    // secrets) remain durable for the sweep to finish.
+    // The sweep-context repair above already finished UID-proven removals
+    // whose annotations this ServiceAccount apply would otherwise prune.
+    // Retained intents were copied onto the desired ServiceAccount.
 
     tracing::info!(namespace = %ns_name, "apply_all complete");
     Ok(())
@@ -9070,6 +9251,154 @@ mod tests {
         assert!(
             !scope_for_shared_namespace_out_of_scope_deploy(None, deploying, &stored_in_scope)
                 .namespace_in_scope
+        );
+    }
+
+    #[test]
+    fn shared_namespace_in_scope_deploy_forces_deploying_account_in_scope() {
+        let deploying = Uuid::from_u128(1);
+        let other = Uuid::from_u128(2);
+        let config = TenantImagePullSecretConfig {
+            name: "enclava-registry-auth".to_string(),
+            username: "cap-bot".to_string(),
+            token: "ghp_platform".to_string(),
+            allowed_repositories: vec![
+                parse_image_pull_repository_scope("ghcr.io/company/private").unwrap(),
+            ],
+        };
+        let out_of_scope = ImageRef::parse("ghcr.io/other/public:latest").unwrap();
+        let in_scope = ImageRef::parse("ghcr.io/company/private:latest").unwrap();
+        let scope = scope_for_shared_namespace_deploy(
+            Some(&config),
+            deploying,
+            true,
+            &[
+                NamespacePullSecretApp {
+                    app_id: deploying,
+                    service_account: "stale-stored".to_string(),
+                    images: Some(vec![out_of_scope]),
+                },
+                NamespacePullSecretApp {
+                    app_id: other,
+                    service_account: "other".to_string(),
+                    images: Some(vec![in_scope]),
+                },
+            ],
+            &["deploying".to_string()],
+        );
+        assert!(scope.namespace_in_scope);
+        assert!(scope.account_in_scope("deploying"));
+        assert!(scope.account_in_scope("other"));
+        assert!(
+            !scope.account_in_scope("stale-stored"),
+            "stored out-of-scope images must not keep the deploying app's old account in scope"
+        );
+    }
+
+    /// Codex review on #276, P1: after a narrowing deleted the configured
+    /// secret and discharged its pending repair, a later expansion has no
+    /// managed object and no intent. Reconciliation must recreate the secret
+    /// and attach it to qualifying accounts instead of reporting convergence.
+    #[tokio::test]
+    async fn in_scope_reconcile_recreates_configured_secret_without_pending_intent() {
+        use std::sync::{Arc, Mutex};
+
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![],
+            service_accounts: vec![
+                fake_service_account("in-scope", &[]),
+                fake_service_account("out-of-scope", &[]),
+            ],
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        let scope = PullSecretAccountScope {
+            namespace_in_scope: true,
+            in_scope_accounts: ["in-scope".to_string()].into(),
+        };
+        let converged = reconcile_managed_pull_secrets(
+            &engine,
+            "tenant-ns",
+            &["in-scope".to_string(), "out-of-scope".to_string()],
+            &reconcile_settings(),
+            &scope,
+            PullSecretReconcileContext::Sweep,
+        )
+        .await
+        .unwrap();
+        assert!(converged);
+        let state = cluster.lock().unwrap();
+        assert_eq!(state.secrets.len(), 1);
+        assert_eq!(
+            state.secrets[0].metadata.name.as_deref(),
+            Some("enclava-registry-auth")
+        );
+        assert!(is_labeled_managed_pull_secret(&state.secrets[0]));
+        let in_scope = state
+            .service_accounts
+            .iter()
+            .find(|account| account.metadata.name.as_deref() == Some("in-scope"))
+            .unwrap();
+        assert_eq!(
+            in_scope.image_pull_secrets.as_ref().unwrap()[0].name,
+            "enclava-registry-auth"
+        );
+        let out_of_scope = state
+            .service_accounts
+            .iter()
+            .find(|account| account.metadata.name.as_deref() == Some("out-of-scope"))
+            .unwrap();
+        assert!(
+            out_of_scope
+                .image_pull_secrets
+                .as_ref()
+                .is_none_or(|references| references.is_empty()),
+            "an out-of-scope account must not gain the recreated platform secret"
+        );
+    }
+
+    #[tokio::test]
+    async fn in_scope_reconcile_does_not_overwrite_tenant_owned_configured_name() {
+        use std::sync::{Arc, Mutex};
+
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![fake_managed_secret(
+                "enclava-registry-auth",
+                false,
+                "tenant-user",
+                "tenant-token",
+            )],
+            service_accounts: vec![fake_service_account("in-scope", &[])],
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        let converged = reconcile_managed_pull_secrets(
+            &engine,
+            "tenant-ns",
+            &["in-scope".to_string()],
+            &reconcile_settings(),
+            &PullSecretAccountScope::uniform(true),
+            PullSecretReconcileContext::Sweep,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !converged,
+            "a tenant-owned object at the configured name must keep admission closed"
+        );
+        let state = cluster.lock().unwrap();
+        assert_eq!(state.secrets.len(), 1);
+        assert!(!is_labeled_managed_pull_secret(&state.secrets[0]));
+        let dockerconfig = state.secrets[0]
+            .data
+            .as_ref()
+            .unwrap()
+            .get(".dockerconfigjson")
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&dockerconfig.0).unwrap();
+        assert_eq!(
+            parsed["auths"]["ghcr.io"]["password"].as_str(),
+            Some("tenant-token")
         );
     }
 

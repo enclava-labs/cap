@@ -559,9 +559,15 @@ pub struct DeploymentResponse {
 const PUBLIC_DEPLOYMENT_ERROR_MESSAGE: &str = "deployment_error";
 
 /// Bounded failure classifications that may cross the API boundary verbatim.
-/// The control-plane pair is the historical passthrough set; the pull-secret
-/// codes are `DeployError::public_code` classifications from #276 and must
-/// stay in lockstep with the 0087 CHECK. Anything else is redacted.
+/// The control-plane pair is the historical passthrough set. The pull-secret
+/// codes are admitted so a stored row is not redacted, in lockstep with the
+/// 0087 CHECK. They are not written today: `pull_secret_reconcile_deferred`
+/// is a non-terminal requeue (`requeue_apply_job` clears `last_error_code`
+/// for every transient reason, and the deployment stays non-terminal), and
+/// `pull_secret_delete_conflict` is a terminal apply failure published as
+/// `deployment_apply_failed` like every other apply error. The specific
+/// classification stays in logs via `DeployError::public_code`. Anything
+/// else is redacted.
 const PUBLIC_DEPLOYMENT_ERROR_CODES: &[&str] = &[
     crate::deploy::DEPLOYMENT_SUPERSEDED_ERROR,
     crate::deployment_jobs::CUSTOMER_CONFIG_HOLD_EXPIRED,

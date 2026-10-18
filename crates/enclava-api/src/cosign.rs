@@ -400,15 +400,38 @@ async fn exchange_registry_basic_auth(
     Ok(Auth::Bearer(token.to_string()))
 }
 
+/// True when the auth about to be exchanged is the legacy `GHCR_*` pair, not
+/// platform `COSIGN_*` credentials. A configured COSIGN pair that is actually
+/// allowlisted for this host wins inside [`registry_auth_with_allowlist`];
+/// only the fallback that selected `GHCR_*` must be pinned to ghcr.io.
+fn legacy_ghcr_credentials_selected(registry: &str) -> bool {
+    if registry != "ghcr.io" || env_nonempty("GHCR_TOKEN").is_none() {
+        return false;
+    }
+    let credentials = CosignRegistryCredentials::from_env();
+    if !credentials.is_configured() {
+        return true;
+    }
+    let allowed = cosign_registry_allowed_hosts_from_env();
+    let allow_http = env_flag("COSIGN_ALLOW_HTTP_REGISTRY");
+    let scheme = if allow_http { "http" } else { "https" };
+    !realm_host_allowed(&format!("{scheme}://{registry}/"), &allowed, allow_http)
+}
+
 fn registry_realm_allowed_hosts(
     registry: &str,
-    mut allowed_hosts: Vec<String>,
-    legacy_ghcr_token_configured: bool,
+    allowed_hosts: Vec<String>,
+    legacy_ghcr_credentials_selected: bool,
 ) -> Vec<String> {
-    // Legacy GHCR credentials are independently scoped to ghcr.io, including
-    // GHCR's same-host token service; they do not require the COSIGN_* list.
-    if registry == "ghcr.io" && legacy_ghcr_token_configured {
-        allowed_hosts.push("ghcr.io".into());
+    // Codex review on #276, P1: when the credentials being exchanged are the
+    // legacy GHCR pair, the realm policy is only the pinned HTTPS/default-port
+    // ghcr.io token service. Unioning `COSIGN_REGISTRY_ALLOWED_HOSTS`
+    // (another token host, or `*`) lets a ghcr.io bearer challenge name that
+    // general destination and `exchange_registry_basic_auth` will send the
+    // GHCR username/token there. COSIGN-selected credentials keep the operator
+    // allowlist — those hosts were explicitly authorized for that pair.
+    if registry == "ghcr.io" && legacy_ghcr_credentials_selected {
+        return vec!["ghcr.io".into()];
     }
     allowed_hosts
 }
@@ -418,11 +441,12 @@ async fn registry_auth_from_env_with_realm_policy(
     registry_base: &str,
     image: &OciReference,
 ) -> Result<Auth, CosignError> {
-    let auth = registry_auth_from_env(image.resolve_registry());
+    let registry = image.resolve_registry();
+    let auth = registry_auth_from_env(registry);
     let allowed_hosts = registry_realm_allowed_hosts(
-        image.resolve_registry(),
+        registry,
         cosign_registry_allowed_hosts_from_env(),
-        env_nonempty("GHCR_TOKEN").is_some(),
+        legacy_ghcr_credentials_selected(registry),
     );
     exchange_registry_basic_auth(
         proxy_url,
@@ -2180,6 +2204,132 @@ mod tests {
         }
         assert!(registry_realm_allowed_hosts("evil.example", vec![], true).is_empty());
         assert!(registry_realm_allowed_hosts("ghcr.io", vec![], false).is_empty());
+    }
+
+    /// Codex review on #276, P1: a GHCR bearer challenge must not be allowed to
+    /// name a general COSIGN destination just because `GHCR_*` was selected.
+    #[test]
+    fn legacy_ghcr_realm_policy_does_not_union_cosign_allowlist() {
+        let isolated = registry_realm_allowed_hosts(
+            "ghcr.io",
+            vec!["*".into(), "token.example".into(), "ghcr.io".into()],
+            true,
+        );
+        assert_eq!(isolated, vec!["ghcr.io".to_string()]);
+        assert!(realm_host_allowed(
+            "https://ghcr.io/token",
+            &isolated,
+            false
+        ));
+        assert!(!realm_host_allowed(
+            "https://ghcr.io:8443/token",
+            &isolated,
+            false
+        ));
+        for realm in [
+            "https://token.example/token",
+            "https://evil.example/token",
+            "http://ghcr.io/token",
+        ] {
+            assert!(
+                !realm_host_allowed(realm, &isolated, false),
+                "{realm} must not receive GHCR credentials"
+            );
+        }
+        // COSIGN-selected credentials keep the operator allowlist.
+        let cosign = registry_realm_allowed_hosts(
+            "ghcr.io",
+            vec!["ghcr.io".into(), "token.example".into()],
+            false,
+        );
+        assert!(realm_host_allowed(
+            "https://token.example/token",
+            &cosign,
+            false
+        ));
+    }
+
+    /// The realm isolation only applies when `GHCR_*` was the selected auth.
+    /// A COSIGN pair that is allowlisted for ghcr.io must keep the operator list.
+    #[test]
+    fn legacy_ghcr_selection_follows_the_auth_that_will_be_exchanged() {
+        const CHILD: &str = "CAP_COSIGN_GHCR_REALM_SOURCE";
+        if let Ok(case) = std::env::var(CHILD) {
+            match case.as_str() {
+                "ghcr-only" => assert!(legacy_ghcr_credentials_selected("ghcr.io")),
+                "cosign-wins" => assert!(!legacy_ghcr_credentials_selected("ghcr.io")),
+                "other-host" => assert!(!legacy_ghcr_credentials_selected("token.example")),
+                other => panic!("unknown case {other}"),
+            }
+            return;
+        }
+        for (case, username, password, token, hosts) in [
+            ("ghcr-only", None, None, Some("ghp_ghcr"), Some("*")),
+            (
+                "cosign-wins",
+                Some("cosign-user"),
+                Some("cosign-pass"),
+                Some("ghp_ghcr"),
+                Some("ghcr.io,token.example"),
+            ),
+            (
+                "other-host",
+                None,
+                None,
+                Some("ghp_ghcr"),
+                Some("token.example"),
+            ),
+        ] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "cosign::tests::legacy_ghcr_selection_follows_the_auth_that_will_be_exchanged",
+                    "--nocapture",
+                ])
+                .env(CHILD, case)
+                .env_remove("COSIGN_REGISTRY_BEARER_TOKEN")
+                .env_remove("COSIGN_ALLOW_HTTP_REGISTRY")
+                .env_remove("GHCR_USERNAME");
+            match username {
+                Some(value) => {
+                    command.env("COSIGN_REGISTRY_USERNAME", value);
+                }
+                None => {
+                    command.env_remove("COSIGN_REGISTRY_USERNAME");
+                }
+            }
+            match password {
+                Some(value) => {
+                    command.env("COSIGN_REGISTRY_PASSWORD", value);
+                }
+                None => {
+                    command.env_remove("COSIGN_REGISTRY_PASSWORD");
+                }
+            }
+            match token {
+                Some(value) => {
+                    command.env("GHCR_TOKEN", value);
+                }
+                None => {
+                    command.env_remove("GHCR_TOKEN");
+                }
+            }
+            match hosts {
+                Some(value) => {
+                    command.env("COSIGN_REGISTRY_ALLOWED_HOSTS", value);
+                }
+                None => {
+                    command.env_remove("COSIGN_REGISTRY_ALLOWED_HOSTS");
+                }
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{case}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     #[test]
