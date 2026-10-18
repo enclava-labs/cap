@@ -1588,6 +1588,80 @@ pub async fn rotate_org_owner(
     let directive_digest = Sha256::digest(&directive);
     let intent_digest = Sha256::digest(&payload_bytes);
 
+    // Preliminary validity checks (PR #185, Codex P2 "reject invalid
+    // directives before persisting their intents"): the intent insert below
+    // commits before any lane validation runs, and org_rotation_intents has
+    // no purge path, so a rejected request used to leave a durable row
+    // behind -- a compromised owner key could grow the database without
+    // completing any rotation. Only checks whose verdicts cannot flip while
+    // queueing for the signing-authority lane are safe here; anything
+    // race-sensitive (missing keyring, version too high -- both can be
+    // legalized by a concurrent commit before the lane is acquired) stays
+    // post-lane and authoritative.
+    {
+        let precheck_now = Utc::now();
+        // The lane reads its clock after queueing, which can outlast any
+        // window captured here, so both bounds carry a skew allowance:
+        // only directives that no realistic clock skew plus queue delay
+        // could legitimize are rejected pre-lane (enclava-api and
+        // PostgreSQL run on different hosts).
+        const PRECHECK_CLOCK_SKEW_SECONDS: i64 = 300;
+        if body.signed_at > precheck_now + chrono::Duration::seconds(PRECHECK_CLOCK_SKEW_SECONDS) {
+            return Err(bad_request(
+                "owner rotation directive signed_at is in the future",
+            ));
+        }
+        // Versions only ever increment, so a body.version strictly below
+        // the current latest can never become an exact replay or a legal
+        // successor. The created_at floor is re-read at the lane; it is
+        // not stable enough to reject here, because a directive captured
+        // during a queued insert can still clear a transaction-start stamp.
+        let latest_version: Option<i64> =
+            sqlx::query_scalar("SELECT max(version) FROM org_keyrings WHERE org_id = $1")
+                .bind(org_id)
+                .fetch_one(&state.db)
+                .await
+                .map_err(|_| db_error())?;
+        if let Some(latest_version) = latest_version {
+            if body.version <= latest_version {
+                // Same-version requests are idempotent replays whose
+                // freshness the lane deliberately does not bound; only
+                // strictly-below versions are stable-rejectable.
+                if body.version < latest_version {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({
+                            "error": "keyring version is stale"
+                        })),
+                    ));
+                }
+            } else if body.signed_at
+                < precheck_now
+                    - chrono::Duration::seconds(
+                        MAX_DIRECTIVE_AGE_SECONDS + PRECHECK_CLOCK_SKEW_SECONDS,
+                    )
+            {
+                // New-version path. An expired directive with no committed
+                // receipt for these exact digests cannot be waived at the
+                // lane either, and receipts are never deleted, so the
+                // verdict is stable. Skew allowance in both directions.
+                let receipted: Option<i32> = sqlx::query_scalar(
+                    "SELECT 1 FROM org_rotation_upstream_receipts
+                      WHERE org_id = $1 AND directive_sha256 = $2 AND keyring_sha256 = $3",
+                )
+                .bind(org_id)
+                .bind(directive_digest.as_slice())
+                .bind(intent_digest.as_slice())
+                .fetch_optional(&state.db)
+                .await
+                .map_err(|_| db_error())?;
+                if receipted.is_none() {
+                    return Err(bad_request("owner rotation directive signed_at is too old"));
+                }
+            }
+        }
+    }
+
     let signing_service = state.signing_service.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         Json(serde_json::json!({"error": "platform signing service is not configured"})),
@@ -1832,7 +1906,7 @@ pub async fn rotate_org_owner(
         .await;
     }
 
-    let committed_own_receipt = if service_owner.as_deref() == Some(current_owner.as_slice()) {
+    if service_owner.as_deref() == Some(current_owner.as_slice()) {
         let rotated = rotate_service_owner(
             signing_service,
             org_id,
@@ -1892,26 +1966,29 @@ pub async fn rotate_org_owner(
             }
         }
         tx.commit().await.map_err(|_| db_error())?;
-        true
     } else if service_owner.as_deref() == Some(replacement_owner.as_slice()) {
         // The service already holds the replacement (a prior attempt or
         // a concurrent retry pinned it): no RPC, and no receipt -- only
         // a response-validated RPC can mint one. Committing ends the
         // read-only phase.
         tx.commit().await.map_err(|_| db_error())?;
-        false
     } else {
         return Err(crate::routes::deployments::signing_error_response(
             crate::signing_service::SigningServiceError::AuthorityStatus(
                 "signing service owner matches neither rotation key".to_string(),
             ),
         ));
-    };
+    }
 
     // Phase 2: final lane transaction. The lane was released after the
     // receipt-only commit, so competing keyring changes may have landed;
-    // membership, keyring, service owner, and freshness are re-read and
-    // re-derived here. This phase never issues an upstream RPC (at most
+    // keyring, service owner, and freshness are re-read and re-derived here.
+    // Recheck and lock the caller's current membership before committing any
+    // successor keyring. A removal committed during the lane gap must win;
+    // a removal racing this lock waits until finalization commits. If the
+    // upstream owner already changed, the durable receipt lets a remaining
+    // owner recover the exact transition instead of granting a removed owner
+    // continued signing authority. This phase never issues an upstream RPC (at most
     // one per request, spent or deliberately skipped in phase 1): the
     // service must already hold the replacement owner before any CAP
     // write, so the stored keyring authority and the service stay pinned
@@ -1933,28 +2010,10 @@ pub async fn rotate_org_owner(
     .await?;
 
     let owner_status = read_live_service_owner(signing_service, org_id).await?;
+    let current_role =
+        scopes::lock_and_read_active_membership_role_in_tx(&mut tx, org_id, auth.user_id).await?;
+    scopes::require_owner_role(current_role)?;
     let service_owner = service_owner_pubkey(&owner_status);
-    // A response-validated RPC performed by this request already passed the
-    // phase-one membership lock before the irreversible owner switch. Once
-    // its exact receipt is committed and still matches the live service,
-    // a subsequent membership demotion must not strand CAP on the old owner.
-    // Requests merely recovering an earlier receipt still need a live owner.
-    let own_receipt_still_live = committed_own_receipt
-        && upstream_receipt_matches_live_service(
-            &mut tx,
-            org_id,
-            directive_digest.as_slice(),
-            intent_digest.as_slice(),
-            &owner_status,
-            &replacement_owner,
-        )
-        .await?;
-    if !own_receipt_still_live {
-        let current_role =
-            scopes::lock_and_read_active_membership_role_in_tx(&mut tx, org_id, auth.user_id)
-                .await?;
-        scopes::require_owner_role(current_role)?;
-    }
     if service_owner.as_deref() != Some(replacement_owner.as_slice()) {
         return Err(crate::routes::deployments::signing_error_response(
             crate::signing_service::SigningServiceError::AuthorityStatus(
@@ -2033,11 +2092,9 @@ pub async fn rotate_org_owner(
             })),
         ));
     }
-    // Revalidate recovery provenance after the lane gap. A request that
-    // performed the RPC itself was authorized under the phase-one lock;
-    // allow that exact committed receipt to preserve its successor-key
-    // registration if the initiator was removed before finalization.
-    let receipt_bound_recovery = (receipt_bound_recovery || own_receipt_still_live)
+    // Revalidate recovery provenance after the lane gap. Fresh requests keep
+    // caller-bound registration checks even if their RPC just minted a receipt.
+    let receipt_bound_recovery = receipt_bound_recovery
         && upstream_receipt_matches_live_service(
             &mut tx,
             org_id,
@@ -6968,8 +7025,9 @@ mod tests {
 
         // Deterministic lane-gap regression: the receipt INSERT runs after
         // phase-one authorization but before its commit. Demote the caller in
-        // that same transaction; phase two must honor this request's own
-        // durable, live-service-bound receipt instead of stranding CAP.
+        // that same transaction. Phase 2 re-authorizes unconditionally, so
+        // the demoted caller must not write the successor keyring; the
+        // durable receipt remains for a still-active owner to recover.
         sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2)")
             .bind(remaining_owner_id)
             .bind(third_key.verifying_key().to_bytes().to_vec())
@@ -7008,15 +7066,15 @@ mod tests {
             Utc::now(),
             "membership-changes-after-upstream",
         );
-        let gap_result = rotate_org_owner(
+        let gap_error = rotate_org_owner(
             remaining_auth,
             State(state),
             Path(org_name),
             Json(gap_request),
         )
         .await
-        .expect("phase-one-authorized RPC completes despite later demotion");
-        assert_eq!(gap_result.keyring_version, 3);
+        .expect_err("a caller demoted before phase 2 must not write the successor keyring");
+        assert_eq!(gap_error.0, StatusCode::FORBIDDEN);
         let role_after: String = sqlx::query_scalar(
             "SELECT role::text FROM memberships WHERE org_id = $1 AND user_id = $2",
         )
@@ -7027,6 +7085,28 @@ mod tests {
         .expect("read role after receipt");
         assert_eq!(role_after, "admin");
         assert_eq!(mock.lock().expect("mock owner lock").rotate_calls, 2);
+        let gap_keyrings: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM org_keyrings WHERE org_id = $1 AND version = 3",
+        )
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count successor keyring after demotion");
+        assert_eq!(
+            gap_keyrings, 0,
+            "demoted caller must not write the successor keyring"
+        );
+        let gap_receipts: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM org_rotation_upstream_receipts WHERE org_id = $1",
+        )
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count recoverable receipts after demotion");
+        assert_eq!(
+            gap_receipts, 2,
+            "the upstream change remains recoverable by a still-active owner"
+        );
         crate::test_support::drop_isolated_database("cap185_receipt_handoff", pool).await;
     }
 
@@ -8269,6 +8349,221 @@ mod tests {
         );
     }
 
+    /// Regression: removing the caller between phase 1's receipt commit and
+    /// phase 2's membership lock must prevent a successor keyring write.
+    /// The upstream change remains recoverable by an active owner using the
+    /// persisted receipt. The mock removes membership during phase 2's
+    /// second owner-status GET, before the phase-2 membership lock.
+    #[tokio::test]
+    async fn owner_rotation_rejects_removed_caller_mid_request() {
+        let pool = database_test_pool().await;
+        let org_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let suffix = org_id.simple().to_string();
+        let org_name = format!("rotate-midremoval-{suffix}");
+        crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+            .await
+            .expect("insert midremoval org");
+        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Midremoval Owner')")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("insert midremoval user");
+        sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+            .bind(user_id)
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("insert midremoval membership");
+        let current_key = SigningKey::generate(&mut OsRng);
+        let replacement_key = SigningKey::generate(&mut OsRng);
+        sqlx::query(
+            "INSERT INTO user_signing_keys (user_id, pubkey)
+             VALUES ($1, $2), ($1, $3)",
+        )
+        .bind(user_id)
+        .bind(current_key.verifying_key().to_bytes().to_vec())
+        .bind(replacement_key.verifying_key().to_bytes().to_vec())
+        .execute(&pool)
+        .await
+        .expect("insert midremoval signing keys");
+
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+
+        // Mock signing service whose second GET /orgs/{id}/owner call
+        // (phase 2's live-owner read) synchronously deletes the caller's
+        // membership before answering -- the exact mid-request removal.
+        let owner = Arc::new(std::sync::Mutex::new(MockSigningServiceOwner {
+            owner: current_key.verifying_key().to_bytes(),
+            changed_at: Utc::now(),
+            version: 1,
+            rotate_calls: 0,
+        }));
+        let status_owner = owner.clone();
+        let rotate_owner = owner.clone();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let status_calls = calls.clone();
+        let hook_pool = pool.clone();
+        let app = axum::Router::new()
+            .route(
+                &format!("/orgs/{org_id}/owner"),
+                axum::routing::get(move || async move {
+                    if status_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 1 {
+                        sqlx::query("DELETE FROM memberships WHERE org_id = $1 AND user_id = $2")
+                            .bind(org_id)
+                            .bind(user_id)
+                            .execute(&hook_pool)
+                            .await
+                            .expect("remove caller membership mid-request");
+                    }
+                    let state = status_owner.lock().expect("mock owner lock");
+                    axum::Json(serde_json::json!({
+                        "org_id": org_id,
+                        "state": "ready",
+                        "version": state.version,
+                        "owner_pubkey_hex": hex::encode(state.owner),
+                        "last_changed_at": state.changed_at,
+                    }))
+                }),
+            )
+            .route(
+                "/rotate-owner",
+                axum::routing::post(
+                    move |axum::Json(req): axum::Json<serde_json::Value>| async move {
+                        let mut state = rotate_owner.lock().expect("mock owner lock");
+                        let signer = req["signing_pubkey_b64"]
+                            .as_str()
+                            .and_then(|raw| B64.decode(raw).ok())
+                            .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok());
+                        if signer != Some(state.owner) {
+                            return (
+                                StatusCode::CONFLICT,
+                                axum::Json(serde_json::json!({
+                                    "error": "rotation signer does not match the current owner"
+                                })),
+                            );
+                        }
+                        let replacement: [u8; 32] = B64
+                            .decode(req["replacement_owner_pubkey_b64"].as_str().unwrap_or(""))
+                            .expect("mock replacement owner decodes")
+                            .try_into()
+                            .expect("mock replacement owner is 32 bytes");
+                        state.owner = replacement;
+                        state.changed_at = Utc::now();
+                        state.version += 1;
+                        state.rotate_calls += 1;
+                        (
+                            StatusCode::OK,
+                            axum::Json(serde_json::json!({
+                                "org_id": req["org_id"].clone(),
+                                "version": state.version,
+                                "owner_pubkey_fingerprint": hex::encode(replacement),
+                                "rotated_at": state.changed_at,
+                            })),
+                        )
+                    },
+                ),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind midremoval mock");
+        let address = listener.local_addr().expect("midremoval mock address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve midremoval mock");
+        });
+        state.signing_service = Some(
+            crate::signing_service::SigningServiceClient::new(format!("http://{address}/"), None)
+                .expect("build midremoval mock client"),
+        );
+
+        let auth = AuthContext {
+            user_id,
+            org_id,
+            org_name: org_name.clone(),
+            role: Role::Owner,
+            api_key: None,
+            management_origin: crate::auth::middleware::ManagementOrigin::Public,
+        };
+        let _ = put_keyring(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(signed_keyring_request(org_id, user_id, &current_key, 1, 1)),
+        )
+        .await
+        .expect("insert v1 keyring");
+        // PUT's authority fence also reads owner status; count only the
+        // rotation's phase-1 and phase-2 reads for this removal hook.
+        calls.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let request = rotation_request(
+            org_id,
+            user_id,
+            &current_key,
+            &replacement_key,
+            2,
+            2,
+            Utc::now(),
+            "mid-request membership removal",
+        );
+        let rejection = rotate_org_owner(
+            auth,
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(request),
+        )
+        .await
+        .expect_err("removed caller must not finalize a successor keyring");
+        assert_eq!(rejection.0, StatusCode::FORBIDDEN);
+        let membership_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM memberships WHERE org_id = $1 AND user_id = $2",
+        )
+        .bind(org_id)
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count caller membership");
+        assert_eq!(
+            membership_count, 0,
+            "the mid-request removal hook must have fired"
+        );
+        let stored: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM org_keyrings WHERE org_id = $1 AND version = 2",
+        )
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count v2 keyring");
+        assert_eq!(stored, 0, "removed owner must not write successor keyring");
+        let receipts: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM org_rotation_upstream_receipts WHERE org_id = $1",
+        )
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count recovery receipts");
+        assert_eq!(receipts, 1, "upstream change must remain recoverable");
+
+        sqlx::query("DELETE FROM audit_log WHERE org_id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete midremoval audit rows");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete midremoval org");
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("delete midremoval user");
+    }
+
     /// Regression (PR #185 review, Devin "concurrent upload leaves owner
     /// authority drifted"): rotate_org_owner pins the replacement in the
     /// signing service before it writes the successor keyring version and
@@ -8702,6 +8997,312 @@ mod tests {
             .execute(&pool)
             .await
             .expect("delete member escalation users");
+    }
+
+    // Stable-invalid directives must be rejected before the intent insert.
+    // org_rotation_intents has no purge path, so a compromised owner key
+    // could otherwise grow the table with presentations the lane would
+    // always reject. Only verdicts that cannot flip while queueing for the
+    // lane are pre-lane: future signed_at beyond the clock-skew allowance,
+    // a version strictly below the current latest, and a too-old directive
+    // with no committed receipt. A receipted expired directive and a fresh
+    // valid directive still record an intent.
+    #[tokio::test]
+    async fn owner_rotation_prechecks_reject_invalid_directives_without_persisting_intents() {
+        let pool = database_test_pool().await;
+        let org_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let suffix = org_id.simple().to_string();
+        let org_name = format!("keyring-intent-stable-precheck-{suffix}");
+        crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+            .await
+            .expect("insert stable precheck org");
+        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Stable Precheck Owner')")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("insert stable precheck user");
+        sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+            .bind(user_id)
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("insert stable precheck membership");
+        let current_key = SigningKey::generate(&mut OsRng);
+        let replacement_key = SigningKey::generate(&mut OsRng);
+        sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2), ($1, $3)")
+            .bind(user_id)
+            .bind(current_key.verifying_key().to_bytes().to_vec())
+            .bind(replacement_key.verifying_key().to_bytes().to_vec())
+            .execute(&pool)
+            .await
+            .expect("insert stable precheck signing keys");
+
+        let (mock_url, mock) = spawn_mock_signing_service_owner(
+            org_id,
+            MockSigningServiceOwner {
+                owner: current_key.verifying_key().to_bytes(),
+                changed_at: Utc::now(),
+                version: 1,
+                rotate_calls: 0,
+            },
+        )
+        .await;
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.signing_service = Some(
+            crate::signing_service::SigningServiceClient::new(mock_url, None)
+                .expect("build mock signing service client"),
+        );
+        let auth = AuthContext {
+            user_id,
+            org_id,
+            org_name: org_name.clone(),
+            role: Role::Owner,
+            api_key: None,
+            management_origin: crate::auth::middleware::ManagementOrigin::Public,
+        };
+        for version in 1..=3 {
+            let _ = put_keyring(
+                auth.clone(),
+                State(state.clone()),
+                Path(org_name.clone()),
+                Json(signed_keyring_request(
+                    org_id,
+                    user_id,
+                    &current_key,
+                    version,
+                    version as u32,
+                )),
+            )
+            .await
+            .expect("publish sequential keyring");
+        }
+
+        async fn intent_count(pool: &sqlx::PgPool, org_id: Uuid) -> i64 {
+            sqlx::query_scalar("SELECT count(*) FROM org_rotation_intents WHERE org_id = $1")
+                .bind(org_id)
+                .fetch_one(pool)
+                .await
+                .expect("count rotation intents")
+        }
+
+        // Strictly below the current latest: versions only increment, so
+        // this can never become a legal new version or an exact replay.
+        let stale = rotation_request(
+            org_id,
+            user_id,
+            &current_key,
+            &replacement_key,
+            2,
+            2,
+            Utc::now(),
+            "precheck-stale-version",
+        );
+        let rejected = rotate_org_owner(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(stale),
+        )
+        .await
+        .expect_err("a strictly stale version is rejected");
+        assert_eq!(rejected.0, StatusCode::CONFLICT);
+        assert_eq!(rejected.1.0["error"], "keyring version is stale");
+        assert_eq!(
+            intent_count(&pool, org_id).await,
+            0,
+            "a strictly stale version must not persist an intent"
+        );
+
+        // Beyond the pre-lane clock-skew allowance. A few minutes of future
+        // skew can still be legitimized by host-clock drift and is left to
+        // the lane; ten minutes cannot.
+        let future = rotation_request(
+            org_id,
+            user_id,
+            &current_key,
+            &replacement_key,
+            4,
+            4,
+            Utc::now() + chrono::Duration::minutes(10),
+            "precheck-future",
+        );
+        let rejected = rotate_org_owner(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(future),
+        )
+        .await
+        .expect_err("a far-future directive is rejected");
+        assert_eq!(rejected.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            rejected.1.0["error"],
+            "owner rotation directive signed_at is in the future"
+        );
+        assert_eq!(
+            intent_count(&pool, org_id).await,
+            0,
+            "a far-future directive must not persist an intent"
+        );
+
+        let expired = rotation_request(
+            org_id,
+            user_id,
+            &current_key,
+            &replacement_key,
+            4,
+            5,
+            Utc::now() - chrono::Duration::hours(2),
+            "precheck-expired",
+        );
+        let rejected = rotate_org_owner(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(expired),
+        )
+        .await
+        .expect_err("an expired directive without a receipt is rejected");
+        assert_eq!(rejected.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            rejected.1.0["error"],
+            "owner rotation directive signed_at is too old"
+        );
+        assert_eq!(
+            intent_count(&pool, org_id).await,
+            0,
+            "an expired directive without a receipt must not persist an intent"
+        );
+
+        // A receipt cannot exist without its intent (FK). Seed both, and
+        // point the live service at the receipt, so the lane waives the
+        // max-age check. The directive still predates v3, which only the
+        // lane enforces: that error proves the precheck did not reject it
+        // as too old. Without the receipt the same request is the case above.
+        let receipted_at = Utc::now() - chrono::Duration::hours(2);
+        let upstream_rotated_at = Utc::now() - chrono::Duration::minutes(5);
+        let receipted = rotation_request(
+            org_id,
+            user_id,
+            &current_key,
+            &replacement_key,
+            4,
+            6,
+            receipted_at,
+            "precheck-receipted",
+        );
+        let receipt_directive = Sha256::digest(owner_rotation_directive_bytes(
+            org_id,
+            &current_key.verifying_key().to_bytes(),
+            &replacement_key.verifying_key().to_bytes(),
+            receipted_at,
+            "precheck-receipted",
+        ));
+        let receipt_keyring = Sha256::digest(normalized_keyring_bytes(
+            org_id,
+            user_id,
+            replacement_key.verifying_key().to_bytes(),
+            4,
+            6,
+        ));
+        seed_rotation_presentation(
+            &pool,
+            org_id,
+            receipt_directive.as_slice(),
+            receipt_keyring.as_slice(),
+            receipted_at,
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO org_rotation_upstream_receipts
+                 (org_id, directive_sha256, keyring_sha256, upstream_owner_version, upstream_rotated_at)
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(org_id)
+        .bind(receipt_directive.as_slice())
+        .bind(receipt_keyring.as_slice())
+        .bind(2_i64)
+        .bind(upstream_rotated_at)
+        .execute(&pool)
+        .await
+        .expect("seed receipt for the expired precheck waiver");
+        {
+            let mut service = mock.lock().expect("mock owner lock");
+            service.owner = replacement_key.verifying_key().to_bytes();
+            service.version = 2;
+            service.changed_at = upstream_rotated_at;
+        }
+        let waived = rotate_org_owner(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(receipted),
+        )
+        .await
+        .expect_err("the lane still rejects a directive that predates v3");
+        assert_eq!(waived.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            waived.1.0["error"], "owner rotation directive predates the current keyring version",
+            "a receipted expired directive must reach the lane, not the precheck"
+        );
+        assert_eq!(
+            intent_count(&pool, org_id).await,
+            1,
+            "the waiver must not record a second intent for the seeded presentation"
+        );
+        // The waiver receipt occupies upstream owner version 2. The positive
+        // control below mints that same version from a fresh RPC; leave the
+        // intent (so the count stays honest) but drop the receipt.
+        sqlx::query("DELETE FROM org_rotation_upstream_receipts WHERE org_id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("drop the waiver receipt before the positive control");
+        {
+            let mut service = mock.lock().expect("mock owner lock");
+            service.owner = current_key.verifying_key().to_bytes();
+            service.version = 1;
+            service.changed_at = Utc::now();
+            service.rotate_calls = 0;
+        }
+
+        let valid = rotation_request(
+            org_id,
+            user_id,
+            &current_key,
+            &replacement_key,
+            4,
+            7,
+            Utc::now(),
+            "precheck-valid",
+        );
+        let response = rotate_org_owner(auth, State(state), Path(org_name), Json(valid))
+            .await
+            .expect("fresh valid rotation succeeds");
+        assert_eq!(response.keyring_version, 4);
+        assert_eq!(
+            intent_count(&pool, org_id).await,
+            2,
+            "the valid presentation still records its intent"
+        );
+
+        sqlx::query("DELETE FROM audit_log WHERE org_id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete stable precheck audit rows");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete stable precheck org");
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("delete stable precheck user");
     }
 
     // The quota counts `created_at > statement_timestamp() - interval '1 hour'`
