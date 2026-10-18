@@ -121,9 +121,7 @@ impl KbsPolicyError {
             KbsPolicyError::ProviderWriteFailed(_) | KbsPolicyError::ProviderWriteTimeout
         )
     }
-}
 
-impl KbsPolicyError {
     /// Return a bounded failure code safe for persistence and operator logs.
     ///
     /// The Display strings embed ConfigMap state and aggregate byte counts of

@@ -1615,6 +1615,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
+ "ed25519-dalek",
  "enclava-common",
  "enclava-engine",
  "flate2",

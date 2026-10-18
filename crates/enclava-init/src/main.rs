@@ -1711,7 +1711,17 @@ fn parse_pubkey(hex_str: &str) -> Result<ed25519_dalek::VerifyingKey> {
     let arr: [u8; 32] = raw
         .try_into()
         .map_err(|_| anyhow!("pubkey must be 32 bytes"))?;
-    Ok(ed25519_dalek::VerifyingKey::from_bytes(&arr)?)
+    let key = ed25519_dalek::VerifyingKey::from_bytes(&arr)?;
+    // Small-order keys provide no unforgeability: verification uses
+    // verify(), not verify_strict(), and a zero signature verifies against a
+    // small-order key for a large share of messages. Mirror of the API's
+    // require_ed25519_point (cap#218 follow-up).
+    if key.is_weak() {
+        return Err(anyhow!(
+            "pubkey has small order and provides no unforgeability"
+        ));
+    }
+    Ok(key)
 }
 
 fn parse_cc_init_data_claims(toml_bytes: &[u8]) -> Result<trustee_verify::CcInitDataClaims> {

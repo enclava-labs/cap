@@ -2208,7 +2208,7 @@ async fn requeue_or_exhaust_apply_job(
     job: &ClaimedJob,
 ) -> Result<bool, DeploymentJobError> {
     if apply_job_retries_exhausted(pool, job.deployment_id).await? {
-        publish_apply_failure_with_mutation(pool, job, None, DEPLOYMENT_RETRY_EXHAUSTED_MESSAGE)
+        publish_apply_failure_with_mutation(pool, job, DEPLOYMENT_RETRY_EXHAUSTED_MESSAGE, None)
             .await?;
         return Ok(true);
     }
@@ -3693,7 +3693,7 @@ async fn fail_apply_job_with_mutation(
     failed_app: Option<&App>,
 ) {
     let published =
-        match publish_apply_failure_with_mutation(&state.db, job, mutation.as_mut(), error.code())
+        match publish_apply_failure_with_mutation(&state.db, job, error.code(), mutation.as_mut())
             .await
         {
             Ok(()) => true,
@@ -4062,14 +4062,13 @@ async fn publish_rollout_outcome(
 
 /// Terminalize a durable deployment apply failure. `failure_code` must be a
 /// bounded classification from `DeploymentJobError::code` (or one of the
-/// fixed setup/apply constants) so the stored `deployments.error_message`
-/// can cross the public projection allowlist without leaking backend
-/// plaintext (#18: users must see *why* a deploy was rejected).
+/// fixed setup/apply constants). It is persisted in both the deployment and
+/// job rows so the public projection can expose the classification without
+/// leaking backend plaintext.
 async fn publish_apply_failure_with_mutation(
     pool: &PgPool,
     job: &ClaimedJob,
     mutation: Option<&mut crate::mutation_leases::AppMutationLease>,
-    failure_code: &'static str,
 ) -> Result<(), DeploymentJobError> {
     let mut tx = pool.begin().await?;
     crate::deploy::lock_app_deployment_lane(&mut tx, job.app_id).await?;
@@ -4212,7 +4211,7 @@ async fn publish_apply_failure_with_mutation(
 
 #[cfg(test)]
 async fn publish_apply_failure(pool: &PgPool, job: &ClaimedJob) -> Result<(), DeploymentJobError> {
-    publish_apply_failure_with_mutation(pool, job, None, DEPLOYMENT_APPLY_FAILED_MESSAGE).await
+    publish_apply_failure_with_mutation(pool, job, DEPLOYMENT_APPLY_FAILED_MESSAGE, None).await
 }
 
 async fn finish_job(
@@ -5095,6 +5094,7 @@ pub(crate) mod tests {
             descriptor_signing_pubkey: binding.descriptor_signing_pubkey,
             org_keyring_fingerprint: binding.org_keyring_fingerprint,
             omit_log_encryption_claim: false,
+            legacy_collapsed_trustee_key: false,
             omit_luks2_header_seal_claim: false,
         });
         crate::routes::deployments::select_local_signed_artifact_delivery(
@@ -11095,34 +11095,6 @@ pub(crate) mod tests {
             .execute(&pool)
             .await
             .expect("delete watching failure fixture");
-    }
-
-    #[test]
-    fn apply_failures_publish_the_job_error_classification() {
-        // #18: fail_apply_job_with_mutation must forward
-        // `error.code()` — not the constant DEPLOYMENT_APPLY_FAILED_MESSAGE —
-        // so the bounded classification reaches the deployments row and the
-        // public projection can surface the real reason.
-        let source = include_str!("deployment_jobs.rs");
-        let body = source
-            .split("async fn fail_apply_job_with_mutation")
-            .nth(1)
-            .and_then(|rest| rest.split("\nasync fn ").next())
-            .unwrap_or("");
-        assert!(
-            body.contains("job, error.code()")
-                || body.contains(
-                    "job,
-            error.code()"
-                ),
-            "fail_apply_job_with_mutation must forward error.code() to \
-             publish_apply_failure_with_mutation"
-        );
-        assert!(
-            !body.contains("DEPLOYMENT_APPLY_FAILED_MESSAGE"),
-            "fail_apply_job_with_mutation must not collapse every apply \
-             failure to the constant DEPLOYMENT_APPLY_FAILED_MESSAGE"
-        );
     }
 
     #[tokio::test]

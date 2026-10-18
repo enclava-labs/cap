@@ -382,7 +382,9 @@ pub(crate) fn confidential_app_for_cc_hash(
             trustee_policy_url: None,
             local_workload_artifacts_json: Some("{}".to_string()),
             local_trustee_policy_json: Some("{}".to_string()),
-            platform_trustee_policy_pubkey_hex: Some(release.signing_service_pubkey_hex.clone()),
+            platform_trustee_policy_pubkey_hex: Some(
+                release.platform_trustee_policy_pubkey_hex.clone(),
+            ),
             signing_service_pubkey_hex: Some(release.signing_service_pubkey_hex.clone()),
             verification_material: None,
         },
@@ -738,6 +740,7 @@ pub(crate) async fn build_signed_deploy_blobs(
         descriptor_signing_pubkey: deployer_key.public.to_bytes(),
         org_keyring_fingerprint,
         omit_log_encryption_claim: false,
+        legacy_collapsed_trustee_key: false,
         omit_luks2_header_seal_claim: !release_carries_seal_claim,
     };
     let (generated_agent_policy, log_encryption) =

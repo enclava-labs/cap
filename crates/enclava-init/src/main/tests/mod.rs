@@ -1270,6 +1270,21 @@ fn fake_stat(pid: u32, start_time: u64) -> String {
     format!("{pid} (enclava-wait-exec) {fields}")
 }
 
+#[test]
+fn parse_pubkey_rejects_small_order_keys() {
+    // cap#218 follow-up: policy verification uses verify(), and a zero
+    // signature verifies against a small-order key for a large share of
+    // messages — such a pin provides no unforgeability. Mirror of the
+    // API's require_ed25519_point.
+    let err = super::parse_pubkey(&"00".repeat(32)).unwrap_err();
+    assert!(
+        err.to_string().contains("small order"),
+        "unexpected error: {err}"
+    );
+    // Sanity: a normal key still parses.
+    assert!(super::parse_pubkey(&"11".repeat(32)).is_ok());
+}
+
 // --- luks2_header_seal rollout gate (cap#242 review) ---
 
 fn seal_cc_init_data(claim: Option<&str>) -> Vec<u8> {
