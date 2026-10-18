@@ -1406,6 +1406,37 @@ fn stamp_sweep_created_pull_secret_lineage(secret: &mut Secret) {
     annotations.insert(MUTATION_GENERATION_ANNOTATION.to_string(), generation);
 }
 
+/// Record a pull Secret this process just created via its own POST into the
+/// engine's creation ledger (cap#272): the stamp alone no longer authorizes
+/// failure-cleanup deletion, only a server-recorded creation row does. The
+/// caller's next gated apply step drains and persists the record.
+/// shortcut: engines without an attached ledger (the startup sweep) record
+/// nothing, so a sweep-created secret classifies ProvenanceUnproven in
+/// failure cleanup (retained, fail closed) until a deploy-path creation or
+/// the pull-secret reconcile itself removes it; upgrade by giving the sweep
+/// a persisted ledger sink.
+fn record_pull_secret_creation(
+    engine: &ApplyEngine,
+    namespace: &str,
+    secret: &Secret,
+    generation: i64,
+) {
+    let Some(ledger) = engine.creation_ledger() else {
+        return;
+    };
+    let (Some(name), Some(uid)) = (secret.metadata.name.clone(), secret.metadata.uid.clone())
+    else {
+        return;
+    };
+    ledger.record(enclava_engine::apply::creation_ledger::CreationRecord {
+        kind: "Secret".to_string(),
+        name,
+        namespace: Some(namespace.to_string()),
+        uid,
+        mutation_generation: generation,
+    });
+}
+
 /// Whether failure cleanup must leave this Secret for a sibling app. The
 /// platform pull secret is namespace-scoped: deleting it because one app's
 /// apply failed would strip credentials another app in the same namespace
@@ -1512,7 +1543,15 @@ async fn ensure_configured_pull_secret_for_in_scope_accounts(
                 .create(&pull_secret_create_params(engine), &created)
                 .await
             {
-                Ok(created) => created.metadata.uid.filter(|uid| !uid.is_empty()),
+                Ok(created) => {
+                    record_pull_secret_creation(
+                        engine,
+                        namespace,
+                        &created,
+                        SWEEP_CREATED_PULL_SECRET_GENERATION,
+                    );
+                    created.metadata.uid.filter(|uid| !uid.is_empty())
+                }
                 // Lost the create race. The winner may be a newer scope
                 // rollout; accepting it on `placeable` alone would attach
                 // that secret to this replica's stale, broader account set.
@@ -2056,7 +2095,13 @@ async fn reconcile_managed_pull_secrets(
                                     .create(&pull_secret_create_params(engine), &desired)
                                     .await
                                 {
-                                    Ok(_applied) => {
+                                    Ok(applied) => {
+                                        record_pull_secret_creation(
+                                            engine,
+                                            namespace,
+                                            &applied,
+                                            SWEEP_CREATED_PULL_SECRET_GENERATION,
+                                        );
                                         // Per-app scope (Codex review on #243, P1):
                                         // only an in-scope account's reference is
                                         // restored; an out-of-scope account keeps
@@ -3676,7 +3721,10 @@ async fn apply_scoped_pull_secret(
                     .create(&pull_secret_create_params(engine), &created)
                     .await
                 {
-                    Ok(_) => return Ok(()),
+                    Ok(created) => {
+                        record_pull_secret_creation(engine, namespace, &created, generation.get());
+                        return Ok(());
+                    }
                     Err(kube::Error::Api(error)) if error.code == 409 => continue,
                     Err(error) => return Err(DeployError::Apply(error.into())),
                 }
@@ -5420,10 +5468,11 @@ mod tests {
         assert!(parse_image_pull_repository_scope("Example.COM/org/private").is_err());
     }
 
-    /// Codex review on #276, P1: a sweep-created secret must classify as a
-    /// failed-generation leftover once the platform field manager owns the
-    /// creation annotation. The same annotations without that ownership, and
-    /// an unstamped secret, stay foreign.
+    /// Codex review on #276, P1 + cap#272: a sweep-created secret classifies
+    /// as a failed-generation leftover only with platform field-manager
+    /// ownership of the creation annotation AND a server-recorded creation
+    /// row. The same annotations without that ownership stay foreign; with
+    /// ownership but no ledger row they stay unresolved (fail closed).
     #[test]
     fn sweep_created_pull_secret_lineage_is_a_generation_leftover() {
         use enclava_engine::apply::generation::{
@@ -5439,8 +5488,18 @@ mod tests {
         };
         let mut secret = generate_tenant_image_pull_secret("tenant-ns", &config);
         stamp_sweep_created_pull_secret_lineage(&mut secret);
+        secret.metadata.uid = Some("uid-sweep-created".to_string());
+        secret.metadata.creation_timestamp =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                "2026-10-18T00:00:00Z".parse().expect("fixture timestamp"),
+            ));
+        let strict_ledger = enclava_engine::apply::creation_ledger::CreationLedgerBuffer::new();
         assert!(matches!(
-            crate::deployment_failure_cleanup::classify_generation_leftover(&secret, 7),
+            crate::deployment_failure_cleanup::classify_generation_leftover(
+                &secret,
+                7,
+                &strict_ledger
+            ),
             crate::deployment_failure_cleanup::GenerationLeftover::Foreign
         ));
         secret.metadata.managed_fields = Some(vec![ManagedFieldsEntry {
@@ -5465,11 +5524,33 @@ mod tests {
             Some("1")
         );
         assert!(matches!(
-            crate::deployment_failure_cleanup::classify_generation_leftover(&secret, 1),
+            crate::deployment_failure_cleanup::classify_generation_leftover(
+                &secret,
+                1,
+                &strict_ledger
+            ),
+            crate::deployment_failure_cleanup::GenerationLeftover::ProvenanceUnproven
+        ));
+        let recorded_ledger = enclava_engine::apply::creation_ledger::CreationLedgerBuffer::new();
+        recorded_ledger.preload([(
+            "Secret".to_string(),
+            "enclava-registry-auth".to_string(),
+            "uid-sweep-created".to_string(),
+        )]);
+        assert!(matches!(
+            crate::deployment_failure_cleanup::classify_generation_leftover(
+                &secret,
+                1,
+                &recorded_ledger
+            ),
             crate::deployment_failure_cleanup::GenerationLeftover::Leftover
         ));
         assert!(matches!(
-            crate::deployment_failure_cleanup::classify_generation_leftover(&secret, 7),
+            crate::deployment_failure_cleanup::classify_generation_leftover(
+                &secret,
+                7,
+                &recorded_ledger
+            ),
             crate::deployment_failure_cleanup::GenerationLeftover::Leftover
         ));
     }

@@ -95,7 +95,7 @@ async fn assert_partial_batch_drained(
 #[tokio::test]
 async fn standard_batch_failure_drains_earlier_service_account_creation() {
     let (engine, ledger) = partial_create_engine("/resourcequotas/");
-    let step = apply_standard_resources(
+    let step = enclava_engine::apply::resources::apply_standard_resources(
         &engine,
         &regression_manifests(),
         MutationGeneration::new(7).unwrap(),
