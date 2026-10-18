@@ -230,8 +230,13 @@ pub struct AppState {
     pub db: PgPool,
     /// Instance-level management ownership mode.
     pub management_mode: CapManagementMode,
-    /// Immutable process-lifetime workload admission decision.
-    pub deployment_dispatch_enabled: bool,
+    /// Live workload admission gate. Starts closed whenever the operator
+    /// disabled deployment dispatch or the first tenant pull-secret cleanup
+    /// sweep did not converge, and is opened — together with the deployment
+    /// dispatcher — as soon as a sweep converges, so a transient Kubernetes
+    /// outage at startup cannot freeze deployments for the process lifetime
+    /// (review finding on #243).
+    pub deployment_dispatch_enabled: Arc<AtomicBool>,
     /// False until startup provider reconciliation has completed.
     pub startup_ready: Arc<AtomicBool>,
     /// Ed25519 signing key for config JWTs.
@@ -259,6 +264,11 @@ pub struct AppState {
     pub outbound_body_limit: u64,
     /// Outbound client for registry tag resolution, with registry allowlist.
     pub registry_client: RegistryClient,
+    /// Pre-flight egress guard for the cosign/sigstore verification paths
+    /// (issue #224): those stacks build their own reqwest transports, so
+    /// their registry-derived destinations are validated through this
+    /// shared allowlist + blocked-networks policy before any I/O.
+    pub cosign_egress: crate::clients::EgressGuard,
     /// HTTP client for fixed internal Trustee/KBS calls.
     pub trustee_http_client: reqwest::Client,
     /// HTTP client for tenant TEE endpoints. Test environments may use staging
@@ -316,6 +326,20 @@ impl AppState {
 
     pub fn mark_startup_ready(&self) {
         self.startup_ready.store(true, Ordering::Release);
+    }
+
+    /// Whether workload mutations are currently admitted (see
+    /// [`AppState::deployment_dispatch_enabled`]).
+    pub fn deployment_dispatch_is_enabled(&self) -> bool {
+        self.deployment_dispatch_enabled.load(Ordering::Acquire)
+    }
+
+    /// Open or close workload admission. Closing is test-only; opening happens
+    /// exactly once in production, together with spawning the deployment
+    /// dispatcher, when a pull-secret sweep converges.
+    pub fn set_deployment_dispatch_enabled(&self, enabled: bool) {
+        self.deployment_dispatch_enabled
+            .store(enabled, Ordering::Release);
     }
 
     pub async fn admit_side_effect(

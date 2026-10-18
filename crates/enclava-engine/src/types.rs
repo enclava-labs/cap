@@ -123,6 +123,14 @@ pub struct WorkloadArtifactBinding {
     /// (`false`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub legacy_collapsed_trustee_key: bool,
+    /// Render-compatibility pin for pre-seal-rollout signed artifacts
+    /// (cap#242): artifacts signed before the `luks2_header_seal` claim
+    /// existed carry an `expected_cc_init_data_hash` computed over a render
+    /// without the claim. Same mechanism as `omit_log_encryption_claim`;
+    /// the guest treats a claim-less render as the rollout-window default
+    /// ("adopt"), so those artifacts keep their original semantics.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub omit_luks2_header_seal_claim: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -2312,12 +2312,17 @@ fn managed_config_progress_message(
     total: usize,
     elapsed: Duration,
     timeout: Duration,
+    receipt_pending: bool,
 ) -> String {
-    timed_progress(
-        &counted_progress("Platform config", ready, total),
-        elapsed,
-        timeout,
-    )
+    // Receipt mode proves delivery only when the receipt lands (strict
+    // receipt keeps every key unready), so a frozen 0/N counter is the
+    // honest state — say what is pending instead of counting keys.
+    let counted = if receipt_pending {
+        "Platform config: delivering (awaiting this deploy's delivery receipt)".to_string()
+    } else {
+        counted_progress("Platform config", ready, total)
+    };
+    timed_progress(&counted, elapsed, timeout)
 }
 
 /// Snapshot each expected managed config key's stored `updated_at` before
@@ -2476,6 +2481,7 @@ async fn wait_for_paas_managed_config_keys(
         expected.len(),
         start.elapsed(),
         timeout,
+        delivery_id.is_some() && !delivered_receipt,
     ));
     loop {
         fail_if_template_deployment_failed(api, instance_name, deployment_id, read_deadline)
@@ -2550,6 +2556,7 @@ async fn wait_for_paas_managed_config_keys(
                     expected.len(),
                     start.elapsed(),
                     timeout,
+                    delivery_id.is_some() && !delivered_receipt,
                 ));
                 if missing.is_empty() {
                     return Ok(());
@@ -4407,9 +4414,21 @@ mod tests {
                 13,
                 Duration::from_secs(372),
                 Duration::from_secs(1800),
+                false,
             ),
             "[06:12 / 30:00] Platform config: 7/13"
         );
+        // Receipt mode keeps every key unready until the receipt lands: the
+        // surface must say so instead of rendering a frozen counter.
+        let pending = managed_config_progress_message(
+            0,
+            13,
+            Duration::from_secs(372),
+            Duration::from_secs(1800),
+            true,
+        );
+        assert!(pending.contains("delivery receipt"), "{pending}");
+        assert!(!pending.contains("0/13"), "{pending}");
     }
 
     fn hosted_template_with_stable_ssh() -> HostedTemplate {

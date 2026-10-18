@@ -1284,3 +1284,37 @@ fn parse_pubkey_rejects_small_order_keys() {
     // Sanity: a normal key still parses.
     assert!(super::parse_pubkey(&"11".repeat(32)).is_ok());
 }
+
+// --- luks2_header_seal rollout gate (cap#242 review) ---
+
+fn seal_cc_init_data(claim: Option<&str>) -> Vec<u8> {
+    let claim_line = claim
+        .map(|c| format!("luks2_header_seal = \"{c}\"\n"))
+        .unwrap_or_default();
+    format!("version = \"0.1.0\"\nalgorithm = \"sha256\"\n\n[data]\nimage_digest = \"sha256:aa\"\n{claim_line}").into_bytes()
+}
+
+#[test]
+fn luks_rollout_policy_defaults_to_adoption_window() {
+    let default = luks_rollout_policy(None).expect("no cc data");
+    assert!(default.allow_legacy_adoption);
+
+    let absent = luks_rollout_policy(Some(&seal_cc_init_data(None))).expect("claim absent");
+    assert!(absent.allow_legacy_adoption);
+
+    let adopt = luks_rollout_policy(Some(&seal_cc_init_data(Some("adopt")))).expect("adopt");
+    assert!(adopt.allow_legacy_adoption);
+}
+
+#[test]
+fn luks_rollout_policy_required_disables_legacy_adoption() {
+    let required =
+        luks_rollout_policy(Some(&seal_cc_init_data(Some("required")))).expect("required");
+    assert!(!required.allow_legacy_adoption);
+}
+
+#[test]
+fn luks_rollout_policy_unknown_value_fails_boot() {
+    let err = luks_rollout_policy(Some(&seal_cc_init_data(Some("maybe")))).expect_err("unknown");
+    assert!(err.to_string().contains("luks2_header_seal"));
+}

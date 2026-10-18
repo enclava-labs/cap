@@ -152,7 +152,6 @@ async fn setup_test_db() -> PgPool {
         .await
         .expect("failed to connect to test db");
 
-    // Run migrations
     sqlx::migrate!("./migrations")
         .run(&pool)
         .await
@@ -176,7 +175,7 @@ async fn setup_test_state_with_mode(management_mode: CapManagementMode) -> (AppS
     let state = AppState {
         db: pool.clone(),
         management_mode,
-        deployment_dispatch_enabled: true,
+        deployment_dispatch_enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         startup_ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         signing_key,
         hmac_key,
@@ -191,6 +190,7 @@ async fn setup_test_state_with_mode(management_mode: CapManagementMode) -> (AppS
             enclava_api::clients::AllowList::from_env_or_default(None),
         )
         .unwrap(),
+        cosign_egress: enclava_api::clients::EgressGuard::from_env(),
         trustee_http_client: reqwest::Client::new(),
         tee_http_client: reqwest::Client::new(),
         recent_tee_probe_failures: Arc::new(std::sync::Mutex::new(

@@ -49,20 +49,17 @@ async fn apply_all_creates_full_stack() {
         .await
         .unwrap();
 
-    // Verify namespace exists
     use k8s_openapi::api::core::v1::Namespace;
     use kube::api::Api;
     let ns_api: Api<Namespace> = Api::all(engine.client().clone());
     let ns = ns_api.get(&app.namespace).await.unwrap();
     assert_eq!(ns.metadata.name.as_deref(), Some(app.namespace.as_str()));
 
-    // Verify StatefulSet exists
     use k8s_openapi::api::apps::v1::StatefulSet;
     let sts_api: Api<StatefulSet> = Api::namespaced(engine.client().clone(), &app.namespace);
     let sts = sts_api.get(&app.name).await.unwrap();
     assert_eq!(sts.metadata.name.as_deref(), Some(app.name.as_str()));
 
-    // Cleanup
     use kube::api::DeleteParams;
     let _ = ns_api
         .delete(&app.namespace, &DeleteParams::default())
@@ -83,10 +80,8 @@ async fn apply_all_is_idempotent() {
 
     let generation = MutationGeneration::new(1).unwrap();
     apply_all(&engine, &manifests, generation).await.unwrap();
-    // Second apply should succeed without errors
     apply_all(&engine, &manifests, generation).await.unwrap();
 
-    // Cleanup
     use k8s_openapi::api::core::v1::Namespace;
     use kube::api::{Api, DeleteParams};
     let ns_api: Api<Namespace> = Api::all(engine.client().clone());

@@ -86,7 +86,6 @@ pub async fn create_org(
         ));
     }
 
-    // Add creator as owner
     sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
         .bind(auth.user_id)
         .bind(org_id)
@@ -1168,7 +1167,6 @@ pub async fn invite_member(
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
     scopes::require_scope(&auth, "org:admin")?;
 
-    // Verify caller is an active owner or admin of the target org.
     let membership: Option<(Uuid, Role)> = sqlx::query_as(
         "SELECT o.id, m.role as \"role: _\"
          FROM organizations o
@@ -1190,7 +1188,6 @@ pub async fn invite_member(
 
     scopes::require_admin_role(caller_role)?;
 
-    // Find user by email
     let invitee: Option<(Uuid,)> = sqlx::query_as(
         "SELECT user_id FROM user_identities WHERE provider = 'email' AND identifier = $1",
     )
@@ -1304,7 +1301,6 @@ pub async fn list_members(
 ) -> Result<Json<Vec<MemberResponse>>, (StatusCode, Json<serde_json::Value>)> {
     scopes::require_member(&auth)?;
 
-    // Verify caller is an active member.
     let org_id: Option<Uuid> = sqlx::query_scalar(
         "SELECT o.id FROM organizations o
          JOIN memberships m ON m.org_id = o.id
@@ -1354,7 +1350,6 @@ pub async fn remove_member(
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
     scopes::require_scope(&auth, "org:admin")?;
 
-    // Verify caller is an active owner or admin.
     let membership: Option<(Uuid, Role)> = sqlx::query_as(
         "SELECT o.id, m.role as \"role: _\"
          FROM organizations o

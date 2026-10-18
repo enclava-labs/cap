@@ -77,10 +77,8 @@ pub async fn run(cmd: ConfigCommand) -> Result<(), Box<dyn std::error::Error>> {
             let (api, _paths, _cli_config) = build_api_client()?;
             let app = api.get_app(&app_name).await?;
 
-            // Get config token from API (authorization)
             let token_resp = api.get_config_token(&app_name).await?;
 
-            // Write directly to TEE (value delivery)
             let tee = token_resp
                 .tee_url
                 .as_deref()
@@ -129,10 +127,8 @@ pub async fn run(cmd: ConfigCommand) -> Result<(), Box<dyn std::error::Error>> {
             let (api, _paths, _cli_config) = build_api_client()?;
             let app_info = api.get_app(&app_name).await?;
 
-            // Get config token from API
             let token_resp = api.get_config_token(&app_name).await?;
 
-            // Delete from TEE
             let tee = token_resp
                 .tee_url
                 .as_deref()
@@ -149,7 +145,6 @@ pub async fn run(cmd: ConfigCommand) -> Result<(), Box<dyn std::error::Error>> {
             // application note before any later step can fail the command.
             println!("{CONFIG_APPLICATION_NOTE}");
 
-            // Delete metadata from API
             api.delete_config_meta(&app_name, &key).await?;
 
             println!("Unset {key}.");

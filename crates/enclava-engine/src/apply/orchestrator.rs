@@ -156,14 +156,11 @@ pub async fn apply_and_watch(
         inspect_fresh_volume_claims(engine, &app.namespace, &app.name, FreshVolumeClaims::ALL)
             .await?;
     enforce_floor_on_claims(app, fresh_volume_claims)?;
-
-    // Generate manifests
     let manifests = generate_all_manifests(app);
 
     crate::manifest::cc_init_data::verify_runtime_class_binding(&manifests.statefulset, app)
         .map_err(ApplyError::ManifestGeneration)?;
 
-    // Apply all
     apply_all(engine, &manifests, generation).await?;
 
     // Watch rollout. The budget grows only with claims that lack positive

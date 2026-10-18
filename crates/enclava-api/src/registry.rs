@@ -246,7 +246,8 @@ pub async fn resolve_image_digest(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clients::{AllowList, BlockedNetworks, ClientConfig};
+    use crate::clients::{AllowList, ClientConfig};
+    use enclava_common::outbound_http::BlockedNetworks;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -273,6 +274,30 @@ mod tests {
         assert!(matches!(
             err,
             RegistryError::Client(crate::clients::ClientError::HostNotAllowed(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn tag_resolution_rejects_allowlisted_private_literal_registry_before_network() {
+        // cap#241 review: a literal-IP registry listed in
+        // REGISTRY_ALLOWLIST must still be refused before any connection —
+        // reqwest bypasses GuardedResolver for literal hosts, so
+        // check_url itself enforces the blocklist.
+        let client = RegistryClient::new(
+            ClientConfig {
+                blocked: Arc::new(BlockedNetworks::defaults()),
+                body_limit_bytes: 1024,
+                timeout: Duration::from_secs(2),
+            },
+            AllowList::from_env_or_default(Some("10.0.5.7".into())),
+        )
+        .unwrap();
+        let image = enclava_common::image::ImageRef::parse("10.0.5.7/team/app:latest").unwrap();
+        let err = resolve_image_digest(&client, &image).await.unwrap_err();
+
+        assert!(matches!(
+            err,
+            RegistryError::Client(crate::clients::ClientError::BlockedAddress(_))
         ));
     }
 

@@ -1,18 +1,23 @@
-//! Outbound HTTP clients hardened against SSRF (C12).
+//! Outbound HTTP client hardened against SSRF (C12).
 //!
-//! Provides two narrow `reqwest` clients:
+//! Provides one narrow `reqwest` client:
 //! - `RegistryClient` — talks to OCI registries on a hostname allowlist.
-//! - `WebhookClient`  — talks to the configured BTCPay Server.
 //!
-//! Both clients refuse redirects, force HTTPS, cap response body size, and
-//! resolve DNS through a custom resolver that rejects loopback, link-local,
-//! RFC1918, IMDS-style metadata addresses, and configured cluster CIDRs.
+//! The client refuses redirects, forces HTTPS, caps response body size, and
+//! resolves DNS through a custom resolver that rejects loopback, link-local,
+//! RFC1918, IMDS-style metadata addresses, IPv4-compatible/mapped IPv6
+//! spellings of all of the above, and configured cluster CIDRs. Because
+//! reqwest never consults a custom resolver for literal-IP hosts, the
+//! cosign/sigstore verification paths (whose stacks build their own
+//! transports) additionally pre-flight every registry-derived destination
+//! through `EgressGuard` (issue #224): https-only, registry allowlist,
+//! literal-IP blocklist, and a one-shot DNS resolution for names.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use reqwest::dns::{Addrs, Name, Resolve, Resolving};
+use enclava_common::outbound_http::{BlockedNetworks, GuardedResolver};
 
 const DEFAULT_REGISTRY_ALLOWLIST: &[&str] = &[
     "ghcr.io",
@@ -42,134 +47,12 @@ pub enum ClientError {
     MissingHost,
     #[error("invalid URL: {0}")]
     InvalidUrl(String),
+    #[error("destination resolves to a blocked address: {0}")]
+    BlockedAddress(String),
+    #[error("DNS lookup for destination failed: {0}")]
+    DnsLookupFailed(String),
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
-}
-
-/// CIDR ranges that outbound HTTP must never touch.
-#[derive(Debug, Clone)]
-pub struct BlockedNetworks {
-    v4: Vec<(Ipv4Addr, u8)>,
-    v6: Vec<(Ipv6Addr, u8)>,
-}
-
-impl BlockedNetworks {
-    pub fn defaults() -> Self {
-        let mut v4 = vec![
-            (Ipv4Addr::new(127, 0, 0, 0), 8),
-            (Ipv4Addr::new(169, 254, 0, 0), 16),
-            (Ipv4Addr::new(10, 0, 0, 0), 8),
-            (Ipv4Addr::new(172, 16, 0, 0), 12),
-            (Ipv4Addr::new(192, 168, 0, 0), 16),
-            (Ipv4Addr::new(0, 0, 0, 0), 8),
-            (Ipv4Addr::new(100, 64, 0, 0), 10), // CGNAT
-        ];
-        let v6 = vec![
-            (Ipv6Addr::LOCALHOST, 128),
-            (Ipv6Addr::UNSPECIFIED, 128),
-            (Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0), 10),
-            (Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0), 7), // ULA
-        ];
-        // CGNAT is not strictly required, but blocking it is consistent with
-        // the rest of the SSRF-defence list and is cheap.
-        let _ = &mut v4;
-        Self { v4, v6 }
-    }
-
-    /// Add CIDR strings of the form `10.0.0.0/8`. Invalid entries are skipped
-    /// with a warning so config typos don't take down the API process.
-    pub fn extend_from_cidrs<I: IntoIterator<Item = S>, S: AsRef<str>>(&mut self, cidrs: I) {
-        for cidr in cidrs {
-            match parse_cidr(cidr.as_ref()) {
-                Some(Cidr::V4(net, bits)) => self.v4.push((net, bits)),
-                Some(Cidr::V6(net, bits)) => self.v6.push((net, bits)),
-                None => tracing::warn!(
-                    "ignoring invalid CIDR in cluster blocklist: {}",
-                    cidr.as_ref()
-                ),
-            }
-        }
-    }
-
-    pub fn contains(&self, addr: IpAddr) -> bool {
-        match addr {
-            IpAddr::V4(ip) => self.v4.iter().any(|(net, bits)| in_v4(ip, *net, *bits)),
-            IpAddr::V6(ip) => {
-                if let Some(v4) = ip.to_ipv4_mapped()
-                    && self.v4.iter().any(|(net, bits)| in_v4(v4, *net, *bits))
-                {
-                    return true;
-                }
-                self.v6.iter().any(|(net, bits)| in_v6(ip, *net, *bits))
-            }
-        }
-    }
-}
-
-enum Cidr {
-    V4(Ipv4Addr, u8),
-    V6(Ipv6Addr, u8),
-}
-
-fn parse_cidr(s: &str) -> Option<Cidr> {
-    let (addr, bits) = s.split_once('/')?;
-    let bits: u8 = bits.trim().parse().ok()?;
-    let ip: IpAddr = addr.trim().parse().ok()?;
-    match ip {
-        IpAddr::V4(v4) if bits <= 32 => Some(Cidr::V4(v4, bits)),
-        IpAddr::V6(v6) if bits <= 128 => Some(Cidr::V6(v6, bits)),
-        _ => None,
-    }
-}
-
-fn in_v4(ip: Ipv4Addr, net: Ipv4Addr, bits: u8) -> bool {
-    if bits == 0 {
-        return true;
-    }
-    let mask: u32 = !0u32 << (32 - bits);
-    (u32::from(ip) & mask) == (u32::from(net) & mask)
-}
-
-fn in_v6(ip: Ipv6Addr, net: Ipv6Addr, bits: u8) -> bool {
-    if bits == 0 {
-        return true;
-    }
-    let ip_bits = u128::from(ip);
-    let net_bits = u128::from(net);
-    let mask: u128 = !0u128 << (128 - bits);
-    (ip_bits & mask) == (net_bits & mask)
-}
-
-/// Custom DNS resolver that rejects any name resolving to a blocked IP.
-struct GuardedResolver {
-    blocked: Arc<BlockedNetworks>,
-}
-
-impl Resolve for GuardedResolver {
-    fn resolve(&self, name: Name) -> Resolving {
-        let host = name.as_str().to_string();
-        let blocked = Arc::clone(&self.blocked);
-        Box::pin(async move {
-            let lookup = format!("{host}:0");
-            let addrs: Vec<SocketAddr> = tokio::net::lookup_host(lookup.as_str())
-                .await
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
-                .collect();
-
-            for addr in &addrs {
-                if blocked.contains(addr.ip()) {
-                    return Err(format!(
-                        "refused to resolve `{host}` to blocked address {}",
-                        addr.ip()
-                    )
-                    .into());
-                }
-            }
-
-            let iter: Addrs = Box::new(addrs.into_iter());
-            Ok(iter)
-        })
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -239,13 +122,7 @@ pub struct ClientConfig {
 
 impl ClientConfig {
     pub fn from_env() -> Self {
-        let mut blocked = BlockedNetworks::defaults();
-        if let Ok(pod) = std::env::var("CLUSTER_POD_CIDR") {
-            blocked.extend_from_cidrs(pod.split(','));
-        }
-        if let Ok(svc) = std::env::var("CLUSTER_SERVICE_CIDR") {
-            blocked.extend_from_cidrs(svc.split(','));
-        }
+        let blocked = BlockedNetworks::from_env();
         Self {
             blocked: Arc::new(blocked),
             body_limit_bytes: std::env::var("OUTBOUND_HTTP_BODY_LIMIT_BYTES")
@@ -266,9 +143,7 @@ pub fn build_guarded_client(config: &ClientConfig) -> Result<reqwest::Client, Cl
 }
 
 fn build_inner(config: &ClientConfig) -> Result<reqwest::Client, ClientError> {
-    let resolver = Arc::new(GuardedResolver {
-        blocked: Arc::clone(&config.blocked),
-    });
+    let resolver = Arc::new(GuardedResolver::new(Arc::clone(&config.blocked)));
     Ok(reqwest::Client::builder()
         .https_only(true)
         .redirect(reqwest::redirect::Policy::none())
@@ -277,11 +152,94 @@ fn build_inner(config: &ClientConfig) -> Result<reqwest::Client, ClientError> {
         .build()?)
 }
 
+/// Parse a URL host as a literal IP if it is one. Brackets are Url's
+/// spelling for IPv6 literals; stripping them lets a single `IpAddr` parse
+/// cover both families.
+fn parse_literal_ip(host: &str) -> Option<IpAddr> {
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<IpAddr>()
+        .ok()
+}
+
+/// Pre-flight destination check for outbound URLs whose transport cannot be
+/// routed through `build_guarded_client` (issue #224): reqwest never
+/// consults a custom DNS resolver for literal-IP hosts, so a literal such
+/// as `10.0.5.7` or `::ffff:169.254.169.254` reaches the socket directly.
+/// The sigstore/oci clients used by the cosign verification paths build
+/// their own reqwest transports internally, so every registry-derived URL
+/// they touch is validated here — https, allowlisted host, and literal IPs
+/// (and, for names, a one-shot DNS resolution) checked against
+/// `BlockedNetworks` — BEFORE any connection is attempted.
+pub async fn check_egress_destination(
+    url: &reqwest::Url,
+    blocked: &BlockedNetworks,
+    allowlist: Option<&AllowList>,
+) -> Result<(), ClientError> {
+    check_egress_destination_with_http(url, blocked, allowlist, false).await
+}
+
+async fn check_egress_destination_with_http(
+    url: &reqwest::Url,
+    blocked: &BlockedNetworks,
+    allowlist: Option<&AllowList>,
+    allow_http: bool,
+) -> Result<(), ClientError> {
+    if url.scheme() != "https" && !(allow_http && url.scheme() == "http") {
+        return Err(ClientError::SchemeNotAllowed(url.scheme().to_string()));
+    }
+    let host = url.host_str().ok_or(ClientError::MissingHost)?;
+    if let Some(allowlist) = allowlist
+        && !allowlist.allows(host)
+    {
+        return Err(ClientError::HostNotAllowed(host.to_string()));
+    }
+    if let Some(addr) = parse_literal_ip(host) {
+        if blocked.contains(addr) {
+            return Err(ClientError::BlockedAddress(format!("{addr} (literal)")));
+        }
+        return Ok(());
+    }
+    // A hostname: resolve it once here so a name pointing into private or
+    // cluster space is refused before the unguarded transport dials it.
+    // This mirrors the GuardedResolver check the guarded transports get.
+    // Resolution FAILURE is reported distinctly from a blocked answer so
+    // callers (and offline test environments) can tell the two apart.
+    // The lookup is bounded (cap#241 review): a slow or nonresponsive
+    // resolver must not hold the deployment request for its full retry
+    // period before the bounded proxy path is even reached.
+    let lookup = tokio::net::lookup_host(format!("{host}:0"));
+    let addrs: Vec<SocketAddr> =
+        match tokio::time::timeout(crate::egress_proxy::DNS_RESOLVE_TIMEOUT, lookup).await {
+            Ok(result) => result
+                .map_err(|e| {
+                    ClientError::DnsLookupFailed(format!("failed to resolve `{host}`: {e}"))
+                })?
+                .collect(),
+            Err(_) => {
+                return Err(ClientError::DnsLookupFailed(format!(
+                    "resolving `{host}` timed out after {:?}",
+                    crate::egress_proxy::DNS_RESOLVE_TIMEOUT
+                )));
+            }
+        };
+    for addr in &addrs {
+        if blocked.contains(addr.ip()) {
+            return Err(ClientError::BlockedAddress(format!(
+                "refused to resolve `{host}` to blocked address {}",
+                addr.ip()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Outbound client for OCI registries.
 #[derive(Clone)]
 pub struct RegistryClient {
     inner: reqwest::Client,
     allowlist: AllowList,
+    blocked: Arc<BlockedNetworks>,
     body_limit: u64,
 }
 
@@ -296,6 +254,7 @@ impl RegistryClient {
         Ok(Self {
             inner: build_inner(&config)?,
             allowlist,
+            blocked: Arc::clone(&config.blocked),
             body_limit: config.body_limit_bytes,
         })
     }
@@ -324,6 +283,17 @@ impl RegistryClient {
         if !self.allowlist.allows(host) {
             return Err(ClientError::HostNotAllowed(host.to_string()));
         }
+        // reqwest bypasses its custom DNS resolver for literal-IP hosts, so
+        // the GuardedResolver blocklist never sees them — an allowlisted
+        // literal (e.g. a custom REGISTRY_ALLOWLIST entry like `10.0.5.7`)
+        // would otherwise be dialed directly. Every request this client
+        // issues goes through here, so enforce the literal-IP blocklist at
+        // the same pre-flight point (cap#241 review).
+        if let Some(addr) = parse_literal_ip(host)
+            && self.blocked.contains(addr)
+        {
+            return Err(ClientError::BlockedAddress(format!("{addr} (literal)")));
+        }
         Ok(())
     }
 
@@ -336,35 +306,64 @@ impl RegistryClient {
     }
 }
 
-/// Outbound client for BTCPay webhook callbacks (admin-controlled host, no
-/// allowlist — but still SSRF-defended through the resolver and redirect ban).
-#[derive(Clone)]
-pub struct WebhookClient {
-    inner: reqwest::Client,
-    body_limit: u64,
+/// Shared egress policy for the cosign/sigstore verification paths (issue
+/// #224): those stacks build their own reqwest transports internally (no
+/// resolver/redirect injection point), so their destinations are validated
+/// through this pre-flight guard instead — https-only, registry allowlist,
+/// literal-IP blocklist, and a one-shot DNS resolution for names — before
+/// any connection is attempted.
+#[derive(Debug, Clone)]
+pub struct EgressGuard {
+    pub blocked: Arc<BlockedNetworks>,
+    pub allowlist: AllowList,
+    /// Loopback CONNECT proxy (see `egress_proxy`) that the sigstore and
+    /// oci-client transports are routed through, so the guarded resolution
+    /// is the one the connection actually uses and every redirect hop /
+    /// bearer-token realm is re-validated (DNS-rebinding and redirect
+    /// bypasses from the cap#241 review).
+    pub proxy: crate::egress_proxy::EgressProxy,
 }
 
-impl WebhookClient {
-    pub fn from_env() -> Result<Self, ClientError> {
-        Self::new(ClientConfig::from_env())
+impl EgressGuard {
+    pub fn from_env() -> Self {
+        let mut blocked = BlockedNetworks::defaults();
+        if let Ok(pod) = std::env::var("CLUSTER_POD_CIDR") {
+            blocked.extend_from_cidrs(pod.split(','));
+        }
+        if let Ok(svc) = std::env::var("CLUSTER_SERVICE_CIDR") {
+            blocked.extend_from_cidrs(svc.split(','));
+        }
+        let blocked = Arc::new(blocked);
+        Self {
+            proxy: crate::egress_proxy::EgressProxy::new(Arc::clone(&blocked)),
+            blocked,
+            allowlist: AllowList::from_env_or_default(std::env::var("REGISTRY_ALLOWLIST").ok()),
+        }
     }
 
-    pub fn new(config: ClientConfig) -> Result<Self, ClientError> {
-        Ok(Self {
-            inner: build_inner(&config)?,
-            body_limit: config.body_limit_bytes,
-        })
+    /// Validate a registry-derived URL before the unguarded transport dials
+    /// it. Fails closed on any violation.
+    pub async fn check_registry_url(&self, url: &reqwest::Url) -> Result<(), ClientError> {
+        check_egress_destination(url, &self.blocked, Some(&self.allowlist)).await
     }
 
-    pub fn inner(&self) -> &reqwest::Client {
-        &self.inner
-    }
-
-    pub fn body_limit(&self) -> u64 {
-        self.body_limit
+    /// Cosign's explicit development HTTP opt-in changes only the scheme
+    /// policy, never host, DNS or blocked-network validation. Release builds
+    /// remain HTTPS-only even if a caller requests HTTP.
+    pub(crate) async fn check_cosign_registry_url(
+        &self,
+        url: &reqwest::Url,
+        allow_http: bool,
+    ) -> Result<(), ClientError> {
+        check_egress_destination_with_http(
+            url,
+            &self.blocked,
+            Some(&self.allowlist),
+            cfg!(debug_assertions) && allow_http,
+        )
+        .await
     }
 }
-
 /// Read a response body into memory while enforcing `limit` against the
 /// bytes actually received, not just the advertised Content-Length: a
 /// hostile server can omit the header or lie about it, so bodies are
@@ -408,6 +407,63 @@ mod tests {
             blocked: Arc::new(BlockedNetworks::defaults()),
             body_limit_bytes: 1024,
             timeout: Duration::from_secs(2),
+        }
+    }
+
+    /// Test-local guard with default policy, independent of ambient env
+    /// (REGISTRY_ALLOWLIST / CLUSTER_*_CIDR may be set by other tests).
+    fn hermetic_egress_guard() -> EgressGuard {
+        let blocked = Arc::new(BlockedNetworks::defaults());
+        EgressGuard {
+            proxy: crate::egress_proxy::EgressProxy::new(Arc::clone(&blocked)),
+            blocked,
+            allowlist: AllowList::from_env_or_default(None),
+        }
+    }
+
+    #[tokio::test]
+    async fn cosign_http_opt_in_preserves_destination_policy() {
+        let guard = hermetic_egress_guard();
+        let public = reqwest::Url::parse("http://8.8.8.8:5000/v2/").unwrap();
+        assert!(matches!(
+            guard.check_cosign_registry_url(&public, false).await,
+            Err(ClientError::SchemeNotAllowed(_))
+        ));
+        assert!(matches!(
+            guard.check_registry_url(&public).await,
+            Err(ClientError::SchemeNotAllowed(_))
+        ));
+        let guard = EgressGuard {
+            allowlist: AllowList::from_env_or_default(Some(
+                "8.8.8.8,127.0.0.1,10.0.0.1,localhost".into(),
+            )),
+            ..guard
+        };
+        let result = guard.check_cosign_registry_url(&public, true).await;
+        if cfg!(debug_assertions) {
+            result.unwrap();
+            for url in [
+                "http://127.0.0.1:5000",
+                "http://10.0.0.1:5000",
+                "http://localhost:5000",
+            ] {
+                assert!(matches!(
+                    guard
+                        .check_cosign_registry_url(&url.parse().unwrap(), true)
+                        .await,
+                    Err(ClientError::BlockedAddress(_))
+                ));
+            }
+            let restricted = EgressGuard {
+                allowlist: AllowList::from_env_or_default(Some("ghcr.io".into())),
+                ..guard
+            };
+            assert!(matches!(
+                restricted.check_cosign_registry_url(&public, true).await,
+                Err(ClientError::HostNotAllowed(_))
+            ));
+        } else {
+            assert!(matches!(result, Err(ClientError::SchemeNotAllowed(_))));
         }
     }
 
@@ -473,56 +529,106 @@ mod tests {
     }
 
     #[test]
-    fn blocked_networks_reject_private_v4() {
-        let blocked = BlockedNetworks::defaults();
-        for ip in [
-            "127.0.0.1",
-            "10.1.2.3",
-            "172.16.5.6",
-            "172.31.255.255",
-            "192.168.1.1",
-            "169.254.169.254", // IMDS
-            "0.0.0.0",
+    fn registry_client_rejects_allowlisted_private_literal_ip() {
+        // cap#241 review: reqwest bypasses GuardedResolver for literal-IP
+        // hosts, so an operator adding a private literal to
+        // REGISTRY_ALLOWLIST must not let tag resolution dial it. The
+        // literal-IP blocklist is enforced in check_url itself.
+        let allow = AllowList::from_env_or_default(Some("10.0.5.7".into()));
+        let client = RegistryClient::new(cfg(), allow).unwrap();
+        let err = client
+            .check_url("https://10.0.5.7/v2/team/app/manifests/latest")
+            .unwrap_err();
+        assert!(matches!(err, ClientError::BlockedAddress(_)));
+    }
+
+    #[test]
+    fn registry_client_rejects_allowlisted_public_literal_ip() {
+        // A public literal is not on the blocklist and is explicitly
+        // allowlisted by the operator, so — mirroring
+        // check_egress_destination's literal branch — it passes the
+        // pre-flight. Only blocked literals fail; this pins that the two
+        // guards stay consistent rather than silently diverging.
+        let allow = AllowList::from_env_or_default(Some("8.8.8.8".into()));
+        let client = RegistryClient::new(cfg(), allow).unwrap();
+        client
+            .check_url("https://8.8.8.8/v2/team/app/manifests/latest")
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn egress_guard_rejects_literal_ip_registry_hosts() {
+        // reqwest bypasses its custom DNS resolver for literal-IP hosts, so
+        // the pre-flight guard must reject them explicitly (issue #224).
+        let guard = hermetic_egress_guard();
+        for url in [
+            "https://10.0.5.7/v2/",
+            "https://127.0.0.1:5000/v2/",
+            "https://169.254.169.254/v2/",
+            // Bracketed IPv6 spellings, v4-compatible and v4-mapped.
+            "https://[::10.0.5.7]/v2/",
+            "https://[::127.0.0.1]/v2/",
+            "https://[::ffff:169.254.169.254]/v2/",
+            "https://[::1]/v2/",
+            // NAT64 spellings of internal v4 destinations (cap#241 review).
+            "https://[64:ff9b::a00:507]/v2/",
+            "https://[64:ff9b::a9fe:a9fe]/v2/",
+            "https://[64:ff9b:1::a00:507]/v2/",
         ] {
-            let parsed: IpAddr = ip.parse().unwrap();
-            assert!(blocked.contains(parsed), "{ip} should be blocked");
+            let parsed = reqwest::Url::parse(url).unwrap();
+            assert!(
+                guard.check_registry_url(&parsed).await.is_err(),
+                "{url} must be rejected"
+            );
         }
     }
 
-    #[test]
-    fn blocked_networks_accept_public_v4() {
-        let blocked = BlockedNetworks::defaults();
-        for ip in ["140.82.121.4", "1.1.1.1", "8.8.8.8"] {
-            let parsed: IpAddr = ip.parse().unwrap();
-            assert!(!blocked.contains(parsed), "{ip} should be permitted");
+    #[tokio::test]
+    async fn egress_guard_rejects_non_allowlisted_registry_hosts() {
+        // A tenant-supplied registry host that is not on the allowlist must
+        // never steer the cosign/sigstore egress (issue #224).
+        let guard = hermetic_egress_guard();
+        for url in [
+            "https://internal.svc.cluster.local/v2/",
+            "https://reg.evil.example/v2/",
+            "https://metadata.google.internal/v2/",
+        ] {
+            let parsed = reqwest::Url::parse(url).unwrap();
+            let err = guard.check_registry_url(&parsed).await.unwrap_err();
+            assert!(
+                matches!(err, ClientError::HostNotAllowed(_)),
+                "{url} must be rejected by the allowlist, got {err:?}"
+            );
         }
     }
 
-    #[test]
-    fn blocked_networks_reject_loopback_v6_and_link_local() {
-        let blocked = BlockedNetworks::defaults();
-        for ip in ["::1", "fe80::1", "fd00::1"] {
-            let parsed: IpAddr = ip.parse().unwrap();
-            assert!(blocked.contains(parsed), "{ip} should be blocked");
+    #[tokio::test]
+    async fn egress_guard_rejects_http_scheme() {
+        let guard = hermetic_egress_guard();
+        let parsed = reqwest::Url::parse("http://ghcr.io/v2/").unwrap();
+        let err = guard.check_registry_url(&parsed).await.unwrap_err();
+        assert!(matches!(err, ClientError::SchemeNotAllowed(_)));
+    }
+
+    #[tokio::test]
+    async fn egress_guard_allows_default_allowlisted_registries() {
+        // Sanity: the default allowlist's own entries still pass the guard.
+        // ghcr.io is a name, so the DNS path runs; offline CI resolves to
+        // nothing, which now surfaces as the distinct `DnsLookupFailed`
+        // variant (a resolution failure, not a block verdict) and is
+        // tolerated here (cap#241 review).
+        let guard = hermetic_egress_guard();
+        let parsed = reqwest::Url::parse("https://ghcr.io/v2/").unwrap();
+        match guard.check_registry_url(&parsed).await {
+            Ok(()) => {}
+            Err(ClientError::DnsLookupFailed(_)) => { /* offline test env: acceptable */ }
+            Err(other) => panic!("ghcr.io must not be blocked: {other:?}"),
         }
     }
-
-    #[test]
-    fn cluster_cidrs_extend_blocklist() {
-        let mut blocked = BlockedNetworks::defaults();
-        blocked.extend_from_cidrs(["10.244.0.0/16", "10.96.0.0/12"]);
-        let pod_ip: IpAddr = "10.244.5.7".parse().unwrap();
-        let svc_ip: IpAddr = "10.96.0.10".parse().unwrap();
-        assert!(blocked.contains(pod_ip));
-        assert!(blocked.contains(svc_ip));
-    }
-
     #[test]
     fn redirect_policy_disabled_on_built_clients() {
         // Smoke check: builders shouldn't fail. The redirect ban is enforced
         // at request time by reqwest; check_url additionally guards the URL.
         RegistryClient::new(cfg(), AllowList::from_env_or_default(None)).unwrap();
-        WebhookClient::new(cfg()).unwrap();
     }
 
     #[tokio::test]
@@ -535,7 +641,6 @@ mod tests {
         let client = RegistryClient::new(cfg(), AllowList::from_env_or_default(None)).unwrap();
         assert_eq!(client.body_limit(), 1024);
     }
-
     #[tokio::test]
     async fn body_limit_is_enforced_mid_stream_when_content_length_is_absent() {
         // A hostile server can omit Content-Length and stream an unbounded

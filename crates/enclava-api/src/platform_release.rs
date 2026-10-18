@@ -155,6 +155,14 @@ pub struct PlatformRelease {
     pub expected_firmware_measurement: String,
     pub expected_runtime_class: String,
     pub genpolicy_version: String,
+    /// LUKS2 header-seal rollout claim (`"adopt"` | `"required"`), carried
+    /// by the signed release (cap#244 review). The rollout value must come
+    /// from verified release metadata — never from a producer's private
+    /// environment — so every producer of `expected_cc_init_data_hash`
+    /// renders identical bytes. Empty for releases signed before this field
+    /// existed; those keep the rollout-window ("adopt") semantics.
+    #[serde(default)]
+    pub luks2_header_seal: String,
     pub created_at: String,
 }
 
@@ -194,6 +202,17 @@ impl PlatformRelease {
         )?;
         require_ed25519_point("platform_trustee_policy_pubkey_hex", &bytes)?;
         Ok(bytes)
+    }
+
+    /// Effective LUKS2 header-seal rollout claim: the signed value when the
+    /// release carries one, otherwise the rollout-window default. Only ever
+    /// read after [`verify_envelope`] / [`validate_release_payload`], which
+    /// pin the value to `"adopt"` / `"required"`.
+    pub fn luks2_header_seal_claim(&self) -> String {
+        if self.luks2_header_seal.is_empty() {
+            return "adopt".to_string();
+        }
+        self.luks2_header_seal.clone()
     }
 }
 
@@ -353,7 +372,7 @@ pub fn canonical_platform_release_bytes(
     let platform_trustee_policy_pubkey = release.platform_trustee_policy_pubkey_bytes()?;
     let policy_template_sha256 = release.policy_template_sha256_bytes()?;
     let expected_firmware_measurement = release.expected_firmware_measurement_bytes()?;
-    Ok(ce_v1_bytes(&[
+    let mut records: Vec<(&str, &[u8])> = vec![
         ("purpose", b"enclava-platform-release-v1"),
         ("schema_version", release.schema_version.as_bytes()),
         (
@@ -405,8 +424,18 @@ pub fn canonical_platform_release_bytes(
             release.expected_runtime_class.as_bytes(),
         ),
         ("genpolicy_version", release.genpolicy_version.as_bytes()),
-        ("created_at", release.created_at.as_bytes()),
-    ]))
+    ];
+    // The seal-rollout claim is signed when present (cap#244 review), but
+    // only then: releases signed before the field existed carry no such
+    // record and must keep verifying byte-for-byte, so the record is
+    // emitted exactly when the payload carries a non-empty value. A
+    // tampered or stripped value changes the signed bytes and fails
+    // verification.
+    if !release.luks2_header_seal.is_empty() {
+        records.push(("luks2_header_seal", release.luks2_header_seal.as_bytes()));
+    }
+    records.push(("created_at", release.created_at.as_bytes()));
+    Ok(ce_v1_bytes(&records))
 }
 
 fn validate_release_payload(release: &PlatformRelease) -> Result<(), PlatformReleaseError> {
@@ -533,6 +562,14 @@ fn validate_release_payload(release: &PlatformRelease) -> Result<(), PlatformRel
         return Err(PlatformReleaseError::InvalidField {
             field: "genpolicy_version",
             message: "must be a concrete pinned generator version".to_string(),
+        });
+    }
+    if !release.luks2_header_seal.is_empty()
+        && !matches!(release.luks2_header_seal.as_str(), "adopt" | "required")
+    {
+        return Err(PlatformReleaseError::InvalidField {
+            field: "luks2_header_seal",
+            message: "expected \"adopt\" or \"required\"".to_string(),
         });
     }
     chrono::DateTime::parse_from_rfc3339(&release.created_at).map_err(|error| {
@@ -967,6 +1004,71 @@ mod tests {
         envelope.signature = hex::encode(key.sign(&canonical).to_bytes());
         envelope.signing_pubkey = hex::encode(key.verifying_key().as_bytes());
         serde_json::to_string(&envelope).unwrap()
+    }
+
+    fn sign_envelope_with_dev_key(payload: PlatformRelease) -> PlatformReleaseEnvelope {
+        use ed25519_dalek::{Signer, SigningKey};
+        let key = SigningKey::from_bytes(&[0xc0; 32]);
+        let canonical = canonical_platform_release_bytes(&payload).unwrap();
+        PlatformReleaseEnvelope {
+            payload,
+            signature: hex::encode(key.sign(&canonical).to_bytes()),
+            signing_pubkey: hex::encode(key.verifying_key().as_bytes()),
+        }
+    }
+
+    /// cap#244: the `luks2_header_seal` rollout claim is part of the signed
+    /// bytes whenever the payload carries one — a tampered or stripped
+    /// value must break the signature (API twin, kept in lockstep with the
+    /// CLI twin's identically named test).
+    #[test]
+    fn seal_rollout_claim_is_covered_by_the_signature() {
+        let mut payload = bundled_payload();
+        payload.luks2_header_seal = "required".to_string();
+        let envelope = sign_envelope_with_dev_key(payload);
+        let verified = verify_envelope(envelope.clone()).unwrap();
+        assert_eq!(verified.luks2_header_seal_claim(), "required");
+
+        let mut tampered = envelope.clone();
+        tampered.payload.luks2_header_seal = "adopt".to_string();
+        let err = verify_envelope(tampered).expect_err("flip must break the signature");
+        assert!(matches!(err, PlatformReleaseError::BadSignature(_)));
+
+        let mut stripped = envelope;
+        stripped.payload.luks2_header_seal = String::new();
+        let err =
+            verify_envelope(stripped).expect_err("stripping the field must break the signature");
+        assert!(matches!(err, PlatformReleaseError::BadSignature(_)));
+    }
+
+    /// cap#244: releases signed before the field existed (no record in the
+    /// signed bytes) must keep verifying byte-for-byte and resolve to the
+    /// rollout-window default.
+    #[test]
+    fn pre_field_release_still_verifies_and_defaults_to_adopt() {
+        let payload = bundled_payload();
+        let mut value = serde_json::to_value(&payload).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("luks2_header_seal")
+            .unwrap();
+        let payload: PlatformRelease = serde_json::from_value(value).unwrap();
+        assert!(payload.luks2_header_seal.is_empty());
+
+        let envelope = sign_envelope_with_dev_key(payload);
+        let verified = verify_envelope(envelope).expect("pre-field envelope must keep verifying");
+        assert_eq!(verified.luks2_header_seal_claim(), "adopt");
+    }
+
+    #[test]
+    fn release_payload_rejects_unknown_seal_rollout_value() {
+        let mut payload = bundled_payload();
+        payload.luks2_header_seal = "banana".to_string();
+        let err = validate_release_payload(&payload).unwrap_err();
+        assert!(
+            matches!(err, PlatformReleaseError::InvalidField { field, .. } if field == "luks2_header_seal")
+        );
     }
 
     #[test]

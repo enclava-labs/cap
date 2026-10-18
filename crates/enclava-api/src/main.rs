@@ -705,6 +705,16 @@ async fn main() {
         eprintln!("startup refused: {e}");
         std::process::exit(1);
     }
+    // Issue #225 fail-closed gates: platform registry credentials must be
+    // explicitly scoped before they may be forwarded anywhere.
+    if let Some(error) = enclava_api::cosign::cosign_registry_credentials_startup_error() {
+        eprintln!("startup refused: {error}");
+        std::process::exit(1);
+    }
+    if let Some(error) = enclava_api::deploy::tenant_image_pull_secret_startup_error() {
+        eprintln!("startup refused: {error}");
+        std::process::exit(1);
+    }
     let deployment_dispatch_enabled = match load_deployment_dispatch_enabled() {
         Ok(enabled) => enabled,
         Err(error) => {
@@ -772,6 +782,27 @@ async fn main() {
             eprintln!("startup refused: {e}");
             std::process::exit(1);
         }
+        // LUKS2 header-seal rollout claim (cap#244 review): the value is
+        // rendered into every cc_init_data from the SIGNED release, so the
+        // API render always matches the CLI's signed hash. An
+        // ENCLAVA_LUKS2_HEADER_SEAL leftover that disagrees with the signed
+        // value is a misconfiguration and refuses startup: silently
+        // rendering either side's private value would let the signed
+        // `expected_cc_init_data_hash` diverge from the actual rollout
+        // state.
+        let seal_claim = release.luks2_header_seal_claim();
+        if let Some(env) = env_nonempty("ENCLAVA_LUKS2_HEADER_SEAL")
+            && env.trim() != seal_claim
+        {
+            eprintln!(
+                "startup refused: ENCLAVA_LUKS2_HEADER_SEAL conflicts with signed platform \
+                 release: env `{env}` != release `{seal_claim}`; the rollout value is sourced \
+                 from the signed platform release (luks2_header_seal), remove the environment \
+                 variable or sign a release carrying the intended value"
+            );
+            std::process::exit(1);
+        }
+        enclava_engine::manifest::cc_init_data::set_luks2_header_seal_claim(&seal_claim);
     }
 
     let startup_proxy_image = match release_env_value(
@@ -804,7 +835,12 @@ async fn main() {
         startup_proxy_image.as_deref(),
         startup_caddy_image.as_deref(),
     ) {
-        Ok(Some(pins)) => match enclava_api::cosign::verify_sidecars_at_startup(&pins).await {
+        Ok(Some(pins)) => match enclava_api::cosign::verify_sidecars_at_startup(
+            &enclava_api::clients::EgressGuard::from_env(),
+            &pins,
+        )
+        .await
+        {
             Ok(v) => tracing::info!(
                 attestation_proxy = %v.attestation_proxy,
                 caddy_ingress = %v.caddy_ingress,
@@ -935,14 +971,22 @@ async fn main() {
     let outbound_body_limit = outbound_config.body_limit_bytes;
     let registry_client =
         enclava_api::clients::RegistryClient::from_env().expect("failed to build registry client");
+    let cosign_egress = enclava_api::clients::EgressGuard::from_env();
     let trustee_http_client =
         build_trustee_http_client().expect("failed to build Trustee HTTP client");
 
     let side_effect_admission = enclava_api::state::side_effect_admission_for_pool(&pool);
+    // Construct the router with workload admission CLOSED. Bind liveness
+    // before the potentially serial, per-namespace Kubernetes sweep: a stalled
+    // cluster must not make startup probes restart us before /livez exists.
+    // The shared atomic is opened only after the initial sweep converges.
+    let mut dispatch_admission = false;
     let state = AppState {
         db: pool,
         management_mode,
-        deployment_dispatch_enabled,
+        deployment_dispatch_enabled: Arc::new(std::sync::atomic::AtomicBool::new(
+            dispatch_admission,
+        )),
         startup_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         signing_key: Arc::new(signing_key),
         hmac_key: Arc::new(hmac_key),
@@ -953,6 +997,7 @@ async fn main() {
         http_client,
         outbound_body_limit,
         registry_client,
+        cosign_egress,
         trustee_http_client,
         tee_http_client,
         recent_tee_probe_failures: std::sync::Arc::new(std::sync::Mutex::new(
@@ -999,6 +1044,16 @@ async fn main() {
         .await
     });
 
+    let pull_secret_sweep_converged =
+        enclava_api::deploy::cleanup_stale_tenant_image_pull_secrets_at_startup(&state.db).await;
+    dispatch_admission = deployment_dispatch_enabled && pull_secret_sweep_converged;
+    if dispatch_admission {
+        state.set_deployment_dispatch_enabled(true);
+    } else if deployment_dispatch_enabled {
+        tracing::error!(
+            "workload admission closed: pull secret cleanup did not converge; background retry scheduled"
+        );
+    }
     if let Err(error) = enclava_api::kbs::reconcile_signed_policy_at_startup(&state).await {
         eprintln!("startup refused: KBS policy reconciliation failed: {error}");
         std::process::exit(1);
@@ -1016,13 +1071,30 @@ async fn main() {
     enclava_api::kbs::spawn_signed_policy_reconciler(state.clone());
     enclava_api::routes::auth::spawn_device_login_reaper(state.db.clone());
     enclava_api::auth::nostr::spawn_nip98_replay_cache_reaper(state.db.clone());
-    if deployment_dispatch_enabled {
+    // The pull-secret cleanup sweep already ran before router construction;
+    // `dispatch_admission` encodes its result together with the operator's
+    // CAP_DEPLOYMENT_DISPATCH_ENABLED intent. The deployment dispatcher is
+    // spawned only when the operator enabled dispatch (review finding on
+    // #243) — and only once, in lockstep with opening workload admission.
+    if deployment_dispatch_enabled && dispatch_admission {
         enclava_api::deployment_jobs::spawn_deployment_dispatcher(state.clone());
-    } else {
+    } else if !deployment_dispatch_enabled {
         tracing::info!(
-            "workload mutation and durable deployment dispatch are disabled by CAP_DEPLOYMENT_DISPATCH_ENABLED"
+            "workload mutation and durable deployment dispatch are disabled \
+             (CAP_DEPLOYMENT_DISPATCH_ENABLED=false)"
         );
     }
+    // The sweep keeps running for the process lifetime regardless of the
+    // dispatch flag (review finding on #243): converged is not a one-shot
+    // property — an older revision rolling out alongside this one can
+    // re-materialize a managed pull secret into a tenant namespace after the
+    // first sweep converged, and a dispatch-disabled (frozen) process must
+    // still reap such residue instead of leaving it until the next restart.
+    spawn_pull_secret_sweep_reconciler(
+        state.clone(),
+        deployment_dispatch_enabled,
+        dispatch_admission,
+    );
     state.mark_startup_ready();
     tracing::info!("startup reconciliation complete; API is ready");
 
@@ -1032,9 +1104,135 @@ async fn main() {
         .expect("server error");
 }
 
+/// Bounded backoff between cleanup-sweep retries: doubles up to one minute,
+/// so a Kubernetes outage cannot make the retry loop hammer the API server,
+/// while a recovery is noticed within at most a minute.
+fn sweep_retry_backoff(previous: std::time::Duration) -> std::time::Duration {
+    (previous * 2).min(std::time::Duration::from_secs(60))
+}
+
+/// Slow interval between converged cleanup sweeps. After the first
+/// convergence the sweep is no longer latency-critical (review finding on
+/// #243): its job is to reap pull secrets an older revision re-materializes
+/// into tenant namespaces during a rolling update, so a converged sweep is
+/// re-run periodically instead of being a one-shot — long enough to stay off
+/// the API server's back, short enough to reap residue within minutes.
+fn sweep_periodic_interval() -> std::time::Duration {
+    std::time::Duration::from_secs(600)
+}
+
+/// Keep the tenant image pull secret cleanup sweep running for the process
+/// lifetime (review finding on #243). While dispatch is operator-enabled and
+/// no sweep has converged yet, the dispatch-freeze middleware keeps rejecting
+/// workload mutations and the deployment dispatcher stays unspawned; the
+/// first convergence opens them exactly once, dispatcher first and admission
+/// second. After that — and with the operator flag off entirely — the sweep
+/// keeps re-running on a slow interval, because converged is not forever: an
+/// older revision rolling out alongside this one can re-materialize a managed
+/// pull secret after the first sweep converged, and a frozen process must
+/// still reap such residue instead of leaving it until the next restart.
+fn spawn_pull_secret_sweep_reconciler(
+    state: AppState,
+    deployment_dispatch_enabled: bool,
+    dispatch_admission: bool,
+) {
+    tokio::spawn(async move {
+        let mut backoff = std::time::Duration::from_secs(2);
+        // The startup sweep already converged: the dispatcher is running and
+        // admission is open.
+        let mut dispatcher_spawned = dispatch_admission;
+        loop {
+            tokio::time::sleep(backoff).await;
+            if enclava_api::deploy::cleanup_stale_tenant_image_pull_secrets_at_startup(&state.db)
+                .await
+            {
+                if deployment_dispatch_enabled && !dispatcher_spawned {
+                    // Dispatcher first, admission second: whenever a workload
+                    // mutation is admitted, the dispatcher is already running.
+                    enclava_api::deployment_jobs::spawn_deployment_dispatcher(state.clone());
+                    state.set_deployment_dispatch_enabled(true);
+                    dispatcher_spawned = true;
+                    tracing::info!(
+                        "tenant image pull secret cleanup sweep converged; \
+                         workload admission and deployment dispatch enabled"
+                    );
+                }
+                backoff = sweep_periodic_interval();
+            } else {
+                if dispatcher_spawned {
+                    // Admission is already open and stays open: the per-deploy
+                    // cleanup is the hard gate for every deploy, so a failure
+                    // of this periodic re-sweep must not flap deployments
+                    // closed — log loudly and retry.
+                    tracing::error!(
+                        "tenant image pull secret cleanup sweep did not converge; a stale \
+                         platform pull secret may still be out there (per-deploy cleanup \
+                         still gates every deploy), retrying"
+                    );
+                } else {
+                    tracing::warn!(
+                        backoff_secs = backoff.as_secs(),
+                        "tenant image pull secret cleanup sweep did not converge; \
+                         workload admission stays closed, retrying"
+                    );
+                }
+                backoff = sweep_retry_backoff(backoff);
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sweep_retry_backoff_is_bounded() {
+        // The cleanup-sweep reconciler retries with exponential backoff that
+        // must stay bounded (review finding on #243): a long Kubernetes
+        // outage must not hammer the API server, and recovery is noticed
+        // within at most the cap.
+        let mut backoff = std::time::Duration::from_secs(2);
+        let mut steps = Vec::new();
+        for _ in 0..10 {
+            backoff = sweep_retry_backoff(backoff);
+            steps.push(backoff);
+        }
+        assert_eq!(
+            steps[..5],
+            [
+                std::time::Duration::from_secs(4),
+                std::time::Duration::from_secs(8),
+                std::time::Duration::from_secs(16),
+                std::time::Duration::from_secs(32),
+                std::time::Duration::from_secs(60),
+            ]
+        );
+        assert!(
+            steps
+                .iter()
+                .all(|step| *step <= std::time::Duration::from_secs(60)),
+            "backoff must never exceed the cap: {steps:?}"
+        );
+    }
+
+    #[test]
+    fn converged_sweeps_keep_running_on_a_slow_interval() {
+        // Converged is not a one-shot (review finding on #243): after the
+        // first convergence the sweep re-runs periodically to reap pull
+        // secrets an older revision re-materializes during a rolling update.
+        // The interval must be slow (not hammering the API server) but finite
+        // (residue reaped within minutes).
+        let interval = sweep_periodic_interval();
+        assert!(
+            interval >= std::time::Duration::from_secs(60),
+            "periodic sweeps must not hammer the API server: {interval:?}"
+        );
+        assert!(
+            interval <= std::time::Duration::from_secs(3600),
+            "periodic sweeps must reap rolling-update residue within minutes: {interval:?}"
+        );
+    }
 
     #[test]
     fn acme_dns_settings_preserve_defaults_and_validate_explicit_values() {
@@ -1206,6 +1404,7 @@ mod tests {
             expected_firmware_measurement: "00".repeat(32),
             expected_runtime_class: "kata-qemu-snp".into(),
             genpolicy_version: "test".into(),
+            luks2_header_seal: String::new(),
             created_at: "2026-01-01T00:00:00Z".into(),
         };
         let (trustee, signing) =

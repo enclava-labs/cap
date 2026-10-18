@@ -94,6 +94,7 @@ fn test_release() -> PlatformRelease {
             expected_firmware_measurement: "00".repeat(32),
             expected_runtime_class: "kata-qemu-snp".to_string(),
             genpolicy_version: "test-genpolicy".to_string(),
+            luks2_header_seal: "adopt".to_string(),
             created_at: "2026-05-09T00:00:00Z".to_string(),
         }
 }
@@ -323,6 +324,7 @@ fn signed_cc_hash_app_uses_local_artifact_urls_like_live_apply() {
                     org_keyring_fingerprint: [3; 32],
                     omit_log_encryption_claim: false,
                     legacy_collapsed_trustee_key: false,
+            omit_luks2_header_seal_claim: false,
                 },
                 generated_agent_policy: GeneratedAgentPolicy {
                     policy_text: "package agent_policy\n".to_string(),
@@ -347,6 +349,7 @@ fn signed_cc_hash_app_uses_local_artifact_urls_like_live_apply() {
             kbs_url: "https://kbs.example.test:8080".to_string(),
             kbs_ca_cert_pem: None,
             runtime_class: cc_init_data::DEFAULT_RUNTIME_CLASS.to_string(),
+            luks2_header_seal: "adopt".to_string(),
         },
     );
 
@@ -391,6 +394,7 @@ fn signed_cc_hash_app_uses_api_deployment_context_without_env_exports() {
                     org_keyring_fingerprint: [3; 32],
                     omit_log_encryption_claim: false,
                     legacy_collapsed_trustee_key: false,
+            omit_luks2_header_seal_claim: false,
                 },
                 generated_agent_policy: GeneratedAgentPolicy {
                     policy_text: "package agent_policy\n".to_string(),
@@ -415,6 +419,7 @@ fn signed_cc_hash_app_uses_api_deployment_context_without_env_exports() {
             kbs_url: "https://kbs.example.test:8080".to_string(),
             kbs_ca_cert_pem: None,
             runtime_class: cc_init_data::DEFAULT_RUNTIME_CLASS.to_string(),
+            luks2_header_seal: "adopt".to_string(),
         },
     );
 

@@ -563,13 +563,32 @@ pub struct DeploymentResponse {
 
 const PUBLIC_DEPLOYMENT_ERROR_MESSAGE: &str = "deployment_error";
 
+/// Bounded failure classifications that may cross the API boundary verbatim.
+/// The control-plane pair is the historical passthrough set. The pull-secret
+/// codes are admitted so a stored row is not redacted, in lockstep with the
+/// 0087 CHECK. They are not written today: `pull_secret_reconcile_deferred`
+/// is a non-terminal requeue (`requeue_apply_job` clears `last_error_code`
+/// for every transient reason, and the deployment stays non-terminal), and
+/// `pull_secret_delete_conflict` is a terminal apply failure published as
+/// `deployment_apply_failed` like every other apply error. The specific
+/// classification stays in logs via `DeployError::public_code`. Anything
+/// else is redacted.
+const PUBLIC_DEPLOYMENT_ERROR_CODES: &[&str] = &[
+    crate::deploy::DEPLOYMENT_SUPERSEDED_ERROR,
+    crate::deployment_jobs::CUSTOMER_CONFIG_HOLD_EXPIRED,
+    "pull_secret_reconcile_deferred",
+    "pull_secret_delete_conflict",
+];
+
 /// Project a stored deployment error across an API boundary without exposing
 /// arbitrary backend, runtime, or workload-controlled plaintext.
 pub(crate) fn public_deployment_error_message(error_message: Option<&str>) -> Option<String> {
-    error_message.map(|error_message| match error_message {
-        crate::deploy::DEPLOYMENT_SUPERSEDED_ERROR
-        | crate::deployment_jobs::CUSTOMER_CONFIG_HOLD_EXPIRED => error_message.to_string(),
-        _ => PUBLIC_DEPLOYMENT_ERROR_MESSAGE.to_string(),
+    error_message.map(|error_message| {
+        if PUBLIC_DEPLOYMENT_ERROR_CODES.contains(&error_message) {
+            error_message.to_string()
+        } else {
+            PUBLIC_DEPLOYMENT_ERROR_MESSAGE.to_string()
+        }
     })
 }
 
@@ -972,7 +991,6 @@ async fn deploy_app_candidate(
         ));
     }
 
-    // Resolve image tag to digest
     let image_ref = enclava_common::image::ImageRef::parse(&body.image).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
@@ -981,6 +999,42 @@ async fn deploy_app_candidate(
     })?;
 
     let image_digest = if image_ref.has_digest() {
+        // Digest-pinned references skip the allowlisted registry_client tag
+        // resolution, but the registry host still drives the cosign/sigstore
+        // egress below — so enforce the same destination policy up front
+        // (issue #224): an unallowlisted or private/literal-IP registry
+        // must never steer API egress, pinned digest or not.
+        let (registry, _) = crate::cosign::parse_image_parts(&body.image).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("invalid image reference: {e}")})),
+            )
+        })?;
+        let base_url = crate::registry::registry_base_url(&registry).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("unsupported registry: {e}")})),
+            )
+        })?;
+        let url = reqwest::Url::parse(&base_url).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("invalid registry URL: {e}")})),
+            )
+        })?;
+        state
+            .cosign_egress
+            .check_registry_url(&url)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "registry_destination_not_allowed",
+                        "message": e.to_string(),
+                    })),
+                )
+            })?;
         image_ref.digest().to_string()
     } else {
         crate::registry::resolve_image_digest(&state.registry_client, &image_ref)
@@ -1313,35 +1367,36 @@ async fn deploy_app_candidate(
             ));
         }
     };
-    let verified = crate::cosign::verify_image(&body.image, &image_digest, &policy)
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "cosign_verification_failed"})),
-            )
-        })?;
-    let portable_material =
-        crate::cosign::fetch_portable_verification_material(&body.image, &image_digest)
+    let verified =
+        crate::cosign::verify_image(&state.cosign_egress, &body.image, &image_digest, &policy)
             .await
             .map_err(|_| {
                 (
                     StatusCode::BAD_REQUEST,
-                    Json(
-                        serde_json::json!({"error": "portable_verification_material_unavailable"}),
-                    ),
+                    Json(serde_json::json!({"error": "cosign_verification_failed"})),
                 )
             })?;
-
-    // Fetch provenance attestation and SBOM if available (non-fatal if missing).
-    let (provenance, sbom) = crate::cosign::fetch_attestations(
-        &state.http_client,
+    let portable_material = crate::cosign::fetch_portable_verification_material(
+        &state.cosign_egress,
         &body.image,
         &image_digest,
-        state.outbound_body_limit,
     )
     .await
-    .unwrap_or((None, None));
+    .map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "portable_verification_material_unavailable"})),
+        )
+    })?;
+
+    // Legacy .att/.sbom tags are mutable and neither the image signature nor
+    // the index-bound portable provenance authenticates these independent
+    // manifest responses. Do not persist or surface them as verified-adjacent
+    // metadata. The portable provenance is checked separately by the offline
+    // verifier; a signed/subject-bound metadata ingestion path is required
+    // before these nullable fields can safely be populated again.
+    let provenance: Option<serde_json::Value> = None;
+    let sbom: Option<serde_json::Value> = None;
 
     let source_provider = body.source_provider.map(SourceProvider::as_str);
     let spec_snapshot = serde_json::json!({

@@ -116,56 +116,63 @@ def require_unforgeable_pubkey(field: str, value: str) -> None:
 
 
 def canonical_platform_release_bytes(payload: dict[str, str]) -> bytes:
-    return ce_v1_bytes(
-        [
-            ("purpose", b"enclava-platform-release-v1"),
-            ("schema_version", payload["schema_version"].encode()),
-            (
-                "platform_release_version",
-                payload["platform_release_version"].encode(),
+    records = [
+        ("purpose", b"enclava-platform-release-v1"),
+        ("schema_version", payload["schema_version"].encode()),
+        (
+            "platform_release_version",
+            payload["platform_release_version"].encode(),
+        ),
+        ("signing_service_url", payload["signing_service_url"].encode()),
+        (
+            "signing_service_pubkey",
+            hex32_bytes(
+                "signing_service_pubkey_hex",
+                payload["signing_service_pubkey_hex"],
             ),
-            ("signing_service_url", payload["signing_service_url"].encode()),
-            (
-                "signing_service_pubkey",
-                hex32_bytes(
-                    "signing_service_pubkey_hex",
-                    payload["signing_service_pubkey_hex"],
-                ),
+        ),
+        (
+            "platform_trustee_policy_pubkey",
+            hex32_bytes(
+                "platform_trustee_policy_pubkey_hex",
+                payload["platform_trustee_policy_pubkey_hex"],
             ),
-            (
-                "platform_trustee_policy_pubkey",
-                hex32_bytes(
-                    "platform_trustee_policy_pubkey_hex",
-                    payload["platform_trustee_policy_pubkey_hex"],
-                ),
-            ),
-            ("policy_template_id", payload["policy_template_id"].encode()),
-            (
+        ),
+        ("policy_template_id", payload["policy_template_id"].encode()),
+        (
+            "policy_template_sha256",
+            hex32_bytes(
                 "policy_template_sha256",
-                hex32_bytes(
-                    "policy_template_sha256",
-                    payload["policy_template_sha256"],
-                ),
+                payload["policy_template_sha256"],
             ),
-            ("policy_template_text", payload["policy_template_text"].encode()),
-            ("attestation_proxy_image", payload["attestation_proxy_image"].encode()),
-            ("caddy_ingress_image", payload["caddy_ingress_image"].encode()),
-            ("trustee_kbs_url", payload["trustee_kbs_url"].encode()),
-            ("trustee_kbs_ca_cert_pem", payload["trustee_kbs_ca_cert_pem"].encode()),
-            ("tenant_caddy_tls_mode", payload["tenant_caddy_tls_mode"].encode()),
-            ("tenant_caddy_acme_ca", payload["tenant_caddy_acme_ca"].encode()),
-            (
+        ),
+        ("policy_template_text", payload["policy_template_text"].encode()),
+        ("attestation_proxy_image", payload["attestation_proxy_image"].encode()),
+        ("caddy_ingress_image", payload["caddy_ingress_image"].encode()),
+        ("trustee_kbs_url", payload["trustee_kbs_url"].encode()),
+        ("trustee_kbs_ca_cert_pem", payload["trustee_kbs_ca_cert_pem"].encode()),
+        ("tenant_caddy_tls_mode", payload["tenant_caddy_tls_mode"].encode()),
+        ("tenant_caddy_acme_ca", payload["tenant_caddy_acme_ca"].encode()),
+        (
+            "expected_firmware_measurement",
+            hex32_bytes(
                 "expected_firmware_measurement",
-                hex32_bytes(
-                    "expected_firmware_measurement",
-                    payload["expected_firmware_measurement"],
-                ),
+                payload["expected_firmware_measurement"],
             ),
-            ("expected_runtime_class", payload["expected_runtime_class"].encode()),
-            ("genpolicy_version", payload["genpolicy_version"].encode()),
-            ("created_at", payload["created_at"].encode()),
-        ]
-    )
+        ),
+        ("expected_runtime_class", payload["expected_runtime_class"].encode()),
+        ("genpolicy_version", payload["genpolicy_version"].encode()),
+    ]
+    # Signed when present, but only then (cap#244 review): releases signed
+    # before the field existed carry no record and must keep verifying
+    # byte-for-byte, so the record is emitted exactly when the payload
+    # carries a non-empty value. Mirrors the Rust twins' encoders.
+    if payload.get("luks2_header_seal"):
+        records.append(
+            ("luks2_header_seal", payload["luks2_header_seal"].encode())
+        )
+    records.append(("created_at", payload["created_at"].encode()))
+    return ce_v1_bytes(records)
 
 
 def env_overlay(payload: dict[str, str]) -> dict[str, str]:
@@ -185,6 +192,7 @@ def env_overlay(payload: dict[str, str]) -> dict[str, str]:
         "EXPECTED_FIRMWARE_MEASUREMENT": "expected_firmware_measurement",
         "EXPECTED_RUNTIME_CLASS": "expected_runtime_class",
         "GENPOLICY_VERSION": "genpolicy_version",
+        "LUKS2_HEADER_SEAL": "luks2_header_seal",
         "CREATED_AT": "created_at",
     }
     for env_name, field in mapping.items():
@@ -468,6 +476,11 @@ def validate_payload(payload: dict[str, str], *, allow_dev_internal_tls: bool = 
     hex32_bytes(
         "expected_firmware_measurement", payload["expected_firmware_measurement"]
     )
+    # Empty (pre-field releases) is legal and keeps the rollout-window
+    # ("adopt") semantics; anything present must be a known claim value.
+    seal = payload.get("luks2_header_seal", "")
+    if seal not in ("", "adopt", "required"):
+        raise ValueError('luks2_header_seal must be "", "adopt", or "required"')
     actual = hashlib.sha256(payload["policy_template_text"].encode()).hexdigest()
     if actual != payload["policy_template_sha256"]:
         raise ValueError("policy_template_sha256 does not match policy_template_text")

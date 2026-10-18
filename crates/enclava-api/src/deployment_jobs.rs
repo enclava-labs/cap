@@ -592,7 +592,8 @@ impl DeploymentJobError {
     fn should_requeue_without_terminal_failure(&self) -> bool {
         matches!(
             self,
-            Self::Db(_)
+            Self::Apply(crate::deploy::DeployError::PullSecretReconcileDeferred(_))
+                | Self::Db(_)
                 | Self::LeaseLost
                 | Self::ApplyLimiterClosed
                 | Self::SideEffectAdmissionClosed
@@ -1763,6 +1764,33 @@ pub fn spawn_deployment_dispatcher(state: AppState) {
         }
     });
 
+    // Retained-namespace fence reconciliation probes Kubernetes and can be
+    // held up by slow/unreachable API servers, so it runs on its own task:
+    // orphaned-apply repair must never wait behind a stalled namespace GET.
+    let retained_state = state.clone();
+    tokio::spawn(async move {
+        loop {
+            // Retained-namespace fences from incomplete failed-apply teardowns
+            // are released only after reconciliation observes the namespace
+            // gone; fail closed on any uncertainty.
+            match crate::mutation_leases::release_retained_deployment_namespace_fences(
+                &retained_state.db,
+            )
+            .await
+            {
+                Ok(released) if released > 0 => tracing::info!(
+                    released,
+                    "released retained deployment namespace fences after confirmed namespace deletion"
+                ),
+                Ok(_) => {}
+                Err(_) => tracing::warn!(
+                    error_code = "retained_namespace_fence_repair_failed",
+                    "failed to release retained deployment namespace fences"
+                ),
+            }
+            tokio::time::sleep(TERMINAL_LEASE_REPAIR_INTERVAL).await;
+        }
+    });
     let setup_worker_slots = Arc::new(tokio::sync::Semaphore::new(MAX_SETUP_WORKERS));
     let configured_apply_workers =
         apply_worker_limit(state.deployment_apply_permits.available_permits());
@@ -1999,8 +2027,27 @@ async fn process_apply_job(
                 );
             }
         }
+        Ok(Ok(JobApplyOutcome::ApplyFailed(error, mutation)))
+            if error.should_requeue_without_terminal_failure() =>
+        {
+            // The reconciliation timed out or encountered a newer rollout.
+            // The provider may have accepted earlier writes in this attempt:
+            // retain the mutation fence's quarantine before another worker
+            // retries the same durable deployment, rather than terminalizing it.
+            if let Err(requeue_error) = requeue_apply_job(&state.db, &job, error.code()).await {
+                tracing::error!(deployment_id = %deployment_id,
+                    error_code = requeue_error.code(),
+                    "failed to requeue deferred pull-secret reconciliation");
+            }
+            if let Err(release_error) = mutation.release_after_provider_quarantine().await {
+                tracing::error!(deployment_id = %deployment_id,
+                    error_code = DeploymentJobError::from(release_error).code(),
+                    "failed to quarantine deferred deployment mutation");
+            }
+        }
         Ok(Ok(JobApplyOutcome::ApplyFailed(error, mutation))) => {
-            fail_apply_job_with_mutation(&state, &job, &error, Some(mutation)).await;
+            fail_apply_job_with_mutation(&state, &job, &error, Some(mutation), Some(&payload.app))
+                .await;
         }
         Ok(Err(error)) if error.should_requeue_without_terminal_failure() => {
             if let Err(requeue_error) = requeue_apply_job(&state.db, &job, error.code()).await {
@@ -2954,7 +3001,7 @@ async fn deployment_is_terminal(
 }
 
 async fn fail_apply_job(state: &AppState, job: &ClaimedJob, error: &DeploymentJobError) {
-    fail_apply_job_with_mutation(state, job, error, None).await;
+    fail_apply_job_with_mutation(state, job, error, None, None).await;
 }
 
 async fn reconcile_pending_kbs_with_mutation(
@@ -3016,6 +3063,7 @@ async fn fail_apply_job_with_mutation(
     job: &ClaimedJob,
     error: &DeploymentJobError,
     mut mutation: Option<crate::mutation_leases::AppMutationLease>,
+    failed_app: Option<&App>,
 ) {
     let published =
         match publish_apply_failure_with_mutation(&state.db, job, mutation.as_mut()).await {
@@ -3029,6 +3077,74 @@ async fn fail_apply_job_with_mutation(
                 false
             }
         };
+    // devin 🔴 round 9: when the terminal publication itself failed, the
+    // structured `CreationEvidenceLost` classification dies with this
+    // call — a retried apply's precondition GET observes the
+    // already-unmarked object, so `preserved_creation_evidence` yields an
+    // empty expectation and the loss is undetectable forever after. A
+    // later adopted-namespace sweep could then classify the live
+    // CAP-created object as foreign and clear cleanup evidence over it.
+    // Persist the app-level marker directly from the in-memory
+    // classification; the published path persists it inside
+    // `cleanup_after_terminal_apply_failure`.
+    if !published
+        && matches!(
+            error,
+            DeploymentJobError::Apply(crate::deploy::DeployError::Apply(
+                enclava_engine::apply::engine::ApplyError::CreationEvidenceLost { .. }
+            ))
+        )
+        && !crate::deployment_failure_cleanup::persist_creation_evidence_loss(&state.db, job.app_id)
+            .await
+    {
+        tracing::error!(
+            deployment_id = %job.deployment_id,
+            app_id = %job.app_id,
+            "creation-evidence-loss marker could not be persisted after a failed publication; a retried apply can no longer detect the loss"
+        );
+    }
+    // Compensating provider cleanup for the partial state this apply may have
+    // published (HAProxy routes, namespace objects). Runs while the mutation
+    // lease still owns the edge/namespace fences, before any fence release.
+    // Cleanup persists the retained-namespace marker itself — BEFORE it
+    // issues the namespace DELETE — and asks us to retain the pre-armed
+    // namespace fence (fail closed, like app delete) only when the delete
+    // is not confirmed complete. RetainNamespaceFence therefore implies the
+    // marker is already durable; every other outcome releases through the
+    // bounded reclaim quarantine, which also re-bounds any pre-armed marker
+    // where retention proved unnecessary.
+    let mut retain_namespace_fence = false;
+    if published
+        && let (Some(mutation), Some(app)) = (mutation.as_mut(), failed_app)
+        // Codex P2: a `creation_evidence_lost` terminal failure must reach
+        // the adopted-namespace sweep so it counts unmarked live targets
+        // as unresolved instead of silently clearing cleanup evidence
+        // over a webhook-stripped CAP-created object.
+        && crate::deployment_failure_cleanup::cleanup_after_terminal_apply_failure(
+            state,
+            app,
+            job.deployment_id,
+            mutation,
+            matches!(
+                error,
+                DeploymentJobError::Apply(crate::deploy::DeployError::Apply(
+                    enclava_engine::apply::engine::ApplyError::CreationEvidenceLost { .. }
+                ))
+            ),
+        )
+        .await
+            == crate::deployment_failure_cleanup::CleanupFenceOutcome::RetainNamespaceFence
+    {
+        retain_namespace_fence = true;
+    }
+    // The retained-namespace marker is no longer written here: cleanup
+    // persists it BEFORE issuing the namespace DELETE (Codex P1 — a process
+    // exit between Kubernetes accepting the DELETE and this post-teardown
+    // write used to leave the terminal job labeled `deployment_apply`, so
+    // `reconcile_orphaned_deployment_apply_leases` would convert the
+    // intentional infinite fence into the 360-second quarantine while the
+    // deletion was still unresolved). RetainNamespaceFence now always
+    // implies the marker is already durable.
     if published && let Some(mutation) = mutation.as_mut() {
         if reconcile_pending_kbs_with_mutation(state, mutation)
             .await
@@ -3049,15 +3165,28 @@ async fn fail_apply_job_with_mutation(
             );
         }
     }
-    if published
-        && let Some(mutation) = mutation
-        && let Err(release_error) = mutation.release_after_provider_quarantine().await
-    {
-        tracing::error!(
-            deployment_id = %job.deployment_id,
-            error_code = DeploymentJobError::from(release_error).code(),
-            "failed to bound failed deployment mutation leases"
-        );
+    // RetainNamespaceFence implies the marker was already persisted before
+    // the DELETE was issued: the namespace scope stays armed under the
+    // retained-namespace marker operation until reconciliation confirms the
+    // namespace is gone — mirroring the app-delete fail-closed teardown
+    // contract. Every other outcome releases through the bounded reclaim
+    // quarantine, which also re-bounds a pre-armed marker where retention
+    // proved unnecessary (confirmed absence, no delete issued, rewritten
+    // namespace); dropping the lease stops renewal so the reconciler's
+    // expiry CAS becomes eligible.
+    if published && let Some(mutation) = mutation {
+        if retain_namespace_fence {
+            tracing::info!(
+                deployment_id = %job.deployment_id,
+                "retained-namespace marker persisted before the delete; keeping the namespace fence armed until reconciliation"
+            );
+        } else if let Err(release_error) = mutation.release_after_provider_quarantine().await {
+            tracing::error!(
+                deployment_id = %job.deployment_id,
+                error_code = DeploymentJobError::from(release_error).code(),
+                "failed to bound failed deployment mutation leases"
+            );
+        }
     }
     tracing::error!(
         app_id = %job.app_id,
@@ -3259,7 +3388,50 @@ async fn publish_apply_failure_with_mutation(
         "UPDATE deployments
             SET status = 'failed'::deploy_status_enum,
                 error_message = $1,
-                completed_at = clock_timestamp()
+                completed_at = clock_timestamp(),
+                -- self-check: a row STILL 'watching' at terminal publish
+                -- backed a WATCHED generation — possibly a live historical
+                -- workload. Record that history NOW: the pre-0047
+                -- population has NULL observing_since (the column shipped
+                -- without a backfill) and would otherwise pass the
+                -- self-veto in no_other_generation_owns_provider_state,
+                -- letting this very row's compensating cleanup treat the
+                -- namespace as adopted, remove the routes of the live
+                -- workload, and clear its provider evidence. COALESCE
+                -- keeps the real watch start where one exists.
+                observing_since = CASE
+                    WHEN status = 'watching' THEN COALESCE(observing_since, clock_timestamp())
+                    ELSE observing_since
+                END,
+                -- Codex P2: arm the retryable-cleanup marker atomically with
+                -- terminal failure publication. If the process exits after
+                -- this commit but before/during the awaited compensating
+                -- cleanup, the row keeps provider evidence AND the marker,
+                -- so no_other_generation_owns_provider_state cannot treat
+                -- it as a permanent owner and block every later failed
+                -- generation's cleanup. The in-process compensation clears
+                -- it on completion (ConfirmedAbsent/Adopted paths); every
+                -- incomplete outcome deliberately keeps it.
+                -- ONLY for rows whose apply never completed: a row that
+                -- reached watching (observing_since set) may still back a
+                -- LIVE workload, so it must keep its full ownership veto
+                -- (devin: exempting it would let a later failed apply
+                -- delete the namespace under that workload). Rows
+                -- terminalized by supersede_incomplete_deployments do NOT
+                -- pass through here either and keep their veto.
+                -- devin 🔴 round-6: do not infer 'never watched' from
+                -- NULL observing_since alone. A pre-0047 watched row carries
+                -- NULL observing_since (the column was added without a
+                -- backfill): the legacy re-apply path stamps it at its
+                -- watching->applying demotion (see set_deployment_status),
+                -- but a row STILL 'watching' here has not been through that
+                -- demotion and its NULL is uninformative — it must keep the
+                -- veto. status <> 'watching' is the conservative cut.
+                cleanup_sweep_incomplete = CASE
+                    WHEN observing_since IS NULL AND status <> 'watching'
+                        THEN true
+                    ELSE cleanup_sweep_incomplete
+                END
           WHERE id = $2
             AND app_id = $3
             AND org_id = $4
@@ -3458,6 +3630,16 @@ pub(crate) mod tests {
                 .with_code(code)
                 .boxed(),
         )
+    }
+
+    #[test]
+    fn deferred_pull_secret_reconciliation_requeues_after_apply() {
+        let deferred =
+            DeploymentJobError::Apply(crate::deploy::DeployError::PullSecretReconcileDeferred(
+                "newer scope generation".to_string(),
+            ));
+        assert!(deferred.should_requeue_without_terminal_failure());
+        assert_eq!(deferred.code(), "pull_secret_reconcile_deferred");
     }
 
     /// Preflight volume-evidence lookups classify Kubernetes failures
@@ -4203,6 +4385,7 @@ pub(crate) mod tests {
             org_keyring_fingerprint: binding.org_keyring_fingerprint,
             omit_log_encryption_claim: false,
             legacy_collapsed_trustee_key: false,
+            omit_luks2_header_seal_claim: false,
         });
         crate::routes::deployments::select_local_signed_artifact_delivery(
             &mut app_spec.attestation,
@@ -7408,6 +7591,208 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn retained_namespace_fence_is_exempt_from_orphan_repair_until_reconciled() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _, _) = insert_job_fixture(&pool).await;
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.side_effect_admission = Arc::new(tokio::sync::Semaphore::new(2));
+        let resources = vec![
+            crate::mutation_leases::ResourceFence::new("kubernetes_namespace", &app.namespace),
+            crate::mutation_leases::ResourceFence::edge_config(),
+        ];
+        // Stage exactly what fail_apply_job_with_mutation leaves behind after
+        // an incomplete teardown retain: a failed apply job, a failed
+        // deployment, and a mutation whose namespace fence was retained under
+        // the marker operation kind.
+        let mut retained = crate::mutation_leases::claim(
+            &state,
+            app.id,
+            "deployment_apply",
+            deployment_id,
+            false,
+            resources.clone(),
+        )
+        .await
+        .expect("claim failed apply resources");
+        retained
+            .arm_resource_scope_until_reconciled("kubernetes_namespace")
+            .await
+            .expect("pre-arm namespace before retain");
+        retained
+            .retain_resource_scope_under_marker(
+                "kubernetes_namespace",
+                crate::mutation_leases::RETAINED_DEPLOYMENT_NAMESPACE_OPERATION,
+            )
+            .await
+            .expect("retain namespace fence under marker");
+        sqlx::query(
+            "UPDATE deployments
+                SET status = 'failed'::deploy_status_enum
+              WHERE id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("stage failed deployment");
+        sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET state = 'failed'
+              WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("stage failed apply job");
+        let owner_token: Uuid =
+            sqlx::query_scalar("SELECT owner_token FROM app_mutation_leases WHERE app_id = $1")
+                .bind(app.id)
+                .fetch_one(&pool)
+                .await
+                .expect("load retained owner");
+        // Expire both leases past every reclaim boundary: the repair loop
+        // must still not bound the retained namespace fence.
+        sqlx::query(
+            "UPDATE app_mutation_leases
+                SET locked_until = clock_timestamp() - interval '2 seconds',
+                    reclaim_after = clock_timestamp() - interval '1 second'
+              WHERE app_id = $1 AND owner_token = $2",
+        )
+        .bind(app.id)
+        .bind(owner_token)
+        .execute(&pool)
+        .await
+        .expect("expire retained app owner");
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET locked_until = clock_timestamp() - interval '2 seconds',
+                    reclaim_after = CASE
+                        WHEN resource_scope = 'kubernetes_namespace'
+                            THEN 'infinity'::timestamptz
+                        ELSE clock_timestamp() - interval '1 second'
+                    END
+              WHERE owner_token = $1",
+        )
+        .bind(owner_token)
+        .execute(&pool)
+        .await
+        .expect("expire retained provider owners");
+
+        let repaired = crate::mutation_leases::reconcile_orphaned_deployment_apply_leases(&pool)
+            .await
+            .expect("run orphan repair over retained fence");
+        assert_eq!(
+            repaired, 0,
+            "an intentionally retained namespace fence must not be re-bounded by the orphan repair loop"
+        );
+        let (namespace_operation, namespace_infinite): (String, bool) = sqlx::query_as(
+            "SELECT operation_kind, reclaim_after = 'infinity'::timestamptz
+               FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1",
+        )
+        .bind(&app.namespace)
+        .fetch_one(&pool)
+        .await
+        .expect("verify retained fence");
+        assert_eq!(
+            namespace_operation,
+            crate::mutation_leases::RETAINED_DEPLOYMENT_NAMESPACE_OPERATION
+        );
+        assert!(
+            namespace_infinite,
+            "the retained fence stays infinite while the delete is unconfirmed"
+        );
+        // And the fence genuinely blocks a retry claiming the namespace name
+        // while the namespace may still be Terminating.
+        let blocked = crate::mutation_leases::claim(
+            &state,
+            app.id,
+            "deployment_apply",
+            Uuid::new_v4(),
+            false,
+            resources.clone(),
+        )
+        .await
+        .expect_err("retained fence rejects a new deployment apply");
+        assert!(matches!(
+            blocked,
+            crate::mutation_leases::MutationLeaseError::Busy
+        ));
+
+        // Once reconciliation observes the namespace gone, the marker rows are
+        // cleared exactly like the documented operator path, and a retry may
+        // claim the name again.
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET owner_token = NULL,
+                    operation_kind = NULL,
+                    operation_id = NULL,
+                    locked_until = NULL,
+                    reclaim_after = NULL,
+                    updated_at = clock_timestamp()
+              WHERE resource_scope = 'kubernetes_namespace'
+                AND resource_key = $1
+                AND owner_token = $2
+                AND reclaim_after = 'infinity'::timestamptz",
+        )
+        .bind(&app.namespace)
+        .bind(owner_token)
+        .execute(&pool)
+        .await
+        .expect("reconciler clears the retained fence after namespace 404");
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET locked_until = clock_timestamp() - interval '2 seconds',
+                    reclaim_after = clock_timestamp() - interval '1 second'
+              WHERE owner_token = $1 AND resource_scope <> 'kubernetes_namespace'",
+        )
+        .bind(owner_token)
+        .execute(&pool)
+        .await
+        .expect("expire remaining provider quarantine");
+        sqlx::query(
+            "UPDATE app_mutation_leases
+                SET owner_token = NULL,
+                    operation_kind = NULL,
+                    operation_id = NULL,
+                    locked_until = NULL,
+                    reclaim_after = NULL
+              WHERE app_id = $1 AND owner_token = $2",
+        )
+        .bind(app.id)
+        .bind(owner_token)
+        .execute(&pool)
+        .await
+        .expect("clear retained app owner");
+        let retry = crate::mutation_leases::claim(
+            &state,
+            app.id,
+            "deployment_apply",
+            Uuid::new_v4(),
+            false,
+            resources,
+        )
+        .await
+        .expect("retry claims the name after reconciliation");
+        retry.finish().await.expect("finish retry generation");
+
+        sqlx::query(
+            "DELETE FROM external_resource_mutation_leases
+              WHERE resource_scope IN ('kubernetes_namespace', 'edge_config')
+                AND resource_key IN ($1, 'global')",
+        )
+        .bind(&app.namespace)
+        .execute(&pool)
+        .await
+        .expect("remove retained-fence fixtures");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("clean retained-fence fixture");
+    }
+
+    #[tokio::test]
     async fn shared_dns_fence_contention_requeues_setup_without_failure() {
         let _kbs_fence_guard = KBS_FENCE_TEST_LOCK.lock().await;
         let pool = database_test_pool().await;
@@ -7931,6 +8316,75 @@ pub(crate) mod tests {
             .execute(&pool)
             .await
             .expect("delete stale failure fixture");
+    }
+
+    /// self-check regression: a row STILL 'watching' when the failure is
+    /// published backed a WATCHED generation (possibly a live historical
+    /// workload). The publish must stamp `observing_since` so the self-veto
+    /// in `no_other_generation_owns_provider_state` fires before any
+    /// provider call — without it a pre-0047 watching row (NULL marker,
+    /// the column shipped without a backfill) would pass the gate and its
+    /// own compensating cleanup would remove the live workload's routes
+    /// and clear its evidence. The retryable marker stays un-armed for
+    /// such rows (they keep the full ownership veto).
+    #[tokio::test]
+    async fn failure_publish_stamps_observation_for_watching_rows() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
+        let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim setup")
+            .expect("setup exists");
+        mark_setup_accepted(&pool, deployment_id, setup.lock_token)
+            .await
+            .expect("accept setup");
+        let job = claim_job(&pool, "pending", "running", Some(deployment_id))
+            .await
+            .expect("claim apply")
+            .expect("apply job exists");
+        // Simulate the pre-0047 population: the row reached `watching`
+        // under code that never stamped observing_since.
+        sqlx::query(
+            "UPDATE deployments
+                SET status = 'watching', observing_since = NULL
+              WHERE id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("mark row watching without observation marker");
+
+        publish_apply_failure(&pool, &job)
+            .await
+            .expect("failure publishes from watching");
+
+        let (status, observing_since, sweep_armed): (
+            String,
+            Option<chrono::DateTime<chrono::Utc>>,
+            bool,
+        ) = sqlx::query_as(
+            "SELECT status::text, observing_since, cleanup_sweep_incomplete
+               FROM deployments WHERE id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load published failure row");
+        assert_eq!(status, "failed");
+        assert!(
+            observing_since.is_some(),
+            "terminal publish from watching must record the observation so the row can never compensate itself"
+        );
+        assert!(
+            !sweep_armed,
+            "a watched generation keeps its full ownership veto; the retryable marker must stay un-armed"
+        );
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete watching failure fixture");
     }
 
     #[tokio::test]

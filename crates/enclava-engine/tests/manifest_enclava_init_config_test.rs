@@ -325,6 +325,7 @@ fn legacy_collapsed_trustee_pin_renders_the_signing_key_consistently() {
         org_keyring_fingerprint: [0u8; 32],
         omit_log_encryption_claim: false,
         legacy_collapsed_trustee_key: true,
+        omit_luks2_header_seal_claim: false,
     });
 
     let collapsed = "bb".repeat(32);

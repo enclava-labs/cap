@@ -2,6 +2,7 @@ use enclava_engine::manifest::cc_init_data::{
     ALLOW_DEV_RUNTIME_CLASS_ENV, COCO_DEV_RUNTIME_CLASS, CcInitDataOptions, DEFAULT_RUNTIME_CLASS,
     RUNTIME_CLASS_ENV, RuntimeClassConfigError, build_toml, build_toml_with_options,
     encode_cc_init_data, resolve_runtime_class_with_env, sha256_hex,
+    validate_luks2_header_seal_claim,
 };
 use enclava_engine::testutil::sample_app;
 use enclava_engine::types::{
@@ -253,6 +254,7 @@ fn options_with_runtime_class(runtime_class: &str) -> CcInitDataOptions {
         kbs_url: "https://kbs.example.test".to_string(),
         kbs_ca_cert_pem: None,
         runtime_class: runtime_class.to_string(),
+        luks2_header_seal: "adopt".to_string(),
     }
 }
 
@@ -324,6 +326,7 @@ fn toml_contains_workload_artifact_binding_when_present() {
         org_keyring_fingerprint: [0xef; 32],
         omit_log_encryption_claim: false,
         legacy_collapsed_trustee_key: false,
+        omit_luks2_header_seal_claim: false,
     });
     let toml = build_toml(&app);
     assert!(toml.contains(&format!("descriptor_core_hash = \"{}\"", "ab".repeat(32))));
@@ -593,6 +596,7 @@ fn log_encryption_claim_is_bound_to_cc_init_data() {
         org_keyring_fingerprint: [0u8; 32],
         omit_log_encryption_claim: true,
         legacy_collapsed_trustee_key: false,
+        omit_luks2_header_seal_claim: false,
     });
     let legacy_toml = build_toml(&legacy);
     let legacy_value: toml::Value = toml::from_str(&legacy_toml).unwrap();
@@ -610,4 +614,26 @@ fn log_encryption_claim_is_bound_to_cc_init_data() {
     let value: toml::Value = toml::from_str(&plain).unwrap();
     let data = value.get("data").and_then(toml::Value::as_table).unwrap();
     assert!(data.get("log_encryption_json").is_none());
+}
+
+#[test]
+fn data_claims_carry_luks2_header_seal_rollout_gate() {
+    let app = sample_app();
+    let toml = build_toml(&app);
+    let value: toml::Value = toml::from_str(&toml).unwrap();
+    let data = value.get("data").and_then(toml::Value::as_table).unwrap();
+
+    // Default rollout window: legacy adoption stays allowed.
+    assert_eq!(
+        data.get("luks2_header_seal").and_then(toml::Value::as_str),
+        Some("adopt")
+    );
+
+    // The claim value is validated by the engine-side helper; "required" is
+    // the operator's one-way flip after fleet migration. (The env read is
+    // process-global and edition-2024 `set_var` is unsafe, so the "required"
+    // variant is asserted through the validator rather than a second full
+    // build.)
+    assert_eq!(validate_luks2_header_seal_claim("required"), "required");
+    assert_eq!(validate_luks2_header_seal_claim("adopt"), "adopt");
 }

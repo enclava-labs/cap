@@ -225,16 +225,13 @@ pub async fn claim(args: ClaimArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Claiming ownership of {app_name}...");
 
-    // Step 1: Get challenge from TEE
     let challenge = tee.bootstrap_challenge().await?;
     println!("Challenge received (expires in {}s)", challenge.ttl_seconds);
 
-    // Step 2: Load or re-derive the deterministic bootstrap keypair.
     let org_id = Uuid::parse_str(&me.active_org.id)?;
     let private_key_bytes =
         load_or_derive_bootstrap_private_key(&paths, &me.active_org.name, org_id, &app_name)?;
 
-    // Step 3: Sign challenge with Ed25519 bootstrap keypair
     let signing_key = SigningKey::from_bytes(&private_key_bytes);
     let verifying_key = signing_key.verifying_key();
 
@@ -248,7 +245,6 @@ pub async fn claim(args: ClaimArgs) -> Result<(), Box<dyn std::error::Error>> {
     let bootstrap_pubkey = URL_SAFE_NO_PAD.encode(verifying_key.to_bytes());
     let signature = URL_SAFE_NO_PAD.encode(signature_bytes.to_bytes());
 
-    // Step 4: Get password
     let password = secret_from_file_or_prompt(
         args.password_file.as_deref(),
         "password",
@@ -257,7 +253,6 @@ pub async fn claim(args: ClaimArgs) -> Result<(), Box<dyn std::error::Error>> {
         "--password-file",
     )?;
 
-    // Step 5: Claim
     let result = match tee
         .bootstrap_claim(&challenge.nonce, &bootstrap_pubkey, &signature, &password)
         .await
@@ -278,7 +273,7 @@ pub async fn claim(args: ClaimArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Ownership claimed.");
 
-    // Step 6: Persist the one-time mnemonic to the prepared protected sink. The
+    // Persist the one-time mnemonic to the prepared protected sink. The
     // mnemonic is never written to stdout/stderr; on failure this returns the
     // ownership-committed/incomplete-backup error and halts.
     let mnemonic = result.mnemonic.ok_or_else(|| {

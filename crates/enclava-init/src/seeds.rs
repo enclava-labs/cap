@@ -15,6 +15,10 @@ pub const CADDY_INFO: &[u8] = b"caddy-seed";
 pub const APP_INFO: &[u8] = b"app-seed";
 pub const STATE_LUKS_INFO: &[u8] = b"state-luks-key";
 pub const TLS_STATE_LUKS_INFO: &[u8] = b"tls-state-luks-key";
+/// HKDF branch for the LUKS2 header MAC (cap#242). Distinct from every
+/// volume passphrase branch so knowledge of one never yields the other.
+pub const STATE_HEADER_MAC_INFO: &[u8] = b"state-luks-header-mac";
+pub const TLS_STATE_HEADER_MAC_INFO: &[u8] = b"tls-state-luks-header-mac";
 
 pub fn derive(owner_seed: &OwnerSeed, info: &[u8]) -> Result<DerivedSeed> {
     let hk = Hkdf::<Sha256>::new(None, owner_seed.as_bytes());

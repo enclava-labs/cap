@@ -88,7 +88,6 @@ pub fn generate_kbs_policy_rego(
     rego.push_str(&tls_entries.join(",\n"));
     rego.push_str("\n}\n\n");
 
-    // CAP owner_resource_bindings
     rego.push_str("owner_resource_bindings := {\n");
     let entries: Vec<String> = apps
         .iter()
