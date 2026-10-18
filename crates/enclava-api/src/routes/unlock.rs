@@ -112,30 +112,11 @@ pub struct TransitionSnpQuote {
 }
 
 /// SHA-256 pins of the AMD ARK roots compiled into the `sev` crate the
-/// platform CLI uses to anchor SNP chains (Milan, Genoa, Turin). The API
-/// accepts only chains whose ARK byte-matches one of these roots, mirroring
-/// the client-side `ark_is_pinned_to_builtin_root` trust anchor.
-const BUILTIN_AMD_ARK_SHA256_PINS: [[u8; 32]; 3] = [
-    // sev 7.1.0 builtin milan ARK
-    [
-        0x69, 0xd0, 0x63, 0xb4, 0x53, 0x44, 0xd2, 0x6a, 0x2e, 0x94, 0xe1, 0xf4, 0x21, 0x0d, 0xe4,
-        0x9e, 0xf5, 0x55, 0x30, 0x82, 0x87, 0xd4, 0xc1, 0x74, 0x44, 0x5c, 0x95, 0x63, 0x9a, 0x54,
-        0x0b, 0xcd,
-    ],
-    // sev 7.1.0 builtin genoa ARK (matches the pinned ARK in the platform
-    // verifier fixtures)
-    [
-        0x4c, 0x65, 0x98, 0xd1, 0x9c, 0x18, 0x71, 0x9c, 0x5d, 0xfd, 0x4a, 0x7d, 0x33, 0x5f, 0x67,
-        0x4e, 0x5b, 0xfe, 0x1d, 0x8f, 0x80, 0x0c, 0xea, 0x2c, 0xf2, 0x70, 0xc1, 0x0d, 0x10, 0x3d,
-        0xb2, 0xf1,
-    ],
-    // sev 7.1.0 builtin turin ARK
-    [
-        0x1f, 0x08, 0x41, 0x61, 0xa4, 0x4b, 0xb6, 0xd9, 0x37, 0x78, 0xa9, 0x04, 0x87, 0x7d, 0x48,
-        0x19, 0xca, 0xfa, 0x5d, 0x05, 0xef, 0x41, 0x93, 0xb2, 0xde, 0xd9, 0xdd, 0x9c, 0x73, 0xdd,
-        0x3f, 0x6a,
-    ],
-];
+/// platform CLI uses to anchor SNP chains (Milan, Genoa, Turin): the shared
+/// anchor set lives in [`crate::tee_attestation`].
+pub(crate) use crate::tee_attestation::{
+    BUILTIN_AMD_ARK_SHA256_PINS, snp_guest_policy_allows_debug,
+};
 
 /// Maximum accepted size of a single submitted AMD certificate DER. Real
 /// ARK/ASK/VCEK certificates are under 2 KiB; anything larger is rejected
@@ -390,18 +371,6 @@ impl TransitionQuoteError {
             }
         }
     }
-}
-
-/// SNP guest policy bit 19 (DEBUG): when set, debugging the guest is
-/// allowed and the PSP exposes the guest's memory-encryption keys to the
-/// debugger. A guest launched with this bit is never confidential,
-/// regardless of how valid its attestation chain is.
-const SNP_GUEST_POLICY_DEBUG_BIT: u64 = 1 << 19;
-
-/// Mirrors the CLI's `ensure_snp_report_production_policy`: reports from
-/// debug-enabled guests must not be trusted as TEE-consent evidence.
-fn snp_guest_policy_allows_debug(guest_policy: u64) -> bool {
-    guest_policy & SNP_GUEST_POLICY_DEBUG_BIT != 0
 }
 
 /// A transition receipt older than this is rejected. Without a window,

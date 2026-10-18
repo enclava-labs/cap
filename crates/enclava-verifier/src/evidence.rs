@@ -80,6 +80,24 @@ pub fn expected_report_data(
     leaf_spki_sha256: &[u8; 32],
     receipt_public_key: &[u8],
 ) -> Result<[u8; 64], EvidenceError> {
+    let receipt_pubkey_sha256: [u8; 32] = Sha256::digest(receipt_public_key).into();
+    expected_report_data_with_pubkey_sha256(
+        target_origin,
+        nonce,
+        leaf_spki_sha256,
+        &receipt_pubkey_sha256,
+    )
+}
+
+/// Same report-data contract as [`expected_report_data`], for verifiers that
+/// authenticate the TEE receipt key as its SHA-256 digest (the attestation
+/// response carries `receipt_pubkey_sha256`, not the raw key).
+pub fn expected_report_data_with_pubkey_sha256(
+    target_origin: &str,
+    nonce: &[u8; 32],
+    leaf_spki_sha256: &[u8; 32],
+    receipt_pubkey_sha256: &[u8; 32],
+) -> Result<[u8; 64], EvidenceError> {
     let url = url::Url::parse(target_origin).map_err(|_| EvidenceError::InvalidEncoding)?;
     if url.scheme() != "https" || url.host_str().is_none() {
         return Err(EvidenceError::InvalidEncoding);
@@ -104,11 +122,10 @@ pub fn expected_report_data(
         ("nonce", nonce),
         ("leaf_spki_sha256", leaf_spki_sha256),
     ]);
-    let receipt_pubkey_sha256: [u8; 32] = Sha256::digest(receipt_public_key).into();
     let binding_hash = ce_v1_hash(&[
         ("purpose", b"enclava-tee-report-data-v1"),
         ("transcript_hash", &transcript_hash),
-        ("receipt_pubkey_sha256", &receipt_pubkey_sha256),
+        ("receipt_pubkey_sha256", receipt_pubkey_sha256),
     ]);
     let encoded = hex::encode(binding_hash);
     Ok(encoded
@@ -184,6 +201,19 @@ mod tests {
         assert_ne!(
             expected,
             expected_report_data(origin, &nonce, &spki, &[6; 32]).unwrap()
+        );
+    }
+
+    #[test]
+    fn pubkey_sha256_variant_hashes_identically_to_raw_key() {
+        let origin = "https://app.example";
+        let nonce = [1; 32];
+        let spki = [2; 32];
+        let key = [3; 32];
+        let key_hash: [u8; 32] = Sha256::digest(key).into();
+        assert_eq!(
+            expected_report_data(origin, &nonce, &spki, &key).unwrap(),
+            expected_report_data_with_pubkey_sha256(origin, &nonce, &spki, &key_hash).unwrap()
         );
     }
 
