@@ -559,7 +559,8 @@ pub struct DeploymentResponse {
 const PUBLIC_DEPLOYMENT_ERROR_MESSAGE: &str = "deployment_error";
 
 /// Bounded failure classifications that may cross the API boundary verbatim.
-/// The control-plane pair is the historical passthrough set. The pull-secret
+/// The control-plane set is the historical passthrough plus retry exhaustion
+/// (#260). The pull-secret
 /// codes are admitted so a stored row is not redacted, in lockstep with the
 /// 0087 CHECK. They are not written today: `pull_secret_reconcile_deferred`
 /// is a non-terminal requeue (`requeue_apply_job` clears `last_error_code`
@@ -571,6 +572,7 @@ const PUBLIC_DEPLOYMENT_ERROR_MESSAGE: &str = "deployment_error";
 const PUBLIC_DEPLOYMENT_ERROR_CODES: &[&str] = &[
     crate::deploy::DEPLOYMENT_SUPERSEDED_ERROR,
     crate::deployment_jobs::CUSTOMER_CONFIG_HOLD_EXPIRED,
+    crate::deployment_jobs::DEPLOYMENT_RETRY_EXHAUSTED_MESSAGE,
     "pull_secret_reconcile_deferred",
     "pull_secret_delete_conflict",
 ];
@@ -2258,6 +2260,30 @@ mod tests {
             .expect("valid log encryption config")
             .expect("config returned");
         assert_eq!(validated, config);
+    }
+
+    #[test]
+    fn public_deployment_error_message_passes_bounded_codes_and_redacts_plaintext() {
+        // Bounded platform classifications cross the tenant boundary verbatim.
+        assert_eq!(
+            public_deployment_error_message(Some(
+                crate::deployment_jobs::DEPLOYMENT_RETRY_EXHAUSTED_MESSAGE
+            ))
+            .as_deref(),
+            Some(crate::deployment_jobs::DEPLOYMENT_RETRY_EXHAUSTED_MESSAGE)
+        );
+        assert_eq!(
+            public_deployment_error_message(Some(crate::deploy::DEPLOYMENT_SUPERSEDED_ERROR))
+                .as_deref(),
+            Some(crate::deploy::DEPLOYMENT_SUPERSEDED_ERROR)
+        );
+        // Arbitrary backend plaintext stays redacted.
+        assert_eq!(
+            public_deployment_error_message(Some("kubernetes: node oom-killed tenant pod"))
+                .as_deref(),
+            Some(PUBLIC_DEPLOYMENT_ERROR_MESSAGE)
+        );
+        assert_eq!(public_deployment_error_message(None), None);
     }
 
     #[test]
