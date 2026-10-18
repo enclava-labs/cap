@@ -1461,6 +1461,24 @@ const ORG_ROTATION_INTENT_LANE_DOMAIN: i32 = 0x5249_4e54;
 /// from a compromised owner key.
 const MAX_INTENTS_PER_HOUR: i64 = 50;
 
+/// Records one verified rotation presentation under the per-org hourly cap.
+/// `created_at` is `statement_timestamp()` (the post-lock statement), not the
+/// column default `now()` (transaction start): a writer queued on the
+/// advisory lock must not stamp the row early and leave the rolling-hour
+/// count early. Shared with the regression that executes this statement
+/// against real PostgreSQL, so the stamp cannot drift from the handler.
+const ORG_ROTATION_INTENT_INSERT_SQL: &str =
+    "INSERT INTO org_rotation_intents (org_id, directive_sha256, keyring_sha256, created_at)
+         SELECT $1, $2, $3, statement_timestamp()
+          WHERE NOT EXISTS (
+                SELECT 1 FROM org_rotation_intents
+                 WHERE org_id = $1 AND directive_sha256 = $2 AND keyring_sha256 = $3
+          )
+            AND (SELECT count(*) FROM org_rotation_intents
+                  WHERE org_id = $1 AND created_at > statement_timestamp() - interval '1 hour')
+                < $4
+         ON CONFLICT DO NOTHING";
+
 pub async fn rotate_org_owner(
     auth: AuthContext,
     State(state): State<AppState>,
@@ -1602,6 +1620,10 @@ pub async fn rotate_org_owner(
     //
     // The rolling-hour clock is sampled in the post-lock statement rather
     // than at transaction start, so time waiting for the lock is excluded.
+    // The inserted row's created_at is that same statement_timestamp():
+    // the column default now() is transaction_timestamp (BEGIN), so a
+    // writer that waited on the lock would otherwise record an intent that
+    // leaves the rolling-hour count early.
     //
     // Concurrent-insert handling (Codex follow-up "handle concurrent inserts
     // of the same rotation intent"): ON CONFLICT DO NOTHING makes the PK
@@ -1615,26 +1637,15 @@ pub async fn rotate_org_owner(
         .execute(&mut *intent_tx)
         .await
         .map_err(|_| db_error())?;
-    let intent_rows = sqlx::query(
-        "INSERT INTO org_rotation_intents (org_id, directive_sha256, keyring_sha256)
-         SELECT $1, $2, $3
-          WHERE NOT EXISTS (
-                SELECT 1 FROM org_rotation_intents
-                 WHERE org_id = $1 AND directive_sha256 = $2 AND keyring_sha256 = $3
-          )
-            AND (SELECT count(*) FROM org_rotation_intents
-                  WHERE org_id = $1 AND created_at > statement_timestamp() - interval '1 hour')
-                < $4
-         ON CONFLICT DO NOTHING",
-    )
-    .bind(org_id)
-    .bind(directive_digest.as_slice())
-    .bind(intent_digest.as_slice())
-    .bind(MAX_INTENTS_PER_HOUR)
-    .execute(&mut *intent_tx)
-    .await
-    .map_err(|_| db_error())?
-    .rows_affected();
+    let intent_rows = sqlx::query(ORG_ROTATION_INTENT_INSERT_SQL)
+        .bind(org_id)
+        .bind(directive_digest.as_slice())
+        .bind(intent_digest.as_slice())
+        .bind(MAX_INTENTS_PER_HOUR)
+        .execute(&mut *intent_tx)
+        .await
+        .map_err(|_| db_error())?
+        .rows_affected();
     // Distinguish the rate cap (reject) from the exact-replay case (already
     // recorded; proceed -- the lane remains authoritative). Checked inside
     // the same locked transaction: no other intent writer can commit
@@ -8691,5 +8702,69 @@ mod tests {
             .execute(&pool)
             .await
             .expect("delete member escalation users");
+    }
+
+    // The quota counts `created_at > statement_timestamp() - interval '1 hour'`
+    // in the post-lock statement, but the column default `now()` is
+    // transaction_timestamp (BEGIN). A writer that waited on the advisory
+    // lock would stamp its intent early and leave the rolling hour early.
+    // The sleep after BEGIN is that wait with the clock moved, not raced:
+    // `created_at` must be the INSERT's statement time, later than a mark
+    // taken before the transaction started.
+    #[tokio::test]
+    async fn queued_intent_created_at_excludes_pre_lock_wait() {
+        let pool = database_test_pool().await;
+        let org_id = Uuid::new_v4();
+        let suffix = org_id.simple().to_string();
+        let org_name = format!("intent-clock-{suffix}");
+        crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+            .await
+            .expect("insert intent clock org");
+
+        let pre_begin = Utc::now();
+        let mut intent_tx = pool.begin().await.expect("begin intent clock transaction");
+        let tx_start: DateTime<Utc> = sqlx::query_scalar("SELECT transaction_timestamp()")
+            .fetch_one(&mut *intent_tx)
+            .await
+            .expect("read intent transaction timestamp");
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let directive = [0xABu8; 32];
+        let keyring = [0xCDu8; 32];
+        let inserted = sqlx::query(ORG_ROTATION_INTENT_INSERT_SQL)
+            .bind(org_id)
+            .bind(directive.as_slice())
+            .bind(keyring.as_slice())
+            .bind(MAX_INTENTS_PER_HOUR)
+            .execute(&mut *intent_tx)
+            .await
+            .expect("insert queued rotation intent")
+            .rows_affected();
+        assert_eq!(inserted, 1, "the clock probe must record one intent");
+        intent_tx
+            .commit()
+            .await
+            .expect("commit intent clock transaction");
+
+        let created_at: DateTime<Utc> = sqlx::query_scalar(
+            "SELECT created_at FROM org_rotation_intents
+              WHERE org_id = $1 AND directive_sha256 = $2 AND keyring_sha256 = $3",
+        )
+        .bind(org_id)
+        .bind(directive.as_slice())
+        .bind(keyring.as_slice())
+        .fetch_one(&pool)
+        .await
+        .expect("load queued intent created_at");
+        let threshold = pre_begin + chrono::Duration::seconds(1);
+        assert!(
+            created_at > threshold,
+            "queued intent created_at={created_at:?} tx_start={tx_start:?} pre_begin={pre_begin:?} threshold={threshold:?}; default now() stamps BEGIN and the row leaves the rolling hour early"
+        );
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete intent clock org");
     }
 }
