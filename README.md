@@ -122,7 +122,7 @@ Common checks:
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo test --workspace -- --test-threads=1
 cargo test --doc
 ```
 
@@ -133,11 +133,16 @@ features.
 When local native dependencies are unavailable, run targeted checks:
 
 ```bash
-cargo test -p enclava-api --lib
+cargo test -p enclava-api --lib -- --test-threads=1
 cargo test -p enclava-cli
 cargo test -p enclava-engine
-cargo test --workspace --exclude enclava-init
+cargo test --workspace --exclude enclava-init -- --test-threads=1
 ```
+
+Database-backed API library tests require a dedicated local PostgreSQL superuser,
+as in CI: isolated fixtures create/drop databases, and schema-guard tests mutate
+system catalogs. Run the full suite serially because remaining fixtures share
+global provider fences. Never point these tests at a persistent environment.
 
 API integration tests need PostgreSQL:
 

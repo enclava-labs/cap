@@ -145,9 +145,10 @@ fn render_config_toml(app: &ConfidentialApp) -> String {
         push_optional_option(
             &mut out,
             "platform-trustee-policy-pubkey-hex",
-            app.attestation
-                .platform_trustee_policy_pubkey_hex
-                .as_deref(),
+            // Render-compat pin: must match the cc_init_data trustee slot
+            // byte-for-byte (enclava-init cross-checks this ConfigMap
+            // section against the signed claims).
+            app.rendered_platform_trustee_policy_pubkey_hex(),
         );
         push_optional_option(
             &mut out,

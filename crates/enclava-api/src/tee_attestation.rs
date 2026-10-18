@@ -1167,6 +1167,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn evidence_rejects_wrong_firmware_even_with_matching_app_host_data() {
+        let fixture = prove_it_live_fixture();
+        let evidence = AttestationEvidence {
+            payload_b64: String::new(),
+            json: Some(fixture_evidence(&fixture)),
+        };
+        let mut identity = fixture_identity(&fixture);
+        identity.expected_firmware_measurement = FirmwareMeasurement::Full([0xAB; 48]);
+        let error = verify_snp_evidence(
+            &evidence,
+            b"",
+            &fixture_report_data(&fixture),
+            &[identity],
+            None,
+        )
+        .await
+        .expect_err("a different measured firmware must not receive a teardown token");
+        assert!(matches!(error, TeeAttestError::Attestation(_)));
+    }
+
+    #[tokio::test]
     async fn evidence_with_unanchored_ark_is_not_trusted() {
         let fixture = prove_it_live_fixture();
         let mut evidence_json = fixture_evidence(&fixture);
@@ -1295,21 +1316,17 @@ mod tests {
         }
     }
 
-
     #[tokio::test(flavor = "current_thread")]
     async fn self_signed_peer_without_hardware_evidence_is_rejected() {
         let domain = "tee.app.example";
-        let socket = spawn_attestation_server(
-            domain,
-            move |request_line, leaf_spki| {
-                attestation_body(
-                    domain,
-                    query_param(request_line, "nonce").unwrap_or_default(),
-                    leaf_spki,
-                    serde_json::json!({"note": "no snp report"}),
-                )
-            },
-        )
+        let socket = spawn_attestation_server(domain, move |request_line, leaf_spki| {
+            attestation_body(
+                domain,
+                query_param(request_line, "nonce").unwrap_or_default(),
+                leaf_spki,
+                serde_json::json!({"note": "no snp report"}),
+            )
+        })
         .await;
 
         let error = attest_teardown_channel(
@@ -1333,10 +1350,15 @@ mod tests {
             .expect("learn self-signed leaf");
         let spki = enclava_verifier::tls_leaf_spki_sha256(&leaf).expect("leaf SPKI");
         let url = format!("https://{domain}:{}/attestation", socket.port());
-        let client = build_spki_pinned_client(spki, timeout, domain, Some(socket))
-            .expect("pinned client");
+        let client =
+            build_spki_pinned_client(spki, timeout, domain, Some(socket)).expect("pinned client");
         assert_eq!(
-            client.get(&url).send().await.expect("matching key").status(),
+            client
+                .get(&url)
+                .send()
+                .await
+                .expect("matching key")
+                .status(),
             reqwest::StatusCode::OK
         );
         let mut foreign_spki = spki;

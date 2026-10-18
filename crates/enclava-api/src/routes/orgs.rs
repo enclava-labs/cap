@@ -7063,8 +7063,7 @@ mod tests {
         let trigger_sql = format!(
             "CREATE TRIGGER cap185_demote_after_receipt_trigger
              AFTER INSERT ON org_rotation_upstream_receipts
-             FOR EACH ROW EXECUTE FUNCTION cap185_demote_after_receipt('{}')",
-            remaining_owner_id
+             FOR EACH ROW EXECUTE FUNCTION cap185_demote_after_receipt('{remaining_owner_id}')"
         );
         sqlx::query(&trigger_sql)
             .execute(&pool)

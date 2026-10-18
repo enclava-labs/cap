@@ -2200,7 +2200,7 @@ pub(crate) mod test_support {
                 trustee_policy_url: Some("https://kbs.example.test/policy".into()),
                 local_workload_artifacts_json: None,
                 local_trustee_policy_json: None,
-                platform_trustee_policy_pubkey_hex: Some("11".repeat(32)),
+                platform_trustee_policy_pubkey_hex: Some("33".repeat(32)),
                 signing_service_pubkey_hex: Some("11".repeat(32)),
                 verification_material: None,
             }),

@@ -26,6 +26,26 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 
 DEV_FIXTURE_SIGNING_KEY_HEX = "c0" * 32
+DEV_FIXTURE_TRUSTEE_POLICY_SEED_HEX = "c1" * 32
+# Public key of the dev-fixture trustee seed (Ed25519 seed -> pubkey, derived
+# once and pinned so the fixture envelope stays byte-stable).
+DEV_FIXTURE_TRUSTEE_POLICY_KEY_HEX = "acdcc8494d458f44a7aaac1d6a84ec624daee88436db2ae26e67ba645a106228"
+
+
+def dev_fixture_signing_root_pubkey() -> bytes:
+    """Public half of DEV_FIXTURE_SIGNING_KEY_HEX (the dev-fixture release
+    root). Signing with the fixture seed is the fixture root regardless of
+    flags, so fixture-root privileges key off this value, not --dev-fixture-key."""
+    return (
+        Ed25519PrivateKey.from_private_bytes(bytes.fromhex(DEV_FIXTURE_SIGNING_KEY_HEX))
+        .public_key()
+        .public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+    )
+
+
 DEFAULT_RELEASE_PATH = Path(__file__).resolve().parents[1] / "platform-release.json"
 GHCR_DIGEST_RE = re.compile(
     r"^ghcr\.io/enclava-labs/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$"
@@ -51,6 +71,50 @@ def hex32_bytes(field: str, value: str) -> bytes:
     return bytes.fromhex(value)
 
 
+_EDWARDS_P = 2**255 - 19
+# edwards25519 d = -121665/121666 (RFC 8032).
+_EDWARDS_D = (-121665 * pow(121666, _EDWARDS_P - 2, _EDWARDS_P)) % _EDWARDS_P
+
+
+def _edwards_add(p1: tuple[int, int], p2: tuple[int, int]) -> tuple[int, int]:
+    (x1, y1), (x2, y2) = p1, p2
+    t = _EDWARDS_D * x1 * x2 * y1 * y2 % _EDWARDS_P
+    x3 = (x1 * y2 + y1 * x2) * pow(1 + t, _EDWARDS_P - 2, _EDWARDS_P) % _EDWARDS_P
+    y3 = (y1 * y2 + x1 * x2) * pow(1 - t, _EDWARDS_P - 2, _EDWARDS_P) % _EDWARDS_P
+    return (x3, y3)
+
+
+def require_unforgeable_pubkey(field: str, value: str) -> None:
+    """Mirror of the Rust ingestion checks (require_ed25519_point +
+    VerifyingKey::is_weak): the pin must decompress to an Edwards point that
+    is not small-order. Policy acceptance uses verify(), not verify_strict(),
+    and a zero signature verifies against a small-order key for a large
+    share of messages — signing such a pin would produce an envelope that
+    accepts forged policies (or that no Rust consumer will load)."""
+    raw = hex32_bytes(field, value)
+    # dalek's VerifyingKey::from_bytes reduces non-canonical y mod p.
+    y = (int.from_bytes(raw, "little") & ((1 << 255) - 1)) % _EDWARDS_P
+    num = (y * y - 1) % _EDWARDS_P
+    den = (_EDWARDS_D * y * y + 1) % _EDWARDS_P
+    if den == 0:
+        raise ValueError(f"{field} is not a valid Ed25519 public key")
+    x2 = num * pow(den, _EDWARDS_P - 2, _EDWARDS_P) % _EDWARDS_P
+    if x2 == 0:
+        x = 0
+    else:
+        if pow(x2, (_EDWARDS_P - 1) // 2, _EDWARDS_P) != 1:
+            raise ValueError(f"{field} is not a valid Ed25519 public key")
+        x = pow(x2, (_EDWARDS_P + 3) // 8, _EDWARDS_P)
+        if x * x % _EDWARDS_P != x2:
+            x = x * pow(2, (_EDWARDS_P - 1) // 4, _EDWARDS_P) % _EDWARDS_P
+    point = (x, y)
+    p2 = _edwards_add(point, point)
+    p4 = _edwards_add(p2, p2)
+    p8 = _edwards_add(p4, p4)
+    if p8 == (0, 1):
+        raise ValueError(f"{field} has small order and provides no unforgeability")
+
+
 def canonical_platform_release_bytes(payload: dict[str, str]) -> bytes:
     records = [
         ("purpose", b"enclava-platform-release-v1"),
@@ -65,6 +129,13 @@ def canonical_platform_release_bytes(payload: dict[str, str]) -> bytes:
             hex32_bytes(
                 "signing_service_pubkey_hex",
                 payload["signing_service_pubkey_hex"],
+            ),
+        ),
+        (
+            "platform_trustee_policy_pubkey",
+            hex32_bytes(
+                "platform_trustee_policy_pubkey_hex",
+                payload["platform_trustee_policy_pubkey_hex"],
             ),
         ),
         ("policy_template_id", payload["policy_template_id"].encode()),
@@ -110,6 +181,7 @@ def env_overlay(payload: dict[str, str]) -> dict[str, str]:
         "PLATFORM_RELEASE_VERSION": "platform_release_version",
         "SIGNING_SERVICE_URL": "signing_service_url",
         "SIGNING_SERVICE_PUBKEY_HEX": "signing_service_pubkey_hex",
+        "PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX": "platform_trustee_policy_pubkey_hex",
         "POLICY_TEMPLATE_ID": "policy_template_id",
         "ATTESTATION_PROXY_IMAGE": "attestation_proxy_image",
         "CADDY_INGRESS_IMAGE": "caddy_ingress_image",
@@ -386,7 +458,20 @@ def validate_payload(payload: dict[str, str], *, allow_dev_internal_tls: bool = 
             "(literal lowercase 'https://' prefix, no newlines/spaces/tabs/"
             "quotes/braces/semicolons, ASCII-only)"
         )
-    hex32_bytes("signing_service_pubkey_hex", payload["signing_service_pubkey_hex"])
+    for field in ["platform_trustee_policy_pubkey_hex", "signing_service_pubkey_hex"]:
+        if field not in payload:
+            raise ValueError(f"{field} is required (two trust domains, cap#118)")
+        require_unforgeable_pubkey(field, payload[field])
+    trustee_key = hex32_bytes(
+        "platform_trustee_policy_pubkey_hex", payload["platform_trustee_policy_pubkey_hex"]
+    )
+    if trustee_key == hex32_bytes(
+        "signing_service_pubkey_hex", payload["signing_service_pubkey_hex"]
+    ):
+        raise ValueError(
+            "platform_trustee_policy_pubkey_hex must differ from signing_service_pubkey_hex "
+            "(two trust domains must not share one key)"
+        )
     hex32_bytes("policy_template_sha256", payload["policy_template_sha256"])
     hex32_bytes(
         "expected_firmware_measurement", payload["expected_firmware_measurement"]
@@ -414,7 +499,13 @@ def signing_seed(args: argparse.Namespace) -> str:
 
 def generate(args: argparse.Namespace) -> str:
     base = json.loads(args.input.read_text())
-    payload = env_overlay(base["payload"])
+    payload = base["payload"]
+    if args.dev_fixture_key and not payload.get("platform_trustee_policy_pubkey_hex"):
+        # PUBKEY of the dev-fixture trustee seed, not the seed itself: this
+        # field pins a verification key; writing the seed here would publish
+        # the fixture private key as the pinned authority.
+        payload["platform_trustee_policy_pubkey_hex"] = DEV_FIXTURE_TRUSTEE_POLICY_KEY_HEX
+    payload = env_overlay(payload)
     validate_payload(payload, allow_dev_internal_tls=args.dev_fixture_key)
 
     seed = hex32_bytes("ENCLAVA_PLATFORM_RELEASE_SIGNING_KEY_HEX", signing_seed(args))
@@ -423,6 +514,27 @@ def generate(args: argparse.Namespace) -> str:
         encoding=serialization.Encoding.Raw,
         format=serialization.PublicFormat.Raw,
     )
+    # Mirror of the Rust release validators (verify_envelope): the dev-fixture
+    # trustee policy key's seed is public, so a non-fixture root must never
+    # sign a release pinning it in EITHER key slot — while both keys are
+    # pinned, policy signatures verify against the signing-service key
+    # (#217), so a public-seed key in either slot lets anyone with the repo
+    # forge policy envelopes the TEE accepts. Refuse at signing time instead
+    # of emitting an envelope every verifier rejects under a production root.
+    if public_key != dev_fixture_signing_root_pubkey():
+        for field in (
+            "platform_trustee_policy_pubkey_hex",
+            "signing_service_pubkey_hex",
+        ):
+            if (
+                hex32_bytes(field, payload[field])
+                == bytes.fromhex(DEV_FIXTURE_TRUSTEE_POLICY_KEY_HEX)
+            ):
+                raise SystemExit(
+                    f"{field} pins the dev-fixture trustee policy key; "
+                    "a production root must not sign it "
+                    "(fixture releases need --dev-fixture-key)"
+                )
     signature = private_key.sign(canonical_platform_release_bytes(payload))
     envelope = {
         "payload": payload,

@@ -1753,11 +1753,24 @@ async fn complete_app_delete_result(
         let teardown_locked = *status == StatusCode::LOCKED
             && body.get("error").and_then(serde_json::Value::as_str)
                 == Some("app_delete_teardown_locked");
-        if status.is_server_error() || teardown_locked {
+        // The budget 409 is a transient pre-mutation rejection: another app's
+        // teardown pins currently occupy the shared signed-policy byte
+        // budget, and the delete becomes admissible once they clear. It must
+        // defer (row stays incomplete) rather than terminalize the receipt
+        // with retryable:false — a same-key retry would otherwise replay the
+        // conflict forever even after capacity frees (Codex review on
+        // 3b168c73).
+        let budget_conflict = *status == StatusCode::CONFLICT
+            && body.get("error").and_then(serde_json::Value::as_str)
+                == Some("app_delete_kbs_policy_budget_exceeded");
+        if status.is_server_error() || teardown_locked || budget_conflict {
             let (deferred_status, Json(mut deferred_body)) =
                 defer_idempotent_request(lease, None).await;
             if teardown_locked && deferred_status == StatusCode::CONFLICT {
                 deferred_body["cause"] = serde_json::json!("app_delete_teardown_locked");
+            }
+            if budget_conflict && deferred_status == StatusCode::CONFLICT {
+                deferred_body["cause"] = serde_json::json!("app_delete_kbs_policy_budget_exceeded");
             }
             // Surface the teardown disposition (restored vs kept deleting)
             // on the deferral too: hosted callers retry through the deferral
@@ -9332,6 +9345,10 @@ mod tests {
 
     async fn app_delete_fixture() -> (AppState, AuthContext, String, Uuid) {
         let pool = database_test_pool().await;
+        app_delete_fixture_on(pool).await
+    }
+
+    async fn app_delete_fixture_on(pool: sqlx::PgPool) -> (AppState, AuthContext, String, Uuid) {
         let org_id = Uuid::new_v4();
         let user_id = Uuid::new_v4();
         let app_id = Uuid::new_v4();
@@ -9577,7 +9594,14 @@ mod tests {
 
     #[tokio::test]
     async fn app_delete_deferral_carries_teardown_disposition() {
-        let (state, auth, app_name, _) = app_delete_fixture().await;
+        // An isolated per-test database: this test only asserts the deferral
+        // body shape, but the shared test database's global state (the
+        // signed-policy singleton, orphaned global fences, and the migration
+        // advisory lock a sibling CI worktree can hold on the same server)
+        // makes the fixture's pool acquisition and lane claims nondeterministic.
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_delete_disposition").await;
+        let (state, auth, app_name, _) = app_delete_fixture_on(pool.clone()).await;
         let key = format!("disposition-delete-{}", Uuid::new_v4());
         let headers = idempotency_headers(&key);
         let path = format!("/internal/paas/orgs/{}/apps/{app_name}", auth.org_id);
@@ -9605,7 +9629,7 @@ mod tests {
         // A locked teardown (423) carries the same disposition — the handler
         // attaches `reason` for every deferral-worthy teardown status — and
         // must keep its `cause` too.
-        let (state, auth, app_name, _) = app_delete_fixture().await;
+        let (state, auth, app_name, _) = app_delete_fixture_on(pool.clone()).await;
         let key = format!("disposition-locked-{}", Uuid::new_v4());
         let headers = idempotency_headers(&key);
         let path = format!("/internal/paas/orgs/{}/apps/{app_name}", auth.org_id);
@@ -9627,6 +9651,59 @@ mod tests {
             deferred.1.0["reason"], "app_restored",
             "locked teardowns keep the app disposition on the deferral"
         );
+
+        crate::test_support::drop_isolated_database("cap_delete_disposition", pool).await;
+    }
+
+    #[tokio::test]
+    async fn app_delete_budget_conflict_defers_instead_of_terminalizing() {
+        let (state, auth, app_name, _) = app_delete_fixture().await;
+        let key = format!("budget-defer-{}", Uuid::new_v4());
+        let headers = idempotency_headers(&key);
+        let path = format!("/internal/paas/orgs/{}/apps/{app_name}", auth.org_id);
+        let body = serde_json::json!({});
+        let lease = expect_idempotency_execution(
+            begin_app_delete_request(&state, &headers, &path, &auth, &body, &app_name)
+                .await
+                .unwrap(),
+        );
+        // The admission gate's real failure shape (Codex review on 3b168c73):
+        // another app's teardown pins occupy the shared budget. This is a
+        // transient pre-mutation rejection — it must defer, not terminalize
+        // the receipt with retryable:false.
+        let failure = json_error(
+            StatusCode::CONFLICT,
+            "app_delete_kbs_policy_budget_exceeded",
+        );
+        let deferred = complete_app_delete_result(lease, Err(failure))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            deferred.0,
+            StatusCode::CONFLICT,
+            "budget conflicts defer like a server error"
+        );
+        assert_eq!(
+            deferred.1.0.get("error"),
+            idempotency_in_progress_error().1.0.get("error"),
+            "budget conflicts defer like a server error"
+        );
+        assert_eq!(
+            deferred.1.0.get("cause"),
+            Some(&serde_json::json!("app_delete_kbs_policy_budget_exceeded")),
+            "deferred budget conflicts must name their cause"
+        );
+        // The receipt stays incomplete: a same-key retry re-executes once
+        // other teardowns free the budget instead of replaying the conflict.
+        let receipt: (bool, bool, bool) = sqlx::query_as(
+            "SELECT completed_at IS NULL, response_status IS NULL, known_not_applied
+               FROM cap_internal_idempotency WHERE idempotency_key = $1",
+        )
+        .bind(&key)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(receipt, (true, true, false));
     }
 
     #[tokio::test]

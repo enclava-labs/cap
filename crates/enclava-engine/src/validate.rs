@@ -435,6 +435,32 @@ fn validate_attestation_pubkey(
             detail: "must be 64 lowercase hex characters (Ed25519 public key)".to_string(),
         });
     }
+    // cap#218 follow-up: mirror the release-ingestion checks — the key must
+    // decompress to an Edwards point that is not small-order. Policy
+    // acceptance uses verify(), not verify_strict(), and a zero signature
+    // verifies against a small-order key for a large share of messages.
+    let raw = hex::decode(value).map_err(|_| ValidationError::InvalidAttestationPubkey {
+        field,
+        detail: "must be 64 lowercase hex characters (Ed25519 public key)".to_string(),
+    })?;
+    let arr: [u8; 32] = raw
+        .try_into()
+        .map_err(|_| ValidationError::InvalidAttestationPubkey {
+            field,
+            detail: "must be 64 lowercase hex characters (Ed25519 public key)".to_string(),
+        })?;
+    let key = ed25519_dalek::VerifyingKey::from_bytes(&arr).map_err(|_| {
+        ValidationError::InvalidAttestationPubkey {
+            field,
+            detail: "not a decompressible Ed25519 public key".to_string(),
+        }
+    })?;
+    if key.is_weak() {
+        return Err(ValidationError::InvalidAttestationPubkey {
+            field,
+            detail: "Ed25519 public key has small order and provides no unforgeability".to_string(),
+        });
+    }
     Ok(())
 }
 

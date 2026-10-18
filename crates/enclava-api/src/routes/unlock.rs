@@ -850,14 +850,17 @@ async fn commit_unlock_mode_transition(
             .validate_customer_authority_in_tx(&mut tx)
             .await
             .map_err(crate::routes::deployments::signing_error_response)?;
-        let signing_service_pubkey_hex = request.signing_service_pubkey_hex.ok_or((
+        // Policy artifacts are produced by the off-cluster signing service,
+        // so its key is the acceptance authority (cap#118 note: the trustee
+        // policy key is a separate in-TEE authority, not a /sign producer).
+        let policy_authority_pubkey_hex = request.signing_service_pubkey_hex.ok_or((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
                 "error": "platform signing-service pubkey required for signed deployment verification"
             })),
         ))?;
         artifacts
-            .validate_signed_artifact(signed_policy_artifact, signing_service_pubkey_hex)
+            .validate_signed_artifact(signed_policy_artifact, policy_authority_pubkey_hex)
             .map_err(crate::routes::deployments::signing_error_response)?;
 
         let locked_profile = locked_primary

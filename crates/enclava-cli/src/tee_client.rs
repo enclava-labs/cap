@@ -966,8 +966,7 @@ async fn read_bounded_response_body(
 
 fn too_large_status_body_error() -> TeeError {
     TeeError::Attestation(format!(
-        "TEE status body exceeds the {}-byte bounded read limit",
-        MAX_BOOTSTRAP_STATUS_BODY_BYTES
+        "TEE status body exceeds the {MAX_BOOTSTRAP_STATUS_BODY_BYTES}-byte bounded read limit"
     ))
 }
 

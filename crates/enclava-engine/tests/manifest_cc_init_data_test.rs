@@ -325,6 +325,7 @@ fn toml_contains_workload_artifact_binding_when_present() {
         descriptor_signing_pubkey: [0xcd; 32],
         org_keyring_fingerprint: [0xef; 32],
         omit_log_encryption_claim: false,
+        legacy_collapsed_trustee_key: false,
         omit_luks2_header_seal_claim: false,
     });
     let toml = build_toml(&app);
@@ -594,6 +595,7 @@ fn log_encryption_claim_is_bound_to_cc_init_data() {
         descriptor_signing_pubkey: [0u8; 32],
         org_keyring_fingerprint: [0u8; 32],
         omit_log_encryption_claim: true,
+        legacy_collapsed_trustee_key: false,
         omit_luks2_header_seal_claim: false,
     });
     let legacy_toml = build_toml(&legacy);

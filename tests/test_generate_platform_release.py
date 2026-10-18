@@ -395,3 +395,170 @@ def test_release_generator_rejects_invalid_unbracketed_colon_hosts():
         payload["trustee_kbs_url"] = value
         with pytest.raises(ValueError, match="trustee_kbs_url must be https"):
             generate_platform_release.validate_payload(payload)
+
+
+def test_release_generator_rejects_collapsed_trustee_and_signing_keys():
+    payload = base_payload()
+    payload["platform_trustee_policy_pubkey_hex"] = payload["signing_service_pubkey_hex"]
+
+    with pytest.raises(ValueError, match="must differ from signing_service_pubkey_hex"):
+        generate_platform_release.validate_payload(payload)
+
+
+def test_release_generator_rejects_missing_trustee_policy_key():
+    payload = base_payload()
+    del payload["platform_trustee_policy_pubkey_hex"]
+
+    with pytest.raises(ValueError, match="platform_trustee_policy_pubkey_hex is required"):
+        generate_platform_release.validate_payload(payload)
+
+
+def test_dev_fixture_trustee_pubkey_is_derived_not_the_seed():
+    import hashlib  # noqa: F401  (documenting no-hash intent)
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    seed = bytes.fromhex(generate_platform_release.DEV_FIXTURE_TRUSTEE_POLICY_SEED_HEX)
+    derived = (
+        Ed25519PrivateKey.from_private_bytes(seed)
+        .public_key()
+        .public_bytes_raw()
+        .hex()
+    )
+    pinned = generate_platform_release.DEV_FIXTURE_TRUSTEE_POLICY_KEY_HEX
+    assert pinned == derived, "fixture trustee constant must be the derived pubkey, not the seed"
+    assert pinned != generate_platform_release.DEV_FIXTURE_TRUSTEE_POLICY_SEED_HEX
+
+
+def _fixture_release_input(tmp_path) -> Path:
+    import json
+
+    input_path = tmp_path / "platform-release.json"
+    input_path.write_text(json.dumps({"payload": base_payload()}, indent=2) + "\n")
+    return input_path
+
+
+def test_generate_rejects_fixture_trustee_key_under_production_root(tmp_path, monkeypatch):
+    # Devin (cap#218): with the checked-in payload and a production signing
+    # seed, generate() used to sign the public dev-fixture trustee key — an
+    # envelope every verifier rejects under a production root. Mirror of the
+    # Rust verify_envelope gate: refuse at signing time instead of emitting
+    # an unusable (and fixture-authority-pinning) envelope.
+    import argparse
+
+    input_path = _fixture_release_input(tmp_path)
+    monkeypatch.setenv("ENCLAVA_PLATFORM_RELEASE_SIGNING_KEY_HEX", "ab" * 32)
+    args = argparse.Namespace(input=input_path, dev_fixture_key=False)
+
+    with pytest.raises(SystemExit, match="dev-fixture trustee policy key"):
+        generate_platform_release.generate(args)
+
+
+def test_generate_rejects_fixture_key_in_signing_slot_under_production_root(
+    tmp_path, monkeypatch
+):
+    # cap#218 self-check: while both keys are pinned, policy signatures
+    # verify against the signing-service key (#217), so the public fixture
+    # key must be refused in EITHER slot — a production root pinning it in
+    # signing_service_pubkey_hex would let anyone with the repo forge
+    # policy envelopes the TEE accepts.
+    import argparse
+    import json
+
+    input_path = tmp_path / "platform-release.json"
+    payload = base_payload()
+    payload["signing_service_pubkey_hex"] = (
+        generate_platform_release.DEV_FIXTURE_TRUSTEE_POLICY_KEY_HEX
+    )
+    payload["platform_trustee_policy_pubkey_hex"] = "bb" * 32
+    input_path.write_text(json.dumps({"payload": payload}, indent=2) + "\n")
+    monkeypatch.setenv("ENCLAVA_PLATFORM_RELEASE_SIGNING_KEY_HEX", "ab" * 32)
+    args = argparse.Namespace(input=input_path, dev_fixture_key=False)
+
+    with pytest.raises(SystemExit, match="signing_service_pubkey_hex"):
+        generate_platform_release.generate(args)
+
+
+def test_release_generator_rejects_unforgeable_key_pins():
+    # cap#218 follow-up: mirror of the Rust require_ed25519_point + is_weak
+    # checks. verify() accepts zero-signature forgeries against small-order
+    # keys, and non-decompressible pins are rejected by every Rust consumer —
+    # the ceremony must not sign either.
+    with pytest.raises(ValueError, match="not a valid Ed25519 public key"):
+        generate_platform_release.require_unforgeable_pubkey(
+            "signing_service_pubkey_hex", "02" + "00" * 31
+        )
+    with pytest.raises(ValueError, match="small order"):
+        generate_platform_release.require_unforgeable_pubkey(
+            "platform_trustee_policy_pubkey_hex", "00" * 32
+        )
+    # Non-canonical y = p reduces to 0 in dalek's from_bytes -> small order.
+    with pytest.raises(ValueError, match="small order"):
+        generate_platform_release.require_unforgeable_pubkey(
+            "signing_service_pubkey_hex", "ed" + "ff" * 30 + "7f"
+        )
+    # The fixture and test keys are valid non-weak points.
+    generate_platform_release.require_unforgeable_pubkey(
+        "platform_trustee_policy_pubkey_hex",
+        generate_platform_release.DEV_FIXTURE_TRUSTEE_POLICY_KEY_HEX,
+    )
+    for key in ["11" * 32, "33" * 32, "01" * 32, "bb" * 32]:
+        generate_platform_release.require_unforgeable_pubkey("k", key)
+
+
+def test_generate_rejects_small_order_signing_pin(tmp_path, monkeypatch):
+    # End-to-end: validate_payload runs the unforgeability gate before any
+    # envelope is produced.
+    import argparse
+    import json
+
+    input_path = tmp_path / "platform-release.json"
+    payload = base_payload()
+    payload["signing_service_pubkey_hex"] = "00" * 32
+    input_path.write_text(json.dumps({"payload": payload}, indent=2) + "\n")
+    monkeypatch.setenv("ENCLAVA_PLATFORM_RELEASE_SIGNING_KEY_HEX", "ab" * 32)
+    args = argparse.Namespace(input=input_path, dev_fixture_key=False)
+
+    with pytest.raises(ValueError, match="small order"):
+        generate_platform_release.generate(args)
+
+
+def test_generate_allows_fixture_trustee_key_with_dev_fixture_key(tmp_path):
+    import argparse
+    import json
+
+    input_path = _fixture_release_input(tmp_path)
+    args = argparse.Namespace(input=input_path, dev_fixture_key=True)
+
+    envelope = json.loads(generate_platform_release.generate(args))
+    assert (
+        envelope["payload"]["platform_trustee_policy_pubkey_hex"]
+        == generate_platform_release.DEV_FIXTURE_TRUSTEE_POLICY_KEY_HEX
+    )
+
+
+def test_generate_fixture_root_privileges_key_off_the_seed_not_the_flag(
+    tmp_path, monkeypatch
+):
+    # Signing with the fixture seed (c0*32) IS the dev fixture root even
+    # without --dev-fixture-key, so it may pin the fixture trustee key; any
+    # other seed is a production root and may not (parity with the Rust
+    # validators, which gate on the signing pubkey).
+    import argparse
+    import json
+
+    input_path = _fixture_release_input(tmp_path)
+    monkeypatch.setenv(
+        "ENCLAVA_PLATFORM_RELEASE_SIGNING_KEY_HEX",
+        generate_platform_release.DEV_FIXTURE_SIGNING_KEY_HEX,
+    )
+    args = argparse.Namespace(input=input_path, dev_fixture_key=False)
+
+    envelope = json.loads(generate_platform_release.generate(args))
+    assert (
+        envelope["payload"]["platform_trustee_policy_pubkey_hex"]
+        == generate_platform_release.DEV_FIXTURE_TRUSTEE_POLICY_KEY_HEX
+    )
+    assert (
+        bytes.fromhex(envelope["signing_pubkey"])
+        == generate_platform_release.dev_fixture_signing_root_pubkey()
+    )

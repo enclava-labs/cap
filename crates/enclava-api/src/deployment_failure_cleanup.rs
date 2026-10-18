@@ -928,7 +928,7 @@ where
     else {
         return GenerationLeftover::Foreign;
     };
-    if !(created_by > 0) {
+    if created_by <= 0 {
         return GenerationLeftover::Foreign;
     }
     // Value alone is not proof: SSA omission cannot remove a marker a
@@ -4411,8 +4411,8 @@ mod tests {
         let bound = earliest_legacy_row_started_at([(Some("old-gen"), None, t1)].into_iter())
             .expect("legacy row present");
         assert!(chrono_time("2026-10-14T10:59:59Z") < bound);
-        assert!(!(chrono_time("2026-10-14T11:00:00Z") < bound));
-        assert!(!(chrono_time("2026-10-14T11:00:01Z") < bound));
+        assert!(chrono_time("2026-10-14T11:00:00Z") >= bound);
+        assert!(chrono_time("2026-10-14T11:00:01Z") >= bound);
     }
 
     fn chrono_time(rfc3339: &str) -> chrono::DateTime<chrono::Utc> {

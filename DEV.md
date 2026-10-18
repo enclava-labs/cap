@@ -58,6 +58,10 @@ cargo audit --ignore RUSTSEC-2023-0071
 cargo deny check advisories sources
 ```
 
+CI and API image workflow concurrency is scoped by workflow and pull-request
+number, falling back to the Git ref for non-PR events. New runs supersede older
+runs for the same PR; unrelated PRs must not cancel each other's checks.
+
 ## Local API
 
 ```bash
