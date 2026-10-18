@@ -711,7 +711,7 @@ pub async fn put_keyring(
         .execute(&mut *tx)
         .await
         .map_err(|_| db_error())?;
-        // Consume the migration-0061 quarantine recovery marker in the same
+        // Consume the quarantine recovery marker (migration 0085) in the same
         // transaction that commits keyring authority: the recovery gate has
         // done its job once a version is stored (a successor version proves
         // authority was already restored, and clears a marker a pre-0061
@@ -1209,7 +1209,8 @@ async fn fence_successor_keyring_version(
     Ok(())
 }
 
-/// Quarantine recovery (migration 0061) restores dropped authority through
+/// Quarantine recovery (quarantine in migration 0061, marker in migration
+/// 0085) restores dropped authority through
 /// the first-version path, which has no pinned predecessor whose signature
 /// could authorize the replacement. The quarantine removed every keyring row
 /// of the org but left the signing service's owner registration live, so an
@@ -1219,7 +1220,8 @@ async fn fence_successor_keyring_version(
 /// replacement v1 signer to match the live signing-service owner before
 /// authority is restored. When no live owner is readable, bind the recovery
 /// to the displaced signer instead: migration 0061 archived every dropped
-/// row in `org_keyring_repairs` before writing the recovery marker, so the
+/// row in `org_keyring_repairs` and migration 0085 wrote the recovery
+/// marker from that archive, so the
 /// signer of the quarantined latest version is durable provenance, and
 /// `put_keyring` already verifies the replacement envelope under the
 /// caller's own registered key -- a matching signer means the displaced
@@ -3248,7 +3250,8 @@ mod tests {
         .await
         .expect("insert quarantine recovery marker");
         // Migration 0061 archives every dropped row in org_keyring_repairs
-        // before writing the marker, so the displaced signer of the
+        // and migration 0085 writes the marker from that archive, so the
+        // displaced signer of the
         // quarantined latest version is durable provenance even on an
         // install without the platform signing service.
         sqlx::query(
@@ -3392,8 +3395,9 @@ mod tests {
             .await
             .expect("insert quarantine recovery signing key");
         // A marker without readable org_keyring_repairs provenance cannot
-        // happen through migration 0061 (it archives every dropped row in
-        // the same run that writes the marker); when the displaced signer is
+        // happen through the 0061/0085 repair (0061 archives every dropped
+        // row and 0085 writes the marker from that archive in the same
+        // migration run); when the displaced signer is
         // unreadable anyway, the recovery fails closed instead of accepting
         // any active owner's key.
         sqlx::query(
