@@ -405,7 +405,14 @@ fn parse_image_pull_repository_scope(raw: &str) -> Result<ImagePullRepositorySco
                 .to_string(),
         );
     }
-    validate_repository_scope_registry(registry)?;
+    // DNS hostnames are case-insensitive. `GHCR.IO` and `ghcr.io` are the
+    // same registry, and ImageRef preserves the spelling from the workload
+    // reference. Canonicalize before the ghcr.io gate and the image-grammar
+    // round-trip so an uppercase scope is not rejected here while a
+    // lowercase scope later fails an exact compare against `GHCR.IO/...`
+    // (Codex review on #276, P2).
+    let registry = registry.to_ascii_lowercase();
+    validate_repository_scope_registry(&registry)?;
     // The generated tenant pull secret only authenticates the literal `ghcr.io`
     // host (its `.dockerconfigjson` carries a single `ghcr.io` auth entry made
     // from GHCR_USERNAME/GHCR_TOKEN). A scope at any other registry can only
@@ -460,7 +467,7 @@ fn parse_image_pull_repository_scope(raw: &str) -> Result<ImagePullRepositorySco
     }
 
     Ok(ImagePullRepositoryScope {
-        registry: registry.to_string(),
+        registry,
         repository: repository.to_string(),
         include_subrepositories,
     })
@@ -551,7 +558,9 @@ fn tenant_image_pull_secret_applies_to_containers(
 }
 
 fn image_matches_repository_scope(image: &ImageRef, scope: &ImagePullRepositoryScope) -> bool {
-    if image.registry() != scope.registry {
+    // Same host, different spelling (`GHCR.IO` vs the canonical `ghcr.io`
+    // stored on the scope). Repository paths stay case-sensitive.
+    if !image.registry().eq_ignore_ascii_case(&scope.registry) {
         return false;
     }
     if image.repository() == scope.repository {
@@ -1321,6 +1330,67 @@ fn configured_pull_secret_from_settings(
     Some(generate_tenant_image_pull_secret(namespace, &config))
 }
 
+/// Minimum valid mutation generation. A sweep-created pull secret has no
+/// deployment apply of its own; stamping this value makes every later failed
+/// generation (`live <= failed`) classify the secret as a leftover. See
+/// [`stamp_sweep_created_pull_secret_lineage`].
+const SWEEP_CREATED_PULL_SECRET_GENERATION: i64 = 1;
+
+/// POST params whose field manager is the platform manager
+/// `classify_generation_leftover` requires. A raw POST without `fieldManager`
+/// leaves `managedFields` empty, so creation-evidence annotations are still
+/// classified as foreign.
+fn pull_secret_create_params(engine: &ApplyEngine) -> kube::api::PostParams {
+    kube::api::PostParams {
+        field_manager: Some(engine.config().field_manager.clone()),
+        ..kube::api::PostParams::default()
+    }
+}
+
+/// Stamp the engine's creation evidence on a pull secret this process is
+/// creating outside `apply_resource`. Adopted-namespace failure cleanup
+/// deletes only objects whose `RESOURCE_CREATED_BY_ANNOTATION` is owned by
+/// the platform field manager and whose mutation generation is positive and
+/// not newer than the failed one. An unstamped secret is `Foreign`, skipped,
+/// and — once the app row is gone — invisible to the lifetime sweep, which
+/// inventories namespaces from app rows only (Codex review on #276, P1).
+///
+/// Stamped only on the create branch. A generation of
+/// [`SWEEP_CREATED_PULL_SECRET_GENERATION`] is the minimum valid generation,
+/// so any failed apply that reaches the classifier can delete it. Shared
+/// namespaces are protected separately: failure cleanup does not delete a
+/// pull secret while another app row still occupies the namespace.
+fn stamp_sweep_created_pull_secret_lineage(secret: &mut Secret) {
+    use enclava_engine::apply::generation::{
+        MUTATION_GENERATION_ANNOTATION, RESOURCE_CREATED_BY_ANNOTATION,
+    };
+    let annotations = secret
+        .metadata
+        .annotations
+        .get_or_insert_with(Default::default);
+    let generation = SWEEP_CREATED_PULL_SECRET_GENERATION.to_string();
+    annotations.insert(
+        RESOURCE_CREATED_BY_ANNOTATION.to_string(),
+        generation.clone(),
+    );
+    annotations.insert(MUTATION_GENERATION_ANNOTATION.to_string(), generation);
+}
+
+/// Whether failure cleanup must leave this Secret for a sibling app. The
+/// platform pull secret is namespace-scoped: deleting it because one app's
+/// apply failed would strip credentials another app in the same namespace
+/// still pulls with. The lifetime sweep still inventories that namespace
+/// through the sibling row.
+pub(crate) fn secret_is_shared_tenant_pull_secret(
+    name: &str,
+    labels: Option<&std::collections::BTreeMap<String, String>>,
+) -> bool {
+    let labeled = labels
+        .and_then(|labels| labels.get(TENANT_PULL_SECRET_LABEL))
+        .is_some_and(|value| value == TENANT_PULL_SECRET_LABEL_VALUE);
+    labeled || name == default_tenant_image_pull_secret_name_for_cleanup()
+}
+
 /// Create the configured pull secret and attach it to in-scope accounts when
 /// no managed secret remains kept after repairs and cleanup. Use the outcome
 /// of this pass, not the pre-repair discovery snapshot: deleting a stale
@@ -1365,8 +1435,15 @@ async fn ensure_configured_pull_secret_for_in_scope_accounts(
             live.metadata.uid.filter(|uid| !uid.is_empty())
         }
         Err(kube::Error::Api(error)) if error.code == 404 => {
+            // Codex review on #276, P1: this POST is the startup path that
+            // materializes a missing secret for an in-scope app. Without
+            // cleanup lineage, a later failed apply in an adopted namespace
+            // classifies the secret as foreign and leaves the platform PAT
+            // readable after the app row disappears.
+            let mut created = desired.clone();
+            stamp_sweep_created_pull_secret_lineage(&mut created);
             match api
-                .create(&kube::api::PostParams::default(), &desired)
+                .create(&pull_secret_create_params(engine), &created)
                 .await
             {
                 Ok(created) => created.metadata.uid.filter(|uid| !uid.is_empty()),
@@ -1894,9 +1971,11 @@ async fn reconcile_managed_pull_secrets(
                             // before reattaching; never declare a missing desired
                             // credential converged merely because refresh saw 404.
                             if let Some(config) = tenant_image_pull_secret_config_from_env() {
-                                let desired = generate_tenant_image_pull_secret(namespace, &config);
+                                let mut desired =
+                                    generate_tenant_image_pull_secret(namespace, &config);
+                                stamp_sweep_created_pull_secret_lineage(&mut desired);
                                 match api
-                                    .create(&kube::api::PostParams::default(), &desired)
+                                    .create(&pull_secret_create_params(engine), &desired)
                                     .await
                                 {
                                     Ok(_applied) => {
@@ -3475,7 +3554,7 @@ async fn apply_scoped_pull_secret(
                         generation.get().to_string(),
                     );
                 match api
-                    .create(&kube::api::PostParams::default(), &created)
+                    .create(&pull_secret_create_params(engine), &created)
                     .await
                 {
                     Ok(_) => return Ok(()),
@@ -5134,6 +5213,107 @@ mod tests {
         assert!(parse_image_pull_repository_scope("ghcr.io").is_err());
     }
 
+    /// Codex review on #276, P2: `GHCR.IO` is the same registry as `ghcr.io`.
+    /// An uppercase scope must parse to the canonical host, and a workload
+    /// image that preserves `GHCR.IO` must match that scope. Repository path
+    /// case stays exact.
+    #[test]
+    fn ghcr_scope_canonicalizes_registry_case() {
+        let scope = parse_image_pull_repository_scope("GHCR.IO/org/private").unwrap();
+        assert_eq!(
+            scope,
+            ImagePullRepositoryScope {
+                registry: "ghcr.io".to_string(),
+                repository: "org/private".to_string(),
+                include_subrepositories: false,
+            }
+        );
+        let digest = "a".repeat(64);
+        let uppercase = ImageRef::parse(&format!("GHCR.IO/org/private@sha256:{digest}")).unwrap();
+        let lowercase = ImageRef::parse(&format!("ghcr.io/org/private@sha256:{digest}")).unwrap();
+        assert_ne!(uppercase.registry(), lowercase.registry());
+        assert!(image_matches_repository_scope(&uppercase, &scope));
+        assert!(image_matches_repository_scope(&lowercase, &scope));
+        let wildcard = parse_image_pull_repository_scope("Ghcr.Io/org/private/*").unwrap();
+        let child = ImageRef::parse(&format!("GHCR.IO/org/private/child@sha256:{digest}")).unwrap();
+        assert!(image_matches_repository_scope(&child, &wildcard));
+        let other_repo = ImageRef::parse(&format!("ghcr.io/Org/private@sha256:{digest}")).unwrap();
+        assert!(!image_matches_repository_scope(&other_repo, &scope));
+        assert!(parse_image_pull_repository_scope("Example.COM/org/private").is_err());
+    }
+
+    /// Codex review on #276, P1: a sweep-created secret must classify as a
+    /// failed-generation leftover once the platform field manager owns the
+    /// creation annotation. The same annotations without that ownership, and
+    /// an unstamped secret, stay foreign.
+    #[test]
+    fn sweep_created_pull_secret_lineage_is_a_generation_leftover() {
+        use enclava_engine::apply::generation::{
+            MUTATION_GENERATION_ANNOTATION, RESOURCE_CREATED_BY_ANNOTATION,
+        };
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::{FieldsV1, ManagedFieldsEntry};
+
+        let config = TenantImagePullSecretConfig {
+            name: "enclava-registry-auth".to_string(),
+            username: "cap-bot".to_string(),
+            token: "token".to_string(),
+            allowed_repositories: Vec::new(),
+        };
+        let mut secret = generate_tenant_image_pull_secret("tenant-ns", &config);
+        stamp_sweep_created_pull_secret_lineage(&mut secret);
+        assert!(matches!(
+            crate::deployment_failure_cleanup::classify_generation_leftover(&secret, 7),
+            crate::deployment_failure_cleanup::GenerationLeftover::Foreign
+        ));
+        secret.metadata.managed_fields = Some(vec![ManagedFieldsEntry {
+            manager: Some("enclava-platform".to_string()),
+            fields_v1: Some(FieldsV1(serde_json::json!({
+                "f:metadata": {
+                    "f:annotations": {
+                        format!("f:{RESOURCE_CREATED_BY_ANNOTATION}"): {}
+                    }
+                }
+            }))),
+            ..Default::default()
+        }]);
+        assert_eq!(
+            secret
+                .metadata
+                .annotations
+                .as_ref()
+                .unwrap()
+                .get(MUTATION_GENERATION_ANNOTATION)
+                .map(String::as_str),
+            Some("1")
+        );
+        assert!(matches!(
+            crate::deployment_failure_cleanup::classify_generation_leftover(&secret, 1),
+            crate::deployment_failure_cleanup::GenerationLeftover::Leftover
+        ));
+        assert!(matches!(
+            crate::deployment_failure_cleanup::classify_generation_leftover(&secret, 7),
+            crate::deployment_failure_cleanup::GenerationLeftover::Leftover
+        ));
+    }
+
+    #[test]
+    fn shared_pull_secret_predicate_covers_label_and_configured_name_only() {
+        let mut labels = std::collections::BTreeMap::new();
+        labels.insert(
+            TENANT_PULL_SECRET_LABEL.to_string(),
+            TENANT_PULL_SECRET_LABEL_VALUE.to_string(),
+        );
+        assert!(secret_is_shared_tenant_pull_secret(
+            "renamed-old-secret",
+            Some(&labels)
+        ));
+        assert!(secret_is_shared_tenant_pull_secret(
+            &default_tenant_image_pull_secret_name_for_cleanup(),
+            None
+        ));
+        assert!(!secret_is_shared_tenant_pull_secret("tenant-owned", None));
+    }
+
     /// #252: scopes with empty path segments — a trailing '/' (including the
     /// `ghcr.io/company/private//*` typo that strips exactly one `/*` and
     /// leaves a trailing slash), interior `//`, or a leading '/' — must be
@@ -6530,6 +6710,10 @@ mod tests {
         /// (Codex review on #243, P2): every Secret PATCH and CREATE returns
         /// 409, driving the apply retry loop to exhaustion.
         secret_write_conflicts: bool,
+        /// `fieldManager` query parameter of the most recent Secret POST, so
+        /// tests can prove sweep-created secrets are attributed to the
+        /// platform manager failure cleanup requires.
+        last_secret_create_field_manager: Option<String>,
     }
 
     fn fake_managed_secret(name: &str, labeled: bool, username: &str, token: &str) -> Secret {
@@ -6823,6 +7007,12 @@ mod tests {
                 if state.secret_write_conflicts {
                     return conflict();
                 }
+                state.last_secret_create_field_manager = query.and_then(|query| {
+                    query.split('&').find_map(|pair| {
+                        let (key, value) = pair.split_once('=')?;
+                        (key == "fieldManager").then(|| decode_query_component(value))
+                    })
+                });
                 let mut created: Secret = serde_json::from_slice(body).unwrap();
                 if state
                     .secrets
@@ -9651,6 +9841,25 @@ mod tests {
             Some("enclava-registry-auth")
         );
         assert!(is_labeled_managed_pull_secret(&state.secrets[0]));
+        let annotations = state.secrets[0].metadata.annotations.as_ref().unwrap();
+        assert_eq!(
+            annotations
+                .get(enclava_engine::apply::generation::RESOURCE_CREATED_BY_ANNOTATION)
+                .map(String::as_str),
+            Some("1"),
+            "sweep-created secrets must carry failure-cleanup creation evidence"
+        );
+        assert_eq!(
+            annotations
+                .get(enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION)
+                .map(String::as_str),
+            Some("1"),
+        );
+        assert_eq!(
+            state.last_secret_create_field_manager.as_deref(),
+            Some("enclava-platform"),
+            "creation evidence is foreign unless the platform field manager owns it"
+        );
         let in_scope = state
             .service_accounts
             .iter()

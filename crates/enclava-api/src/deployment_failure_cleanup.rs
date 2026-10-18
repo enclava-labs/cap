@@ -529,6 +529,33 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
             failures += 1;
         }
     }
+    // A sweep-created pull secret is stamped with generation 1 so this
+    // classifier can delete it. That also makes it a leftover of every
+    // failed generation. The secret is namespace-scoped, so a sibling app
+    // still occupying the namespace must keep it; the lifetime sweep still
+    // sees that sibling's row. A query failure is not proof the secret is
+    // unneeded — keep it and leave the sweep incomplete (Codex review on
+    // #276, P1).
+    let other_apps_share_namespace = match sqlx::query_scalar::<_, bool>(
+        "SELECT COUNT(*) > 0 FROM apps WHERE namespace = $1 AND id <> $2",
+    )
+    .bind(&app.namespace)
+    .bind(app.id)
+    .fetch_one(&state.db)
+    .await
+    {
+        Ok(shared) => shared,
+        Err(error) => {
+            tracing::warn!(
+                app_id = %app.id,
+                namespace = %app.namespace,
+                error = %error,
+                "adopted-namespace sweep cannot tell whether another app still needs the shared pull secret; keeping it and marking the sweep incomplete"
+            );
+            failures += 1;
+            true
+        }
+    };
     for target in targets {
         if tokio::time::Instant::now() >= sweep_deadline {
             tracing::warn!(
@@ -669,6 +696,21 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
                     // PVCs from a previous sweep. Inspect dependents below,
                     // irrespective of the owner's classification.
                 }
+                break;
+            }
+            if other_apps_share_namespace
+                && target.kind == "Secret"
+                && crate::deploy::secret_is_shared_tenant_pull_secret(
+                    &target.name,
+                    live.metadata.labels.as_ref(),
+                )
+            {
+                tracing::info!(
+                    app_id = %app.id,
+                    namespace = %app.namespace,
+                    secret = %target.name,
+                    "adopted-namespace sweep keeps a shared pull secret; another app still occupies the namespace"
+                );
                 break;
             }
             let preconditions = kube::api::Preconditions {
