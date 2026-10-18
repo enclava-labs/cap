@@ -668,6 +668,17 @@ pub async fn put_keyring(
                 &signing_pubkey,
             )
             .await?;
+            // Consume the marker before the insert. Migration 0085's BEFORE
+            // INSERT trigger rejects any keyring write while the marker
+            // remains, so a pre-0085 binary cannot re-insert the replacement
+            // this migration just removed. The delete is in this transaction:
+            // a failed insert rolls the marker back, and only a recovery that
+            // passed the displaced-signer check reaches the insert.
+            sqlx::query("DELETE FROM org_keyring_shape_recoveries WHERE org_id = $1")
+                .bind(org_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| db_error())?;
         }
     }
 
@@ -710,16 +721,6 @@ pub async fn put_keyring(
         .execute(&mut *tx)
         .await
         .map_err(|_| db_error())?;
-        // Consume the quarantine recovery marker (migration 0085) in the same
-        // transaction that commits keyring authority: the recovery gate has
-        // done its job once a version is stored (a successor version proves
-        // authority was already restored, and clears a marker a pre-0061
-        // binary's rollout-window write left behind).
-        sqlx::query("DELETE FROM org_keyring_shape_recoveries WHERE org_id = $1")
-            .bind(org_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|_| db_error())?;
         // A new keyring generation can revoke the signer of retained signed
         // policy artifacts; the owed generation bump is deferred to
         // migration 0061's INSERT trigger (durable selector debt) and
@@ -3076,6 +3077,258 @@ mod tests {
             .await
             .expect("delete second-owner replay users");
         drop_isolated_database("cap178_second_owner_replay", pool).await;
+    }
+
+    /// 0061 quarantines by deleting every keyring row, then commits and drops
+    /// its ACCESS EXCLUSIVE lock before 0085 runs. An active owner can insert
+    /// a replacement v1 in that gap (the unrestricted first-version path).
+    /// 0085's backfill used to require the org to still have no keyring row —
+    /// the quarantine state the replacement no longer has — so the recovery
+    /// marker was never created and `fence_quarantined_keyring_recovery`
+    /// never compared the replacement to the displaced signer.
+    #[tokio::test]
+    async fn migration_0085_backfill_fences_owner_replaced_quarantine() {
+        let _singleton = keyring_enqueue_guard().await;
+        let (_db_cleanup, pool) = isolated_database_test_pool("cap187_replaced_quarantine").await;
+        let captured_org = Uuid::new_v4();
+        let survivor_org = Uuid::new_v4();
+        let alice_id = Uuid::new_v4();
+        let bob_id = Uuid::new_v4();
+        let carol_id = Uuid::new_v4();
+        let captured_name = format!("keyring-replaced-q-{}", captured_org.simple());
+        let survivor_name = format!("keyring-survivor-{}", survivor_org.simple());
+        crate::db::orgs::insert_org_pool(&pool, captured_org, &captured_name, None, false)
+            .await
+            .expect("insert captured org");
+        crate::db::orgs::insert_org_pool(&pool, survivor_org, &survivor_name, None, false)
+            .await
+            .expect("insert survivor org");
+        for (user_id, display_name) in [(alice_id, "Alice"), (bob_id, "Bob"), (carol_id, "Carol")] {
+            sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, $2)")
+                .bind(user_id)
+                .bind(display_name)
+                .execute(&pool)
+                .await
+                .expect("insert user");
+        }
+        for (user_id, org_id) in [
+            (alice_id, captured_org),
+            (bob_id, captured_org),
+            (carol_id, survivor_org),
+        ] {
+            sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+                .bind(user_id)
+                .bind(org_id)
+                .execute(&pool)
+                .await
+                .expect("insert membership");
+        }
+        let alice_key = SigningKey::generate(&mut OsRng);
+        let bob_key = SigningKey::generate(&mut OsRng);
+        let carol_key = SigningKey::generate(&mut OsRng);
+        let alice_signing_key_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(alice_id)
+        .bind(alice_key.verifying_key().to_bytes().to_vec())
+        .fetch_one(&pool)
+        .await
+        .expect("insert alice signing key");
+        let bob_signing_key_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(bob_id)
+        .bind(bob_key.verifying_key().to_bytes().to_vec())
+        .fetch_one(&pool)
+        .await
+        .expect("insert bob signing key");
+        let carol_signing_key_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(carol_id)
+        .bind(carol_key.verifying_key().to_bytes().to_vec())
+        .fetch_one(&pool)
+        .await
+        .expect("insert carol signing key");
+        let well_formed = br#"{"members":[]}"#.to_vec();
+        let signature = vec![0u8; 64];
+        // 0061 archives every version of a quarantined org, including v1,
+        // then deletes them. The window replacement re-inserts v1.
+        sqlx::query(
+            "INSERT INTO org_keyring_repairs
+                 (org_id, version, keyring_payload, signature, signing_key_id, created_at)
+             VALUES ($1, 1, $2, $3, $4, now()),
+                    ($1, 3, $2, $3, $4, now())",
+        )
+        .bind(captured_org)
+        .bind(&well_formed)
+        .bind(&signature)
+        .bind(alice_signing_key_id)
+        .execute(&pool)
+        .await
+        .expect("archive quarantined versions");
+        sqlx::query(
+            "INSERT INTO org_keyrings
+                 (org_id, version, keyring_payload, signature, signing_key_id)
+             VALUES ($1, 1, $2, $3, $4)",
+        )
+        .bind(captured_org)
+        .bind(&well_formed)
+        .bind(&signature)
+        .bind(bob_signing_key_id)
+        .execute(&pool)
+        .await
+        .expect("insert window replacement");
+        // Control: a clean current version survived 0061 (not archived) while
+        // a malformed historical row was archived. That org must keep its
+        // keyring and must not receive a recovery marker.
+        sqlx::query(
+            "INSERT INTO org_keyring_repairs
+                 (org_id, version, keyring_payload, signature, signing_key_id, created_at)
+             VALUES ($1, 1, $2, $3, $4, now())",
+        )
+        .bind(survivor_org)
+        .bind(&well_formed)
+        .bind(&signature)
+        .bind(carol_signing_key_id)
+        .execute(&pool)
+        .await
+        .expect("archive survivor historical row");
+        sqlx::query(
+            "INSERT INTO org_keyrings
+                 (org_id, version, keyring_payload, signature, signing_key_id)
+             VALUES ($1, 2, $2, $3, $4)",
+        )
+        .bind(survivor_org)
+        .bind(&well_formed)
+        .bind(&signature)
+        .bind(carol_signing_key_id)
+        .execute(&pool)
+        .await
+        .expect("insert surviving clean keyring");
+
+        // Replay 0085 as it runs on a database that does not yet have the
+        // marker table (canonical 0061 does not create it).
+        sqlx::raw_sql(
+            "DROP TRIGGER IF EXISTS org_keyrings_fence_quarantine_recovery ON org_keyrings;
+             DROP FUNCTION IF EXISTS org_keyrings_reject_unfenced_quarantine_recovery();
+             DROP TABLE IF EXISTS org_keyring_shape_recoveries;",
+        )
+        .execute(&pool)
+        .await
+        .expect("restore pre-0085 schema");
+        sqlx::raw_sql(include_str!(
+            "../../migrations/0085_org_keyring_shape_recoveries.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("replay production 0085 migration");
+
+        let captured_rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM org_keyrings WHERE org_id = $1")
+                .bind(captured_org)
+                .fetch_one(&pool)
+                .await
+                .expect("count captured keyrings");
+        assert_eq!(
+            captured_rows, 0,
+            "0085 must remove the unfenced window replacement so the first-version fence can run"
+        );
+        let marker: Option<i64> = sqlx::query_scalar(
+            "SELECT quarantined_latest_version FROM org_keyring_shape_recoveries WHERE org_id = $1",
+        )
+        .bind(captured_org)
+        .fetch_optional(&pool)
+        .await
+        .expect("read captured recovery marker");
+        assert_eq!(
+            marker,
+            Some(3),
+            "0085 must record the quarantined latest version even though a replacement keyring existed"
+        );
+        let archived: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM org_keyring_repairs WHERE org_id = $1")
+                .bind(captured_org)
+                .fetch_one(&pool)
+                .await
+                .expect("count archived provenance");
+        assert_eq!(
+            archived, 2,
+            "the repair archive is the displaced-signer provenance"
+        );
+        let survivor_version: i64 =
+            sqlx::query_scalar("SELECT version FROM org_keyrings WHERE org_id = $1")
+                .bind(survivor_org)
+                .fetch_one(&pool)
+                .await
+                .expect("read surviving keyring");
+        assert_eq!(
+            survivor_version, 2,
+            "a clean survivor must not be quarantined"
+        );
+        let survivor_marker: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM org_keyring_shape_recoveries WHERE org_id = $1",
+        )
+        .bind(survivor_org)
+        .fetch_one(&pool)
+        .await
+        .expect("count survivor marker");
+        assert_eq!(
+            survivor_marker, 0,
+            "a clean survivor must not get a recovery marker"
+        );
+
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        let auth_for = |user_id, org_id, org_name: &str| AuthContext {
+            user_id,
+            org_id,
+            org_name: org_name.to_string(),
+            role: Role::Owner,
+            api_key: None,
+            management_origin: crate::auth::middleware::ManagementOrigin::Public,
+        };
+        let hijack = put_keyring(
+            auth_for(bob_id, captured_org, &captured_name),
+            State(state.clone()),
+            Path(captured_name.clone()),
+            Json(signed_keyring_request(captured_org, bob_id, &bob_key, 1, 1)),
+        )
+        .await
+        .expect_err("the capturer must not restore quarantined authority");
+        assert_eq!(hijack.0, StatusCode::CONFLICT);
+        assert_eq!(
+            hijack.1.0["error"],
+            "quarantined keyring recovery signer does not match the quarantined signing owner"
+        );
+        let recovered = put_keyring(
+            auth_for(alice_id, captured_org, &captured_name),
+            State(state),
+            Path(captured_name),
+            Json(signed_keyring_request(
+                captured_org,
+                alice_id,
+                &alice_key,
+                1,
+                1,
+            )),
+        )
+        .await
+        .expect("the displaced signer must restore authority through the fence");
+        assert_eq!(recovered.0, StatusCode::OK);
+        let marker_after: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM org_keyring_shape_recoveries WHERE org_id = $1",
+        )
+        .bind(captured_org)
+        .fetch_one(&pool)
+        .await
+        .expect("read marker after recovery");
+        assert_eq!(
+            marker_after, 0,
+            "the fenced recovery must consume the marker"
+        );
+
+        drop_isolated_database("cap187_replaced_quarantine", pool).await;
     }
 
     #[tokio::test]

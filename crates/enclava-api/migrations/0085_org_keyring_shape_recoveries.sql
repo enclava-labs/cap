@@ -34,7 +34,56 @@
 -- on both fresh and populated databases.  The IF NOT EXISTS / ON CONFLICT
 -- guards keep this migration safe on databases that already carry the
 -- marker table from #187's earlier divergent 0061.
+--
+-- Window capture (review finding): 0061 commits and releases ACCESS
+-- EXCLUSIVE before this migration runs (0062..0084 sit in between, and the
+-- documented rollout keeps a pre-0061 replica live).  That replica's
+-- unrestricted first-version path inserts a replacement v1.  The backfill's
+-- NOT EXISTS (org_keyrings) filter is the post-quarantine empty state, which
+-- the replacement no longer has, so the marker was never created and
+-- fence_quarantined_keyring_recovery never compared the replacement to the
+-- displaced signer.  A replacement is distinguishable from a clean survivor:
+-- 0061 archives only rows it deletes, the first-version path requires
+-- version 1, and every quarantined org's v1 was archived, so the live v1
+-- collides with the archive.  A preserved version is live and absent from
+-- the archive.  Delete the colliding re-inserts (the archived payload stays
+-- in org_keyring_repairs) before the backfill, so the empty-state filter
+-- records the marker and the next upload takes the fenced path.
+--
+-- Skip that delete when the marker table already exists.  Divergent 0061
+-- created it in the same transaction as the quarantine, so a keyring beside
+-- an existing marker is a fenced recovery or a clean survivor, not an
+-- unfenced window capture.
 LOCK TABLE org_keyrings, org_keyring_repairs IN ACCESS EXCLUSIVE MODE;
+
+DO $$
+DECLARE
+    captured record;
+BEGIN
+    IF to_regclass('public.org_keyring_shape_recoveries') IS NULL THEN
+        FOR captured IN
+            DELETE FROM org_keyrings k
+             USING org_keyring_repairs r
+             WHERE k.org_id = r.org_id
+               AND k.version = r.version
+               AND NOT EXISTS (
+                   SELECT 1
+                     FROM org_keyrings live
+                    WHERE live.org_id = k.org_id
+                      AND NOT EXISTS (
+                          SELECT 1
+                            FROM org_keyring_repairs archived
+                           WHERE archived.org_id = live.org_id
+                             AND archived.version = live.version
+                      )
+               )
+             RETURNING k.org_id, k.version
+        LOOP
+            RAISE NOTICE 'migration 0085: removed unfenced keyring v% for quarantined org % (inserted before the recovery marker); the displaced signer must restore authority through the fenced first-version path',
+                captured.version, captured.org_id;
+        END LOOP;
+    END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS org_keyring_shape_recoveries (
     org_id                     uuid PRIMARY KEY REFERENCES organizations(id) ON DELETE CASCADE,
@@ -50,3 +99,34 @@ SELECT r.org_id, max(r.version)
  )
  GROUP BY r.org_id
 ON CONFLICT (org_id) DO NOTHING;
+
+-- The repair above is not durable against the still-live old binary: the
+-- moment this transaction commits, that binary can insert another v1, the
+-- new binary sees a row and skips fence_quarantined_keyring_recovery, and a
+-- later successor write would consume the marker.  Reject any keyring insert
+-- while the marker remains.  The fenced path deletes the marker in the same
+-- transaction before its insert, so a recovery that passed the signer check
+-- is allowed and a failed insert rolls the marker back.  Old binaries do not
+-- know to delete the marker, so their insert fails closed.
+CREATE OR REPLACE FUNCTION org_keyrings_reject_unfenced_quarantine_recovery()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+          FROM org_keyring_shape_recoveries r
+         WHERE r.org_id = NEW.org_id
+    ) THEN
+        RAISE EXCEPTION 'quarantined keyring recovery requires the fenced signer check'
+            USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS org_keyrings_fence_quarantine_recovery ON org_keyrings;
+CREATE TRIGGER org_keyrings_fence_quarantine_recovery
+    BEFORE INSERT ON org_keyrings
+    FOR EACH ROW
+    EXECUTE FUNCTION org_keyrings_reject_unfenced_quarantine_recovery();
