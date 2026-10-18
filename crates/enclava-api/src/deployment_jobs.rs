@@ -59,10 +59,7 @@ pub fn customer_config_roll_hold_applies(
     rollout_in_flight: bool,
     tee_domain: Option<&str>,
 ) -> bool {
-    if is_new_app
-        || rollout_in_flight
-        || !tee_domain.is_some_and(|domain| !domain.trim().is_empty())
-    {
+    if is_new_app || rollout_in_flight || tee_domain.is_none_or(|domain| domain.trim().is_empty()) {
         return false;
     }
     match live_app_status {
@@ -4071,7 +4068,6 @@ async fn publish_rollout_outcome(
 async fn publish_apply_failure_with_mutation(
     pool: &PgPool,
     job: &ClaimedJob,
-    failure_code: &str,
     mutation: Option<&mut crate::mutation_leases::AppMutationLease>,
     failure_code: &'static str,
 ) -> Result<(), DeploymentJobError> {
@@ -11152,7 +11148,7 @@ pub(crate) mod tests {
                 .expect("claim code fixture apply")
                 .expect("code fixture apply exists");
 
-            publish_apply_failure_with_mutation(&pool, &job, failure_code, None)
+            publish_apply_failure_with_mutation(&pool, &job, None, failure_code)
                 .await
                 .expect("publish classified apply failure");
 

@@ -1035,6 +1035,14 @@ fn hold_deferral_correlates(revoked_owners: &[String], hold_apps: &[String]) -> 
 /// fail closed when the org has no keyring row at all.
 /// The prior healthy workload remains required until a replacement is healthy,
 /// including when replacement setup fails without stopping the running workload.
+/// the last completed workload (supersession never rewrites completed jobs)
+/// plus the newest later generation that published a StatefulSet, until teardown
+/// completes. Setup acceptance is not publication. Apply failures are never
+/// reverted, and the delete flip itself supersedes leased work; a later
+/// publication supersedes older failed attempts, bounding the authority one
+/// deleting app can force into the shared policy. The prior healthy workload
+/// remains required until a replacement is healthy, including when replacement
+/// setup fails without stopping the running workload.
 async fn load_signed_policy_candidates(
     db: &PgPool,
     retention: i64,
@@ -1054,8 +1062,7 @@ async fn load_signed_policy_candidates(
                 app.status::text AS app_status,
                 app.workload_teardown_required,
                 app.workload_teardown_completed_at,
-                job.last_error_code,
-                deployment.spec_snapshot->>'setup_state' AS deployment_setup_state,
+                deployment.workload_spec_published_at,
                 ROW_NUMBER() OVER (
                     PARTITION BY job.app_id
                     ORDER BY job.generation DESC
@@ -1116,41 +1123,27 @@ async fn load_signed_policy_candidates(
                         AND job_state IN ('setup_pending', 'setting_up', 'pending', 'running', 'completed')
                     )
                     OR (
-                        -- Deleting with confidential teardown still pending:
-                        -- every workload generation the app may still be
-                        -- running under stays authorized until the teardown
-                        -- completes, so the teardown's policy-governed KBS
-                        -- deletes cannot be stranded by a reconciliation.
+                        -- Deleting with confidential teardown still pending.
+                        -- Policy-governed KBS deletes stay possible until
+                        -- teardown completes.
                         --
-                        -- Soundness does not come from a generation count:
-                        -- single-flight leases serialize concurrent
-                        -- deployments, but sequentially failed generations
-                        -- stack, so the live workload can sit at any rank.
-                        -- It comes from workload state instead:
+                        -- Failed generations stack. Two rows cover the
+                        -- workloads that can still be serving, and bound what
+                        -- one app can force into the shared policy:
                         --   * the newest completed job is the last workload
                         --     known applied (a watching generation's job
-                        --     completes, and supersession only rewrites
-                        --     queued/leased jobs, so it stays completed) —
-                        --     admitted however many later generations
-                        --     failed;
-                        --   * any later generation that reached the apply
-                        --     phase may have written (or still be rolling
-                        --     out) a workload spec — apply failures are
-                        --     never reverted and the delete flip itself
-                        --     supersedes leased work with
-                        --     'deployment_superseded'. Two signals gate
-                        --     this arm: only provable setup failures are
-                        --     excluded by error code (setup completes
-                        --     before any workload spec is written), and
-                        --     the deployment must carry setup_state
-                        --     'accepted' (the durable setup machine in
-                        --     spec_snapshot, which supersession never
-                        --     rewrites) — a deployment superseded while
-                        --     still queued never entered the apply phase,
-                        --     wrote no spec, and admitting a pile of them
-                        --     would crowd the per-app retention slots and
-                        --     could push the live workload's artifact out
-                        --     of the published policy.
+                        --     completes; supersession does not rewrite
+                        --     completed jobs);
+                        --   * the newest later generation with
+                        --     workload_spec_published_at set has applied a
+                        --     StatefulSet. That column is written only after
+                        --     apply_statefulset returns. A later
+                        --     setup-accepted failure — preflight, resources
+                        --     before the StatefulSet, or supersession before
+                        --     that write — neither replaces the spec nor
+                        --     suppresses it. The probe below uses the same
+                        --     column.
+                        -- shortcut: intermediate publications between the last completed job and the newest publication are dropped, upgrade when teardown can name the pod that is still live
                         app_status = 'deleting'
                         AND workload_teardown_required
                         AND workload_teardown_completed_at IS NULL
@@ -1167,13 +1160,18 @@ async fn load_signed_policy_candidates(
                                 )
                             )
                             OR (
-                                job_state <> 'completed'
-                                AND COALESCE(
-                                       ranked_job_operations.last_error_code,
-                                       ''
-                                   ) <> 'deployment_setup_failed'
-                                AND ranked_job_operations.deployment_setup_state
-                                    = 'accepted'
+                                ranked_job_operations.workload_spec_published_at
+                                    IS NOT NULL
+                                AND NOT EXISTS (
+                                    SELECT 1
+                                      FROM ranked_job_operations AS newer_published
+                                     WHERE newer_published.app_id
+                                         = ranked_job_operations.app_id
+                                       AND newer_published.generation
+                                           > ranked_job_operations.generation
+                                       AND newer_published.workload_spec_published_at
+                                           IS NOT NULL
+                                )
                                 AND ranked_job_operations.generation > COALESCE(
                                        (
                                            SELECT MAX(applied.generation)
@@ -1244,7 +1242,8 @@ async fn load_signed_policy_candidates(
                     historical.artifact_deployment_id = current.artifact_deployment_id
                     AND historical.artifact_descriptor_core_hash
                         = current.artifact_descriptor_core_hash
-                ) AS required
+                ) AS required,
+                (current.app_status = 'deleting') AS retention_exempt
             FROM eligible_current_job_operations AS current
             JOIN deployment_apply_jobs AS historical
               ON historical.app_id = current.app_id
@@ -1322,13 +1321,18 @@ async fn load_signed_policy_candidates(
                 operation_generation,
                 artifact_created_at,
                 descriptor_core_hash,
-                ROW_NUMBER() OVER (
-                    PARTITION BY app_id
-                    ORDER BY required DESC,
-                             operation_generation DESC,
-                             artifact_created_at DESC,
-                             descriptor_core_hash
-                ) AS app_artifact_rank
+                CASE
+                    -- Both teardown artifacts can still be serving. Retention
+                    -- must not drop either; the byte budget fail-closes.
+                    WHEN retention_exempt THEN 1
+                    ELSE ROW_NUMBER() OVER (
+                        PARTITION BY app_id
+                        ORDER BY required DESC,
+                                 operation_generation DESC,
+                                 artifact_created_at DESC,
+                                 descriptor_core_hash
+                    )
+                END AS app_artifact_rank
             FROM job_artifact_candidates
         ),
         ranked_legacy_operations AS (
@@ -1434,6 +1438,332 @@ async fn load_signed_policy_candidates(
                 .map_err(KbsPolicyError::Serialize)
         })
         .collect()
+}
+
+/// The policy authority one app pins for confidential teardown: the newest
+/// completed workload plus the newest later generation that published a
+/// StatefulSet — the same two arms `load_signed_policy_candidates` admits for
+/// a deleting app with teardown still pending — or the newest healthy
+/// deployment's artifacts for a legacy app whose authority no job-backed
+/// deployment has durably replaced (a failed job-backed replacement leaves the
+/// pre-job healthy workload required, mirroring the selector's legacy
+/// eligibility). The delete transition marks the app deleting and sets
+/// `workload_teardown_required` together, so this projection is exactly what
+/// the selector admits once that transition lands.
+async fn load_teardown_policy_unit(
+    db: &PgPool,
+    app_id: Uuid,
+) -> Result<Vec<crate::signing_service::SignedPolicyArtifact>, KbsPolicyError> {
+    let rows: Vec<serde_json::Value> = sqlx::query_scalar(
+        r#"
+        WITH ranked_job_operations AS (
+            SELECT
+                job.generation,
+                job.state AS job_state,
+                job.artifact_deployment_id,
+                job.artifact_descriptor_core_hash,
+                deployment.status::text AS deployment_status,
+                deployment.workload_spec_published_at
+            FROM deployment_apply_jobs AS job
+            JOIN deployments AS deployment
+              ON deployment.id = job.deployment_id
+             AND deployment.app_id = job.app_id
+             AND deployment.org_id = job.org_id
+            WHERE job.app_id = $1
+              AND NOT (
+                  job.customer_config_hold
+                  AND job.customer_config_released_at IS NULL
+              )
+        ),
+        max_completed AS (
+            SELECT MAX(generation) AS generation
+              FROM deployment_apply_jobs
+             WHERE app_id = $1 AND state = 'completed'
+        ),
+        picked AS (
+            SELECT artifact_deployment_id, artifact_descriptor_core_hash
+              FROM ranked_job_operations
+             WHERE job_state = 'completed'
+               AND generation = (SELECT generation FROM max_completed)
+            UNION
+            SELECT artifact_deployment_id, artifact_descriptor_core_hash
+              FROM ranked_job_operations
+             WHERE workload_spec_published_at IS NOT NULL
+               AND generation > COALESCE((SELECT generation FROM max_completed), 0)
+               AND generation = (
+                   SELECT MAX(generation)
+                     FROM ranked_job_operations
+                    WHERE workload_spec_published_at IS NOT NULL
+               )
+        ),
+        job_unit AS (
+            SELECT artifact.descriptor_core_hash, artifact.signed_policy_artifact
+              FROM picked
+              JOIN workload_artifacts AS artifact
+                ON artifact.app_id = $1
+               AND artifact.deploy_id = picked.artifact_deployment_id
+               AND artifact.descriptor_core_hash = picked.artifact_descriptor_core_hash
+             WHERE picked.artifact_deployment_id IS NOT NULL
+               AND picked.artifact_descriptor_core_hash IS NOT NULL
+        ),
+        ranked_legacy_operations AS (
+            SELECT
+                deployment.id AS deployment_id,
+                deployment.status::text AS deployment_status,
+                ROW_NUMBER() OVER (
+                    ORDER BY deployment.created_at DESC, deployment.id DESC
+                ) AS current_operation_rank
+            FROM deployments AS deployment
+            WHERE deployment.app_id = $1
+              -- Failed or held replacements do not retire legacy authority.
+              AND NOT EXISTS (
+                  SELECT 1
+                    FROM ranked_job_operations AS operation
+                   WHERE operation.deployment_status = 'healthy'
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                    FROM deployment_apply_jobs AS own_job
+                   WHERE own_job.deployment_id = deployment.id
+              )
+        ),
+        legacy_unit AS (
+            SELECT artifact.descriptor_core_hash, artifact.signed_policy_artifact
+              FROM ranked_legacy_operations AS legacy
+              JOIN workload_artifacts AS artifact
+                ON artifact.app_id = $1
+               AND artifact.deploy_id = legacy.deployment_id
+             WHERE legacy.current_operation_rank = 1
+               AND legacy.deployment_status = 'healthy'
+        ),
+        teardown_unit AS (
+            SELECT descriptor_core_hash, signed_policy_artifact FROM job_unit
+            UNION
+            SELECT descriptor_core_hash, signed_policy_artifact FROM legacy_unit
+        ),
+        current_keyring AS (
+            SELECT keyring_payload
+              FROM org_keyrings
+             WHERE org_id = (SELECT org_id FROM apps WHERE id = $1)
+             ORDER BY version DESC
+             LIMIT 1
+        )
+        SELECT unit.signed_policy_artifact
+          FROM teardown_unit AS unit
+         WHERE NOT EXISTS (
+             SELECT 1
+               FROM withdrawn_signer_artifacts AS withdrawn
+              WHERE withdrawn.descriptor_core_hash = unit.descriptor_core_hash
+         )
+           AND EXISTS (
+               SELECT 1
+                 FROM current_keyring,
+                 jsonb_array_elements(
+                     convert_from(keyring_payload, 'UTF8')::jsonb->'members'
+                 ) AS member
+                WHERE member.value->>'role' IN ('owner', 'admin', 'deployer')
+                  AND lower(member.value->>'pubkey') = lower(
+                      unit.signed_policy_artifact
+                          ->'metadata'->>'descriptor_signing_pubkey'
+                  )
+           )
+        "#,
+    )
+    .bind(app_id)
+    .fetch_all(db)
+    .await?;
+    rows.into_iter()
+        .map(|value| serde_json::from_value(value).map_err(KbsPolicyError::Serialize))
+        .collect()
+}
+
+fn dedup_signed_policy_artifacts_by_hash(
+    artifacts: Vec<crate::signing_service::SignedPolicyArtifact>,
+) -> Vec<crate::signing_service::SignedPolicyArtifact> {
+    let mut seen = HashSet::new();
+    artifacts
+        .into_iter()
+        .filter(|artifact| seen.insert(artifact.metadata.descriptor_core_hash.clone()))
+        .collect()
+}
+
+/// Admission control for confidential teardown (Codex security finding
+/// 4a27950: teardown candidates can exhaust the global KBS policy budget).
+///
+/// A teardown-pending workload keeps required, retention-exempt authority in
+/// the shared signed policy for as long as it can still be serving (it needs
+/// that authority to erase its owner seed), and a delete can turn optional
+/// retention artifacts into required pins — the only required artifacts that
+/// grow without a deploy replacing them. When the required set overflows
+/// `signed_policy_max_bytes`, the selection fail-closes the whole
+/// reconciliation, so one tenant stacking deletions can stop every app's
+/// policy from converging.
+///
+/// `delete_app_before` calls this under the global `kbs_policy` fence before
+/// the app is marked deleting, so that overflow state is unreachable: the
+/// delete is admitted only when this app's teardown unit still fits the
+/// shared byte budget alongside every other required artifact. The fail-closed
+/// selection stays authoritative as the backstop for anything that bypasses
+/// this check, and nothing is ever dropped from the policy to make a delete
+/// fit.
+///
+/// A delete that does not grow the required set is always admitted: an
+/// already-overflowed deployment must still be able to shrink its way back.
+pub async fn teardown_unit_fits_signed_policy_budget(
+    db: &PgPool,
+    config: Option<&KbsPolicyConfig>,
+    app_id: Uuid,
+) -> Result<bool, KbsPolicyError> {
+    let Some(config) = config else {
+        return Ok(true);
+    };
+    // Completed teardowns contribute no policy authority: the selector's
+    // deleting-app arms require `workload_teardown_completed_at IS NULL`.
+    // A deletion retry after teardown succeeded but a later cleanup step
+    // failed must therefore bypass admission — projecting its unit here
+    // would return a phantom 409 that blocks the app's own removal.
+    let teardown_completed: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT workload_teardown_completed_at FROM apps WHERE id = $1")
+            .bind(app_id)
+            .fetch_one(db)
+            .await?;
+    if teardown_completed.is_some() {
+        return Ok(true);
+    }
+    let candidates = load_signed_policy_candidates(db, config.signed_policy_retention).await?;
+    let mut projected = Vec::new();
+    let mut current = Vec::new();
+    for candidate in candidates {
+        if !candidate.required {
+            continue;
+        }
+        if candidate.artifact.metadata.app_id != app_id.to_string() {
+            projected.push(candidate.artifact.clone());
+        }
+        current.push(candidate.artifact);
+    }
+    projected.extend(load_teardown_policy_unit(db, app_id).await?);
+    let projected = dedup_signed_policy_artifacts_by_hash(projected);
+    let projected_len = signed_policy_artifact_policy_body(&projected)?.len();
+    if projected_len <= config.signed_policy_max_bytes {
+        return Ok(true);
+    }
+    let current = dedup_signed_policy_artifacts_by_hash(current);
+    let current_len = signed_policy_artifact_policy_body(&current)?.len();
+    Ok(projected_len <= current_len)
+}
+
+/// Whether a published signed-policy body already carries every artifact of a
+/// projected teardown unit. Understands both body shapes (the artifact-set
+/// document and the legacy single-artifact document); a non-JSON legacy Rego
+/// body covers nothing.
+fn signed_policy_body_covers_artifacts(
+    policy: &str,
+    artifacts: &[crate::signing_service::SignedPolicyArtifact],
+) -> bool {
+    if artifacts.is_empty() {
+        return true;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(policy) else {
+        return false;
+    };
+    let hash = |artifact: &serde_json::Value| {
+        artifact
+            .get("metadata")?
+            .get("descriptor_core_hash")?
+            .as_str()
+            .map(str::to_owned)
+    };
+    let published: HashSet<String> = value
+        .get("artifacts")
+        .and_then(serde_json::Value::as_array)
+        .map(|artifacts| artifacts.iter().filter_map(hash).collect())
+        .unwrap_or_else(|| hash(&value).into_iter().collect());
+    artifacts
+        .iter()
+        .all(|artifact| published.contains(&artifact.metadata.descriptor_core_hash))
+}
+
+/// Whether the live signed policy already authorizes every artifact of the
+/// app's teardown unit (Codex review on 0c678f57: let non-growing deletes
+/// bypass over-budget republication). Admission deliberately admits a delete
+/// whose teardown unit does not grow the required set — an already-overflowed
+/// deployment (e.g. after `signed_policy_max_bytes` was lowered below the
+/// published required set) must be able to shrink its way back — but
+/// republication of that still-over-budget unit fail-closes in
+/// `select_signed_policy_artifacts_for_policy_body`. When the exact authority
+/// is already live, republication is unnecessary: teardown authorization is
+/// evaluated against the live policy, so the delete may proceed to teardown
+/// and the required set shrinks once teardown completes.
+pub async fn teardown_unit_already_published(
+    db: &PgPool,
+    config: &KbsPolicyConfig,
+    client: kube::Client,
+    app_id: Uuid,
+) -> Result<bool, KbsPolicyError> {
+    let unit = dedup_signed_policy_artifacts_by_hash(load_teardown_policy_unit(db, app_id).await?);
+    let applied: Option<(i64, Vec<u8>)> = sqlx::query_as(
+        "SELECT applied_generation, applied_policy_sha256
+           FROM kbs_signed_policy_reconciliation
+          WHERE singleton AND applied_generation > 0",
+    )
+    .fetch_optional(db)
+    .await?;
+    teardown_unit_already_published_with_applied(config, client, &unit, applied).await
+}
+
+// Accept the applied snapshot explicitly so tests can check publication
+// without overwriting the shared database's global reconciliation singleton.
+async fn teardown_unit_already_published_with_applied(
+    config: &KbsPolicyConfig,
+    client: kube::Client,
+    unit: &[crate::signing_service::SignedPolicyArtifact],
+    applied: Option<(i64, Vec<u8>)>,
+) -> Result<bool, KbsPolicyError> {
+    if unit.is_empty() {
+        return Ok(true);
+    }
+    let cm_api: Api<ConfigMap> = Api::namespaced(client.clone(), &config.namespace);
+    let configmap = cm_api.get(&config.configmap_name).await?;
+    let current_policy = configmap
+        .data
+        .as_ref()
+        .and_then(|data| data.get(&config.policy_key))
+        .map(String::as_str)
+        .unwrap_or_default();
+    if !signed_policy_body_covers_artifacts(current_policy, unit) {
+        return Ok(false);
+    }
+    // A ConfigMap write precedes Trustee rollout. Only an applied generation
+    // proves that this particular publication made it through rollout; the
+    // desired ConfigMap alone can be ahead of the serving policy.
+    let Some((generation, applied_hash)) = applied else {
+        return Ok(false);
+    };
+    let hash = hex::encode(Sha256::digest(current_policy.as_bytes()));
+    let annotations = configmap.metadata.annotations.as_ref();
+    if applied_hash != Sha256::digest(current_policy.as_bytes()).to_vec()
+        || annotated_policy_generation(annotations)? != Some((generation, hash.as_str()))
+    {
+        return Ok(false);
+    }
+    let token = annotations
+        .and_then(|a| a.get(POLICY_PUBLICATION_TOKEN_ANNOTATION))
+        .filter(|token| !token.is_empty());
+    let Some(token) = token else {
+        return Ok(false);
+    };
+    let deployment: Api<Deployment> = Api::namespaced(client, &config.namespace);
+    let trustee = deployment.get(&config.deployment_name).await?;
+    let template = trustee
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.template.metadata.as_ref())
+        .and_then(|metadata| metadata.annotations.as_ref());
+    Ok(
+        annotated_policy_generation(template)? == Some((generation, hash.as_str()))
+            && template.and_then(|a| a.get(POLICY_PUBLICATION_TOKEN_ANNOTATION)) == Some(token),
+    )
 }
 
 pub async fn reconcile_signed_policy_artifacts(
@@ -3771,10 +4101,9 @@ resource_bindings := {
         .expect("insert KBS test deployment");
     }
 
-    /// Stamp the durable setup machine a deployment would carry in
-    /// spec_snapshot: 'accepted' once setup finished (the apply phase was
-    /// entered), 'dns_pending' while still queued. Supersession never
-    /// rewrites it, which is exactly why the selector can trust it.
+    /// Stamp spec_snapshot.setup_state. Supersession never rewrites it.
+    /// Setup acceptance indicates the apply phase was entered, but teardown
+    /// authority does not treat 'accepted' as a published workload spec.
     async fn set_test_setup_state(pool: &PgPool, deployment_id: Uuid, state: &str) {
         sqlx::query(
             "UPDATE deployments
@@ -3791,6 +4120,34 @@ resource_bindings := {
         .execute(pool)
         .await
         .expect("stamp KBS test setup state");
+    }
+
+    async fn mark_test_workload_published(pool: &PgPool, deployment_id: Uuid) {
+        sqlx::query(
+            "UPDATE deployments
+                SET workload_spec_published_at = clock_timestamp()
+              WHERE id = $1",
+        )
+        .bind(deployment_id)
+        .execute(pool)
+        .await
+        .expect("mark KBS test workload spec published");
+    }
+
+    /// Descriptor hash for a DB fixture artifact: workload_artifacts is keyed
+    /// by descriptor_core_hash globally, so a bare repeated byte collides
+    /// across tests (and leaked rows) on the shared test database. The prefix
+    /// byte keeps fixture intent readable; the deployment id keeps it unique.
+    fn unique_test_descriptor_hash(hash_byte: &str, deployment_id: Uuid) -> String {
+        hex::encode(Sha256::digest(
+            [
+                hex::decode(hash_byte)
+                    .expect("decode fixture hash byte")
+                    .as_slice(),
+                deployment_id.as_bytes().as_slice(),
+            ]
+            .concat(),
+        ))
     }
 
     async fn insert_test_artifact(
@@ -3813,6 +4170,8 @@ resource_bindings := {
         signer_hex: &str,
     ) -> crate::signing_service::SignedPolicyArtifact {
         let mut artifact = test_signed_policy_artifact(hash_byte, 16);
+        artifact.metadata.descriptor_core_hash =
+            unique_test_descriptor_hash(hash_byte, deployment_id);
         artifact.metadata.app_id = app_id.to_string();
         artifact.metadata.deploy_id = deployment_id.to_string();
         artifact.metadata.descriptor_signing_pubkey = signer_hex.repeat(32);
@@ -3885,6 +4244,25 @@ resource_bindings := {
         version: i64,
         member_pubkeys: &[&str],
     ) -> (Uuid, Uuid) {
+        let members: Vec<(&str, &str)> = member_pubkeys
+            .iter()
+            .enumerate()
+            .map(|(index, pubkey)| (*pubkey, if index == 0 { "owner" } else { "deployer" }))
+            .collect();
+        insert_test_keyring_with_roles(pool, org_id, version, &members).await
+    }
+
+    /// Insert one append-only org keyring version whose member roles are
+    /// chosen per member, so fixtures can exercise the non-deploy-role
+    /// exclusion. The first member's pubkey signs the keyring row; the raw
+    /// signature bytes are irrelevant to candidate selection. Returns the
+    /// ids of the user and signing key rows it created.
+    async fn insert_test_keyring_with_roles(
+        pool: &PgPool,
+        org_id: Uuid,
+        version: i64,
+        members_with_roles: &[(&str, &str)],
+    ) -> (Uuid, Uuid) {
         let user_id = Uuid::new_v4();
         sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'kbs keyring member')")
             .bind(user_id)
@@ -3895,18 +4273,17 @@ resource_bindings := {
         sqlx::query("INSERT INTO user_signing_keys (id, user_id, pubkey) VALUES ($1, $2, $3)")
             .bind(signing_key_id)
             .bind(user_id)
-            .bind(hex::decode(member_pubkeys[0]).expect("decode owner keyring pubkey"))
+            .bind(hex::decode(members_with_roles[0].0).expect("decode owner keyring pubkey"))
             .execute(pool)
             .await
             .expect("insert KBS keyring signing key");
-        let members: Vec<serde_json::Value> = member_pubkeys
+        let members: Vec<serde_json::Value> = members_with_roles
             .iter()
-            .enumerate()
-            .map(|(index, pubkey)| {
+            .map(|(pubkey, role)| {
                 serde_json::json!({
                     "user_id": user_id,
                     "pubkey": pubkey,
-                    "role": if index == 0 { "owner" } else { "deployer" },
+                    "role": role,
                     "added_at": "2026-01-01T00:00:00Z",
                 })
             })
@@ -6547,9 +6924,956 @@ resource_bindings := {
         }
     }
 
+    fn teardown_budget_config(max_policy_bytes: usize) -> KbsPolicyConfig {
+        KbsPolicyConfig {
+            namespace: "cap-test".to_string(),
+            configmap_name: "resource-policy".to_string(),
+            policy_key: "resource-policy.rego".to_string(),
+            deployment_name: "trustee".to_string(),
+            required: false,
+            signed_policy_retention: 6,
+            signed_policy_max_bytes: max_policy_bytes,
+        }
+    }
+
+    /// Codex security finding 4a27950: a delete whose teardown unit would
+    /// overflow the shared byte budget must be refused up front — the
+    /// fail-closed selector would otherwise wedge every app's policy
+    /// convergence.
+    #[tokio::test]
+    async fn teardown_admission_refuses_a_unit_that_exceeds_the_shared_budget() {
+        // The budget check sums required candidates across every app, so a
+        // sibling test's live fixtures would shift the byte math; run on a
+        // per-process database.
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_teardown_over_budget").await;
+        let now = Utc::now();
+
+        // Mid-upgrade delete: the unit pins the last completed workload plus
+        // the newer published generation, growing the required set by the
+        // older artifact.
+        let (org_id, app_id) = insert_test_app(&pool, "running").await;
+        // The teardown unit loader and the deleting selector filter artifacts
+        // by current keyring membership (issue #130), so the fixture signer
+        // (bb repeated) must be a current member.
+        insert_test_keyring_version(&pool, org_id, 1, &["bb".repeat(32).as_str()]).await;
+        let completed = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, completed, "healthy", now).await;
+        let completed_artifact = insert_test_artifact(&pool, app_id, completed, "aa").await;
+        insert_test_job(
+            &pool,
+            org_id,
+            app_id,
+            completed,
+            completed,
+            Some((completed, &completed_artifact)),
+        )
+        .await;
+        let published = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            org_id,
+            app_id,
+            published,
+            "failed",
+            now + chrono::Duration::seconds(1),
+        )
+        .await;
+        let published_artifact = insert_test_artifact(&pool, app_id, published, "bb").await;
+        insert_failed_apply_job(&pool, org_id, app_id, published, &published_artifact, 7).await;
+        mark_test_workload_published(&pool, published).await;
+
+        let unit_len =
+            signed_policy_artifact_policy_body(&dedup_signed_policy_artifacts_by_hash(vec![
+                completed_artifact.clone(),
+                published_artifact.clone(),
+            ]))
+            .expect("serialize projected teardown unit")
+            .len();
+
+        let fits = teardown_unit_fits_signed_policy_budget(
+            &pool,
+            Some(&teardown_budget_config(unit_len)),
+            app_id,
+        )
+        .await
+        .expect("admit a teardown unit that fits the shared budget");
+        assert!(
+            fits,
+            "a teardown unit that fits the shared byte budget must be admitted"
+        );
+
+        let fits = teardown_unit_fits_signed_policy_budget(
+            &pool,
+            Some(&teardown_budget_config(unit_len - 1)),
+            app_id,
+        )
+        .await
+        .expect("refuse a teardown unit that exceeds the shared budget");
+        assert!(
+            !fits,
+            "a teardown unit that would overflow the shared byte budget must be refused"
+        );
+
+        crate::test_support::drop_isolated_database("cap_teardown_over_budget", pool).await;
+    }
+
+    /// Other apps' pending teardown pins already occupy the budget: admitting
+    /// another unit must count them instead of only checking this app in
+    /// isolation.
+    #[tokio::test]
+    async fn teardown_admission_counts_other_apps_pending_pins() {
+        // The budget check counts required candidates across every app, so
+        // run on a per-process database.
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_teardown_pin_bytes").await;
+        let now = Utc::now();
+
+        let (pin_org, pin_app) = insert_test_app(&pool, "deleting").await;
+        // Both loaders filter by current keyring membership (issue #130):
+        // the pin artifact stays authorized only while its fixture signer
+        // (bb repeated) is a current member of the pin org's keyring.
+        insert_test_keyring_version(&pool, pin_org, 1, &["bb".repeat(32).as_str()]).await;
+        sqlx::query("UPDATE apps SET workload_teardown_required = true WHERE id = $1")
+            .bind(pin_app)
+            .execute(&pool)
+            .await
+            .expect("mark workload teardown pending");
+        let pin_deployment = Uuid::new_v4();
+        insert_test_deployment(&pool, pin_org, pin_app, pin_deployment, "healthy", now).await;
+        let pin_artifact = insert_test_artifact(&pool, pin_app, pin_deployment, "cc").await;
+        insert_test_job(
+            &pool,
+            pin_org,
+            pin_app,
+            pin_deployment,
+            pin_deployment,
+            Some((pin_deployment, &pin_artifact)),
+        )
+        .await;
+
+        let (org_id, app_id) = insert_test_app(&pool, "running").await;
+        insert_test_keyring_version(&pool, org_id, 1, &["bb".repeat(32).as_str()]).await;
+        let completed = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, completed, "healthy", now).await;
+        let completed_artifact = insert_test_artifact(&pool, app_id, completed, "aa").await;
+        insert_test_job(
+            &pool,
+            org_id,
+            app_id,
+            completed,
+            completed,
+            Some((completed, &completed_artifact)),
+        )
+        .await;
+        let published = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            org_id,
+            app_id,
+            published,
+            "failed",
+            now + chrono::Duration::seconds(1),
+        )
+        .await;
+        let published_artifact = insert_test_artifact(&pool, app_id, published, "bb").await;
+        insert_failed_apply_job(&pool, org_id, app_id, published, &published_artifact, 7).await;
+        mark_test_workload_published(&pool, published).await;
+
+        let unit_len =
+            signed_policy_artifact_policy_body(&dedup_signed_policy_artifacts_by_hash(vec![
+                completed_artifact,
+                published_artifact,
+            ]))
+            .expect("serialize projected teardown unit")
+            .len();
+        let pin_len = signed_policy_artifact_policy_body(&[pin_artifact])
+            .expect("serialize pending teardown pin")
+            .len();
+
+        // The applicant's own unit fits alone; the other app's pending pin
+        // eats the headroom and must be counted.
+        let fits = teardown_unit_fits_signed_policy_budget(
+            &pool,
+            Some(&teardown_budget_config(unit_len)),
+            app_id,
+        )
+        .await
+        .expect("weigh other apps' pending teardown pins");
+        assert!(
+            !fits,
+            "another app's pending teardown pin must count against the shared byte budget"
+        );
+
+        let fits = teardown_unit_fits_signed_policy_budget(
+            &pool,
+            Some(&teardown_budget_config(pin_len + unit_len)),
+            app_id,
+        )
+        .await
+        .expect("admit a teardown unit alongside existing pins");
+        assert!(
+            fits,
+            "a teardown unit must be admitted once every required artifact fits"
+        );
+
+        crate::test_support::drop_isolated_database("cap_teardown_pin_bytes", pool).await;
+    }
+
+    /// A delete that does not grow the required set must never be refused —
+    /// even an already-overflowed deployment has to be able to shrink back,
+    /// and deleting a healthy app replaces its live authority with the same
+    /// artifact.
+    #[tokio::test]
+    async fn teardown_admission_never_refuses_a_non_growing_delete() {
+        let pool = crate::test_support::database_test_pool().await;
+        let now = Utc::now();
+
+        let (org_id, app_id) = insert_test_app(&pool, "running").await;
+        // The teardown unit loader and the deleting selector filter artifacts
+        // by current keyring membership (issue #130), so the fixture signer
+        // (bb repeated) must be a current member.
+        insert_test_keyring_version(&pool, org_id, 1, &["bb".repeat(32).as_str()]).await;
+        let deployment_id = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, deployment_id, "healthy", now).await;
+        let artifact = insert_test_artifact(&pool, app_id, deployment_id, "dd").await;
+        insert_test_job(
+            &pool,
+            org_id,
+            app_id,
+            deployment_id,
+            deployment_id,
+            Some((deployment_id, &artifact)),
+        )
+        .await;
+
+        // A budget far below anything realistic: the unit replaces this app's
+        // live required artifact byte for byte, so the required set cannot
+        // grow and the delete must be admitted regardless.
+        let fits = teardown_unit_fits_signed_policy_budget(
+            &pool,
+            Some(&teardown_budget_config(1)),
+            app_id,
+        )
+        .await
+        .expect("admit a delete that does not grow the required set");
+        assert!(
+            fits,
+            "a delete that does not grow the required set must never be refused"
+        );
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete non-growing delete fixture organization");
+    }
+
+    /// A deletion retry after the teardown already completed must bypass
+    /// admission: the selector excludes apps with
+    /// `workload_teardown_completed_at` set, so projecting the unit would
+    /// phantom-409 the only operation that removes the app when the budget
+    /// is tight.
+    #[tokio::test]
+    async fn teardown_admission_bypasses_completed_teardown_retries() {
+        let pool = crate::test_support::database_test_pool().await;
+        let now = Utc::now();
+
+        let (org_id, app_id) = insert_test_app(&pool, "deleting").await;
+        // Keep the fixture signer (bb repeated) in the current keyring so the
+        // completed-teardown artifacts remain eligible if the bypass regresses.
+        insert_test_keyring_version(&pool, org_id, 1, &["bb".repeat(32).as_str()]).await;
+        sqlx::query(
+            "UPDATE apps
+                SET workload_teardown_required = true,
+                    workload_teardown_completed_at = clock_timestamp()
+              WHERE id = $1",
+        )
+        .bind(app_id)
+        .execute(&pool)
+        .await
+        .expect("mark workload teardown completed");
+
+        // Two historical teardown artifacts that would never fit a tiny
+        // budget — exactly the phantom-pin scenario from review.
+        let completed = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, completed, "healthy", now).await;
+        let completed_artifact = insert_test_artifact(&pool, app_id, completed, "ee").await;
+        insert_test_job(
+            &pool,
+            org_id,
+            app_id,
+            completed,
+            completed,
+            Some((completed, &completed_artifact)),
+        )
+        .await;
+        let published = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            org_id,
+            app_id,
+            published,
+            "failed",
+            now + chrono::Duration::seconds(1),
+        )
+        .await;
+        let published_artifact = insert_test_artifact(&pool, app_id, published, "ff").await;
+        insert_failed_apply_job(&pool, org_id, app_id, published, &published_artifact, 9).await;
+        mark_test_workload_published(&pool, published).await;
+
+        let unit_len = signed_policy_artifact_policy_body(&[
+            completed_artifact.clone(),
+            published_artifact.clone(),
+        ])
+        .expect("serialize the would-be teardown unit")
+        .len();
+
+        let fits = teardown_unit_fits_signed_policy_budget(
+            &pool,
+            Some(&teardown_budget_config(unit_len / 2)),
+            app_id,
+        )
+        .await
+        .expect("admission check on a completed teardown");
+        assert!(
+            fits,
+            "a deletion retry after teardown completed must bypass budget admission"
+        );
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete completed-teardown fixture organization");
+    }
+
+    /// Codex review on 0c678f57 (mixed legacy authority): the app still runs a
+    /// pre-job healthy deployment while a later job-backed replacement failed
+    /// after publishing its workload spec. The selector keeps BOTH artifacts
+    /// required while deleting, so admission must project both — excluding
+    /// every legacy row merely because an apply job exists undercounts the
+    /// authority the delete will actually pin.
+    #[tokio::test]
+    async fn teardown_admission_counts_mixed_legacy_authority() {
+        // The budget check sums required candidates across every app, so
+        // run on a per-process database.
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_teardown_mixed").await;
+        let now = Utc::now();
+
+        let (org_id, app_id) = insert_test_app(&pool, "running").await;
+        // The teardown unit loader filters both the job unit and the legacy
+        // unit by current keyring membership (issue #130), so the fixture
+        // signer (bb repeated) must be a current member.
+        insert_test_keyring_version(&pool, org_id, 1, &["bb".repeat(32).as_str()]).await;
+        // The pre-job healthy workload: a deployment with no apply job rows.
+        let legacy = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, legacy, "healthy", now).await;
+        let legacy_artifact = insert_test_artifact(&pool, app_id, legacy, "ee").await;
+        // The failed job-backed replacement that still published its spec.
+        let published = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            org_id,
+            app_id,
+            published,
+            "failed",
+            now + chrono::Duration::seconds(1),
+        )
+        .await;
+        let published_artifact = insert_test_artifact(&pool, app_id, published, "0f").await;
+        insert_failed_apply_job(&pool, org_id, app_id, published, &published_artifact, 7).await;
+        mark_test_workload_published(&pool, published).await;
+
+        let unit_len =
+            signed_policy_artifact_policy_body(&dedup_signed_policy_artifacts_by_hash(vec![
+                legacy_artifact.clone(),
+                published_artifact.clone(),
+            ]))
+            .expect("serialize the projected mixed teardown unit")
+            .len();
+
+        let fits = teardown_unit_fits_signed_policy_budget(
+            &pool,
+            Some(&teardown_budget_config(unit_len)),
+            app_id,
+        )
+        .await
+        .expect("admit the full mixed legacy/job unit");
+        assert!(
+            fits,
+            "the full mixed legacy/job teardown unit fits the shared byte budget"
+        );
+
+        let fits = teardown_unit_fits_signed_policy_budget(
+            &pool,
+            Some(&teardown_budget_config(unit_len - 1)),
+            app_id,
+        )
+        .await
+        .expect("refuse a mixed unit that exceeds the shared budget");
+        assert!(
+            !fits,
+            "the legacy artifact must count against the projected teardown unit, \
+             not disappear merely because an apply job exists"
+        );
+
+        crate::test_support::drop_isolated_database("cap_teardown_mixed", pool).await;
+    }
+
+    /// Selector-vs-projection regression: the admission projection must pin
+    /// exactly the authority the deleting selector will require. Both sides
+    /// filter by current-keyring deploy-role membership (case-insensitive)
+    /// and drop withdrawn artifacts, and neither treats an unreleased
+    /// customer-config hold as the newest operation — a drift in either
+    /// predicate undercounts (teardown denied live authority) or inflates
+    /// (phantom 409) the projected unit.
+    async fn teardown_projection(pool: &PgPool, app_id: Uuid) -> HashSet<String> {
+        load_teardown_policy_unit(pool, app_id)
+            .await
+            .expect("project teardown unit")
+            .into_iter()
+            .map(|artifact| artifact.metadata.descriptor_core_hash)
+            .collect()
+    }
+
+    async fn deleting_selector_authority(pool: &PgPool, app_id: Uuid) -> HashSet<String> {
+        load_signed_policy_candidates(pool, 1)
+            .await
+            .expect("load deleting selector candidates")
+            .into_iter()
+            .filter(|candidate| candidate.required)
+            .filter(|candidate| candidate.artifact.metadata.app_id == app_id.to_string())
+            .map(|candidate| candidate.artifact.metadata.descriptor_core_hash)
+            .collect()
+    }
+
+    async fn assert_projection_matches_selector(pool: &PgPool, app_id: Uuid, label: &str) {
+        assert_eq!(
+            teardown_projection(pool, app_id).await,
+            deleting_selector_authority(pool, app_id).await,
+            "{label}: the teardown-unit projection must match the authority the deleting selector requires"
+        );
+    }
+
+    async fn insert_teardown_pending_app(pool: &PgPool) -> (Uuid, Uuid) {
+        let (org_id, app_id) = insert_test_app(pool, "deleting").await;
+        sqlx::query("UPDATE apps SET workload_teardown_required = true WHERE id = $1")
+            .bind(app_id)
+            .execute(pool)
+            .await
+            .expect("mark workload teardown pending");
+        (org_id, app_id)
+    }
+
+    /// A deleting app whose newest completed job-backed deployment carries
+    /// the given signer. Returns the hash both sides must agree on.
+    async fn insert_job_teardown_authority(
+        pool: &PgPool,
+        org_id: Uuid,
+        app_id: Uuid,
+        signer: &str,
+    ) -> crate::signing_service::SignedPolicyArtifact {
+        let live = Uuid::new_v4();
+        insert_test_deployment(pool, org_id, app_id, live, "healthy", Utc::now()).await;
+        let artifact = insert_test_artifact_signed_by(pool, app_id, live, "aa", signer).await;
+        insert_test_job(pool, org_id, app_id, live, live, Some((live, &artifact))).await;
+        artifact
+    }
+
+    /// A deleting app whose only authority is a pre-job healthy deployment.
+    async fn insert_legacy_teardown_authority(
+        pool: &PgPool,
+        org_id: Uuid,
+        app_id: Uuid,
+        signer: &str,
+    ) -> crate::signing_service::SignedPolicyArtifact {
+        let legacy = Uuid::new_v4();
+        insert_test_deployment(pool, org_id, app_id, legacy, "healthy", Utc::now()).await;
+        insert_test_artifact_signed_by(pool, app_id, legacy, "aa", signer).await
+    }
+
+    async fn withdraw_fixture_artifact(
+        pool: &PgPool,
+        artifact: &crate::signing_service::SignedPolicyArtifact,
+        app_id: Uuid,
+    ) {
+        sqlx::query(
+            "INSERT INTO withdrawn_signer_artifacts (descriptor_core_hash, app_id)
+             VALUES ($1, $2) ON CONFLICT DO NOTHING",
+        )
+        .bind(hex::decode(&artifact.metadata.descriptor_core_hash).unwrap())
+        .bind(app_id)
+        .execute(pool)
+        .await
+        .expect("withdraw teardown artifact");
+    }
+
+    async fn delete_fixture_orgs(pool: &PgPool, orgs: &[Uuid]) {
+        for org in orgs {
+            sqlx::query("DELETE FROM organizations WHERE id = $1")
+                .bind(org)
+                .execute(pool)
+                .await
+                .expect("delete selector-parity fixture organization");
+        }
+    }
+
+    /// Job-backed teardown authority: for every keyring shape and withdrawal
+    /// state, the projected unit must equal the required set the deleting
+    /// selector admits.
+    #[tokio::test]
+    async fn teardown_unit_projection_matches_deleting_selector_for_job_authority() {
+        let pool = crate::test_support::database_test_pool().await;
+        let signer = "bb";
+
+        // Missing keyring: nothing is authorized on either side.
+        let (no_keyring_org, no_keyring_app) = insert_teardown_pending_app(&pool).await;
+        insert_job_teardown_authority(&pool, no_keyring_org, no_keyring_app, signer).await;
+
+        // Current member: both sides admit the artifact.
+        let (current_org, current_app) = insert_teardown_pending_app(&pool).await;
+        insert_test_keyring_version(&pool, current_org, 1, &[signer.repeat(32).as_str()]).await;
+        let current_artifact =
+            insert_job_teardown_authority(&pool, current_org, current_app, signer).await;
+
+        // Rotated-out signer: version 2 drops bb, so both sides drop it.
+        let (rotated_org, rotated_app) = insert_teardown_pending_app(&pool).await;
+        insert_test_keyring_version(&pool, rotated_org, 1, &[signer.repeat(32).as_str()]).await;
+        insert_test_keyring_version(&pool, rotated_org, 2, &["ab".repeat(32).as_str()]).await;
+        insert_job_teardown_authority(&pool, rotated_org, rotated_app, signer).await;
+
+        // Non-deploy role: a 'viewer' member never authorizes artifacts.
+        let (viewer_org, viewer_app) = insert_teardown_pending_app(&pool).await;
+        insert_test_keyring_with_roles(
+            &pool,
+            viewer_org,
+            1,
+            &[(signer.repeat(32).as_str(), "viewer")],
+        )
+        .await;
+        insert_job_teardown_authority(&pool, viewer_org, viewer_app, signer).await;
+
+        // Uppercase member pubkey: membership compares case-insensitively,
+        // so both sides still admit the lowercase-signed artifact.
+        let (upper_org, upper_app) = insert_teardown_pending_app(&pool).await;
+        insert_test_keyring_version(&pool, upper_org, 1, &["BB".repeat(32).as_str()]).await;
+        let upper_artifact =
+            insert_job_teardown_authority(&pool, upper_org, upper_app, signer).await;
+
+        // Withdrawn artifact: both sides must refuse it.
+        let (withdrawn_org, withdrawn_app) = insert_teardown_pending_app(&pool).await;
+        insert_test_keyring_version(&pool, withdrawn_org, 1, &[signer.repeat(32).as_str()]).await;
+        let withdrawn_artifact =
+            insert_job_teardown_authority(&pool, withdrawn_org, withdrawn_app, signer).await;
+        withdraw_fixture_artifact(&pool, &withdrawn_artifact, withdrawn_app).await;
+
+        assert_projection_matches_selector(&pool, no_keyring_app, "job authority without keyring")
+            .await;
+        assert_eq!(teardown_projection(&pool, no_keyring_app).await.len(), 0);
+        assert_projection_matches_selector(&pool, current_app, "job authority with current member")
+            .await;
+        assert_eq!(
+            teardown_projection(&pool, current_app).await,
+            HashSet::from([current_artifact.metadata.descriptor_core_hash.clone()])
+        );
+        assert_projection_matches_selector(&pool, rotated_app, "job authority after rotation")
+            .await;
+        assert_eq!(teardown_projection(&pool, rotated_app).await.len(), 0);
+        assert_projection_matches_selector(&pool, viewer_app, "job authority with non-deploy role")
+            .await;
+        assert_eq!(teardown_projection(&pool, viewer_app).await.len(), 0);
+        assert_projection_matches_selector(&pool, upper_app, "job authority with uppercase member")
+            .await;
+        assert_eq!(
+            teardown_projection(&pool, upper_app).await,
+            HashSet::from([upper_artifact.metadata.descriptor_core_hash.clone()])
+        );
+        assert_projection_matches_selector(&pool, withdrawn_app, "job authority withdrawn").await;
+        assert_eq!(teardown_projection(&pool, withdrawn_app).await.len(), 0);
+
+        delete_fixture_orgs(
+            &pool,
+            &[
+                no_keyring_org,
+                current_org,
+                rotated_org,
+                viewer_org,
+                upper_org,
+                withdrawn_org,
+            ],
+        )
+        .await;
+    }
+
+    /// Legacy (pre-job) teardown authority: same selector/projection parity
+    /// on the legacy arm, plus an unreleased customer-config hold, which the
+    /// selector excludes before ranking and the projection must too.
+    #[tokio::test]
+    async fn teardown_unit_projection_matches_deleting_selector_for_legacy_authority() {
+        let pool = crate::test_support::database_test_pool().await;
+        let signer = "bb";
+
+        // Missing keyring.
+        let (no_keyring_org, no_keyring_app) = insert_teardown_pending_app(&pool).await;
+        insert_legacy_teardown_authority(&pool, no_keyring_org, no_keyring_app, signer).await;
+
+        // Current member.
+        let (current_org, current_app) = insert_teardown_pending_app(&pool).await;
+        insert_test_keyring_version(&pool, current_org, 1, &[signer.repeat(32).as_str()]).await;
+        let current_artifact =
+            insert_legacy_teardown_authority(&pool, current_org, current_app, signer).await;
+
+        // Rotated-out signer.
+        let (rotated_org, rotated_app) = insert_teardown_pending_app(&pool).await;
+        insert_test_keyring_version(&pool, rotated_org, 1, &[signer.repeat(32).as_str()]).await;
+        insert_test_keyring_version(&pool, rotated_org, 2, &["ab".repeat(32).as_str()]).await;
+        insert_legacy_teardown_authority(&pool, rotated_org, rotated_app, signer).await;
+
+        // Non-deploy role.
+        let (viewer_org, viewer_app) = insert_teardown_pending_app(&pool).await;
+        insert_test_keyring_with_roles(
+            &pool,
+            viewer_org,
+            1,
+            &[(signer.repeat(32).as_str(), "viewer")],
+        )
+        .await;
+        insert_legacy_teardown_authority(&pool, viewer_org, viewer_app, signer).await;
+
+        // Uppercase member pubkey.
+        let (upper_org, upper_app) = insert_teardown_pending_app(&pool).await;
+        insert_test_keyring_version(&pool, upper_org, 1, &["BB".repeat(32).as_str()]).await;
+        let upper_artifact =
+            insert_legacy_teardown_authority(&pool, upper_org, upper_app, signer).await;
+
+        // Withdrawn artifact.
+        let (withdrawn_org, withdrawn_app) = insert_teardown_pending_app(&pool).await;
+        insert_test_keyring_version(&pool, withdrawn_org, 1, &[signer.repeat(32).as_str()]).await;
+        let withdrawn_artifact =
+            insert_legacy_teardown_authority(&pool, withdrawn_org, withdrawn_app, signer).await;
+        withdraw_fixture_artifact(&pool, &withdrawn_artifact, withdrawn_app).await;
+
+        // Unreleased hold: the only apply job is held pending, so the
+        // selector ranks nothing and the projection must be empty too.
+        let (held_org, held_app) = insert_teardown_pending_app(&pool).await;
+        insert_test_keyring_version(&pool, held_org, 1, &[signer.repeat(32).as_str()]).await;
+        let held = Uuid::new_v4();
+        insert_test_deployment(&pool, held_org, held_app, held, "healthy", Utc::now()).await;
+        let held_artifact =
+            insert_test_artifact_signed_by(&pool, held_app, held, "aa", signer).await;
+        insert_test_job(
+            &pool,
+            held_org,
+            held_app,
+            held,
+            held,
+            Some((held, &held_artifact)),
+        )
+        .await;
+        sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET state = 'setup_pending',
+                    customer_config_hold = true,
+                    customer_config_hold_until = clock_timestamp() + interval '1 hour',
+                    next_attempt_at = 'infinity'::timestamptz
+              WHERE deployment_id = $1",
+        )
+        .bind(held)
+        .execute(&pool)
+        .await
+        .expect("hold the teardown job");
+        // Nonterminal deployments require a nonterminal durable job.
+        sqlx::query("UPDATE deployments SET status = 'pending' WHERE id = $1")
+            .bind(held)
+            .execute(&pool)
+            .await
+            .expect("mark the held deployment pending after its durable job exists");
+
+        // Released hold: the same job counts again on both sides.
+        let (released_org, released_app) = insert_teardown_pending_app(&pool).await;
+        insert_test_keyring_version(&pool, released_org, 1, &[signer.repeat(32).as_str()]).await;
+        let released = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            released_org,
+            released_app,
+            released,
+            "healthy",
+            Utc::now(),
+        )
+        .await;
+        let released_artifact =
+            insert_test_artifact_signed_by(&pool, released_app, released, "aa", signer).await;
+        insert_test_job(
+            &pool,
+            released_org,
+            released_app,
+            released,
+            released,
+            Some((released, &released_artifact)),
+        )
+        .await;
+        sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET customer_config_hold = true,
+                    customer_config_hold_until = clock_timestamp() - interval '1 hour',
+                    customer_config_released_at = clock_timestamp()
+              WHERE deployment_id = $1",
+        )
+        .bind(released)
+        .execute(&pool)
+        .await
+        .expect("release the teardown job hold");
+
+        assert_projection_matches_selector(
+            &pool,
+            no_keyring_app,
+            "legacy authority without keyring",
+        )
+        .await;
+        assert_eq!(teardown_projection(&pool, no_keyring_app).await.len(), 0);
+        assert_projection_matches_selector(
+            &pool,
+            current_app,
+            "legacy authority with current member",
+        )
+        .await;
+        assert_eq!(
+            teardown_projection(&pool, current_app).await,
+            HashSet::from([current_artifact.metadata.descriptor_core_hash.clone()])
+        );
+        assert_projection_matches_selector(&pool, rotated_app, "legacy authority after rotation")
+            .await;
+        assert_eq!(teardown_projection(&pool, rotated_app).await.len(), 0);
+        assert_projection_matches_selector(
+            &pool,
+            viewer_app,
+            "legacy authority with non-deploy role",
+        )
+        .await;
+        assert_eq!(teardown_projection(&pool, viewer_app).await.len(), 0);
+        assert_projection_matches_selector(
+            &pool,
+            upper_app,
+            "legacy authority with uppercase member",
+        )
+        .await;
+        assert_eq!(
+            teardown_projection(&pool, upper_app).await,
+            HashSet::from([upper_artifact.metadata.descriptor_core_hash.clone()])
+        );
+        assert_projection_matches_selector(&pool, withdrawn_app, "legacy authority withdrawn")
+            .await;
+        assert_eq!(teardown_projection(&pool, withdrawn_app).await.len(), 0);
+        assert_projection_matches_selector(&pool, held_app, "unreleased hold").await;
+        assert_eq!(teardown_projection(&pool, held_app).await.len(), 0);
+        assert_projection_matches_selector(&pool, released_app, "released hold").await;
+        assert_eq!(
+            teardown_projection(&pool, released_app).await,
+            HashSet::from([released_artifact.metadata.descriptor_core_hash.clone()])
+        );
+
+        delete_fixture_orgs(
+            &pool,
+            &[
+                no_keyring_org,
+                current_org,
+                rotated_org,
+                viewer_org,
+                upper_org,
+                withdrawn_org,
+                held_org,
+                released_org,
+            ],
+        )
+        .await;
+    }
+
+    /// Codex review on 0c678f57 (over-budget republication): when the required
+    /// set is already over budget but the live policy carries the app's full
+    /// teardown unit, the delete must be able to proceed to teardown without
+    /// demanding an impossible republication.
+    #[tokio::test]
+    async fn teardown_unit_already_published_checks_the_live_policy_body() {
+        let pool = crate::test_support::database_test_pool().await;
+        let now = Utc::now();
+
+        let (org_id, app_id) = insert_test_app(&pool, "running").await;
+        // The production unit loader filters by current keyring membership
+        // (issue #130); the fixture signer (bb repeated) must be a member or
+        // load_teardown_policy_unit below returns an empty unit.
+        insert_test_keyring_version(&pool, org_id, 1, &["bb".repeat(32).as_str()]).await;
+        let legacy = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, legacy, "healthy", now).await;
+        let legacy_artifact = insert_test_artifact(&pool, app_id, legacy, "1e").await;
+        let published = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            org_id,
+            app_id,
+            published,
+            "failed",
+            now + chrono::Duration::seconds(1),
+        )
+        .await;
+        let published_artifact = insert_test_artifact(&pool, app_id, published, "2e").await;
+        insert_failed_apply_job(&pool, org_id, app_id, published, &published_artifact, 7).await;
+        mark_test_workload_published(&pool, published).await;
+
+        let config = teardown_budget_config(1024 * 1024);
+        let full_body =
+            signed_policy_artifact_policy_body(&dedup_signed_policy_artifacts_by_hash(vec![
+                legacy_artifact.clone(),
+                published_artifact.clone(),
+            ]))
+            .expect("serialize the live policy body");
+        let partial_body =
+            signed_policy_artifact_policy_body(&dedup_signed_policy_artifacts_by_hash(vec![
+                published_artifact.clone(),
+            ]))
+            .expect("serialize the partial policy body");
+
+        let client_for = |policy: String, deployment_token: &'static str| {
+            kube::Client::new(
+                tower::service_fn(move |request: axum::http::Request<kube::client::Body>| {
+                    let hash = hex::encode(Sha256::digest(policy.as_bytes()));
+                    let annotations = serde_json::json!({
+                        (POLICY_GENERATION_ANNOTATION): "7",
+                        (POLICY_SHA256_ANNOTATION): hash,
+                        (POLICY_PUBLICATION_TOKEN_ANNOTATION): "published",
+                    });
+                    let object = if request.uri().path().contains("deployments") {
+                        serde_json::json!({
+                            "apiVersion": "apps/v1", "kind": "Deployment",
+                            "metadata": {"name": "trustee", "namespace": "cap-test"},
+                            "spec": {"template": {"metadata": {"annotations": {
+                                (POLICY_GENERATION_ANNOTATION): "7",
+                                (POLICY_SHA256_ANNOTATION): hash,
+                                (POLICY_PUBLICATION_TOKEN_ANNOTATION): deployment_token,
+                            }}}}
+                        })
+                    } else {
+                        serde_json::json!({
+                            "apiVersion": "v1", "kind": "ConfigMap",
+                            "metadata": {"name": "resource-policy", "namespace": "cap-test",
+                                         "resourceVersion": "3", "annotations": annotations},
+                            "data": {"resource-policy.rego": policy}
+                        })
+                    };
+                    async move {
+                        Ok::<_, std::io::Error>(axum::http::Response::new(
+                            kube::client::Body::from(serde_json::to_vec(&object).unwrap()),
+                        ))
+                    }
+                }),
+                "default",
+            )
+        };
+
+        // Exercise the production unit loader too: the publication predicate
+        // must not silently pass because the app's teardown set is empty.
+        let loaded_unit = dedup_signed_policy_artifacts_by_hash(
+            load_teardown_policy_unit(&pool, app_id)
+                .await
+                .expect("load teardown unit"),
+        );
+        assert_eq!(
+            loaded_unit.len(),
+            2,
+            "both teardown artifacts must be loaded"
+        );
+        assert!(signed_policy_body_covers_artifacts(
+            &signed_policy_artifact_policy_body(&loaded_unit).expect("serialize loaded unit"),
+            &[legacy_artifact.clone(), published_artifact.clone()],
+        ));
+        let unit = loaded_unit;
+        let production_covers = teardown_unit_already_published(
+            &pool,
+            &config,
+            client_for(partial_body.clone(), "published"),
+            app_id,
+        )
+        .await
+        .expect("check production loader against partial live policy");
+        assert!(
+            !production_covers,
+            "a missing teardown artifact must fail closed through the production entry point"
+        );
+        let covers = teardown_unit_already_published_with_applied(
+            &config,
+            client_for(full_body.clone(), "published"),
+            &unit,
+            None,
+        )
+        .await
+        .expect("check pending publication");
+        assert!(
+            !covers,
+            "ConfigMap publication alone must not authorize teardown"
+        );
+
+        let full_hash = Sha256::digest(full_body.as_bytes()).to_vec();
+        let applied = Some((7, full_hash));
+        let covers = teardown_unit_already_published_with_applied(
+            &config,
+            client_for(full_body.clone(), "published"),
+            &unit,
+            applied.clone(),
+        )
+        .await
+        .expect("check applied publication");
+        assert!(
+            covers,
+            "applied full-unit policy must let the delete proceed"
+        );
+
+        let covers = teardown_unit_already_published_with_applied(
+            &config,
+            client_for(full_body.clone(), "stale"),
+            &unit,
+            applied.clone(),
+        )
+        .await
+        .expect("check deployment publication token");
+        assert!(!covers, "a different Trustee publication must fail closed");
+
+        let covers = teardown_unit_already_published_with_applied(
+            &config,
+            client_for(partial_body.clone(), "published"),
+            &unit,
+            applied,
+        )
+        .await
+        .expect("check partial policy body");
+        assert!(!covers, "partial unit must still fail the delete");
+
+        // The exact live body also covers a single-artifact unit, proving the
+        // pure predicate handles the single-artifact body shape too.
+        assert!(signed_policy_body_covers_artifacts(
+            &full_body,
+            std::slice::from_ref(&legacy_artifact),
+        ));
+        assert!(!signed_policy_body_covers_artifacts(
+            "package authz\n# legacy rego\n",
+            &[legacy_artifact],
+        ));
+        assert!(signed_policy_body_covers_artifacts("package authz", &[]));
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete already-published fixture organization");
+    }
+
     #[tokio::test]
     async fn teardown_pending_authorization_survives_deployment_supersession() {
-        let pool = crate::test_support::database_test_pool().await;
+        // Asserts the exact size of the global candidate set, so run on a
+        // per-process database.
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_teardown_supersede").await;
         let now = Utc::now();
         let (org_id, app_id) = insert_test_app(&pool, "deleting").await;
 
@@ -6597,12 +7921,14 @@ resource_bindings := {
         )
         .await;
 
-        // A newer upgrade that never finished applying. The three rows share
-        // one transaction: a nonterminal deployment requires its apply job at
-        // INSERT time (schema trigger), while the job's artifact binding and
-        // the artifact's deployment reference are deferred FKs.
+        // Setup accepted, still pending, then superseded before apply.
+        // No StatefulSet was written. The three rows share one transaction:
+        // a nonterminal deployment requires its apply job at INSERT time,
+        // while the job's artifact binding and the artifact's deployment
+        // reference are deferred FKs.
         let pending = Uuid::new_v4();
         let mut pending_artifact = test_signed_policy_artifact("cd", 16);
+        pending_artifact.metadata.descriptor_core_hash = unique_test_descriptor_hash("cd", pending);
         pending_artifact.metadata.app_id = app_id.to_string();
         pending_artifact.metadata.deploy_id = pending.to_string();
         let pending_hash = hex::decode(&pending_artifact.metadata.descriptor_core_hash).unwrap();
@@ -6678,19 +8004,20 @@ resource_bindings := {
             "the still-running workload's artifact must stay authorized through teardown"
         );
         assert!(
-            hashes.contains(pending_artifact.metadata.descriptor_core_hash.as_str()),
-            "a superseded-but-maybe-applied operation's artifact must stay authorized through teardown"
+            !hashes.contains(pending_artifact.metadata.descriptor_core_hash.as_str()),
+            "a setup-accepted job superseded before publication wrote no spec"
+        );
+        assert_eq!(
+            hashes.len(),
+            1,
+            "only the last applied workload stays authorized"
         );
         assert!(
             !hashes.contains(dead_artifact.metadata.descriptor_core_hash.as_str()),
             "a long-dead historical operation's artifact must not re-enter the policy"
         );
 
-        sqlx::query("DELETE FROM organizations WHERE id = $1")
-            .bind(org_id)
-            .execute(&pool)
-            .await
-            .expect("delete supersession fixture organization");
+        crate::test_support::drop_isolated_database("cap_teardown_supersede", pool).await;
     }
 
     async fn seed_owner_binding_for_app(pool: &PgPool, app_id: Uuid) {
@@ -7003,7 +8330,10 @@ resource_bindings := {
 
     #[tokio::test]
     async fn teardown_pending_authorization_survives_stacked_failed_generations() {
-        let pool = crate::test_support::database_test_pool().await;
+        // Asserts the exact size of the global candidate set, so run on a
+        // per-process database.
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_teardown_stacked").await;
         let now = Utc::now();
         let (org_id, app_id) = insert_test_app(&pool, "deleting").await;
 
@@ -7063,9 +8393,8 @@ resource_bindings := {
         .await
         .expect("insert setup-failed apply job");
 
-        // A failed generation that reached the apply phase: apply failures
-        // are never reverted, so its workload spec may be the one the
-        // teardown hits.
+        // Published a StatefulSet, then failed. That spec may still be the
+        // one running. Setup acceptance alone is not this signal.
         let apply_failed = Uuid::new_v4();
         insert_test_deployment(
             &pool,
@@ -7077,6 +8406,7 @@ resource_bindings := {
         )
         .await;
         set_test_setup_state(&pool, apply_failed, "accepted").await;
+        mark_test_workload_published(&pool, apply_failed).await;
         let apply_failed_artifact = insert_test_artifact(&pool, app_id, apply_failed, "de").await;
         sqlx::query(
             "INSERT INTO deployment_apply_jobs (
@@ -7099,7 +8429,44 @@ resource_bindings := {
         .await
         .expect("insert apply-failed apply job");
 
-        let candidates = load_signed_policy_candidates(&pool, 2)
+        // Newer generation reached setup accepted and failed before any
+        // StatefulSet write. It must not suppress the published spec, and
+        // it must not consume required policy budget.
+        let latest_apply_failed = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            org_id,
+            app_id,
+            latest_apply_failed,
+            "failed",
+            now + chrono::Duration::seconds(2),
+        )
+        .await;
+        set_test_setup_state(&pool, latest_apply_failed, "accepted").await;
+        let latest_apply_failed_artifact =
+            insert_test_artifact(&pool, app_id, latest_apply_failed, "ef").await;
+        sqlx::query(
+            "INSERT INTO deployment_apply_jobs (
+                 deployment_id, app_id, org_id, source_deployment_id,
+                 payload_version, payload, payload_sha256,
+                 cleanup_app_on_setup_failure, signed_required,
+                 artifact_deployment_id, artifact_descriptor_core_hash,
+                 log_encryption, state, last_error_code
+             ) VALUES ($1, $2, $3, $1, 1,
+                       '{\"version\":1,\"log_encryption\":null}'::jsonb,
+                       $4, false, true, $1, $5, NULL, 'failed',
+                       'deployment_apply_failed')",
+        )
+        .bind(latest_apply_failed)
+        .bind(app_id)
+        .bind(org_id)
+        .bind(vec![7u8; 32])
+        .bind(hex::decode(&latest_apply_failed_artifact.metadata.descriptor_core_hash).unwrap())
+        .execute(&pool)
+        .await
+        .expect("insert latest apply-failed apply job");
+
+        let candidates = load_signed_policy_candidates(&pool, 6)
             .await
             .expect("select teardown-pending authority with stacked failures");
         let hashes: HashSet<_> = candidates
@@ -7112,23 +8479,168 @@ resource_bindings := {
         );
         assert!(
             hashes.contains(apply_failed_artifact.metadata.descriptor_core_hash.as_str()),
-            "an apply-phase failure newer than the last applied workload must stay authorized"
+            "a published spec must stay authorized when a newer failure never wrote one"
+        );
+        assert!(
+            !hashes.contains(
+                latest_apply_failed_artifact
+                    .metadata
+                    .descriptor_core_hash
+                    .as_str()
+            ),
+            "a setup-accepted failure that never published a spec must not be authorized"
         );
         assert!(
             !hashes.contains(setup_failed_artifact.metadata.descriptor_core_hash.as_str()),
             "a provable setup failure never wrote a workload spec and must stay excluded"
         );
+        assert_eq!(hashes.len(), 2, "deletion authority must stay bounded");
 
-        sqlx::query("DELETE FROM organizations WHERE id = $1")
-            .bind(org_id)
+        let retained = load_signed_policy_candidates(&pool, 1)
+            .await
+            .expect("select teardown authority at retention 1");
+        let retained_hashes: HashSet<_> = retained
+            .iter()
+            .map(|candidate| candidate.artifact.metadata.descriptor_core_hash.as_str())
+            .collect();
+        assert!(
+            retained_hashes.contains(live_artifact.metadata.descriptor_core_hash.as_str())
+                && retained_hashes
+                    .contains(apply_failed_artifact.metadata.descriptor_core_hash.as_str()),
+            "retention 1 must not drop either live teardown artifact: {retained_hashes:?}"
+        );
+        assert_eq!(retained_hashes.len(), 2);
+
+        crate::test_support::drop_isolated_database("cap_teardown_stacked", pool).await;
+    }
+
+    #[tokio::test]
+    async fn newer_published_spec_bounds_teardown_authority() {
+        // Asserts the exact size of the global candidate set, so run on a
+        // per-process database.
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_teardown_bounded").await;
+        let now = Utc::now();
+        let (org_id, app_id) = insert_test_app(&pool, "deleting").await;
+        // The candidates query filters artifacts by current keyring
+        // membership (issue #130), so the fixture org needs a keyring whose
+        // member set still contains the fixture signer pubkey (test_signed_
+        // policy_artifact signs with bb repeated 32 times) for its artifacts
+        // to stay authorized.
+        insert_test_keyring_version(&pool, org_id, 1, &["bb".repeat(32).as_str()]).await;
+        sqlx::query("UPDATE apps SET workload_teardown_required = true WHERE id = $1")
+            .bind(app_id)
             .execute(&pool)
             .await
-            .expect("delete stacked-failures fixture organization");
+            .expect("mark workload teardown pending");
+
+        let live = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, live, "healthy", now).await;
+        let live_artifact = insert_test_artifact(&pool, app_id, live, "11").await;
+        insert_test_job(
+            &pool,
+            org_id,
+            app_id,
+            live,
+            live,
+            Some((live, &live_artifact)),
+        )
+        .await;
+
+        let older = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, older, "failed", now).await;
+        set_test_setup_state(&pool, older, "accepted").await;
+        mark_test_workload_published(&pool, older).await;
+        let older_artifact = insert_test_artifact(&pool, app_id, older, "22").await;
+        insert_failed_apply_job(&pool, org_id, app_id, older, &older_artifact, 6).await;
+
+        let newer = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            org_id,
+            app_id,
+            newer,
+            "failed",
+            now + chrono::Duration::seconds(1),
+        )
+        .await;
+        set_test_setup_state(&pool, newer, "accepted").await;
+        mark_test_workload_published(&pool, newer).await;
+        let newer_artifact = insert_test_artifact(&pool, app_id, newer, "33").await;
+        insert_failed_apply_job(&pool, org_id, app_id, newer, &newer_artifact, 7).await;
+
+        // Highest generation, setup accepted, never published. Must not be
+        // the row that wins, and must not be admitted.
+        let unpublished = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            org_id,
+            app_id,
+            unpublished,
+            "failed",
+            now + chrono::Duration::seconds(2),
+        )
+        .await;
+        set_test_setup_state(&pool, unpublished, "accepted").await;
+        let unpublished_artifact = insert_test_artifact(&pool, app_id, unpublished, "44").await;
+        insert_failed_apply_job(&pool, org_id, app_id, unpublished, &unpublished_artifact, 8).await;
+
+        let candidates = load_signed_policy_candidates(&pool, 1)
+            .await
+            .expect("select bounded teardown authority");
+        let hashes: HashSet<_> = candidates
+            .iter()
+            .map(|candidate| candidate.artifact.metadata.descriptor_core_hash.as_str())
+            .collect();
+        assert!(hashes.contains(live_artifact.metadata.descriptor_core_hash.as_str()));
+        assert!(hashes.contains(newer_artifact.metadata.descriptor_core_hash.as_str()));
+        assert!(!hashes.contains(older_artifact.metadata.descriptor_core_hash.as_str()));
+        assert!(!hashes.contains(unpublished_artifact.metadata.descriptor_core_hash.as_str()));
+        assert_eq!(
+            hashes.len(),
+            2,
+            "only the last completed workload and the newest publication"
+        );
+
+        crate::test_support::drop_isolated_database("cap_teardown_bounded", pool).await;
+    }
+
+    async fn insert_failed_apply_job(
+        pool: &PgPool,
+        org_id: Uuid,
+        app_id: Uuid,
+        deployment_id: Uuid,
+        artifact: &crate::signing_service::SignedPolicyArtifact,
+        payload_byte: u8,
+    ) {
+        sqlx::query(
+            "INSERT INTO deployment_apply_jobs (
+                 deployment_id, app_id, org_id, source_deployment_id,
+                 payload_version, payload, payload_sha256,
+                 cleanup_app_on_setup_failure, signed_required,
+                 artifact_deployment_id, artifact_descriptor_core_hash,
+                 log_encryption, state, last_error_code
+             ) VALUES ($1, $2, $3, $1, 1,
+                       '{\"version\":1,\"log_encryption\":null}'::jsonb,
+                       $4, false, true, $1, $5, NULL, 'failed',
+                       'deployment_apply_failed')",
+        )
+        .bind(deployment_id)
+        .bind(app_id)
+        .bind(org_id)
+        .bind(vec![payload_byte; 32])
+        .bind(hex::decode(&artifact.metadata.descriptor_core_hash).unwrap())
+        .execute(pool)
+        .await
+        .expect("insert failed apply job");
     }
 
     #[tokio::test]
     async fn queued_supersessions_do_not_crowd_out_live_teardown_authority() {
-        let pool = crate::test_support::database_test_pool().await;
+        // Asserts the exact size of the global candidate set, so run on a
+        // per-process database.
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_teardown_queued").await;
         let now = Utc::now();
         let (org_id, app_id) = insert_test_app(&pool, "deleting").await;
 
@@ -7168,6 +8680,8 @@ resource_bindings := {
         for index in 0..4u32 {
             let queued = Uuid::new_v4();
             let mut artifact = test_signed_policy_artifact(&format!("{index:x}0"), 16);
+            artifact.metadata.descriptor_core_hash =
+                unique_test_descriptor_hash(&format!("{index:x}0"), queued);
             artifact.metadata.app_id = app_id.to_string();
             artifact.metadata.deploy_id = queued.to_string();
             let hash = hex::decode(&artifact.metadata.descriptor_core_hash).unwrap();
@@ -7253,16 +8767,16 @@ resource_bindings := {
             );
         }
 
-        sqlx::query("DELETE FROM organizations WHERE id = $1")
-            .bind(org_id)
-            .execute(&pool)
-            .await
-            .expect("delete queued-supersessions fixture organization");
+        crate::test_support::drop_isolated_database("cap_teardown_queued", pool).await;
     }
 
     #[tokio::test]
     async fn unreleased_signed_customer_config_hold_defers_an_empty_policy() {
-        let pool = crate::test_support::database_test_pool().await;
+        // Asserts exact emptiness on the global hold-deferral probe and the
+        // global candidate set, and sweeps every app's hold, so run on a
+        // per-process database.
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_signed_hold_deferral").await;
         let (org_id, app_id) = insert_test_app(&pool, "running").await;
         // The candidates query filters artifacts by current keyring
         // membership (issue #130), so the fixture org needs a keyring whose
@@ -7293,6 +8807,7 @@ resource_bindings := {
         // The signed artifact the hold will withhold; its row lands in the
         // same transaction (artifact -> deployment FK is checked at commit).
         let mut artifact = test_signed_policy_artifact("09", 16);
+        artifact.metadata.descriptor_core_hash = unique_test_descriptor_hash("09", held);
         artifact.metadata.app_id = app_id.to_string();
         artifact.metadata.deploy_id = held.to_string();
         let artifact_hash = hex::decode(&artifact.metadata.descriptor_core_hash).unwrap();
@@ -7400,6 +8915,7 @@ resource_bindings := {
         // deferring the empty publish after the job turns terminal.
         let held2 = Uuid::new_v4();
         let mut artifact2 = test_signed_policy_artifact("0b", 16);
+        artifact2.metadata.descriptor_core_hash = unique_test_descriptor_hash("0b", held2);
         artifact2.metadata.app_id = app_id.to_string();
         artifact2.metadata.deploy_id = held2.to_string();
         let artifact2_hash = hex::decode(&artifact2.metadata.descriptor_core_hash).unwrap();
@@ -7520,16 +9036,15 @@ resource_bindings := {
             "a newer durable operation ends the expired hold's protection"
         );
 
-        sqlx::query("DELETE FROM organizations WHERE id = $1")
-            .bind(org_id)
-            .execute(&pool)
-            .await
-            .expect("delete held fixture organization");
+        crate::test_support::drop_isolated_database("cap_signed_hold_deferral", pool).await;
     }
 
     #[tokio::test]
     async fn unrelated_unsigned_hold_does_not_defer_an_empty_policy() {
-        let pool = crate::test_support::database_test_pool().await;
+        // Asserts on the global hold-deferral probe, so run on a per-process
+        // database.
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_unsigned_hold_probe").await;
         let (org_id, app_id) = insert_test_app(&pool, "running").await;
         // The candidates query filters artifacts by current keyring
         // membership (issue #130), so the fixture org needs a keyring whose
@@ -7579,16 +9094,15 @@ resource_bindings := {
             "an unsigned hold withholds no authority and must not defer policy convergence"
         );
 
-        sqlx::query("DELETE FROM organizations WHERE id = $1")
-            .bind(org_id)
-            .execute(&pool)
-            .await
-            .expect("delete unsigned held fixture organization");
+        crate::test_support::drop_isolated_database("cap_unsigned_hold_probe", pool).await;
     }
 
     #[tokio::test]
     async fn expired_signed_hold_preserves_legacy_policy_until_lifecycle_advances() {
-        let pool = crate::test_support::database_test_pool().await;
+        // Sweeps holds and bumps the kbs_signed_policy_reconciliation
+        // singleton globally, so run on a per-process database.
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_teardown_hold_sweep").await;
         let (org_id, app_id) = insert_test_app(&pool, "running").await;
 
         // The still-running workload the hold preserved: a healthy legacy
@@ -7600,6 +9114,7 @@ resource_bindings := {
         // terminalizes it without ever applying the workload.
         let held = Uuid::new_v4();
         let mut artifact = test_signed_policy_artifact("0d", 16);
+        artifact.metadata.descriptor_core_hash = unique_test_descriptor_hash("0d", held);
         artifact.metadata.app_id = app_id.to_string();
         artifact.metadata.deploy_id = held.to_string();
         let artifact_hash = hex::decode(&artifact.metadata.descriptor_core_hash).unwrap();
@@ -7753,11 +9268,7 @@ resource_bindings := {
             "stopping the app must let the pending reconciliation publish"
         );
 
-        sqlx::query("DELETE FROM organizations WHERE id = $1")
-            .bind(org_id)
-            .execute(&pool)
-            .await
-            .expect("delete expired hold fixture organization");
+        crate::test_support::drop_isolated_database("cap_teardown_hold_sweep", pool).await;
     }
 
     #[test]
