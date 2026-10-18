@@ -641,11 +641,15 @@ async fn deletion_retry_preserves_teardown_requirement_before_policy_revocation(
         .await
         .unwrap();
     let provider = Arc::new(tokio::sync::Mutex::new(KbsPolicyProvider::new(true)));
-    let app_name: String = sqlx::query_scalar("SELECT name FROM apps WHERE id = $1")
-        .bind(app_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app_name: String =
+        sqlx::query_scalar("UPDATE apps SET tee_domain = $2 WHERE id = $1 RETURNING name")
+            .bind(app_id)
+            .bind(address.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     sqlx::query(
         "UPDATE kbs_signed_policy_reconciliation SET desired_generation = 1 WHERE singleton",
     )
@@ -689,6 +693,15 @@ async fn deletion_retry_preserves_teardown_requirement_before_policy_revocation(
         .expect_err("an unavailable TEE must block both deletion attempts");
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert_eq!(body["error"], "app_delete_teardown_unavailable");
+        // The fixture has no signed deployment descriptor to bind SNP
+        // evidence. Deletion must fail before contacting the TEE or issuing
+        // its protected bearer, while preserving authority for a retry.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err(),
+            "teardown must not contact an unauthenticated TEE"
+        );
         let app_status: String = sqlx::query_scalar("SELECT status::text FROM apps WHERE id = $1")
             .bind(app_id)
             .fetch_one(&pool)
