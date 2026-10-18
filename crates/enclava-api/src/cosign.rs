@@ -110,18 +110,148 @@ fn env_nonempty(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn registry_auth_from_env(registry: &str) -> Auth {
-    if let Some(token) = env_nonempty("COSIGN_REGISTRY_BEARER_TOKEN") {
-        return Auth::Bearer(token);
+const COSIGN_REGISTRY_ALLOWED_HOSTS_ENV: &str = "COSIGN_REGISTRY_ALLOWED_HOSTS";
+
+/// Hosts the operator has explicitly allowlisted to receive the platform
+/// `COSIGN_*` registry credentials (issue #225). An unset or empty list
+/// means no host is trusted, so the credentials are never attached.
+pub fn cosign_registry_allowed_hosts_from_env() -> Vec<String> {
+    env_nonempty(COSIGN_REGISTRY_ALLOWED_HOSTS_ENV)
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|host| !host.is_empty())
+                .map(str::to_ascii_lowercase)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// True when any platform `COSIGN_*` registry credential is configured.
+pub fn cosign_registry_credentials_configured() -> bool {
+    CosignRegistryCredentials::from_env().is_configured()
+}
+
+/// Canonical host form for exact-match allowlist comparison. `docker.io` and
+/// `index.docker.io` are the same registry — OCI clients rewrite the former to
+/// the latter at dial time (`resolve_registry`), so a `docker.io` allowlist
+/// entry must describe the endpoint that actually receives the credentials.
+fn canonical_registry_host(host: &str) -> &str {
+    if host == "docker.io" {
+        "index.docker.io"
+    } else {
+        host
+    }
+}
+
+/// Exact or leading-wildcard host match against an allowlist pattern.
+///
+/// Patterns: `host[:port]` matches exactly (case-insensitive), `*.example.com`
+/// matches `example.com` and any dot-separated subdomain of it, and the bare
+/// pattern `*` is an explicit operator opt-in matching every host. A wildcard
+/// never matches across a partial label (`*.example.com` does not match
+/// `notexample.com`). The host must be the one the registry client actually
+/// dials (`resolve_registry`), not a re-parse of the image reference.
+fn host_matches_allowed_pattern(host: &str, pattern: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    let host = host.to_ascii_lowercase();
+    let pattern = pattern.to_ascii_lowercase();
+    if host == pattern || canonical_registry_host(&host) == canonical_registry_host(&pattern) {
+        return true;
+    }
+    pattern.strip_prefix("*.").is_some_and(|base| {
+        host == base
+            || host
+                .strip_suffix(&format!(".{base}"))
+                .is_some_and(|label| !label.is_empty() && !label.contains('.'))
+    })
+}
+
+/// Platform `COSIGN_*` registry credentials read once from the environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CosignRegistryCredentials {
+    bearer_token: Option<String>,
+    username: Option<String>,
+    password: Option<String>,
+}
+
+impl CosignRegistryCredentials {
+    fn from_env() -> Self {
+        Self {
+            bearer_token: env_nonempty("COSIGN_REGISTRY_BEARER_TOKEN"),
+            username: env_nonempty("COSIGN_REGISTRY_USERNAME"),
+            password: env_nonempty("COSIGN_REGISTRY_PASSWORD"),
+        }
     }
 
-    if let (Some(username), Some(password)) = (
-        env_nonempty("COSIGN_REGISTRY_USERNAME"),
-        env_nonempty("COSIGN_REGISTRY_PASSWORD"),
-    ) {
-        return Auth::Basic(username, password);
+    #[cfg(test)]
+    fn basic(username: &str, password: &str) -> Self {
+        Self {
+            bearer_token: None,
+            username: Some(username.to_string()),
+            password: Some(password.to_string()),
+        }
     }
 
+    fn is_configured(&self) -> bool {
+        self.bearer_token.is_some() || (self.username.is_some() && self.password.is_some())
+    }
+
+    fn auth(&self) -> Option<Auth> {
+        if let Some(token) = &self.bearer_token {
+            return Some(Auth::Bearer(token.clone()));
+        }
+        if let (Some(username), Some(password)) = (&self.username, &self.password) {
+            return Some(Auth::Basic(username.clone(), password.clone()));
+        }
+        None
+    }
+}
+
+/// Pure decision core of the credential-forwarding gate: platform registry
+/// credentials are only attached for allowlisted destination hosts.
+fn registry_auth_with_allowlist(
+    registry: &str,
+    credentials: Option<&CosignRegistryCredentials>,
+    allowed_hosts: &[String],
+) -> Auth {
+    // Platform registry credentials must never be forwarded to a host the
+    // tenant picked (issue #225): image references — including digest-pinned
+    // ones, which skip the registry allowlist — are attacker-controlled
+    // input, so the COSIGN_* credentials are only attached when the operator
+    // explicitly listed the destination host in COSIGN_REGISTRY_ALLOWED_HOSTS.
+    // An unset/empty allowlist fails closed to anonymous access.
+    if let Some(credentials) = credentials {
+        let allow_http = env_flag("COSIGN_ALLOW_HTTP_REGISTRY");
+        let scheme = if allow_http { "http" } else { "https" };
+        let host_allowed = realm_host_allowed(
+            &format!("{scheme}://{registry}/"),
+            allowed_hosts,
+            allow_http,
+        );
+        match (credentials.auth(), host_allowed) {
+            (Some(auth), true) => return auth,
+            (Some(_), false) => {
+                tracing::warn!(
+                    registry = %registry,
+                    env = COSIGN_REGISTRY_ALLOWED_HOSTS_ENV,
+                    "platform registry credentials not attached: registry host is not allowlisted"
+                );
+            }
+            (None, _) => {}
+        }
+    }
+
+    // Token-only GHCR authentication is valid for VERIFICATION — Basic auth
+    // against ghcr.io with the conventional `oauth2` username. The
+    // enclava-api startup gate (`deploy::tenant_image_pull_secret_startup_error`)
+    // still requires both GHCR_USERNAME and GHCR_TOKEN: the tenant pull
+    // secret needs both, and a half-rotated pair must never reach the startup
+    // cleanup sweep (Devin review on #276). This fallback keeps the module
+    // usable for verification-only embedders and tests; a running enclava-api
+    // never sees token-only environment because the startup gate exits first.
     if registry == "ghcr.io"
         && let Some(token) = env_nonempty("GHCR_TOKEN")
     {
@@ -130,6 +260,351 @@ fn registry_auth_from_env(registry: &str) -> Auth {
     }
 
     Auth::Anonymous
+}
+
+fn registry_auth_from_env(registry: &str) -> Auth {
+    let credentials = CosignRegistryCredentials::from_env();
+    registry_auth_with_allowlist(
+        registry,
+        credentials.is_configured().then_some(&credentials),
+        &cosign_registry_allowed_hosts_from_env(),
+    )
+}
+
+/// A bare allowlist host authorizes the scheme's default port, not arbitrary
+/// services on that host. Explicit :443 also matches implicit HTTPS port 443.
+fn realm_host_allowed(realm: &str, allowed_hosts: &[String], allow_http: bool) -> bool {
+    let Ok(url) = reqwest::Url::parse(realm) else {
+        return false;
+    };
+    if !(url.scheme() == "https" || (allow_http && url.scheme() == "http"))
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    allowed_hosts.iter().any(|pattern| {
+        if pattern == "*" {
+            return true;
+        }
+        let (pattern_host, pattern_port) = match pattern.rsplit_once(':') {
+            Some((host, port)) => (host, port.parse::<u16>().ok()),
+            None => (
+                pattern.as_str(),
+                Some(if url.scheme() == "https" { 443 } else { 80 }),
+            ),
+        };
+        pattern_port == url.port_or_known_default()
+            && host_matches_allowed_pattern(host, pattern_host)
+    })
+}
+
+/// Raw Basic credentials are used ONLY here, never passed to OCI. In
+/// oci-client 0.17, _auth returns immediately for RegistryAuth::Bearer. Later
+/// requests therefore cannot replay our password to a changed /v2/ challenge.
+/// This is not an advisory preflight. Token redirects are disabled, including
+/// same-host redirects that could change ports or downgrade HTTPS. Both
+/// requests still traverse the SSRF-guarded egress proxy.
+async fn exchange_registry_basic_auth(
+    proxy_url: Option<&str>,
+    registry_base: &str,
+    repository: &str,
+    auth: Auth,
+    allowed_hosts: &[String],
+    allow_http: bool,
+) -> Result<Auth, CosignError> {
+    let Auth::Basic(username, password) = auth else {
+        return Ok(auth);
+    };
+    let mut builder = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy();
+    if let Some(proxy) = proxy_url {
+        builder = builder.proxy(reqwest::Proxy::all(proxy)?);
+    }
+    let client = builder.build()?;
+    let response = client
+        .get(format!("{}/v2/", registry_base.trim_end_matches('/')))
+        .send()
+        .await?;
+    let challenge = enclava_common::registry::select_bearer_challenge(
+        response
+            .headers()
+            .get_all(reqwest::header::WWW_AUTHENTICATE)
+            .iter()
+            .filter_map(|value| value.to_str().ok()),
+    )
+    .ok_or_else(|| {
+        CosignError::VerificationFailed(
+            "credentialed registry requires a Bearer challenge; unsafe OCI Basic fallback is disabled".into(),
+        )
+    })?;
+    let realm = &challenge.realm;
+    if !realm_host_allowed(realm, allowed_hosts, allow_http) {
+        return Err(CosignError::VerificationFailed(
+            "registry token realm rejected by credential host/port/HTTPS policy".into(),
+        ));
+    }
+    let mut token_url = reqwest::Url::parse(realm)
+        .map_err(|_| CosignError::VerificationFailed("invalid registry token realm".into()))?;
+    // The realm is registry-controlled. Remove every preexisting scope and
+    // service (including percent-encoded keys), then supply exactly our pull
+    // scope and the selected challenge's service. Preserve unrelated routing
+    // parameters required by token services.
+    let retained: Vec<(String, String)> = token_url
+        .query_pairs()
+        .filter(|(key, _)| {
+            !key.eq_ignore_ascii_case("scope") && !key.eq_ignore_ascii_case("service")
+        })
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    token_url.set_query(None);
+    {
+        let mut query = token_url.query_pairs_mut();
+        query.extend_pairs(retained);
+        query.append_pair("scope", &format!("repository:{repository}:pull"));
+        if let Some(service) = challenge.service {
+            query.append_pair("service", &service);
+        }
+    }
+    let response = client
+        .get(token_url)
+        .basic_auth(username, Some(password))
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        // Server bodies might echo secrets: report status only.
+        return Err(CosignError::VerificationFailed(format!(
+            "registry token exchange failed with status {}",
+            response.status()
+        )));
+    }
+    let bytes = crate::clients::read_body_capped(response, 65_536)
+        .await
+        .map_err(|_| CosignError::VerificationFailed("invalid registry token response".into()))?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|_| CosignError::VerificationFailed("invalid registry token JSON".into()))?;
+    let token = value
+        .get("token")
+        .or_else(|| value.get("access_token"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| {
+            CosignError::VerificationFailed("registry token response has no token".into())
+        })?;
+    Ok(Auth::Bearer(token.to_string()))
+}
+
+/// True when the auth about to be exchanged is the legacy `GHCR_*` pair, not
+/// platform `COSIGN_*` credentials. A configured COSIGN pair that is actually
+/// allowlisted for this host wins inside [`registry_auth_with_allowlist`];
+/// only the fallback that selected `GHCR_*` must be pinned to ghcr.io.
+fn legacy_ghcr_credentials_selected(registry: &str) -> bool {
+    if registry != "ghcr.io" || env_nonempty("GHCR_TOKEN").is_none() {
+        return false;
+    }
+    let credentials = CosignRegistryCredentials::from_env();
+    if !credentials.is_configured() {
+        return true;
+    }
+    let allowed = cosign_registry_allowed_hosts_from_env();
+    let allow_http = env_flag("COSIGN_ALLOW_HTTP_REGISTRY");
+    let scheme = if allow_http { "http" } else { "https" };
+    !realm_host_allowed(&format!("{scheme}://{registry}/"), &allowed, allow_http)
+}
+
+fn registry_realm_allowed_hosts(
+    registry: &str,
+    allowed_hosts: Vec<String>,
+    legacy_ghcr_credentials_selected: bool,
+) -> Vec<String> {
+    // Codex review on #276, P1: when the credentials being exchanged are the
+    // legacy GHCR pair, the realm policy is only the pinned HTTPS/default-port
+    // ghcr.io token service. Unioning `COSIGN_REGISTRY_ALLOWED_HOSTS`
+    // (another token host, or `*`) lets a ghcr.io bearer challenge name that
+    // general destination and `exchange_registry_basic_auth` will send the
+    // GHCR username/token there. COSIGN-selected credentials keep the operator
+    // allowlist — those hosts were explicitly authorized for that pair.
+    if registry == "ghcr.io" && legacy_ghcr_credentials_selected {
+        return vec!["ghcr.io".into()];
+    }
+    allowed_hosts
+}
+
+async fn registry_auth_from_env_with_realm_policy(
+    proxy_url: Option<&str>,
+    registry_base: &str,
+    image: &OciReference,
+) -> Result<Auth, CosignError> {
+    let registry = image.resolve_registry();
+    let auth = registry_auth_from_env(registry);
+    let allowed_hosts = registry_realm_allowed_hosts(
+        registry,
+        cosign_registry_allowed_hosts_from_env(),
+        legacy_ghcr_credentials_selected(registry),
+    );
+    exchange_registry_basic_auth(
+        proxy_url,
+        registry_base,
+        image.repository(),
+        auth,
+        &allowed_hosts,
+        env_flag("COSIGN_ALLOW_HTTP_REGISTRY"),
+    )
+    .await
+}
+
+/// The OCI parser calls Hub index.docker.io, while the guarded public
+/// distribution endpoint is registry-1.docker.io. Use the same mapping for
+/// prechecks and token discovery regardless of the user's Hub spelling.
+fn cosign_registry_base_url(registry: &str) -> Result<String, CosignError> {
+    let registry = if registry == "index.docker.io" {
+        "docker.io"
+    } else {
+        registry
+    };
+    // The shared mapper only recognizes dotted hosts. OCI also treats an
+    // explicitly ported single-label host (e.g. registry:5000) as a registry,
+    // not a Hub namespace. Keep this exception local and validate the entire
+    // authority so paths, userinfo, wildcards, and invalid ports cannot enter
+    // the precheck/token-discovery URL.
+    let ported_single_label = registry.rsplit_once(':').is_some_and(|(host, _)| {
+        !host.contains('.')
+            && !host.contains('*')
+            && cosign_registry_host_pattern_error(registry).is_none()
+    });
+    let base = if ported_single_label {
+        format!("https://{registry}")
+    } else {
+        registry_base_url(registry)
+            .map_err(|e| CosignError::VerificationFailed(format!("unsupported registry: {e}")))?
+    };
+    Ok(if env_flag("COSIGN_ALLOW_HTTP_REGISTRY") {
+        base.replacen("https://", "http://", 1)
+    } else {
+        base
+    })
+}
+
+/// Entry grammar for `COSIGN_REGISTRY_ALLOWED_HOSTS`: exactly `*`,
+/// `host[:port]`, or `*.host[:port]` over DNS labels / IPv4. Anything else
+/// (partial-label wildcards like `*ghcr.io`, repeated wildcards like
+/// `**.host`, empty labels like `ghcr..io`, paths, out-of-range ports) can
+/// never match a parsed registry name, so it is refused at startup: a typo'd
+/// pattern must fail loudly instead of quietly withholding the platform
+/// credentials from the host the operator meant to allow (same rationale as
+/// the strict tenant pull-secret scope collector).
+fn cosign_registry_host_pattern_error(pattern: &str) -> Option<&'static str> {
+    if pattern == "*" {
+        return None;
+    }
+    if pattern.is_empty() {
+        return Some("entry is empty");
+    }
+    let host = match pattern.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
+            match port.parse::<u16>() {
+                Ok(port) if port != 0 => host,
+                _ => return Some("port must be in 1..=65535"),
+            }
+        }
+        _ => pattern,
+    };
+    let base = host.strip_prefix("*.").unwrap_or(host);
+    // OCI treats bare single-label prefixes as Docker Hub namespaces, not
+    // registry endpoints; only localhost or an explicit port is addressable.
+    if !base.contains('.') && base != "localhost" && !pattern.contains(':') {
+        return Some("single-label registry hosts require an explicit port (except localhost)");
+    }
+    if base.is_empty() || base.starts_with('.') || base.ends_with('.') || base.contains("..") {
+        return Some("host must be a DNS name or IPv4 address without empty labels");
+    }
+    if !base.split('.').all(|label| {
+        !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    }) {
+        return Some("host must be a DNS name or IPv4 address (labels of letters, digits, '-')");
+    }
+    None
+}
+
+/// Codex review on #243, P2: only one of
+/// `COSIGN_REGISTRY_USERNAME`/`COSIGN_REGISTRY_PASSWORD` being set attaches no
+/// credential at all (`is_configured` stays false), so every private-registry
+/// verification silently runs anonymously — fail fast at startup instead.
+fn incomplete_basic_pair_error(username: Option<&str>, password: Option<&str>) -> Option<String> {
+    (username.is_some() != password.is_some()).then(|| {
+        "COSIGN_REGISTRY_USERNAME and COSIGN_REGISTRY_PASSWORD must be set together: an \
+         incomplete pair attaches no registry credential, so every private-registry \
+         verification would silently run anonymously"
+            .to_string()
+    })
+}
+
+/// Startup validation (issue #225): platform `COSIGN_*` registry credentials
+/// without an explicit `COSIGN_REGISTRY_ALLOWED_HOSTS` scope are refused —
+/// silently downgrading every registry to anonymous would break private-
+/// registry verification in confusing ways, so misconfiguration must be loud.
+pub fn cosign_registry_credentials_startup_error() -> Option<String> {
+    let patterns = cosign_registry_allowed_hosts_from_env();
+    if let Some(raw) = env_nonempty(COSIGN_REGISTRY_ALLOWED_HOSTS_ENV) {
+        let invalid: Vec<String> = raw
+            .split(',')
+            .map(str::trim)
+            .filter_map(|pattern| {
+                cosign_registry_host_pattern_error(pattern)
+                    .map(|reason| format!("{pattern:?} ({reason})"))
+            })
+            .collect();
+        if !invalid.is_empty() {
+            return Some(format!(
+                "COSIGN_REGISTRY_ALLOWED_HOSTS contains entries outside the allowed grammar \
+                 `*`, `host[:port]`, or `*.host[:port]`: {}; such a pattern can never match a \
+                 registry host, so startup is refused instead of silently withholding the \
+                 platform registry credentials",
+                invalid.join(", ")
+            ));
+        }
+    }
+    // Match auth() precedence: a nonempty bearer token wins over Basic, so
+    // unused partial Basic settings must not reject valid bearer deployments.
+    let credentials = CosignRegistryCredentials::from_env();
+    if credentials.bearer_token.is_none()
+        && let Some(error) = incomplete_basic_pair_error(
+            credentials.username.as_deref(),
+            credentials.password.as_deref(),
+        )
+    {
+        return Some(error);
+    }
+    if patterns.iter().any(|pattern| pattern == "*") {
+        tracing::warn!(
+            env = COSIGN_REGISTRY_ALLOWED_HOSTS_ENV,
+            "allowlist contains bare `*`: platform registry credentials will be forwarded to \
+             every registry host named by tenant-supplied image references"
+        );
+    }
+    if !cosign_registry_credentials_configured() {
+        return None;
+    }
+    if patterns.is_empty() {
+        return Some(
+            "COSIGN_REGISTRY_BEARER_TOKEN or COSIGN_REGISTRY_USERNAME/COSIGN_REGISTRY_PASSWORD \
+             is set but COSIGN_REGISTRY_ALLOWED_HOSTS is unset or empty; platform registry \
+             credentials are never forwarded to tenant-chosen registry hosts (issue #225), so \
+             set COSIGN_REGISTRY_ALLOWED_HOSTS to the hosts that should receive them"
+                .to_string(),
+        );
+    }
+    None
 }
 
 fn looks_like_not_signed_error(err: &str) -> bool {
@@ -276,12 +751,11 @@ pub async fn verify_image(
     // checked against the allowlist, the literal-IP blocklist, and DNS
     // before any network I/O (including the dev TUF fallback below).
     let (registry, _) = parse_image_parts(image_ref)?;
-    let base_url = registry_base_url(&registry)
-        .map_err(|e| CosignError::VerificationFailed(format!("unsupported registry: {e}")))?;
+    let base_url = cosign_registry_base_url(&registry)?;
     let registry_url = reqwest::Url::parse(&base_url)
         .map_err(|e| CosignError::VerificationFailed(format!("invalid registry URL: {e}")))?;
     egress
-        .check_registry_url(&registry_url)
+        .check_cosign_registry_url(&registry_url, env_flag("COSIGN_ALLOW_HTTP_REGISTRY"))
         .await
         .map_err(|e| {
             CosignError::VerificationFailed(format!("registry destination rejected: {e}"))
@@ -309,8 +783,9 @@ pub async fn verify_image(
         .proxy
         .url()
         .map_err(|e| CosignError::VerificationFailed(format!("egress proxy unavailable: {e}")))?;
+    let realm_policy_proxy = proxy_url.clone();
     oci_client_config.https_proxy = Some(proxy_url.clone());
-    oci_client_config.http_proxy = Some(proxy_url);
+    oci_client_config.http_proxy = Some(proxy_url.clone());
 
     let mut cosign_client = ClientBuilder::default()
         .with_oci_client_config(oci_client_config)
@@ -321,7 +796,20 @@ pub async fn verify_image(
             CosignError::VerificationFailed(format!("failed to initialize sigstore client: {e}"))
         })?;
 
-    let auth = registry_auth_from_env(&registry);
+    // Gate the credentials on the host the client will actually dial
+    // (`resolve_registry` — the same value sigstore's OciReference uses to
+    // connect), never on `parse_image_parts`' host: the two parsers disagree
+    // on single-label three-component references (`registry/foo/bar` is
+    // Docker Hub `registry/foo/bar` to the OCI parser but host `registry` to
+    // the custom parser), and the allowlist must describe the dialed host or
+    // a tenant-chosen ref still routes the platform password somewhere the
+    // operator never allowlisted (review finding).
+    let auth = registry_auth_from_env_with_realm_policy(
+        Some(realm_policy_proxy.as_str()),
+        &base_url,
+        &image,
+    )
+    .await?;
     let (_, source_image_digest) = cosign_client
         .triangulate(&image, &auth)
         .await
@@ -505,18 +993,26 @@ pub async fn fetch_portable_verification_material(
         "application/vnd.docker.distribution.manifest.list.v2+json",
     ];
 
-    let (registry, repository) = parse_image_parts(image_ref)?;
-    let base_url = registry_base_url(&registry)
-        .map_err(|e| CosignError::VerificationFailed(format!("unsupported registry: {e}")))?;
+    // Parse with the same OCI reference grammar the client dials with (not
+    // `parse_image_parts`): the two disagree on single-label three-component
+    // references, and this path must fetch — and authenticate to — exactly
+    // the host/repository `verify_image` verified (review finding).
+    let image: OciReference = image_ref
+        .parse()
+        .map_err(|e| CosignError::VerificationFailed(format!("invalid image reference: {e}")))?;
+    let registry = image.resolve_registry().to_string();
+    let repository = image.repository().to_string();
+    let base_url = cosign_registry_base_url(&registry)?;
     let registry_url = reqwest::Url::parse(&base_url)
         .map_err(|e| CosignError::VerificationFailed(format!("invalid registry URL: {e}")))?;
     egress
-        .check_registry_url(&registry_url)
+        .check_cosign_registry_url(&registry_url, env_flag("COSIGN_ALLOW_HTTP_REGISTRY"))
         .await
         .map_err(|e| {
             CosignError::VerificationFailed(format!("registry destination rejected: {e}"))
         })?;
-    let auth: RegistryAuth = (&registry_auth_from_env(&registry)).into();
+    // Resolve credentials only after the egress proxy URL is known: the
+    // guarded Basic-to-Bearer exchange uses that proxy too.
     let mut config = ClientConfig::default();
     if env_flag("COSIGN_ALLOW_HTTP_REGISTRY") {
         config.protocol = oci_client::client::ClientProtocol::Http;
@@ -528,9 +1024,18 @@ pub async fn fetch_portable_verification_material(
         .proxy
         .url()
         .map_err(|e| CosignError::VerificationFailed(format!("egress proxy unavailable: {e}")))?;
+    let realm_policy_proxy = proxy_url.clone();
     config.https_proxy = Some(proxy_url.clone());
     config.http_proxy = Some(proxy_url);
-    let client = Client::new(config);
+    let client = Client::try_from(config)
+        .map_err(|e| CosignError::VerificationFailed(format!("OCI client setup failed: {e}")))?;
+    let auth: RegistryAuth = (&registry_auth_from_env_with_realm_policy(
+        Some(realm_policy_proxy.as_str()),
+        &base_url,
+        &image,
+    )
+    .await?)
+        .into();
     let source = oci_client::Reference::with_digest(
         registry.clone(),
         repository.clone(),
@@ -684,7 +1189,7 @@ fn is_portable_signature_blob(blob: &[u8]) -> bool {
 async fn pull_provenance_objects(
     client: &oci_client::client::Client,
     source_manifest: &[u8],
-    image_digest: &str,
+    _image_digest: &str,
     registry: &str,
     repository: &str,
     auth: &oci_client::secrets::RegistryAuth,
@@ -714,11 +1219,16 @@ async fn pull_provenance_objects(
                 )
             })
             .collect::<Vec<_>>(),
-        OciManifest::Image(_) => vec![oci_client::Reference::with_tag(
-            registry.to_string(),
-            repository.to_string(),
-            digest_to_cosign_tag(image_digest, "att"),
-        )],
+        // A single-image manifest cannot bind an external digest-derived .att
+        // tag. A registry (or an attacker with tag-write access) may replace
+        // it without changing the already signed image digest. Until signed
+        // single-image attestations are verified against the app's policy,
+        // never collect such bytes as portable provenance evidence.
+        OciManifest::Image(_) => {
+            return Err(CosignError::VerificationFailed(
+                "single-image provenance tag is not signed or bound to the source manifest".into(),
+            ));
+        }
     };
     if references.is_empty() {
         return Err(CosignError::VerificationFailed(
@@ -1206,9 +1716,10 @@ mod tests {
     async fn fetch_portable_verification_material_rejects_unguarded_destinations() {
         let guard = hermetic_egress_guard();
         let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        // Refs that parse under the OCI grammar must be stopped by the egress
+        // guard before any request is issued.
         for image in [
             "169.254.169.254/repo/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "[::ffff:10.0.5.7]/repo/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "evil.example/repo/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         ] {
             let err = fetch_portable_verification_material(&guard, image, digest)
@@ -1219,6 +1730,21 @@ mod tests {
                 "{image} must be rejected, got: {err}"
             );
         }
+        // A bracket-IPv6 literal fails the OCI reference grammar (the same
+        // parser the dialing client uses) before the egress check — still
+        // fail closed, just with the parse error.
+        let err = fetch_portable_verification_material(
+            &guard,
+            "[::ffff:10.0.5.7]/repo/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            digest,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("invalid image reference")
+                || err.to_string().contains("registry destination rejected"),
+            "bracket-IPv6 image ref must be rejected, got: {err}"
+        );
     }
 
     fn url_policy() -> VerificationPolicy {
@@ -1227,6 +1753,113 @@ mod tests {
                 "https://github.com/example/repo/.github/workflows/build.yml@refs/heads/main"
                     .to_string(),
             fulcio_issuer: "https://token.actions.githubusercontent.com".to_string(),
+        }
+    }
+
+    /// The allowlist must describe the host the registry client actually
+    /// dials. `parse_image_parts` and the OCI reference parser disagree on
+    /// single-label three-component refs (`registry/foo/bar` is host
+    /// `registry` to the custom parser but Docker Hub's `index.docker.io` to
+    /// the OCI parser), and a custom-parser allowlist match must never leak
+    /// the platform password to the host the client really connects to
+    /// (review finding on #243).
+    #[test]
+    fn allowlist_gates_the_dialed_registry_host_not_the_custom_parser() {
+        let image: OciReference = "registry/foo/bar@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            .parse()
+            .unwrap();
+        assert_eq!(image.resolve_registry(), "index.docker.io");
+        let creds = CosignRegistryCredentials::basic("cap-bot", "platform-token");
+        let allowed = ["registry".to_string()];
+        // The custom parser's host matches the allowlist (the pre-fix
+        // behavior)...
+        assert!(matches!(
+            registry_auth_with_allowlist("registry", Some(&creds), &allowed),
+            Auth::Basic(..)
+        ));
+        // ...but the client dials the OCI-resolved host, which must NOT
+        // receive the platform credentials.
+        assert!(matches!(
+            registry_auth_with_allowlist(image.resolve_registry(), Some(&creds), &allowed),
+            Auth::Anonymous
+        ));
+    }
+
+    /// `docker.io` is rewritten to `index.docker.io` at dial time, so a
+    /// `docker.io` allowlist entry must describe that real endpoint instead
+    /// of never matching (or matching some other host).
+    #[test]
+    fn docker_io_allowlist_entry_matches_the_real_hub_endpoint() {
+        let creds = CosignRegistryCredentials::basic("cap-bot", "platform-token");
+        assert!(matches!(
+            registry_auth_with_allowlist(
+                "index.docker.io",
+                Some(&creds),
+                &["docker.io".to_string()]
+            ),
+            Auth::Basic(..)
+        ));
+        assert!(matches!(
+            registry_auth_with_allowlist(
+                "index.docker.io",
+                Some(&creds),
+                &["*.docker.io".to_string()]
+            ),
+            Auth::Basic(..)
+        ));
+        assert!(matches!(
+            registry_auth_with_allowlist("notdocker.io", Some(&creds), &["docker.io".to_string()]),
+            Auth::Anonymous
+        ));
+    }
+
+    /// Issue #225 hardening: allowlist entries outside the grammar can never
+    /// match a parsed registry name and must be refused at startup, not
+    /// silently ignored (same strictness as the pull-secret scope collector).
+    #[test]
+    fn cosign_registry_host_pattern_grammar_accepts_matchable_entries() {
+        for pattern in [
+            "*",
+            "ghcr.io",
+            "ghcr.io:5000",
+            "registry:5000",
+            "localhost",
+            "localhost:5000",
+            "10.0.0.1:5000",
+            "*.corp.example",
+            "*.corp.example:5000",
+        ] {
+            assert_eq!(
+                cosign_registry_host_pattern_error(pattern),
+                None,
+                "pattern {pattern:?} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn cosign_registry_host_pattern_grammar_rejects_never_matching_entries() {
+        for pattern in [
+            "",                // empty entry (e.g. a trailing comma)
+            "*ghcr.io",        // partial-label wildcard never matches
+            "**.corp.example", // repeated wildcard never matches
+            "*.",              // empty wildcard base
+            "ghcr..io",        // empty label
+            ".ghcr.io",        // leading dot
+            "ghcr.io.",        // trailing dot
+            "ghcr.io/path",    // path, not a host
+            "registry",        // OCI interprets it as a Docker Hub namespace
+            "*.registry",      // wildcard base is not a registry endpoint
+            "ghcr.io:",        // empty port
+            "ghcr.io:0",       // port zero
+            "ghcr.io:99999",   // port out of range
+            "-bad.example",    // leading-hyphen label
+            "bad-.example",    // trailing-hyphen label
+        ] {
+            assert!(
+                cosign_registry_host_pattern_error(pattern).is_some(),
+                "pattern {pattern:?} must be rejected"
+            );
         }
     }
 
@@ -1429,6 +2062,7 @@ mod tests {
             std::env::remove_var("COSIGN_REGISTRY_BEARER_TOKEN");
             std::env::remove_var("GHCR_USERNAME");
             std::env::remove_var("GHCR_TOKEN");
+            std::env::set_var("COSIGN_REGISTRY_ALLOWED_HOSTS", "ghcr.io");
         }
 
         let auth = registry_auth_from_env("ghcr.io");
@@ -1437,6 +2071,898 @@ mod tests {
             auth,
             Auth::Basic(username, password) if username == "cap-bot" && password == "ghp_example"
         ));
+    }
+
+    /// Devin review on #276: token-only GHCR authentication is deliberately
+    /// accepted here for verification — Basic auth against ghcr.io with the
+    /// conventional `oauth2` username. The startup gate in deploy.rs is what
+    /// keeps this configuration out of a running enclava-api (whose
+    /// pull-secret machinery needs both values); this pins the documented
+    /// cosign-vs-startup asymmetry as intended. Runs in a child process so
+    /// the process-global env mutation cannot race the other env-reading
+    /// tests in this binary.
+    #[test]
+    fn ghcr_token_only_auth_is_valid_for_verification_only() {
+        const CHILD: &str = "CAP_COSIGN_GHCR_TOKEN_ONLY";
+        if std::env::var(CHILD).is_ok() {
+            let auth = registry_auth_with_allowlist("ghcr.io", None, &[]);
+            assert!(
+                matches!(auth, Auth::Basic(username, token)
+                    if username == "oauth2" && token == "ghp_token_only"),
+                "token-only must authenticate ghcr.io verification with the oauth2 username"
+            );
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "cosign::tests::ghcr_token_only_auth_is_valid_for_verification_only",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env_remove("GHCR_USERNAME")
+            .env("GHCR_TOKEN", "ghp_token_only")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    /// Codex review on #243, P2: only one of USERNAME/PASSWORD being set
+    /// attaches no credential at all (`is_configured` stays false), so every
+    /// private-registry verification would silently run anonymously — the
+    /// startup gate must refuse the incomplete pair instead.
+    #[test]
+    fn incomplete_basic_credentials_are_a_startup_error() {
+        assert!(incomplete_basic_pair_error(Some("cap-bot"), None).is_some());
+        assert!(incomplete_basic_pair_error(None, Some("ghp_example")).is_some());
+        assert!(incomplete_basic_pair_error(None, None).is_none());
+        assert!(incomplete_basic_pair_error(Some("cap-bot"), Some("ghp_example")).is_none());
+    }
+
+    #[test]
+    fn ported_single_label_registry_base_url() {
+        const CHILD: &str = "CAP_COSIGN_PORTED_REGISTRY";
+        if let Ok(scheme) = std::env::var(CHILD) {
+            for registry in [
+                "registry:5000",
+                "localhost:5000",
+                "registry:1",
+                "registry:65535",
+            ] {
+                assert_eq!(
+                    cosign_registry_host_pattern_error(registry),
+                    None,
+                    "allowlist grammar must agree with base URL support"
+                );
+                assert_eq!(
+                    cosign_registry_base_url(registry).unwrap(),
+                    format!("{scheme}://{registry}")
+                );
+                let image: OciReference = format!("{registry}/org/app:latest").parse().unwrap();
+                assert_eq!(image.resolve_registry(), registry);
+            }
+            for registry in ["docker.io", "index.docker.io"] {
+                assert_eq!(
+                    cosign_registry_base_url(registry).unwrap(),
+                    format!("{scheme}://registry-1.docker.io")
+                );
+            }
+            for invalid in [
+                "registry",
+                "registry:0",
+                "registry:65536",
+                "registry:abc",
+                "registry:",
+                "registry/path:5000",
+                "user@registry:5000",
+                "*:5000",
+                "-registry:5000",
+            ] {
+                assert!(cosign_registry_base_url(invalid).is_err(), "{invalid}");
+            }
+            return;
+        }
+        for (scheme, allow_http) in [("https", "0"), ("http", "1")] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cosign::tests::ported_single_label_registry_base_url",
+                    "--nocapture",
+                ])
+                .env(CHILD, scheme)
+                .env("COSIGN_ALLOW_HTTP_REGISTRY", allow_http)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn bearer_precedence_in_startup_validation() {
+        const CHILD: &str = "CAP_COSIGN_BEARER_STARTUP";
+        if let Ok(expected) = std::env::var(CHILD) {
+            let error = cosign_registry_credentials_startup_error();
+            match expected.as_str() {
+                "ok" => {
+                    assert_eq!(error, None);
+                    assert!(
+                        matches!(registry_auth_from_env("registry:5000"), Auth::Bearer(token) if token == "selected-token")
+                    );
+                }
+                "pair" => assert!(error.unwrap().contains("must be set together")),
+                "scope" => assert!(error.unwrap().contains("unset or empty")),
+                "grammar" => assert!(error.unwrap().contains("outside the allowed grammar")),
+                _ => panic!("unexpected child mode"),
+            }
+            return;
+        }
+        // Child processes isolate environment settings from parallel tests.
+        for (username, password) in [("stale-user", ""), ("", "stale-password")] {
+            for (bearer, hosts, expected) in [
+                (" selected-token ", "registry:5000", "ok"),
+                ("", "registry:5000", "pair"),
+                ("   ", "registry:5000", "pair"),
+                ("selected-token", "", "scope"),
+                ("selected-token", "registry/path:5000", "grammar"),
+            ] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "cosign::tests::bearer_precedence_in_startup_validation",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, expected)
+                    .env("COSIGN_REGISTRY_BEARER_TOKEN", bearer)
+                    .env("COSIGN_REGISTRY_USERNAME", username)
+                    .env("COSIGN_REGISTRY_PASSWORD", password)
+                    .env("COSIGN_REGISTRY_ALLOWED_HOSTS", hosts)
+                    .env("COSIGN_ALLOW_HTTP_REGISTRY", "0")
+                    .env_remove("GHCR_TOKEN")
+                    .env_remove("GHCR_USERNAME")
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{expected}: {}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    }
+
+    /// Issue #225: platform COSIGN_* credentials must never be forwarded to a
+    /// registry host the tenant picked. The allowlist gate is exercised
+    /// through the pure decision core so the env-dependent happy path above
+    /// stays the only test touching process-global environment state here.
+    #[test]
+    fn registry_credentials_are_not_forwarded_to_unlisted_hosts() {
+        let allowed = vec!["ghcr.io".to_string(), "*.corp.example".to_string()];
+        let credentials = CosignRegistryCredentials::basic("cap-bot", "ghp_example");
+
+        // Allowlisted hosts receive the credentials.
+        assert!(matches!(
+            registry_auth_with_allowlist("ghcr.io", Some(&credentials), &allowed),
+            Auth::Basic(..)
+        ));
+        assert!(matches!(
+            registry_auth_with_allowlist("registry.corp.example", Some(&credentials), &allowed),
+            Auth::Basic(..)
+        ));
+
+        // Tenant-chosen hosts do not — the exact attack from the issue.
+        for host in [
+            "attacker.example.com",
+            "evil.example.com:5000",
+            // wildcard must not leak into sibling domains
+            "notcorp.example",
+            "deep.sub.corp.example",
+        ] {
+            assert!(
+                matches!(
+                    registry_auth_with_allowlist(host, Some(&credentials), &allowed),
+                    Auth::Anonymous
+                ),
+                "credentials must not attach to {host}"
+            );
+        }
+
+        // Unset allowlist fails closed for every host.
+        assert!(matches!(
+            registry_auth_with_allowlist("ghcr.io", Some(&credentials), &[]),
+            Auth::Anonymous
+        ));
+
+        // Without credentials configured the gate is inert (anonymous anyway
+        // unless GHCR_* applies, which is separately host-bound).
+        assert!(matches!(
+            registry_auth_with_allowlist("attacker.example.com", None, &allowed),
+            Auth::Anonymous
+        ));
+    }
+
+    #[test]
+    fn host_allowlist_patterns_match_exact_and_single_level_wildcards() {
+        assert!(host_matches_allowed_pattern("ghcr.io", "ghcr.io"));
+        assert!(host_matches_allowed_pattern("GHCR.IO", "ghcr.io"));
+        assert!(host_matches_allowed_pattern(
+            "reg.example:5000",
+            "reg.example:5000"
+        ));
+        assert!(host_matches_allowed_pattern(
+            "a.corp.example",
+            "*.corp.example"
+        ));
+        assert!(host_matches_allowed_pattern(
+            "corp.example",
+            "*.corp.example"
+        ));
+        assert!(host_matches_allowed_pattern("any.host.example", "*"));
+        assert!(!host_matches_allowed_pattern(
+            "notexample.com",
+            "*.example.com"
+        ));
+        assert!(!host_matches_allowed_pattern(
+            "a.b.corp.example",
+            "*.corp.example"
+        ));
+        assert!(!host_matches_allowed_pattern("ghcr.io.evil.com", "ghcr.io"));
+    }
+
+    /// Codex review on #243, round 3, P1 "Validate token realms before
+    /// forwarding basic credentials": the `realm` URL must be extracted from
+    /// a `WWW-Authenticate: Bearer` challenge (quoted, bare, scheme-prefixed)
+    /// and its host checked against the same allowlist grammar as registry
+    /// hosts — unparseable or unlisted realms are NOT allowed.
+    #[test]
+    fn legacy_ghcr_realms_work_without_cosign_allowlist() {
+        let allowed = registry_realm_allowed_hosts("ghcr.io", vec![], true);
+        assert!(realm_host_allowed("https://ghcr.io/token", &allowed, false));
+        for realm in [
+            "https://evil.example/token",
+            "https://ghcr.io:8443/token",
+            "http://ghcr.io/token",
+        ] {
+            assert!(!realm_host_allowed(realm, &allowed, false));
+        }
+        assert!(registry_realm_allowed_hosts("evil.example", vec![], true).is_empty());
+        assert!(registry_realm_allowed_hosts("ghcr.io", vec![], false).is_empty());
+    }
+
+    /// Codex review on #276, P1: a GHCR bearer challenge must not be allowed to
+    /// name a general COSIGN destination just because `GHCR_*` was selected.
+    #[test]
+    fn legacy_ghcr_realm_policy_does_not_union_cosign_allowlist() {
+        let isolated = registry_realm_allowed_hosts(
+            "ghcr.io",
+            vec!["*".into(), "token.example".into(), "ghcr.io".into()],
+            true,
+        );
+        assert_eq!(isolated, vec!["ghcr.io".to_string()]);
+        assert!(realm_host_allowed(
+            "https://ghcr.io/token",
+            &isolated,
+            false
+        ));
+        assert!(!realm_host_allowed(
+            "https://ghcr.io:8443/token",
+            &isolated,
+            false
+        ));
+        for realm in [
+            "https://token.example/token",
+            "https://evil.example/token",
+            "http://ghcr.io/token",
+        ] {
+            assert!(
+                !realm_host_allowed(realm, &isolated, false),
+                "{realm} must not receive GHCR credentials"
+            );
+        }
+        // COSIGN-selected credentials keep the operator allowlist.
+        let cosign = registry_realm_allowed_hosts(
+            "ghcr.io",
+            vec!["ghcr.io".into(), "token.example".into()],
+            false,
+        );
+        assert!(realm_host_allowed(
+            "https://token.example/token",
+            &cosign,
+            false
+        ));
+    }
+
+    /// The realm isolation only applies when `GHCR_*` was the selected auth.
+    /// A COSIGN pair that is allowlisted for ghcr.io must keep the operator list.
+    #[test]
+    fn legacy_ghcr_selection_follows_the_auth_that_will_be_exchanged() {
+        const CHILD: &str = "CAP_COSIGN_GHCR_REALM_SOURCE";
+        if let Ok(case) = std::env::var(CHILD) {
+            match case.as_str() {
+                "ghcr-only" => assert!(legacy_ghcr_credentials_selected("ghcr.io")),
+                "cosign-wins" => assert!(!legacy_ghcr_credentials_selected("ghcr.io")),
+                "other-host" => assert!(!legacy_ghcr_credentials_selected("token.example")),
+                other => panic!("unknown case {other}"),
+            }
+            return;
+        }
+        for (case, username, password, token, hosts) in [
+            ("ghcr-only", None, None, Some("ghp_ghcr"), Some("*")),
+            (
+                "cosign-wins",
+                Some("cosign-user"),
+                Some("cosign-pass"),
+                Some("ghp_ghcr"),
+                Some("ghcr.io,token.example"),
+            ),
+            (
+                "other-host",
+                None,
+                None,
+                Some("ghp_ghcr"),
+                Some("token.example"),
+            ),
+        ] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "cosign::tests::legacy_ghcr_selection_follows_the_auth_that_will_be_exchanged",
+                    "--nocapture",
+                ])
+                .env(CHILD, case)
+                .env_remove("COSIGN_REGISTRY_BEARER_TOKEN")
+                .env_remove("COSIGN_ALLOW_HTTP_REGISTRY")
+                .env_remove("GHCR_USERNAME");
+            match username {
+                Some(value) => {
+                    command.env("COSIGN_REGISTRY_USERNAME", value);
+                }
+                None => {
+                    command.env_remove("COSIGN_REGISTRY_USERNAME");
+                }
+            }
+            match password {
+                Some(value) => {
+                    command.env("COSIGN_REGISTRY_PASSWORD", value);
+                }
+                None => {
+                    command.env_remove("COSIGN_REGISTRY_PASSWORD");
+                }
+            }
+            match token {
+                Some(value) => {
+                    command.env("GHCR_TOKEN", value);
+                }
+                None => {
+                    command.env_remove("GHCR_TOKEN");
+                }
+            }
+            match hosts {
+                Some(value) => {
+                    command.env("COSIGN_REGISTRY_ALLOWED_HOSTS", value);
+                }
+                None => {
+                    command.env_remove("COSIGN_REGISTRY_ALLOWED_HOSTS");
+                }
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{case}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn registry_default_https_ports_match_allowlist() {
+        let creds = CosignRegistryCredentials::basic("test-user", "test-password");
+        for (registry, pattern) in [
+            ("reg.example", "reg.example:443"),
+            ("reg.example:443", "reg.example"),
+            ("docker.io:443", "index.docker.io"),
+        ] {
+            assert!(matches!(
+                registry_auth_with_allowlist(registry, Some(&creds), &[pattern.into()]),
+                Auth::Basic(..)
+            ));
+        }
+        assert!(matches!(
+            registry_auth_with_allowlist("reg.example:8443", Some(&creds), &["reg.example".into()]),
+            Auth::Anonymous
+        ));
+    }
+
+    #[test]
+    fn realm_policy_preserves_ports_and_requires_https() {
+        for (realm, pattern, http, expected) in [
+            ("https://auth.example/token", "auth.example", false, true),
+            (
+                "https://auth.example:443/token",
+                "auth.example",
+                false,
+                true,
+            ),
+            (
+                "https://auth.example/token",
+                "auth.example:443",
+                false,
+                true,
+            ),
+            (
+                "https://auth.example:8443/token",
+                "auth.example",
+                false,
+                false,
+            ),
+            (
+                "https://auth.example:8443/token",
+                "auth.example:8443",
+                false,
+                true,
+            ),
+            (
+                "https://auth.example:8443/token",
+                "*.example:8443",
+                false,
+                true,
+            ),
+            (
+                "https://auth.example:8443/token",
+                "*.example:443",
+                false,
+                false,
+            ),
+            ("http://auth.example/token", "auth.example", false, false),
+            ("http://auth.example/token", "*", false, false),
+            ("http://auth.example/token", "auth.example", true, true),
+            (
+                "http://auth.example:8080/token",
+                "auth.example",
+                true,
+                false,
+            ),
+            (
+                "http://auth.example:8080/token",
+                "auth.example:8080",
+                true,
+                true,
+            ),
+            (
+                "https://auth.example.evil/token",
+                "auth.example",
+                false,
+                false,
+            ),
+            (
+                "https://user@auth.example/token",
+                "auth.example",
+                false,
+                false,
+            ),
+            ("ftp://auth.example/token", "*", true, false),
+            ("not a URL", "*", true, false),
+        ] {
+            assert_eq!(
+                realm_host_allowed(realm, &[pattern.into()], http),
+                expected,
+                "realm={realm}, pattern={pattern}, http={http}"
+            );
+        }
+    }
+
+    async fn auth_test_server(router: axum::Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        (base, task)
+    }
+
+    #[tokio::test]
+    async fn actual_oci_requests_never_replay_basic_to_changed_challenges() {
+        use axum::{
+            Router,
+            http::{HeaderMap, StatusCode},
+            routing::get,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let evil_hits = Arc::new(AtomicUsize::new(0));
+        let hits = evil_hits.clone();
+        let (evil, evil_task) = auth_test_server(Router::new().fallback(move || {
+            hits.fetch_add(1, Ordering::SeqCst);
+            async { "stolen" }
+        }))
+        .await;
+        let registry_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let registry = registry_listener.local_addr().unwrap().to_string();
+        let base = format!("http://{registry}");
+        let v2_hits = Arc::new(AtomicUsize::new(0));
+        let count = v2_hits.clone();
+        let token_hits = Arc::new(AtomicUsize::new(0));
+        let tokens = token_hits.clone();
+        let safe_realm = format!("{base}/token");
+        let bad_challenge = format!("Bearer realm=\"{evil}/token\"");
+        let later = bad_challenge.clone();
+        let router = Router::new()
+            .route(
+                "/v2/",
+                get(move |headers: HeaderMap| {
+                    assert!(!headers.contains_key("authorization"));
+                    let realm = if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                        format!("Bearer realm=\"{safe_realm}\",service=\"test\"")
+                    } else {
+                        bad_challenge.clone()
+                    };
+                    async move { (StatusCode::UNAUTHORIZED, [("www-authenticate", realm)]) }
+                }),
+            )
+            .route(
+                "/token",
+                get(move |headers: HeaderMap, uri: axum::http::Uri| {
+                    tokens.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(
+                        headers["authorization"],
+                        format!("Basic {}", B64.encode("test-user:test-password"))
+                    );
+                    assert!(
+                        uri.query()
+                            .unwrap()
+                            .contains("scope=repository%3Ateam%2Fapp%3Apull")
+                    );
+                    assert!(uri.query().unwrap().contains("service=test"));
+                    async { r#"{"token":"short-lived-test-token"}"# }
+                }),
+            )
+            .fallback(move |headers: HeaderMap| {
+                assert_eq!(headers["authorization"], "Bearer short-lived-test-token");
+                let challenge = later.clone();
+                async move { (StatusCode::UNAUTHORIZED, [("www-authenticate", challenge)]) }
+            });
+        let registry_task = tokio::spawn(async move {
+            axum::serve(registry_listener, router).await.unwrap();
+        });
+        let auth = exchange_registry_basic_auth(
+            None,
+            &base,
+            "team/app",
+            Auth::Basic("test-user".into(), "test-password".into()),
+            std::slice::from_ref(&registry),
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(&auth, Auth::Bearer(token) if token == "short-lived-test-token"));
+        let client = oci_client::client::Client::try_from(oci_client::client::ClientConfig {
+            protocol: oci_client::client::ClientProtocol::Http,
+            ..Default::default()
+        })
+        .unwrap();
+        let image = oci_client::Reference::with_tag(registry, "team/app".into(), "latest".into());
+        let auth = (&auth).into();
+        // Exercise both explicit auth and real manifest/blob/referrers paths.
+        client
+            .auth(&image, &auth, oci_client::RegistryOperation::Pull)
+            .await
+            .unwrap();
+        assert!(
+            client
+                .pull_manifest_raw(
+                    &image,
+                    &auth,
+                    &["application/vnd.oci.image.manifest.v1+json"]
+                )
+                .await
+                .is_err()
+        );
+        assert!(client.pull_referrers(&image, None).await.is_err());
+        let layer = oci_client::manifest::OciDescriptor {
+            digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .into(),
+            media_type: "application/octet-stream".into(),
+            size: 1,
+            urls: None,
+            annotations: None,
+            artifact_type: None,
+        };
+        assert!(client.pull_blob_stream(&image, &layer).await.is_err());
+        assert_eq!(
+            v2_hits.load(Ordering::SeqCst),
+            1,
+            "OCI must never discover a second realm"
+        );
+        assert_eq!(token_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(evil_hits.load(Ordering::SeqCst), 0);
+        registry_task.abort();
+        evil_task.abort();
+    }
+
+    #[tokio::test]
+    async fn basic_first_challenges_exchange_only_the_requested_pull_scope() {
+        use axum::{
+            Router,
+            http::{HeaderMap, HeaderValue, StatusCode},
+            routing::get,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // Exercise separate/joined headers and service present/absent. Even
+        // encoded and duplicated query keys must not survive the exchange.
+        for joined in [false, true] {
+            for service in [None, Some("selected,service")] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let realm = format!(
+                    "http://{addr}/token?scope=repository:other:push&%73cope=registry:catalog:*&SCOPE=bad&service=evil&%73ervice=evil2&route=keep"
+                );
+                let mut bearer =
+                    format!("Bearer realm=\"{realm}\",scope=\"repository:other:push\"");
+                if let Some(service) = service {
+                    bearer.push_str(&format!(",service=\"{service}\""));
+                }
+                let hits = Arc::new(AtomicUsize::new(0));
+                let tokens = hits.clone();
+                let router = Router::new()
+                    .route(
+                        "/v2/",
+                        get(move |headers: HeaderMap| {
+                            assert!(!headers.contains_key("authorization"));
+                            let mut challenges = HeaderMap::new();
+                            if joined {
+                                challenges.insert(
+                                    "www-authenticate",
+                                    HeaderValue::from_str(&format!(
+                                        "Basic realm=\"registry\", {bearer}"
+                                    ))
+                                    .unwrap(),
+                                );
+                            } else {
+                                challenges.append(
+                                    "www-authenticate",
+                                    HeaderValue::from_static("Basic realm=\"registry\""),
+                                );
+                                challenges.append(
+                                    "www-authenticate",
+                                    HeaderValue::from_str(&bearer).unwrap(),
+                                );
+                            }
+                            async move { (StatusCode::UNAUTHORIZED, challenges) }
+                        }),
+                    )
+                    .route(
+                        "/token",
+                        get(move |headers: HeaderMap, uri: axum::http::Uri| {
+                            tokens.fetch_add(1, Ordering::SeqCst);
+                            assert_eq!(
+                                headers["authorization"],
+                                format!("Basic {}", B64.encode("test-user:test-password"))
+                            );
+                            let url = reqwest::Url::parse(&format!("http://test{uri}")).unwrap();
+                            let pairs: Vec<_> = url
+                                .query_pairs()
+                                .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                                .collect();
+                            let mut expected = vec![
+                                ("route".to_string(), "keep".to_string()),
+                                ("scope".to_string(), "repository:team/app:pull".to_string()),
+                            ];
+                            if let Some(service) = service {
+                                expected.push(("service".to_string(), service.to_string()));
+                            }
+                            assert_eq!(pairs, expected);
+                            async { r#"{"access_token":"scoped-token"}"# }
+                        }),
+                    );
+                let task = tokio::spawn(async move {
+                    axum::serve(listener, router).await.unwrap();
+                });
+                let auth = exchange_registry_basic_auth(
+                    None,
+                    &format!("http://{addr}"),
+                    "team/app",
+                    Auth::Basic("test-user".into(), "test-password".into()),
+                    &[addr.to_string()],
+                    true,
+                )
+                .await
+                .unwrap();
+                assert!(matches!(auth, Auth::Bearer(token) if token == "scoped-token"));
+                assert_eq!(hits.load(Ordering::SeqCst), 1);
+                task.abort();
+            }
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn opted_in_http_verification_paths_pass_preflight() {
+        // Isolate environment changes from parallel tests in a subprocess.
+        const CHILD: &str = "CAP_COSIGN_HTTP_PREFLIGHT_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cosign::tests::opted_in_http_verification_paths_pass_preflight",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("COSIGN_ALLOW_HTTP_REGISTRY", "true")
+                .env("SIGSTORE_TUF_ROOT_PATH", "")
+                .env_remove("COSIGN_REGISTRY_USERNAME")
+                .env_remove("COSIGN_REGISTRY_PASSWORD")
+                .env_remove("COSIGN_REGISTRY_BEARER_TOKEN")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            use crate::clients::AllowList;
+            use enclava_common::outbound_http::BlockedNetworks;
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            let hits = Arc::new(AtomicUsize::new(0));
+            let requests = hits.clone();
+            let (base, task) = auth_test_server(axum::Router::new().fallback(move || {
+                requests.fetch_add(1, Ordering::SeqCst);
+                async { axum::http::StatusCode::NOT_FOUND }
+            }))
+            .await;
+            let registry = base.strip_prefix("http://").unwrap();
+            // Explicit test-only unblocked loopback, not production policy.
+            let blocked = Arc::new(BlockedNetworks::empty());
+            let egress = EgressGuard {
+                proxy: crate::egress_proxy::EgressProxy::new(blocked.clone()),
+                blocked,
+                allowlist: AllowList::from_env_or_default(Some("127.0.0.1".into())),
+            };
+            let digest = format!("sha256:{}", "a".repeat(64));
+            let image = format!("{registry}/team/app@{digest}");
+            let policy = VerificationPolicy::PublicKey {
+                pem: "unused".into(),
+            };
+            let err = verify_image(&egress, &image, &digest, &policy)
+                .await
+                .unwrap_err();
+            // Empty pinned-root path deterministically stops after preflight,
+            // without contacting the public TUF service.
+            assert!(matches!(err, CosignError::TrustRoot(_)), "{err}");
+            let err = fetch_portable_verification_material(&egress, &image, &digest)
+                .await
+                .unwrap_err();
+            assert!(
+                !err.to_string().contains("registry destination rejected"),
+                "{err}"
+            );
+            assert!(
+                hits.load(Ordering::SeqCst) > 0,
+                "portable path must reach the HTTP registry through the proxy"
+            );
+            task.abort();
+        });
+    }
+
+    #[tokio::test]
+    async fn challenge_free_or_basic_only_registry_never_releases_basic_to_oci() {
+        use axum::{Router, http::StatusCode, routing::get};
+        for challenge in [None, Some("Basic realm=\"registry\"")] {
+            let router = Router::new().route(
+                "/v2/",
+                get(move || async move {
+                    match challenge {
+                        Some(value) => (StatusCode::UNAUTHORIZED, [("www-authenticate", value)]),
+                        None => (StatusCode::OK, [("www-authenticate", "")]),
+                    }
+                }),
+            );
+            let (base, task) = auth_test_server(router).await;
+            let err = exchange_registry_basic_auth(
+                None,
+                &base,
+                "team/app",
+                Auth::Basic("test-user".into(), "test-password".into()),
+                &["*".into()],
+                true,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("unsafe OCI Basic fallback is disabled")
+            );
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn token_exchange_blocks_unlisted_ports_http_and_redirects() {
+        use axum::{Router, http::StatusCode, routing::get};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let realm = format!("http://{addr}/token");
+        let challenge = format!("Bearer realm=\"{realm}\"");
+        let router = Router::new()
+            .route(
+                "/v2/",
+                get(move || {
+                    let challenge = challenge.clone();
+                    async move { (StatusCode::UNAUTHORIZED, [("www-authenticate", challenge)]) }
+                }),
+            )
+            .route(
+                "/token",
+                get(|| async {
+                    (
+                        StatusCode::TEMPORARY_REDIRECT,
+                        [("location", "/must-not-receive-auth")],
+                    )
+                }),
+            )
+            .route(
+                "/must-not-receive-auth",
+                get(|| async {
+                    panic!("token redirects must not be followed");
+                    #[allow(unreachable_code)]
+                    ""
+                }),
+            );
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        for (allowed, http, error) in [
+            (vec![addr.to_string()], false, "realm rejected"),
+            (vec!["127.0.0.1".into()], true, "realm rejected"),
+            (vec![addr.to_string()], true, "status 307"),
+        ] {
+            let err = exchange_registry_basic_auth(
+                None,
+                &format!("http://{addr}"),
+                "team/app",
+                Auth::Basic("test-user".into(), "test-password".into()),
+                &allowed,
+                http,
+            )
+            .await
+            .unwrap_err();
+            assert!(err.to_string().contains(error), "{err}");
+        }
+        task.abort();
+    }
+
+    #[test]
+    fn portable_hub_precheck_uses_the_distribution_endpoint() {
+        for registry in ["docker.io", "index.docker.io", "registry-1.docker.io"] {
+            assert_eq!(
+                cosign_registry_base_url(registry).unwrap(),
+                "https://registry-1.docker.io"
+            );
+        }
+        for reference in [
+            "nginx:latest",
+            "docker.io/library/nginx:latest",
+            "index.docker.io/library/nginx:latest",
+        ] {
+            let image: OciReference = reference.parse().unwrap();
+            let base = cosign_registry_base_url(image.resolve_registry()).unwrap();
+            assert_eq!(
+                reqwest::Url::parse(&base).unwrap().host_str(),
+                Some("registry-1.docker.io")
+            );
+        }
     }
 
     /// Regression test for issue #125: a malicious registry must not be able
