@@ -1918,10 +1918,13 @@ async fn recover_ambiguous_pull_secret_create(
             record_pull_secret_creation(engine, namespace, &live, generation.get());
             return Ok(());
         }
-        // Only compensate an object that carries the platform label. A tenant
-        // secret that won the create race is unlabeled and must be left alone;
-        // the retry takes the existing-object path and fails closed there.
-        if is_labeled_managed_pull_secret(&live) {
+        // Compensate only an object that could be this POST: platform-labeled,
+        // and either unmarked or stamped with this generation. A different
+        // positive marker belongs to another writer (a sweep or a peer deploy
+        // that won the create race) and must not be deleted.
+        let marker = secret_mutation_generation(&live);
+        let could_be_this_create = marker.is_none() || marker == Some(generation.get());
+        if is_labeled_managed_pull_secret(&live) && could_be_this_create {
             remove_untrusted_created_pull_secret(api, namespace, name, &live).await?;
         }
         return Err(deferred());
@@ -8131,6 +8134,10 @@ mod tests {
         /// create or patch while leaving other fields intact.
         strip_mutation_generation_on_create: bool,
         strip_mutation_generation_on_patch: bool,
+        /// After an accepted create, replace the mutation-generation value.
+        /// Models another writer winning the name before our stalled POST is
+        /// observed. Recovery must not compensate that object.
+        replace_mutation_generation_on_create: Option<i64>,
         /// Deploy attaches a reference after the sweep's generation check.
         fresh_reference_after_secret_gets: Option<FreshReferenceAfterSecretGets>,
         /// One-shot: before answering a named Secret GET, raise the fleet
@@ -8623,6 +8630,17 @@ mod tests {
                 {
                     annotations
                         .remove(enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION);
+                }
+                if let Some(generation) = state.replace_mutation_generation_on_create {
+                    created
+                        .metadata
+                        .annotations
+                        .get_or_insert_with(Default::default)
+                        .insert(
+                            enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION
+                                .to_string(),
+                            generation.to_string(),
+                        );
                 }
                 state.secrets.push(created);
                 (
@@ -13294,6 +13312,37 @@ mod tests {
             cluster.lock().unwrap().secrets.is_empty(),
             "the unmarked accepted PAT must be compensated before the deferred error"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scoped_deploy_create_timeout_keeps_other_writers_secret() {
+        use std::sync::{Arc, Mutex};
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            stall_after_accepting_secret_create: true,
+            replace_mutation_generation_on_create: Some(9),
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        let config = TenantImagePullSecretConfig {
+            name: "enclava-registry-auth".to_string(),
+            username: "cap-bot".to_string(),
+            token: "ghp_platform".to_string(),
+            allowed_repositories: Vec::new(),
+        };
+        let error = apply_scoped_pull_secret(
+            &engine,
+            "tenant-ns",
+            &config,
+            MutationGeneration::new(3).unwrap(),
+            &[],
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, DeployError::PullSecretReconcileDeferred(_)));
+        let state = cluster.lock().unwrap();
+        assert_eq!(state.secrets.len(), 1);
+        assert_eq!(secret_mutation_generation(&state.secrets[0]), Some(9));
     }
 
     #[tokio::test]
