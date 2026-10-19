@@ -1,5 +1,17 @@
 use super::*;
 
+/// The server's app `id` must be a UUID; a non-UUID (observed: the app name
+/// served for rows without a CAP identity yet) otherwise surfaces as a raw
+/// uuid crate error with no field or remediation context.
+fn parse_app_id(id: &str) -> Result<Uuid, Box<dyn std::error::Error>> {
+    Uuid::parse_str(id).map_err(|err| {
+        format!(
+            "app id returned by the platform is not a UUID (got {id:?}; {err}) -- the app              row may be incomplete; retry the deploy once any app quota or in-flight              operation clears, or contact the operator if it persists"
+        )
+        .into()
+    })
+}
+
 fn parse_hex32(name: &str, value: &str) -> Result<[u8; 32], Box<dyn std::error::Error>> {
     let bytes = hex::decode(value.trim())?;
     bytes
@@ -326,7 +338,7 @@ pub(crate) fn confidential_app_for_cc_hash(
     };
 
     Ok(ConfidentialApp {
-        app_id: Uuid::parse_str(&app.id)?,
+        app_id: parse_app_id(&app.id)?,
         deployment_id,
         name: app.name.clone(),
         namespace: app.namespace.clone(),
@@ -620,7 +632,7 @@ pub(crate) async fn build_signed_deploy_blobs(
 
     let (org_id, org_name, deployer_key) = ensure_manual_deploy_keyring(api, paths, true).await?;
 
-    let app_id = Uuid::parse_str(&app.id)?;
+    let app_id = parse_app_id(&app.id)?;
     let trusted_owner = load_trusted_owner(&org_id)?
         .ok_or("org owner pubkey is not trusted; run `enclava org keyring trust` or `enclava org keyring init`")?;
     let keyring_envelope = load_keyring_envelope(&org_id).map_err(|err| {
