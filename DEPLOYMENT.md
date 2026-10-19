@@ -439,6 +439,8 @@ Before using it outside local experimentation:
 - pin the API image digest in `deploy/api/kustomization.yaml`;
 - add the required production environment variables;
 - configure service account/RBAC for only the tenant resources CAP owns;
+  Pod readiness and volume-initialization checks use name-scoped pod lists;
+  keep individual pod GET and `pods/log` access denied.
 - configure network policy for PostgreSQL, Trustee/KBS, policy signing,
   registry metadata, DNS, and tenant TEE callbacks;
 - decide whether CAP-managed DNS and KBS policy management are required.
@@ -526,6 +528,11 @@ token, the API verifies fresh nonce-bound SNP evidence under pinned AMD roots,
 binding the TLS SPKI and receipt-key hash to the app's admitted init-data and
 firmware identity. Its app-scoped KBS authority includes rollback and prior
 healthy deployments, but excludes held, withdrawn, and removed-signer artifacts.
+
+Normal deletion requires teardown whenever deployments or owner bindings show
+that a seed may exist, even if the app row is no longer `running`. An unreachable
+TEE fails closed; skipping erasure requires explicit `--abandon-teardown` and
+leaves the existing same-name recreation guard in force.
 
 `AMD_KDS_BASE_URL` includes `/vcek/v1`; its default is
 `https://kdsintf.amd.com/vcek/v1`. An internal HTTP collateral relay is supported

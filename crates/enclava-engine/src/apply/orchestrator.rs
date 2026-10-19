@@ -307,7 +307,7 @@ pub async fn inspect_fresh_volume_claims(
     claims_to_check: FreshVolumeClaims,
 ) -> Result<FreshVolumeClaims, ApplyError> {
     use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod};
-    use kube::api::Api;
+    use kube::api::{Api, ListParams};
 
     if !claims_to_check.app_data && !claims_to_check.tls_data {
         return Ok(FreshVolumeClaims::NONE);
@@ -337,7 +337,11 @@ pub async fn inspect_fresh_volume_claims(
         };
         let pvc_millis = created.0.as_millisecond();
         if live_pod.is_none() {
-            *live_pod = Some(pod_api.get_opt(pod_name).await?);
+            // Pod GET is withheld to preserve the log-access boundary.
+            let params = ListParams::default()
+                .fields(&format!("metadata.name={pod_name}"))
+                .limit(1);
+            *live_pod = Some(pod_api.list(&params).await?.items.pop());
         }
         Ok(!pod_proves_claim_initialized(
             live_pod.as_ref().and_then(|pod| pod.as_ref()),
