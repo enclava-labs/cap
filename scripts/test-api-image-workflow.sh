@@ -809,4 +809,34 @@ assert_order "- name: Install cosign" "- name: Sign pushed digest"
 assert_order "- name: Sign pushed digest" "- name: Verify signed digest"
 assert_order "- name: Verify signed digest" "- name: Upload release manifest artifact"
 
+python3 - "$WORKFLOW" <<'PYTAGS'
+import os
+import subprocess
+import sys
+import yaml
+
+steps = {
+    step.get("name"): step
+    for step in yaml.safe_load(open(sys.argv[1]))["jobs"]["publish"]["steps"]
+}
+cases = [
+    ("Validate manual image tag", "VERSION_TAG", "", "manual-" + "a" * 120, True),
+    ("Validate manual image tag", "VERSION_TAG", "preprod-", "manual-" + "a" * 113, True),
+    ("Validate manual image tag", "VERSION_TAG", "preprod-", "manual-" + "a" * 114, False),
+    ("Validate pushed tag name", "PUSHED_REF", "", "refs/tags/v" + "a" * 127, True),
+    ("Validate pushed tag name", "PUSHED_REF", "", "refs/tags/v" + "a" * 128, False),
+    ("Validate pushed tag name", "PUSHED_REF", "preprod-", "refs/tags/v" + "a" * 119, True),
+    ("Validate pushed tag name", "PUSHED_REF", "preprod-", "refs/tags/v" + "a" * 120, False),
+]
+for name, variable, prefix, value, accepted in cases:
+    result = subprocess.run(
+        ["bash", "-e", "-c", steps[name]["run"]],
+        env={**os.environ, variable: value, "IMAGE_TAG_PREFIX": prefix},
+        capture_output=True,
+        text=True,
+    )
+    if (result.returncode == 0) != accepted:
+        raise SystemExit(f"{name}: wrong acceptance for prefix {prefix!r}, value length {len(value)}")
+PYTAGS
+
 echo "CAP API image workflow tests passed"

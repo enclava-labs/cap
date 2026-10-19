@@ -128,6 +128,8 @@ jobs:
     if: github.event_name == 'workflow_dispatch' || (github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref_type == 'tag'))
     runs-on: ubuntu-latest
     environment: ${{ inputs.release_environment == 'preprod' && 'preprod' || 'default' }}
+    env:
+      IMAGE_TAG_PREFIX: ${{ inputs.release_environment == 'preprod' && 'preprod-' || '' }}
     permissions:
       contents: read
       id-token: write
@@ -165,6 +167,10 @@ jobs:
             echo "::error::Manual image tags must match ^manual-[a-z0-9][a-z0-9_.-]{0,119}$."
             exit 1
           fi
+          if (( ${#IMAGE_TAG_PREFIX} + ${#VERSION_TAG} > 128 )); then
+            echo "::error::Manual image tag exceeds Docker's 128-character limit after the environment prefix."
+            exit 1
+          fi
 
       - name: Validate pushed tag name
         # Belt and braces: the env:-bound WORKFLOW_REF below already prevents
@@ -181,6 +187,11 @@ jobs:
             echo "::error::Pushed tag names must match ^v[A-Za-z0-9][A-Za-z0-9._-]*$ (same alphabet as SIGNER_SUBJECT_PATTERN in scripts/verify-api-image-ref.bash)."
             exit 1
           fi
+          image_tag="${PUSHED_REF#refs/tags/}"
+          if (( ${#IMAGE_TAG_PREFIX} + ${#image_tag} > 128 )); then
+            echo "::error::Pushed image tag exceeds Docker's 128-character limit after the environment prefix."
+            exit 1
+          fi
 
       - name: Log in to GHCR
         uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
@@ -194,11 +205,11 @@ jobs:
         uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
         with:
           images: ghcr.io/enclava-labs/enclava-api
-          flavor: prefix=${{ inputs.release_environment == 'preprod' && 'preprod-' || '' }},onlatest=true
+          flavor: prefix=${{ env.IMAGE_TAG_PREFIX }},onlatest=true
           tags: |
             type=ref,event=branch
             type=ref,event=tag
-            type=sha,prefix=${{ inputs.release_environment == 'preprod' && 'preprod-' || '' }}
+            type=sha,prefix=${{ env.IMAGE_TAG_PREFIX }}
             type=raw,value=${{ github.event.inputs.version_tag }},enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version_tag != '' }}
 
       - name: Materialize production platform-release envelope
@@ -278,9 +289,9 @@ jobs:
         uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
         with:
           images: ghcr.io/enclava-labs/enclava-appraiser
-          flavor: prefix=${{ inputs.release_environment == 'preprod' && 'preprod-' || '' }},onlatest=true
+          flavor: prefix=${{ env.IMAGE_TAG_PREFIX }},onlatest=true
           tags: |
-            type=sha,prefix=${{ inputs.release_environment == 'preprod' && 'preprod-' || '' }}
+            type=sha,prefix=${{ env.IMAGE_TAG_PREFIX }}
             type=raw,value=${{ github.event.inputs.version_tag }},enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version_tag != '' }}
 
       - name: Build and push appraiser

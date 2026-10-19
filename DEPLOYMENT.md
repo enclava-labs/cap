@@ -480,6 +480,9 @@ manual build's `workflow_dispatch` trigger when selecting its signed digest in o
 deployment, verify that the image accepts preprod's existing signed envelope;
 do not rotate cluster trust to accommodate an image built for another root.
 
+Preprod manual tag inputs may contain at most 120 characters, including
+`manual-`, so the added namespace stays within Docker's 128-character limit.
+
 ## Kubernetes
 
 The checked-in overlay is intentionally minimal:
