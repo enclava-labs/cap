@@ -2894,9 +2894,7 @@ pub async fn logs(args: LogsArgs) -> Result<(), Box<dyn std::error::Error>> {
         let mut reader = tokio::io::BufReader::new(reader);
         let mut line = String::new();
         while read_bounded_log_line(&mut reader, &mut line).await? != 0 {
-            if !line.trim().is_empty() {
-                print_decrypted_log_frame(&private_key, &line)?;
-            }
+            print_decrypted_log_frame(&private_key, &line)?;
         }
     } else {
         // A hostile API must not turn a buffered log read into unbounded memory use.
@@ -2906,7 +2904,7 @@ pub async fn logs(args: LogsArgs) -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
         let body = String::from_utf8_lossy(&bytes);
-        for line in body.lines().filter(|line| !line.trim().is_empty()) {
+        for line in body.lines() {
             print_decrypted_log_frame(&private_key, line)?;
         }
     }
@@ -2959,14 +2957,19 @@ fn print_decrypted_log_frame(
     private_key: &str,
     line: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!("{}", decrypted_log_frame_output(private_key, line)?);
+    if let Some(output) = decrypted_log_frame_output(private_key, line)? {
+        println!("{output}");
+    }
     Ok(())
 }
 
 fn decrypted_log_frame_output(
     private_key: &str,
     line: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    if line.trim().is_empty() {
+        return Ok(None);
+    }
     let frame: EncryptedLogFrame =
         serde_json::from_str(line).map_err(|err| format!("invalid encrypted log frame: {err}"))?;
     let plaintext = decrypt_log_frame(private_key, &frame).map_err(|err| {
@@ -2976,13 +2979,13 @@ fn decrypted_log_frame_output(
         )
     })?;
     let message = String::from_utf8_lossy(&plaintext);
-    Ok(format!(
+    Ok(Some(format!(
         "{} {} {} {}",
         frame.timestamp,
         frame.container,
         frame.stream,
         sanitize_log_output(message.trim_end())
-    ))
+    )))
 }
 
 #[derive(Subcommand)]

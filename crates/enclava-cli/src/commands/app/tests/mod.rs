@@ -1474,7 +1474,13 @@ fn logs_command_decrypts_encrypted_frames_locally() {
     .unwrap();
     let line = serde_json::to_string(&frame).unwrap();
 
-    let output = super::decrypted_log_frame_output(&keypair.private_key_base64url, &line).unwrap();
+    let output = super::decrypted_log_frame_output(&keypair.private_key_base64url, &line)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        super::decrypted_log_frame_output(&keypair.private_key_base64url, "\n").unwrap(),
+        None
+    );
 
     assert_eq!(
         output,

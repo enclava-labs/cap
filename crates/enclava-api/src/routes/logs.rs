@@ -79,7 +79,7 @@ pub async fn paas_app_logs(
     if !encrypted_logs_configured {
         return Ok(encrypted_logs_required_response());
     }
-    proxy_encrypted_logs_from_tee(&app_name, &namespace, &domain, &query).await
+    proxy_encrypted_logs_from_tee(&state, &app_name, &namespace, &domain, &query).await
 }
 
 async fn require_log_entitlement(state: &AppState, auth: &AuthContext) -> Result<(), RouteError> {
@@ -201,13 +201,19 @@ fn encrypted_logs_required_response() -> Response {
 }
 
 async fn proxy_encrypted_logs_from_tee(
+    state: &AppState,
     app_name: &str,
     namespace: &str,
     domain: &str,
     query: &ValidatedLogQuery,
 ) -> Result<Response, RouteError> {
-    let (client, url) = tenant_tee_logs_client(app_name, namespace, domain).await?;
-    let request = client.get(url).query(&query.tee_query_pairs()).send();
+    let (client, url) =
+        tenant_tee_logs_client(state, app_name, namespace, domain, query.follow).await?;
+    let mut request = client.get(url).query(&query.tee_query_pairs());
+    if !query.follow {
+        request = request.timeout(std::time::Duration::from_secs(15));
+    }
+    let request = request.send();
     let upstream = tokio::time::timeout(std::time::Duration::from_secs(15), request)
         .await
         .map_err(|_| json_error(StatusCode::BAD_GATEWAY, "encrypted_log_stream_unavailable"))?
@@ -246,38 +252,54 @@ async fn proxy_encrypted_logs_from_tee(
 
 fn with_log_heartbeats(
     stream: impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
-) -> impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> {
+) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> {
     use futures::StreamExt;
 
-    futures::stream::unfold(
-        (stream, true),
-        |(mut stream, mut at_frame_boundary)| async move {
-            let chunk = if at_frame_boundary {
-                match tokio::time::timeout(std::time::Duration::from_secs(15), stream.next()).await
-                {
-                    Ok(chunk) => chunk?,
-                    Err(_) => return Some((Ok(bytes::Bytes::from_static(b"\n")), (stream, true))),
+    futures::stream::unfold(Some((stream, true)), |state| async move {
+        let (mut stream, mut at_frame_boundary) = state?;
+        let chunk =
+            match tokio::time::timeout(std::time::Duration::from_secs(15), stream.next()).await {
+                Ok(chunk) => chunk?.map_err(std::io::Error::other),
+                Err(_) if at_frame_boundary => Ok(bytes::Bytes::from_static(b"\n")),
+                Err(_) => {
+                    return Some((
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "encrypted log frame stalled",
+                        )),
+                        None,
+                    ));
                 }
-            } else {
-                stream.next().await?
             };
-            // A heartbeat inside a split encrypted record would corrupt that record.
-            if let Ok(bytes) = &chunk
-                && let Some(last) = bytes.last()
-            {
-                at_frame_boundary = *last == b'\n';
-            }
-            Some((chunk, (stream, at_frame_boundary)))
-        },
-    )
+        // A heartbeat inside a split encrypted record would corrupt that record.
+        if let Ok(bytes) = &chunk
+            && let Some(last) = bytes.last()
+        {
+            at_frame_boundary = *last == b'\n';
+        }
+        let next = if chunk.is_err() {
+            None
+        } else {
+            Some((stream, at_frame_boundary))
+        };
+        Some((chunk, next))
+    })
 }
 
 async fn tenant_tee_logs_client(
+    state: &AppState,
     app_name: &str,
     namespace: &str,
     confidential_domain: &str,
+    follow: bool,
 ) -> Result<(reqwest::Client, String), RouteError> {
-    let socket = match resolve_internal_tee_socket(app_name, namespace).await {
+    let resolution = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        resolve_internal_tee_socket(app_name, namespace),
+    )
+    .await
+    .unwrap_or_else(|_| Err("internal tenant TEE lookup timed out".to_string()));
+    let socket = match resolution {
         Ok(socket) => Some(socket),
         Err(detail) => {
             tracing::warn!(
@@ -289,12 +311,16 @@ async fn tenant_tee_logs_client(
             None
         }
     };
-    let client = build_tenant_tee_http_client_with_builder(
-        reqwest::Client::builder(),
-        confidential_domain,
-        socket,
-    )
-    .map_err(|_| json_error(StatusCode::BAD_GATEWAY, "encrypted_log_stream_unavailable"))?;
+    let client = if !follow && socket.is_none() {
+        state.tee_http_client.clone()
+    } else {
+        build_tenant_tee_http_client_with_builder(
+            reqwest::Client::builder(),
+            confidential_domain,
+            socket,
+        )
+        .map_err(|_| json_error(StatusCode::BAD_GATEWAY, "encrypted_log_stream_unavailable"))?
+    };
     let url = match socket {
         Some(socket) => format!(
             "https://{confidential_domain}:{}/.well-known/confidential/logs",
@@ -511,7 +537,7 @@ mod tests {
             .unwrap();
         assert_eq!(followed.next().await.unwrap().unwrap(), b"{\"record\":"[..]);
         assert!(
-            tokio::time::timeout(Duration::from_secs(31), followed.next())
+            tokio::time::timeout(Duration::from_secs(5), followed.next())
                 .await
                 .is_err()
         );
@@ -522,6 +548,21 @@ mod tests {
         assert_eq!(followed.next().await.unwrap().unwrap(), b"true}\n"[..]);
         assert_eq!(followed.next().await.unwrap().unwrap(), b"\n"[..]);
         drop(sender);
+        assert!(followed.next().await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_partial_log_frame_closes_the_stream() {
+        use bytes::Bytes;
+        use futures::{StreamExt, stream};
+
+        let upstream = stream::iter([Ok(Bytes::from_static(b"partial"))]).chain(stream::pending());
+        let followed = with_log_heartbeats(upstream);
+        futures::pin_mut!(followed);
+
+        assert_eq!(followed.next().await.unwrap().unwrap(), b"partial"[..]);
+        let error = followed.next().await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
         assert!(followed.next().await.is_none());
     }
 
