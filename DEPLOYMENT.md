@@ -439,6 +439,8 @@ Before using it outside local experimentation:
 - pin the API image digest in `deploy/api/kustomization.yaml`;
 - add the required production environment variables;
 - configure service account/RBAC for only the tenant resources CAP owns;
+  Pod readiness and volume-initialization checks use name-scoped pod lists;
+  keep individual pod GET and `pods/log` access denied.
 - configure network policy for PostgreSQL, Trustee/KBS, policy signing,
   registry metadata, DNS, and tenant TEE callbacks;
 - decide whether CAP-managed DNS and KBS policy management are required.

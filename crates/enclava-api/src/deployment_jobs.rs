@@ -9403,10 +9403,13 @@ pub(crate) mod tests {
                                     "creationTimestamp": "2026-01-01T00:00:00Z",
                                 },
                             })
-                        } else if name == pod_name {
+                        } else if name == "pods" {
                             serde_json::json!({
                                 "apiVersion": "v1",
-                                "kind": "Pod",
+                                "kind": "PodList",
+                                "items": [{
+                                    "apiVersion": "v1",
+                                    "kind": "Pod",
                                 "metadata": {
                                     "name": pod_name,
                                     "namespace": namespace,
@@ -9422,6 +9425,7 @@ pub(crate) mod tests {
                                 "status": {
                                     "conditions": [{"type": "Ready", "status": "True"}],
                                 },
+                                }],
                             })
                         } else {
                             serde_json::Value::Null
