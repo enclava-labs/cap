@@ -321,6 +321,26 @@ CAP_EGRESS_ALLOW_INTERNAL_HOSTS (without CAP_ALLOW_PRODUCTION_INTERNAL_EGRESS=tr
 Release builds also require `API_KEY_HMAC_PEPPER` or
 `API_KEY_HMAC_PEPPER_BASE64`, and `TRUSTEE_POLICY_READ_AVAILABLE=true`.
 
+## Noninteractive CLI ownership claims
+
+Agents and CI can use `enclava deploy --storage-password-file PATH`,
+`enclava template deploy --storage-password-file PATH`, or
+`enclava claim --password-file PATH` without terminal stdin or stderr.
+Without a password file, password prompts require both streams to be terminals.
+
+Keep `ENCLAVA_STATE_DIR` on persistent private storage. Before claiming, the CLI
+validates the protected recovery-mnemonic destination; after claiming, it stores
+the mnemonic atomically with owner-only permissions and filesystem syncs. It
+never prints the mnemonic. `--no-store-mnemonic` remains invalid for claims.
+Export an encrypted backup with `enclava key backup` and retain it off-machine.
+
+The TEE still returns the recovery mnemonic only once. A lost claim response or
+failed mnemonic write exits nonzero and halts dependent actions; when ownership
+is known to have committed, the error is
+`ownership_committed_recovery_backup_incomplete`. Ownership is not rolled back.
+Do not blindly retry a claim or treat this as a completed backup. A terminal
+does not provide response-loss recovery either.
+
 ## Platform Release
 
 The API and CLI load the bundled
