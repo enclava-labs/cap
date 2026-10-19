@@ -22,7 +22,7 @@ path = "src/bin/cap_migrate.rs"
 [dependencies]
 anyhow = { workspace = true }
 enclava-engine = { workspace = true }
-enclava-common = { workspace = true, features = ["outbound-http"] }
+enclava-common = { workspace = true, features = ["outbound-http", "release-profiles"] }
 tokio = { workspace = true }
 axum = { workspace = true }
 sqlx = { workspace = true }
@@ -71,7 +71,7 @@ tokio-rustls = { workspace = true }
 sev = { version = "7.1.0", default-features = false, features = ["snp", "openssl", "serde"] }
 
 [features]
-prod-strict = ["enclava-engine/prod-strict"]
+prod-strict = ["enclava-engine/prod-strict", "enclava-common/prod-strict"]
 
 [dev-dependencies]
 axum-test = "20"

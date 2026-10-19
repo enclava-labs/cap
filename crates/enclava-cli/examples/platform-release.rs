@@ -21,20 +21,20 @@
 //!     platform-release.json <root-pubkey-hex>
 //! ```
 //!
-//! Then set BOTH repository secrets together:
-//! `ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX` (pubkey hex) and
-//! `ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON` (the envelope file contents).
+//! Put each independently approved root and signed baseline in the common
+//! profile bundle, verify it with `verify-profiles`, then supply that public
+//! bundle as `ENCLAVA_PLATFORM_RELEASE_PROFILES_JSON` to release CI.
 
 use std::io::Read;
 use std::process::ExitCode;
 
 use ed25519_dalek::{Signer, SigningKey};
 use enclava_cli::platform_release::{
-    PlatformRelease, PlatformReleaseEnvelope, canonical_platform_release_bytes,
-    verify_envelope_with_root, verify_signed_baseline_with_root,
+    PlatformRelease, PlatformReleaseEnvelope, canonical_platform_release_bytes, verify_envelope,
+    verify_envelope_with_root, verify_profile_bundle, verify_signed_baseline_with_root,
 };
 
-const USAGE: &str = "usage: platform-release sign <payload.json> <root-seed-hex-on-stdin>\n       platform-release verify <envelope.json> <root-pubkey-hex>\n       platform-release verify-baseline <envelope.json> <root-pubkey-hex>";
+const USAGE: &str = "usage: platform-release sign <payload.json> <root-seed-hex-on-stdin>\n       platform-release verify <envelope.json> <root-pubkey-hex>\n       platform-release verify-baseline <envelope.json> <root-pubkey-hex>\n       platform-release verify-profiles <profiles.json>\n       platform-release verify-target <api-url> <envelope.json>";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -45,6 +45,8 @@ fn main() -> ExitCode {
         Some("sign") => sign(args.get(2)),
         Some("verify") => verify(args.get(2), args.get(3)),
         Some("verify-baseline") => verify_baseline(args.get(2), args.get(3)),
+        Some("verify-profiles") if args.len() == 3 => verify_profiles(&args[2]),
+        Some("verify-target") if args.len() == 4 => verify_target(&args[2], &args[3]),
         _ => Err(USAGE.to_string()),
     };
     match result {
@@ -129,6 +131,31 @@ fn verify_baseline(
     println!(
         "{envelope_path}: signed baseline {} verifies against the pinned root",
         baseline.platform_release_version
+    );
+    Ok(())
+}
+
+fn verify_profiles(path: &str) -> Result<(), String> {
+    let raw = std::fs::read_to_string(path).map_err(|error| format!("read {path}: {error}"))?;
+    let profiles = verify_profile_bundle(&raw, true).map_err(|error| error.to_string())?;
+    for (name, _) in profiles.iter() {
+        println!("{name}: approved root and signed baseline verified");
+    }
+    Ok(())
+}
+
+fn verify_target(api_url: &str, path: &str) -> Result<(), String> {
+    let profiles =
+        enclava_common::release_profiles::bundled().map_err(|error| error.to_string())?;
+    let profile = profiles
+        .for_api(api_url)
+        .map_err(|error| error.to_string())?;
+    let raw = std::fs::read_to_string(path).map_err(|error| format!("read {path}: {error}"))?;
+    let envelope = serde_json::from_str(&raw).map_err(|error| format!("parse {path}: {error}"))?;
+    let release = verify_envelope(envelope, profile).map_err(|error| error.to_string())?;
+    println!(
+        "{api_url}: {} verifies against the selected installation profile",
+        release.platform_release_version
     );
     Ok(())
 }

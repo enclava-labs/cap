@@ -2,10 +2,6 @@
 
 FROM rust:1.88-bookworm@sha256:af306cfa71d987911a781c37b59d7d67d934f49684058f96cf72079c3626bfe0 AS debug-builder
 
-ARG ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX
-ENV ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX=${ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX}
-RUN test -n "$ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX" || (echo "ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX must be provided as a build-arg" >&2; exit 1)
-
 RUN apt-get update && \
     apt-get install -y --no-install-recommends pkg-config libssl-dev jq && \
     rm -rf /var/lib/apt/lists/*
@@ -14,11 +10,6 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY vendor/ vendor/
 COPY crates/ crates/
-COPY scripts/require-platform-release-root.sh scripts/require-platform-release-root.sh
-
-# Debug images may pin the dev fixture root only while the bundled envelope
-# is fixture-signed; the root must still match that envelope.
-RUN bash scripts/require-platform-release-root.sh --allow-dev-fixture
 RUN printf "%s  crates/enclava-api/trust-roots/sigstore-public-good-1.root.json\n" \
       6494e21ea73fa7ee769f85f57d5a3e6a08725eae1e38c755fc3517c9e6bc0b66 \
       | sha256sum -c >/dev/null
@@ -54,10 +45,6 @@ ENTRYPOINT ["/usr/local/bin/enclava-api"]
 
 FROM rust:1.88-alpine@sha256:9dfaae478ecd298b6b5a039e1f2cc4fc040fc818a2de9aa78fa714dea036574d AS release-builder
 
-ARG ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX
-ENV ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX=${ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX}
-RUN test -n "$ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX" || (echo "ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX must be provided as a build-arg" >&2; exit 1)
-
 # perl+make: the envelope verify step compiles enclava-cli, whose vendored
 # openssl build needs them.
 RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconf bash jq perl make
@@ -66,19 +53,12 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY vendor/ vendor/
 COPY crates/ crates/
-COPY scripts/require-platform-release-root.sh scripts/require-platform-release-root.sh
-
-# Released images must pin a production root that matches the bundled
-# envelope; the fixture root is rejected unconditionally here.
-RUN bash scripts/require-platform-release-root.sh
 RUN printf "%s  crates/enclava-api/trust-roots/sigstore-public-good-1.root.json\n" \
       6494e21ea73fa7ee769f85f57d5a3e6a08725eae1e38c755fc3517c9e6bc0b66 \
       | sha256sum -c >/dev/null
 
-# The bundled signed envelope is only a downgrade floor. Pre-trustee bytes
-# remain valid for this floor, never for the mounted runtime release.
-RUN cargo run --locked --release -p enclava-cli --example platform-release -- verify-baseline \
-    crates/enclava-cli/platform-release.json "$ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX"
+RUN cargo run --locked --release -p enclava-cli --example platform-release -- verify-profiles \
+    crates/enclava-common/platform-release-profiles.json
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \

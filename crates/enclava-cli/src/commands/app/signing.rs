@@ -20,20 +20,23 @@ fn confirmed_bootstrap_state(state: &str) -> bool {
 
 pub(crate) fn platform_release_from_deployment_context(
     deployment_context: &DeploymentContextResponse,
+    api_url: &str,
 ) -> Result<Option<PlatformRelease>, Box<dyn std::error::Error>> {
-    platform_release_from_deployment_context_with_verifier(deployment_context, verify_envelope)
+    let profile = enclava_common::release_profiles::bundled()?.for_api(api_url)?;
+    platform_release_from_deployment_context_with_verifier(deployment_context, |envelope| {
+        verify_envelope(envelope, profile)
+    })
 }
 
 pub(crate) async fn fetch_verified_platform_release(
     api: &ApiClient,
     paths: &enclava_cli::config::CliPaths,
 ) -> Result<(DeploymentContextResponse, PlatformRelease), Box<dyn std::error::Error>> {
+    enclava_common::release_profiles::bundled()?.for_api(api.origin())?;
     let deployment_context = api.deployment_context().await?;
-    let release = match platform_release_from_deployment_context(&deployment_context)? {
+    let release = match platform_release_from_deployment_context(&deployment_context, api.origin())?
+    {
         Some(release) => {
-            // Anti-downgrade baseline is per-API (an environment may serve an
-            // older active release than this CLI bundles); the bundled
-            // baseline applies only to local env-path overrides.
             enclava_cli::platform_release::enforce_release_not_older_than_last_accepted(
                 &paths.api_release_baseline,
                 api.origin(),
@@ -57,7 +60,7 @@ pub(crate) async fn fetch_verified_platform_release(
                 )
                 .into());
             }
-            PlatformRelease::load_verified()?
+            PlatformRelease::load_verified(api.origin())?
         }
     };
     Ok((deployment_context, release))

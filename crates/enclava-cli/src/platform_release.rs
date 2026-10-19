@@ -9,15 +9,13 @@ use std::path::Path;
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use enclava_common::canonical::ce_v1_bytes;
+use enclava_common::release_profiles::{self, ProfileError, ReleaseProfile, ReleaseProfiles};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+#[cfg(test)]
 const BUNDLED_PLATFORM_RELEASE: &str = include_str!("../platform-release.json");
-
-#[cfg(any(test, feature = "prod-strict"))]
-const FORBIDDEN_FIXTURE_RELEASE_ROOT_PUBKEY_HEX: &str =
-    "5b9437adeaffbe8f41b13d96ed49d2f51cd6c266cd8ecc284b0552ec4912b8dd";
 
 /// Public half of the dev-fixture trustee policy seed (c1*32) committed with
 /// crates/enclava-cli/scripts/generate-platform-release.py. Rejected for any
@@ -39,62 +37,7 @@ fn fixture_root_pubkey() -> [u8; 32] {
 }
 
 #[cfg(test)]
-const TEST_FIXTURE_RELEASE_ROOT_PUBKEY_HEX: &str = FORBIDDEN_FIXTURE_RELEASE_ROOT_PUBKEY_HEX;
-
-#[cfg(any(test, feature = "prod-strict"))]
-// ponytail: manual compare, u8::eq_ignore_ascii_case is not const at MSRV 1.85
-#[allow(clippy::manual_ignore_case_cmp)]
-const fn eq_ignore_ascii_case(a: &str, b: &str) -> bool {
-    let a = a.as_bytes();
-    let b = b.as_bytes();
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut i = 0;
-    while i < a.len() {
-        if a[i].to_ascii_lowercase() != b[i].to_ascii_lowercase() {
-            return false;
-        }
-        i += 1;
-    }
-    true
-}
-
-#[cfg(any(test, feature = "prod-strict"))]
-const fn is_forbidden_fixture_root(root: &str) -> bool {
-    eq_ignore_ascii_case(root, FORBIDDEN_FIXTURE_RELEASE_ROOT_PUBKEY_HEX)
-}
-
-/// 64 ASCII hex characters (either case) = a 32-byte key.
-#[cfg(any(test, feature = "prod-strict"))]
-const fn is_hex32_root(root: &str) -> bool {
-    let bytes = root.as_bytes();
-    if bytes.len() != 64 {
-        return false;
-    }
-    let mut i = 0;
-    while i < bytes.len() {
-        let c = bytes[i].to_ascii_lowercase();
-        if !(c.is_ascii_digit() || (c >= b'a' && c <= b'f')) {
-            return false;
-        }
-        i += 1;
-    }
-    true
-}
-
-#[cfg(all(not(test), feature = "prod-strict"))]
-const _: () = {
-    match option_env!("ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX") {
-        Some(root) if is_forbidden_fixture_root(root) => {
-            panic!("prod-strict builds must not pin the committed fixture platform-release root");
-        }
-        Some(root) if is_hex32_root(root) => {}
-        _ => panic!(
-            "prod-strict builds require ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX to be set to a 32-byte hex pubkey"
-        ),
-    }
-};
+const TEST_FIXTURE_RELEASE_ROOT_PUBKEY_HEX: &str = release_profiles::FIXTURE_ROOT;
 
 #[derive(Debug, Error)]
 pub enum PlatformReleaseError {
@@ -109,8 +52,8 @@ pub enum PlatformReleaseError {
         field: &'static str,
         message: String,
     },
-    #[error("platform release root pubkey is not configured at compile time")]
-    MissingRootPubkey,
+    #[error(transparent)]
+    Profile(#[from] ProfileError),
     #[error(
         "platform release signature pubkey is not the pinned root: this build pins {pinned}, the release declares {signing}; verify the target platform and, if this is an expected root rotation, update this CLI from a trusted source"
     )]
@@ -181,8 +124,8 @@ pub struct PlatformRelease {
 }
 
 impl PlatformRelease {
-    pub fn load_verified() -> Result<Self, PlatformReleaseError> {
-        Ok(PlatformReleaseEnvelope::load_verified()?.payload)
+    pub fn load_verified(api_url: &str) -> Result<Self, PlatformReleaseError> {
+        Ok(PlatformReleaseEnvelope::load_verified(api_url)?.payload)
     }
 
     pub fn policy_template_sha256_bytes(&self) -> Result<[u8; 32], PlatformReleaseError> {
@@ -231,38 +174,33 @@ impl PlatformRelease {
 }
 
 impl PlatformReleaseEnvelope {
-    pub fn load_verified() -> Result<Self, PlatformReleaseError> {
+    pub fn load_verified(api_url: &str) -> Result<Self, PlatformReleaseError> {
+        let profile = release_profiles::bundled()?.for_api(api_url)?;
         let override_path = std::env::var("ENCLAVA_PLATFORM_RELEASE_PATH")
             .ok()
             .filter(|path| !path.trim().is_empty());
-        let raw = match &override_path {
-            Some(path) => std::fs::read_to_string(Path::new(path))?,
-            None => BUNDLED_PLATFORM_RELEASE.to_string(),
-        };
-        let envelope: PlatformReleaseEnvelope = serde_json::from_str(&raw)?;
-        verify_envelope(envelope.clone())?;
-        // Downgrade protection: an env-path override may never be older than
-        // the release compiled into this binary. A validly-signed stale
-        // release (pinned to old measurements/sidecar digests) is exactly
-        // what a file-swap or env-var attack serves.
+        let override_raw = override_path
+            .as_ref()
+            .map(|path| std::fs::read_to_string(Path::new(path)))
+            .transpose()?;
+        let raw = override_raw.as_deref().unwrap_or(profile.baseline.get());
+        let envelope: PlatformReleaseEnvelope = serde_json::from_str(raw)?;
+        verify_envelope(envelope.clone(), profile)?;
         if override_path.is_some() {
-            enforce_release_not_older_than_bundled(&envelope.payload)?;
+            enforce_release_not_older_than_bundled(&envelope.payload, profile)?;
         }
         Ok(envelope)
     }
 }
 
-/// Reject `release` when it is older than the release compiled into this
-/// binary. Applied to every release source that did not itself come from the
-/// bundle: env-path overrides AND API-provided envelopes (a compromised API
-/// can serve an old, still-validly-signed envelope with a matching
-/// `current_platform_release_id`, otherwise the CLI would sign against
-/// stale measurements, policy, and sidecar digests).
+/// File overrides use the selected profile's signed floor. API-served releases
+/// instead retain their per-origin persisted floor, allowing staggered promotion.
 pub fn enforce_release_not_older_than_bundled(
     release: &PlatformRelease,
+    profile: &ReleaseProfile,
 ) -> Result<(), PlatformReleaseError> {
-    let root = configured_root()?;
-    let bundled = verify_signed_baseline_with_root(BUNDLED_PLATFORM_RELEASE, root)?;
+    let bundled =
+        verify_signed_baseline_with_root(profile.baseline.get(), &profile.root_pubkey_hex)?;
     let candidate_ts = parse_release_timestamp(&release.created_at)?;
     let bundled_ts = parse_release_timestamp(&bundled.created_at)?;
     if candidate_ts < bundled_ts
@@ -317,23 +255,17 @@ fn parse_release_timestamp(
 
 pub fn verify_envelope(
     envelope: PlatformReleaseEnvelope,
+    profile: &ReleaseProfile,
 ) -> Result<PlatformRelease, PlatformReleaseError> {
-    verify_envelope_with_root(envelope, configured_root()?)
+    let release = verify_envelope_with_root(envelope, &profile.root_pubkey_hex)?;
+    profile.require_installation_identity(
+        &release.signing_service_pubkey_hex,
+        &release.trustee_kbs_ca_cert_pem,
+    )?;
+    Ok(release)
 }
 
-fn configured_root() -> Result<&'static str, PlatformReleaseError> {
-    #[cfg(test)]
-    let configured_root = option_env!("ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX")
-        .unwrap_or(TEST_FIXTURE_RELEASE_ROOT_PUBKEY_HEX);
-    #[cfg(not(test))]
-    let configured_root = option_env!("ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX")
-        .ok_or(PlatformReleaseError::MissingRootPubkey)?;
-    Ok(configured_root)
-}
-
-/// Root-pinning variant used by the release ceremony helper
-/// (`examples/platform-release.rs`), which takes the root as an argument
-/// instead of a compile-time `option_env!`.
+/// Offline signature verification against an independently supplied root.
 pub fn verify_envelope_with_root(
     envelope: PlatformReleaseEnvelope,
     root_hex: &str,
@@ -401,12 +333,23 @@ pub fn verify_signed_baseline_with_root(
     })
 }
 
+pub fn verify_profile_bundle(
+    raw: &str,
+    strict: bool,
+) -> Result<ReleaseProfiles, PlatformReleaseError> {
+    let profiles = ReleaseProfiles::parse(raw, strict)?;
+    for (_, profile) in profiles.iter() {
+        verify_signed_baseline_with_root(profile.baseline.get(), &profile.root_pubkey_hex)?;
+    }
+    Ok(profiles)
+}
+
 fn verify_root_signature(
     envelope: &PlatformReleaseEnvelope,
     root_hex: &str,
     canonical: &[u8],
 ) -> Result<[u8; 32], PlatformReleaseError> {
-    let pinned = hex32("ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX", root_hex)?;
+    let pinned = hex32("root_pubkey_hex", root_hex)?;
     let signing = hex32("signing_pubkey", &envelope.signing_pubkey)?;
     if signing != pinned {
         return Err(PlatformReleaseError::RootMismatch {
@@ -756,6 +699,50 @@ pub fn validate_release_payload(release: &PlatformRelease) -> Result<(), Platfor
 mod tests {
     use super::*;
 
+    fn test_profile() -> &'static ReleaseProfile {
+        release_profiles::bundled().unwrap().named("dev").unwrap()
+    }
+
+    #[test]
+    fn shared_root_does_not_authorize_a_different_installation() {
+        let profiles = verify_profile_bundle(release_profiles::BUNDLED_PROFILES, false).unwrap();
+        let preprod = profiles.named("preprod").unwrap();
+        let production = profiles.named("production").unwrap();
+        assert_eq!(preprod.root_pubkey_hex, production.root_pubkey_hex);
+        let mut envelope: PlatformReleaseEnvelope =
+            serde_json::from_str(preprod.baseline.get()).unwrap();
+        envelope.payload.created_at = "2099-01-01T00:00:00Z".into();
+        let envelope = sign_with_dev_fixture_key(envelope.payload);
+        verify_envelope(envelope.clone(), preprod).unwrap();
+        assert!(matches!(
+            verify_envelope(envelope, production),
+            Err(PlatformReleaseError::Profile(_)),
+        ));
+    }
+
+    #[test]
+    fn api_release_can_predate_profile_floor_but_not_last_seen_release() {
+        let mut envelope: PlatformReleaseEnvelope =
+            serde_json::from_str(test_profile().baseline.get()).unwrap();
+        envelope.payload.created_at = "2020-01-01T00:00:00Z".into();
+        let envelope = sign_with_dev_fixture_key(envelope.payload);
+        let release = verify_envelope(envelope, test_profile()).unwrap();
+        assert!(matches!(
+            enforce_release_not_older_than_bundled(&release, test_profile()),
+            Err(PlatformReleaseError::DowngradeRefused { .. }),
+        ));
+        let directory = tempfile::tempdir().unwrap();
+        let store = directory.path().join("accepted.json");
+        let api = "https://cap.dev.enclava.work";
+        enforce_release_not_older_than_last_accepted(&store, api, &release).unwrap();
+        let current = PlatformRelease::load_verified(api).unwrap();
+        enforce_release_not_older_than_last_accepted(&store, api, &current).unwrap();
+        assert!(matches!(
+            enforce_release_not_older_than_last_accepted(&store, api, &release),
+            Err(PlatformReleaseError::ApiDowngradeRefused { .. }),
+        ));
+    }
+
     fn release(version: &str, created_at: &str) -> PlatformRelease {
         PlatformRelease {
             schema_version: "v1".into(),
@@ -928,10 +915,11 @@ mod tests {
     fn api_release_older_than_bundle_is_refused() {
         // The bundled release is current by definition; anything with an
         // older signed timestamp loses regardless of identifier.
-        let bundled = PlatformReleaseEnvelope::load_verified().unwrap();
+        let bundled =
+            PlatformReleaseEnvelope::load_verified("https://cap.dev.enclava.work").unwrap();
         let stale = release("zzz-newer-suffix", "2020-01-01T00:00:00Z");
         assert!(matches!(
-            enforce_release_not_older_than_bundled(&stale),
+            enforce_release_not_older_than_bundled(&stale, test_profile()),
             Err(PlatformReleaseError::DowngradeRefused { .. })
         ));
         drop(bundled);
@@ -939,7 +927,7 @@ mod tests {
 
     #[test]
     fn bundled_release_verifies_and_hashes_template() {
-        let release = PlatformRelease::load_verified().unwrap();
+        let release = PlatformRelease::load_verified("https://cap.dev.enclava.work").unwrap();
         assert_eq!(release.schema_version, "v1");
         assert_eq!(
             release.policy_template_sha256,
@@ -950,7 +938,7 @@ mod tests {
 
     #[test]
     fn bundled_release_uses_ghcr_digest_pinned_sidecars() {
-        let release = PlatformRelease::load_verified().unwrap();
+        let release = PlatformRelease::load_verified("https://cap.dev.enclava.work").unwrap();
         for image in [release.attestation_proxy_image, release.caddy_ingress_image] {
             assert!(image.starts_with("ghcr.io/enclava-labs/"));
             assert!(image.contains("@sha256:"));
@@ -1012,29 +1000,6 @@ mod tests {
     }
 
     #[test]
-    fn cli_dockerfile_requires_platform_release_root_build_arg() {
-        let dockerfile = include_str!("../Dockerfile").replace("\r\n", "\n");
-        assert!(
-            !dockerfile.contains("ARG ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX="),
-            "CLI Dockerfile must not default the platform-release root"
-        );
-        assert!(
-            dockerfile.contains(
-                "ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX must be provided as a build-arg"
-            )
-        );
-        assert!(
-            dockerfile
-                .contains("cargo build --locked --release --bin enclava --features prod-strict")
-        );
-        assert!(dockerfile.contains("bash scripts/require-platform-release-root.sh"));
-        assert!(dockerfile.contains("COPY scripts/require-platform-release-root.sh"));
-        // The Dockerfile itself must verify the envelope signature, not just
-        // compare pubkeys.
-        assert!(dockerfile.contains("--example platform-release -- verify"));
-    }
-
-    #[test]
     fn legacy_signed_baseline_verifies_but_cannot_be_used_as_a_runtime_release() {
         use ed25519_dalek::Signer;
 
@@ -1084,62 +1049,6 @@ mod tests {
             verify_signed_baseline_with_root(&stripped.to_string(), &root),
             Err(PlatformReleaseError::BadSignature(_))
         ));
-    }
-
-    #[test]
-    fn tagged_cli_release_build_requires_platform_release_root_secret() {
-        let workflow = include_str!("../../../.github/workflows/release.yml");
-        // Windows checkouts use CRLF (autocrlf); normalize before matching.
-        let workflow = workflow.replace("\r\n", "\n");
-        let expected = "\nenv:\n  ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX: ${{ secrets.ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX }}\n";
-
-        assert!(
-            workflow.contains(expected),
-            "release workflow must take the root from a required secret, not a committed fixture"
-        );
-        assert!(
-            workflow.contains("scripts/require-platform-release-root.sh"),
-            "release workflow must run the production platform-release root gate"
-        );
-        assert!(
-            !workflow.contains(TEST_FIXTURE_RELEASE_ROOT_PUBKEY_HEX),
-            "release workflow must not hardcode the committed dev fixture pubkey"
-        );
-        assert_eq!(
-            workflow
-                .matches("ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX:")
-                .count(),
-            1
-        );
-        // Every published CLI binary is a prod-strict build, so an invalid,
-        // missing, or fixture root fails at compile time, and no job builds
-        // artifacts before the root gate has passed.
-        assert_eq!(
-            workflow
-                .matches("--bin enclava --features prod-strict")
-                .count(),
-            3
-        );
-        assert_eq!(
-            workflow
-                .matches("needs: require-platform-release-root")
-                .count(),
-            4
-        );
-        // The gate is satisfiable only by supplying a matching production
-        // envelope: the secret is materialized over the bundled envelope in
-        // the gate job and every build job, and the gate job verifies the
-        // full signature before anything builds.
-        assert!(workflow.contains(
-            "ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON: ${{ secrets.ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON }}"
-        ));
-        assert_eq!(
-            workflow
-                .matches("printf '%s' \"$ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON\" > crates/enclava-cli/platform-release.json")
-                .count(),
-            4
-        );
-        assert!(workflow.contains("--example platform-release -- verify"));
     }
 
     #[test]
@@ -1197,40 +1106,6 @@ mod tests {
     }
 
     #[test]
-    fn fixture_root_is_detected_case_insensitively() {
-        assert!(is_forbidden_fixture_root(
-            TEST_FIXTURE_RELEASE_ROOT_PUBKEY_HEX
-        ));
-        assert!(is_forbidden_fixture_root(
-            &TEST_FIXTURE_RELEASE_ROOT_PUBKEY_HEX.to_ascii_uppercase()
-        ));
-        assert!(!is_forbidden_fixture_root(
-            "0000000000000000000000000000000000000000000000000000000000000001"
-        ));
-    }
-
-    #[test]
-    fn hex32_root_shape_is_validated() {
-        assert!(is_hex32_root(
-            "0000000000000000000000000000000000000000000000000000000000000001"
-        ));
-        // Uppercase hex is still a valid key (hex::decode accepts it).
-        assert!(is_hex32_root(
-            "000000000000000000000000000000000000000000000000000000000000000A"
-        ));
-        assert!(!is_hex32_root(""));
-        assert!(!is_hex32_root(
-            "000000000000000000000000000000000000000000000000000000000000001"
-        ));
-        assert!(!is_hex32_root(
-            "00000000000000000000000000000000000000000000000000000000000000010"
-        ));
-        assert!(!is_hex32_root(
-            "zzzz000000000000000000000000000000000000000000000000000000000001"
-        ));
-    }
-
-    #[test]
     fn verify_envelope_with_root_pins_the_supplied_root() {
         // The ceremony helper passes the root at runtime; it must accept the
         // bundled fixture envelope against the fixture root and reject any
@@ -1266,7 +1141,7 @@ mod tests {
             .payload
             .platform_release_version
             .push_str("-tampered");
-        let err = verify_envelope(tampered).unwrap_err();
+        let err = verify_envelope(tampered, test_profile()).unwrap_err();
         assert!(matches!(err, PlatformReleaseError::BadSignature(_)));
     }
 
@@ -1330,7 +1205,7 @@ mod tests {
         // service are two trust domains. The bundled signed release must pin
         // a dedicated trustee policy key that differs from the
         // signing-service key.
-        let release = PlatformRelease::load_verified().unwrap();
+        let release = PlatformRelease::load_verified("https://cap.dev.enclava.work").unwrap();
         let trustee = release.platform_trustee_policy_pubkey_bytes().unwrap();
         let signing = release.signing_service_pubkey_bytes().unwrap();
         assert_ne!(trustee, signing);
@@ -1449,6 +1324,10 @@ mod tests {
     /// predates those checks and carries placeholder shapes).
     fn valid_test_payload(version: &str, created_at: &str) -> PlatformRelease {
         let mut payload = release(version, created_at);
+        let identity: PlatformReleaseEnvelope =
+            serde_json::from_str(test_profile().baseline.get()).unwrap();
+        payload.signing_service_pubkey_hex = identity.payload.signing_service_pubkey_hex;
+        payload.trustee_kbs_ca_cert_pem = identity.payload.trustee_kbs_ca_cert_pem;
         payload.policy_template_text = "package policy\n".into();
         payload.policy_template_sha256 =
             hex::encode(Sha256::digest(payload.policy_template_text.as_bytes()));
@@ -1488,18 +1367,20 @@ mod tests {
     #[test]
     fn seal_rollout_claim_is_covered_by_the_signature() {
         let envelope = sealed_test_envelope();
-        let verified = verify_envelope(envelope.clone()).expect("valid envelope verifies");
+        let verified =
+            verify_envelope(envelope.clone(), test_profile()).expect("valid envelope verifies");
         assert_eq!(verified.luks2_header_seal_claim(), "required");
 
         let mut tampered = envelope.clone();
         tampered.payload.luks2_header_seal = "adopt".into();
-        let err = verify_envelope(tampered).expect_err("flip must break the signature");
+        let err =
+            verify_envelope(tampered, test_profile()).expect_err("flip must break the signature");
         assert!(matches!(err, PlatformReleaseError::BadSignature(_)));
 
         let mut stripped = envelope;
         stripped.payload.luks2_header_seal = String::new();
-        let err =
-            verify_envelope(stripped).expect_err("stripping the field must break the signature");
+        let err = verify_envelope(stripped, test_profile())
+            .expect_err("stripping the field must break the signature");
         assert!(matches!(err, PlatformReleaseError::BadSignature(_)));
     }
 
@@ -1521,7 +1402,8 @@ mod tests {
         assert!(payload.luks2_header_seal.is_empty());
 
         let envelope = sign_with_dev_fixture_key(payload);
-        let verified = verify_envelope(envelope).expect("pre-field envelope must keep verifying");
+        let verified = verify_envelope(envelope, test_profile())
+            .expect("pre-field envelope must keep verifying");
         assert_eq!(verified.luks2_header_seal_claim(), "adopt");
     }
 
@@ -1537,7 +1419,7 @@ mod tests {
 
     #[test]
     fn bundled_release_carries_a_valid_seal_rollout_claim() {
-        let release = PlatformRelease::load_verified().unwrap();
+        let release = PlatformRelease::load_verified("https://cap.dev.enclava.work").unwrap();
         let claim = release.luks2_header_seal_claim();
         assert!(claim == "adopt" || claim == "required", "got {claim}");
     }

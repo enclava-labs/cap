@@ -12,6 +12,8 @@ pub mod orgs;
 #[cfg(feature = "outbound-http")]
 pub mod outbound_http;
 pub mod registry;
+#[cfg(feature = "release-profiles")]
+pub mod release_profiles;
 #[cfg(feature = "runtime")]
 pub mod types;
 pub mod validate;
