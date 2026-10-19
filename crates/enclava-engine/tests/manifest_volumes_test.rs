@@ -167,6 +167,29 @@ fn v2_layout_with_log_encryption_renders_memory_mountpoint() {
 }
 
 #[test]
+fn v2_layout_with_omit_spool_bind_pin_keeps_memory_mountpoint() {
+    // A claim-less v2 artifact (hash computed before log_spool_storage
+    // existed) pins omit_log_spool_bind_claim at validation. Its signed
+    // agent policy still encodes the v2 tmpfs mount, so the render must
+    // keep the Memory mountpoint; only the guest-side state bind is off.
+    let mut app = v2_app_with_logs();
+    app.workload_artifact_binding = Some(enclava_engine::types::WorkloadArtifactBinding {
+        descriptor_core_hash: [0u8; 32],
+        descriptor_signing_pubkey: [0u8; 32],
+        org_keyring_fingerprint: [0u8; 32],
+        omit_log_encryption_claim: false,
+        legacy_collapsed_trustee_key: false,
+        omit_luks2_header_seal_claim: false,
+        omit_log_spool_bind_claim: true,
+    });
+    let vols = build_volumes(&app);
+    let v = vols.iter().find(|v| v.name == "logs").unwrap();
+    let ed = v.empty_dir.as_ref().unwrap();
+    assert_eq!(ed.medium.as_deref(), Some("Memory"));
+    assert_eq!(ed.size_limit.as_ref().map(|q| q.0.as_str()), Some("1Mi"));
+}
+
+#[test]
 fn v1_layout_without_log_encryption_keeps_disk_spool_and_tools_mount() {
     // A v1-signed artifact renders byte-identical to its signed shape: the
     // 4Gi disk spool AND the enclava-logs provisioning stay.

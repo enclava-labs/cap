@@ -122,8 +122,15 @@ pub fn build_volumes(app: &ConfidentialApp) -> Vec<Volume> {
     if logs_volume_included(app) {
         // Under the v2 layout the encrypted log spool is a small
         // RAM-backed mountpoint: enclava-init re-binds it onto a directory
-        // on the encrypted state PVC after LUKS unlock, so the plaintext
-        // spool never touches host disk (cap#289).
+        // on the encrypted state PVC after LUKS unlock, so the spool never
+        // provisions host disk storage (cap#289). Claim-less v2 artifacts
+        // (omit_log_spool_bind_claim pinned by hash validation) keep this
+        // same mountpoint on purpose: their signed agent policy encodes
+        // tmpfs storage for it, so rendering the legacy disk volume would
+        // violate that policy. The guest then skips the state bind and the
+        // spool stays on guest tmpfs — the declared 1Mi is not forwarded
+        // as a guest hard bound (bootstrap-mountpoint pattern, below), so
+        // the only degradation is spool persistence, not capacity.
         let empty_dir = if layout == VolumeLayout::GuestMemoryV2 {
             EmptyDirVolumeSource {
                 medium: Some("Memory".to_string()),
