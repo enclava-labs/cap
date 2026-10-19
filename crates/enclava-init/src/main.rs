@@ -1849,18 +1849,18 @@ fn prepare_log_spool_dir_at(
             if name == b"." || name == b".." {
                 continue;
             }
+            let keep_seq = [keep, b".seq".as_slice()].concat();
             let kept = name == keep
+                || name == keep_seq.as_slice()
                 || (name.starts_with(keep) && name[keep.len()..].starts_with(b".rotate."));
             if kept {
                 continue;
             }
             let looks_like_spool = name.ends_with(b".jsonl")
+                || name.ends_with(b".jsonl.seq")
                 || name
                     .windows(b".jsonl.rotate.".len())
                     .any(|w| w == b".jsonl.rotate.");
-            if !looks_like_spool {
-                continue;
-            }
             let is_dir = match entry.file_type() {
                 Some(nix::dir::Type::Directory) => true,
                 Some(_) => false,
@@ -1872,7 +1872,7 @@ fn prepare_log_spool_dir_at(
                 .map(|stat| (stat.st_mode & nix::libc::S_IFMT) == nix::libc::S_IFDIR)
                 .unwrap_or(false),
             };
-            if !is_dir {
+            if looks_like_spool && !is_dir {
                 stale.push(entry.file_name().to_owned());
             }
         }
