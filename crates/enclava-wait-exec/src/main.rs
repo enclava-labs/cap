@@ -547,13 +547,18 @@ fn open_log_spool(path: &Path) -> Result<File, String> {
     Ok(file)
 }
 
-/// Highest frame sequence present in the surviving spool, plus one. Called
-/// once at wrapper startup so a restarted process resumes sequence numbers
-/// ABOVE everything the previous process wrote (the `logs` emptyDir and its
-/// spool survive container restarts; the relay's rotation dedup would drop
-/// post-restart frames whose reset sequences land at or below its retained
-/// frontier). The spool is bounded by the rotation threshold, so one
-/// startup scan is cheap; lines that do not parse as frames are skipped.
+/// Highest frame sequence present in the surviving spool tail, plus one.
+/// Called once at wrapper startup so a restarted process resumes sequence
+/// numbers ABOVE everything the previous process wrote (the spool survives
+/// container restarts and, under the state bind, pod replacement; the
+/// relay's rotation dedup would drop post-restart frames whose reset
+/// sequences land at or below its retained frontier). A writer-produced
+/// spool is bounded by the rotation threshold, but the directory is
+/// workload-writable and a retained file can be grown far past it by
+/// direct writes, so the scan itself is TOTAL-bounded to the last
+/// `LOG_SPOOL_ROTATE_BYTES + MAX_SPOOL_LINE_BYTES` (cap#290 round-3
+/// review): writer sequences are monotonic, so the maximum lives in that
+/// tail; a forged sequence in the discarded head can at worst be ignored.
 /// The spool directory is workload-writable, so the scan is over
 /// attacker-influenced content: a forged `{"sequence":u64::MAX}` line must
 /// not wrap the resumed counter to 0 (round-14 self-check Critical), so
@@ -578,8 +583,28 @@ fn open_log_spool(path: &Path) -> Result<File, String> {
 /// connected relay dedup set references — and it cannot be a
 /// writer-produced frame at all (those are capped well below the bound).
 fn initial_spool_sequence(spool: &mut File) -> Result<u64, String> {
+    const MAX_STARTUP_SCAN_BYTES: u64 = LOG_SPOOL_ROTATE_BYTES + MAX_SPOOL_LINE_BYTES;
+    let len = spool
+        .metadata()
+        .map_err(|err| format!("failed to stat log spool for sequence scan: {err}"))?
+        .len();
+    let scan_start = len.saturating_sub(MAX_STARTUP_SCAN_BYTES);
+    // When the window opens mid-record, the first record read is a
+    // fragment: discard it rather than let a crafted suffix parse as a
+    // frame. The byte before the window tells us whether we are aligned.
+    let mut discard_first_record = false;
+    if scan_start > 0 {
+        spool
+            .seek(SeekFrom::Start(scan_start - 1))
+            .map_err(|err| format!("failed to seek log spool for sequence scan: {err}"))?;
+        let mut prev = [0u8; 1];
+        spool
+            .read_exact(&mut prev)
+            .map_err(|err| format!("failed to read log spool for sequence scan: {err}"))?;
+        discard_first_record = prev[0] != b'\n';
+    }
     spool
-        .seek(SeekFrom::Start(0))
+        .seek(SeekFrom::Start(scan_start))
         .map_err(|err| format!("failed to seek log spool for sequence scan: {err}"))?;
     let read_err = |err: io::Error| format!("failed to read log spool for sequence scan: {err}");
     let mut max_sequence = 0u64;
@@ -631,6 +656,11 @@ fn initial_spool_sequence(spool: &mut File) -> Result<u64, String> {
                 // EOF mid-oversized-record: incomplete tail, skip.
                 break;
             }
+            discard_first_record = false;
+            continue;
+        }
+        if discard_first_record {
+            discard_first_record = false;
             continue;
         }
         // Complete record INCLUDING its terminating newline. Strip the
@@ -1688,6 +1718,7 @@ mod tests {
     #[test]
     #[cfg(feature = "prod-strict")]
     fn handoff_with_unsupported_algorithm_fails() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let keypair = enclava_common::log_encryption::generate_log_keypair();
         let path = unique_handoff_path("badalg");
         let claim = serde_json::json!({
@@ -2265,6 +2296,27 @@ mod tests {
         std::fs::write(&path, "not-json\nalso not json\n").unwrap();
         let mut spool = open_log_spool(&path).unwrap();
         assert_eq!(initial_spool_sequence(&mut spool).unwrap(), 1);
+    }
+
+    /// cap#290 round-3 review: the persistent spool is workload-writable
+    /// and can be grown far past the writer's rotation cap by direct
+    /// appends. The startup scan must stay total-bounded to the tail
+    /// window instead of reading the whole retained file before spawn.
+    #[test]
+    fn initial_spool_sequence_scans_only_the_tail_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.jsonl");
+        let frame = |seq: u64| format!(r#"{{"version":"enclava-log-frame-v1","sequence":{seq}}}"#);
+        let mut body = format!("{}\n", frame(999));
+        // Push the high-sequence head frame outside the scan window.
+        let filler = "x".repeat(1023) + "\n";
+        for _ in 0..((LOG_SPOOL_ROTATE_BYTES + MAX_SPOOL_LINE_BYTES) / 1024 + 1) {
+            body.push_str(&filler);
+        }
+        body.push_str(&format!("{}\n", frame(10)));
+        std::fs::write(&path, body).unwrap();
+        let mut spool = open_log_spool(&path).unwrap();
+        assert_eq!(initial_spool_sequence(&mut spool).unwrap(), 11);
     }
 
     /// Round-14 self-check Critical: the spool directory is
