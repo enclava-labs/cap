@@ -751,10 +751,11 @@ impl DeploymentSigningArtifacts {
         let seal_required =
             enclava_engine::manifest::cc_init_data::luks2_header_seal_claim() == "required";
         // cap#290 review: the `log_spool_storage` claim may only be
-        // accepted/emitted once the signed release declares the deployed
-        // enclava-init performs the bind (init-first rollout). Under a
-        // pre-field release, claim-bearing artifacts are rejected with a
-        // re-sign diagnostic.
+        // accepted/emitted once this API deployment declares the bind
+        // capability (installed at startup from its deployment
+        // environment, reported to signers via deployment-context). While
+        // the deployment does not declare it, claim-bearing artifacts are
+        // rejected with a re-sign diagnostic.
         let spool_bind_supported =
             enclava_engine::manifest::cc_init_data::log_spool_bind_supported();
         pin_matching_cc_init_data_render(app, &expected, seal_required, spool_bind_supported)
@@ -1804,14 +1805,14 @@ impl LoadedWorkloadArtifacts {
 /// have it adopted despite the fleet-wide release rejecting that rollback.
 /// Affected artifacts must be re-signed against the current release.
 ///
-/// `spool_bind_supported` (the ACTIVE signed release sets
+/// `spool_bind_supported` (this API's deployment gate declares
 /// `log_spool_storage: state-bind-v1`, cap#290 review) is the init-first
 /// rollout gate: a claim-bearing spool render is only legitimate once the
-/// deployed enclava-init performs the state-PVC bind, so while the release
-/// still predates the field such renders must not be accepted — a pre-bind
-/// init would parse the ConfigMap key yet leave the spool on the RAM
-/// mountpoint. An artifact matching ONLY a claim-bearing render gets a
-/// re-sign diagnostic instead of a generic hash mismatch.
+/// deployed enclava-init performs the state-PVC bind, so while the
+/// deployment does not declare the capability such renders must not be
+/// accepted — a pre-bind init would parse the ConfigMap key yet leave the
+/// spool on the RAM mountpoint. An artifact matching ONLY a claim-bearing
+/// render gets a re-sign diagnostic instead of a generic hash mismatch.
 fn pin_matching_cc_init_data_render(
     app: &mut enclava_engine::types::ConfidentialApp,
     expected_hash_hex: &str,
@@ -1819,7 +1820,7 @@ fn pin_matching_cc_init_data_render(
     spool_bind_supported: bool,
 ) -> Result<(), SigningServiceError> {
     // Set when a claim-bearing spool render reproduced the signed hash
-    // while the active release predates `log_spool_storage`.
+    // while this deployment does not declare the `log_spool_storage` bind.
     let mut claim_bearing_spool_match = false;
     for omit_seal in [false, true] {
         if omit_seal && seal_required {
@@ -1838,7 +1839,7 @@ fn pin_matching_cc_init_data_render(
                         enclava_engine::manifest::cc_init_data::compute_cc_init_data(app);
                     if hash == expected_hash_hex {
                         // Claim-bearing spool renders are only acceptable
-                        // once the release declares the deployed init
+                        // once the deployment declares the deployed init
                         // understands the claim.
                         if !omit_spool_bind && !spool_bind_supported {
                             claim_bearing_spool_match = true;
@@ -1859,8 +1860,8 @@ fn pin_matching_cc_init_data_render(
     if claim_bearing_spool_match {
         return Err(SigningServiceError::Mismatch(
             "expected_cc_init_data_hash (artifact was signed over a \
-             log_spool_storage claim-bearing render but the active signed \
-             platform release predates the log_spool_storage field; \
+             log_spool_storage claim-bearing render but this API deployment \
+             does not declare the log_spool_storage state-bind capability; \
              re-sign the artifact after the init rollout ships an \
              enclava-init that understands the claim)"
                 .into(),

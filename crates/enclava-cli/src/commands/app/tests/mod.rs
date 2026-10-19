@@ -95,7 +95,6 @@ fn test_release() -> PlatformRelease {
             expected_runtime_class: "kata-qemu-snp".to_string(),
             genpolicy_version: "test-genpolicy".to_string(),
             luks2_header_seal: "adopt".to_string(),
-            log_spool_storage: "state-bind-v1".to_string(),
             created_at: "2026-05-09T00:00:00Z".to_string(),
         }
 }
@@ -156,6 +155,7 @@ fn test_deployment_context() -> DeploymentContextResponse {
         tls_certificate_broker_url: None,
         current_platform_release_id: None,
         platform_release_envelope: None,
+        log_spool_state_bind_supported: false,
     }
 }
 
@@ -267,6 +267,7 @@ fn deployment_context_platform_release_is_verified_and_selected() {
         tls_certificate_broker_url: None,
         current_platform_release_id: Some(expected_release_id.clone()),
         platform_release_envelope: Some(envelope),
+        log_spool_state_bind_supported: false,
     };
 
     let release =
@@ -291,6 +292,7 @@ fn deployment_context_platform_release_tampering_fails_closed() {
         tls_certificate_broker_url: None,
         current_platform_release_id: Some(envelope.payload.platform_release_version.clone()),
         platform_release_envelope: Some(envelope),
+        log_spool_state_bind_supported: false,
     };
 
     let err =
@@ -378,6 +380,7 @@ fn signed_cc_hash_app_uses_api_deployment_context_without_env_exports() {
         ),
         current_platform_release_id: None,
         platform_release_envelope: None,
+        log_spool_state_bind_supported: false,
     };
 
     let app = confidential_app_for_cc_hash(

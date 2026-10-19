@@ -396,15 +396,12 @@ The production platform-release envelope is the exception: the new
 re-sign the production envelope with a distinct trustee key before
 deploying this binary — an old envelope will not load.
 
-The `log_spool_storage` claim additionally requires an init-first rollout
-step (cap#290 review): the claim is only rendered once the signed platform
-release carries `log_spool_storage: "state-bind-v1"`, which must be set only
-after the deployed enclava-init image that performs the state-PVC bind is
-live — an older init parses the ConfigMap key but never binds the spool.
-Until the release carries the value, renders stay claim-less and
-claim-bearing artifacts are rejected for re-signing; a leftover
-`ENCLAVA_LOG_SPOOL_STORAGE` that disagrees with the signed value refuses
-API startup.
+The `log_spool_storage` claim is gated by the API deployment, not the
+signed release (cap#290 review): set `ENCLAVA_LOG_SPOOL_STORAGE=
+"state-bind-v1"` on enclava-api atomically with the `ENCLAVA_INIT_IMAGE`
+pin that performs the state-PVC bind. Until set, the API reports the
+capability as unsupported in deployment-context, renders stay claim-less,
+and claim-bearing artifacts are rejected for re-signing.
 
 ### Rotating the production root
 

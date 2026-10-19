@@ -224,15 +224,18 @@ pub fn validate_app(app: &ConfidentialApp) -> Result<(), ValidationError> {
     // rendering a corrupting manifest, and require enough state PVC for
     // the 32 MiB rotation cap plus temp/headroom.
     if crate::manifest::enclava_init_config::log_spool_state_bind(app) {
-        if let Ok(mib) = storage_quantity_mib_ceil(&app.storage.app_data.size)
-            && mib < LOG_SPOOL_MIN_STATE_MIB
+        // Exact rational compare — no rounding: a fractional quantity just
+        // under the floor (e.g. 127.5Mi) must not ceil past it.
+        if let Some((numerator, scale)) = binary_quantity_mib_parts(&app.storage.app_data.size)
+            && numerator < LOG_SPOOL_MIN_STATE_MIB * 10u128.pow(scale)
         {
             return Err(ValidationError::InvalidStorageSize {
                 field: "storage.app_data.size",
                 detail: format!(
                     "guest-memory-v2 log spool binds to the state PVC and needs at \
                      least {LOG_SPOOL_MIN_STATE_MIB}Mi (32Mi rotation cap plus \
-                     rotation-temp and fs/platform headroom), got {mib}Mi"
+                     rotation-temp and fs/platform headroom), got {:?}",
+                    app.storage.app_data.size
                 ),
             });
         }
@@ -378,6 +381,17 @@ fn binary_quantity_parts(trimmed: &str) -> Option<(&str, u128)> {
         .find_map(|(suffix, multiplier)| trimmed.strip_suffix(*suffix).map(|n| (n, *multiplier)))
 }
 
+/// `(numerator, scale)` of a binary quantity in Mi units — an exact
+/// rational (`value_mib = numerator / 10^scale`) so floors can compare
+/// against `MIN * 10^scale` without floats or rounding (mirroring
+/// `validate_persistent_volume_size_for_fresh_provisioning`). `None` for
+/// grammar-invalid values; callers that already ran the storage grammar
+/// may treat that as "no floor opinion".
+fn binary_quantity_mib_parts(value: &str) -> Option<(u128, u32)> {
+    let (number, multiplier) = binary_quantity_parts(value.trim())?;
+    validate_scaled_decimal(number, multiplier).ok()
+}
+
 /// Whether a persistent-volume size parses as a valid binary quantity that
 /// is strictly below [`MIN_VOLUME_SIZE_MIB`]. Only these sizes can need the
 /// fresh-format floor's cluster check; callers must still run
@@ -385,10 +399,7 @@ fn binary_quantity_parts(trimmed: &str) -> Option<(&str, u128)> {
 /// admission error, and grammar-invalid values return false here (they are
 /// rejected by the validator/limits path, not waived by claim evidence).
 pub fn is_sub_floor_volume_size(value: &str) -> bool {
-    let Some((number, multiplier)) = binary_quantity_parts(value) else {
-        return false;
-    };
-    let Ok((numerator, scale)) = validate_scaled_decimal(number, multiplier) else {
+    let Some((numerator, scale)) = binary_quantity_mib_parts(value) else {
         return false;
     };
     numerator < MIN_VOLUME_SIZE_MIB * 10u128.pow(scale)

@@ -1942,13 +1942,13 @@ fn pre_spool_bind_claim_render_match_pins_the_binding() {
 }
 
 #[test]
-fn pre_field_release_rejects_spool_claim_bearing_artifacts() {
-    // cap#290 review (init-first rollout): while the active signed release
-    // predates `log_spool_storage`, an artifact signed over a claim-bearing
-    // render must be REJECTED — a pre-bind enclava-init parses the additive
-    // ConfigMap key but never performs the state-PVC bind, leaving the
-    // spool on the RAM mountpoint. The distinct diagnostic directs the
-    // operator to re-sign after the init rollout.
+fn spool_gate_unsupported_rejects_claim_bearing_artifacts() {
+    // cap#290 review (init-first rollout): while this API deployment does
+    // not declare the `log_spool_storage` bind capability, an artifact
+    // signed over a claim-bearing render must be REJECTED — a pre-bind
+    // enclava-init parses the additive ConfigMap key but never performs the
+    // state-PVC bind, leaving the spool on the RAM mountpoint. The distinct
+    // diagnostic directs the operator to re-sign after the init rollout.
     let descriptor = descriptor();
     let mut app = pinned_app_for_descriptor(&descriptor);
     // The claim only exists under the v2 signed layout.
@@ -1965,9 +1965,9 @@ fn pre_field_release_rejects_spool_claim_bearing_artifacts() {
         &mut app,
         &claim_bearing_hash,
         false,
-        false, // active signed release predates log_spool_storage
+        false, // deployment does not declare log_spool_storage state-bind
     )
-    .expect_err("claim-bearing artifact must be rejected while the release predates the field");
+    .expect_err("claim-bearing artifact must be rejected while the gate is unsupported");
     assert!(
         matches!(&err, SigningServiceError::Mismatch(msg) if msg.contains("log_spool_storage") && msg.contains("re-sign")),
         "expected a re-sign diagnostic naming log_spool_storage, got: {err:?}"
@@ -2004,7 +2004,7 @@ fn required_seal_policy_rejects_claim_less_artifacts() {
         &mut app,
         &pre_seal_hash,
         true, // active signed release: luks2_header_seal = required
-        true, // active signed release: log_spool_storage = state-bind-v1
+        true, // deployment declares log_spool_storage = state-bind-v1
     )
     .expect_err("claim-less artifact must be rejected under a required seal");
     assert!(
@@ -2031,7 +2031,7 @@ fn required_seal_policy_still_accepts_modern_render() {
         &mut app,
         &modern_hash,
         true, // active signed release: luks2_header_seal = required
-        true, // active signed release: log_spool_storage = state-bind-v1
+        true, // deployment declares log_spool_storage = state-bind-v1
     )
     .expect("modern render must still validate under a required seal");
     let binding = app.workload_artifact_binding.as_ref().unwrap();

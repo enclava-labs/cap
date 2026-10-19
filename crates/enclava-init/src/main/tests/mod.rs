@@ -1265,6 +1265,102 @@ fn log_spool_prepare_retires_previous_key_generation() {
 }
 
 #[test]
+fn log_spool_prepare_removes_symlinked_keep_without_touching_referent() {
+    let dir = tempdir().unwrap();
+    let state_root = dir.path().join("state");
+    let spool_path = state_root.join(".enclava").join("log-spool");
+    std::fs::create_dir_all(&spool_path).unwrap();
+
+    let keep = "web-abc.jsonl";
+    let outside = dir.path().join("outside-target.jsonl");
+    std::fs::write(&outside, b"tenant data").unwrap();
+    let ctime_before = std::fs::metadata(&outside).unwrap().ctime_nsec();
+    std::os::unix::fs::symlink(&outside, spool_path.join(keep)).unwrap();
+
+    prepare_spool(&state_root, keep).unwrap();
+
+    assert!(
+        std::fs::symlink_metadata(spool_path.join(keep)).is_err(),
+        "a symlinked keep entry must be unlinked, never followed"
+    );
+    assert_eq!(
+        std::fs::metadata(&outside).unwrap().ctime_nsec(),
+        ctime_before,
+        "the outside referent must be untouched (no chown/chmod followed the link)"
+    );
+    assert_eq!(std::fs::read(&outside).unwrap(), b"tenant data");
+}
+
+#[test]
+fn log_spool_prepare_removes_fifo_keep() {
+    let dir = tempdir().unwrap();
+    let state_root = dir.path().join("state");
+    let spool_path = state_root.join(".enclava").join("log-spool");
+    std::fs::create_dir_all(&spool_path).unwrap();
+
+    let keep = "web-abc.jsonl";
+    nix::unistd::mkfifo(
+        &spool_path.join(keep),
+        nix::sys::stat::Mode::from_bits_truncate(0o644),
+    )
+    .unwrap();
+
+    prepare_spool(&state_root, keep).unwrap();
+
+    assert!(
+        std::fs::symlink_metadata(spool_path.join(keep)).is_err(),
+        "a FIFO keep entry must be unlinked"
+    );
+}
+
+#[test]
+fn log_spool_prepare_keeps_regular_file_and_normalizes_mode() {
+    let dir = tempdir().unwrap();
+    let state_root = dir.path().join("state");
+    let spool_path = state_root.join(".enclava").join("log-spool");
+    std::fs::create_dir_all(&spool_path).unwrap();
+
+    let keep = "web-abc.jsonl";
+    let keep_path = spool_path.join(keep);
+    std::fs::write(&keep_path, b"existing frames\n").unwrap();
+    // A planted unwritable inode must not wedge wait-exec. (The test runs
+    // unprivileged, so use 0o400: production init is uid 0 and opens even
+    // a 0o000 inode through the same code path.)
+    std::fs::set_permissions(&keep_path, std::fs::Permissions::from_mode(0o400)).unwrap();
+
+    prepare_spool(&state_root, keep).unwrap();
+
+    assert_eq!(
+        std::fs::read(&keep_path).unwrap(),
+        b"existing frames\n",
+        "the regular keep file's content must survive"
+    );
+    assert_eq!(
+        std::fs::metadata(&keep_path).unwrap().permissions().mode() & 0o777,
+        0o640,
+        "the keep file's mode must be normalized to 0o640"
+    );
+}
+
+#[test]
+fn log_spool_prepare_removes_empty_dir_keep() {
+    let dir = tempdir().unwrap();
+    let state_root = dir.path().join("state");
+    let spool_path = state_root.join(".enclava").join("log-spool");
+    std::fs::create_dir_all(&spool_path).unwrap();
+
+    let keep = "web-abc.jsonl";
+    std::fs::create_dir(spool_path.join(keep)).unwrap();
+
+    prepare_spool(&state_root, keep).unwrap();
+
+    assert!(
+        std::fs::symlink_metadata(spool_path.join(keep)).is_err(),
+        "an empty directory keep entry must be removed"
+    );
+}
+
+#[test]
 fn log_spool_capacity_floor() {
     assert!(!log_spool_capacity_sufficient(
         LOG_SPOOL_MIN_STATE_BYTES - 1

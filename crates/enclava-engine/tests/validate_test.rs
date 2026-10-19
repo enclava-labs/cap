@@ -202,28 +202,34 @@ fn v2_app_with_logs(storage_paths: Vec<String>) -> enclava_engine::types::Confid
 #[test]
 fn v2_spool_layout_rejects_state_volume_too_small_for_the_spool() {
     // cap#290 round-2 review: the bind moves the 32 MiB-rotation spool onto
-    // the state PVC; a sub-floor volume wedges the workload on ENOSPC.
-    let mut app = v2_app_with_logs(Vec::new());
-    app.storage.app_data.size = "64Mi".to_string();
-    let err = validate_app(&app).unwrap_err();
-    assert!(
-        matches!(
-            &err,
-            ValidationError::InvalidStorageSize { field, .. } if *field == "storage.app_data.size"
-        ),
-        "expected InvalidStorageSize for storage.app_data.size, got: {err:?}"
-    );
+    // the state PVC; a sub-floor volume wedges the workload on ENOSPC. The
+    // compare is exact (no ceil): 127.5Mi must NOT sneak past as 128Mi.
+    for size in ["64Mi", "127.5Mi"] {
+        let mut app = v2_app_with_logs(Vec::new());
+        app.storage.app_data.size = size.to_string();
+        let err = validate_app(&app).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                ValidationError::InvalidStorageSize { field, .. } if *field == "storage.app_data.size"
+            ),
+            "{size}: expected InvalidStorageSize for storage.app_data.size, got: {err:?}"
+        );
+    }
 
-    let mut app = v2_app_with_logs(Vec::new());
-    app.storage.app_data.size = "128Mi".to_string();
-    assert!(
-        !matches!(
-            &validate_app(&app),
-            Err(ValidationError::InvalidStorageSize { field, .. })
-                if *field == "storage.app_data.size"
-        ),
-        "128Mi must satisfy the spool capacity gate"
-    );
+    // 128Mi exactly and its fractional-Gi spelling both satisfy the floor.
+    for size in ["128Mi", "0.125Gi"] {
+        let mut app = v2_app_with_logs(Vec::new());
+        app.storage.app_data.size = size.to_string();
+        assert!(
+            !matches!(
+                &validate_app(&app),
+                Err(ValidationError::InvalidStorageSize { field, .. })
+                    if *field == "storage.app_data.size"
+            ),
+            "{size} must satisfy the spool capacity gate"
+        );
+    }
 }
 
 #[test]

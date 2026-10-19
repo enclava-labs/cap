@@ -45,10 +45,10 @@ pub(crate) const LOG_SPOOL_STORAGE_STATE_BIND: &str = "state-bind-v1";
 /// True when the rendered pod mounts the log spool as a Memory mountpoint
 /// that enclava-init must re-bind onto the encrypted state PVC: v2 signed
 /// layout with encrypted logging whose signed claims are the modern render
-/// (pins absent or cleared) AND the active platform release declares the
-/// deployed enclava-init understands the claim (init-first rollout,
-/// cap#290 review) — the ConfigMap must never enable the bind ahead of the
-/// init rollout.
+/// (pins absent or cleared) AND the API deployment declares the deployed
+/// enclava-init understands the claim (deployment-context gate, cap#290
+/// review) — the ConfigMap must never enable the bind ahead of the init
+/// rollout.
 pub(crate) fn log_spool_state_bind(app: &ConfidentialApp) -> bool {
     if app.log_encryption.is_none() || volume_layout(app) != VolumeLayout::GuestMemoryV2 {
         return false;

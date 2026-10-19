@@ -596,6 +596,16 @@ pub(crate) async fn build_signed_deploy_blobs(
     }
 
     let (deployment_context, release) = fetch_verified_platform_release(api, paths).await?;
+
+    // cap#290 review (version-skew): the log-spool bind gate is an API
+    // DEPLOYMENT capability read from deployment-context, deliberately NOT
+    // signed release metadata — a canonical signed field would break
+    // release-signature verification on every previously released CLI, so
+    // ops declares it in the API environment (atomically with the
+    // bind-capable ENCLAVA_INIT_IMAGE pin) and it affects
+    // availability/persistence only. Older APIs omit the field and default
+    // to false; their pre-bind init cannot act on the claim anyway.
+    let log_spool_state_bind_supported = deployment_context.log_spool_state_bind_supported;
     let policy_template_sha256 = release.policy_template_sha256_bytes()?;
     let _signing_service_pubkey = release.signing_service_pubkey_bytes()?;
     let proxy_image = enclava_common::image::ImageRef::parse(&release.attestation_proxy_image)?;
@@ -734,9 +744,11 @@ pub(crate) async fn build_signed_deploy_blobs(
     // the binding to the claim-less render so both producers hash identical
     // bytes; the guest side defaults a missing claim to the rollout-window
     // ("adopt") semantics. Releases carrying the field sign the full render.
-    // Same for `log_spool_storage` (cap#290 review): a release without the
-    // field pins an enclava-init image that cannot perform the state-PVC
-    // bind, so the render must omit the claim AND the ConfigMap enablement.
+    // The `log_spool_storage` claim follows the deployment-context gate
+    // (cap#290 review): an API whose deployment does not declare the
+    // state-bind capability renders claim-less cc_init_data, so the signed
+    // render must omit the claim AND the ConfigMap enablement to hash
+    // identical bytes.
     let release_carries_seal_claim = !release.luks2_header_seal.is_empty();
     let workload_artifact_binding = WorkloadArtifactBinding {
         descriptor_core_hash,
@@ -745,7 +757,7 @@ pub(crate) async fn build_signed_deploy_blobs(
         omit_log_encryption_claim: false,
         legacy_collapsed_trustee_key: false,
         omit_luks2_header_seal_claim: !release_carries_seal_claim,
-        omit_log_spool_bind_claim: release.log_spool_storage != "state-bind-v1",
+        omit_log_spool_bind_claim: !log_spool_state_bind_supported,
     };
     let (generated_agent_policy, log_encryption) =
         fetch_generated_agent_policy(api, &release, &descriptor).await?;
@@ -781,10 +793,14 @@ pub(crate) async fn build_signed_deploy_blobs(
         // signed value, so the signed expected_cc_init_data_hash can only
         // match when both producers agree by construction.
         luks2_header_seal: release.luks2_header_seal_claim(),
-        // Same signed-release sourcing as the seal claim: empty means the
-        // release predates the field and no log_spool_storage claim is
-        // rendered (init-first rollout).
-        log_spool_storage: release.log_spool_storage_claim(),
+        // Same deployment-context sourcing as the binding flag: empty means
+        // the serving API's deployment does not declare the bind capability
+        // and no log_spool_storage claim is rendered.
+        log_spool_storage: if log_spool_state_bind_supported {
+            "state-bind-v1".to_string()
+        } else {
+            String::new()
+        },
     };
     let cc_init_data_hash: [u8; 32] =
         Sha256::digest(cc_init_data::build_toml_with_options(&cc_app, &cc_init_options).as_bytes())

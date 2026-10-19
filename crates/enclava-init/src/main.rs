@@ -1896,6 +1896,63 @@ fn prepare_log_spool_dir_at(
         }
     }
 
+    // The current-generation keep entry must be a regular file or absent:
+    // a planted symlink/FIFO would be followed by wait-exec's append path
+    // (writing outside the spool), and a directory would shadow the file
+    // the workload writes. fstatat without following; a non-regular entry
+    // is unlinked, a non-empty directory fails closed (cap#290 round-3
+    // review).
+    let keep_cname = std::ffi::CString::new(keep_file_name)
+        .map_err(|_| anyhow!("log spool keep file name contains NUL"))?;
+    match nix::sys::stat::fstatat(
+        Some(spool.as_raw_fd()),
+        keep_cname.as_c_str(),
+        nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
+    ) {
+        Err(nix::errno::Errno::ENOENT) => {}
+        Err(err) => return Err(err).context("stating log spool file"),
+        Ok(stat) => match stat.st_mode & nix::libc::S_IFMT {
+            m if m == nix::libc::S_IFREG => {
+                // Normalize mode on the verified inode: a planted 0o000
+                // spool must not wedge wait-exec. The openat O_NOFOLLOW
+                // closes the stat->open swap race.
+                let fd = nix::fcntl::openat(
+                    Some(spool.as_raw_fd()),
+                    keep_cname.as_c_str(),
+                    nix::fcntl::OFlag::O_NOFOLLOW | nix::fcntl::OFlag::O_CLOEXEC,
+                    nix::sys::stat::Mode::empty(),
+                )
+                .with_context(|| format!("opening log spool file {keep_file_name}"))?;
+                let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+                nix::sys::stat::fchmod(
+                    fd.as_raw_fd(),
+                    nix::sys::stat::Mode::from_bits_truncate(0o640),
+                )
+                .context("chmod log spool file")?;
+            }
+            m if m == nix::libc::S_IFDIR => {
+                nix::unistd::unlinkat(
+                    Some(spool.as_raw_fd()),
+                    keep_cname.as_c_str(),
+                    nix::unistd::UnlinkatFlags::RemoveDir,
+                )
+                .with_context(|| {
+                    format!("removing directory {keep_file_name} from the log spool dir")
+                })?;
+            }
+            _ => {
+                nix::unistd::unlinkat(
+                    Some(spool.as_raw_fd()),
+                    keep_cname.as_c_str(),
+                    nix::unistd::UnlinkatFlags::NoRemoveDir,
+                )
+                .with_context(|| {
+                    format!("removing non-regular {keep_file_name} from the log spool dir")
+                })?;
+            }
+        },
+    }
+
     // The spool survives on the state PVC across profile changes:
     // entries written under a root-running workload stay root:root and
     // would wedge a redeploy to the restricted identity. Reconcile

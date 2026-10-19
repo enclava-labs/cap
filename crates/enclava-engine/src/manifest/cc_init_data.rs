@@ -93,28 +93,30 @@ pub fn validate_luks2_header_seal_claim(value: &str) -> String {
     }
 }
 
-/// Log-spool state-bind rollout claim rendered into the signed
-/// cc_init_data (cap#289/290 review): "state-bind-v1" once the deployed
-/// enclava-init understands the claim (init-first rollout), empty for
-/// releases signed before the field existed — those pin init images that
-/// parse the additive ConfigMap key but have no binding logic, so they
-/// must neither emit the claim nor enable the bind. Sourced like the seal
-/// claim: installed from the signed platform release at startup so every
-/// producer of `expected_cc_init_data_hash` renders identical bytes; the
-/// environment variable is only a release-less dev/test fallback, and
-/// enclava-api refuses to start when it conflicts with the signed value.
+/// Log-spool state-bind deployment claim rendered into cc_init_data
+/// (cap#290 review): "state-bind-v1" once the API deployment declares that
+/// its deployed enclava-init understands the claim and performs the
+/// state-PVC bind, empty otherwise. The gate is deliberately NOT signed
+/// platform-release metadata — a canonical signed field would break
+/// release-signature verification on previously released CLIs; it is an
+/// API deployment capability that affects availability/persistence only.
+/// enclava-api installs the gate at startup from its deployment
+/// environment (which ops sets atomically with the bind-capable init-image
+/// pin) so every producer of `expected_cc_init_data_hash` renders
+/// identical bytes; the environment variable is only a release-less
+/// dev/test fallback, and under an installed gate the env is not consulted.
 static LOG_SPOOL_STORAGE_CLAIM: OnceLock<String> = OnceLock::new();
 
-/// Install the release-sourced spool-storage claim (called once at process
-/// startup by producers that have verified a signed platform release). An
-/// empty value is the unsupported sentinel for pre-field releases.
+/// Install the deployment-gate spool-storage claim (called once at API
+/// startup by producers running under a signed platform release). An empty
+/// value is the unsupported sentinel for deployments that did not opt in.
 pub fn set_log_spool_storage_claim(value: &str) {
     let value = validate_log_spool_storage_claim(value);
     // First write wins; startup runs this exactly once per process.
     let _ = LOG_SPOOL_STORAGE_CLAIM.set(value);
 }
 
-/// The claim value rendered into cc_init_data: the release-installed value
+/// The claim value rendered into cc_init_data: the startup-installed value
 /// (including the empty unsupported sentinel) when set, else the dev/test
 /// environment fallback, else "state-bind-v1" for release-less dev.
 pub fn log_spool_storage_claim() -> String {
@@ -128,8 +130,11 @@ pub fn log_spool_storage_claim() -> String {
 }
 
 /// Pure precedence rule, testable without process-global state.
-fn resolve_log_spool_storage_claim(release_value: Option<&str>, env_value: Option<&str>) -> String {
-    if let Some(value) = release_value {
+fn resolve_log_spool_storage_claim(
+    installed_value: Option<&str>,
+    env_value: Option<&str>,
+) -> String {
+    if let Some(value) = installed_value {
         return validate_log_spool_storage_claim(value.trim());
     }
     match env_value {
@@ -151,9 +156,9 @@ pub fn validate_log_spool_storage_claim(value: &str) -> String {
     }
 }
 
-/// Whether the active platform release declares that the deployed
-/// enclava-init understands the `log_spool_storage` claim and performs the
-/// state-PVC bind (init-first rollout gate, cap#290 review).
+/// Whether the API deployment declares that its deployed enclava-init
+/// understands the `log_spool_storage` claim and performs the state-PVC
+/// bind (deployment-context rollout gate, cap#290 review).
 pub fn log_spool_bind_supported() -> bool {
     log_spool_storage_claim() == crate::manifest::enclava_init_config::LOG_SPOOL_STORAGE_STATE_BIND
 }
@@ -168,10 +173,10 @@ pub struct CcInitDataOptions {
     /// (enclava-api render, hosted/local CLI signing) renders identical
     /// bytes instead of each process reading its private environment.
     pub luks2_header_seal: String,
-    /// Log-spool state-bind rollout claim (cap#289, init-first rollout
-    /// gate): same render-option reasoning as `luks2_header_seal`; empty
-    /// means the active release predates the field and no claim may be
-    /// emitted.
+    /// Log-spool state-bind claim (cap#289, deployment gate): same
+    /// render-option reasoning as `luks2_header_seal`; empty means the
+    /// serving API's deployment does not declare the capability and no
+    /// claim may be emitted.
     pub log_spool_storage: String,
 }
 

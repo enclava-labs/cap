@@ -212,17 +212,12 @@ fn encrypted_log_config_from_raw_env(
         .trim()
         .to_string();
     validate_sentinel_name(&container)?;
-    // The env-provided path still selects the spool's parent directory in
-    // non-prod-strict builds, but the file name is always key-namespaced so
-    // a recipient change can never interleave with the previous
-    // generation's spool.
+    // A set env path is used verbatim (non-prod-strict only): the operator
+    // pairs this writer's spool with the relay's explicitly. Only the
+    // default location gets the key-namespaced file name so a recipient
+    // change can never interleave with the previous generation's spool.
     let spool_path = env::var_os("ENCLAVA_LOG_SPOOL_PATH")
         .map(PathBuf::from)
-        .map(|p| {
-            p.parent()
-                .unwrap_or(Path::new(""))
-                .join(spool_file_name(&container, &recipient))
-        })
         .unwrap_or_else(|| {
             PathBuf::from(DEFAULT_LOG_SPOOL_DIR).join(spool_file_name(&container, &recipient))
         });
@@ -1838,16 +1833,13 @@ mod tests {
             PathBuf::from(DEFAULT_LOG_SPOOL_DIR).join(&expected)
         );
 
-        // An env-provided spool path still selects the parent directory,
-        // but the file name stays key-namespaced: its basename is ignored.
+        // An env-provided spool path is used verbatim: the operator pairs
+        // this writer's spool with the relay's explicitly in dev.
         unsafe {
             env::set_var("ENCLAVA_LOG_SPOOL_PATH", "/tmp/spools/legacy.jsonl");
         }
         let config = encrypted_log_config_from_env("web").unwrap().unwrap();
-        assert_eq!(
-            config.spool_path,
-            PathBuf::from("/tmp/spools").join(&expected)
-        );
+        assert_eq!(config.spool_path, PathBuf::from("/tmp/spools/legacy.jsonl"));
         unsafe {
             env::remove_var("ENCLAVA_LOG_SPOOL_PATH");
         }
