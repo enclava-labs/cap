@@ -462,6 +462,27 @@ and manual dispatches. For non-PR events it also uploads an
 
 Deploy the digest reference from that artifact, not a mutable tag.
 
+For preprod's separate release root, configure the GitHub `preprod`
+environment with its existing `ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX`
+and `ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON` values. Restrict that
+environment to the reviewed `main` branch, then publish explicitly:
+
+```bash
+gh workflow run api-image.yml --repo enclava-labs/cap --ref main \
+  -f release_environment=preprod -f version_tag=manual-preprod-release
+```
+
+The `default` environment inherits the repository secrets used by ordinary
+pushes, tags and dispatches. Preprod prefixes every API and appraiser tag with
+`preprod-`, including supplied manual tags, and uses a separate concurrency
+lane; it replaces neither default tags nor repository-wide secrets. Record the
+manual build's `workflow_dispatch` trigger when selecting its signed digest in ops. Before
+deployment, verify that the image accepts preprod's existing signed envelope;
+do not rotate cluster trust to accommodate an image built for another root.
+
+Preprod manual tag inputs may contain at most 120 characters, including
+`manual-`, so the added namespace stays within Docker's 128-character limit.
+
 ## Kubernetes
 
 The checked-in overlay is intentionally minimal:
