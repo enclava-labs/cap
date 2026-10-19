@@ -49,9 +49,17 @@ on:
         description: "Optional additional image tag. Manual tags must start with manual-."
         required: false
         type: string
+      release_environment:
+        description: "Release-root secret scope for a manual build"
+        required: false
+        type: choice
+        default: default
+        options:
+          - default
+          - preprod
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ inputs.release_environment == 'preprod' && 'preprod' || 'default' }}
   cancel-in-progress: true
 
 jobs:
@@ -119,6 +127,7 @@ jobs:
     name: Publish signed API image
     if: github.event_name == 'workflow_dispatch' || (github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref_type == 'tag'))
     runs-on: ubuntu-latest
+    environment: ${{ inputs.release_environment == 'preprod' && 'preprod' || 'default' }}
     permissions:
       contents: read
       id-token: write

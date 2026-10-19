@@ -462,6 +462,23 @@ and manual dispatches. For non-PR events it also uploads an
 
 Deploy the digest reference from that artifact, not a mutable tag.
 
+For preprod's separate release root, configure the GitHub `preprod`
+environment with its existing `ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX`
+and `ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON` values. Restrict that
+environment to the reviewed `main` branch, then publish explicitly:
+
+```bash
+gh workflow run api-image.yml --repo enclava-labs/cap --ref main \
+  -f release_environment=preprod -f version_tag=manual-preprod-release
+```
+
+The `default` environment inherits the repository secrets used by ordinary
+pushes, tags and dispatches. Preprod builds use a separate concurrency lane;
+they do not replace those repository-wide secrets. Record the manual build's
+`workflow_dispatch` trigger when selecting its signed digest in ops. Before
+deployment, verify that the image accepts preprod's existing signed envelope;
+do not rotate cluster trust to accommodate an image built for another root.
+
 ## Kubernetes
 
 The checked-in overlay is intentionally minimal:
