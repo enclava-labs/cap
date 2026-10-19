@@ -7516,9 +7516,8 @@ mod tests {
         assert_eq!(outcome.error_code, None);
     }
 
-    /// Kubernetes API double for `ingress_restart_verdict`: exact-path GET
-    /// responses, 404 `Status` for anything absent — the same shape the real
-    /// API server returns to `get`/`get_opt`.
+    /// Kubernetes API double for `ingress_restart_verdict`, including empty
+    /// pod lists and 404 responses for absent individual resources.
     struct GateCluster {
         responses: std::collections::HashMap<String, (u16, serde_json::Value)>,
     }
@@ -7543,6 +7542,11 @@ mod tests {
                 }),
             );
             cluster.with_claims(namespace, workload, &["state", "tls-state"]);
+            cluster.put(
+                format!("/api/v1/namespaces/{namespace}/pods"),
+                200,
+                serde_json::json!({"apiVersion": "v1", "kind": "PodList", "items": []}),
+            );
             cluster
         }
 
@@ -7573,10 +7577,7 @@ mod tests {
             let state_claim = format!("state-{workload}-0");
             let tls_claim = format!("tls-state-{workload}-0");
             let ready_status = if ready { "True" } else { "False" };
-            self.put(
-                format!("/api/v1/namespaces/{namespace}/pods/{pod_name}"),
-                200,
-                serde_json::json!({
+            let pod = serde_json::json!({
                     "apiVersion": "v1",
                     "kind": "Pod",
                     "metadata": {
@@ -7599,7 +7600,11 @@ mod tests {
                             "status": ready_status,
                         }],
                     },
-                }),
+            });
+            self.put(
+                format!("/api/v1/namespaces/{namespace}/pods"),
+                200,
+                serde_json::json!({"apiVersion": "v1", "kind": "PodList", "items": [pod]}),
             );
         }
 
