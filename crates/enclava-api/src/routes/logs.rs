@@ -449,12 +449,11 @@ fn build_tenant_tee_http_client_with_builder(
 ) -> Result<reqwest::Client, reqwest::Error> {
     let mut builder = builder
         .https_only(true)
-        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(std::time::Duration::from_secs(5))
         .danger_accept_invalid_certs(accepts_invalid_tenant_tee_certs());
     if let Some(socket) = socket {
-        builder = builder.resolve(confidential_domain, socket);
+        builder = builder.no_proxy().resolve(confidential_domain, socket);
     }
 
     // Startup already validates the same CA inputs while constructing the
@@ -625,12 +624,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolved_tenant_tee_client_bypasses_configured_proxy() {
+    async fn tenant_tee_clients_preserve_internal_and_public_proxy_routing() {
         let direct = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let direct_socket = direct.local_addr().unwrap();
         let proxy_url = format!("http://{}", proxy.local_addr().unwrap());
-        let builder = reqwest::Client::builder().proxy(reqwest::Proxy::all(proxy_url).unwrap());
+        let builder =
+            reqwest::Client::builder().proxy(reqwest::Proxy::all(proxy_url.as_str()).unwrap());
         let client = build_tenant_tee_http_client_with_builder(
             builder,
             "tenant.example.test",
@@ -659,5 +659,22 @@ mod tests {
                 .await
                 .is_err()
         );
+
+        let builder = reqwest::Client::builder().proxy(reqwest::Proxy::all(proxy_url).unwrap());
+        let client =
+            build_tenant_tee_http_client_with_builder(builder, "tenant.example.test", None)
+                .unwrap();
+        let request = tokio::spawn(async move {
+            client
+                .get("https://tenant.example.test/healthz")
+                .send()
+                .await
+        });
+        let (stream, _) = tokio::time::timeout(std::time::Duration::from_secs(1), proxy.accept())
+            .await
+            .expect("public fallback used the configured proxy")
+            .unwrap();
+        drop(stream);
+        assert!(request.await.unwrap().is_err());
     }
 }
