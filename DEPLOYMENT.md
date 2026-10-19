@@ -388,8 +388,10 @@ renders the exact signed bytes, so the workload boots exactly as it did
 before the upgrade. No workload-artifact re-signing is required before
 rollout; re-deploying (re-signing) an app moves it to the split layout. The
 same render-pin mechanism covers artifacts signed before the
-`log_encryption_json` claim existed (`omit_log_encryption_claim`). The
-production platform-release envelope is the exception: the new
+`log_encryption_json` claim existed (`omit_log_encryption_claim`), before
+the `luks2_header_seal` claim existed (`omit_luks2_header_seal_claim`), and
+before the `log_spool_storage` claim existed (`omit_log_spool_bind_claim`).
+The production platform-release envelope is the exception: the new
 `platform_trustee_policy_pubkey_hex` field is required with no default, so
 re-sign the production envelope with a distinct trustee key before
 deploying this binary — an old envelope will not load.

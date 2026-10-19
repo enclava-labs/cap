@@ -519,6 +519,7 @@ impl DeploymentSigningArtifacts {
             omit_log_encryption_claim: false,
             legacy_collapsed_trustee_key: false,
             omit_luks2_header_seal_claim: false,
+            omit_log_spool_bind_claim: false,
         }
     }
 
@@ -1806,14 +1807,18 @@ fn pin_matching_cc_init_data_render(
         }
         for collapsed_trustee in [false, true] {
             for omit_log in [false, true] {
-                if let Some(binding) = app.workload_artifact_binding.as_mut() {
-                    binding.omit_log_encryption_claim = omit_log;
-                    binding.omit_luks2_header_seal_claim = omit_seal;
-                    binding.legacy_collapsed_trustee_key = collapsed_trustee;
-                }
-                let (_, hash) = enclava_engine::manifest::cc_init_data::compute_cc_init_data(app);
-                if hash == expected_hash_hex {
-                    return Ok(());
+                for omit_spool_bind in [false, true] {
+                    if let Some(binding) = app.workload_artifact_binding.as_mut() {
+                        binding.omit_log_encryption_claim = omit_log;
+                        binding.omit_luks2_header_seal_claim = omit_seal;
+                        binding.legacy_collapsed_trustee_key = collapsed_trustee;
+                        binding.omit_log_spool_bind_claim = omit_spool_bind;
+                    }
+                    let (_, hash) =
+                        enclava_engine::manifest::cc_init_data::compute_cc_init_data(app);
+                    if hash == expected_hash_hex {
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -1822,6 +1827,7 @@ fn pin_matching_cc_init_data_render(
         binding.omit_log_encryption_claim = false;
         binding.omit_luks2_header_seal_claim = false;
         binding.legacy_collapsed_trustee_key = false;
+        binding.omit_log_spool_bind_claim = false;
     }
     if seal_required {
         return Err(SigningServiceError::Mismatch(
@@ -1953,6 +1959,7 @@ fn decode_loaded_workload_artifacts(
             omit_log_encryption_claim: false,
             legacy_collapsed_trustee_key: false,
             omit_luks2_header_seal_claim: false,
+            omit_log_spool_bind_claim: false,
         },
         trustee_policy_json: trustee_policy_json(&signed_policy_artifact)?,
         workload_artifacts_json: serde_json::to_string(&artifacts_json)?,
@@ -2121,6 +2128,7 @@ pub async fn load_workload_artifact_binding(
             omit_log_encryption_claim: false,
             legacy_collapsed_trustee_key: false,
             omit_luks2_header_seal_claim: false,
+            omit_log_spool_bind_claim: false,
         },
         signed_policy_artifact,
     )))

@@ -501,6 +501,14 @@ fn caddy_tls_bind_source_is_below_tls_state_root() {
 }
 
 #[test]
+fn log_spool_state_dir_is_below_state_root() {
+    assert_eq!(
+        log_spool_state_dir(Path::new("/state")),
+        PathBuf::from("/state/enclava-logs")
+    );
+}
+
+#[test]
 fn static_broker_tls_does_not_back_sync_ephemeral_caddy_runtime() {
     let dir = tempdir().unwrap();
     let mut cfg = config_with_signed_cc(dir.path(), "");
@@ -990,6 +998,44 @@ fn signed_cc_init_data_mismatch_rejects_changed_mode() {
 }
 
 #[test]
+fn signed_cc_init_data_mismatch_rejects_unsigned_spool_storage() {
+    // cap#289: a ConfigMap `spool-storage` value the signed cc_init_data
+    // does not claim must fail the transport cross-check — the host cannot
+    // silently rebind the spool onto its own disk.
+    let dir = tempdir().unwrap();
+    let mut cfg = config_with_matching_signed_cc(dir.path());
+    cfg.log_encryption = Some(LogEncryptionSection {
+        spool_storage: Some("state-bind-v1".to_string()),
+        ..Default::default()
+    });
+
+    let err = validate_transport(&cfg).unwrap_err();
+    assert!(err.to_string().contains("log_spool_storage"));
+}
+
+#[test]
+fn signed_cc_init_data_accepts_matching_spool_storage_claim() {
+    let dir = tempdir().unwrap();
+    let mut cfg = unsigned_config();
+    cfg.log_encryption = Some(LogEncryptionSection {
+        spool_storage: Some("state-bind-v1".to_string()),
+        ..Default::default()
+    });
+    let mut cc_body = signed_cc_claims_toml(&cfg);
+    cc_body.push_str("log_spool_storage = \"state-bind-v1\"\n");
+    let cc_path = dir.path().join("cc-init-data.toml");
+    cfg.cc_init_data_path = Some(cc_path.display().to_string());
+    std::fs::write(&cc_path, cc_body).unwrap();
+
+    // Matching claim/section passes the transport check; the fixture has no
+    // signed log_encryption_json, so the handoff itself stays disabled.
+    assert!(matches!(
+        validate_transport(&cfg).unwrap(),
+        LogEncryptionHandoffFile::DisabledMarker
+    ));
+}
+
+#[test]
 fn password_mode_signed_cc_init_data_binds_mode_claim() {
     let dir = tempdir().unwrap();
     let mut cfg = unsigned_config();
@@ -1057,6 +1103,7 @@ fn log_encryption_handoff_uses_single_cc_init_data_snapshot() {
         key_id: Some("k1".to_string()),
         public_key_base64url: Some("key-material-b64url".to_string()),
         public_key_sha256: Some("aa".repeat(32)),
+        spool_storage: None,
     });
     let mut cc_body = signed_cc_claims_toml(&cfg);
     let claim_json = serde_json::to_string(&serde_json::json!({

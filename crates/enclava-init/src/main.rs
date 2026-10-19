@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use enclava_init::chown::{self, ExecIdentity, IdentityKind};
 use enclava_init::config::{
-    Config, LogEncryptionHandoff, LogEncryptionHandoffFile, Mode, VolumeConfig,
+    Config, LOG_SPOOL_STORAGE_STATE_BIND, LogEncryptionHandoff, LogEncryptionHandoffFile, Mode,
+    VolumeConfig,
 };
 use enclava_init::safe_diagnostics::SafeBootstrapDiagnostic;
 use enclava_init::secrets::{DerivedSeed, OwnerSeed, Password};
@@ -166,6 +167,8 @@ fn run() -> Result<()> {
     )?;
     record_stage("preparing mount ownership").ok();
     prepare_mount_ownership(&cfg)?;
+    bind_log_spool_to_state(&cfg, &log_encryption_handoff)
+        .context("binding log spool to encrypted state")?;
 
     record_stage("provisioning static tls certificate").ok();
     provision_static_tls_certificate(&cfg).context("provisioning static TLS certificate")?;
@@ -752,6 +755,14 @@ fn validate_configmap_transport_against_signed_cc_init_data(
             "signing-service-pubkey-hex",
         )?;
     }
+    require_optional_signed_config_match(
+        data,
+        "log_spool_storage",
+        cfg.log_encryption
+            .as_ref()
+            .and_then(|section| section.spool_storage.as_deref()),
+        "log-encryption.spool-storage",
+    )?;
     let handoff = signed_log_encryption_handoff(data, cfg)?;
 
     Ok(handoff)
@@ -1433,6 +1444,16 @@ fn prepare_mount_ownership(cfg: &Config) -> Result<()> {
     chown::chown_recursive(&caddy_seed_dir, caddy_identity)
         .with_context(|| format!("chown {}", caddy_seed_dir.display()))?;
 
+    if log_spool_state_bind_enabled(cfg) {
+        let spool_dir = log_spool_state_dir(Path::new(&cfg.state_root));
+        std::fs::create_dir_all(&spool_dir)
+            .with_context(|| format!("creating {}", spool_dir.display()))?;
+        chown::chown(&spool_dir, numeric_identity(0, cfg.app_gid))
+            .with_context(|| format!("chown {}", spool_dir.display()))?;
+        fs::set_permissions(&spool_dir, fs::Permissions::from_mode(0o2770))
+            .with_context(|| format!("chmod {}", spool_dir.display()))?;
+    }
+
     for bind in &cfg.app_bind_mounts {
         let dir = app_bind_mount_dir(state_root, &bind.subdir)?;
         std::fs::create_dir_all(&dir).with_context(|| {
@@ -1623,6 +1644,42 @@ fn sync_dir_contents(src: &Path, dst: &Path) -> Result<()> {
 
 fn caddy_tls_bind_dir(tls_state_root: &Path) -> PathBuf {
     tls_state_root.join("tenant-ingress")
+}
+
+/// Whether the signed/config render pins the log spool onto the encrypted
+/// state PVC (`[log-encryption] spool-storage = "state-bind-v1"`, cap#289).
+fn log_spool_state_bind_enabled(cfg: &Config) -> bool {
+    cfg.log_encryption.as_ref().is_some_and(|section| {
+        section.spool_storage.as_deref() == Some(LOG_SPOOL_STORAGE_STATE_BIND)
+    })
+}
+
+/// Spool source directory on the encrypted state volume.
+fn log_spool_state_dir(state_root: &Path) -> PathBuf {
+    state_root.join("enclava-logs")
+}
+
+/// Re-bind the "logs" Memory emptyDir mountpoint onto the encrypted state
+/// PVC so the plaintext spool is bounded by the PVC, not host disk
+/// (cap#289). Runs after LUKS unlock, before readiness; the pod mount
+/// propagations (Bidirectional here, HostToContainer on the app side) carry
+/// the re-bind to the workload. No-op for any layout that did not opt in.
+fn bind_log_spool_to_state(cfg: &Config, handoff: &LogEncryptionHandoffFile) -> Result<()> {
+    if !log_spool_state_bind_enabled(cfg)
+        || !matches!(handoff, LogEncryptionHandoffFile::Enabled(_))
+    {
+        return Ok(());
+    }
+    let source = log_spool_state_dir(Path::new(&cfg.state_root));
+    let target = Path::new("/run/enclava-logs");
+    nix::mount::mount(
+        Some(source.as_path()),
+        target,
+        None::<&str>,
+        nix::mount::MsFlags::MS_BIND,
+        None::<&str>,
+    )
+    .with_context(|| format!("bind mounting {} to {}", source.display(), target.display()))
 }
 
 fn numeric_identity(uid: u32, gid: u32) -> ExecIdentity {

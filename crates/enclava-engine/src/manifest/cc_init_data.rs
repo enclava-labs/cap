@@ -390,6 +390,18 @@ pub fn build_toml_with_options(app: &ConfidentialApp, options: &CcInitDataOption
         });
         push_toml_string(&mut toml, "log_encryption_json", &handoff.to_string());
     }
+    // cap#289: under the v2 layout the spool lives on the encrypted state
+    // PVC; the claim pins that storage mode so the guest enables the bind
+    // only for signed renders, never from host-controlled ConfigMap alone.
+    // `omit_log_spool_bind_claim` reproduces the pre-claim byte layout for
+    // artifacts signed before this field existed.
+    if crate::manifest::enclava_init_config::log_spool_state_bind(app) {
+        push_toml_string(
+            &mut toml,
+            "log_spool_storage",
+            crate::manifest::enclava_init_config::LOG_SPOOL_STORAGE_STATE_BIND,
+        );
+    }
     push_toml_string(
         &mut toml,
         "signer_identity_subject",

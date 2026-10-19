@@ -16,6 +16,7 @@ use k8s_openapi::api::core::v1::{
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 
 use crate::manifest::cc_init_data;
+use crate::manifest::volumes::{VolumeLayout, volume_layout};
 use crate::types::{CaddyTlsMode, ConfidentialApp, WorkloadSecurityProfile};
 use enclava_common::types::UnlockMode;
 
@@ -351,10 +352,16 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
             ..Default::default()
         });
         if app.log_encryption.is_some() {
+            // Under the v2 layout enclava-init re-binds this mountpoint
+            // onto the encrypted state PVC after unlock; HostToContainer
+            // lets the workload see that re-bind (cap#289).
+            let propagation = (volume_layout(app) == VolumeLayout::GuestMemoryV2)
+                .then(|| "HostToContainer".to_string());
             volume_mounts.push(VolumeMount {
                 name: "logs".to_string(),
                 mount_path: ENCLAVA_LOG_SPOOL_DIR.to_string(),
                 read_only: Some(false),
+                mount_propagation: propagation,
                 ..Default::default()
             });
         }
@@ -563,10 +570,17 @@ pub fn build_enclava_init_container(app: &ConfidentialApp) -> Container {
         },
     ];
     if app.log_encryption.is_some() {
+        // Under the v2 layout the bind of /run/enclava-logs onto the
+        // encrypted state PVC must propagate OUT of this container into
+        // the pod, so the mount is Bidirectional; the app side consumes
+        // it via HostToContainer (cap#289).
+        let propagation = (volume_layout(app) == VolumeLayout::GuestMemoryV2)
+            .then(|| "Bidirectional".to_string());
         volume_mounts.push(VolumeMount {
             name: "logs".to_string(),
             mount_path: ENCLAVA_LOG_SPOOL_DIR.to_string(),
             read_only: Some(false),
+            mount_propagation: propagation,
             ..Default::default()
         });
     }
@@ -619,7 +633,34 @@ pub fn build_enclava_init_container(app: &ConfidentialApp) -> Container {
     }
 }
 
-pub fn build_enclava_tools_init_container() -> Container {
+/// The exact shell commands the enclava-tools init container runs: the
+/// signer-generated pod render must reproduce these bytes verbatim.
+const ENCLAVA_TOOLS_COMMAND_WITH_LOGS: &str = "cp /usr/local/bin/enclava-wait-exec /work/enclava-wait-exec && chmod 0555 /work/enclava-wait-exec && install -d -m 02770 -o 0 -g 10001 /run/enclava/containers && install -d -m 02770 -o 0 -g 10001 /run/enclava-logs && printf 'not-ready\\n' > /run/enclava/init-ready && chmod 0644 /run/enclava/init-ready";
+/// Under the v2 layout without encrypted logging there is no "logs"
+/// volume at all (cap#289): no spool dir to provision, no mount.
+const ENCLAVA_TOOLS_COMMAND_NO_LOGS: &str = "cp /usr/local/bin/enclava-wait-exec /work/enclava-wait-exec && chmod 0555 /work/enclava-wait-exec && install -d -m 02770 -o 0 -g 10001 /run/enclava/containers && printf 'not-ready\\n' > /run/enclava/init-ready && chmod 0644 /run/enclava/init-ready";
+
+pub fn build_enclava_tools_init_container(include_logs: bool) -> Container {
+    let mut volume_mounts = vec![
+        VolumeMount {
+            name: "enclava-tools".to_string(),
+            mount_path: "/work".to_string(),
+            ..Default::default()
+        },
+        VolumeMount {
+            name: "unlock-socket".to_string(),
+            mount_path: "/run/enclava".to_string(),
+            ..Default::default()
+        },
+    ];
+    if include_logs {
+        volume_mounts.push(VolumeMount {
+            name: "logs".to_string(),
+            mount_path: ENCLAVA_LOG_SPOOL_DIR.to_string(),
+            read_only: Some(false),
+            ..Default::default()
+        });
+    }
     Container {
         name: "enclava-tools".to_string(),
         image: Some(enclava_init_image()),
@@ -627,26 +668,14 @@ pub fn build_enclava_tools_init_container() -> Container {
             "/bin/sh".to_string(),
             "-eu".to_string(),
             "-c".to_string(),
-            "cp /usr/local/bin/enclava-wait-exec /work/enclava-wait-exec && chmod 0555 /work/enclava-wait-exec && install -d -m 02770 -o 0 -g 10001 /run/enclava/containers && install -d -m 02770 -o 0 -g 10001 /run/enclava-logs && printf 'not-ready\\n' > /run/enclava/init-ready && chmod 0644 /run/enclava/init-ready".to_string(),
+            if include_logs {
+                ENCLAVA_TOOLS_COMMAND_WITH_LOGS
+            } else {
+                ENCLAVA_TOOLS_COMMAND_NO_LOGS
+            }
+            .to_string(),
         ]),
-        volume_mounts: Some(vec![
-            VolumeMount {
-                name: "enclava-tools".to_string(),
-                mount_path: "/work".to_string(),
-                ..Default::default()
-            },
-            VolumeMount {
-                name: "unlock-socket".to_string(),
-                mount_path: "/run/enclava".to_string(),
-                ..Default::default()
-            },
-            VolumeMount {
-                name: "logs".to_string(),
-                mount_path: ENCLAVA_LOG_SPOOL_DIR.to_string(),
-                read_only: Some(false),
-                ..Default::default()
-            },
-        ]),
+        volume_mounts: Some(volume_mounts),
         security_context: Some(SecurityContext {
             allow_privilege_escalation: Some(false),
             read_only_root_filesystem: Some(true),

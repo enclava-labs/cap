@@ -324,7 +324,8 @@ fn signed_cc_hash_app_uses_local_artifact_urls_like_live_apply() {
                     org_keyring_fingerprint: [3; 32],
                     omit_log_encryption_claim: false,
                     legacy_collapsed_trustee_key: false,
-            omit_luks2_header_seal_claim: false,
+                    omit_luks2_header_seal_claim: false,
+                    omit_log_spool_bind_claim: false,
                 },
                 generated_agent_policy: GeneratedAgentPolicy {
                     policy_text: "package agent_policy\n".to_string(),
@@ -394,7 +395,8 @@ fn signed_cc_hash_app_uses_api_deployment_context_without_env_exports() {
                     org_keyring_fingerprint: [3; 32],
                     omit_log_encryption_claim: false,
                     legacy_collapsed_trustee_key: false,
-            omit_luks2_header_seal_claim: false,
+                    omit_luks2_header_seal_claim: false,
+                    omit_log_spool_bind_claim: false,
                 },
                 generated_agent_policy: GeneratedAgentPolicy {
                     policy_text: "package agent_policy\n".to_string(),

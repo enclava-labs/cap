@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 
 use crate::manifest::cc_init_data;
 use crate::manifest::containers::UNLOCK_SOCKET_PATH;
+use crate::manifest::volumes::{VolumeLayout, volume_layout};
 use crate::types::{ConfidentialApp, WorkloadSecurityProfile};
 use enclava_common::canonical::ce_v1_hash;
 use enclava_common::types::UnlockMode;
@@ -35,6 +36,24 @@ pub(crate) const ROOT_GID: u32 = 0;
 pub(crate) const CADDY_UID: u32 = 10002;
 pub(crate) const CADDY_GID: u32 = 10002;
 pub(crate) const ROOT_ONLY_MANAGED_CONFIG_DIR_MODE: u32 = 0o700;
+
+/// Value of the signed `log_spool_storage` cc_init_data claim and the
+/// `[log-encryption] spool-storage` ConfigMap key when the v2 layout binds
+/// /run/enclava-logs onto the encrypted state PVC (cap#289).
+pub(crate) const LOG_SPOOL_STORAGE_STATE_BIND: &str = "state-bind-v1";
+
+/// True when the rendered pod mounts the log spool as a Memory mountpoint
+/// that enclava-init must re-bind onto the encrypted state PVC: v2 signed
+/// layout with encrypted logging whose signed claims are the modern render
+/// (pins absent or cleared).
+pub(crate) fn log_spool_state_bind(app: &ConfidentialApp) -> bool {
+    if app.log_encryption.is_none() || volume_layout(app) != VolumeLayout::GuestMemoryV2 {
+        return false;
+    }
+    let binding = app.workload_artifact_binding.as_ref();
+    !binding.is_some_and(|b| b.omit_log_encryption_claim)
+        && !binding.is_some_and(|b| b.omit_log_spool_bind_claim)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct AppBindMountClaim {
@@ -206,6 +225,12 @@ fn render_config_toml(app: &ConfidentialApp) -> String {
             "public-key-sha256 = {}\n",
             toml_string(&log_encryption.public_key_sha256)
         ));
+        if log_spool_state_bind(app) {
+            out.push_str(&format!(
+                "spool-storage = {}\n",
+                toml_string(LOG_SPOOL_STORAGE_STATE_BIND)
+            ));
+        }
     }
 
     out

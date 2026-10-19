@@ -131,6 +131,14 @@ pub struct WorkloadArtifactBinding {
     /// ("adopt"), so those artifacts keep their original semantics.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub omit_luks2_header_seal_claim: bool,
+    /// Render-compatibility pin for artifacts signed before the
+    /// `log_spool_storage` cc_init_data claim existed (cap#289): they carry
+    /// an `expected_cc_init_data_hash` computed over a render without the
+    /// claim. Same mechanism as `omit_log_encryption_claim`; a claim-less
+    /// render keeps the pre-v2 disk-backed log spool semantics, so those
+    /// artifacts boot exactly as they did pre-change.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub omit_log_spool_bind_claim: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

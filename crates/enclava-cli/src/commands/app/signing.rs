@@ -742,6 +742,7 @@ pub(crate) async fn build_signed_deploy_blobs(
         omit_log_encryption_claim: false,
         legacy_collapsed_trustee_key: false,
         omit_luks2_header_seal_claim: !release_carries_seal_claim,
+        omit_log_spool_bind_claim: false,
     };
     let (generated_agent_policy, log_encryption) =
         fetch_generated_agent_policy(api, &release, &descriptor).await?;

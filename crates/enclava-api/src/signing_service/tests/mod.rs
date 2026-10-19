@@ -1650,6 +1650,7 @@ fn pinned_app_for_descriptor(descriptor: &DeploymentDescriptor) -> ConfidentialA
         omit_log_encryption_claim: false,
         legacy_collapsed_trustee_key: false,
         omit_luks2_header_seal_claim: false,
+        omit_log_spool_bind_claim: false,
     });
     app
 }
@@ -1895,6 +1896,49 @@ fn seal_claim_render_without_log_encryption_also_matches() {
     let binding = app.workload_artifact_binding.as_ref().unwrap();
     assert!(binding.omit_log_encryption_claim);
     assert!(binding.omit_luks2_header_seal_claim);
+}
+
+// --- log_spool_storage render compatibility (cap#289) ---
+
+#[test]
+fn pre_spool_bind_claim_render_match_pins_the_binding() {
+    let descriptor = descriptor();
+    let mut app = pinned_app_for_descriptor(&descriptor);
+    // The claim only exists under the v2 signed layout; give the app a v2
+    // policy so the pin changes the render.
+    let policy_text =
+        "# enclava-cap-volume-layout: guest-memory-v2\npackage agent_policy\n".to_string();
+    app.generated_agent_policy = Some(GeneratedAgentPolicy {
+        policy_sha256: Sha256::digest(policy_text.as_bytes()).into(),
+        policy_text,
+        genpolicy_version_pin: "kata-containers/genpolicy@3.28.0+test".to_string(),
+    });
+    // An artifact signed before the log_spool_storage claim existed hashes
+    // a render without it.
+    let mut pre_spool_app = app.clone();
+    pre_spool_app
+        .workload_artifact_binding
+        .as_mut()
+        .unwrap()
+        .omit_log_spool_bind_claim = true;
+    let (_, pre_spool_hash) =
+        enclava_engine::manifest::cc_init_data::compute_cc_init_data(&pre_spool_app);
+    let artifacts = artifacts_with_expected_hash(
+        &descriptor,
+        hex::decode(pre_spool_hash).unwrap().try_into().unwrap(),
+    );
+    artifacts
+        .validate_and_pin_cc_init_data_render(&mut app)
+        .expect("pre-spool-claim render must validate");
+    let binding = app.workload_artifact_binding.as_ref().unwrap();
+    assert!(
+        binding.omit_log_spool_bind_claim,
+        "a pre-claim-only match must pin the binding to the claim-less render"
+    );
+    assert!(
+        !binding.omit_log_encryption_claim,
+        "the log-encryption pin must stay modern when only the spool claim differs"
+    );
 }
 
 // --- claim-less artifacts once sealing is required (cap#244 review) ---
