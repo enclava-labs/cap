@@ -535,6 +535,12 @@ pub struct DeploymentContextResponse {
     pub api_signing_pubkey: String,
     #[serde(default)]
     pub tls_certificate_broker_url: Option<String>,
+    /// Whether the API's deployed enclava-init performs the log-spool
+    /// state-PVC bind (cap#290 review). An API deployment capability, not
+    /// release metadata: absent on older APIs, which default to false so
+    /// they keep producing claim-less signed renders.
+    #[serde(default)]
+    pub log_spool_state_bind_supported: bool,
     #[serde(default)]
     pub current_platform_release_id: Option<String>,
     #[serde(default)]
@@ -1238,6 +1244,22 @@ mod tests {
         );
         assert_eq!(parsed.expires_in_seconds, Some(300));
         assert_eq!(parsed.expires_at, None);
+    }
+
+    #[test]
+    fn deployment_context_defaults_spool_bind_gate_to_unsupported() {
+        let parsed: super::DeploymentContextResponse = serde_json::from_value(serde_json::json!({
+            "api_signing_pubkey": "pub"
+        }))
+        .expect("deployment context without the gate field should decode");
+        assert!(!parsed.log_spool_state_bind_supported);
+
+        let parsed: super::DeploymentContextResponse = serde_json::from_value(serde_json::json!({
+            "api_signing_pubkey": "pub",
+            "log_spool_state_bind_supported": true
+        }))
+        .expect("deployment context with the gate field should decode");
+        assert!(parsed.log_spool_state_bind_supported);
     }
 
     #[test]

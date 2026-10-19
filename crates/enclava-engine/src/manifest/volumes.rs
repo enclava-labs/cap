@@ -19,6 +19,53 @@ use crate::manifest::enclava_init_config;
 use crate::types::ConfidentialApp;
 
 const GUEST_MEMORY_LAYOUT_MARKER: &str = "# enclava-cap-volume-layout: guest-memory-v1\n";
+/// Signed volume layout that keeps bootstrap emptyDirs RAM-backed like v1
+/// but re-binds the workload log spool onto the encrypted state PVC
+/// (cap#289): Kata's block-encrypted emptyDir sizes disk.img from the host
+/// FS, so the ext4 inode-init through the LUKS device (~32GiB on ~2TiB)
+/// evicts the pod on the 4Gi logs emptyDir limit.
+const GUEST_MEMORY_V2_LAYOUT_MARKER: &str = "# enclava-cap-volume-layout: guest-memory-v2\n";
+
+/// The signed volume layout an app's generated agent policy pins. v1 and
+/// v2 policies both select RAM-backed bootstrap emptyDirs; v2 additionally
+/// moves the workload log spool onto the encrypted state PVC (see
+/// [`logs_volume_included`]). Unmarked policies keep the historical
+/// disk-backed layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VolumeLayout {
+    Legacy,
+    GuestMemoryV1,
+    GuestMemoryV2,
+}
+
+pub(crate) fn volume_layout(app: &ConfidentialApp) -> VolumeLayout {
+    // The signer binds this exact prefix into the policy hash/signature.
+    // Retry and rollback retain their stored policy and therefore its layout.
+    // Unmarked policies (including the local fallback) keep historical disks.
+    let Some(policy) = app.generated_agent_policy.as_ref() else {
+        return VolumeLayout::Legacy;
+    };
+    if policy
+        .policy_text
+        .starts_with(GUEST_MEMORY_V2_LAYOUT_MARKER)
+    {
+        VolumeLayout::GuestMemoryV2
+    } else if policy.policy_text.starts_with(GUEST_MEMORY_LAYOUT_MARKER) {
+        VolumeLayout::GuestMemoryV1
+    } else {
+        VolumeLayout::Legacy
+    }
+}
+
+/// Whether the shared "logs" emptyDir exists at all. Under the v2 layout
+/// with no encrypted logging the spool path is unused: no volume, no mount,
+/// and no spool-dir provisioning in the tools container. With encrypted
+/// logging the volume survives as a small Memory mountpoint that
+/// enclava-init re-binds onto the encrypted state PVC. Older layouts keep
+/// the disk-backed spool unconditionally.
+pub(crate) fn logs_volume_included(app: &ConfidentialApp) -> bool {
+    !(volume_layout(app) == VolumeLayout::GuestMemoryV2 && app.log_encryption.is_none())
+}
 
 /// Names of the StatefulSet volumeClaimTemplates CAP renders. PVCs created
 /// from them are named `<vct>-<statefulset>-<ordinal>`; cleanup identifies
@@ -41,22 +88,21 @@ pub fn provisioned_pod_name(statefulset: &str) -> String {
 }
 
 /// Disk-backed bound for the shared workload log spool AND Kata's
-/// direct-assigned-volume staging. The spool rotates at 32 MiB, but staging
-/// has used ~2.3–2.4 GiB of real blocks on first boot (#223). A 64Mi bound
-/// evicts the pod before readiness and each restart repeats staging from zero.
-/// Keep the 4Gi outer fence until staging moves off this volume or a smaller
-/// bound is justified by boot-time measurements; monitor for growth beyond 4Gi.
+/// direct-assigned-volume staging — legacy (pre-v2) layouts only. The spool
+/// rotates at 32 MiB, but staging has used ~2.3–2.4 GiB of real blocks on
+/// first boot (#223). A 64Mi bound evicts the pod before readiness and each
+/// restart repeats staging from zero. Keep the 4Gi outer fence for layouts
+/// that still size the spool from host disk; the v2 layout re-binds the
+/// spool onto the encrypted state PVC instead (cap#289).
 const LOGS_EMPTY_DIR_SIZE_LIMIT: &str = "4Gi";
 
 pub fn build_volumes(app: &ConfidentialApp) -> Vec<Volume> {
     let legacy = legacy_bootstrap_enabled();
-    // The signer binds this exact prefix into the policy hash/signature.
-    // Retry and rollback retain their stored policy and therefore its layout.
-    // Unmarked policies (including the local fallback) keep historical disks.
-    let guest_memory = app
-        .generated_agent_policy
-        .as_ref()
-        .is_some_and(|policy| policy.policy_text.starts_with(GUEST_MEMORY_LAYOUT_MARKER));
+    let layout = volume_layout(app);
+    let guest_memory = matches!(
+        layout,
+        VolumeLayout::GuestMemoryV1 | VolumeLayout::GuestMemoryV2
+    );
     let bootstrap_empty_dir = |size: &str| {
         if guest_memory {
             EmptyDirVolumeSource {
@@ -72,15 +118,37 @@ pub fn build_volumes(app: &ConfidentialApp) -> Vec<Volume> {
             }
         }
     };
-    let mut v = vec![
-        Volume {
-            name: "logs".to_string(),
-            empty_dir: Some(EmptyDirVolumeSource {
+    let mut v = Vec::new();
+    if logs_volume_included(app) {
+        // Under the v2 layout the encrypted log spool is a small
+        // RAM-backed mountpoint: enclava-init re-binds it onto a directory
+        // on the encrypted state PVC after LUKS unlock, so the spool never
+        // provisions host disk storage (cap#289). Claim-less v2 artifacts
+        // (omit_log_spool_bind_claim pinned by hash validation) keep this
+        // same mountpoint on purpose: their signed agent policy encodes
+        // tmpfs storage for it, so rendering the legacy disk volume would
+        // violate that policy. The guest then skips the state bind and the
+        // spool stays on guest tmpfs — the declared 1Mi is not forwarded
+        // as a guest hard bound (bootstrap-mountpoint pattern, below), so
+        // the only degradation is spool persistence, not capacity.
+        let empty_dir = if layout == VolumeLayout::GuestMemoryV2 {
+            EmptyDirVolumeSource {
+                medium: Some("Memory".to_string()),
+                size_limit: Some(Quantity("1Mi".to_string())),
+            }
+        } else {
+            EmptyDirVolumeSource {
                 medium: None,
                 size_limit: Some(Quantity(LOGS_EMPTY_DIR_SIZE_LIMIT.to_string())),
-            }),
+            }
+        };
+        v.push(Volume {
+            name: "logs".to_string(),
+            empty_dir: Some(empty_dir),
             ..Default::default()
-        },
+        });
+    }
+    v.extend([
         Volume {
             name: "ownership-signal".to_string(),
             empty_dir: Some(EmptyDirVolumeSource {
@@ -98,7 +166,7 @@ pub fn build_volumes(app: &ConfidentialApp) -> Vec<Volume> {
             }),
             ..Default::default()
         },
-    ];
+    ]);
     if legacy {
         v.push(Volume {
             name: "secure-pv-bootstrap".to_string(),

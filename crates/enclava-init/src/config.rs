@@ -76,6 +76,11 @@ pub enum LogEncryptionHandoffFile {
     Enabled(LogEncryptionHandoff),
 }
 
+/// Value of `spool-storage` in the `[log-encryption]` section and the
+/// signed `log_spool_storage` cc_init_data claim when the v2 layout binds
+/// /run/enclava-logs onto the encrypted state PVC (cap#289).
+pub const LOG_SPOOL_STORAGE_STATE_BIND: &str = "state-bind-v1";
+
 /// The `[log-encryption]` ConfigMap section. Host-controlled transport copy
 /// of a subset of the handoff fields; never trusted on its own — when the
 /// signed claim exists, any field present here must match it. All fields are
@@ -88,6 +93,12 @@ pub struct LogEncryptionSection {
     pub key_id: Option<String>,
     pub public_key_base64url: Option<String>,
     pub public_key_sha256: Option<String>,
+    /// Where the workload log spool physically lives. Absent: the pod's
+    /// disk-backed "logs" emptyDir. `state-bind-v1`: /run/enclava-logs is a
+    /// mountpoint that enclava-init re-binds onto `<state-root>/.enclava/log-spool`
+    /// on the encrypted state PVC. Cross-checked against the signed
+    /// `log_spool_storage` claim, never trusted alone.
+    pub spool_storage: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -332,6 +343,44 @@ hkdf-info = "tls-state-luks-key"
                 subdir: "app-data".to_string(),
                 mount_path: "/app/data".to_string(),
             }]
+        );
+    }
+    #[test]
+    fn parses_log_encryption_spool_storage() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("c.toml");
+        std::fs::write(
+            &p,
+            r#"
+mode = "autounlock"
+kbs-url = "http://kbs"
+kbs-resource-path = "default/x/wrap-owner"
+
+[log-encryption]
+required = true
+algorithm = "x25519-hpke-v1"
+key-id = "logs-prod"
+spool-storage = "state-bind-v1"
+
+[state]
+device = "/dev/csi0"
+mapping-name = "cap-state"
+mount-path = "/state"
+hkdf-info = "state-luks-key"
+
+[tls-state]
+device = "/dev/csi1"
+mapping-name = "cap-tls-state"
+mount-path = "/state/tls-state"
+hkdf-info = "tls-state-luks-key"
+"#,
+        )
+        .unwrap();
+        let c = Config::load(&p).unwrap();
+        let section = c.log_encryption.unwrap();
+        assert_eq!(
+            section.spool_storage.as_deref(),
+            Some(LOG_SPOOL_STORAGE_STATE_BIND)
         );
     }
 }

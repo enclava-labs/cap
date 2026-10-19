@@ -23,6 +23,23 @@ fn memory_app() -> ConfidentialApp {
     app_with_policy(format!("{MEMORY_LAYOUT_MARKER}package agent_policy\n"))
 }
 
+fn v2_app() -> ConfidentialApp {
+    app_with_policy(
+        "# enclava-cap-volume-layout: guest-memory-v2\npackage agent_policy\n".to_string(),
+    )
+}
+
+fn v2_app_with_logs() -> ConfidentialApp {
+    let mut app = v2_app();
+    app.log_encryption = Some(enclava_engine::types::LogEncryptionConfig {
+        algorithm: "x25519-hpke-v1".to_string(),
+        key_id: "logs-prod".to_string(),
+        public_key_base64url: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+        public_key_sha256: "sha256:Zmh6rfhivXdsj8GLjp-OIAiXFIVu4jOzkCpZHQ1fKSU".to_string(),
+    });
+    app
+}
+
 #[test]
 fn volumes_has_ownership_signal() {
     let vols = build_volumes(&sample_app());
@@ -116,9 +133,10 @@ fn volumes_decrypted_mountpoints_use_memory_medium_and_1mi_limit() {
 
 #[test]
 fn volumes_logs_emptydir_is_disk_backed_and_bounded() {
-    // Both bootstrap layouts share this disk-backed volume with Kata staging.
-    // #223 observed ~2.4 GiB of real blocks before readiness; 64Mi evicted
-    // first deployments. Retain at least 4Gi until staging is relocated.
+    // Legacy (pre-v2) layouts share this disk-backed volume with Kata
+    // staging. #223 observed ~2.4 GiB of real blocks before readiness; 64Mi
+    // evicted first deployments. The v2 layout re-binds the spool onto the
+    // encrypted state PVC instead (cap#289).
     for app in [sample_app(), memory_app()] {
         let vols = build_volumes(&app);
         let v = vols.iter().find(|v| v.name == "logs").unwrap();
@@ -126,6 +144,103 @@ fn volumes_logs_emptydir_is_disk_backed_and_bounded() {
         assert!(ed.medium.is_none());
         assert_eq!(ed.size_limit.as_ref().map(|q| q.0.as_str()), Some("4Gi"));
     }
+}
+
+#[test]
+fn v2_layout_without_log_encryption_omits_logs_volume() {
+    let vols = build_volumes(&v2_app());
+    assert!(
+        vols.iter().all(|v| v.name != "logs"),
+        "v2 without encrypted logging must not render the logs emptyDir"
+    );
+}
+
+#[test]
+fn v2_layout_with_log_encryption_renders_memory_mountpoint() {
+    let vols = build_volumes(&v2_app_with_logs());
+    let v = vols.iter().find(|v| v.name == "logs").unwrap();
+    let ed = v.empty_dir.as_ref().unwrap();
+    assert_eq!(ed.medium.as_deref(), Some("Memory"));
+    assert_eq!(ed.size_limit.as_ref().map(|q| q.0.as_str()), Some("1Mi"));
+    // Volume order is part of the rendered pod shape: logs stays first.
+    assert_eq!(vols.first().unwrap().name, "logs");
+}
+
+#[test]
+fn v2_layout_with_omit_spool_bind_pin_keeps_memory_mountpoint() {
+    // A claim-less v2 artifact (hash computed before log_spool_storage
+    // existed) pins omit_log_spool_bind_claim at validation. Its signed
+    // agent policy still encodes the v2 tmpfs mount, so the render must
+    // keep the Memory mountpoint; only the guest-side state bind is off.
+    let mut app = v2_app_with_logs();
+    app.workload_artifact_binding = Some(enclava_engine::types::WorkloadArtifactBinding {
+        descriptor_core_hash: [0u8; 32],
+        descriptor_signing_pubkey: [0u8; 32],
+        org_keyring_fingerprint: [0u8; 32],
+        omit_log_encryption_claim: false,
+        legacy_collapsed_trustee_key: false,
+        omit_luks2_header_seal_claim: false,
+        omit_log_spool_bind_claim: true,
+    });
+    let vols = build_volumes(&app);
+    let v = vols.iter().find(|v| v.name == "logs").unwrap();
+    let ed = v.empty_dir.as_ref().unwrap();
+    assert_eq!(ed.medium.as_deref(), Some("Memory"));
+    assert_eq!(ed.size_limit.as_ref().map(|q| q.0.as_str()), Some("1Mi"));
+}
+
+#[test]
+fn v1_layout_without_log_encryption_keeps_disk_spool_and_tools_mount() {
+    // A v1-signed artifact renders byte-identical to its signed shape: the
+    // 4Gi disk spool AND the enclava-logs provisioning stay.
+    let app = memory_app();
+    let vols = build_volumes(&app);
+    let v = vols.iter().find(|v| v.name == "logs").unwrap();
+    let ed = v.empty_dir.as_ref().unwrap();
+    assert!(ed.medium.is_none());
+    assert_eq!(ed.size_limit.as_ref().map(|q| q.0.as_str()), Some("4Gi"));
+
+    let c = enclava_engine::manifest::containers::build_enclava_tools_init_container(true);
+    let command = c.command.as_ref().unwrap().join(" ");
+    assert!(command.contains("install -d -m 02770 -o 0 -g 10001 /run/enclava-logs"));
+    assert!(
+        c.volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|m| m.name == "logs" && m.mount_path == "/run/enclava-logs")
+    );
+}
+
+#[test]
+fn v2_layout_statefulset_drops_logs_everywhere_without_log_encryption() {
+    use enclava_engine::manifest::statefulset::generate_statefulset;
+    let sts = generate_statefulset(&v2_app());
+    let spec = sts.spec.unwrap().template.spec.unwrap();
+    assert!(
+        spec.volumes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .all(|v| v.name != "logs")
+    );
+    let tools = spec
+        .init_containers
+        .as_ref()
+        .unwrap()
+        .iter()
+        .find(|c| c.name == "enclava-tools")
+        .unwrap();
+    assert!(
+        tools
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .all(|m| m.name != "logs")
+    );
+    let command = tools.command.as_ref().unwrap().join(" ");
+    assert!(!command.contains("/run/enclava-logs"));
 }
 
 #[test]
@@ -181,7 +296,7 @@ fn historical_policy_replay_preserves_bootstrap_volume_layout() {
 #[test]
 fn only_exact_first_line_policy_marker_selects_memory() {
     for prefix in [
-        "# enclava-cap-volume-layout: guest-memory-v2\n".to_string(),
+        "# enclava-cap-volume-layout: guest-memory-v3\n".to_string(),
         format!("\n{MEMORY_LAYOUT_MARKER}"),
         format!("\u{feff}{MEMORY_LAYOUT_MARKER}"),
         MEMORY_LAYOUT_MARKER.replace('\n', "\r\n"),

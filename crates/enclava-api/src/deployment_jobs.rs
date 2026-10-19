@@ -5098,6 +5098,7 @@ pub(crate) mod tests {
             omit_log_encryption_claim: false,
             legacy_collapsed_trustee_key: false,
             omit_luks2_header_seal_claim: false,
+            omit_log_spool_bind_claim: false,
         });
         crate::routes::deployments::select_local_signed_artifact_delivery(
             &mut app_spec.attestation,

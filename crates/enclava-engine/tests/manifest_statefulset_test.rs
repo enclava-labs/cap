@@ -350,7 +350,7 @@ fn statefulset_configures_enclava_init_log_relay_only_with_log_key_metadata() {
             .iter()
             .find(|env| env.name == "ENCLAVA_LOG_RELAY_SPOOL_PATH")
             .and_then(|env| env.value.as_deref()),
-        Some("/run/enclava-logs/web.jsonl")
+        Some("/run/enclava-logs/web-Zmh6rfhivXdsj8GLjp-OIAiXFIVu4jOzkCpZHQ1fKSU.jsonl")
     );
     assert!(
         enclava_init

@@ -155,6 +155,7 @@ fn test_deployment_context() -> DeploymentContextResponse {
         tls_certificate_broker_url: None,
         current_platform_release_id: None,
         platform_release_envelope: None,
+        log_spool_state_bind_supported: false,
     }
 }
 
@@ -266,6 +267,7 @@ fn deployment_context_platform_release_is_verified_and_selected() {
         tls_certificate_broker_url: None,
         current_platform_release_id: Some(expected_release_id.clone()),
         platform_release_envelope: Some(envelope),
+        log_spool_state_bind_supported: false,
     };
 
     let release =
@@ -290,6 +292,7 @@ fn deployment_context_platform_release_tampering_fails_closed() {
         tls_certificate_broker_url: None,
         current_platform_release_id: Some(envelope.payload.platform_release_version.clone()),
         platform_release_envelope: Some(envelope),
+        log_spool_state_bind_supported: false,
     };
 
     let err =
@@ -324,7 +327,8 @@ fn signed_cc_hash_app_uses_local_artifact_urls_like_live_apply() {
                     org_keyring_fingerprint: [3; 32],
                     omit_log_encryption_claim: false,
                     legacy_collapsed_trustee_key: false,
-            omit_luks2_header_seal_claim: false,
+                    omit_luks2_header_seal_claim: false,
+                    omit_log_spool_bind_claim: false,
                 },
                 generated_agent_policy: GeneratedAgentPolicy {
                     policy_text: "package agent_policy\n".to_string(),
@@ -350,6 +354,7 @@ fn signed_cc_hash_app_uses_local_artifact_urls_like_live_apply() {
             kbs_ca_cert_pem: None,
             runtime_class: cc_init_data::DEFAULT_RUNTIME_CLASS.to_string(),
             luks2_header_seal: "adopt".to_string(),
+            log_spool_storage: "state-bind-v1".to_string(),
         },
     );
 
@@ -375,6 +380,7 @@ fn signed_cc_hash_app_uses_api_deployment_context_without_env_exports() {
         ),
         current_platform_release_id: None,
         platform_release_envelope: None,
+        log_spool_state_bind_supported: false,
     };
 
     let app = confidential_app_for_cc_hash(
@@ -394,7 +400,8 @@ fn signed_cc_hash_app_uses_api_deployment_context_without_env_exports() {
                     org_keyring_fingerprint: [3; 32],
                     omit_log_encryption_claim: false,
                     legacy_collapsed_trustee_key: false,
-            omit_luks2_header_seal_claim: false,
+                    omit_luks2_header_seal_claim: false,
+                    omit_log_spool_bind_claim: false,
                 },
                 generated_agent_policy: GeneratedAgentPolicy {
                     policy_text: "package agent_policy\n".to_string(),
@@ -420,6 +427,7 @@ fn signed_cc_hash_app_uses_api_deployment_context_without_env_exports() {
             kbs_ca_cert_pem: None,
             runtime_class: cc_init_data::DEFAULT_RUNTIME_CLASS.to_string(),
             luks2_header_seal: "adopt".to_string(),
+            log_spool_storage: "state-bind-v1".to_string(),
         },
     );
 

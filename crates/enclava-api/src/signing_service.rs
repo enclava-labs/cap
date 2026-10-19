@@ -519,6 +519,7 @@ impl DeploymentSigningArtifacts {
             omit_log_encryption_claim: false,
             legacy_collapsed_trustee_key: false,
             omit_luks2_header_seal_claim: false,
+            omit_log_spool_bind_claim: false,
         }
     }
 
@@ -749,7 +750,15 @@ impl DeploymentSigningArtifacts {
         // rejecting that rollback. Affected artifacts must be re-signed.
         let seal_required =
             enclava_engine::manifest::cc_init_data::luks2_header_seal_claim() == "required";
-        pin_matching_cc_init_data_render(app, &expected, seal_required)
+        // cap#290 review: the `log_spool_storage` claim may only be
+        // accepted/emitted once this API deployment declares the bind
+        // capability (installed at startup from its deployment
+        // environment, reported to signers via deployment-context). While
+        // the deployment does not declare it, claim-bearing artifacts are
+        // rejected with a re-sign diagnostic.
+        let spool_bind_supported =
+            enclava_engine::manifest::cc_init_data::log_spool_bind_supported();
+        pin_matching_cc_init_data_render(app, &expected, seal_required, spool_bind_supported)
     }
 
     /// `signing_service_pubkey_hex` is the public key of the off-cluster
@@ -1795,25 +1804,49 @@ impl LoadedWorkloadArtifacts {
 /// accepting one would let a hostile host replay an unsealed header and
 /// have it adopted despite the fleet-wide release rejecting that rollback.
 /// Affected artifacts must be re-signed against the current release.
+///
+/// `spool_bind_supported` (this API's deployment gate declares
+/// `log_spool_storage: state-bind-v1`, cap#290 review) is the init-first
+/// rollout gate: a claim-bearing spool render is only legitimate once the
+/// deployed enclava-init performs the state-PVC bind, so while the
+/// deployment does not declare the capability such renders must not be
+/// accepted — a pre-bind init would parse the ConfigMap key yet leave the
+/// spool on the RAM mountpoint. An artifact matching ONLY a claim-bearing
+/// render gets a re-sign diagnostic instead of a generic hash mismatch.
 fn pin_matching_cc_init_data_render(
     app: &mut enclava_engine::types::ConfidentialApp,
     expected_hash_hex: &str,
     seal_required: bool,
+    spool_bind_supported: bool,
 ) -> Result<(), SigningServiceError> {
+    // Set when a claim-bearing spool render reproduced the signed hash
+    // while this deployment does not declare the `log_spool_storage` bind.
+    let mut claim_bearing_spool_match = false;
     for omit_seal in [false, true] {
         if omit_seal && seal_required {
             continue;
         }
         for collapsed_trustee in [false, true] {
             for omit_log in [false, true] {
-                if let Some(binding) = app.workload_artifact_binding.as_mut() {
-                    binding.omit_log_encryption_claim = omit_log;
-                    binding.omit_luks2_header_seal_claim = omit_seal;
-                    binding.legacy_collapsed_trustee_key = collapsed_trustee;
-                }
-                let (_, hash) = enclava_engine::manifest::cc_init_data::compute_cc_init_data(app);
-                if hash == expected_hash_hex {
-                    return Ok(());
+                for omit_spool_bind in [false, true] {
+                    if let Some(binding) = app.workload_artifact_binding.as_mut() {
+                        binding.omit_log_encryption_claim = omit_log;
+                        binding.omit_luks2_header_seal_claim = omit_seal;
+                        binding.legacy_collapsed_trustee_key = collapsed_trustee;
+                        binding.omit_log_spool_bind_claim = omit_spool_bind;
+                    }
+                    let (_, hash) =
+                        enclava_engine::manifest::cc_init_data::compute_cc_init_data(app);
+                    if hash == expected_hash_hex {
+                        // Claim-bearing spool renders are only acceptable
+                        // once the deployment declares the deployed init
+                        // understands the claim.
+                        if !omit_spool_bind && !spool_bind_supported {
+                            claim_bearing_spool_match = true;
+                            continue;
+                        }
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -1822,6 +1855,17 @@ fn pin_matching_cc_init_data_render(
         binding.omit_log_encryption_claim = false;
         binding.omit_luks2_header_seal_claim = false;
         binding.legacy_collapsed_trustee_key = false;
+        binding.omit_log_spool_bind_claim = false;
+    }
+    if claim_bearing_spool_match {
+        return Err(SigningServiceError::Mismatch(
+            "expected_cc_init_data_hash (artifact was signed over a \
+             log_spool_storage claim-bearing render but this API deployment \
+             does not declare the log_spool_storage state-bind capability; \
+             re-sign the artifact after the init rollout ships an \
+             enclava-init that understands the claim)"
+                .into(),
+        ));
     }
     if seal_required {
         return Err(SigningServiceError::Mismatch(
@@ -1953,6 +1997,7 @@ fn decode_loaded_workload_artifacts(
             omit_log_encryption_claim: false,
             legacy_collapsed_trustee_key: false,
             omit_luks2_header_seal_claim: false,
+            omit_log_spool_bind_claim: false,
         },
         trustee_policy_json: trustee_policy_json(&signed_policy_artifact)?,
         workload_artifacts_json: serde_json::to_string(&artifacts_json)?,
@@ -2121,6 +2166,7 @@ pub async fn load_workload_artifact_binding(
             omit_log_encryption_claim: false,
             legacy_collapsed_trustee_key: false,
             omit_luks2_header_seal_claim: false,
+            omit_log_spool_bind_claim: false,
         },
         signed_policy_artifact,
     )))

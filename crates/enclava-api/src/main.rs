@@ -803,6 +803,27 @@ async fn main() {
             std::process::exit(1);
         }
         enclava_engine::manifest::cc_init_data::set_luks2_header_seal_claim(&seal_claim);
+
+        // Log-spool state-bind deployment gate (cap#290 review): NOT signed
+        // release metadata — a canonical field would break release-signature
+        // verification on previously released CLIs, so it is a deployment
+        // capability only. Ops sets ENCLAVA_LOG_SPOOL_STORAGE only in the
+        // same package that pins the bind-capable ENCLAVA_INIT_IMAGE; under
+        // a signed release its absence is the unsupported sentinel and must
+        // be installed verbatim so neither the env fallback nor the dev
+        // default can resurrect the claim. A value other than
+        // "state-bind-v1" refuses startup rather than rendering an
+        // unverifiable claim.
+        let spool_claim = env_nonempty("ENCLAVA_LOG_SPOOL_STORAGE").unwrap_or_default();
+        if !matches!(spool_claim.as_str(), "" | "state-bind-v1") {
+            eprintln!(
+                "startup refused: ENCLAVA_LOG_SPOOL_STORAGE {spool_claim:?} is not a valid \
+                 log-spool storage claim (expected unset or \"state-bind-v1\"); it must be set \
+                 only together with the bind-capable ENCLAVA_INIT_IMAGE pin"
+            );
+            std::process::exit(1);
+        }
+        enclava_engine::manifest::cc_init_data::set_log_spool_storage_claim(&spool_claim);
     }
 
     let startup_proxy_image = match release_env_value(
