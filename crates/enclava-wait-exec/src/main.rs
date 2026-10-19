@@ -212,15 +212,39 @@ fn encrypted_log_config_from_raw_env(
         .trim()
         .to_string();
     validate_sentinel_name(&container)?;
+    // The env-provided path still selects the spool's parent directory in
+    // non-prod-strict builds, but the file name is always key-namespaced so
+    // a recipient change can never interleave with the previous
+    // generation's spool.
     let spool_path = env::var_os("ENCLAVA_LOG_SPOOL_PATH")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_LOG_SPOOL_DIR).join(format!("{container}.jsonl")));
+        .map(|p| {
+            p.parent()
+                .unwrap_or(Path::new(""))
+                .join(spool_file_name(&container, &recipient))
+        })
+        .unwrap_or_else(|| {
+            PathBuf::from(DEFAULT_LOG_SPOOL_DIR).join(spool_file_name(&container, &recipient))
+        });
     Ok(Some(EncryptedLogConfig {
         recipient,
         context,
         spool_path,
         container,
     }))
+}
+
+/// Spool file name `<container>-<recipient_digest>.jsonl` (cap#290 round-2
+/// review): the recipient's canonical `sha256:`-prefixed base64url digest
+/// (as verified by `validate_public_key`) namespaces the file so a key
+/// rotation spools to a distinct file and the guest-side generation
+/// cleanup can retire the previous generation's file.
+fn spool_file_name(container: &str, recipient: &LogEncryptionPublicKey) -> String {
+    let digest = recipient
+        .public_key_sha256
+        .strip_prefix("sha256:")
+        .unwrap_or(&recipient.public_key_sha256);
+    format!("{container}-{digest}.jsonl")
 }
 
 #[cfg(not(feature = "prod-strict"))]
@@ -368,8 +392,11 @@ fn encrypted_log_config_from_handoff_at(path: &Path) -> Result<Option<EncryptedL
     };
     let container = handoff_container_name()?;
     // Spool pinned to the dedicated log spool dir: the host-controlled
-    // ENCLAVA_LOG_SPOOL_PATH env is not honored in prod-strict.
-    let spool_path = PathBuf::from(DEFAULT_LOG_SPOOL_DIR).join(format!("{container}.jsonl"));
+    // ENCLAVA_LOG_SPOOL_PATH env is not honored in prod-strict. The file
+    // name is key-namespaced on the signed recipient (cap#290 round-2
+    // review).
+    let spool_path =
+        PathBuf::from(DEFAULT_LOG_SPOOL_DIR).join(spool_file_name(&container, &recipient));
     Ok(Some(EncryptedLogConfig {
         recipient,
         context,
@@ -1646,6 +1673,16 @@ mod tests {
             "11111111-1111-1111-1111-111111111111"
         );
         assert_eq!(config.container, "web");
+        // The spool path is key-namespaced on the signed recipient digest
+        // (cap#290 round-2 review).
+        let expected = format!(
+            "web-{}.jsonl",
+            keypair.public_key_sha256.strip_prefix("sha256:").unwrap()
+        );
+        assert_eq!(
+            config.spool_path,
+            PathBuf::from(DEFAULT_LOG_SPOOL_DIR).join(expected)
+        );
         unsafe {
             env::remove_var("ENCLAVA_LOG_DEPLOYMENT_ID");
             env::remove_var("ENCLAVA_CONTAINER_NAME");
@@ -1790,6 +1827,54 @@ mod tests {
         assert_eq!(config.context.app_name, "secure-app");
         assert_eq!(config.context.deployment_id, "deploy-123");
         assert_eq!(config.container, "web");
+
+        // Default spool path is key-namespaced on the recipient digest.
+        let expected = format!(
+            "web-{}.jsonl",
+            keypair.public_key_sha256.strip_prefix("sha256:").unwrap()
+        );
+        assert_eq!(
+            config.spool_path,
+            PathBuf::from(DEFAULT_LOG_SPOOL_DIR).join(&expected)
+        );
+
+        // An env-provided spool path still selects the parent directory,
+        // but the file name stays key-namespaced: its basename is ignored.
+        unsafe {
+            env::set_var("ENCLAVA_LOG_SPOOL_PATH", "/tmp/spools/legacy.jsonl");
+        }
+        let config = encrypted_log_config_from_env("web").unwrap().unwrap();
+        assert_eq!(
+            config.spool_path,
+            PathBuf::from("/tmp/spools").join(&expected)
+        );
+        unsafe {
+            env::remove_var("ENCLAVA_LOG_SPOOL_PATH");
+        }
+    }
+
+    #[test]
+    fn spool_file_name_is_namespaced_by_recipient_digest() {
+        // cap#290 round-2 review: distinct recipients must produce distinct
+        // spool files so a key rotation never interleaves generations.
+        let recipient_of =
+            |pair: &enclava_common::log_encryption::LogEncryptionKeyPair| LogEncryptionPublicKey {
+                key_id: "test-key".to_string(),
+                public_key_base64url: pair.public_key_base64url.clone(),
+                public_key_sha256: pair.public_key_sha256.clone(),
+            };
+        let a = recipient_of(&enclava_common::log_encryption::generate_log_keypair());
+        let b = recipient_of(&enclava_common::log_encryption::generate_log_keypair());
+        let name_a = spool_file_name("web", &a);
+        let name_b = spool_file_name("web", &b);
+        assert_ne!(name_a, name_b);
+        assert_eq!(
+            name_a,
+            format!(
+                "web-{}.jsonl",
+                a.public_key_sha256.strip_prefix("sha256:").unwrap()
+            )
+        );
     }
 
     // ---- spool rotation (round-3 review) ----

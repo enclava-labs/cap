@@ -1,3 +1,5 @@
+use std::path::Component;
+
 use enclava_common::log_encryption;
 use enclava_common::validate::validate_fqdn;
 
@@ -212,18 +214,42 @@ pub fn validate_app(app: &ConfidentialApp) -> Result<(), ValidationError> {
     }
 
     // cap#290 review: the v2 log spool lives at <state-root>/.enclava/
-    // log-spool. A tenant storage_path mapping onto the reserved .enclava
-    // state subdir would share that directory with the spool, so wait-exec
-    // could append to and rotate tenant files as encrypted-log data.
-    // Reject the collision at validation instead of rendering a corrupting
-    // manifest.
+    // log-spool and is bind-mounted over /run/enclava-logs. A tenant
+    // storage_path mapping onto the reserved .enclava state subdir would
+    // share that directory with the spool, so wait-exec could append to
+    // and rotate tenant files as encrypted-log data; a storage_path whose
+    // guest mount covers the spool target (the dir itself, an ancestor
+    // that would shadow the bind, or a descendant the bind would mount
+    // over) collides the same way. Reject both at validation instead of
+    // rendering a corrupting manifest, and require enough state PVC for
+    // the 32 MiB rotation cap plus temp/headroom.
     if crate::manifest::enclava_init_config::log_spool_state_bind(app) {
+        if let Ok(mib) = storage_quantity_mib_ceil(&app.storage.app_data.size)
+            && mib < LOG_SPOOL_MIN_STATE_MIB
+        {
+            return Err(ValidationError::InvalidStorageSize {
+                field: "storage.app_data.size",
+                detail: format!(
+                    "guest-memory-v2 log spool binds to the state PVC and needs at \
+                     least {LOG_SPOOL_MIN_STATE_MIB}Mi (32Mi rotation cap plus \
+                     rotation-temp and fs/platform headroom), got {mib}Mi"
+                ),
+            });
+        }
         for container in &app.containers {
             for path in &container.storage_paths {
                 if crate::manifest::enclava_init_config::storage_subdir(path) == ".enclava" {
                     return Err(ValidationError::InvalidStoragePath {
                         path: path.clone(),
                         detail: "maps onto the platform-reserved \".enclava\" state subdir"
+                            .to_string(),
+                    });
+                }
+                if mount_path_covers_log_spool_target(path) {
+                    return Err(ValidationError::InvalidStoragePath {
+                        path: path.clone(),
+                        detail: "covers /run/enclava-logs, the encrypted log spool \
+                                 bind target"
                             .to_string(),
                     });
                 }
@@ -277,6 +303,41 @@ fn validate_storage_size(field: &'static str, value: &str) -> Result<(), String>
 /// enforce it (see its comment). Enforced in lockstep with enclava-init
 /// `MIN_VOLUME_BYTES` — keep the two bounds identical.
 pub const MIN_VOLUME_SIZE_MIB: u128 = 32;
+
+/// Fresh-state floor for `storage.app_data.size` when the v2 signed layout
+/// re-binds the encrypted log spool onto the state PVC (`log_spool_state_bind`).
+/// The spool dir holds a 32 MiB live file plus a rotation temp copy, and the
+/// filesystem/platform need headroom on top (cap#290 round-2 review).
+pub const LOG_SPOOL_MIN_STATE_MIB: u128 = 128;
+
+/// Whether a guest mount path covers the encrypted log spool bind target
+/// `/run/enclava-logs` (cap#290 round-2 review): equal, an ancestor that
+/// would shadow the bind (e.g. `/run`, `/`), or a descendant the bind
+/// would mount over (`/run/enclava-logs/sub`). Comparison is lexical on
+/// normalized components (`.` skipped); a `..` segment fails closed as
+/// covering — such paths are invalid downstream anyway.
+fn mount_path_covers_log_spool_target(path: &str) -> bool {
+    fn normal_components(path: &str) -> Option<Vec<std::ffi::OsString>> {
+        let mut out = Vec::new();
+        for component in std::path::Path::new(path).components() {
+            match component {
+                Component::Normal(part) => out.push(part.to_os_string()),
+                Component::CurDir => {}
+                Component::ParentDir => return None,
+                Component::RootDir | Component::Prefix(_) => {}
+            }
+        }
+        Some(out)
+    }
+    let Some(mount) = normal_components(path) else {
+        return true;
+    };
+    let Some(target) = normal_components("/run/enclava-logs") else {
+        return true;
+    };
+    (mount.len() <= target.len() && target.starts_with(&mount))
+        || (target.len() <= mount.len() && mount.starts_with(&target))
+}
 
 /// Validate that a persistent-volume size is a positive binary quantity of
 /// at least [`MIN_VOLUME_SIZE_MIB`]. Shared by API admission paths; exact

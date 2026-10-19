@@ -4,6 +4,7 @@ use enclava_init::config::{AppBindMountConfig, LogEncryptionSection};
 use enclava_init::safe_diagnostics::SafeDiagnosticCode;
 use enclava_init::tls_certificate::TlsBrokerFailure;
 use serde_json::json;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::sync::{Arc, Mutex};
 use tempfile::tempdir;
@@ -1063,6 +1064,213 @@ fn signed_cc_init_data_rejects_reserved_enclava_bind_mount_with_spool() {
     let message = err.to_string();
     assert!(message.contains("reserved"), "got: {message}");
     assert!(message.contains(".enclava"), "got: {message}");
+}
+
+#[test]
+fn signed_cc_init_data_rejects_bind_mount_covering_spool_target() {
+    // cap#290 round-2 review: under the v2 spool bind, a signed artifact
+    // whose bind mount mount_path covers /run/enclava-logs (the bind
+    // target — equal, ancestor, or descendant) collides the app mount with
+    // the platform bind. The guest refuses the combination even though
+    // claims and ConfigMap match.
+    let dir = tempdir().unwrap();
+    let mut cfg = unsigned_config();
+    cfg.log_encryption = Some(LogEncryptionSection {
+        spool_storage: Some("state-bind-v1".to_string()),
+        ..Default::default()
+    });
+    cfg.app_bind_mounts.push(AppBindMountConfig {
+        subdir: "data".to_string(),
+        mount_path: "/run/enclava-logs".to_string(),
+    });
+    let mut cc_body = signed_cc_claims_toml(&cfg);
+    cc_body.push_str("log_spool_storage = \"state-bind-v1\"\n");
+    let cc_path = dir.path().join("cc-init-data.toml");
+    cfg.cc_init_data_path = Some(cc_path.display().to_string());
+    std::fs::write(&cc_path, cc_body).unwrap();
+
+    let err = validate_transport(&cfg).unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("/run/enclava-logs"),
+        "error must name the spool bind target, got: {message}"
+    );
+
+    // The same check covers ancestor paths that would shadow the bind.
+    let mut cfg = unsigned_config();
+    cfg.log_encryption = Some(LogEncryptionSection {
+        spool_storage: Some("state-bind-v1".to_string()),
+        ..Default::default()
+    });
+    cfg.app_bind_mounts.push(AppBindMountConfig {
+        subdir: "data".to_string(),
+        mount_path: "/run".to_string(),
+    });
+    let mut cc_body = signed_cc_claims_toml(&cfg);
+    cc_body.push_str("log_spool_storage = \"state-bind-v1\"\n");
+    let cc_path = dir.path().join("cc-init-data.toml");
+    cfg.cc_init_data_path = Some(cc_path.display().to_string());
+    std::fs::write(&cc_path, cc_body).unwrap();
+    let err = validate_transport(&cfg).unwrap_err();
+    assert!(
+        err.to_string().contains("/run/enclava-logs"),
+        "ancestor mount must fail too, got: {err}"
+    );
+
+    // A non-covering mount is fine.
+    let mut cfg = unsigned_config();
+    cfg.log_encryption = Some(LogEncryptionSection {
+        spool_storage: Some("state-bind-v1".to_string()),
+        ..Default::default()
+    });
+    cfg.app_bind_mounts.push(AppBindMountConfig {
+        subdir: "data".to_string(),
+        mount_path: "/run/enclava-logs-other".to_string(),
+    });
+    let mut cc_body = signed_cc_claims_toml(&cfg);
+    cc_body.push_str("log_spool_storage = \"state-bind-v1\"\n");
+    let cc_path = dir.path().join("cc-init-data.toml");
+    cfg.cc_init_data_path = Some(cc_path.display().to_string());
+    std::fs::write(&cc_path, cc_body).unwrap();
+    validate_transport(&cfg).expect("non-covering mount must pass");
+}
+
+// --- fd-relative log spool preparation (cap#290 round-2 review) ---
+
+/// Run `prepare_log_spool_dir_at` under the current uid/gid (tests are not
+/// root, so the production owner uid 0 is replaced by the euid — chowning
+/// to the current ids is always permitted).
+fn prepare_spool(state_root: &Path, keep_file_name: &str) -> Result<std::os::fd::OwnedFd> {
+    let uid = nix::unistd::Uid::effective().as_raw();
+    let gid = nix::unistd::Gid::effective().as_raw();
+    prepare_log_spool_dir_at(
+        state_root,
+        ExecIdentity {
+            uid,
+            gid,
+            kind: IdentityKind::Numeric,
+        },
+        uid,
+        gid,
+        keep_file_name,
+    )
+}
+
+#[test]
+fn log_spool_dir_is_prepared_fd_relative_with_mount_contract() {
+    let dir = tempdir().unwrap();
+    let state_root = dir.path().join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+
+    // A surviving current-generation spool file is preserved and re-owned.
+    let spool_path = state_root.join(".enclava").join("log-spool");
+    std::fs::create_dir_all(&spool_path).unwrap();
+    let keep = "web-Zmh6rfhivXdsj8GLjp-OIAiXFIVu4jOzkCpZHQ1fKSU.jsonl";
+    std::fs::write(spool_path.join(keep), b"frame").unwrap();
+
+    let fd = prepare_spool(&state_root, keep).unwrap();
+    assert!(fd.as_raw_fd() > 0, "expected an open spool directory fd");
+
+    let mode = std::fs::metadata(&spool_path).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(
+        mode, 0o2770,
+        "spool dir must carry the group-setgid contract"
+    );
+    let uid = nix::unistd::Uid::effective().as_raw();
+    let gid = nix::unistd::Gid::effective().as_raw();
+    let meta = std::fs::metadata(&spool_path).unwrap();
+    assert_eq!(meta.uid(), uid);
+    assert_eq!(meta.gid(), gid);
+    assert!(
+        spool_path.join(keep).exists(),
+        "the current-generation spool file must be preserved"
+    );
+}
+
+#[test]
+fn log_spool_dir_rejects_symlinked_enclava_component() {
+    let dir = tempdir().unwrap();
+    let state_root = dir.path().join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let elsewhere = dir.path().join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, state_root.join(".enclava")).unwrap();
+
+    let err = prepare_spool(&state_root, "web-abc.jsonl").unwrap_err();
+    assert!(
+        err.to_string().contains(".enclava"),
+        "error should name the component, got: {err}"
+    );
+}
+
+#[test]
+fn log_spool_dir_rejects_symlinked_log_spool_component() {
+    let dir = tempdir().unwrap();
+    let state_root = dir.path().join("state");
+    std::fs::create_dir_all(state_root.join(".enclava")).unwrap();
+    let elsewhere = dir.path().join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, state_root.join(".enclava/log-spool")).unwrap();
+
+    assert!(prepare_spool(&state_root, "web-abc.jsonl").is_err());
+}
+
+#[test]
+fn log_spool_prepare_retires_previous_key_generation() {
+    let dir = tempdir().unwrap();
+    let state_root = dir.path().join("state");
+    let spool_path = state_root.join(".enclava").join("log-spool");
+    std::fs::create_dir_all(&spool_path).unwrap();
+
+    let keep = "web-Zmh6rfhivXdsj8GLjp-OIAiXFIVu4jOzkCpZHQ1fKSU.jsonl";
+    let keep_rotate = format!("{keep}.rotate.1");
+    let stale = "web-OLDGENERATIONaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.jsonl";
+    let stale_rotate = format!("{stale}.rotate.2");
+    let stray_spool = "other-generation.jsonl";
+    let unrelated = "not-a-spool.txt";
+    for name in [
+        keep,
+        &keep_rotate,
+        stale,
+        &stale_rotate,
+        stray_spool,
+        unrelated,
+    ] {
+        std::fs::write(spool_path.join(name), b"x").unwrap();
+    }
+    std::fs::create_dir(spool_path.join("nested-dir.jsonl")).unwrap();
+
+    prepare_spool(&state_root, keep).unwrap();
+
+    for name in [keep, &keep_rotate] {
+        assert!(
+            spool_path.join(name).exists(),
+            "{name}: current generation must survive"
+        );
+    }
+    for name in [stale, &stale_rotate, stray_spool] {
+        assert!(
+            !spool_path.join(name).exists(),
+            "{name}: previous generation must be retired"
+        );
+    }
+    assert!(
+        spool_path.join(unrelated).exists(),
+        "non-spool files are left alone"
+    );
+    assert!(
+        spool_path.join("nested-dir.jsonl").is_dir(),
+        "directories are never unlinked"
+    );
+}
+
+#[test]
+fn log_spool_capacity_floor() {
+    assert!(!log_spool_capacity_sufficient(
+        LOG_SPOOL_MIN_STATE_BYTES - 1
+    ));
+    assert!(log_spool_capacity_sufficient(LOG_SPOOL_MIN_STATE_BYTES));
+    assert!(log_spool_capacity_sufficient(LOG_SPOOL_MIN_STATE_BYTES * 2));
 }
 
 #[test]

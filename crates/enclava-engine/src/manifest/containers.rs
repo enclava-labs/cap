@@ -53,6 +53,20 @@ pub const CADDY_INTERNAL_TLS_PORT: i32 = 10443;
 pub const CADDY_INTERNAL_RUNTIME_PATH: &str = "/run/enclava/caddy-runtime";
 pub const UNLOCK_SOCKET_PATH: &str = "/run/enclava-unlock/unlock.sock";
 pub const ENCLAVA_LOG_SPOOL_DIR: &str = "/run/enclava-logs";
+
+/// Key-namespaced workload log spool path `<container>-<recipient_digest>.jsonl`
+/// (cap#290 round-2 review): distinct log-encryption recipients spool to
+/// distinct files so a key rotation cannot interleave frames encrypted to
+/// different recipients, and the guest-side generation cleanup can retire
+/// the previous generation. The digest is the canonical `sha256:`-prefixed
+/// base64url from `validate_public_key` with the scheme prefix stripped.
+fn log_spool_path(container: &str, public_key_sha256: &str) -> String {
+    let digest = public_key_sha256
+        .strip_prefix("sha256:")
+        .unwrap_or(public_key_sha256);
+    format!("{ENCLAVA_LOG_SPOOL_DIR}/{container}-{digest}.jsonl")
+}
+
 pub const ENCLAVA_LOG_RELAY_PORT: i32 = 8082;
 const CADDY_DNS01_BROKER_TLS_HANDOFF_SCRIPT: &str = concat!(
     "trap 'exit 0' TERM INT\n",
@@ -278,7 +292,7 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
             env_vars.push(env("ENCLAVA_LOG_CONTAINER_NAME", &primary.name));
             env_vars.push(env(
                 "ENCLAVA_LOG_SPOOL_PATH",
-                &format!("{ENCLAVA_LOG_SPOOL_DIR}/{}.jsonl", primary.name),
+                &log_spool_path(&primary.name, &log_encryption.public_key_sha256),
             ));
         }
     }
@@ -519,7 +533,7 @@ pub fn build_enclava_init_container(app: &ConfidentialApp) -> Container {
         env("KBS_FETCH_RETRY_SLEEP_SECONDS", "2"),
         env("KBS_FETCH_REQUEST_TIMEOUT_SECONDS", "10"),
     ];
-    if app.log_encryption.is_some() {
+    if let Some(log_encryption) = app.log_encryption.as_ref() {
         env_vars.push(env(
             "ENCLAVA_LOG_RELAY_BIND",
             &format!("127.0.0.1:{ENCLAVA_LOG_RELAY_PORT}"),
@@ -527,7 +541,7 @@ pub fn build_enclava_init_container(app: &ConfidentialApp) -> Container {
         env_vars.push(env("ENCLAVA_LOG_RELAY_CONTAINER", &primary.name));
         env_vars.push(env(
             "ENCLAVA_LOG_RELAY_SPOOL_PATH",
-            &format!("{ENCLAVA_LOG_SPOOL_DIR}/{}.jsonl", primary.name),
+            &log_spool_path(&primary.name, &log_encryption.public_key_sha256),
         ));
     }
     let mut volume_mounts = vec![

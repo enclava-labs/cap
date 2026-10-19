@@ -167,7 +167,13 @@ fn run() -> Result<()> {
     )?;
     record_stage("preparing mount ownership").ok();
     prepare_mount_ownership(&cfg)?;
-    bind_log_spool_to_state(&cfg, &log_encryption_handoff)
+    // The spool dir is prepared fd-relative (a symlinked <state-root>/
+    // .enclava or log-spool fails closed) and the bind pins the verified
+    // inode via /proc/self/fd rather than a re-resolved path (cap#290
+    // round-2 review).
+    let spool_dir = prepare_log_spool_dir(&cfg, &log_encryption_handoff)
+        .context("preparing log spool directory on encrypted state")?;
+    bind_log_spool_to_state(&cfg, &log_encryption_handoff, spool_dir.as_ref())
         .context("binding log spool to encrypted state")?;
 
     record_stage("provisioning static tls certificate").ok();
@@ -763,12 +769,15 @@ fn validate_configmap_transport_against_signed_cc_init_data(
             .and_then(|section| section.spool_storage.as_deref()),
         "log-encryption.spool-storage",
     )?;
-    // cap#290 review: the v2 spool lives below <state-root>/.enclava. A
-    // signed artifact whose bind mounts claim that reserved subdir would
-    // collide the spool with tenant storage — even though the claims and
-    // ConfigMap agree, the combination is refused rather than rendered
-    // into a corrupting mount layout. (Validation should have rejected it
-    // upstream; this is the guest-side fail-closed check.)
+    // cap#290 review: the v2 spool lives below <state-root>/.enclava and
+    // is bound over /run/enclava-logs. A signed artifact whose bind mounts
+    // claim the reserved subdir — or whose mount_path covers the spool
+    // target (equal, an ancestor that shadows the bind, or a descendant
+    // the bind mounts over) — would collide the spool with tenant
+    // storage. Even though claims and ConfigMap agree, the combination is
+    // refused rather than rendered into a corrupting mount layout.
+    // (Validation should have rejected it upstream; this is the guest-side
+    // fail-closed check.)
     if log_spool_state_bind_enabled(cfg)
         && cfg
             .app_bind_mounts
@@ -778,6 +787,18 @@ fn validate_configmap_transport_against_signed_cc_init_data(
         anyhow::bail!(
             "app bind mount uses the reserved .enclava ({MANAGED_CONFIG_ROOT}) state subdir, \
              which collides with the encrypted log spool"
+        );
+    }
+    if log_spool_state_bind_enabled(cfg)
+        && let Some(bind) = cfg
+            .app_bind_mounts
+            .iter()
+            .find(|bind| mount_path_covers_log_spool_target(&bind.mount_path))
+    {
+        anyhow::bail!(
+            "app bind mount mount_path {:?} covers /run/enclava-logs, the encrypted \
+             log spool bind target",
+            bind.mount_path
         );
     }
     let handoff = signed_log_encryption_handoff(data, cfg)?;
@@ -965,6 +986,35 @@ fn validate_app_bind_mount_path(path: &str) -> Result<()> {
         anyhow::bail!("app bind mount mount_path must not contain '..' path segments: {path}");
     }
     Ok(())
+}
+
+/// Whether an app bind mount path covers the encrypted log spool bind
+/// target `/run/enclava-logs` (cap#290 round-2 review): equal, an ancestor
+/// that would shadow the bind (e.g. `/run`, `/`), or a descendant the bind
+/// would mount over (`/run/enclava-logs/sub`). Lexical on normalized
+/// components (`.` skipped); `..` fails closed as covering (such paths are
+/// already rejected by [`validate_app_bind_mount_path`]).
+fn mount_path_covers_log_spool_target(path: &str) -> bool {
+    fn normal_components(path: &str) -> Option<Vec<std::ffi::OsString>> {
+        let mut out = Vec::new();
+        for component in std::path::Path::new(path).components() {
+            match component {
+                std::path::Component::Normal(part) => out.push(part.to_os_string()),
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => return None,
+                std::path::Component::RootDir | std::path::Component::Prefix(_) => {}
+            }
+        }
+        Some(out)
+    }
+    let Some(mount) = normal_components(path) else {
+        return true;
+    };
+    let Some(target) = normal_components("/run/enclava-logs") else {
+        return true;
+    };
+    (mount.len() <= target.len() && target.starts_with(&mount))
+        || (target.len() <= mount.len() && mount.starts_with(&target))
 }
 
 fn require_signed_config_match(
@@ -1461,23 +1511,6 @@ fn prepare_mount_ownership(cfg: &Config) -> Result<()> {
     chown::chown_recursive(&caddy_seed_dir, caddy_identity)
         .with_context(|| format!("chown {}", caddy_seed_dir.display()))?;
 
-    if log_spool_state_bind_enabled(cfg) {
-        let spool_dir = log_spool_state_dir(Path::new(&cfg.state_root));
-        std::fs::create_dir_all(&spool_dir)
-            .with_context(|| format!("creating {}", spool_dir.display()))?;
-        // The spool survives on the state PVC across profile changes:
-        // entries written under a root-running workload stay root:root and
-        // would wedge a redeploy to the restricted identity. Reconcile
-        // existing contents to the current app identity (symlink-safe),
-        // then restore the dir's group-writable mount contract.
-        chown::chown_recursive(&spool_dir, app_identity)
-            .with_context(|| format!("chown {}", spool_dir.display()))?;
-        chown::chown(&spool_dir, numeric_identity(0, cfg.app_gid))
-            .with_context(|| format!("chown {}", spool_dir.display()))?;
-        fs::set_permissions(&spool_dir, fs::Permissions::from_mode(0o2770))
-            .with_context(|| format!("chmod {}", spool_dir.display()))?;
-    }
-
     for bind in &cfg.app_bind_mounts {
         let dir = app_bind_mount_dir(state_root, &bind.subdir)?;
         std::fs::create_dir_all(&dir).with_context(|| {
@@ -1681,9 +1714,233 @@ fn log_spool_state_bind_enabled(cfg: &Config) -> bool {
 /// Spool source directory on the encrypted state volume. Lives below the
 /// platform-reserved `.enclava` namespace so no tenant `storage_paths`
 /// bind (which maps to `<state-root>/<subdir>`) can collide with the
-/// spool (cap#290 review).
+/// spool (cap#290 review). Kept for tests that pin the on-disk location;
+/// runtime traversal is fd-relative via [`prepare_log_spool_dir`].
+#[cfg(test)]
 fn log_spool_state_dir(state_root: &Path) -> PathBuf {
     state_root.join(MANAGED_CONFIG_ROOT).join("log-spool")
+}
+
+/// `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`: every component of the spool
+/// source path is opened under these flags so a symlink or non-directory
+/// swapped in at any level fails closed (ELOOP/ENOTDIR) instead of being
+/// followed or silently accepted (cap#290 round-2 review).
+const SPOOL_OPEN_FLAGS: nix::fcntl::OFlag = nix::fcntl::OFlag::from_bits_retain(
+    nix::fcntl::OFlag::O_DIRECTORY.bits()
+        | nix::fcntl::OFlag::O_NOFOLLOW.bits()
+        | nix::fcntl::OFlag::O_CLOEXEC.bits(),
+);
+
+/// Minimum total capacity of the filesystem backing the state-bound spool.
+/// Validation requires ≥128Mi state PVC for these renders; the runtime
+/// check is the fail-closed floor for grandfathered or bypassed renders —
+/// 64 MiB covers the 32 MiB live spool plus its rotation temp with a small
+/// margin (cap#290 round-2 review).
+const LOG_SPOOL_MIN_STATE_BYTES: u64 = 64 * 1024 * 1024;
+
+fn log_spool_capacity_sufficient(total_bytes: u64) -> bool {
+    total_bytes >= LOG_SPOOL_MIN_STATE_BYTES
+}
+
+/// Prepare `<state-root>/.enclava/log-spool` for the state bind, entirely
+/// fd-relative. Returns `None` when the bind is not enabled or no signed
+/// log-encryption claim exists.
+fn prepare_log_spool_dir(
+    cfg: &Config,
+    handoff: &LogEncryptionHandoffFile,
+) -> Result<Option<std::os::fd::OwnedFd>> {
+    let LogEncryptionHandoffFile::Enabled(handoff) = handoff else {
+        return Ok(None);
+    };
+    if !log_spool_state_bind_enabled(cfg) {
+        return Ok(None);
+    }
+    prepare_log_spool_dir_at(
+        Path::new(&cfg.state_root),
+        numeric_identity(cfg.app_uid, cfg.app_gid),
+        0,
+        cfg.app_gid,
+        &log_spool_keep_file_name(&handoff.public_key_sha256),
+    )
+    .map(Some)
+}
+
+/// Fd-relative `prepare_log_spool_dir` for tests (cap#290 round-2 review).
+/// Opens `<state_root>/.enclava/log-spool` component-wise under
+/// [`SPOOL_OPEN_FLAGS`], creating `.enclava` (0o750) or `log-spool`
+/// (0o2770) only when missing — `.enclava` is normally already created by
+/// `prepare_managed_config_dir`. Any symlinked or non-directory component
+/// fails closed, and the returned fd pins the verified spool inode for the
+/// later bind mount.
+fn prepare_log_spool_dir_at(
+    state_root: &Path,
+    app_identity: ExecIdentity,
+    // The spool dir's owner uid: always root (0) in production so only the
+    // privileged init sidecar manages it; tests pass the current euid.
+    dir_uid: u32,
+    dir_gid: u32,
+    keep_file_name: &str,
+) -> Result<std::os::fd::OwnedFd> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    fn open_dir(path: &Path) -> Result<std::os::fd::OwnedFd> {
+        let fd = nix::fcntl::open(path, SPOOL_OPEN_FLAGS, nix::sys::stat::Mode::empty())
+            .with_context(|| format!("opening {}", path.display()))?;
+        // SAFETY: open returned a fresh owned descriptor.
+        Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+    }
+    fn open_or_mkdir_at(
+        dir: &std::os::fd::OwnedFd,
+        name: &str,
+        mode: nix::sys::stat::Mode,
+    ) -> Result<std::os::fd::OwnedFd> {
+        match nix::fcntl::openat(
+            Some(dir.as_raw_fd()),
+            name,
+            SPOOL_OPEN_FLAGS,
+            nix::sys::stat::Mode::empty(),
+        ) {
+            Ok(fd) => Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }),
+            Err(nix::errno::Errno::ENOENT) => {
+                nix::sys::stat::mkdirat(Some(dir.as_raw_fd()), name, mode)
+                    .with_context(|| format!("creating {name}"))?;
+                let fd = nix::fcntl::openat(
+                    Some(dir.as_raw_fd()),
+                    name,
+                    SPOOL_OPEN_FLAGS,
+                    nix::sys::stat::Mode::empty(),
+                )
+                .with_context(|| format!("opening {name}"))?;
+                Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+            }
+            Err(err) => Err(err).with_context(|| format!("opening {name}")),
+        }
+    }
+
+    let root = open_dir(state_root)?;
+    let managed = open_or_mkdir_at(
+        &root,
+        MANAGED_CONFIG_ROOT,
+        nix::sys::stat::Mode::from_bits_truncate(0o750),
+    )?;
+    let spool = open_or_mkdir_at(
+        &managed,
+        "log-spool",
+        nix::sys::stat::Mode::from_bits_truncate(0o2770),
+    )?;
+
+    // Retire previous key-generation spools: `.jsonl` files (and their
+    // `.rotate.` temp copies) not belonging to the current generation are
+    // unlinked fd-relatively — files/symlinks only, directories are never
+    // removed (cap#290 round-2 review).
+    {
+        let keep = keep_file_name.as_bytes();
+        let mut stale = Vec::new();
+        let mut iter_dir = nix::dir::Dir::openat(
+            Some(spool.as_raw_fd()),
+            ".",
+            SPOOL_OPEN_FLAGS,
+            nix::sys::stat::Mode::empty(),
+        )
+        .context("listing log spool directory")?;
+        for entry in iter_dir.iter() {
+            let entry = entry.context("reading log spool directory")?;
+            let name = entry.file_name().to_bytes();
+            if name == b"." || name == b".." {
+                continue;
+            }
+            let kept = name == keep
+                || (name.starts_with(keep) && name[keep.len()..].starts_with(b".rotate."));
+            if kept {
+                continue;
+            }
+            let looks_like_spool = name.ends_with(b".jsonl")
+                || name
+                    .windows(b".jsonl.rotate.".len())
+                    .any(|w| w == b".jsonl.rotate.");
+            if !looks_like_spool {
+                continue;
+            }
+            let is_dir = match entry.file_type() {
+                Some(nix::dir::Type::Directory) => true,
+                Some(_) => false,
+                None => nix::sys::stat::fstatat(
+                    Some(spool.as_raw_fd()),
+                    entry.file_name(),
+                    nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
+                )
+                .map(|stat| (stat.st_mode & nix::libc::S_IFMT) == nix::libc::S_IFDIR)
+                .unwrap_or(false),
+            };
+            if !is_dir {
+                stale.push(entry.file_name().to_owned());
+            }
+        }
+        drop(iter_dir);
+        for name in stale {
+            match nix::unistd::unlinkat(
+                Some(spool.as_raw_fd()),
+                name.as_c_str(),
+                nix::unistd::UnlinkatFlags::NoRemoveDir,
+            ) {
+                Ok(()) => {}
+                // Removed concurrently, or raced into a directory —
+                // directories are never unlinked either way.
+                Err(nix::errno::Errno::ENOENT)
+                | Err(nix::errno::Errno::EISDIR)
+                | Err(nix::errno::Errno::EPERM) => {}
+                Err(err) => {
+                    return Err(err).context("removing previous-generation log spool file");
+                }
+            }
+        }
+    }
+
+    // The spool survives on the state PVC across profile changes:
+    // entries written under a root-running workload stay root:root and
+    // would wedge a redeploy to the restricted identity. Reconcile
+    // existing contents to the current app identity fd-relatively
+    // (symlink-safe), then restore the dir's group-writable mount
+    // contract on the verified inode.
+    chown::chown_recursive_at(spool.as_raw_fd(), app_identity)
+        .context("chown log spool contents")?;
+    nix::unistd::fchown(
+        spool.as_raw_fd(),
+        Some(nix::unistd::Uid::from_raw(dir_uid)),
+        Some(nix::unistd::Gid::from_raw(dir_gid)),
+    )
+    .context("chown log spool directory")?;
+    nix::sys::stat::fchmod(
+        spool.as_raw_fd(),
+        nix::sys::stat::Mode::from_bits_truncate(0o2770),
+    )
+    .context("chmod log spool directory")?;
+    Ok(spool)
+}
+
+/// Name of the current key generation's spool file inside the prepared
+/// spool dir. Prefers the basename of ENCLAVA_LOG_RELAY_SPOOL_PATH (the
+/// engine renders the key-namespaced name there for the relay); when the
+/// env is unset or its basename is not a single `.jsonl` file name, falls
+/// back to deriving `<container>-<digest>.jsonl` from
+/// ENCLAVA_LOG_RELAY_CONTAINER (default "app") and the signed recipient
+/// digest — the derivation is write-free (compare-only), so a hostile env
+/// can at worst retire files that never belonged to this generation.
+fn log_spool_keep_file_name(recipient_sha256: &str) -> String {
+    let digest = recipient_sha256
+        .strip_prefix("sha256:")
+        .unwrap_or(recipient_sha256);
+    let derived = format!(
+        "{}-{digest}.jsonl",
+        std::env::var("ENCLAVA_LOG_RELAY_CONTAINER").unwrap_or_else(|_| "app".to_string())
+    );
+    let Some(env_path) = std::env::var_os("ENCLAVA_LOG_RELAY_SPOOL_PATH") else {
+        return derived;
+    };
+    match Path::new(&env_path).file_name().and_then(|n| n.to_str()) {
+        Some(name) if name.ends_with(".jsonl") => name.to_string(),
+        _ => derived,
+    }
 }
 
 /// Re-bind the "logs" Memory emptyDir mountpoint onto the encrypted state
@@ -1691,22 +1948,59 @@ fn log_spool_state_dir(state_root: &Path) -> PathBuf {
 /// (cap#289). Runs after LUKS unlock, before readiness; the pod mount
 /// propagations (Bidirectional here, HostToContainer on the app side) carry
 /// the re-bind to the workload. No-op for any layout that did not opt in.
-fn bind_log_spool_to_state(cfg: &Config, handoff: &LogEncryptionHandoffFile) -> Result<()> {
+/// The bind source is `/proc/self/fd/<spool_dir>` so the mount pins the
+/// inode verified by [`prepare_log_spool_dir`] instead of re-resolving a
+/// host-raceable path (cap#290 round-2 review).
+fn bind_log_spool_to_state(
+    cfg: &Config,
+    handoff: &LogEncryptionHandoffFile,
+    spool_dir: Option<&std::os::fd::OwnedFd>,
+) -> Result<()> {
     if !log_spool_state_bind_enabled(cfg)
         || !matches!(handoff, LogEncryptionHandoffFile::Enabled(_))
     {
         return Ok(());
     }
-    let source = log_spool_state_dir(Path::new(&cfg.state_root));
+    use std::os::fd::AsRawFd;
+    let spool_dir = spool_dir
+        .ok_or_else(|| anyhow!("log spool state bind enabled without a prepared spool fd"))?;
+    // The bind target must be the real directory the manifest mounted;
+    // a host-planted symlink would redirect the bind outside the pod's
+    // view of /run/enclava-logs.
     let target = Path::new("/run/enclava-logs");
+    let target_meta =
+        fs::symlink_metadata(target).with_context(|| format!("stating {}", target.display()))?;
+    if !target_meta.is_dir() || target_meta.file_type().is_symlink() {
+        anyhow::bail!(
+            "log spool bind target {} is not a real directory",
+            target.display()
+        );
+    }
+    // Capacity of the filesystem the spool will live on, taken on the
+    // verified fd: validation requires a ≥128Mi state PVC for these
+    // renders; this floor (64Mi — 32Mi live spool plus rotation temp and
+    // a small margin) is the fail-closed bound for grandfathered or
+    // bypassed renders.
+    let statfs = nix::sys::statfs::fstatfs(spool_dir).context("statfs on log spool directory")?;
+    let total_bytes = (statfs.blocks() as u128)
+        .saturating_mul(u64::try_from(statfs.block_size()).unwrap_or(0) as u128);
+    let total_bytes = u64::try_from(total_bytes).unwrap_or(u64::MAX);
+    if !log_spool_capacity_sufficient(total_bytes) {
+        anyhow::bail!(
+            "log spool state filesystem has only {total_bytes} bytes total capacity; \
+             need at least {} (32Mi spool rotation plus temp and fs/platform headroom)",
+            LOG_SPOOL_MIN_STATE_BYTES
+        );
+    }
+    let source = format!("/proc/self/fd/{}", spool_dir.as_raw_fd());
     nix::mount::mount(
-        Some(source.as_path()),
+        Some(source.as_str()),
         target,
         None::<&str>,
         nix::mount::MsFlags::MS_BIND,
         None::<&str>,
     )
-    .with_context(|| format!("bind mounting {} to {}", source.display(), target.display()))
+    .with_context(|| format!("bind mounting {source} to {}", target.display()))
 }
 
 fn numeric_identity(uid: u32, gid: u32) -> ExecIdentity {

@@ -155,25 +155,7 @@ fn v2_spool_layout_rejects_tenant_path_mapping_onto_reserved_enclava_subdir() {
     // cap#290 review: the v2 log spool lives at <state-root>/.enclava/
     // log-spool; a tenant storage_path whose state subdir collapses onto
     // .enclava would share the directory with the spool.
-    let v2_app = |storage_paths: Vec<String>| {
-        let mut app = sample_app();
-        let policy_text = "# enclava-cap-volume-layout: guest-memory-v2\npackage agent_policy\n";
-        app.generated_agent_policy = Some(enclava_engine::types::GeneratedAgentPolicy {
-            policy_text: policy_text.to_string(),
-            policy_sha256: Sha256::digest(policy_text.as_bytes()).into(),
-            genpolicy_version_pin: "kata-containers/genpolicy@3.28.0+test".to_string(),
-        });
-        app.log_encryption = Some(enclava_engine::types::LogEncryptionConfig {
-            algorithm: "x25519-hpke-v1".to_string(),
-            key_id: "logs-prod".to_string(),
-            public_key_base64url: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
-            public_key_sha256: "sha256:Zmh6rfhivXdsj8GLjp-OIAiXFIVu4jOzkCpZHQ1fKSU".to_string(),
-        });
-        app.containers[0].storage_paths = storage_paths;
-        app
-    };
-
-    let err = validate_app(&v2_app(vec!["/.enclava".to_string()])).unwrap_err();
+    let err = validate_app(&v2_app_with_logs(vec!["/.enclava".to_string()])).unwrap_err();
     assert!(
         matches!(&err, ValidationError::InvalidStoragePath { .. }),
         "expected InvalidStoragePath, got: {err:?}"
@@ -182,7 +164,7 @@ fn v2_spool_layout_rejects_tenant_path_mapping_onto_reserved_enclava_subdir() {
     // The same v2+encrypted app without the reserved path must not produce
     // InvalidStoragePath (the bind subdir transform leaves "/app/data" as
     // "app-data").
-    let app = v2_app(vec!["/app/data".to_string()]);
+    let app = v2_app_with_logs(vec!["/app/data".to_string()]);
     assert!(
         !matches!(
             &validate_app(&app),
@@ -190,4 +172,94 @@ fn v2_spool_layout_rejects_tenant_path_mapping_onto_reserved_enclava_subdir() {
         ),
         "a non-colliding storage path must not be rejected"
     );
+}
+
+/// v2 signed layout with encrypted logging; the fixture sha256 matches
+/// `public_key_sha256("".as_bytes())`-style canonical test material shared
+/// with the manifest tests (AAAA… → sha256:Zmh6…).
+fn v2_app_with_logs(storage_paths: Vec<String>) -> enclava_engine::types::ConfidentialApp {
+    let mut app = sample_app();
+    let policy_text = "# enclava-cap-volume-layout: guest-memory-v2\npackage agent_policy\n";
+    app.generated_agent_policy = Some(enclava_engine::types::GeneratedAgentPolicy {
+        policy_text: policy_text.to_string(),
+        policy_sha256: Sha256::digest(policy_text.as_bytes()).into(),
+        genpolicy_version_pin: "kata-containers/genpolicy@3.28.0+test".to_string(),
+    });
+    app.log_encryption = Some(enclava_engine::types::LogEncryptionConfig {
+        algorithm: "x25519-hpke-v1".to_string(),
+        key_id: "logs-prod".to_string(),
+        public_key_base64url: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+        public_key_sha256: "sha256:Zmh6rfhivXdsj8GLjp-OIAiXFIVu4jOzkCpZHQ1fKSU".to_string(),
+    });
+    // The spool capacity floor (128Mi) is part of this gate; give the
+    // fixture enough state so storage-path tests exercise only the path
+    // checks.
+    app.storage.app_data.size = "256Mi".to_string();
+    app.containers[0].storage_paths = storage_paths;
+    app
+}
+
+#[test]
+fn v2_spool_layout_rejects_state_volume_too_small_for_the_spool() {
+    // cap#290 round-2 review: the bind moves the 32 MiB-rotation spool onto
+    // the state PVC; a sub-floor volume wedges the workload on ENOSPC.
+    let mut app = v2_app_with_logs(Vec::new());
+    app.storage.app_data.size = "64Mi".to_string();
+    let err = validate_app(&app).unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            ValidationError::InvalidStorageSize { field, .. } if *field == "storage.app_data.size"
+        ),
+        "expected InvalidStorageSize for storage.app_data.size, got: {err:?}"
+    );
+
+    let mut app = v2_app_with_logs(Vec::new());
+    app.storage.app_data.size = "128Mi".to_string();
+    assert!(
+        !matches!(
+            &validate_app(&app),
+            Err(ValidationError::InvalidStorageSize { field, .. })
+                if *field == "storage.app_data.size"
+        ),
+        "128Mi must satisfy the spool capacity gate"
+    );
+}
+
+#[test]
+fn v2_spool_layout_rejects_storage_paths_covering_the_spool_target() {
+    // cap#290 round-2 review: a tenant storage_path that covers the
+    // /run/enclava-logs bind target (equal, ancestor, or descendant)
+    // collides the app mount with the platform bind.
+    for path in [
+        "/run/enclava-logs",
+        "/run",
+        "/",
+        "/run/enclava-logs/sub",
+        "/./run/enclava-logs",
+        "/run/enclava-logs/../x",
+    ] {
+        let err = validate_app(&v2_app_with_logs(vec![path.to_string()])).unwrap_err();
+        assert!(
+            matches!(&err, ValidationError::InvalidStoragePath { .. }),
+            "{path}: expected InvalidStoragePath, got: {err:?}"
+        );
+    }
+
+    // Sibling names and unrelated trees do not cover the target.
+    for path in [
+        "/run/enclava-logs-other",
+        "/data",
+        "/run/enclava",
+        "/state/app",
+    ] {
+        let app = v2_app_with_logs(vec![path.to_string()]);
+        assert!(
+            !matches!(
+                &validate_app(&app),
+                Err(ValidationError::InvalidStoragePath { .. })
+            ),
+            "{path}: must not be rejected"
+        );
+    }
 }
