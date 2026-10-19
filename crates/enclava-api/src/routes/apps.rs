@@ -361,6 +361,26 @@ fn requires_workload_teardown(status: AppStatus) -> bool {
     matches!(status, AppStatus::Running)
 }
 
+// Recorded status can lag a live TEE; use the same seed evidence as the waiver guard.
+async fn teardown_required_pre_delete(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    app: &App,
+) -> Result<bool, sqlx::Error> {
+    if requires_workload_teardown(app.status) {
+        return Ok(true);
+    }
+    sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM deployments WHERE app_id = $1
+         ) OR EXISTS(
+             SELECT 1 FROM kbs_owner_bindings WHERE app_id = $1
+         )",
+    )
+    .bind(app.id)
+    .fetch_one(&mut **tx)
+    .await
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct WorkloadTeardownDecision {
     required: bool,
@@ -384,7 +404,7 @@ async fn request_workload_teardown(
         tracing::info!(
             app_id = %app.id,
             code = "app_delete_teardown_not_required",
-            "skipping workload teardown endpoint for non-running app"
+            "skipping workload teardown endpoint: no owner-seed evidence"
         );
         return Ok(());
     }
@@ -1753,6 +1773,9 @@ pub(crate) async fn delete_app_before(
             Json(serde_json::json!({ "error": "app resource authority changed; retry deletion" })),
         ));
     }
+    let pre_delete_teardown_required = teardown_required_pre_delete(&mut phase_tx, &phase_app)
+        .await
+        .map_err(|_| internal_server_error())?;
     // Admission control for the teardown policy pin (Codex security finding
     // 4a27950: teardown candidates can exhaust the global KBS policy budget).
     // A teardown-pending workload keeps required, retention-exempt signed
@@ -1786,7 +1809,7 @@ pub(crate) async fn delete_app_before(
             .map_err(|_| internal_server_error())?;
             teardown_required && teardown_completed.is_none()
         } else {
-            requires_workload_teardown(phase_app.status)
+            pre_delete_teardown_required
         };
         if pin_will_apply {
             let fits = crate::kbs::teardown_unit_fits_signed_policy_budget(
@@ -1824,7 +1847,7 @@ pub(crate) async fn delete_app_before(
           WHERE id = $1",
     )
     .bind(phase_app.id)
-    .bind(requires_workload_teardown(phase_app.status))
+    .bind(pre_delete_teardown_required)
     .execute(&mut *phase_tx)
     .await
     .map_err(|_| internal_server_error())?;
@@ -1872,7 +1895,7 @@ pub(crate) async fn delete_app_before(
         .map_err(|_| internal_server_error())?;
         required && completed.is_none()
     } else {
-        requires_workload_teardown(phase_app.status)
+        pre_delete_teardown_required
     };
     let publish_enqueued = if publication_needed {
         crate::kbs::enqueue_signed_policy_revocation_if_active(&mut phase_tx)

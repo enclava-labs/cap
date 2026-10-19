@@ -527,6 +527,11 @@ binding the TLS SPKI and receipt-key hash to the app's admitted init-data and
 firmware identity. Its app-scoped KBS authority includes rollback and prior
 healthy deployments, but excludes held, withdrawn, and removed-signer artifacts.
 
+Normal deletion requires teardown whenever deployments or owner bindings show
+that a seed may exist, even if the app row is no longer `running`. An unreachable
+TEE fails closed; skipping erasure requires explicit `--abandon-teardown` and
+leaves the existing same-name recreation guard in force.
+
 `AMD_KDS_BASE_URL` includes `/vcek/v1`; its default is
 `https://kdsintf.amd.com/vcek/v1`. An internal HTTP collateral relay is supported
 without relaxing AMD certificate-chain, HWID/TCB, or debug-policy checks.
