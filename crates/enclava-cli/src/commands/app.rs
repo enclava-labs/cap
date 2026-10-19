@@ -2887,33 +2887,44 @@ pub async fn logs(args: LogsArgs) -> Result<(), Box<dyn std::error::Error>> {
     let private_key = load_log_private_key(args.log_private_key_file.as_ref())?;
 
     if args.follow {
-        // Stream logs line by line
-        use tokio::io::AsyncBufReadExt;
         let stream = resp.bytes_stream();
         let reader = tokio_util::io::StreamReader::new(
             stream.map(|result| result.map_err(std::io::Error::other)),
         );
-        let mut lines = tokio::io::BufReader::new(reader).lines();
-        while let Some(line) = lines.next_line().await? {
+        let mut reader = tokio::io::BufReader::new(reader);
+        let mut line = String::new();
+        while read_bounded_log_line(&mut reader, &mut line).await? != 0 {
             print_decrypted_log_frame(&private_key, &line)?;
         }
     } else {
-        // Non-follow mode: bound the buffered read so a hostile API cannot
-        // stream an unbounded "logs" body into CLI memory (the follow-mode
-        // stream below is line-at-a-time and inherently bounded by the
-        // client timeout instead).
+        // A hostile API must not turn a buffered log read into unbounded memory use.
         let bytes = enclava_cli::api_client::read_bounded_body(
             resp,
             enclava_cli::api_client::MAX_API_RESPONSE_BODY_BYTES,
         )
         .await?;
         let body = String::from_utf8_lossy(&bytes);
-        for line in body.lines().filter(|line| !line.trim().is_empty()) {
+        for line in body.lines() {
             print_decrypted_log_frame(&private_key, line)?;
         }
     }
 
     Ok(())
+}
+
+async fn read_bounded_log_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    line: &mut String,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+
+    let limit = enclava_cli::api_client::MAX_API_RESPONSE_BODY_BYTES;
+    line.clear();
+    let read = reader.take((limit + 1) as u64).read_line(line).await?;
+    if read > limit {
+        return Err(enclava_cli::api_client::ApiError::ResponseTooLarge(limit).into());
+    }
+    Ok(read)
 }
 
 fn response_is_encrypted_logs(resp: &reqwest::Response) -> bool {
@@ -2946,14 +2957,19 @@ fn print_decrypted_log_frame(
     private_key: &str,
     line: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!("{}", decrypted_log_frame_output(private_key, line)?);
+    if let Some(output) = decrypted_log_frame_output(private_key, line)? {
+        println!("{output}");
+    }
     Ok(())
 }
 
 fn decrypted_log_frame_output(
     private_key: &str,
     line: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    if line.trim().is_empty() {
+        return Ok(None);
+    }
     let frame: EncryptedLogFrame =
         serde_json::from_str(line).map_err(|err| format!("invalid encrypted log frame: {err}"))?;
     let plaintext = decrypt_log_frame(private_key, &frame).map_err(|err| {
@@ -2963,13 +2979,13 @@ fn decrypted_log_frame_output(
         )
     })?;
     let message = String::from_utf8_lossy(&plaintext);
-    Ok(format!(
+    Ok(Some(format!(
         "{} {} {} {}",
         frame.timestamp,
         frame.container,
         frame.stream,
         sanitize_log_output(message.trim_end())
-    ))
+    )))
 }
 
 #[derive(Subcommand)]

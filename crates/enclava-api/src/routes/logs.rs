@@ -207,12 +207,16 @@ async fn proxy_encrypted_logs_from_tee(
     domain: &str,
     query: &ValidatedLogQuery,
 ) -> Result<Response, RouteError> {
-    let (client, url) = tenant_tee_logs_client(state, app_name, namespace, domain).await;
-    let upstream = client
-        .get(url)
-        .query(&query.tee_query_pairs())
-        .send()
+    let (client, url) =
+        tenant_tee_logs_client(state, app_name, namespace, domain, query.follow).await?;
+    let mut request = client.get(url).query(&query.tee_query_pairs());
+    if !query.follow {
+        request = request.timeout(std::time::Duration::from_secs(15));
+    }
+    let request = request.send();
+    let upstream = tokio::time::timeout(std::time::Duration::from_secs(15), request)
         .await
+        .map_err(|_| json_error(StatusCode::BAD_GATEWAY, "encrypted_log_stream_unavailable"))?
         .map_err(|_| json_error(StatusCode::BAD_GATEWAY, "encrypted_log_stream_unavailable"))?;
     if !upstream.status().is_success() {
         return Err(match upstream.status() {
@@ -223,10 +227,16 @@ async fn proxy_encrypted_logs_from_tee(
             _ => json_error(StatusCode::BAD_GATEWAY, "encrypted_log_stream_unavailable"),
         });
     }
+    let body = if query.follow {
+        Body::from_stream(with_log_heartbeats(upstream.bytes_stream()))
+    } else {
+        Body::from_stream(upstream.bytes_stream())
+    };
     let mut response = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/x-ndjson")
-        .body(Body::from_stream(upstream.bytes_stream()))
+        .header("x-accel-buffering", "no")
+        .body(body)
         .map_err(|_| db_error())?;
     add_no_store_headers(response.headers_mut());
     response.headers_mut().insert(
@@ -240,34 +250,57 @@ async fn proxy_encrypted_logs_from_tee(
     Ok(response)
 }
 
+fn with_log_heartbeats(
+    stream: impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
+) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> {
+    use futures::StreamExt;
+
+    futures::stream::unfold(Some((stream, true)), |state| async move {
+        let (mut stream, mut at_frame_boundary) = state?;
+        let chunk =
+            match tokio::time::timeout(std::time::Duration::from_secs(15), stream.next()).await {
+                Ok(chunk) => chunk?.map_err(std::io::Error::other),
+                Err(_) if at_frame_boundary => Ok(bytes::Bytes::from_static(b"\n")),
+                Err(_) => {
+                    return Some((
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "encrypted log frame stalled",
+                        )),
+                        None,
+                    ));
+                }
+            };
+        // A heartbeat inside a split encrypted record would corrupt that record.
+        if let Ok(bytes) = &chunk
+            && let Some(last) = bytes.last()
+        {
+            at_frame_boundary = *last == b'\n';
+        }
+        let next = if chunk.is_err() {
+            None
+        } else {
+            Some((stream, at_frame_boundary))
+        };
+        Some((chunk, next))
+    })
+}
+
 async fn tenant_tee_logs_client(
     state: &AppState,
     app_name: &str,
     namespace: &str,
     confidential_domain: &str,
-) -> (reqwest::Client, String) {
-    match resolve_internal_tee_socket(app_name, namespace).await {
-        Ok(socket) => match build_resolved_tenant_tee_http_client(confidential_domain, socket) {
-            Ok(client) => (
-                client,
-                format!(
-                    "https://{confidential_domain}:{}/.well-known/confidential/logs",
-                    socket.port()
-                ),
-            ),
-            Err(err) => {
-                tracing::warn!(
-                    app = %app_name,
-                    namespace = %namespace,
-                    error = %err,
-                    "failed to build internally resolved TEE log client; falling back to public TEE DNS"
-                );
-                (
-                    state.tee_http_client.clone(),
-                    format!("https://{confidential_domain}/.well-known/confidential/logs"),
-                )
-            }
-        },
+    follow: bool,
+) -> Result<(reqwest::Client, String), RouteError> {
+    let resolution = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        resolve_internal_tee_socket(app_name, namespace),
+    )
+    .await
+    .unwrap_or_else(|_| Err("internal tenant TEE lookup timed out".to_string()));
+    let socket = match resolution {
+        Ok(socket) => Some(socket),
         Err(detail) => {
             tracing::warn!(
                 app = %app_name,
@@ -275,12 +308,27 @@ async fn tenant_tee_logs_client(
                 detail = %detail,
                 "failed to resolve internal tenant TEE endpoint for logs; falling back to public TEE DNS"
             );
-            (
-                state.tee_http_client.clone(),
-                format!("https://{confidential_domain}/.well-known/confidential/logs"),
-            )
+            None
         }
-    }
+    };
+    let client = if !follow && socket.is_none() {
+        state.tee_http_client.clone()
+    } else {
+        build_tenant_tee_http_client_with_builder(
+            reqwest::Client::builder(),
+            confidential_domain,
+            socket,
+        )
+        .map_err(|_| json_error(StatusCode::BAD_GATEWAY, "encrypted_log_stream_unavailable"))?
+    };
+    let url = match socket {
+        Some(socket) => format!(
+            "https://{confidential_domain}:{}/.well-known/confidential/logs",
+            socket.port()
+        ),
+        None => format!("https://{confidential_domain}/.well-known/confidential/logs"),
+    };
+    Ok((client, url))
 }
 
 /// Resolve the internal tenant TEE socket for a probe. Returns the resolution
@@ -387,25 +435,26 @@ pub(crate) fn build_resolved_tenant_tee_http_client(
     confidential_domain: &str,
     socket: SocketAddr,
 ) -> Result<reqwest::Client, reqwest::Error> {
-    build_resolved_tenant_tee_http_client_with_builder(
+    build_tenant_tee_http_client_with_builder(
         reqwest::Client::builder(),
         confidential_domain,
-        socket,
+        Some(socket),
     )
 }
 
-fn build_resolved_tenant_tee_http_client_with_builder(
+fn build_tenant_tee_http_client_with_builder(
     builder: reqwest::ClientBuilder,
     confidential_domain: &str,
-    socket: SocketAddr,
+    socket: Option<SocketAddr>,
 ) -> Result<reqwest::Client, reqwest::Error> {
     let mut builder = builder
         .https_only(true)
-        .no_proxy()
-        .resolve(confidential_domain, socket)
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(std::time::Duration::from_secs(5))
         .danger_accept_invalid_certs(accepts_invalid_tenant_tee_certs());
+    if let Some(socket) = socket {
+        builder = builder.no_proxy().resolve(confidential_domain, socket);
+    }
 
     // Startup already validates the same CA inputs while constructing the
     // shared TEE client. Re-read them only because reqwest resolution is fixed
@@ -467,6 +516,55 @@ fn add_no_store_headers(headers: &mut HeaderMap) {
 mod tests {
     use super::*;
 
+    #[tokio::test(start_paused = true)]
+    async fn idle_follow_heartbeats_do_not_split_records_or_hide_eof() {
+        use bytes::Bytes;
+        use futures::StreamExt;
+        use std::time::Duration;
+
+        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+        let upstream = futures::stream::unfold(receiver, |mut receiver| async {
+            receiver.recv().await.map(|chunk| (chunk, receiver))
+        })
+        .boxed();
+        let followed = with_log_heartbeats(upstream);
+        futures::pin_mut!(followed);
+
+        sender
+            .send(Ok(Bytes::from_static(b"{\"record\":")))
+            .await
+            .unwrap();
+        assert_eq!(followed.next().await.unwrap().unwrap(), b"{\"record\":"[..]);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), followed.next())
+                .await
+                .is_err()
+        );
+        sender
+            .send(Ok(Bytes::from_static(b"true}\n")))
+            .await
+            .unwrap();
+        assert_eq!(followed.next().await.unwrap().unwrap(), b"true}\n"[..]);
+        assert_eq!(followed.next().await.unwrap().unwrap(), b"\n"[..]);
+        drop(sender);
+        assert!(followed.next().await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_partial_log_frame_closes_the_stream() {
+        use bytes::Bytes;
+        use futures::{StreamExt, stream};
+
+        let upstream = stream::iter([Ok(Bytes::from_static(b"partial"))]).chain(stream::pending());
+        let followed = with_log_heartbeats(upstream);
+        futures::pin_mut!(followed);
+
+        assert_eq!(followed.next().await.unwrap().unwrap(), b"partial"[..]);
+        let error = followed.next().await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(followed.next().await.is_none());
+    }
+
     #[test]
     fn app_logs_validates_log_query_defaults_and_bounds() {
         let query = validate_query(RawLogQuery {
@@ -526,16 +624,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolved_tenant_tee_client_bypasses_configured_proxy() {
+    async fn tenant_tee_clients_preserve_internal_and_public_proxy_routing() {
         let direct = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let direct_socket = direct.local_addr().unwrap();
         let proxy_url = format!("http://{}", proxy.local_addr().unwrap());
-        let builder = reqwest::Client::builder().proxy(reqwest::Proxy::all(proxy_url).unwrap());
-        let client = build_resolved_tenant_tee_http_client_with_builder(
+        let builder =
+            reqwest::Client::builder().proxy(reqwest::Proxy::all(proxy_url.as_str()).unwrap());
+        let client = build_tenant_tee_http_client_with_builder(
             builder,
             "tenant.example.test",
-            direct_socket,
+            Some(direct_socket),
         )
         .unwrap();
 
@@ -560,5 +659,22 @@ mod tests {
                 .await
                 .is_err()
         );
+
+        let builder = reqwest::Client::builder().proxy(reqwest::Proxy::all(proxy_url).unwrap());
+        let client =
+            build_tenant_tee_http_client_with_builder(builder, "tenant.example.test", None)
+                .unwrap();
+        let request = tokio::spawn(async move {
+            client
+                .get("https://tenant.example.test/healthz")
+                .send()
+                .await
+        });
+        let (stream, _) = tokio::time::timeout(std::time::Duration::from_secs(1), proxy.accept())
+            .await
+            .expect("public fallback used the configured proxy")
+            .unwrap();
+        drop(stream);
+        assert!(request.await.unwrap().is_err());
     }
 }

@@ -64,6 +64,18 @@ enclava status
 enclava key backup --out enclava-recovery.json
 ```
 
+For encrypted workload logs, use the current CLI and the tenant's log private key:
+
+```bash
+enclava logs --follow --log-private-key-file /path/to/log-key.x25519
+```
+
+Approve `apps:logs` with `enclava login --approve-logs` if the session lacks it.
+Successful follow streams have no total deadline; initial headers, error bodies
+and ordinary API requests remain bounded.
+Blank-line keepalives preserve idle streams without printing fake log messages.
+Each encrypted record is size-bounded before decoding.
+
 Images may be digest-pinned or tagged (`enclava deploy --image
 <registry>/<image>:<tag>`). The CLI resolves tags to a content digest before
 signing; CAP independently resolves the image and checks that the digests agree.

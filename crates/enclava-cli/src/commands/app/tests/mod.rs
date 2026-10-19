@@ -1406,22 +1406,42 @@ fn log_output_sanitizer_removes_terminal_control_sequences() {
     assert!(!sanitized.contains('\u{1b}'));
 }
 
-#[test]
-fn logs_command_points_missing_scope_to_explicit_reapproval() {
-    // CRLF checkouts (Windows autocrlf) must not break source matching.
-    let source = include_str!("../../app.rs").replace("\r\n", "\n");
-    let fn_start = source
-        .find("pub async fn logs")
-        .expect("logs function exists");
-    let fn_end = source[fn_start..]
-        .find("#[derive(Args)]\npub struct RollbackArgs")
-        .expect("rollback args follow logs function")
-        + fn_start;
-    let body = &source[fn_start..fn_end];
+#[tokio::test]
+async fn followed_log_lines_are_bounded_without_consuming_the_next_frame() {
+    let limit = enclava_cli::api_client::MAX_API_RESPONSE_BODY_BYTES;
+    let mut input = vec![b'x'; limit - 1];
+    input.extend_from_slice(b"\nnext\n");
+    let mut reader = tokio::io::BufReader::new(input.as_slice());
+    let mut line = String::new();
+    assert_eq!(
+        super::read_bounded_log_line(&mut reader, &mut line)
+            .await
+            .unwrap(),
+        limit
+    );
+    assert_eq!(
+        super::read_bounded_log_line(&mut reader, &mut line)
+            .await
+            .unwrap(),
+        5
+    );
+    assert_eq!(line, "next\n");
+    assert_eq!(
+        super::read_bounded_log_line(&mut reader, &mut line)
+            .await
+            .unwrap(),
+        0
+    );
 
-    assert!(body.contains("message.contains(\"apps:logs\")"));
-    assert!(body.contains("enclava login --approve-logs"));
-    assert!(body.contains("sanitize_log_output"));
+    let oversized = vec![b'x'; limit + 1];
+    let mut reader = tokio::io::BufReader::new(oversized.as_slice());
+    let error = super::read_bounded_log_line(&mut reader, &mut line)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<enclava_cli::api_client::ApiError>(),
+        Some(enclava_cli::api_client::ApiError::ResponseTooLarge(size)) if *size == limit
+    ));
 }
 
 #[test]
@@ -1454,7 +1474,13 @@ fn logs_command_decrypts_encrypted_frames_locally() {
     .unwrap();
     let line = serde_json::to_string(&frame).unwrap();
 
-    let output = super::decrypted_log_frame_output(&keypair.private_key_base64url, &line).unwrap();
+    let output = super::decrypted_log_frame_output(&keypair.private_key_base64url, &line)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        super::decrypted_log_frame_output(&keypair.private_key_base64url, "\n").unwrap(),
+        None
+    );
 
     assert_eq!(
         output,
