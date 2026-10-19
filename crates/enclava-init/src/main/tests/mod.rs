@@ -501,10 +501,12 @@ fn caddy_tls_bind_source_is_below_tls_state_root() {
 }
 
 #[test]
-fn log_spool_state_dir_is_below_state_root() {
+fn log_spool_state_dir_lives_below_the_reserved_managed_config_root() {
+    // cap#290 review: the spool sits under .enclava so tenant
+    // storage_paths subdirs cannot collide with it.
     assert_eq!(
         log_spool_state_dir(Path::new("/state")),
-        PathBuf::from("/state/enclava-logs")
+        PathBuf::from("/state/.enclava/log-spool")
     );
 }
 
@@ -1033,6 +1035,34 @@ fn signed_cc_init_data_accepts_matching_spool_storage_claim() {
         validate_transport(&cfg).unwrap(),
         LogEncryptionHandoffFile::DisabledMarker
     ));
+}
+
+#[test]
+fn signed_cc_init_data_rejects_reserved_enclava_bind_mount_with_spool() {
+    // cap#290 review: the v2 spool lives below <state-root>/.enclava, so a
+    // signed artifact that also claims the reserved subdir for a tenant
+    // bind mount would collide the spool with tenant storage. The guest
+    // refuses the combination even though claims and ConfigMap match.
+    let dir = tempdir().unwrap();
+    let mut cfg = unsigned_config();
+    cfg.log_encryption = Some(LogEncryptionSection {
+        spool_storage: Some("state-bind-v1".to_string()),
+        ..Default::default()
+    });
+    cfg.app_bind_mounts.push(AppBindMountConfig {
+        subdir: ".enclava".to_string(),
+        mount_path: "/data".to_string(),
+    });
+    let mut cc_body = signed_cc_claims_toml(&cfg);
+    cc_body.push_str("log_spool_storage = \"state-bind-v1\"\n");
+    let cc_path = dir.path().join("cc-init-data.toml");
+    cfg.cc_init_data_path = Some(cc_path.display().to_string());
+    std::fs::write(&cc_path, cc_body).unwrap();
+
+    let err = validate_transport(&cfg).unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("reserved"), "got: {message}");
+    assert!(message.contains(".enclava"), "got: {message}");
 }
 
 #[test]

@@ -803,6 +803,29 @@ async fn main() {
             std::process::exit(1);
         }
         enclava_engine::manifest::cc_init_data::set_luks2_header_seal_claim(&seal_claim);
+
+        // Log-spool state-bind rollout claim (cap#290 review, init-first
+        // rollout): sourced from the SIGNED release like the seal claim so
+        // the API render, CLI signing, and the deployed enclava-init image
+        // agree. An empty signed value is the unsupported sentinel: it
+        // must be installed verbatim so neither the env fallback nor the
+        // dev default can resurrect the claim under a pre-field release.
+        // An ENCLAVA_LOG_SPOOL_STORAGE leftover that disagrees refuses
+        // startup instead of silently diverging the signed
+        // `expected_cc_init_data_hash` from the actual rollout state.
+        let spool_claim = release.log_spool_storage_claim();
+        if let Some(env) = env_nonempty("ENCLAVA_LOG_SPOOL_STORAGE")
+            && env.trim() != spool_claim
+        {
+            eprintln!(
+                "startup refused: ENCLAVA_LOG_SPOOL_STORAGE conflicts with signed platform \
+                 release: env `{env}` != release `{spool_claim}`; the rollout value is sourced \
+                 from the signed platform release (log_spool_storage), remove the environment \
+                 variable or sign a release carrying the intended value"
+            );
+            std::process::exit(1);
+        }
+        enclava_engine::manifest::cc_init_data::set_log_spool_storage_claim(&spool_claim);
     }
 
     let startup_proxy_image = match release_env_value(
@@ -1405,6 +1428,7 @@ mod tests {
             expected_runtime_class: "kata-qemu-snp".into(),
             genpolicy_version: "test".into(),
             luks2_header_seal: String::new(),
+            log_spool_storage: String::new(),
             created_at: "2026-01-01T00:00:00Z".into(),
         };
         let (trustee, signing) =

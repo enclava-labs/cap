@@ -95,7 +95,7 @@ pub struct LogEncryptionSection {
     pub public_key_sha256: Option<String>,
     /// Where the workload log spool physically lives. Absent: the pod's
     /// disk-backed "logs" emptyDir. `state-bind-v1`: /run/enclava-logs is a
-    /// mountpoint that enclava-init re-binds onto `<state-root>/enclava-logs`
+    /// mountpoint that enclava-init re-binds onto `<state-root>/.enclava/log-spool`
     /// on the encrypted state PVC. Cross-checked against the signed
     /// `log_spool_storage` claim, never trusted alone.
     pub spool_storage: Option<String>,

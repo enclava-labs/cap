@@ -177,6 +177,17 @@ pub struct PlatformRelease {
     /// existed; those keep the rollout-window ("adopt") semantics.
     #[serde(default)]
     pub luks2_header_seal: String,
+    /// Log-spool state-bind rollout claim (`"state-bind-v1"`), carried by
+    /// the signed release (cap#290 review): an enclava-init that understands
+    /// the `log_spool_storage` cc_init_data claim and performs the
+    /// state-PVC bind is deployed. The rollout value must come from
+    /// verified release metadata — never from a producer's private
+    /// environment — so every producer of `expected_cc_init_data_hash`
+    /// renders identical bytes. Empty for releases signed before this
+    /// field existed; those pin pre-bind init images and must render
+    /// claim-less bytes.
+    #[serde(default)]
+    pub log_spool_storage: String,
     pub created_at: String,
 }
 
@@ -227,6 +238,16 @@ impl PlatformRelease {
             return "adopt".to_string();
         }
         self.luks2_header_seal.clone()
+    }
+
+    /// Log-spool state-bind rollout claim as signed. Unlike
+    /// `luks2_header_seal_claim` there is no pre-field default: empty means
+    /// "pre-field release, bind unsupported" and stays empty so consumers
+    /// can distinguish the sentinel. Only ever read after
+    /// [`verify_envelope`] / [`validate_release_payload`], which pin the
+    /// value to `""` / `"state-bind-v1"`.
+    pub fn log_spool_storage_claim(&self) -> String {
+        self.log_spool_storage.clone()
     }
 }
 
@@ -566,6 +587,12 @@ fn canonical_release_bytes(
     if !release.luks2_header_seal.is_empty() {
         records.push(("luks2_header_seal", release.luks2_header_seal.as_bytes()));
     }
+    // Same signed-when-present rule for the spool-bind rollout claim
+    // (cap#290 review): only non-empty payloads carry the record, so
+    // pre-field releases keep verifying byte-for-byte.
+    if !release.log_spool_storage.is_empty() {
+        records.push(("log_spool_storage", release.log_spool_storage.as_bytes()));
+    }
     records.push(("created_at", release.created_at.as_bytes()));
     Ok(ce_v1_bytes(&records))
 }
@@ -749,6 +776,12 @@ pub fn validate_release_payload(release: &PlatformRelease) -> Result<(), Platfor
         });
     }
     parse_release_timestamp(&release.created_at)?;
+    if !release.log_spool_storage.is_empty() && release.log_spool_storage != "state-bind-v1" {
+        return Err(PlatformReleaseError::InvalidField {
+            field: "log_spool_storage",
+            message: "expected \"\" or \"state-bind-v1\"".to_string(),
+        });
+    }
     Ok(())
 }
 
@@ -784,6 +817,7 @@ mod tests {
             expected_runtime_class: "kata-qemu-snp".into(),
             genpolicy_version: "0".into(),
             luks2_header_seal: String::new(),
+            log_spool_storage: String::new(),
             created_at: created_at.into(),
         }
     }
@@ -1540,6 +1574,52 @@ mod tests {
         let release = PlatformRelease::load_verified().unwrap();
         let claim = release.luks2_header_seal_claim();
         assert!(claim == "adopt" || claim == "required", "got {claim}");
+    }
+
+    /// cap#290 review: the `log_spool_storage` rollout claim is part of the
+    /// signed bytes whenever the payload carries one — a tampered or
+    /// stripped value must break the signature; pre-field envelopes keep
+    /// verifying with an empty claim; unknown values fail validation.
+    #[test]
+    fn spool_storage_claim_is_covered_by_the_signature() {
+        let mut payload = valid_test_payload("r-spool", "2026-10-15T00:00:00Z");
+        payload.log_spool_storage = "state-bind-v1".into();
+        let envelope = sign_with_dev_fixture_key(payload);
+        let verified = verify_envelope(envelope.clone()).expect("valid envelope verifies");
+        assert_eq!(verified.log_spool_storage_claim(), "state-bind-v1");
+
+        let mut tampered = envelope.clone();
+        tampered.payload.log_spool_storage = String::new();
+        let err = verify_envelope(tampered).expect_err("flip must break the signature");
+        assert!(matches!(err, PlatformReleaseError::BadSignature(_)));
+
+        let mut stripped = envelope;
+        stripped.payload.log_spool_storage = "banana".into();
+        let err =
+            verify_envelope(stripped).expect_err("stripping the field must break the signature");
+        assert!(matches!(err, PlatformReleaseError::BadSignature(_)));
+
+        // Pre-field envelope: the key is absent from the JSON entirely and
+        // the claim resolves to the empty unsupported sentinel.
+        let payload = valid_test_payload("r-old", "2026-09-01T00:00:00Z");
+        let mut value = serde_json::to_value(&payload).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("log_spool_storage")
+            .unwrap();
+        let payload: PlatformRelease = serde_json::from_value(value).unwrap();
+        assert!(payload.log_spool_storage.is_empty());
+        let envelope = sign_with_dev_fixture_key(payload);
+        let verified = verify_envelope(envelope).expect("pre-field envelope must keep verifying");
+        assert_eq!(verified.log_spool_storage_claim(), "");
+
+        let mut payload = valid_test_payload("r-spool", "2026-10-15T00:00:00Z");
+        payload.log_spool_storage = "banana".into();
+        let err = validate_release_payload(&payload).unwrap_err();
+        assert!(
+            matches!(err, PlatformReleaseError::InvalidField { field, .. } if field == "log_spool_storage")
+        );
     }
 }
 

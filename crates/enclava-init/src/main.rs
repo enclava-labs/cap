@@ -763,6 +763,23 @@ fn validate_configmap_transport_against_signed_cc_init_data(
             .and_then(|section| section.spool_storage.as_deref()),
         "log-encryption.spool-storage",
     )?;
+    // cap#290 review: the v2 spool lives below <state-root>/.enclava. A
+    // signed artifact whose bind mounts claim that reserved subdir would
+    // collide the spool with tenant storage — even though the claims and
+    // ConfigMap agree, the combination is refused rather than rendered
+    // into a corrupting mount layout. (Validation should have rejected it
+    // upstream; this is the guest-side fail-closed check.)
+    if log_spool_state_bind_enabled(cfg)
+        && cfg
+            .app_bind_mounts
+            .iter()
+            .any(|bind| bind.subdir == MANAGED_CONFIG_ROOT)
+    {
+        anyhow::bail!(
+            "app bind mount uses the reserved .enclava ({MANAGED_CONFIG_ROOT}) state subdir, \
+             which collides with the encrypted log spool"
+        );
+    }
     let handoff = signed_log_encryption_handoff(data, cfg)?;
 
     Ok(handoff)
@@ -1448,6 +1465,13 @@ fn prepare_mount_ownership(cfg: &Config) -> Result<()> {
         let spool_dir = log_spool_state_dir(Path::new(&cfg.state_root));
         std::fs::create_dir_all(&spool_dir)
             .with_context(|| format!("creating {}", spool_dir.display()))?;
+        // The spool survives on the state PVC across profile changes:
+        // entries written under a root-running workload stay root:root and
+        // would wedge a redeploy to the restricted identity. Reconcile
+        // existing contents to the current app identity (symlink-safe),
+        // then restore the dir's group-writable mount contract.
+        chown::chown_recursive(&spool_dir, app_identity)
+            .with_context(|| format!("chown {}", spool_dir.display()))?;
         chown::chown(&spool_dir, numeric_identity(0, cfg.app_gid))
             .with_context(|| format!("chown {}", spool_dir.display()))?;
         fs::set_permissions(&spool_dir, fs::Permissions::from_mode(0o2770))
@@ -1654,9 +1678,12 @@ fn log_spool_state_bind_enabled(cfg: &Config) -> bool {
     })
 }
 
-/// Spool source directory on the encrypted state volume.
+/// Spool source directory on the encrypted state volume. Lives below the
+/// platform-reserved `.enclava` namespace so no tenant `storage_paths`
+/// bind (which maps to `<state-root>/<subdir>`) can collide with the
+/// spool (cap#290 review).
 fn log_spool_state_dir(state_root: &Path) -> PathBuf {
-    state_root.join("enclava-logs")
+    state_root.join(MANAGED_CONFIG_ROOT).join("log-spool")
 }
 
 /// Re-bind the "logs" Memory emptyDir mountpoint onto the encrypted state

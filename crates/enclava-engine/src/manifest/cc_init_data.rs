@@ -93,6 +93,71 @@ pub fn validate_luks2_header_seal_claim(value: &str) -> String {
     }
 }
 
+/// Log-spool state-bind rollout claim rendered into the signed
+/// cc_init_data (cap#289/290 review): "state-bind-v1" once the deployed
+/// enclava-init understands the claim (init-first rollout), empty for
+/// releases signed before the field existed — those pin init images that
+/// parse the additive ConfigMap key but have no binding logic, so they
+/// must neither emit the claim nor enable the bind. Sourced like the seal
+/// claim: installed from the signed platform release at startup so every
+/// producer of `expected_cc_init_data_hash` renders identical bytes; the
+/// environment variable is only a release-less dev/test fallback, and
+/// enclava-api refuses to start when it conflicts with the signed value.
+static LOG_SPOOL_STORAGE_CLAIM: OnceLock<String> = OnceLock::new();
+
+/// Install the release-sourced spool-storage claim (called once at process
+/// startup by producers that have verified a signed platform release). An
+/// empty value is the unsupported sentinel for pre-field releases.
+pub fn set_log_spool_storage_claim(value: &str) {
+    let value = validate_log_spool_storage_claim(value);
+    // First write wins; startup runs this exactly once per process.
+    let _ = LOG_SPOOL_STORAGE_CLAIM.set(value);
+}
+
+/// The claim value rendered into cc_init_data: the release-installed value
+/// (including the empty unsupported sentinel) when set, else the dev/test
+/// environment fallback, else "state-bind-v1" for release-less dev.
+pub fn log_spool_storage_claim() -> String {
+    resolve_log_spool_storage_claim(
+        LOG_SPOOL_STORAGE_CLAIM.get().map(String::as_str),
+        std::env::var("ENCLAVA_LOG_SPOOL_STORAGE")
+            .ok()
+            .as_deref()
+            .map(str::trim),
+    )
+}
+
+/// Pure precedence rule, testable without process-global state.
+fn resolve_log_spool_storage_claim(release_value: Option<&str>, env_value: Option<&str>) -> String {
+    if let Some(value) = release_value {
+        return validate_log_spool_storage_claim(value.trim());
+    }
+    match env_value {
+        Some(value) if !value.trim().is_empty() => validate_log_spool_storage_claim(value.trim()),
+        _ => crate::manifest::enclava_init_config::LOG_SPOOL_STORAGE_STATE_BIND.to_string(),
+    }
+}
+
+/// Validate an explicit claim value; testable without process-global env
+/// mutation (edition 2024 makes `set_var` unsafe, and env mutation races
+/// parallel tests anyway).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn validate_log_spool_storage_claim(value: &str) -> String {
+    match value {
+        "" | "state-bind-v1" => value.to_string(),
+        other => panic!(
+            "invalid ENCLAVA_LOG_SPOOL_STORAGE {other:?}: expected \"\" or \"state-bind-v1\""
+        ),
+    }
+}
+
+/// Whether the active platform release declares that the deployed
+/// enclava-init understands the `log_spool_storage` claim and performs the
+/// state-PVC bind (init-first rollout gate, cap#290 review).
+pub fn log_spool_bind_supported() -> bool {
+    log_spool_storage_claim() == crate::manifest::enclava_init_config::LOG_SPOOL_STORAGE_STATE_BIND
+}
+
 #[derive(Debug, Clone)]
 pub struct CcInitDataOptions {
     pub kbs_url: String,
@@ -103,6 +168,11 @@ pub struct CcInitDataOptions {
     /// (enclava-api render, hosted/local CLI signing) renders identical
     /// bytes instead of each process reading its private environment.
     pub luks2_header_seal: String,
+    /// Log-spool state-bind rollout claim (cap#289, init-first rollout
+    /// gate): same render-option reasoning as `luks2_header_seal`; empty
+    /// means the active release predates the field and no claim may be
+    /// emitted.
+    pub log_spool_storage: String,
 }
 
 impl CcInitDataOptions {
@@ -112,6 +182,7 @@ impl CcInitDataOptions {
             kbs_ca_cert_pem: trustee_kbs_ca_cert_pem(),
             runtime_class: runtime_class(),
             luks2_header_seal: luks2_header_seal_claim(),
+            log_spool_storage: log_spool_storage_claim(),
         }
     }
 }
@@ -394,8 +465,15 @@ pub fn build_toml_with_options(app: &ConfidentialApp, options: &CcInitDataOption
     // PVC; the claim pins that storage mode so the guest enables the bind
     // only for signed renders, never from host-controlled ConfigMap alone.
     // `omit_log_spool_bind_claim` reproduces the pre-claim byte layout for
-    // artifacts signed before this field existed.
-    if crate::manifest::enclava_init_config::log_spool_state_bind(app) {
+    // artifacts signed before this field existed. The claim is emitted only
+    // when the active signed release declares the deployed enclava-init
+    // understands it (init-first rollout, cap#290 review): an older init
+    // parses the additive ConfigMap key but never performs the bind, so a
+    // pre-field release must render claim-less bytes.
+    if crate::manifest::enclava_init_config::log_spool_state_bind(app)
+        && options.log_spool_storage
+            == crate::manifest::enclava_init_config::LOG_SPOOL_STORAGE_STATE_BIND
+    {
         push_toml_string(
             &mut toml,
             "log_spool_storage",
@@ -858,6 +936,56 @@ mod seal_claim_tests {
     fn rendered_claim_is_always_a_valid_value() {
         let value = luks2_header_seal_claim();
         assert!(value == "adopt" || value == "required", "got {value}");
+    }
+}
+
+#[cfg(test)]
+mod spool_claim_tests {
+    use super::{log_spool_storage_claim, resolve_log_spool_storage_claim};
+
+    /// Pure precedence: the release-installed value always wins — including
+    /// the empty unsupported sentinel, which must NOT fall through to the
+    /// env/default (a pre-field release under a dev env must still render
+    /// claim-less). The env fallback applies only when no release value is
+    /// installed (release-less dev/test), and absence of both is the
+    /// supported default.
+    #[test]
+    fn resolve_prefers_the_release_value_over_environment() {
+        assert_eq!(
+            resolve_log_spool_storage_claim(Some("state-bind-v1"), Some("")),
+            "state-bind-v1"
+        );
+        assert_eq!(
+            resolve_log_spool_storage_claim(Some(""), Some("state-bind-v1")),
+            "",
+            "the installed empty sentinel overrides the environment"
+        );
+        assert_eq!(
+            resolve_log_spool_storage_claim(None, Some("state-bind-v1")),
+            "state-bind-v1"
+        );
+        assert_eq!(resolve_log_spool_storage_claim(None, None), "state-bind-v1");
+        assert_eq!(
+            resolve_log_spool_storage_claim(None, Some("  ")),
+            "state-bind-v1",
+            "blank env values fall back to the default"
+        );
+        assert_eq!(
+            resolve_log_spool_storage_claim(None, Some(" state-bind-v1 ")),
+            "state-bind-v1",
+            "env values are trimmed"
+        );
+    }
+
+    /// The claim rendered into cc_init_data is always a known value, even
+    /// with a hostile environment.
+    #[test]
+    fn rendered_claim_is_always_a_valid_value() {
+        let value = log_spool_storage_claim();
+        assert!(
+            value.is_empty() || value == "state-bind-v1",
+            "got {value:?}"
+        );
     }
 }
 

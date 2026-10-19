@@ -750,7 +750,14 @@ impl DeploymentSigningArtifacts {
         // rejecting that rollback. Affected artifacts must be re-signed.
         let seal_required =
             enclava_engine::manifest::cc_init_data::luks2_header_seal_claim() == "required";
-        pin_matching_cc_init_data_render(app, &expected, seal_required)
+        // cap#290 review: the `log_spool_storage` claim may only be
+        // accepted/emitted once the signed release declares the deployed
+        // enclava-init performs the bind (init-first rollout). Under a
+        // pre-field release, claim-bearing artifacts are rejected with a
+        // re-sign diagnostic.
+        let spool_bind_supported =
+            enclava_engine::manifest::cc_init_data::log_spool_bind_supported();
+        pin_matching_cc_init_data_render(app, &expected, seal_required, spool_bind_supported)
     }
 
     /// `signing_service_pubkey_hex` is the public key of the off-cluster
@@ -1796,11 +1803,24 @@ impl LoadedWorkloadArtifacts {
 /// accepting one would let a hostile host replay an unsealed header and
 /// have it adopted despite the fleet-wide release rejecting that rollback.
 /// Affected artifacts must be re-signed against the current release.
+///
+/// `spool_bind_supported` (the ACTIVE signed release sets
+/// `log_spool_storage: state-bind-v1`, cap#290 review) is the init-first
+/// rollout gate: a claim-bearing spool render is only legitimate once the
+/// deployed enclava-init performs the state-PVC bind, so while the release
+/// still predates the field such renders must not be accepted — a pre-bind
+/// init would parse the ConfigMap key yet leave the spool on the RAM
+/// mountpoint. An artifact matching ONLY a claim-bearing render gets a
+/// re-sign diagnostic instead of a generic hash mismatch.
 fn pin_matching_cc_init_data_render(
     app: &mut enclava_engine::types::ConfidentialApp,
     expected_hash_hex: &str,
     seal_required: bool,
+    spool_bind_supported: bool,
 ) -> Result<(), SigningServiceError> {
+    // Set when a claim-bearing spool render reproduced the signed hash
+    // while the active release predates `log_spool_storage`.
+    let mut claim_bearing_spool_match = false;
     for omit_seal in [false, true] {
         if omit_seal && seal_required {
             continue;
@@ -1817,6 +1837,13 @@ fn pin_matching_cc_init_data_render(
                     let (_, hash) =
                         enclava_engine::manifest::cc_init_data::compute_cc_init_data(app);
                     if hash == expected_hash_hex {
+                        // Claim-bearing spool renders are only acceptable
+                        // once the release declares the deployed init
+                        // understands the claim.
+                        if !omit_spool_bind && !spool_bind_supported {
+                            claim_bearing_spool_match = true;
+                            continue;
+                        }
                         return Ok(());
                     }
                 }
@@ -1828,6 +1855,16 @@ fn pin_matching_cc_init_data_render(
         binding.omit_luks2_header_seal_claim = false;
         binding.legacy_collapsed_trustee_key = false;
         binding.omit_log_spool_bind_claim = false;
+    }
+    if claim_bearing_spool_match {
+        return Err(SigningServiceError::Mismatch(
+            "expected_cc_init_data_hash (artifact was signed over a \
+             log_spool_storage claim-bearing render but the active signed \
+             platform release predates the log_spool_storage field; \
+             re-sign the artifact after the init rollout ships an \
+             enclava-init that understands the claim)"
+                .into(),
+        ));
     }
     if seal_required {
         return Err(SigningServiceError::Mismatch(

@@ -1,6 +1,8 @@
 use enclava_engine::testutil::{sample_app, sample_password_app};
+use enclava_engine::validate::ValidationError;
 use enclava_engine::validate::validate_app;
 use enclava_engine::validate::validate_persistent_volume_size_for_fresh_provisioning;
+use sha2::{Digest, Sha256};
 
 #[test]
 fn valid_auto_app_passes() {
@@ -146,4 +148,46 @@ fn validate_app_accepts_pre_floor_sizes_for_grandfathered_apps() {
         app.storage.app_data.size = size.to_string();
         validate_app(&app).unwrap_or_else(|e| panic!("{size} should pass validate_app: {e}"));
     }
+}
+
+#[test]
+fn v2_spool_layout_rejects_tenant_path_mapping_onto_reserved_enclava_subdir() {
+    // cap#290 review: the v2 log spool lives at <state-root>/.enclava/
+    // log-spool; a tenant storage_path whose state subdir collapses onto
+    // .enclava would share the directory with the spool.
+    let v2_app = |storage_paths: Vec<String>| {
+        let mut app = sample_app();
+        let policy_text = "# enclava-cap-volume-layout: guest-memory-v2\npackage agent_policy\n";
+        app.generated_agent_policy = Some(enclava_engine::types::GeneratedAgentPolicy {
+            policy_text: policy_text.to_string(),
+            policy_sha256: Sha256::digest(policy_text.as_bytes()).into(),
+            genpolicy_version_pin: "kata-containers/genpolicy@3.28.0+test".to_string(),
+        });
+        app.log_encryption = Some(enclava_engine::types::LogEncryptionConfig {
+            algorithm: "x25519-hpke-v1".to_string(),
+            key_id: "logs-prod".to_string(),
+            public_key_base64url: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+            public_key_sha256: "sha256:Zmh6rfhivXdsj8GLjp-OIAiXFIVu4jOzkCpZHQ1fKSU".to_string(),
+        });
+        app.containers[0].storage_paths = storage_paths;
+        app
+    };
+
+    let err = validate_app(&v2_app(vec!["/.enclava".to_string()])).unwrap_err();
+    assert!(
+        matches!(&err, ValidationError::InvalidStoragePath { .. }),
+        "expected InvalidStoragePath, got: {err:?}"
+    );
+
+    // The same v2+encrypted app without the reserved path must not produce
+    // InvalidStoragePath (the bind subdir transform leaves "/app/data" as
+    // "app-data").
+    let app = v2_app(vec!["/app/data".to_string()]);
+    assert!(
+        !matches!(
+            &validate_app(&app),
+            Err(ValidationError::InvalidStoragePath { .. })
+        ),
+        "a non-colliding storage path must not be rejected"
+    );
 }

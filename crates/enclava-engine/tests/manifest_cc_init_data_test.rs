@@ -255,6 +255,7 @@ fn options_with_runtime_class(runtime_class: &str) -> CcInitDataOptions {
         kbs_ca_cert_pem: None,
         runtime_class: runtime_class.to_string(),
         luks2_header_seal: "adopt".to_string(),
+        log_spool_storage: "state-bind-v1".to_string(),
     }
 }
 

@@ -171,6 +171,12 @@ def canonical_platform_release_bytes(payload: dict[str, str]) -> bytes:
         records.append(
             ("luks2_header_seal", payload["luks2_header_seal"].encode())
         )
+    # Same signed-when-present rule for the spool-bind rollout claim
+    # (cap#290 review).
+    if payload.get("log_spool_storage"):
+        records.append(
+            ("log_spool_storage", payload["log_spool_storage"].encode())
+        )
     records.append(("created_at", payload["created_at"].encode()))
     return ce_v1_bytes(records)
 
@@ -193,6 +199,7 @@ def env_overlay(payload: dict[str, str]) -> dict[str, str]:
         "EXPECTED_RUNTIME_CLASS": "expected_runtime_class",
         "GENPOLICY_VERSION": "genpolicy_version",
         "LUKS2_HEADER_SEAL": "luks2_header_seal",
+        "LOG_SPOOL_STORAGE": "log_spool_storage",
         "CREATED_AT": "created_at",
     }
     for env_name, field in mapping.items():
@@ -482,6 +489,12 @@ def validate_payload(payload: dict[str, str], *, allow_dev_internal_tls: bool = 
     if seal not in ("", "adopt", "required"):
         raise ValueError('luks2_header_seal must be "", "adopt", or "required"')
     actual = hashlib.sha256(payload["policy_template_text"].encode()).hexdigest()
+    # Empty (pre-field releases) is legal and means the deployed enclava-init
+    # does not understand the claim (init-first rollout); anything present
+    # must be the one known claim value.
+    spool = payload.get("log_spool_storage", "")
+    if spool not in ("", "state-bind-v1"):
+        raise ValueError('log_spool_storage must be "" or "state-bind-v1"')
     if actual != payload["policy_template_sha256"]:
         raise ValueError("policy_template_sha256 does not match policy_template_text")
 

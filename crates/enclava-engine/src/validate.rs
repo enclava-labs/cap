@@ -43,6 +43,8 @@ pub enum ValidationError {
     InvalidAttestationPubkey { field: &'static str, detail: String },
     #[error("log_encryption config is invalid: {0}")]
     InvalidLogEncryption(String),
+    #[error("storage path {path:?} is invalid: {detail}")]
+    InvalidStoragePath { path: String, detail: String },
 }
 
 /// Validates that a ConfidentialApp spec is well-formed.
@@ -206,6 +208,26 @@ pub fn validate_app(app: &ConfidentialApp) -> Result<(), ValidationError> {
                 config.algorithm,
                 log_encryption::LOG_ENCRYPTION_ALGORITHM
             )));
+        }
+    }
+
+    // cap#290 review: the v2 log spool lives at <state-root>/.enclava/
+    // log-spool. A tenant storage_path mapping onto the reserved .enclava
+    // state subdir would share that directory with the spool, so wait-exec
+    // could append to and rotate tenant files as encrypted-log data.
+    // Reject the collision at validation instead of rendering a corrupting
+    // manifest.
+    if crate::manifest::enclava_init_config::log_spool_state_bind(app) {
+        for container in &app.containers {
+            for path in &container.storage_paths {
+                if crate::manifest::enclava_init_config::storage_subdir(path) == ".enclava" {
+                    return Err(ValidationError::InvalidStoragePath {
+                        path: path.clone(),
+                        detail: "maps onto the platform-reserved \".enclava\" state subdir"
+                            .to_string(),
+                    });
+                }
+            }
         }
     }
 
