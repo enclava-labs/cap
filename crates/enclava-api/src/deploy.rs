@@ -5919,6 +5919,36 @@ pub(crate) async fn supersede_incomplete_deployments(
     .bind(app_id)
     .execute(&mut **tx)
     .await?;
+
+    // Reconcile the app when the supersede leaves nothing active. The
+    // watcher's own publish path skips the app-status write whenever its job
+    // is no longer the latest generation, so a supersede that terminalizes
+    // the LAST incomplete deployment would otherwise strand the app in
+    // `creating` forever with every deployment terminal-failed (#292: the
+    // host observes deployment=failed + app=creating and must ignore the
+    // terminal tuple, looping forever). Only a still-`creating` app can be
+    // stranded this way — a `running` app keeps serving under its live
+    // workload until the superseding deployment's own outcome decides, and
+    // `deleting` is owned by the delete lane. When a new deployment follows
+    // (the normal supersede caller), its create path sets `creating` again
+    // while the deployment row is still non-terminal, so this write cannot
+    // publish a terminal-looking tuple for the new rollout.
+    sqlx::query(
+        "UPDATE apps
+            SET status = 'failed'::app_status_enum,
+                updated_at = clock_timestamp()
+          WHERE id = $1
+            AND status = 'creating'::app_status_enum
+            AND NOT EXISTS (
+                SELECT 1
+                  FROM deployments
+                 WHERE app_id = $1
+                   AND status::text IN ('pending', 'applying', 'watching')
+            )",
+    )
+    .bind(app_id)
+    .execute(&mut **tx)
+    .await?;
     Ok(result.rows_affected())
 }
 
@@ -7415,6 +7445,130 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn supersede_fails_stranded_creating_app_when_no_deployment_remains() {
+        // #292: a supersede that terminalizes the LAST incomplete deployment
+        // must reconcile a still-`creating` app to `failed`, or the host-side
+        // observation loop sees deployment=failed + app=creating forever (the
+        // stranded shape observed live on staging).
+        let pool = crate::test_support::database_test_pool().await;
+        let (app, _, _, _) =
+            crate::deployment_jobs::tests::insert_job_fixture(&pool).await;
+        let mut tx = pool.begin().await.expect("begin stranded supersede tx");
+        crate::deploy::lock_app_deployment_lane(&mut tx, app.id)
+            .await
+            .expect("lock lane");
+        assert_eq!(
+            supersede_incomplete_deployments(&mut tx, app.id)
+                .await
+                .expect("supersede last incomplete deployment"),
+            1
+        );
+        let app_status: String = sqlx::query_scalar("SELECT status::text FROM apps WHERE id = $1")
+            .bind(app.id)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(app_status, "failed");
+        tx.rollback().await.unwrap();
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn supersede_never_fails_a_running_app_or_one_with_a_fresh_deployment() {
+        let pool = crate::test_support::database_test_pool().await;
+        // A running app keeps serving under its live workload; the
+        // superseding deployment's own outcome decides its status later.
+        let (running_app, _, _, _) = crate::deployment_jobs::tests::insert_job_fixture(&pool).await;
+        sqlx::query("UPDATE apps SET status = 'running' WHERE id = $1")
+            .bind(running_app.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut tx = pool.begin().await.expect("begin running supersede tx");
+        crate::deploy::lock_app_deployment_lane(&mut tx, running_app.id)
+            .await
+            .expect("lock lane");
+        assert_eq!(
+            supersede_incomplete_deployments(&mut tx, running_app.id)
+                .await
+                .expect("supersede under a running app"),
+            1
+        );
+        let app_status: String = sqlx::query_scalar("SELECT status::text FROM apps WHERE id = $1")
+            .bind(running_app.id)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(app_status, "running");
+        tx.rollback().await.unwrap();
+
+        // The normal supersede caller inserts the fresh deployment in the
+        // same transaction and its create path resets the app to `creating`
+        // while the fresh deployment is still `watching` (non-terminal): the
+        // host only acts on terminal DEPLOYMENT statuses, so the transient
+        // `failed` between the supersede write and that reset publishes no
+        // terminal-looking tuple. Assert the sequence explicitly.
+        let (app, _, _, _) = crate::deployment_jobs::tests::insert_job_fixture(&pool).await;
+        let mut tx = pool.begin().await.expect("begin fresh supersede tx");
+        crate::deploy::lock_app_deployment_lane(&mut tx, app.id)
+            .await
+            .expect("lock lane");
+        assert_eq!(
+            supersede_incomplete_deployments(&mut tx, app.id)
+                .await
+                .expect("supersede before fresh insert"),
+            1
+        );
+        sqlx::query(
+            "INSERT INTO deployments (
+                 id, org_id, app_id, trigger, status, spec_snapshot, image_digest
+             ) VALUES ($1, $2, $3, 'api', 'watching', $4, $5)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(app.org_id)
+        .bind(app.id)
+        .bind(serde_json::json!({
+            "setup_state": crate::deployment_jobs::DEPLOYMENT_SETUP_DNS_PENDING,
+            "image": "ghcr.io/acme/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "image_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "signed_descriptor_core_hash": null,
+            "log_encryption": null,
+        }))
+        .bind("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        .execute(&mut *tx)
+        .await
+        .expect("insert fresh watching deployment");
+        let transient_status: String =
+            sqlx::query_scalar("SELECT status::text FROM apps WHERE id = $1")
+                .bind(app.id)
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+        assert_eq!(transient_status, "failed");
+        let fresh_deployment_status: String = sqlx::query_scalar(
+            "SELECT status::text FROM deployments WHERE app_id = $1 ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(app.id)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        assert_eq!(fresh_deployment_status, "watching");
+        tx.rollback().await.unwrap();
+
+        for org in [running_app.org_id, app.org_id] {
+            sqlx::query("DELETE FROM organizations WHERE id = $1")
+                .bind(org)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
     }
 
     #[tokio::test]
