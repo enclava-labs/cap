@@ -71,7 +71,8 @@ enclava logs --follow --log-private-key-file /path/to/log-key.x25519
 ```
 
 Approve `apps:logs` with `enclava login --approve-logs` if the session lacks it.
-Follow has no total request deadline; ordinary API requests remain bounded.
+Successful follow streams have no total deadline; initial headers, error bodies
+and ordinary API requests remain bounded.
 Blank-line keepalives preserve idle streams without printing fake log messages.
 Each encrypted record is size-bounded before decoding.
 

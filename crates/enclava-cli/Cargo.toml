@@ -72,3 +72,4 @@ prod-strict = []
 [dev-dependencies]
 enclava-engine = { path = "../enclava-engine", features = ["testutil"] }
 parking_lot = "0.12"
+tokio = { workspace = true, features = ["test-util"] }

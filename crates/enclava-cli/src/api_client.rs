@@ -532,9 +532,24 @@ impl ApiClient {
                 .expect("failed to build HTTP client")
         });
         let http = streaming_http.as_ref().unwrap_or(&self.http);
-        let resp = http.get(&url).headers(self.auth_headers()?).send().await?;
-        let resp = self.check_response(resp).await?;
-        Ok(resp)
+        let request = async {
+            let resp = http.get(&url).headers(self.auth_headers()?).send().await?;
+            self.check_response(resp).await
+        };
+        if follow {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(API_REQUEST_TIMEOUT_SECONDS),
+                request,
+            )
+            .await
+            .map_err(|_| ApiError::Api {
+                status: 0,
+                code: Some("request_timeout".to_string()),
+                message: "HTTP request timed out".to_string(),
+            })?
+        } else {
+            request.await
+        }
     }
 
     pub async fn list_log_keys(&self, app_name: &str) -> Result<LogEncryptionKeyList, ApiError> {
@@ -1116,6 +1131,49 @@ mod tests {
         };
         assert!(error.is_timeout());
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn follow_error_body_has_a_total_deadline_despite_trickling_data() {
+        use std::time::Duration;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let (headers_sent, headers_received) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            stream.set_nodelay(true).unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            while reader.read_line(&mut line).await.unwrap() != 0 {
+                if line == "\r\n" {
+                    break;
+                }
+                line.clear();
+            }
+            let mut stream = reader.into_inner();
+            stream.write_all(b"HTTP/1.1 403 Forbidden\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").await.unwrap();
+            headers_sent.send(()).unwrap();
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if stream.write_all(b"1\r\nx\r\n").await.is_err() {
+                    break;
+                }
+            }
+        });
+        let client = ApiClient::new(&base_url, Some("test-session".to_string()));
+        let request = tokio::spawn(async move { client.get_logs("test-app", true).await });
+        headers_received.await.unwrap();
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        let error = request.await.unwrap().unwrap_err();
+        server.abort();
+        let _ = server.await;
+        assert!(
+            matches!(error, ApiError::Api { status: 0, code: Some(code), .. } if code == "request_timeout")
+        );
+        assert!(started.elapsed() < Duration::from_secs(API_REQUEST_TIMEOUT_SECONDS * 2));
     }
 
     #[test]
