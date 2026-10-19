@@ -3641,7 +3641,7 @@ fn destroy_failure_hint(code: Option<&str>, message: &str, app_name: &str) -> Op
         || message.contains("app_delete_teardown_locked");
     if teardown_cause {
         return Some(format!(
-            "the confidential workload is locked and the app remains intact; unlock it with its storage password (`enclava unlock --app {app_name}`), then retry destroy"
+            "the confidential workload is locked and the app remains intact; unlock it with its storage password (`enclava unlock --app {app_name}`), then retry destroy; if the unlock cannot reach the workload (for example the TEE TLS handshake fails), destroy with `--abandon-teardown` instead"
         ));
     }
     match code {
