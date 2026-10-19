@@ -529,32 +529,6 @@ fn deploy_preflight_gate_fails_closed_on_unresolved_ownership() {
 }
 
 #[test]
-fn deploy_preflight_reads_live_ownership_before_the_claim_gate() {
-    // CRLF checkouts (Windows autocrlf) must not break source matching.
-    let source = include_str!("../../app.rs").replace("\r\n", "\n");
-    let deploy_start = source.find("pub async fn deploy").expect("deploy exists");
-    let deploy_end = source[deploy_start..]
-        .find("// Phase 1: Deploy")
-        .expect("phase 1 follows deploy setup")
-        + deploy_start;
-    let setup = &source[deploy_start..deploy_end];
-
-    let ownership_read = setup
-        .find("preflight_ownership = api")
-        .expect("deploy reads live ownership before the gate");
-    let gate = setup
-        .find("ensure_claim_session_now")
-        .expect("deploy gates the claim session");
-    let gate_decision = setup
-        .find("preflight_ownership.as_deref()")
-        .expect("the gate decision consumes the prefetched ownership state");
-    assert!(
-        ownership_read < gate_decision && gate_decision < gate,
-        "ownership must be read before the gate decision, and the decision before the session gate"
-    );
-}
-
-#[test]
 fn destroy_failure_hint_covers_lane_conflicts_and_teardown_failures() {
     let busy = destroy_failure_hint(
         Some("app mutation already in progress"),

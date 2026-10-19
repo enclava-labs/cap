@@ -258,17 +258,8 @@ pub(crate) fn deploy_needs_initial_claim(
     }
 }
 
-/// The pre-mutation claim gate's decision: the post-submit
-/// [`deploy_needs_initial_claim`] predicate, except that unresolved
-/// ownership fails CLOSED before submission. The status read is a TEE
-/// query: a window that closes between this read and the post-submit one
-/// is exactly the strand this gate exists to prevent, so an unreadable
-/// state gates. The cost -- an unattended redeploy of an already-claimed
-/// app while its TEE status is unreachable now needs a session -- leaves
-/// no residue, while the strand leaves a submitted deployment with no
-/// claimant. The post-submit predicate keeps its own None fallback
-/// unchanged (gating there would strand claimed redeploys in the claim
-/// wait instead).
+/// Unresolved ownership requires claim-ready password input before submission,
+/// so a first deployment cannot be stranded by a missing password prompt.
 pub(crate) fn deploy_preflight_needs_claim(
     is_password_mode: bool,
     ownership_state: Option<&str>,
