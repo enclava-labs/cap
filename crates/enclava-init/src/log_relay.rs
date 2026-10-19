@@ -2762,7 +2762,7 @@ mod tests {
     /// and releases the slot — new connections are then served again.
     #[test]
     fn over_capacity_gets_503_and_vanished_clients_release_slots() {
-        use std::io::{Read as _, Write as _};
+        use std::io::{BufRead as _, BufReader, Read as _, Write as _};
         use std::net::{TcpListener, TcpStream};
         use std::time::Instant;
 
@@ -2798,6 +2798,22 @@ mod tests {
                   Host: x\r\n\r\n",
             )
             .unwrap();
+        held_client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        {
+            let mut reader = BufReader::new(&mut held_client);
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap() != 0 {
+                if line == "\r\n" {
+                    break;
+                }
+                line.clear();
+            }
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(line, "{\"sequence\":1}\n");
+        }
 
         // Over budget: rejected at accept — the request is never read.
         let mut rejected = TcpStream::connect(addr).unwrap();
