@@ -355,22 +355,9 @@ pub async fn soft_delete_owner_binding(
     namespace: &str,
     app_name: &str,
 ) -> Result<(), KbsPolicyError> {
-    // If the confidential teardown never completed, the owner seed may still
-    // exist in KBS: record the waiver FIRST, in a table that survives the app
-    // row (kbs_owner_bindings cascades away with it), so a later recreate of
-    // the same binding key is refused until the seed is erased.
-    //
-    // "Never completed" is derived from seed existence, not the flip-time
-    // requirement flag alone: a teardown-required workload (signed paths
-    // never create a binding row — the key is name-derived either way) OR
-    // any workload with a live owner binding (a running-then-stopped app
-    // keeps its seed; PaaS desired-state only scales it to zero) OR any
-    // workload that ever deployed (requires_workload_teardown only matches
-    // Running, so a stopped or failed app records teardown as not required —
-    // and a signed deployment leaves no binding row, yet its name-derived
-    // seed survives the scale-to-zero) waives when the completion marker is
-    // absent. Completed teardowns and never-deployed apps record nothing:
-    // absence of a waiver means recreate is allowed.
+    // Deployment history and owner bindings can outlive a running status.
+    // Without a completion marker, preserve their same-name seed guard before
+    // the app row and its owner bindings are removed by the deletion tail.
     sqlx::query(
         "INSERT INTO kbs_owner_seed_waivers (binding_key, app_id, org_name, app_name)
          SELECT $2, app.id, org.name, app.name
@@ -8340,9 +8327,9 @@ resource_bindings := {
         );
 
         // A stopped app keeps its owner binding (PaaS desired-state only
-        // scales the workload to zero, the seed survives) even though the
-        // flip records teardown as not required: the binding row is the
-        // seed-existence signal — waived.
+        // scales the workload to zero, the seed survives) even when the
+        // recorded status cannot tell the workload is gone: the binding row
+        // is the seed-existence signal — waived.
         let (stopped_org, stopped_app) = insert_test_app(&pool, "stopped").await;
         seed_owner_binding_for_app(&pool, stopped_app).await;
         let stopped_identity = app_identity(&pool, stopped_app).await;
@@ -8414,8 +8401,7 @@ resource_bindings := {
     async fn soft_delete_owner_binding_waives_ever_deployed_workload_without_binding() {
         let pool = crate::test_support::database_test_pool().await;
 
-        // A signed deployment leaves no owner binding row and a stopped (or
-        // failed) workload records teardown as not required — the deployment
+        // A signed deployment leaves no owner binding row — the deployment
         // row is the only durable signal that a TEE boot may have left the
         // name-derived seed behind. The seed survives a scale-to-zero, so
         // the destroy must waive.
