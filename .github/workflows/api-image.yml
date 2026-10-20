@@ -114,6 +114,8 @@ jobs:
           provenance: false
           build-args: |
             ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX=5b9437adeaffbe8f41b13d96ed49d2f51cd6c266cd8ecc284b0552ec4912b8dd
+          cache-from: type=gha,scope=api-debug
+          cache-to: type=gha,mode=max,scope=api-debug
 
       - name: Build appraiser image
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
@@ -122,6 +124,8 @@ jobs:
           file: ./crates/enclava-appraiser/Dockerfile
           push: false
           provenance: false
+          cache-from: type=gha,scope=appraiser
+          cache-to: type=gha,mode=max,scope=appraiser
 
   publish:
     name: Publish signed API image
@@ -239,8 +243,8 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX=${{ secrets.ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=api-release
+          cache-to: type=gha,mode=max,scope=api-release
           provenance: true
 
       - name: Set up Kustomize
