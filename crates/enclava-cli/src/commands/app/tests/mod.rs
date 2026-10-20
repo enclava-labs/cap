@@ -2883,6 +2883,7 @@ mod terminal_diagnostics {
 
     #[test]
     fn launch_identity_binding_fixtures() {
+        use crate::commands::app::DeploymentWait;
         use enclava_cli::tee_client::{
             VerifiedSnpLaunchIdentity, launch_identity_binds_deployment,
         };
@@ -2893,6 +2894,23 @@ mod terminal_diagnostics {
             host_data: NEW_EXPECTED_LAUNCH_HASH,
             firmware_measurement: EXPECTED_FIRMWARE_MEASUREMENT,
         };
+        let expectation = test_expectation("new-1", NEW_EXPECTED_LAUNCH_HASH);
+        let deployment = DeploymentWait::trusted("new-1", Some(&expectation));
+        assert!(deployment.matches_launch_identity(Some(&fully_verified)));
+        assert!(!deployment.matches_launch_identity(None));
+        assert!(
+            !DeploymentWait::trusted("new-1", None).matches_launch_identity(Some(&fully_verified))
+        );
+        assert!(
+            !DeploymentWait::trusted("old-1", Some(&expectation))
+                .matches_launch_identity(Some(&fully_verified))
+        );
+        assert!(
+            !deployment.matches_launch_identity(Some(&VerifiedSnpLaunchIdentity {
+                host_data: OLD_TEE_LAUNCH_HASH,
+                firmware_measurement: EXPECTED_FIRMWARE_MEASUREMENT,
+            }))
+        );
 
         // Positive: same fully verified client (hash AND measurement match).
         assert!(launch_identity_binds_deployment(

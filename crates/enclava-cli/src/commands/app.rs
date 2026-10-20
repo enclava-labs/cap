@@ -810,6 +810,19 @@ impl<'a> DeploymentWait<'a> {
             }),
         }
     }
+
+    pub(crate) fn matches_launch_identity(
+        self,
+        identity: Option<&enclava_cli::tee_client::VerifiedSnpLaunchIdentity>,
+    ) -> bool {
+        self.expectation.is_some_and(|expectation| {
+            enclava_cli::tee_client::launch_identity_binds_deployment(
+                identity,
+                &expectation.expected_cc_init_data_hash,
+                &expectation.expected_firmware_measurement,
+            )
+        })
+    }
 }
 
 /// Hard cap on one complete terminal-diagnostic probe (CAP endpoint lookup,
@@ -2445,6 +2458,12 @@ pub(crate) async fn claim_initial_ownership(
             );
         }
     };
+    if !deployment.matches_launch_identity(tee.verified_launch_identity().as_ref()) {
+        return Err(
+            "TEE launch identity does not match the signed deployment; no ownership was claimed; retry the deployment"
+                .into(),
+        );
+    }
 
     let challenge = match bounded_request(deadline, tee.bootstrap_challenge()).await {
         Some(challenge) => challenge?,

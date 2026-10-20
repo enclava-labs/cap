@@ -1648,7 +1648,11 @@ async fn wait_for_template_bootstrap_endpoint(
                 )
                 .await
                 {
-                    Some(Ok(_)) => {
+                    Some(Ok(_))
+                        if deployment.matches_launch_identity(
+                            attested_tee.verified_launch_identity().as_ref(),
+                        ) =>
+                    {
                         // A terminal diagnostic read over this attested,
                         // SPKI-pinned channel outranks a reachable challenge
                         // endpoint: stop before attempting any claim, but only
@@ -1759,9 +1763,8 @@ async fn wait_for_template_bootstrap_endpoint(
                             }
                         }
                     }
-                    // A cut is not a challenge failure: no fallback reads;
-                    // the loop's expiry reports the wait timeout.
-                    None => {
+                    // An old unclaimed guest or an expired read must not authorize a new claim.
+                    Some(Ok(_)) | None => {
                         pb.set_message(timed_progress(
                             "TEE ownership: waiting for claim endpoint",
                             start.elapsed(),
