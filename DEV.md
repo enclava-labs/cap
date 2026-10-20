@@ -80,6 +80,9 @@ The recipe tracks workspace manifests and `Cargo.lock`; the real vendored
 `rdrand` patch is also copied before dependency compilation. Cargo sources and
 compiled dependencies stay in exported layers rather than ephemeral cache mounts.
 
+Main pushes seed `api-debug` with the `debug-dependencies` target in a separate,
+non-publishing job so newly opened PRs can restore compiled dependencies.
+
 Release dependency compilation uses separate CLI-example and API `prod-strict`
 passes because their resolved dependency features differ. Real sources, the
 signed envelope, and the root pin are applied afterward; the existing root,
