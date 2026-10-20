@@ -73,6 +73,20 @@ New scopes need a successful run to warm. GitHub's branch restrictions still
 apply: PR caches do not seed `main`. These caches do not preserve Dockerfile
 cache-mount contents across runners.
 
+API builds use checksum-pinned `cargo-chef` 0.1.78 binaries for amd64 and arm64
+to cache compiled dependencies separately from application sources. The recipe
+tracks workspace manifests and `Cargo.lock`; the real vendored `rdrand` patch
+is also copied before dependency compilation. Cargo sources and compiled
+dependencies stay in exported layers rather than ephemeral cache mounts.
+
+Release dependency compilation uses separate CLI-example and API `prod-strict`
+passes because their resolved dependency features differ. Real sources, the
+signed envelope, and the root pin are applied afterward; the existing root,
+signature, and trust-root checks still gate the final binaries. Source-only
+edits can reuse dependency layers; manifest, lockfile, and vendored-source
+changes invalidate them. Measure a source-edit rebuild, not just an unchanged
+commit rerun, and include cache export/import costs when comparing CI times.
+
 ## Shared signed API image
 
 The API image pins the platform-release root and verifies its bundled signed
