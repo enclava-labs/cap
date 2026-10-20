@@ -125,6 +125,14 @@ pub async fn run(cmd: ConfigCommand) -> Result<(), Box<dyn std::error::Error>> {
         ConfigCommand::Unset { key, app } => {
             let app_name = resolve_app_name(&app)?;
             let (api, _paths, _cli_config) = build_api_client()?;
+            // Store first, guest second (#304): the required-key guard lives
+            // on the meta delete, so it must be able to refuse BEFORE the
+            // TEE key is removed — a refused unset must mutate nothing. The
+            // meta delete is idempotent (204 whether or not the row existed),
+            // so a retry after a TEE-side failure re-runs it harmlessly and
+            // retries the TEE delete.
+            api.delete_config_meta(&app_name, &key).await?;
+
             let app_info = api.get_app(&app_name).await?;
 
             let token_resp = api.get_config_token(&app_name).await?;
@@ -140,12 +148,21 @@ pub async fn run(cmd: ConfigCommand) -> Result<(), Box<dyn std::error::Error>> {
                     TeeClient::new_with_resolve_ip(tee_domain, token_resp.tee_resolve_ip)
                 });
             let (_attestation, tee) = tee.attest_receipt_key().await?;
-            tee.config_unset(&key, &token_resp.token).await?;
+            if let Err(error) = tee.config_unset(&key, &token_resp.token).await {
+                // The store is already unset; the guest may keep using the
+                // delivered copy until this succeeds. Fail toward availability
+                // with the state spelled out: the command exits non-zero and a
+                // retry completes the guest-side removal.
+                eprintln!(
+                    "Warning: {key} was removed from the config store, but the TEE could not \
+                     be reached to remove the delivered copy ({error}). The app may keep \
+                     using the old value until `config unset {key}` succeeds."
+                );
+                return Err(error.into());
+            }
             // The key is removed from the TEE store from here on; emit the
             // application note before any later step can fail the command.
             println!("{CONFIG_APPLICATION_NOTE}");
-
-            api.delete_config_meta(&app_name, &key).await?;
 
             println!("Unset {key}.");
         }
@@ -227,10 +244,12 @@ mod tests {
             .expect("unset names the next-boot application contract");
         let meta_delete = unset_body
             .find("delete_config_meta")
-            .expect("unset deletes key metadata after the TEE deletion");
+            .expect("unset deletes key metadata before the TEE deletion");
         assert!(
-            tee_delete < unset_note && unset_note < meta_delete,
-            "unset prints the application note after the TEE deletion and before the metadata delete can fail the command"
+            meta_delete < tee_delete && tee_delete < unset_note,
+            "unset runs the store-side guard first, then the TEE deletion, then prints the \
+             application note — a refused unset must mutate nothing, and the note must not \
+             print while a step can still fail the command (#304)"
         );
     }
 
@@ -275,6 +294,27 @@ mod tests {
         assert!(
             attest < config_unset,
             "config unset must verify attestation/SPKI binding before deleting config"
+        );
+    }
+
+    #[test]
+    fn config_unset_stores_meta_delete_before_any_tee_mutation() {
+        let source = include_str!("config.rs");
+        let unset_start = source
+            .find("ConfigCommand::Unset { key, app } =>")
+            .expect("unset command branch exists");
+        let body = &source[unset_start..];
+
+        let meta_delete = body
+            .find("delete_config_meta")
+            .expect("config unset must delete the store metadata");
+        let config_unset = body
+            .find("config_unset")
+            .expect("config unset must delete value");
+        assert!(
+            meta_delete < config_unset,
+            "config unset must run the store-side guard (delete_config_meta) before the TEE \
+             key is removed — a refused unset must mutate nothing (#304)"
         );
     }
 }
