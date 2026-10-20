@@ -3724,15 +3724,6 @@ async fn cleanup_stale_tenant_image_pull_secrets(pool: &PgPool) -> Result<bool, 
     // finding): the caller keeps workload admission closed on it and retries.
     let mut converged = true;
     for (namespace, apps_in_namespace) in &by_namespace {
-        if namespace_absent(&engine, namespace).await {
-            tracing::info!(
-                %namespace,
-                "tenant image pull secret cleanup sweep: namespace does not exist — \
-                 skipping (no stale secret can live there; the per-deploy cleanup \
-                 gates whatever deploy creates it)"
-            );
-            continue;
-        }
         // In-scope namespaces are reconciled too (review finding): pre-label
         // secrets there must be adopted (labeled) before the keep decision
         // applies, and unreferenced residue (e.g. a renamed old secret) must
@@ -3853,6 +3844,19 @@ async fn cleanup_stale_tenant_image_pull_secrets(pool: &PgPool) -> Result<bool, 
                  exists fleet-wide — this replica defers all tenant pull-secret work \
                  (including namespaces without a fence row or a live Secret) until \
                  upgraded"
+            );
+            continue;
+        }
+        // Authority rechecks above stay in force for absent namespaces too
+        // (review on #306): a stale replica must still defer when a newer
+        // epoch was raised mid-sweep. Only then is the namespace's absence
+        // conclusive — nothing to clean, and the per-deploy cleanup gates
+        // whatever deploy later creates it.
+        if namespace_absent(&engine, namespace).await {
+            tracing::info!(
+                %namespace,
+                "tenant image pull secret cleanup sweep: namespace does not exist — \
+                 skipping (no stale secret can live there)"
             );
             continue;
         }
