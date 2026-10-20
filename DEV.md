@@ -73,11 +73,12 @@ New scopes need a successful run to warm. GitHub's branch restrictions still
 apply: PR caches do not seed `main`. These caches do not preserve Dockerfile
 cache-mount contents across runners.
 
-API builds use checksum-pinned `cargo-chef` 0.1.78 binaries for amd64 and arm64
-to cache compiled dependencies separately from application sources. The recipe
-tracks workspace manifests and `Cargo.lock`; the real vendored `rdrand` patch
-is also copied before dependency compilation. Cargo sources and compiled
-dependencies stay in exported layers rather than ephemeral cache mounts.
+API builds use `cargo-chef` 0.1.78 to cache compiled dependencies separately
+from application sources. The installer uses checksum-pinned binaries on amd64
+and arm64, and builds the same locked version on other Rust image architectures.
+The recipe tracks workspace manifests and `Cargo.lock`; the real vendored
+`rdrand` patch is also copied before dependency compilation. Cargo sources and
+compiled dependencies stay in exported layers rather than ephemeral cache mounts.
 
 Release dependency compilation uses separate CLI-example and API `prod-strict`
 passes because their resolved dependency features differ. Real sources, the

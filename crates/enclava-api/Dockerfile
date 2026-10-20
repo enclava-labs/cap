@@ -1,34 +1,21 @@
 # syntax=docker/dockerfile:1.7
 
-FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc AS cargo-chef
+FROM rust:1.88-bookworm@sha256:af306cfa71d987911a781c37b59d7d67d934f49684058f96cf72079c3626bfe0 AS cargo-chef
 ARG TARGETARCH
-RUN apk add --no-cache ca-certificates curl xz
-RUN set -eu; \
-    case "$TARGETARCH" in \
-      amd64) target=x86_64-unknown-linux-musl; checksum=aca691abfbfbbe00d482e0ed2249eec3091b65e96a0ce92947fb5b254d48b16d ;; \
-      arm64) target=aarch64-unknown-linux-musl; checksum=cd59b90fce5fa84c4189648fec33404ec5491791eebdb812df5e7fca8336408d ;; \
-      *) echo "unsupported cargo-chef architecture: $TARGETARCH" >&2; exit 1 ;; \
-    esac; \
-    curl --proto '=https' --tlsv1.2 -fsSL \
-      "https://github.com/LukeMathWalker/cargo-chef/releases/download/v0.1.78/cargo-chef-${target}.tar.xz" \
-      -o /tmp/cargo-chef.tar.xz; \
-    echo "$checksum  /tmp/cargo-chef.tar.xz" | sha256sum -c -; \
-    tar -xJf /tmp/cargo-chef.tar.xz -C /usr/local/bin --strip-components=1 "cargo-chef-${target}/cargo-chef"; \
-    rm /tmp/cargo-chef.tar.xz
+COPY scripts/install-cargo-chef.sh /usr/local/bin/install-cargo-chef.sh
+RUN sh /usr/local/bin/install-cargo-chef.sh "$TARGETARCH" && cargo-chef --version
 
-FROM rust:1.88-alpine@sha256:9dfaae478ecd298b6b5a039e1f2cc4fc040fc818a2de9aa78fa714dea036574d AS planner
-COPY --from=cargo-chef /usr/local/bin/cargo-chef /usr/local/bin/cargo-chef
+FROM cargo-chef AS planner
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY vendor/ vendor/
 COPY crates/ crates/
 RUN cargo chef prepare --recipe-path recipe.json
 
-FROM rust:1.88-bookworm@sha256:af306cfa71d987911a781c37b59d7d67d934f49684058f96cf72079c3626bfe0 AS debug-dependencies
+FROM cargo-chef AS debug-dependencies
 RUN apt-get update && \
     apt-get install -y --no-install-recommends pkg-config libssl-dev jq && \
     rm -rf /var/lib/apt/lists/*
-COPY --from=cargo-chef /usr/local/bin/cargo-chef /usr/local/bin/cargo-chef
 WORKDIR /build
 COPY --from=planner /build/recipe.json recipe.json
 COPY vendor/ vendor/
@@ -78,12 +65,17 @@ ENV DATABASE_URL="postgresql://host:5432/db" \
 
 ENTRYPOINT ["/usr/local/bin/enclava-api"]
 
-FROM rust:1.88-alpine@sha256:9dfaae478ecd298b6b5a039e1f2cc4fc040fc818a2de9aa78fa714dea036574d AS release-dependencies
+FROM rust:1.88-alpine@sha256:9dfaae478ecd298b6b5a039e1f2cc4fc040fc818a2de9aa78fa714dea036574d AS cargo-chef-musl
+ARG TARGETARCH
+RUN apk add --no-cache musl-dev curl xz
+COPY scripts/install-cargo-chef.sh /usr/local/bin/install-cargo-chef.sh
+RUN sh /usr/local/bin/install-cargo-chef.sh "$TARGETARCH" && cargo-chef --version
+
+FROM cargo-chef-musl AS release-dependencies
 
 # perl+make: the envelope verify step compiles enclava-cli, whose vendored
 # openssl build needs them.
 RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconf bash jq perl make
-COPY --from=cargo-chef /usr/local/bin/cargo-chef /usr/local/bin/cargo-chef
 WORKDIR /build
 COPY --from=planner /build/recipe.json recipe.json
 COPY vendor/ vendor/
