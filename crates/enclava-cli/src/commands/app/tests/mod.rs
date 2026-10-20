@@ -556,6 +556,17 @@ fn destroy_failure_hint_covers_lane_conflicts_and_teardown_failures() {
         locked.contains("enclava unlock --app shell"),
         "got: {locked}"
     );
+    // The prescribed unlock is impossible when the wedged workload never
+    // stood up its TEE serving endpoint — the hint must offer the abandon
+    // path for that case (#292 field evidence: unlock fails with a TEE TLS
+    // handshake error while the workload stays 0/4), framed as a last
+    // resort with its owner-seed consequence spelled out.
+    assert!(locked.contains("last resort"), "got: {locked}");
+    assert!(locked.contains("--abandon-teardown"), "got: {locked}");
+    assert!(
+        locked.contains("blocks recreating this app name"),
+        "got: {locked}"
+    );
     // Hosted deferrals carry the locked cause only in-band.
     let locked_in_band = destroy_failure_hint(
         Some("app mutation already in progress"),
