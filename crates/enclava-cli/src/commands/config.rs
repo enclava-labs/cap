@@ -1,6 +1,6 @@
 use clap::Subcommand;
 
-use enclava_cli::api_client::ApiClient;
+use enclava_cli::api_client::{ApiClient, ApiError};
 use enclava_cli::app_config::AppConfig;
 use enclava_cli::config::{self, CliPaths};
 use enclava_cli::tee_client::TeeClient;
@@ -131,7 +131,25 @@ pub async fn run(cmd: ConfigCommand) -> Result<(), Box<dyn std::error::Error>> {
             // meta delete is idempotent (204 whether or not the row existed),
             // so a retry after a TEE-side failure re-runs it harmlessly and
             // retries the TEE delete.
-            api.delete_config_meta(&app_name, &key).await?;
+            match api.delete_config_meta(&app_name, &key).await {
+                Ok(()) => {}
+                // Transport-indeterminate (review on #307): the DELETE may
+                // have landed server-side — the store may already be unset —
+                // while the TEE copy certainly remains. Same partial state
+                // as a TEE-side failure below; the retry is safe either way.
+                Err(error @ ApiError::Http(_)) => {
+                    eprintln!(
+                        "Warning: the outcome of removing {key} from the config store for app \
+                         {app_name} is unknown ({error}) — it may already be unset there. Retry \
+                         with `enclava config unset {key} --app {app_name}` (the store delete is \
+                         idempotent) to complete the removal."
+                    );
+                    return Err(error.into());
+                }
+                // A definite server answer (guard refusal, unknown app):
+                // nothing was mutated — propagate as-is.
+                Err(error) => return Err(error.into()),
+            }
 
             // Every remaining step reads or mutates the TEE. Any failure in
             // the phase leaves the partial state (store unset, delivered copy
@@ -170,8 +188,8 @@ pub async fn run(cmd: ConfigCommand) -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!(
                     "Warning: {key} was removed from the config store for app \
                      {app_name}, but the TEE copy could not be removed ({error}). Retry with \
-                     `config unset {key} --app {app_name}` to complete the removal; a running \
-                     workload keeps using its already-consumed value until it restarts."
+                     `enclava config unset {key} --app {app_name}` to complete the removal; a \
+                     running workload keeps using its already-consumed value until it restarts."
                 );
                 return Err(error);
             }
