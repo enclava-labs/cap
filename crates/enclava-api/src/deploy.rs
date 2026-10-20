@@ -19,7 +19,7 @@ use enclava_engine::types::{
     AttestationConfig, BindMount, ConfidentialApp, Container, DomainSpec, EgressMode,
     LogEncryptionConfig, StorageSpec, WorkloadArtifactBinding, WorkloadSecurityProfile,
 };
-use k8s_openapi::api::core::v1::{Secret, ServiceAccount};
+use k8s_openapi::api::core::v1::{Namespace, Secret, ServiceAccount};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::{
     Api, Resource as _,
@@ -3582,6 +3582,23 @@ async fn sweep_namespace_with_budget(
 type NamespacePullSecretInventory =
     std::collections::BTreeMap<String, Vec<(String, Option<Vec<ImageRef>>)>>;
 
+/// True only on an explicit NotFound. A namespace that does not exist cannot
+/// hold a stale pull secret, so the sweep skips its app rows entirely (#305):
+/// a `deleting` row whose namespace is already gone — or a blocked create
+/// whose namespace never materialized because admission was closed — must not
+/// keep workload admission closed fleet-wide. Any other outcome (the
+/// namespace exists, or the API server answered something other than
+/// NotFound) falls through to the normal reconcile, preserving today's
+/// behavior; the per-deploy cleanup remains the hard gate for everything that
+/// does exist.
+async fn namespace_absent(engine: &ApplyEngine, namespace: &str) -> bool {
+    let api: Api<Namespace> = Api::all(engine.client().clone());
+    matches!(
+        api.get(namespace).await,
+        Err(kube::Error::Api(error)) if error.code == 404
+    )
+}
+
 async fn cleanup_stale_tenant_image_pull_secrets(pool: &PgPool) -> Result<bool, DeployError> {
     let settings = PullSecretSettings::from_env();
     let config = tenant_image_pull_secret_config_from_env();
@@ -3702,6 +3719,15 @@ async fn cleanup_stale_tenant_image_pull_secrets(pool: &PgPool) -> Result<bool, 
     // finding): the caller keeps workload admission closed on it and retries.
     let mut converged = true;
     for (namespace, apps_in_namespace) in &by_namespace {
+        if namespace_absent(&engine, namespace).await {
+            tracing::info!(
+                %namespace,
+                "tenant image pull secret cleanup sweep: namespace does not exist — \
+                 skipping (no stale secret can live there; the per-deploy cleanup \
+                 gates whatever deploy creates it)"
+            );
+            continue;
+        }
         // In-scope namespaces are reconciled too (review finding): pre-label
         // secrets there must be adopted (labeled) before the keep decision
         // applies, and unreferenced residue (e.g. a renamed old secret) must
@@ -9119,6 +9145,38 @@ mod tests {
         assert!(
             converged,
             "a missing namespace is an already-clean sweep, not a failure"
+        );
+    }
+
+    /// #305: the discovery 404 path above only covers out-of-scope
+    /// namespaces — an IN-scope app whose namespace is absent drives the
+    /// configured-secret ensure into the same 404 and wedges admission. The
+    /// sweep now skips absent namespaces before any reconcile (#305), and
+    /// `namespace_absent` is the gate: true only on an explicit NotFound,
+    /// false whenever the namespace answers (or the API server errors — that
+    /// falls through to the reconcile, preserving today's behavior).
+    #[tokio::test]
+    async fn namespace_absent_is_true_only_on_explicit_not_found() {
+        use std::sync::{Arc, Mutex};
+
+        let missing = Arc::new(Mutex::new(FakeCluster {
+            namespace_missing: true,
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(missing);
+        assert!(
+            namespace_absent(&engine, "gone-ns").await,
+            "a namespace the API server answers NotFound for is absent"
+        );
+
+        let live = Arc::new(Mutex::new(FakeCluster {
+            echo_namespace_generation: Some(7),
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(live);
+        assert!(
+            !namespace_absent(&engine, "live-ns").await,
+            "a namespace that answers is not absent"
         );
     }
 
