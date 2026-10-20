@@ -3593,9 +3593,14 @@ type NamespacePullSecretInventory =
 /// does exist.
 async fn namespace_absent(engine: &ApplyEngine, namespace: &str) -> bool {
     let api: Api<Namespace> = Api::all(engine.client().clone());
+    // Bounded like the reconcile it precedes (review on #306): a stalled
+    // API server must not hang the sweep on this probe — a timeout falls
+    // through to the normal reconcile, which is itself budgeted and reports
+    // its own outcome.
+    let probe = tokio::time::timeout(PULL_SECRET_NAMESPACE_RECONCILE_TIMEOUT, api.get(namespace));
     matches!(
-        api.get(namespace).await,
-        Err(kube::Error::Api(error)) if error.code == 404
+        probe.await,
+        Ok(Err(kube::Error::Api(error))) if error.code == 404
     )
 }
 
@@ -7921,6 +7926,10 @@ mod tests {
         /// Simulate a stalled API server (Codex review on #243, P1 follow-up):
         /// the label-selected Secret list hangs until the caller's per-
         /// namespace budget cancels it.
+        /// Stall every namespace GET far beyond the sweep's per-namespace
+        /// budget: `namespace_absent` must fall through on its own timeout
+        /// instead of hanging the sweep (review on #306).
+        stall_namespace_gets: bool,
         stall_secrets_list: bool,
         /// Fail ServiceAccount patches that ADD an `imagePullSecrets` entry
         /// (reference restores) with a 500 this many times — the durable
@@ -8064,10 +8073,20 @@ mod tests {
                         let named_secret_get = method.as_str() == "GET"
                             && path.contains("/secrets/")
                             && !path.trim_end_matches('/').ends_with("/secrets");
+                        let namespace_get = method.as_str() == "GET"
+                            && path
+                                .trim_start_matches('/')
+                                .starts_with("api/v1/namespaces/")
+                            && path
+                                .trim_start_matches("/api/v1/namespaces/")
+                                .trim_end_matches('/')
+                                .find('/')
+                                .is_none();
                         (state.stall_secrets_list
                             && method.as_str() == "GET"
                             && path.trim_end_matches('/').ends_with("/secrets"))
                             || (state.stall_secret_gets && named_secret_get)
+                            || (state.stall_namespace_gets && namespace_get)
                     };
                     if stall {
                         tokio::time::sleep(std::time::Duration::from_secs(600)).await;
@@ -9177,6 +9196,24 @@ mod tests {
         assert!(
             !namespace_absent(&engine, "live-ns").await,
             "a namespace that answers is not absent"
+        );
+    }
+
+    /// Review on #306: a stalled API server must not hang the sweep on the
+    /// probe — the bounded GET falls through (treated as not-absent) and the
+    /// budgeted reconcile decides.
+    #[tokio::test(start_paused = true)]
+    async fn namespace_absent_falls_through_when_the_probe_stalls() {
+        use std::sync::{Arc, Mutex};
+
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            stall_namespace_gets: true,
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster);
+        assert!(
+            !namespace_absent(&engine, "any-ns").await,
+            "a stalled probe must fall through to the reconcile path instead of hanging"
         );
     }
 
