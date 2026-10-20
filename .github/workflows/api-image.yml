@@ -8,6 +8,7 @@ on:
       - ".github/workflows/api-image.yml"
       - "scripts/render-api-release-manifest.sh"
       - "scripts/require-platform-release-root.sh"
+      - "scripts/install-cargo-chef.sh"
       - "scripts/test-api-image-workflow.sh"
       - "scripts/test-verify-api-image-ref.sh"
       - "scripts/verify-api-image-ref.bash"
@@ -15,6 +16,8 @@ on:
       - "deploy/api/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "crates/*/Cargo.toml"
+      - "vendor/rdrand-0.8.3/**"
       - "crates/enclava-api/**"
       - "crates/enclava-appraiser/**"
       # The release stage compiles the whole enclava-cli crate for the
@@ -28,6 +31,7 @@ on:
       - ".github/workflows/api-image.yml"
       - "scripts/render-api-release-manifest.sh"
       - "scripts/require-platform-release-root.sh"
+      - "scripts/install-cargo-chef.sh"
       - "scripts/test-api-image-workflow.sh"
       - "scripts/test-verify-api-image-ref.sh"
       - "scripts/verify-api-image-ref.bash"
@@ -35,6 +39,8 @@ on:
       - "deploy/api/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "crates/*/Cargo.toml"
+      - "vendor/rdrand-0.8.3/**"
       - "crates/enclava-api/**"
       - "crates/enclava-appraiser/**"
       # The release stage compiles the whole enclava-cli crate for the
@@ -63,6 +69,30 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  warm-debug-dependencies:
+    name: Cache API debug dependencies
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Cache debug dependencies
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: ./crates/enclava-api/Dockerfile
+          target: debug-dependencies
+          push: false
+          provenance: false
+          cache-from: type=gha,scope=api-debug
+          cache-to: type=gha,mode=max,scope=api-debug
+
   validate:
     name: Validate API image
     if: github.event_name == 'pull_request'
