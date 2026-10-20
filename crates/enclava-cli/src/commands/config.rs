@@ -125,6 +125,11 @@ pub async fn run(cmd: ConfigCommand) -> Result<(), Box<dyn std::error::Error>> {
         ConfigCommand::Unset { key, app } => {
             let app_name = resolve_app_name(&app)?;
             let (api, _paths, _cli_config) = build_api_client()?;
+            // Read-only lookups first (review on #307): a token without
+            // apps:read must fail HERE, cleanly, not after the store delete —
+            // every step below may mutate.
+            let app_info = api.get_app(&app_name).await?;
+
             // Store first, guest second (#304): the required-key guard lives
             // on the meta delete, so it must be able to refuse BEFORE the
             // TEE key is removed — a refused unset must mutate nothing. The
@@ -133,11 +138,17 @@ pub async fn run(cmd: ConfigCommand) -> Result<(), Box<dyn std::error::Error>> {
             // retries the TEE delete.
             match api.delete_config_meta(&app_name, &key).await {
                 Ok(()) => {}
-                // Transport-indeterminate (review on #307): the DELETE may
-                // have landed server-side — the store may already be unset —
+                // Indeterminate outcome (review on #307): transport errors,
+                // and gateway/server 5xx — the request may have reached and
+                // been applied upstream — leave the store possibly unset
                 // while the TEE copy certainly remains. Same partial state
                 // as a TEE-side failure below; the retry is safe either way.
-                Err(error @ ApiError::Http(_)) => {
+                Err(
+                    error @ (ApiError::Http(_)
+                    | ApiError::Api {
+                        status: 500..=599, ..
+                    }),
+                ) => {
                     eprintln!(
                         "Warning: the outcome of removing {key} from the config store for app \
                          {app_name} is unknown ({error}) — it may already be unset there. Retry \
@@ -146,8 +157,8 @@ pub async fn run(cmd: ConfigCommand) -> Result<(), Box<dyn std::error::Error>> {
                     );
                     return Err(error.into());
                 }
-                // A definite server answer (guard refusal, unknown app):
-                // nothing was mutated — propagate as-is.
+                // A definite client-side answer (guard refusal, unknown app,
+                // permissions): nothing was mutated — propagate as-is.
                 Err(error) => return Err(error.into()),
             }
 
@@ -156,8 +167,6 @@ pub async fn run(cmd: ConfigCommand) -> Result<(), Box<dyn std::error::Error>> {
             // possibly still in place) — so the whole phase reports it, not
             // just the final TEE delete.
             let tee_phase: Result<(), Box<dyn std::error::Error>> = async {
-                let app_info = api.get_app(&app_name).await?;
-
                 let token_resp = api.get_config_token(&app_name).await?;
 
                 let tee = token_resp
