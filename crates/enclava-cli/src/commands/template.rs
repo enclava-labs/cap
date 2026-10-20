@@ -1649,13 +1649,9 @@ async fn wait_for_template_bootstrap_endpoint(
                 .await
                 {
                     Some(Ok(_))
-                        if deployment.expectation.is_none_or(|expectation| {
-                            enclava_cli::tee_client::launch_identity_binds_deployment(
-                                attested_tee.verified_launch_identity().as_ref(),
-                                &expectation.expected_cc_init_data_hash,
-                                &expectation.expected_firmware_measurement,
-                            )
-                        }) =>
+                        if deployment.matches_launch_identity(
+                            attested_tee.verified_launch_identity().as_ref(),
+                        ) =>
                     {
                         // A terminal diagnostic read over this attested,
                         // SPKI-pinned channel outranks a reachable challenge

@@ -104,10 +104,11 @@ for the core manual deploy path.
 
 An interrupted first template deployment can be retried with the same command.
 For CAP's single-replica automatic rollouts, applying changed init data replaces
-only an unready Pod owned by that StatefulSet and still using the old init data.
-Deletion is UID-preconditioned and graceful; PVCs are retained. The template CLI
-waits for the signed deployment's attested launch identity before claiming it,
-rather than claiming an older guest that is still serving during the rollout.
+only an unready Pod owned by a ledger-recorded StatefulSet and still using the
+old init data. Deletion checks the live StatefulSet generation and the Pod UID
+and resource version, retains PVCs, and uses normal graceful termination.
+The CLI requires the signed deployment's attested launch identity both while
+waiting for bootstrap and on the client that submits the ownership claim.
 
 ## Local Development
 
