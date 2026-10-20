@@ -133,32 +133,47 @@ pub async fn run(cmd: ConfigCommand) -> Result<(), Box<dyn std::error::Error>> {
             // retries the TEE delete.
             api.delete_config_meta(&app_name, &key).await?;
 
-            let app_info = api.get_app(&app_name).await?;
+            // Every remaining step reads or mutates the TEE. Any failure in
+            // the phase leaves the partial state (store unset, delivered copy
+            // possibly still in place) — so the whole phase reports it, not
+            // just the final TEE delete.
+            let tee_phase: Result<(), Box<dyn std::error::Error>> = async {
+                let app_info = api.get_app(&app_name).await?;
 
-            let token_resp = api.get_config_token(&app_name).await?;
+                let token_resp = api.get_config_token(&app_name).await?;
 
-            let tee = token_resp
-                .tee_url
-                .as_deref()
-                .map(|tee_url| {
-                    TeeClient::from_config_url_with_resolve_ip(tee_url, token_resp.tee_resolve_ip)
-                })
-                .unwrap_or_else(|| {
-                    let tee_domain = app_info.tee_domain.as_deref().unwrap_or(&app_info.domain);
-                    TeeClient::new_with_resolve_ip(tee_domain, token_resp.tee_resolve_ip)
-                });
-            let (_attestation, tee) = tee.attest_receipt_key().await?;
-            if let Err(error) = tee.config_unset(&key, &token_resp.token).await {
-                // The store is already unset; the guest may keep using the
-                // delivered copy until this succeeds. Fail toward availability
-                // with the state spelled out: the command exits non-zero and a
-                // retry completes the guest-side removal.
+                let tee = token_resp
+                    .tee_url
+                    .as_deref()
+                    .map(|tee_url| {
+                        TeeClient::from_config_url_with_resolve_ip(
+                            tee_url,
+                            token_resp.tee_resolve_ip,
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        let tee_domain = app_info.tee_domain.as_deref().unwrap_or(&app_info.domain);
+                        TeeClient::new_with_resolve_ip(tee_domain, token_resp.tee_resolve_ip)
+                    });
+                let (_attestation, tee) = tee.attest_receipt_key().await?;
+                tee.config_unset(&key, &token_resp.token).await?;
+                Ok(())
+            }
+            .await;
+            if let Err(error) = tee_phase {
+                // The store is already unset; the guest may keep the delivered
+                // copy until this succeeds. Fail toward availability with the
+                // state spelled out: the command exits non-zero and the
+                // suggested retry completes the TEE-side removal. A running
+                // workload keeps its already-consumed value until restart —
+                // removing the stored key never revokes it from the process.
                 eprintln!(
-                    "Warning: {key} was removed from the config store, but the TEE could not \
-                     be reached to remove the delivered copy ({error}). The app may keep \
-                     using the old value until `config unset {key}` succeeds."
+                    "Warning: {key} was removed from the config store for app \
+                     {app_name}, but the TEE copy could not be removed ({error}). Retry with \
+                     `config unset {key} --app {app_name}` to complete the removal; a running \
+                     workload keeps using its already-consumed value until it restarts."
                 );
-                return Err(error.into());
+                return Err(error);
             }
             // The key is removed from the TEE store from here on; emit the
             // application note before any later step can fail the command.
