@@ -1329,14 +1329,6 @@ const PULL_SECRET_DELETION_POLL_DEADLINE: std::time::Duration = std::time::Durat
 const PULL_SECRET_NAMESPACE_RECONCILE_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(180);
 
-/// The absence probe's own share of that budget. The probe runs UNDER the
-/// shared mutation guard (review on #306, round 2), so a stalled GET must
-/// not hold the guard — and thereby block a newer replica's exclusive
-/// authority publication — for a full budget (Devin review on #306, round
-/// 3). A stalled probe surrenders after this slice and falls through to the
-/// budgeted reconcile, which degrades to pre-skip behavior for that cycle.
-const NAMESPACE_ABSENCE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
 /// The mutation generation a live Secret carries, if any (`None` covers both
 /// unannotated legacy secrets and unparsable annotation values).
 fn secret_mutation_generation(secret: &Secret) -> Option<i64> {
@@ -3870,8 +3862,8 @@ async fn cleanup_stale_tenant_image_pull_secrets(pool: &PgPool) -> Result<bool, 
         // the rechecks stick for the skip path (see its comment). Nothing
         // to clean in an absent namespace, and the per-deploy cleanup gates
         // whatever deploy later creates it.
-        // One shared deadline per namespace covers the mutation guard, the
-        // probe, and the reconcile (codex review on #306): a stalled step
+        // One shared deadline per namespace covers the probe, the mutation
+        // guard, and the reconcile (codex review on #306): a stalled step
         // must not buy a second full window — once the budget is spent the
         // remaining steps time out immediately, the namespace reports
         // unconverged for this pass, and the next sweep cycle retries it.
@@ -3880,15 +3872,22 @@ async fn cleanup_stale_tenant_image_pull_secrets(pool: &PgPool) -> Result<bool, 
             PULL_SECRET_NAMESPACE_RECONCILE_TIMEOUT
                 .saturating_sub(namespace_deadline_started.elapsed())
         };
-        // Acquire the shared mutation guard BEFORE accepting absence
-        // (codex review on #306, round 2): the guard's advisory lock is the
-        // authority fence — an epoch transition takes the exclusive side
-        // first, so it cannot complete while the guard is held, and the
-        // guard re-reads the fleet epochs under that lock and defers a
-        // stale replica. Probing before the guard left a window for a newer
-        // replica to raise the fleet epoch mid-probe (after the recheck
-        // above) and the 404's skip to converge a stale sweep and open its
-        // admission; a 404 observed UNDER the guard is conclusive.
+        // Probe BEFORE taking the guard — it is a read-only GET that needs
+        // no mutation fence, and running it under the guard held the shared
+        // advisory lock across a network op (Devin review on #306, rounds
+        // 3–4: a stalled or merely slow GET then either blocked a newer
+        // replica's exclusive authority publication or surrendered too
+        // early and resurrected the admission wedge on slow API servers).
+        // Absence is only ACCEPTED afterwards, under the guard: its epoch
+        // read under the shared advisory lock is the authority fence (codex
+        // review on #306, round 2) — a fleet epoch raised before the guard
+        // is caught there and defers this stale replica, and none can be
+        // raised between that read and the skip because the exclusive side
+        // waits on our shared hold. An in-flight, not-yet-published raise
+        // matches present-namespace mid-pass semantics: the next sweep's
+        // start-of-sweep authority read defers the whole pass.
+        let namespace_is_absent =
+            namespace_absent(&engine, namespace, remaining_namespace_budget()).await;
         let _mutation_guard = match tokio::time::timeout(
             remaining_namespace_budget(),
             pull_secret_mutation_guard(pool),
@@ -3901,13 +3900,7 @@ async fn cleanup_stale_tenant_image_pull_secrets(pool: &PgPool) -> Result<bool, 
                 continue;
             }
         };
-        if namespace_absent(
-            &engine,
-            namespace,
-            remaining_namespace_budget().min(NAMESPACE_ABSENCE_PROBE_TIMEOUT),
-        )
-        .await
-        {
+        if namespace_is_absent {
             tracing::info!(
                 %namespace,
                 "tenant image pull secret cleanup sweep: namespace does not exist — \
