@@ -1329,6 +1329,14 @@ const PULL_SECRET_DELETION_POLL_DEADLINE: std::time::Duration = std::time::Durat
 const PULL_SECRET_NAMESPACE_RECONCILE_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(180);
 
+/// The absence probe's own share of that budget. The probe runs UNDER the
+/// shared mutation guard (review on #306, round 2), so a stalled GET must
+/// not hold the guard — and thereby block a newer replica's exclusive
+/// authority publication — for a full budget (Devin review on #306, round
+/// 3). A stalled probe surrenders after this slice and falls through to the
+/// budgeted reconcile, which degrades to pre-skip behavior for that cycle.
+const NAMESPACE_ABSENCE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// The mutation generation a live Secret carries, if any (`None` covers both
 /// unannotated legacy secrets and unparsable annotation values).
 fn secret_mutation_generation(secret: &Secret) -> Option<i64> {
@@ -3893,7 +3901,13 @@ async fn cleanup_stale_tenant_image_pull_secrets(pool: &PgPool) -> Result<bool, 
                 continue;
             }
         };
-        if namespace_absent(&engine, namespace, remaining_namespace_budget()).await {
+        if namespace_absent(
+            &engine,
+            namespace,
+            remaining_namespace_budget().min(NAMESPACE_ABSENCE_PROBE_TIMEOUT),
+        )
+        .await
+        {
             tracing::info!(
                 %namespace,
                 "tenant image pull secret cleanup sweep: namespace does not exist — \
