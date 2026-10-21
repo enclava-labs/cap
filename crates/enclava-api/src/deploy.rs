@@ -3858,11 +3858,12 @@ async fn cleanup_stale_tenant_image_pull_secrets(pool: &PgPool) -> Result<bool, 
         }
         // Authority rechecks above stay in force for absent namespaces too
         // (review on #306): a stale replica must still defer when a newer
-        // epoch was raised mid-sweep. Only then is the namespace's absence
-        // conclusive — nothing to clean, and the per-deploy cleanup gates
+        // epoch was raised mid-sweep — and the guard below is what makes
+        // the rechecks stick for the skip path (see its comment). Nothing
+        // to clean in an absent namespace, and the per-deploy cleanup gates
         // whatever deploy later creates it.
-        // One shared deadline per namespace covers the probe, the mutation
-        // guard, and the reconcile (codex review on #306): a stalled probe
+        // One shared deadline per namespace covers the mutation guard, the
+        // probe, and the reconcile (codex review on #306): a stalled step
         // must not buy a second full window — once the budget is spent the
         // remaining steps time out immediately, the namespace reports
         // unconverged for this pass, and the next sweep cycle retries it.
@@ -3871,14 +3872,15 @@ async fn cleanup_stale_tenant_image_pull_secrets(pool: &PgPool) -> Result<bool, 
             PULL_SECRET_NAMESPACE_RECONCILE_TIMEOUT
                 .saturating_sub(namespace_deadline_started.elapsed())
         };
-        if namespace_absent(&engine, namespace, remaining_namespace_budget()).await {
-            tracing::info!(
-                %namespace,
-                "tenant image pull secret cleanup sweep: namespace does not exist — \
-                 skipping (no stale secret can live there)"
-            );
-            continue;
-        }
+        // Acquire the shared mutation guard BEFORE accepting absence
+        // (codex review on #306, round 2): the guard's advisory lock is the
+        // authority fence — an epoch transition takes the exclusive side
+        // first, so it cannot complete while the guard is held, and the
+        // guard re-reads the fleet epochs under that lock and defers a
+        // stale replica. Probing before the guard left a window for a newer
+        // replica to raise the fleet epoch mid-probe (after the recheck
+        // above) and the 404's skip to converge a stale sweep and open its
+        // admission; a 404 observed UNDER the guard is conclusive.
         let _mutation_guard = match tokio::time::timeout(
             remaining_namespace_budget(),
             pull_secret_mutation_guard(pool),
@@ -3891,6 +3893,14 @@ async fn cleanup_stale_tenant_image_pull_secrets(pool: &PgPool) -> Result<bool, 
                 continue;
             }
         };
+        if namespace_absent(&engine, namespace, remaining_namespace_budget()).await {
+            tracing::info!(
+                %namespace,
+                "tenant image pull secret cleanup sweep: namespace does not exist — \
+                 skipping (no stale secret can live there)"
+            );
+            continue;
+        }
         let (namespace_generation, lease_held) =
             lease_rows.get(namespace).copied().unwrap_or((0, false));
         match sweep_namespace_with_budget(
