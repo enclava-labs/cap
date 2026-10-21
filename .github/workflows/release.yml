@@ -163,7 +163,10 @@ jobs:
           targets: wasm32-unknown-unknown
 
       - name: Install matching wasm-bindgen CLI
-        run: cargo install wasm-bindgen-cli --version 0.2.118 --locked
+        uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2
+        with:
+          tool: wasm-bindgen-cli@0.2.118
+          fallback: none
 
       - name: Build deterministic web release
         run: ./web/verifier/build.sh

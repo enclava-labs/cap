@@ -406,11 +406,29 @@ renders the exact signed bytes, so the workload boots exactly as it did
 before the upgrade. No workload-artifact re-signing is required before
 rollout; re-deploying (re-signing) an app moves it to the split layout. The
 same render-pin mechanism covers artifacts signed before the
-`log_encryption_json` claim existed (`omit_log_encryption_claim`). The
-production platform-release envelope is the exception: the new
+`log_encryption_json` claim existed (`omit_log_encryption_claim`), before
+the `luks2_header_seal` claim existed (`omit_luks2_header_seal_claim`), and
+before the `log_spool_storage` claim existed (`omit_log_spool_bind_claim`).
+The production platform-release envelope is the exception: the new
 `platform_trustee_policy_pubkey_hex` field is required with no default, so
 re-sign the production envelope with a distinct trustee key before
 deploying this binary — an old envelope will not load.
+
+The `log_spool_storage` claim is gated by the API deployment, not the
+signed release (cap#290 review), and enablement is two-phase — never flip
+the gate in the same step that first ships the bind-capable init:
+
+1. Deploy the API with the new `ENCLAVA_INIT_IMAGE` pin and
+   `ENCLAVA_LOG_SPOOL_STORAGE` **unset**. Renders stay claim-less.
+2. Redeploy a workload and verify the bind-capable init digest is the one
+   actually running in its live manifest/pod (`imageID`), per the
+   init-first rule above.
+3. Only then set `ENCLAVA_LOG_SPOOL_STORAGE="state-bind-v1"` on
+   enclava-api and restart it. From that point the API reports the
+   capability in deployment-context, signers render the claim, and every
+   workload the API renders carries the verified init pin.
+
+Until phase 3, claim-bearing artifacts are rejected for re-signing.
 
 ### Rotating the production root
 

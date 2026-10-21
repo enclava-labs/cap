@@ -11,6 +11,12 @@ use crate::state::AppState;
 pub struct DeploymentContextResponse {
     pub api_signing_pubkey: String,
     pub tls_certificate_broker_url: Option<String>,
+    /// Whether this API's deployed enclava-init performs the log-spool
+    /// state-PVC bind (cap#290 review): the API installs the gate from
+    /// `ENCLAVA_LOG_SPOOL_STORAGE` at startup, so an absent or false flag
+    /// tells signers to render claim-less cc_init_data. Deployment-context
+    /// JSON tolerates unknown fields, so older CLIs ignore it.
+    pub log_spool_state_bind_supported: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_platform_release_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -34,6 +40,8 @@ pub(crate) fn deployment_context_response(state: &AppState) -> DeploymentContext
             .attestation
             .as_ref()
             .and_then(|cfg| cfg.tls_certificate_broker_url.clone()),
+        log_spool_state_bind_supported:
+            enclava_engine::manifest::cc_init_data::log_spool_bind_supported(),
         current_platform_release_id: state
             .platform_release_envelope
             .as_ref()
@@ -79,6 +87,11 @@ mod tests {
         );
         assert_eq!(response.current_platform_release_id, None);
         assert!(response.platform_release_envelope.is_none());
+        assert_eq!(
+            response.log_spool_state_bind_supported,
+            enclava_engine::manifest::cc_init_data::log_spool_bind_supported(),
+            "the deployment-context gate must mirror the API's installed claim"
+        );
     }
 
     #[tokio::test]

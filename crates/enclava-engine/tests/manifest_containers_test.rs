@@ -9,7 +9,34 @@ use enclava_engine::manifest::containers::{
 };
 use enclava_engine::manifest::volumes::build_volumes;
 use enclava_engine::testutil::{sample_app, sample_password_app};
-use enclava_engine::types::{CaddyTlsMode, WorkloadSecurityProfile};
+use enclava_engine::types::{
+    CaddyTlsMode, GeneratedAgentPolicy, LogEncryptionConfig, WorkloadSecurityProfile,
+};
+use sha2::{Digest, Sha256};
+
+const V2_LAYOUT_MARKER: &str = "# enclava-cap-volume-layout: guest-memory-v2\n";
+
+fn v2_app() -> enclava_engine::types::ConfidentialApp {
+    let mut app = sample_app();
+    let policy_text = format!("{V2_LAYOUT_MARKER}package agent_policy\n");
+    app.generated_agent_policy = Some(GeneratedAgentPolicy {
+        policy_sha256: Sha256::digest(policy_text.as_bytes()).into(),
+        policy_text,
+        genpolicy_version_pin: "kata-containers/genpolicy@3.28.0+test".to_string(),
+    });
+    app
+}
+
+fn v2_app_with_logs() -> enclava_engine::types::ConfidentialApp {
+    let mut app = v2_app();
+    app.log_encryption = Some(LogEncryptionConfig {
+        algorithm: "x25519-hpke-v1".to_string(),
+        key_id: "logs-prod".to_string(),
+        public_key_base64url: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+        public_key_sha256: "sha256:Zmh6rfhivXdsj8GLjp-OIAiXFIVu4jOzkCpZHQ1fKSU".to_string(),
+    });
+    app
+}
 
 // === App container (Phase 5 default) ===
 
@@ -825,7 +852,7 @@ fn enclava_init_container_has_memory_for_unlock_verification_and_certificate_pro
 
 #[test]
 fn enclava_tools_init_container_has_resources_for_tenant_quota() {
-    let c = build_enclava_tools_init_container();
+    let c = build_enclava_tools_init_container(true);
     let resources = c.resources.as_ref().unwrap();
     let requests = resources.requests.as_ref().unwrap();
     let limits = resources.limits.as_ref().unwrap();
@@ -838,7 +865,7 @@ fn enclava_tools_init_container_has_resources_for_tenant_quota() {
 
 #[test]
 fn enclava_tools_init_container_prepares_group_restricted_wait_handoff() {
-    let c = build_enclava_tools_init_container();
+    let c = build_enclava_tools_init_container(true);
     let command = c.command.as_ref().unwrap().join(" ");
     assert!(command.contains("install -d -m 02770 -o 0 -g 10001 /run/enclava/containers"));
     assert!(command.contains("printf 'not-ready\\n' > /run/enclava/init-ready"));
@@ -848,6 +875,85 @@ fn enclava_tools_init_container_prepares_group_restricted_wait_handoff() {
             .iter()
             .any(|m| m.name == "unlock-socket" && m.mount_path == "/run/enclava")
     );
+}
+
+// === cap#289: guest-memory-v2 log spool layout ===
+
+#[test]
+fn enclava_tools_init_container_omits_log_spool_when_include_logs_false() {
+    let c = build_enclava_tools_init_container(false);
+    let command = c.command.as_ref().unwrap().join(" ");
+    assert!(!command.contains("/run/enclava-logs"));
+    assert!(command.contains("install -d -m 02770 -o 0 -g 10001 /run/enclava/containers"));
+    assert!(command.contains("printf 'not-ready\\n' > /run/enclava/init-ready"));
+    let mounts = c.volume_mounts.as_ref().unwrap();
+    assert!(mounts.iter().all(|m| m.name != "logs"));
+}
+
+#[test]
+fn v2_layout_with_log_encryption_binds_spool_through_both_containers() {
+    let app = v2_app_with_logs();
+
+    // The "logs" volume survives only as a small Memory mountpoint that
+    // enclava-init re-binds onto the encrypted state PVC.
+    let vols = build_volumes(&app);
+    let logs = vols.iter().find(|v| v.name == "logs").unwrap();
+    let ed = logs.empty_dir.as_ref().unwrap();
+    assert_eq!(ed.medium.as_deref(), Some("Memory"));
+    assert_eq!(ed.size_limit.as_ref().map(|q| q.0.as_str()), Some("1Mi"));
+
+    let app_c = build_app_container(&app);
+    let app_logs = app_c
+        .volume_mounts
+        .as_ref()
+        .unwrap()
+        .iter()
+        .find(|m| m.name == "logs")
+        .unwrap();
+    assert_eq!(
+        app_logs.mount_propagation.as_deref(),
+        Some("HostToContainer")
+    );
+
+    let init_c = build_enclava_init_container(&app);
+    let init_logs = init_c
+        .volume_mounts
+        .as_ref()
+        .unwrap()
+        .iter()
+        .find(|m| m.name == "logs")
+        .unwrap();
+    assert_eq!(
+        init_logs.mount_propagation.as_deref(),
+        Some("Bidirectional")
+    );
+}
+
+#[test]
+fn legacy_log_mounts_have_no_propagation() {
+    let mut app = sample_app();
+    app.log_encryption = Some(LogEncryptionConfig {
+        algorithm: "x25519-hpke-v1".to_string(),
+        key_id: "logs-prod".to_string(),
+        public_key_base64url: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+        public_key_sha256: "sha256:Zmh6rfhivXdsj8GLjp-OIAiXFIVu4jOzkCpZHQ1fKSU".to_string(),
+    });
+    for c in [
+        build_app_container(&app),
+        build_enclava_init_container(&app),
+    ] {
+        let m = c
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|m| m.name == "logs")
+            .unwrap();
+        assert!(
+            m.mount_propagation.is_none(),
+            "non-v2 layouts keep the plain disk-backed logs mount"
+        );
+    }
 }
 
 #[test]

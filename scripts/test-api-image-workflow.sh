@@ -535,4 +535,30 @@ jobs:
 guard_must_be_clean anchor_in_quoted
 rm -rf "$guard_tmp"
 
+python3 - "$WORKFLOW" <<'PYTAGS'
+import os
+import subprocess
+import sys
+import yaml
+
+steps = {
+    step.get("name"): step
+    for step in yaml.safe_load(open(sys.argv[1]))["jobs"]["publish"]["steps"]
+}
+cases = [
+    ("Validate manual image tag", "VERSION_TAG", "manual-" + "a" * 120, True),
+    ("Validate pushed tag name", "PUSHED_REF", "refs/tags/v" + "a" * 127, True),
+    ("Validate pushed tag name", "PUSHED_REF", "refs/tags/v" + "a" * 128, False),
+]
+for name, variable, value, accepted in cases:
+    result = subprocess.run(
+        ["bash", "-e", "-c", steps[name]["run"]],
+        env={**os.environ, variable: value},
+        capture_output=True,
+        text=True,
+    )
+    if (result.returncode == 0) != accepted:
+        raise SystemExit(f"{name}: wrong acceptance for value length {len(value)}")
+PYTAGS
+
 echo "CAP API image workflow tests passed"

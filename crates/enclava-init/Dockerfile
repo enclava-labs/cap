@@ -39,7 +39,7 @@ RUN if [ "${BUILD_PROFILE}" = "release" ]; then \
       exit 1; \
     fi
 
-FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251
+FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8
 
 # cap#242: cryptsetup >= 2.8.1 floor (null keyslot ciphers rejected for
 # nonempty passwords). Debian bookworm ships 2.6.x and the trixie/sid debs
