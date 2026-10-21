@@ -13,7 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
-enclava-common = { workspace = true, features = ["outbound-http"] }
+enclava-common = { workspace = true, features = ["outbound-http", "release-profiles"] }
 enclava-verifier = { path = "../enclava-verifier" }
 enclava-engine = { path = "../enclava-engine" }
 tokio = { workspace = true }
@@ -67,7 +67,7 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [features]
-prod-strict = []
+prod-strict = ["enclava-common/prod-strict"]
 
 [dev-dependencies]
 enclava-engine = { path = "../enclava-engine", features = ["testutil"] }

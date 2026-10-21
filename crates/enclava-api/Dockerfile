@@ -23,17 +23,8 @@ COPY vendor/ vendor/
 RUN cargo chef cook --locked --bin enclava-api --bin cap-migrate
 
 FROM debug-dependencies AS debug-builder
-ARG ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX
-ENV ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX=${ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX}
-RUN test -n "$ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX" || (echo "ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX must be provided as a build-arg" >&2; exit 1)
-
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
-COPY scripts/require-platform-release-root.sh scripts/require-platform-release-root.sh
-
-# Debug images may pin the dev fixture root only while the bundled envelope
-# is fixture-signed; the root must still match that envelope.
-RUN bash scripts/require-platform-release-root.sh --allow-dev-fixture
 RUN printf "%s  crates/enclava-api/trust-roots/sigstore-public-good-1.root.json\n" \
       6494e21ea73fa7ee769f85f57d5a3e6a08725eae1e38c755fc3517c9e6bc0b66 \
       | sha256sum -c >/dev/null
@@ -42,7 +33,7 @@ RUN cargo build --locked --bin enclava-api --bin cap-migrate && \
     cp /build/target/debug/enclava-api /usr/local/bin/enclava-api && \
     cp /build/target/debug/cap-migrate /usr/local/bin/cap-migrate
 
-FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS runtime-debug
+FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8 AS runtime-debug
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates tzdata wget libssl3 && \
@@ -84,32 +75,21 @@ RUN cargo chef cook --locked --release -p enclava-cli --examples && \
     cargo chef cook --locked --release --bin enclava-api --bin cap-migrate --features prod-strict
 
 FROM release-dependencies AS release-builder
-ARG ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX
-ENV ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX=${ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX}
-RUN test -n "$ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX" || (echo "ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX must be provided as a build-arg" >&2; exit 1)
-
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
-COPY scripts/require-platform-release-root.sh scripts/require-platform-release-root.sh
-
-# Released images must pin a production root that matches the bundled
-# envelope; the fixture root is rejected unconditionally here.
-RUN bash scripts/require-platform-release-root.sh
 RUN printf "%s  crates/enclava-api/trust-roots/sigstore-public-good-1.root.json\n" \
       6494e21ea73fa7ee769f85f57d5a3e6a08725eae1e38c755fc3517c9e6bc0b66 \
       | sha256sum -c >/dev/null
 
-# The bundled signed envelope is only a downgrade floor. Pre-trustee bytes
-# remain valid for this floor, never for the mounted runtime release.
-RUN cargo run --locked --release -p enclava-cli --example platform-release -- verify-baseline \
-    crates/enclava-cli/platform-release.json "$ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX"
+RUN cargo run --locked --release -p enclava-cli --example platform-release -- verify-profiles \
+    crates/enclava-common/platform-release-profiles.json
 
 RUN cargo build --locked --release --bin enclava-api --bin cap-migrate --features prod-strict && \
     cp /build/target/release/enclava-api /usr/local/bin/enclava-api && \
     cp /build/target/release/cap-migrate /usr/local/bin/cap-migrate && \
     strip /usr/local/bin/enclava-api /usr/local/bin/cap-migrate
 
-FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc AS runtime-release
+FROM alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6 AS runtime-release
 
 RUN apk add --no-cache ca-certificates tzdata wget && \
     addgroup -g 1000 enclava && \

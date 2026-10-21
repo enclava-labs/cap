@@ -216,7 +216,7 @@ Release builds also require:
 | --- | --- |
 | `API_KEY_HMAC_PEPPER` or `API_KEY_HMAC_PEPPER_BASE64` | Pepper for HMAC-format API keys. Must be at least 32 bytes. |
 | `TRUSTEE_POLICY_READ_AVAILABLE=true` | Enables the supported signed-policy and in-TEE verification path. |
-| `ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX` | Compile-time root public key used to verify the bundled or supplied platform release. |
+| `ENCLAVA_PLATFORM_RELEASE_PROFILE` | Required API runtime profile: `dev`, `preprod`, or `production`. Must match the `API_URL` origin. |
 
 For production deploys with policy-read mode enabled:
 
@@ -343,13 +343,24 @@ does not provide response-loss recovery either.
 
 ## Platform Release
 
-The API and CLI load the bundled
-`crates/enclava-cli/platform-release.json` unless
-`ENCLAVA_PLATFORM_RELEASE_PATH` points at another signed release envelope.
+API and CLI images embed the same
+`crates/enclava-common/platform-release-profiles.json` bundle. It contains
+exactly `dev`, `preprod`, and `production`, each with `api_origins`,
+`root_pubkey_hex`, and a signed `baseline` envelope. The CLI selects the profile
+from the configured API origin, never from a server-supplied root. The API
+requires `ENCLAVA_PLATFORM_RELEASE_PROFILE` and a matching `API_URL`.
+Unknown origins, missing/unknown production profiles, and credential-bearing
+URLs fail closed.
+
+`ENCLAVA_PLATFORM_RELEASE_PATH` still selects an environment-owned signed runtime
+envelope. Without it, the selected profile's baseline is loaded. The committed
+bundle uses public test keys; release builds and publication reject it.
 
 Release verification checks:
 
-- envelope signature against `ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX`;
+- envelope signature against the selected profile's compiled root;
+- signing-service key and Trustee CA equal the selected baseline's installation
+  identity, including when environments share a release root;
 - `platform_trustee_policy_pubkey_hex` is present and distinct from
   `signing_service_pubkey_hex` (the in-TEE policy authority and the
   off-cluster signing service are separate trust domains);
@@ -359,8 +370,8 @@ Release verification checks:
 - genpolicy version;
 - policy template hash;
 - runtime class expected by the engine;
-- API overrides must not predate the binary's bundled release; equal timestamps
-  with different signed payloads are rejected.
+- API envelopes and CLI file overrides must not predate the selected profile's
+  baseline; equal timestamps with different signed payloads are rejected.
 
 The API compares overrides only with its compiled bundle. Accepting a newer
 override does not change that minimum: a previous signed override can be
@@ -370,6 +381,13 @@ migration, persistent release state, or replica-termination watchdog.
 Existing database-schema compatibility and CLI per-API release-history checks
 still apply; this is not a guarantee that any older API image or client will
 accept a rollback.
+
+API-served CLI releases may predate the compiled baseline for that installation;
+the existing persisted per-API history remains their rollback floor. Updating
+one environment's runtime envelope does not change another profile's floor.
+Changing a signing-service key or Trustee CA requires a reviewed common profile
+bundle and new common artifacts; another environment's signed envelope is not
+an authorized identity rotation.
 
 When the signed release supplies a value, an explicit environment override must
 match it exactly or startup fails.
@@ -414,11 +432,11 @@ Until phase 3, claim-bearing artifacts are rejected for re-signing.
 
 ### Rotating the production root
 
-The committed `platform-release.json` is signed by a well-known dev fixture
-root whose seed is public. Publishing requires a production root held outside
-this repository; gates reject the fixture root and any root that does not sign
-the envelope the build bundles, so the root and the envelope always rotate
-together:
+The committed profile bundle uses a well-known public fixture root. Publishing
+requires one approved bundle containing all three installations' public roots,
+signed baselines and API origins. Existing installations keep their authorities;
+do not generate new keys merely to adopt shared images. For an explicitly
+approved root rotation:
 
 1. Generate the production root offline:
    `openssl genpkey -algorithm ed25519 -out root.pem`
@@ -440,15 +458,23 @@ together:
    payload.json < root-seed.hex > platform-release.json`
 4. Sanity-check it: `cargo run --locked -p enclava-cli --example \
    platform-release -- verify platform-release.json <root-pubkey-hex>`
-5. Set both repository secrets in one sitting:
-   `ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX` (pubkey hex) and
-   `ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON` (the signed envelope contents).
+5. Update the affected profile's public root and signed baseline in the common
+   bundle, retaining the other two profiles. Verify every profile:
 
-Release workflows materialize the envelope secret over
-`crates/enclava-cli/platform-release.json` before building, verify its full
-signature against the pinned root, and embed it in every published binary and
-image. With only one of the two secrets set (or neither), publishing fails
-closed.
+   ```console
+   cargo run --locked -p enclava-cli --example platform-release -- \
+     verify-profiles crates/enclava-common/platform-release-profiles.json
+   ```
+
+6. Set the single repository secret `ENCLAVA_PLATFORM_RELEASE_PROFILES_JSON`
+   to that complete public bundle. It must contain no private keys.
+
+Release workflows materialize this same bundle before building API, migration
+and CLI artifacts. The helper verifies every baseline's canonical signature;
+`prod-strict` rejects missing profiles, malformed roots and the fixture root.
+Promote the resulting digest unchanged between environments. Runtime profile,
+domains, measurements, signed overrides and credentials remain deployment data.
+This supports the three managed environments, not arbitrary-domain installation.
 
 ## Images
 
@@ -461,27 +487,6 @@ and manual dispatches. For non-PR events it also uploads an
 - `enclava-api-deploy.yaml` rendered from `deploy/api`.
 
 Deploy the digest reference from that artifact, not a mutable tag.
-
-For preprod's separate release root, configure the GitHub `preprod`
-environment with its existing `ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX`
-and `ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON` values. Restrict that
-environment to the reviewed `main` branch, then publish explicitly:
-
-```bash
-gh workflow run api-image.yml --repo enclava-labs/cap --ref main \
-  -f release_environment=preprod -f version_tag=manual-preprod-release
-```
-
-The `default` environment inherits the repository secrets used by ordinary
-pushes, tags and dispatches. Preprod prefixes every API and appraiser tag with
-`preprod-`, including supplied manual tags, and uses a separate concurrency
-lane; it replaces neither default tags nor repository-wide secrets. Record the
-manual build's `workflow_dispatch` trigger when selecting its signed digest in ops. Before
-deployment, verify that the image accepts preprod's existing signed envelope;
-do not rotate cluster trust to accommodate an image built for another root.
-
-Preprod manual tag inputs may contain at most 120 characters, including
-`manual-`, so the added namespace stays within Docker's 128-character limit.
 
 ## Kubernetes
 

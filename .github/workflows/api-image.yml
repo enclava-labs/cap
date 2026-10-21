@@ -7,7 +7,6 @@ on:
     paths:
       - ".github/workflows/api-image.yml"
       - "scripts/render-api-release-manifest.sh"
-      - "scripts/require-platform-release-root.sh"
       - "scripts/install-cargo-chef.sh"
       - "scripts/test-api-image-workflow.sh"
       - "scripts/test-verify-api-image-ref.sh"
@@ -30,7 +29,6 @@ on:
     paths:
       - ".github/workflows/api-image.yml"
       - "scripts/render-api-release-manifest.sh"
-      - "scripts/require-platform-release-root.sh"
       - "scripts/install-cargo-chef.sh"
       - "scripts/test-api-image-workflow.sh"
       - "scripts/test-verify-api-image-ref.sh"
@@ -55,17 +53,9 @@ on:
         description: "Optional additional image tag. Manual tags must start with manual-."
         required: false
         type: string
-      release_environment:
-        description: "Release-root secret scope for a manual build"
-        required: false
-        type: choice
-        default: default
-        options:
-          - default
-          - preprod
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ inputs.release_environment == 'preprod' && 'preprod' || 'default' }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -133,7 +123,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
 
-      # Test-only well-known fixture; never a Dockerfile default. PR validation only.
+      # The committed profile bundle is only for non-publishing debug builds.
       - name: Build image
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
@@ -142,8 +132,6 @@ jobs:
           target: runtime-debug
           push: false
           provenance: false
-          build-args: |
-            ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX=5b9437adeaffbe8f41b13d96ed49d2f51cd6c266cd8ecc284b0552ec4912b8dd
           cache-from: type=gha,scope=api-debug
           cache-to: type=gha,mode=max,scope=api-debug
 
@@ -161,9 +149,6 @@ jobs:
     name: Publish signed API image
     if: github.event_name == 'workflow_dispatch' || (github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref_type == 'tag'))
     runs-on: ubuntu-latest
-    environment: ${{ inputs.release_environment == 'preprod' && 'preprod' || 'default' }}
-    env:
-      IMAGE_TAG_PREFIX: ${{ inputs.release_environment == 'preprod' && 'preprod-' || '' }}
     permissions:
       contents: read
       id-token: write
@@ -201,8 +186,8 @@ jobs:
             echo "::error::Manual image tags must match ^manual-[a-z0-9][a-z0-9_.-]{0,119}$."
             exit 1
           fi
-          if (( ${#IMAGE_TAG_PREFIX} + ${#VERSION_TAG} > 128 )); then
-            echo "::error::Manual image tag exceeds Docker's 128-character limit after the environment prefix."
+          if (( ${#VERSION_TAG} > 128 )); then
+            echo "::error::Manual image tag exceeds Docker's 128-character limit."
             exit 1
           fi
 
@@ -222,8 +207,8 @@ jobs:
             exit 1
           fi
           image_tag="${PUSHED_REF#refs/tags/}"
-          if (( ${#IMAGE_TAG_PREFIX} + ${#image_tag} > 128 )); then
-            echo "::error::Pushed image tag exceeds Docker's 128-character limit after the environment prefix."
+          if (( ${#image_tag} > 128 )); then
+            echo "::error::Pushed image tag exceeds Docker's 128-character limit."
             exit 1
           fi
 
@@ -239,25 +224,18 @@ jobs:
         uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
         with:
           images: ghcr.io/enclava-labs/enclava-api
-          flavor: prefix=${{ env.IMAGE_TAG_PREFIX }},onlatest=true
           tags: |
             type=ref,event=branch
             type=ref,event=tag
-            type=sha,prefix=${{ env.IMAGE_TAG_PREFIX }}
+            type=sha,prefix=
             type=raw,value=${{ github.event.inputs.version_tag }},enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version_tag != '' }}
 
-      - name: Materialize production platform-release envelope
+      - name: Materialize common platform-release profiles
         env:
-          ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON: ${{ secrets.ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON }}
+          ENCLAVA_PLATFORM_RELEASE_PROFILES_JSON: ${{ secrets.ENCLAVA_PLATFORM_RELEASE_PROFILES_JSON }}
         run: |
-          if [[ -n "$ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON" ]]; then
-            printf '%s' "$ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON" > crates/enclava-cli/platform-release.json
-          fi
-
-      - name: Require platform-release root
-        env:
-          ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX: ${{ secrets.ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX }}
-        run: bash scripts/require-platform-release-root.sh
+          test -n "$ENCLAVA_PLATFORM_RELEASE_PROFILES_JSON"
+          printf '%s' "$ENCLAVA_PLATFORM_RELEASE_PROFILES_JSON" > crates/enclava-common/platform-release-profiles.json
 
       # Every pushed image is a prod-strict release build; the debug stage is
       # reserved for PR validation and local compose.
@@ -271,8 +249,6 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX=${{ secrets.ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX }}
           cache-from: type=gha,scope=api-release
           cache-to: type=gha,mode=max,scope=api-release
           provenance: true
@@ -323,9 +299,8 @@ jobs:
         uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
         with:
           images: ghcr.io/enclava-labs/enclava-appraiser
-          flavor: prefix=${{ env.IMAGE_TAG_PREFIX }},onlatest=true
           tags: |
-            type=sha,prefix=${{ env.IMAGE_TAG_PREFIX }}
+            type=sha,prefix=
             type=raw,value=${{ github.event.inputs.version_tag }},enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version_tag != '' }}
 
       - name: Build and push appraiser
