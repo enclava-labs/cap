@@ -1329,6 +1329,16 @@ const PULL_SECRET_DELETION_POLL_DEADLINE: std::time::Duration = std::time::Durat
 const PULL_SECRET_NAMESPACE_RECONCILE_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(180);
 
+/// The absence probe's cap. Grounded in the platform, not tuning: kube-apiserver's
+/// default `--request-timeout` is 60s — a namespace GET either answers within
+/// that or never (reviews on #306, rounds 4–5: an unbounded probe starves the
+/// mutation guard and reconcile when GETs stall while Secret requests stay
+/// healthy; a too-small one wedges admission on slow-but-valid 404s). At this
+/// cap every legitimately answerable 404 fits, and a stalled GET still leaves
+/// two-thirds of the namespace budget for the guard and reconcile — under
+/// which a healthy Secret API reconciles this namespace to convergence.
+const NAMESPACE_ABSENCE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// The mutation generation a live Secret carries, if any (`None` covers both
 /// unannotated legacy secrets and unparsable annotation values).
 fn secret_mutation_generation(secret: &Secret) -> Option<i64> {
@@ -3886,8 +3896,12 @@ async fn cleanup_stale_tenant_image_pull_secrets(pool: &PgPool) -> Result<bool, 
         // waits on our shared hold. An in-flight, not-yet-published raise
         // matches present-namespace mid-pass semantics: the next sweep's
         // start-of-sweep authority read defers the whole pass.
-        let namespace_is_absent =
-            namespace_absent(&engine, namespace, remaining_namespace_budget()).await;
+        let namespace_is_absent = namespace_absent(
+            &engine,
+            namespace,
+            remaining_namespace_budget().min(NAMESPACE_ABSENCE_PROBE_TIMEOUT),
+        )
+        .await;
         let _mutation_guard = match tokio::time::timeout(
             remaining_namespace_budget(),
             pull_secret_mutation_guard(pool),
