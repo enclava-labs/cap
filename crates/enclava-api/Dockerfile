@@ -42,7 +42,7 @@ RUN cargo build --locked --bin enclava-api --bin cap-migrate && \
     cp /build/target/debug/enclava-api /usr/local/bin/enclava-api && \
     cp /build/target/debug/cap-migrate /usr/local/bin/cap-migrate
 
-FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS runtime-debug
+FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8 AS runtime-debug
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates tzdata wget libssl3 && \
@@ -109,7 +109,7 @@ RUN cargo build --locked --release --bin enclava-api --bin cap-migrate --feature
     cp /build/target/release/cap-migrate /usr/local/bin/cap-migrate && \
     strip /usr/local/bin/enclava-api /usr/local/bin/cap-migrate
 
-FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc AS runtime-release
+FROM alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6 AS runtime-release
 
 RUN apk add --no-cache ca-certificates tzdata wget && \
     addgroup -g 1000 enclava && \
