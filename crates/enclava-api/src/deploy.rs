@@ -5043,10 +5043,7 @@ async fn apply_scoped_pull_secret(
             // own error (still ambiguous) takes precedence; otherwise the
             // apply's real failure reason is returned (Codex review on #280,
             // P1 "Recover ambiguous POST transport failures before returning").
-            if result.is_err()
-                && create_submitted.load(std::sync::atomic::Ordering::SeqCst)
-                && std::env::var("NP280A").is_err()
-            {
+            if result.is_err() && create_submitted.load(std::sync::atomic::Ordering::SeqCst) {
                 bounded_recover_ambiguous_pull_secret_create(
                     engine,
                     &api,
