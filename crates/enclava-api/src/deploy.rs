@@ -1378,6 +1378,33 @@ fn pull_secret_conflict_retry_delay(attempt: usize) -> std::time::Duration {
 const PULL_SECRET_DELETION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 const PULL_SECRET_DELETION_POLL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Per-apply create provenance nonce (Devin review on #280, SEC "Unproven
+/// Secret gains deletion authority"): stamped on the object BEFORE the POST,
+/// so a re-read after an ambiguous timeout can prove the object is this
+/// apply's creation. The generation markers alone are namespace-shared and
+/// predictable, so a name-race winner carrying trusted-looking metadata must
+/// never be adopted as ours — or deleted as ours.
+const PULL_SECRET_CREATE_NONCE_ANNOTATION: &str = "enclava.dev/pull-secret-create-nonce";
+
+/// How long a submitted Secret POST can still commit server-side after our
+/// client gave up: kube-apiserver's default `--request-timeout` bounds the
+/// request's execution at 60 s, so probing the name until this window closes
+/// resolves create-vs-no-create for good (Codex review on #280, P1 "Poll for
+/// the full late-commit window") instead of three immediate 404s concluding
+/// in ~2 s while the POST is still executing.
+const PULL_SECRET_CREATE_LATE_COMMIT_WINDOW: std::time::Duration =
+    std::time::Duration::from_secs(75);
+
+/// Interval between late-commit-window absence probes.
+const PULL_SECRET_CREATE_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Hard bound on the whole ambiguity recovery — probes and compensation
+/// together (Devin review on #280: a stalled DELETE or deletion poll must not
+/// hold the deploy's mutation guard and apply permit indefinitely). On
+/// overrun the caller returns the deferred error; the mutation lease's own
+/// reclaim quarantine keeps any late create fenced.
+const PULL_SECRET_CREATE_RECOVERY_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Hard bound on ONE namespace's pull-secret reconciliation (Codex review on
 /// #243, P1, follow-up "let oversized cleanup sweeps make forward progress"):
 /// the reconcile path's Kubernetes calls are not individually time-bounded
@@ -1865,14 +1892,19 @@ fn record_pull_secret_creation(
     });
 }
 
-/// Trusted creation evidence for a pull Secret this process POSTed: both
-/// generation markers match, the platform manager owns each annotation path,
-/// and the dedicated label is owned. A webhook that strips or rewrites either
-/// marker fails this check.
+/// Trusted creation evidence for a pull Secret this process POSTed: the
+/// per-apply create nonce proves the object is THIS attempt's creation (the
+/// generation markers are namespace-shared and predictable — a name-race
+/// winner carrying trusted-looking metadata must not be recorded as ours,
+/// which is what grants failed-deployment cleanup its deletion authority),
+/// both generation markers match, the platform manager owns each annotation
+/// path, and the dedicated label is owned. A webhook that strips or rewrites
+/// any of them fails this check.
 fn pull_secret_create_evidence_trusted(
     engine: &ApplyEngine,
     secret: &Secret,
     generation: i64,
+    create_nonce: &str,
 ) -> bool {
     use enclava_engine::apply::generation::{
         MUTATION_GENERATION_ANNOTATION, RESOURCE_CREATED_BY_ANNOTATION, annotation_owned_by_manager,
@@ -1885,10 +1917,22 @@ fn pull_secret_create_evidence_trusted(
         .as_ref()
         .and_then(|annotations| annotations.get(RESOURCE_CREATED_BY_ANNOTATION));
     created_by == Some(&expected)
+        && secret_create_nonce(secret) == Some(create_nonce)
         && secret_mutation_generation(secret) == Some(generation)
         && annotation_owned_by_manager(secret, RESOURCE_CREATED_BY_ANNOTATION, manager)
         && annotation_owned_by_manager(secret, MUTATION_GENERATION_ANNOTATION, manager)
         && pull_secret_label_owned(engine, secret)
+}
+
+/// The per-apply create nonce stamped on the object before the POST.
+fn secret_create_nonce(secret: &Secret) -> Option<&str> {
+    secret
+        .metadata
+        .annotations
+        .as_ref()?
+        .get(PULL_SECRET_CREATE_NONCE_ANNOTATION)
+        .map(String::as_str)
+        .filter(|value| !value.is_empty())
 }
 
 /// Re-read after an apply budget timeout that may have dropped an accepted
@@ -1904,6 +1948,7 @@ async fn recover_ambiguous_pull_secret_create(
     name: &str,
     generation: MutationGeneration,
     create_submitted: bool,
+    create_nonce: &str,
 ) -> Result<(), DeployError> {
     let deferred = || {
         DeployError::PullSecretReconcileDeferred(format!(
@@ -1914,32 +1959,89 @@ async fn recover_ambiguous_pull_secret_create(
     if !create_submitted {
         return Err(deferred());
     }
-    for attempt in 0..3 {
-        if attempt > 0 {
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    // Probe for the whole late-commit window: a 404 two seconds in proves
+    // nothing about a POST that is still executing server-side (Codex review
+    // on #280, P1 "Poll for the full late-commit window").
+    let started = tokio::time::Instant::now();
+    let mut probe = 0u32;
+    loop {
+        if probe > 0 {
+            if tokio::time::Instant::now().duration_since(started)
+                >= PULL_SECRET_CREATE_LATE_COMMIT_WINDOW
+            {
+                // The window has closed: a submitted create would be visible
+                // by now, so nothing landed and the ambiguity is resolved
+                // without recording or deleting anything.
+                return Err(deferred());
+            }
+            tokio::time::sleep(PULL_SECRET_CREATE_PROBE_INTERVAL).await;
         }
+        probe += 1;
         let live =
             match tokio::time::timeout(std::time::Duration::from_secs(30), api.get(name)).await {
                 Ok(Ok(live)) => live,
                 Ok(Err(kube::Error::Api(error))) if error.code == 404 => continue,
                 Ok(Err(_)) | Err(_) => return Err(deferred()),
             };
-        if pull_secret_create_evidence_trusted(engine, &live, generation.get()) {
+        if pull_secret_create_evidence_trusted(engine, &live, generation.get(), create_nonce) {
             record_pull_secret_creation(engine, namespace, &live, generation.get());
             return Ok(());
         }
-        // Compensate only an object that could be this POST: platform-labeled,
-        // and either unmarked or stamped with this generation. A different
-        // positive marker belongs to another writer (a sweep or a peer deploy
-        // that won the create race) and must not be deleted.
+        // Compensate only an object that PROVES it is this apply's creation —
+        // the nonce stamped before the POST (Devin review on #280, SEC) — AND
+        // is still in the state we created (its generation marker is ours or
+        // stripped): a marker owned by a NEWER writer means the object changed
+        // hands after our create, and deleting it would destroy that writer's
+        // live state. Creation provenance and current ownership are two
+        // separate facts and deletion authority needs both.
         let marker = secret_mutation_generation(&live);
-        let could_be_this_create = marker.is_none() || marker == Some(generation.get());
-        if is_labeled_managed_pull_secret(&live) && could_be_this_create {
+        let still_ours = marker.is_none() || marker == Some(generation.get());
+        if secret_create_nonce(&live) == Some(create_nonce)
+            && is_labeled_managed_pull_secret(&live)
+            && still_ours
+        {
             remove_untrusted_created_pull_secret(api, namespace, name, &live).await?;
         }
         return Err(deferred());
     }
-    Err(deferred())
+}
+
+/// Bound the whole ambiguity recovery — probes and compensation together
+/// (Devin review on #280): a stalled DELETE or deletion poll must not hold the
+/// deploy's mutation guard and apply permit indefinitely. On overrun return
+/// the deferred error; the mutation lease's own reclaim quarantine keeps any
+/// late create fenced.
+async fn bounded_recover_ambiguous_pull_secret_create(
+    engine: &ApplyEngine,
+    api: &Api<Secret>,
+    namespace: &str,
+    name: &str,
+    generation: MutationGeneration,
+    create_submitted: bool,
+    create_nonce: &str,
+) -> Result<(), DeployError> {
+    match tokio::time::timeout(
+        PULL_SECRET_CREATE_RECOVERY_BUDGET,
+        recover_ambiguous_pull_secret_create(
+            engine,
+            api,
+            namespace,
+            name,
+            generation,
+            create_submitted,
+            create_nonce,
+        ),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(DeployError::PullSecretReconcileDeferred(format!(
+            "pull-secret apply for {namespace}/{name} did not resolve its create ambiguity within \
+             the recovery budget (stalled Kubernetes API?); retry the deployment — the namespace \
+             lease and apply permit are released and the mutation lease's reclaim quarantine keeps \
+             any late create fenced"
+        ))),
+    }
 }
 
 /// Whether failure cleanup must leave this Secret for a sibling app. The
@@ -4629,6 +4731,9 @@ async fn apply_scoped_pull_secret(
     // defers (requeueable) exactly like the reconciliation paths.
     let create_submitted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let create_submitted_in_apply = std::sync::Arc::clone(&create_submitted);
+    // Per-apply create provenance nonce, stamped on the Secret before the
+    // POST so recovery can prove a re-read object is this attempt's creation.
+    let create_nonce = uuid::Uuid::new_v4().to_string();
     let apply = async {
         for _ in 0..5 {
             match api.get(&config.name).await {
@@ -4781,12 +4886,28 @@ async fn apply_scoped_pull_secret(
                             RESOURCE_CREATED_BY_ANNOTATION.to_string(),
                             generation.get().to_string(),
                         );
+                    created
+                        .metadata
+                        .annotations
+                        .as_mut()
+                        .expect("annotations initialized above")
+                        .insert(
+                            PULL_SECRET_CREATE_NONCE_ANNOTATION.to_string(),
+                            create_nonce.clone(),
+                        );
                     create_submitted_in_apply.store(true, std::sync::atomic::Ordering::SeqCst);
                     match api
                         .create(&pull_secret_create_params(engine), &created)
                         .await
                     {
                         Ok(applied) => {
+                            // A received response resolves the create
+                            // ambiguity: only a LOST response keeps the create
+                            // candidate armed for recovery (Codex review on
+                            // #280, P1 "Clear the create flag after a
+                            // definitive response").
+                            create_submitted_in_apply
+                                .store(false, std::sync::atomic::Ordering::SeqCst);
                             // Codex review on #243, round 2, P1 "verify
                             // creation evidence returned by the Secret POST":
                             // a mutating admission webhook can strip the
@@ -4802,6 +4923,7 @@ async fn apply_scoped_pull_secret(
                                 engine,
                                 &applied,
                                 generation.get(),
+                                &create_nonce,
                             ) {
                                 remove_untrusted_created_pull_secret(
                                     &api,
@@ -4827,7 +4949,24 @@ async fn apply_scoped_pull_secret(
                             );
                             return Ok(());
                         }
-                        Err(kube::Error::Api(error)) if error.code == 409 => continue,
+                        Err(kube::Error::Api(error)) if error.code == 409 => {
+                            // A server response — including the name-race
+                            // winner's 409 — resolves the create ambiguity:
+                            // recovery must not later treat this definitively
+                            // completed POST as ours to ledger or delete
+                            // (Codex review on #280, P1).
+                            create_submitted_in_apply
+                                .store(false, std::sync::atomic::Ordering::SeqCst);
+                            continue;
+                        }
+                        Err(kube::Error::Api(error)) => {
+                            create_submitted_in_apply
+                                .store(false, std::sync::atomic::Ordering::SeqCst);
+                            return Err(DeployError::Apply(kube::Error::Api(error).into()));
+                        }
+                        // A transport error is not a response: the POST may
+                        // still commit server-side, so the create candidate
+                        // stays armed for recovery.
                         Err(error) => return Err(DeployError::Apply(error.into())),
                     }
                 }
@@ -4849,13 +4988,14 @@ async fn apply_scoped_pull_secret(
     match tokio::time::timeout(PULL_SECRET_NAMESPACE_RECONCILE_TIMEOUT, apply).await {
         Ok(result) => result,
         Err(_) => {
-            recover_ambiguous_pull_secret_create(
+            bounded_recover_ambiguous_pull_secret_create(
                 engine,
                 &api,
                 namespace,
                 &config.name,
                 generation,
                 create_submitted.load(std::sync::atomic::Ordering::SeqCst),
+                &create_nonce,
             )
             .await
         }
@@ -8198,6 +8338,15 @@ mod tests {
         inject_secret_on_create: Option<Secret>,
         /// If set, every Secret GET returns this status instead of the object.
         secret_get_status: Option<u16>,
+        /// Named Secret GETs return 404 this many times before the object
+        /// becomes visible (Codex review on #280, P1 "Poll for the full
+        /// late-commit window"): models a create still executing server-side
+        /// past the client's first probes.
+        secret_get_404s_left: u8,
+        /// Secret DELETEs hang without responding (Devin review on #280): the
+        /// compensation path must fall out of the caller's recovery budget
+        /// instead of holding the deploy's mutation guard and apply permit.
+        stall_secret_deletes: bool,
         /// Simulate a mutating admission webhook that strips
         /// RESOURCE_CREATED_BY_ANNOTATION from an ACCEPTED Secret create
         /// (Codex review on #243, round 2, P1): the stored/returned object
@@ -8372,6 +8521,12 @@ mod tests {
                             && path.trim_end_matches('/').ends_with("/secrets"))
                             || (state.stall_secret_gets && named_secret_get)
                             || (state.stall_namespace_gets && namespace_get)
+                            // A DELETE that never responds (Devin review on
+                            // #280): only the caller's recovery budget can
+                            // end this request.
+                            || (state.stall_secret_deletes
+                                && method.as_str() == "DELETE"
+                                && path.contains("/secrets"))
                     };
                     if stall {
                         tokio::time::sleep(std::time::Duration::from_secs(600)).await;
@@ -8501,6 +8656,13 @@ mod tests {
                 )
             }
             ("secrets", "GET") => {
+                // Named-GET 404 countdown: the object is absent for the first
+                // N named GETs — modeling a create still executing server-side
+                // past the client's first probes (Codex review on #280).
+                if state.secret_get_404s_left > 0 {
+                    state.secret_get_404s_left -= 1;
+                    return not_found();
+                }
                 if let Some(status) = state.secret_get_status {
                     return (
                         status,
@@ -15140,6 +15302,287 @@ mod tests {
             .is_err(),
             "a Secret lookup failure must prevent apply from pruning the reference"
         );
+    }
+
+    /// Managed-fields entry proving `manager` owns the given annotation and
+    /// label keys — the ownership half of creation evidence.
+    fn owned_managed_fields(
+        manager: &str,
+        annotation_keys: &[&str],
+        label_keys: &[&str],
+    ) -> Vec<k8s_openapi::apimachinery::pkg::apis::meta::v1::ManagedFieldsEntry> {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::{FieldsV1, ManagedFieldsEntry};
+        let owned = |keys: &[&str]| {
+            keys.iter()
+                .map(|key| (format!("f:{key}"), serde_json::json!({})))
+                .collect::<serde_json::Map<String, serde_json::Value>>()
+        };
+        vec![ManagedFieldsEntry {
+            manager: Some(manager.to_string()),
+            operation: Some("Apply".to_string()),
+            fields_v1: Some(FieldsV1(serde_json::json!({
+                "f:metadata": {
+                    "f:annotations": owned(annotation_keys),
+                    "f:labels": owned(label_keys),
+                }
+            }))),
+            ..Default::default()
+        }]
+    }
+
+    /// A pre-stored Secret shaped like a create this apply may or may not own.
+    fn recovery_secret(
+        manager: &str,
+        nonce: Option<&str>,
+        owned_evidence: bool,
+        generation: i64,
+    ) -> Secret {
+        use enclava_engine::apply::generation::{
+            MUTATION_GENERATION_ANNOTATION, RESOURCE_CREATED_BY_ANNOTATION,
+        };
+        let mut secret = fake_managed_secret("enclava-registry-auth", true, "cap", "pat-token");
+        let annotations = secret
+            .metadata
+            .annotations
+            .get_or_insert_with(Default::default);
+        annotations.insert(
+            RESOURCE_CREATED_BY_ANNOTATION.to_string(),
+            generation.to_string(),
+        );
+        annotations.insert(
+            MUTATION_GENERATION_ANNOTATION.to_string(),
+            generation.to_string(),
+        );
+        if let Some(nonce) = nonce {
+            annotations.insert(
+                PULL_SECRET_CREATE_NONCE_ANNOTATION.to_string(),
+                nonce.to_string(),
+            );
+        }
+        if owned_evidence {
+            secret.metadata.managed_fields = Some(owned_managed_fields(
+                manager,
+                &[
+                    RESOURCE_CREATED_BY_ANNOTATION,
+                    MUTATION_GENERATION_ANNOTATION,
+                    PULL_SECRET_CREATE_NONCE_ANNOTATION,
+                ],
+                &[MANAGED_BY_LABEL, TENANT_PULL_SECRET_LABEL],
+            ));
+        }
+        secret
+    }
+
+    /// Devin review on #280, SEC "Unproven Secret gains deletion authority":
+    /// a re-read Secret that does not carry this apply's create nonce is
+    /// neither recorded as ours (the record is what grants failed-deployment
+    /// cleanup its deletion authority) nor deleted (it may be the name-race
+    /// winner's) — even platform-labeled and unmarked, which the previous
+    /// "could be this POST" rule deleted. The nonce proves ownership and
+    /// unlocks both.
+    #[tokio::test(start_paused = true)]
+    async fn recovery_requires_nonce_proven_create_for_authority() {
+        use std::sync::{Arc, Mutex};
+        let generation = 3i64;
+        let nonce = "nonce-recovery-test";
+
+        // (a) Unmarked, platform-labeled, no nonce: foreign. Must survive,
+        // stay unrecorded, and keep the deployment deferred.
+        let foreign = fake_managed_secret("enclava-registry-auth", true, "cap", "pat-token");
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![foreign],
+            ..Default::default()
+        }));
+        let ledger = Arc::new(enclava_engine::apply::creation_ledger::CreationLedgerBuffer::new());
+        let engine = reconcile_engine(cluster.clone()).with_creation_ledger(ledger.clone());
+        let api: Api<Secret> = Api::namespaced(engine.client().clone(), "tenant-ns");
+        let result = recover_ambiguous_pull_secret_create(
+            &engine,
+            &api,
+            "tenant-ns",
+            "enclava-registry-auth",
+            MutationGeneration::new(generation).unwrap(),
+            true,
+            nonce,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "an unproven object keeps the deploy deferred"
+        );
+        assert!(
+            api.get("enclava-registry-auth").await.is_ok(),
+            "a foreign Secret must not be deleted"
+        );
+        assert!(
+            !ledger.contains_name_uid("enclava-registry-auth", "uid-enclava-registry-auth"),
+            "a foreign Secret must not gain deletion authority"
+        );
+
+        // (b) Nonce plus owned evidence: provably ours — recorded.
+        let ours = recovery_secret(
+            &engine.config().field_manager,
+            Some(nonce),
+            true,
+            generation,
+        );
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![ours],
+            ..Default::default()
+        }));
+        let ledger = Arc::new(enclava_engine::apply::creation_ledger::CreationLedgerBuffer::new());
+        let engine = reconcile_engine(cluster.clone()).with_creation_ledger(ledger.clone());
+        let api: Api<Secret> = Api::namespaced(engine.client().clone(), "tenant-ns");
+        recover_ambiguous_pull_secret_create(
+            &engine,
+            &api,
+            "tenant-ns",
+            "enclava-registry-auth",
+            MutationGeneration::new(generation).unwrap(),
+            true,
+            nonce,
+        )
+        .await
+        .expect("a nonce-proven creation with owned evidence is recorded");
+        assert!(ledger.contains_name_uid("enclava-registry-auth", "uid-enclava-registry-auth"));
+
+        // (c) Nonce but ownership unproven (webhook moved managedFields):
+        // still ours to compensate — deleted, and the deploy stays deferred.
+        let stripped = recovery_secret(
+            &engine.config().field_manager,
+            Some(nonce),
+            false,
+            generation,
+        );
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![stripped],
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        let api: Api<Secret> = Api::namespaced(engine.client().clone(), "tenant-ns");
+        let result = recover_ambiguous_pull_secret_create(
+            &engine,
+            &api,
+            "tenant-ns",
+            "enclava-registry-auth",
+            MutationGeneration::new(generation).unwrap(),
+            true,
+            nonce,
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(
+            api.get("enclava-registry-auth").await.is_err(),
+            "a nonce-proven create is compensated even when ownership is stripped"
+        );
+    }
+
+    /// Codex review on #280, P1 "Poll for the full late-commit window": a
+    /// create still executing server-side past the client's first probes must
+    /// still be found and recorded (the previous three-404 loop concluded in
+    /// ~2 s), and an absent object keeps the probe running until the window
+    /// closes rather than releasing the ambiguity early.
+    #[tokio::test(start_paused = true)]
+    async fn recovery_probes_the_full_late_commit_window() {
+        use std::sync::{Arc, Mutex};
+        let generation = 3i64;
+        let nonce = "nonce-window-test";
+
+        // (a) Absent for the first 25 probes (50 s of 404s), then visible.
+        let ours = recovery_secret(
+            &reconcile_engine(Arc::new(Mutex::new(FakeCluster::default())))
+                .config()
+                .field_manager,
+            Some(nonce),
+            true,
+            generation,
+        );
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![ours],
+            secret_get_404s_left: 25,
+            ..Default::default()
+        }));
+        let ledger = Arc::new(enclava_engine::apply::creation_ledger::CreationLedgerBuffer::new());
+        let engine = reconcile_engine(cluster.clone()).with_creation_ledger(ledger.clone());
+        let api: Api<Secret> = Api::namespaced(engine.client().clone(), "tenant-ns");
+        recover_ambiguous_pull_secret_create(
+            &engine,
+            &api,
+            "tenant-ns",
+            "enclava-registry-auth",
+            MutationGeneration::new(generation).unwrap(),
+            true,
+            nonce,
+        )
+        .await
+        .expect("a late-committing create is found within the window");
+        assert!(ledger.contains_name_uid("enclava-registry-auth", "uid-enclava-registry-auth"));
+
+        // (b) Absent throughout: the probe spans the whole window.
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            secret_get_404s_left: u8::MAX,
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        let api: Api<Secret> = Api::namespaced(engine.client().clone(), "tenant-ns");
+        let started = tokio::time::Instant::now();
+        let result = recover_ambiguous_pull_secret_create(
+            &engine,
+            &api,
+            "tenant-ns",
+            "enclava-registry-auth",
+            MutationGeneration::new(generation).unwrap(),
+            true,
+            nonce,
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(
+            started.elapsed() >= PULL_SECRET_CREATE_LATE_COMMIT_WINDOW,
+            "404s must not conclude the probe before the late-commit window closes"
+        );
+    }
+
+    /// Devin review on #280: a stalled DELETE or deletion poll must not hold
+    /// the deploy's mutation guard and apply permit indefinitely — the bounded
+    /// recovery returns a deferred error once its budget is spent, while the
+    /// mutation lease's reclaim quarantine keeps any late create fenced.
+    #[tokio::test(start_paused = true)]
+    async fn recovery_budget_bounds_stalled_compensation() {
+        use std::sync::{Arc, Mutex};
+        let generation = 3i64;
+        let nonce = "nonce-budget-test";
+        let ours = recovery_secret(
+            &reconcile_engine(Arc::new(Mutex::new(FakeCluster::default())))
+                .config()
+                .field_manager,
+            Some(nonce),
+            false,
+            generation,
+        );
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            secrets: vec![ours],
+            stall_secret_deletes: true,
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        let api: Api<Secret> = Api::namespaced(engine.client().clone(), "tenant-ns");
+        let started = tokio::time::Instant::now();
+        let result = bounded_recover_ambiguous_pull_secret_create(
+            &engine,
+            &api,
+            "tenant-ns",
+            "enclava-registry-auth",
+            MutationGeneration::new(generation).unwrap(),
+            true,
+            nonce,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(DeployError::PullSecretReconcileDeferred(_))),
+            "a stalled compensation falls out as a deferred error"
+        );
+        assert!(started.elapsed() >= PULL_SECRET_CREATE_RECOVERY_BUDGET);
     }
 }
 
