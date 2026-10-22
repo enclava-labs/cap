@@ -42,10 +42,10 @@ use enclava_engine::types::{
     AttestationConfig, ConfidentialApp, Container, DomainSpec, GeneratedAgentPolicy,
     LogEncryptionConfig, StorageSpec, WorkloadArtifactBinding, WorkloadSecurityProfile,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use uuid::Uuid;
 
-use crate::commands::template::normalize_ngrok_tcp_url;
+use crate::commands::template::{normalize_ngrok_tcp_url, should_retry_api_transport_error};
 
 const DEPLOY_HEALTH_TIMEOUT_SECONDS: u64 = 900;
 
@@ -258,17 +258,8 @@ pub(crate) fn deploy_needs_initial_claim(
     }
 }
 
-/// The pre-mutation claim gate's decision: the post-submit
-/// [`deploy_needs_initial_claim`] predicate, except that unresolved
-/// ownership fails CLOSED before submission. The status read is a TEE
-/// query: a window that closes between this read and the post-submit one
-/// is exactly the strand this gate exists to prevent, so an unreadable
-/// state gates. The cost -- an unattended redeploy of an already-claimed
-/// app while its TEE status is unreachable now needs a session -- leaves
-/// no residue, while the strand leaves a submitted deployment with no
-/// claimant. The post-submit predicate keeps its own None fallback
-/// unchanged (gating there would strand claimed redeploys in the claim
-/// wait instead).
+/// Unresolved ownership requires claim-ready password input before submission,
+/// so a first deployment cannot be stranded by a missing password prompt.
 pub(crate) fn deploy_preflight_needs_claim(
     is_password_mode: bool,
     ownership_state: Option<&str>,
@@ -723,7 +714,8 @@ async fn set_deploy_config(
     value: &str,
     token: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + Duration::from_secs(60);
+    // First-boot encrypted storage can still be initializing after the ownership claim.
+    let deadline = Instant::now() + Duration::from_secs(240);
     loop {
         match tee.config_set(key, value, token).await {
             Err(error) if should_retry_deploy_config(&error) && Instant::now() < deadline => {
@@ -817,6 +809,19 @@ impl<'a> DeploymentWait<'a> {
                     && expectation.deploy_id == deployment_id
             }),
         }
+    }
+
+    pub(crate) fn matches_launch_identity(
+        self,
+        identity: Option<&enclava_cli::tee_client::VerifiedSnpLaunchIdentity>,
+    ) -> bool {
+        self.expectation.is_some_and(|expectation| {
+            enclava_cli::tee_client::launch_identity_binds_deployment(
+                identity,
+                &expectation.expected_cc_init_data_hash,
+                &expectation.expected_firmware_measurement,
+            )
+        })
     }
 }
 
@@ -1043,14 +1048,15 @@ pub(crate) async fn wait_for_bootstrap_endpoint(
     poll_interval: Duration,
     pb: &ProgressBar,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    let endpoint = api.get_unlock_endpoint(app_name).await?;
-    let tee = TeeClient::new_for_ownership_probe_with_resolve_ip(
-        &endpoint.tee_url,
-        endpoint.tee_resolve_ip,
-    );
+    let deployment_id = deployment.deployment_id;
+    let mut tee = None;
     let start = std::time::Instant::now();
+    let mut history = DeploymentHistoryProbe::new();
 
     loop {
+        // Check the wait deadline before polling deployment history: once
+        // the budget is gone the wait must return instead of issuing one
+        // more request that could outlive it (cap#220 review).
         if start.elapsed() > max_wait {
             pb.abandon_with_message("TEE ownership timed out");
             return Err(format!(
@@ -1059,16 +1065,81 @@ pub(crate) async fn wait_for_bootstrap_endpoint(
             )
             .into());
         }
+        // Poll the terminal-failure check before any endpoint fetch: a
+        // rejected deployment must fail fast rather than block on a
+        // request whose response would never satisfy it (#18). Every
+        // synchronous request in this loop is cut at the finite per-attempt
+        // budget, so a stalled response can never consume the wait
+        // (cap#220 review); the history lookups themselves run detached on
+        // the probe and never block the poll.
+        fail_if_template_deployment_failed(
+            api,
+            app_name,
+            deployment_id,
+            start + max_wait,
+            &mut history,
+        )
+        .await?;
 
         pb.set_message(timed_progress(
             "TEE ownership: waiting for attested endpoint",
             start.elapsed(),
             max_wait,
         ));
-        match tee.attest_receipt_key().await {
-            Ok((_attestation, attested_tee)) => {
-                match attested_tee.bootstrap_challenge().await {
-                    Ok(_) => {
+        if tee.is_none() {
+            match bounded_wait_attempt(start + max_wait, api.get_unlock_endpoint(app_name)).await {
+                Some(Ok(endpoint)) => {
+                    tee = Some(TeeClient::new_for_ownership_probe_with_resolve_ip(
+                        &endpoint.tee_url,
+                        endpoint.tee_resolve_ip,
+                    ));
+                }
+                Some(Err(error)) => {
+                    // Same retry predicate as the template wait: transient
+                    // transport/5xx/rate-limit conditions retry; auth,
+                    // decode, and 404-class failures surface immediately
+                    // instead of burning the whole wait budget.
+                    let error: ApiError = error;
+                    if !crate::commands::template::should_retry_template_bootstrap_endpoint_error(
+                        &error,
+                    ) {
+                        return Err(error.into());
+                    }
+                    pb.set_message(timed_progress(
+                        "TEE ownership: waiting for endpoint",
+                        start.elapsed(),
+                        max_wait,
+                    ));
+                    tokio::time::sleep(poll_interval).await;
+                    continue;
+                }
+                // The attempt outlived its per-attempt budget (cap#220
+                // review): a stalled endpoint must not consume the wait, so
+                // retry on the next tick.
+                None => {
+                    pb.set_message(timed_progress(
+                        "TEE ownership: waiting for endpoint",
+                        start.elapsed(),
+                        max_wait,
+                    ));
+                    tokio::time::sleep(poll_interval).await;
+                    continue;
+                }
+            }
+        }
+        let tee = tee.as_ref().expect("tee client was just acquired");
+        // Attestation and the bootstrap challenge run under the same finite
+        // per-attempt budget as every other request in this loop (cap#220
+        // review follow-up #3): the ownership-probe client's own 15s request
+        // timeout bounds them, but the per-attempt guarantee must hold
+        // structurally -- clamped to the wait's remaining time -- instead of
+        // relying on client configuration.
+        match bounded_wait_attempt(start + max_wait, tee.attest_receipt_key()).await {
+            Some(Ok((_attestation, attested_tee))) => {
+                match bounded_wait_attempt(start + max_wait, attested_tee.bootstrap_challenge())
+                    .await
+                {
+                    Some(Ok(_)) => {
                         // A terminal diagnostic read over this attested,
                         // SPKI-pinned channel outranks a reachable challenge
                         // endpoint: stop before attempting any claim, but only
@@ -1089,10 +1160,30 @@ pub(crate) async fn wait_for_bootstrap_endpoint(
                                 terminal_bootstrap_failure_message(app_name, &diagnostic).into()
                             );
                         }
-                        pb.set_message("Ownership claim endpoint ready");
-                        return Ok(true);
+                        // Readiness alone must not end the wait (cap#220
+                        // review follow-up): the success must be authorized
+                        // by a current deployment-state observation, and an
+                        // inconclusive one keeps the wait running (the
+                        // enclosing deadline governs).
+                        if let SuccessGate::Confirmed = reconcile_success_with_deployment_history(
+                            api,
+                            app_name,
+                            deployment_id,
+                            start + max_wait,
+                            &mut history,
+                        )
+                        .await?
+                        {
+                            pb.set_message("Ownership claim endpoint ready");
+                            return Ok(true);
+                        }
+                        pb.set_message(timed_progress(
+                            "TEE ownership: confirming deployment state",
+                            start.elapsed(),
+                            max_wait,
+                        ));
                     }
-                    Err(_) => {
+                    Some(Err(_)) | None => {
                         // One safe status read decides the challenge-failure
                         // fallback: a terminal diagnostic is never masked by a
                         // claimed ownership state. The read runs under a
@@ -1131,8 +1222,24 @@ pub(crate) async fn wait_for_bootstrap_endpoint(
                                     ));
                                 }
                                 BootstrapEndpointStatusDecision::AlreadyClaimed => {
-                                    pb.set_message("Ownership already claimed");
-                                    return Ok(false);
+                                    if let SuccessGate::Confirmed =
+                                        reconcile_success_with_deployment_history(
+                                            api,
+                                            app_name,
+                                            deployment_id,
+                                            start + max_wait,
+                                            &mut history,
+                                        )
+                                        .await?
+                                    {
+                                        pb.set_message("Ownership already claimed");
+                                        return Ok(false);
+                                    }
+                                    pb.set_message(timed_progress(
+                                        "TEE ownership: confirming deployment state",
+                                        start.elapsed(),
+                                        max_wait,
+                                    ));
                                 }
                                 BootstrapEndpointStatusDecision::Waiting => {
                                     pb.set_message(timed_progress(
@@ -1153,7 +1260,7 @@ pub(crate) async fn wait_for_bootstrap_endpoint(
                     }
                 }
             }
-            Err(_) => {
+            Some(Err(_)) | None => {
                 pb.set_message(timed_progress(
                     "TEE ownership: waiting for attested endpoint",
                     start.elapsed(),
@@ -1178,8 +1285,12 @@ async fn wait_for_deploy_runtime(
     let expected_deployment_id = deployment.deployment_id;
     let start = std::time::Instant::now();
     let mut terminal_probe_at: Option<Instant> = None;
+    let mut history = DeploymentHistoryProbe::new();
 
     loop {
+        // Check the wait deadline before polling deployment history: once
+        // the budget is gone the wait must return instead of issuing one
+        // more request that could outlive it (cap#220 review).
         if start.elapsed() > max_wait {
             pb.abandon_with_message("TEE boot timed out");
             return Err(format!(
@@ -1188,6 +1299,20 @@ async fn wait_for_deploy_runtime(
             )
             .into());
         }
+        // Fail fast on a terminalized deployment before any readiness poll
+        // (#18). Every synchronous request in this loop is cut at the finite
+        // per-attempt budget, so a stalled response can never consume the
+        // wait and make a healthy deployment report a boot timeout
+        // (cap#220 review); the history lookups themselves run detached on
+        // the probe and never block the poll.
+        fail_if_template_deployment_failed(
+            api,
+            app_name,
+            expected_deployment_id,
+            start + max_wait,
+            &mut history,
+        )
+        .await?;
 
         pb.set_message(timed_progress(
             "TEE boot: waiting for runtime",
@@ -1195,54 +1320,87 @@ async fn wait_for_deploy_runtime(
             max_wait,
         ));
         let observation_is_fresh;
-        let direct_tee_allowed = match api.get_status(app_name).await {
-            Ok(status) => {
-                observation_is_fresh = observation_is_fresh_for_deployment(
-                    status.observation.as_ref(),
-                    expected_deployment_id,
-                );
-                let direct_tee_allowed = status.status != "failed"
-                    && observation_allows_direct_tee_fallback(
+        let direct_tee_allowed =
+            match bounded_wait_attempt(start + max_wait, api.get_status(app_name)).await {
+                Some(Ok(status)) => {
+                    observation_is_fresh = observation_is_fresh_for_deployment(
                         status.observation.as_ref(),
                         expected_deployment_id,
                     );
-                if observation_is_fresh && target.accepts_api_status(status.status.as_str()) {
-                    pb.set_position(3);
-                    pb.set_message(match status.status.as_str() {
-                        "locked" => "TEE running, storage locked",
-                        _ => "TEE running, attestation complete",
-                    });
-                    return Ok(());
-                }
+                    let direct_tee_allowed = status.status != "failed"
+                        && observation_allows_direct_tee_fallback(
+                            status.observation.as_ref(),
+                            expected_deployment_id,
+                        );
+                    if observation_is_fresh && target.accepts_api_status(status.status.as_str()) {
+                        // Readiness alone must not end the wait (cap#220
+                        // review follow-up): the success must be authorized
+                        // by a current deployment-state observation, and an
+                        // inconclusive one keeps the wait running (the
+                        // enclosing deadline governs).
+                        if let SuccessGate::Confirmed = reconcile_success_with_deployment_history(
+                            api,
+                            app_name,
+                            expected_deployment_id,
+                            start + max_wait,
+                            &mut history,
+                        )
+                        .await?
+                        {
+                            pb.set_position(3);
+                            pb.set_message(match status.status.as_str() {
+                                "locked" => "TEE running, storage locked",
+                                _ => "TEE running, attestation complete",
+                            });
+                            return Ok(());
+                        }
+                    }
 
-                let pod_phase_is_verified = observation_is_fresh && status.status != "failed";
-                match status.pod_phase.as_deref() {
-                    Some("Running")
-                        if pod_phase_is_verified && target.accepts_running_pod_phase() =>
-                    {
-                        pb.set_position(3);
-                        pb.set_message("TEE running, attestation complete");
-                        return Ok(());
+                    let pod_phase_is_verified = observation_is_fresh && status.status != "failed";
+                    match status.pod_phase.as_deref() {
+                        Some("Running")
+                            if pod_phase_is_verified && target.accepts_running_pod_phase() =>
+                        {
+                            if let SuccessGate::Confirmed =
+                                reconcile_success_with_deployment_history(
+                                    api,
+                                    app_name,
+                                    expected_deployment_id,
+                                    start + max_wait,
+                                    &mut history,
+                                )
+                                .await?
+                            {
+                                pb.set_position(3);
+                                pb.set_message("TEE running, attestation complete");
+                                return Ok(());
+                            }
+                            pb.set_message(timed_progress(
+                                "TEE boot: confirming deployment state",
+                                start.elapsed(),
+                                max_wait,
+                            ));
+                        }
+                        Some(phase) => {
+                            pb.set_message(timed_progress(
+                                &format!("TEE boot: Pod {phase}"),
+                                start.elapsed(),
+                                max_wait,
+                            ));
+                        }
+                        None => {}
                     }
-                    Some(phase) => {
-                        pb.set_message(timed_progress(
-                            &format!("TEE boot: Pod {phase}"),
-                            start.elapsed(),
-                            max_wait,
-                        ));
-                    }
-                    None => {}
+                    direct_tee_allowed
                 }
-                direct_tee_allowed
-            }
-            Err(_) => {
-                // The direct endpoint is app-bound rather than deployment-bound.
-                // Without a current CAP observation there is no pod/deployment
+                // Ok(Err): the API call failed. None: the attempt outlived
+                // its per-attempt budget (cap#220 review) -- a stalled status
+                // call must not consume the wait. Either way: the direct
+                // endpoint is app-bound rather than deployment-bound. Without
+                // a current CAP observation there is no pod/deployment
                 // evidence proving it belongs to this deploy, so retry CAP and
                 // do not let an old TEE satisfy a replacement rollout.
-                false
-            }
-        };
+                Some(Err(_)) | None => false,
+            };
 
         // A terminal bootstrap diagnostic from the attested app TEE stops the
         // wait, but only when CAP's live observation proves the endpoint
@@ -1263,12 +1421,14 @@ async fn wait_for_deploy_runtime(
         }
 
         if direct_tee_allowed
-            && let Ok(endpoint) = api.get_unlock_endpoint(app_name).await
+            && let Some(Ok(endpoint)) =
+                bounded_wait_attempt(start + max_wait, api.get_unlock_endpoint(app_name)).await
             && let tee = TeeClient::new_for_ownership_with_resolve_ip(
                 &endpoint.tee_url,
                 endpoint.tee_resolve_ip,
             )
-            && let Ok((_attestation, attested_tee)) = tee.attest_receipt_key().await
+            && let Some(Ok((_attestation, attested_tee))) =
+                bounded_wait_attempt(start + max_wait, tee.attest_receipt_key()).await
             && let Ok(status) = attested_tee
                 .bounded_status_json_within(terminal_diagnostic_budget(Some(start + max_wait)))
                 .await
@@ -1295,14 +1455,44 @@ async fn wait_for_deploy_runtime(
             if tee_supplemental_fields_are_consistent(&status) {
                 match outcome {
                     DirectTeeRuntimeOutcome::Locked => {
-                        pb.set_position(3);
-                        pb.set_message("TEE running, storage locked");
-                        return Ok(());
+                        if let SuccessGate::Confirmed = reconcile_success_with_deployment_history(
+                            api,
+                            app_name,
+                            expected_deployment_id,
+                            start + max_wait,
+                            &mut history,
+                        )
+                        .await?
+                        {
+                            pb.set_position(3);
+                            pb.set_message("TEE running, storage locked");
+                            return Ok(());
+                        }
+                        pb.set_message(timed_progress(
+                            "TEE boot: confirming deployment state",
+                            start.elapsed(),
+                            max_wait,
+                        ));
                     }
                     DirectTeeRuntimeOutcome::Unlocked if target.accepts_direct_unlocked() => {
-                        pb.set_position(3);
-                        pb.set_message("TEE running, attestation complete");
-                        return Ok(());
+                        if let SuccessGate::Confirmed = reconcile_success_with_deployment_history(
+                            api,
+                            app_name,
+                            expected_deployment_id,
+                            start + max_wait,
+                            &mut history,
+                        )
+                        .await?
+                        {
+                            pb.set_position(3);
+                            pb.set_message("TEE running, attestation complete");
+                            return Ok(());
+                        }
+                        pb.set_message(timed_progress(
+                            "TEE boot: confirming deployment state",
+                            start.elapsed(),
+                            max_wait,
+                        ));
                     }
                     DirectTeeRuntimeOutcome::Unlocked => {
                         pb.set_message(timed_progress(
@@ -1357,14 +1547,536 @@ fn observation_allows_direct_tee_fallback(
     })
 }
 
+/// Per-attempt budget for the synchronous requests a wait loop makes (the
+/// readiness polls: unlock endpoint, runtime status, config keys, SSH
+/// command). The shared HTTP client's per-request timeout is generous (it
+/// also covers slow deploy/setup calls), so without a cap a single stalled
+/// request can hold the loop for up to that timeout and consume the
+/// enclosing wait's entire budget (cap#220 review). 60s is the tradeoff the
+/// reviews converged on: finite and shorter than any wait (a stalled attempt
+/// is cut and the loop retries once the endpoint recovers), and never more
+/// than the wait's remaining time (a passed deadline yields zero budget and
+/// issues no request at all, so no request can outlive its wait).
+///
+/// Deployment-history lookups deliberately do NOT cut at this budget: their
+/// answers are the wait loops' source of truth, and cutting a request at a
+/// fixed budget discards valid responses slower than it (cap#220 review
+/// follow-up: a history endpoint consistently answering after 70s must
+/// still be observed, not cancelled at 60s). They run as detached requests
+/// through [`DeploymentHistoryProbe`], for which this budget is only the
+/// refresh cadence.
+const WAIT_ATTEMPT_BUDGET: Duration = Duration::from_secs(60);
+
+fn wait_attempt_budget(wait_deadline: Instant) -> Duration {
+    WAIT_ATTEMPT_BUDGET.min(wait_deadline.saturating_duration_since(Instant::now()))
+}
+
+/// One bounded request attempt inside a wait loop (cap#220 review). `None`
+/// means the attempt could not land within `wait_attempt_budget` -- either
+/// the wait's deadline has passed (no request is issued at all) or the
+/// request stalled and was cut -- so the caller retries on the next tick
+/// instead of letting the request consume the wait.
+pub(crate) async fn bounded_wait_attempt<T>(
+    wait_deadline: Instant,
+    request: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    let budget = wait_attempt_budget(wait_deadline);
+    if budget.is_zero() {
+        // The wait's deadline has already passed: a response arriving now
+        // could only land after the budget is gone, so skip the request.
+        return None;
+    }
+    tokio::time::timeout(budget, request).await.ok()
+}
+
+/// A [`tokio::task::JoinHandle`] that aborts its task when dropped
+/// (cap#220 review follow-up): a dropped `JoinHandle` detaches its task, so
+/// a plain handle would let a stalled history lookup hold its connection
+/// until the API client's 900-second request timeout after the enclosing
+/// wait has already returned. Every exit from a request -- supersession,
+/// a dropped `take_landed` join, or the probe dropping with its wait --
+/// therefore cancels the lookup instead of orphaning it.
+struct AbortOnDropHandle<T>(Option<tokio::task::JoinHandle<T>>);
+
+impl<T> AbortOnDropHandle<T> {
+    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self(Some(handle))
+    }
+
+    fn is_finished(&self) -> bool {
+        self.0
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+    }
+
+    fn abort(&self) {
+        if let Some(handle) = &self.0 {
+            handle.abort();
+        }
+    }
+
+    /// Await the task's outcome. The handle stays inside the wrapper while
+    /// joining, so a dropped or cancelled join still aborts the task through
+    /// [`Drop`] instead of detaching it.
+    async fn join(&mut self) -> Option<Result<T, tokio::task::JoinError>> {
+        Some(self.0.as_mut()?.await)
+    }
+}
+
+impl<T> Drop for AbortOnDropHandle<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
+/// One detached deployment-history request ([`DeploymentHistoryProbe`]): the
+/// handle stays in flight across wait-loop iterations, so a slow answer is
+/// still observed when it lands instead of being cancelled at a budget.
+struct HistoryRequest {
+    issued_at: Instant,
+    handle: AbortOnDropHandle<Result<Vec<DeploymentEntry>, ApiError>>,
+}
+
+/// Supersession depth for detached history requests: a request stays in
+/// flight across at most this many [`WAIT_ATTEMPT_BUDGET`] refresh windows
+/// before a newer one may replace it. That bounds sockets on a stalled
+/// endpoint while still observing any response slower than the attempt
+/// budget (see [`DeploymentHistoryProbe`]).
+const HISTORY_MAX_IN_FLIGHT: usize = 3;
+
+/// Polling granularity for the successful-exit pickup
+/// ([`DeploymentHistoryProbe::take_landed_within`]): how often a pending
+/// handle is checked while the exit waits, bounded by the pickup budget.
+const LANDED_PICKUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Detached deployment-history observation for the wait loops (cap#220
+/// review follow-ups).
+///
+/// Deployment history is the source of truth for the apply-start, health,
+/// and terminal-failure checks, so its answers must be observed however slow
+/// they are -- but no single request may consume the enclosing wait, and the
+/// wait must keep retrying after the endpoint recovers. One synchronous
+/// request cannot satisfy all three (the reviews alternated between "cut at
+/// a small budget", which discards valid slower answers, and "wait up to the
+/// deadline", which lets one stalled request block every retry), so history
+/// requests are detached from the wait loop instead:
+///
+/// - a pump issues at most one new request per [`WAIT_ATTEMPT_BUDGET`] window
+///   while older ones keep running, so an answer slower than the attempt
+///   budget (e.g. 70s) is observed whenever it lands instead of being
+///   cancelled at 60s -- any response arriving within
+///   [`HISTORY_MAX_IN_FLIGHT`] refresh windows (~3 minutes) of its request
+///   start is observed, and older pending requests are superseded;
+/// - landed answers are returned to exactly one caller, whenever they land,
+///   and a pump never blocks waiting for one, so a stalled history endpoint
+///   cannot spend the wait's budget before the readiness polls behind the
+///   check run (cap#220 review follow-up #2: a 30s template wait must still
+///   poll its ready TEE endpoint);
+/// - requests are only issued while the wait still has budget (a passed
+///   deadline issues nothing), a landed answer is never dropped (a request
+///   is only ever superseded while still pending), and the probe -- with
+///   every request it holds -- is dropped when the wait returns.
+pub(crate) struct DeploymentHistoryProbe {
+    in_flight: VecDeque<HistoryRequest>,
+    refresh_age: Duration,
+}
+
+impl DeploymentHistoryProbe {
+    pub(crate) fn new() -> Self {
+        Self::with_refresh_age(WAIT_ATTEMPT_BUDGET)
+    }
+
+    /// A probe with a non-default refresh window (tests exercise the
+    /// supersession behavior without waiting out the real budget).
+    fn with_refresh_age(refresh_age: Duration) -> Self {
+        Self {
+            in_flight: VecDeque::new(),
+            refresh_age,
+        }
+    }
+
+    /// Keep the observation current: issue a detached request when none is
+    /// in flight or the newest one is a refresh window old, applying the
+    /// overflow supersession policy. A passed wait deadline issues nothing.
+    ///
+    /// The supersession check runs on *every* pump, not only when a refresh
+    /// is due (cap#220 review follow-up): the successful-exit gate issues
+    /// and consumes a fresh request per iteration, which keeps the newest
+    /// request younger than the refresh window -- so a pump that only
+    /// retired stale requests when issuing new ones would never retire a
+    /// request that stalled before the gate.
+    fn ensure_request(&mut self, api: &ApiClient, app_name: &str, wait_deadline: Instant) {
+        if wait_attempt_budget(wait_deadline).is_zero() {
+            return;
+        }
+        self.supersede_overflow();
+        let refresh_due = self
+            .in_flight
+            .back()
+            .is_none_or(|request| request.issued_at.elapsed() >= self.refresh_age);
+        if !refresh_due {
+            return;
+        }
+        self.push_request(api, app_name);
+        self.supersede_overflow();
+    }
+
+    /// Issue a detached request now, ignoring the refresh cadence
+    /// (cap#220 review follow-up): a successful exit needs a *current*
+    /// observation, and the newest answer the probe already holds may
+    /// predate the deployment's failure -- a pre-gate non-failure is not
+    /// authority. This never supersedes older pending lookups (cap#220
+    /// review): at a successful exit any of them may be the request about to
+    /// report the failure, so they get their full chance to land inside the
+    /// gate's settle budget; only the wait loop's next pump applies the
+    /// overflow policy, after that budget has passed. A passed wait deadline
+    /// issues nothing.
+    fn force_request(&mut self, api: &ApiClient, app_name: &str, wait_deadline: Instant) {
+        if wait_attempt_budget(wait_deadline).is_zero() {
+            return;
+        }
+        self.push_request(api, app_name);
+    }
+
+    /// One detached lookup.
+    fn push_request(&mut self, api: &ApiClient, app_name: &str) {
+        let api = api.clone();
+        let app_name = app_name.to_owned();
+        self.in_flight.push_back(HistoryRequest {
+            issued_at: Instant::now(),
+            handle: AbortOnDropHandle::new(tokio::spawn(async move {
+                api.list_deployments(&app_name).await
+            })),
+        });
+    }
+
+    /// The pump's overflow policy: bound sockets on a stalled endpoint while
+    /// still observing any response slower than the refresh cadence.
+    ///
+    /// Requests are superseded by *age*, not just by count (cap#220 review
+    /// follow-up): a stalled request only ever hits the depth limit when the
+    /// endpoint stays silent, but the successful-exit gate consumes every
+    /// fresh answer it issues, so a healthy endpoint keeps the queue below
+    /// the depth limit indefinitely -- and a request that stalled *before*
+    /// the gate would then survive forever, blocking every later gate with
+    /// `Inconclusive` until the wait's deadline (the exact bug the review
+    /// reported). Aging out at [`HISTORY_MAX_IN_FLIGHT`] refresh windows
+    /// gives every request the same bounded lifetime (~3 minutes) the depth
+    /// policy intended, independently of how often answers land, while the
+    /// landed-answer guard still applies: a finished request is never
+    /// superseded (its answer is picked up unobserved-dropping-free by the
+    /// next `take_landed`), and aborting a task that already finished is a
+    /// no-op anyway.
+    fn supersede_overflow(&mut self) {
+        let max_age = self.refresh_age * (HISTORY_MAX_IN_FLIGHT as u32);
+        while let Some(front) = self.in_flight.front() {
+            // Never supersede a landed answer: its result would be dropped
+            // unobserved. A finished request is picked up on the next
+            // `take_landed`, one per call, before any further supersession.
+            if front.handle.is_finished() {
+                break;
+            }
+            // Age bound (cap#220 review follow-up): a request older than
+            // `HISTORY_MAX_IN_FLIGHT` refresh windows is retired even below
+            // the depth limit. The depth check alone never fires while the
+            // successful-exit gate keeps consuming the fresh answers it
+            // issues, so a request that stalled before the gate would
+            // otherwise stay pending forever and hold every later gate at
+            // `Inconclusive` until the wait's deadline.
+            let over_depth = self.in_flight.len() > HISTORY_MAX_IN_FLIGHT;
+            let expired = front.issued_at.elapsed() >= max_age;
+            if !over_depth && !expired {
+                break;
+            }
+            if let Some(superseded) = self.in_flight.pop_front() {
+                superseded.handle.abort();
+            }
+        }
+    }
+
+    /// Consume one landed observation, without blocking: `None` means no
+    /// answer has landed since the previous call (still in flight, or the
+    /// request was cancelled/panicked -- indistinguishable from "no
+    /// observation", so the caller keeps waiting and the wait's own deadline
+    /// governs).
+    async fn take_landed(&mut self) -> Option<(Instant, Result<Vec<DeploymentEntry>, ApiError>)> {
+        let index = self
+            .in_flight
+            .iter()
+            .position(|request| request.handle.is_finished())?;
+        let mut request = self.in_flight.remove(index)?;
+        // A cancelled or panicked task surfaces as `Err` and reads as "no
+        // observation", exactly like `take_landed`'s `None`.
+        match request.handle.join().await {
+            Some(Ok(result)) => Some((request.issued_at, result)),
+            Some(Err(_)) | None => None,
+        }
+    }
+
+    /// Consume observations for a successful wait exit (cap#220 review
+    /// follow-up): every answer that lands within `budget`, waiting while
+    /// requests are still in flight. Two properties the exit gate needs:
+    ///
+    /// - a landed answer is never dropped unobserved -- `on_landed` sees it
+    ///   the moment it lands (with the request's issue time, so the gate can
+    ///   tell a current answer from a stale one), so a failure answer is
+    ///   reported right away instead of after the rest settles;
+    /// - a pending request keeps the exit waiting, so a stale non-failure
+    ///   answer can never authorize success while the request that would
+    ///   show the current state is still in flight.
+    ///
+    /// `on_landed` returns `false` to stop the settle immediately (a
+    /// terminal failure needs no further observation). `budget` expires
+    /// with requests still pending (a stalled history endpoint): the
+    /// returned `bool` says whether everything settled (`true`) or the
+    /// budget ran out with answers still pending (`false`) -- the caller
+    /// must treat the latter as an inconclusive observation, never as
+    /// authority for success.
+    async fn take_settled_within(
+        &mut self,
+        budget: Duration,
+        mut on_landed: impl FnMut(Instant, Result<Vec<DeploymentEntry>, ApiError>) -> bool,
+    ) -> bool {
+        let deadline = Instant::now() + budget;
+        loop {
+            while let Some((issued_at, result)) = self.take_landed().await {
+                if !on_landed(issued_at, result) {
+                    return false;
+                }
+            }
+            if self.in_flight.is_empty() {
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            tokio::time::sleep(remaining.min(LANDED_PICKUP_POLL_INTERVAL)).await;
+        }
+    }
+}
+
+impl Default for DeploymentHistoryProbe {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Fail fast when CAP has already terminalized the deployment we are waiting
+/// on (#18): a manifest-apply rejection (e.g. the KBS signed-policy byte
+/// budget) otherwise surfaces only as an opaque wait timeout ~10 minutes
+/// later. Shared by the standalone `app deploy` waits and the hosted
+/// template deploy flow. The history lookup is a non-blocking pickup from
+/// the detached probe (cap#220 review follow-ups): the check issues a
+/// request and consumes an answer only if one has landed, so it can never
+/// spend the enclosing wait's budget on a stalled history endpoint before
+/// the readiness polls behind it run -- while a slow-but-valid answer (the
+/// one that carries the #18 rejection) is still observed when it lands.
+pub(crate) async fn fail_if_template_deployment_failed(
+    api: &ApiClient,
+    app_name: &str,
+    deployment_id: &str,
+    wait_deadline: Instant,
+    history: &mut DeploymentHistoryProbe,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if deployment_id == "pending" {
+        return Ok(());
+    }
+    match template_deployment_failure(api, app_name, deployment_id, wait_deadline, history).await {
+        Ok(Some(message)) => Err(message.into()),
+        Ok(None) => Ok(()),
+        Err(error) if should_retry_template_deployment_status_error(&error) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Classify one deployment-history answer for `deployment_id`: `Ok(Some)` is
+/// the terminal-failure message when the answer records the deployment as
+/// `failed`. Shared by the per-iteration failure check and the
+/// successful-exit reconciliation (cap#220 review follow-up) so both report
+/// exactly the same terminal error.
+fn deployment_history_failure(
+    result: Result<Vec<DeploymentEntry>, ApiError>,
+    deployment_id: &str,
+) -> Result<Option<String>, ApiError> {
+    let deployment = result?
+        .into_iter()
+        .find(|deployment| deployment.id == deployment_id);
+    Ok(deployment
+        .as_ref()
+        .filter(|deployment| deployment.status == "failed")
+        .map(|deployment| template_deployment_failure_message(deployment, deployment_id)))
+}
+
+async fn template_deployment_failure(
+    api: &ApiClient,
+    app_name: &str,
+    deployment_id: &str,
+    wait_deadline: Instant,
+    history: &mut DeploymentHistoryProbe,
+) -> Result<Option<String>, ApiError> {
+    // Non-blocking pickup from the detached history probe (cap#220 review
+    // follow-ups): the request runs past any per-attempt budget, so a
+    // slow-but-valid answer -- including the issue #18 rejection -- is
+    // observed when it lands, while a stalled endpoint costs this check
+    // nothing and the readiness polls still run every iteration.
+    history.ensure_request(api, app_name, wait_deadline);
+    let Some((_issued_at, result)) = history.take_landed().await else {
+        return Ok(None);
+    };
+    deployment_history_failure(result, deployment_id)
+}
+
+fn template_deployment_failure_message(
+    deployment: &DeploymentEntry,
+    deployment_id: &str,
+) -> String {
+    let detail = deployment
+        .error_message
+        .as_deref()
+        .unwrap_or("deployment failed");
+    format!("deployment {deployment_id} failed: {detail}")
+}
+
+pub(crate) fn should_retry_template_deployment_status_error(error: &ApiError) -> bool {
+    match error {
+        ApiError::Http(error) => should_retry_api_transport_error(error),
+        // A malformed or oversized body will not improve on retry.
+        ApiError::Decode(_) | ApiError::ResponseTooLarge(_) => false,
+        ApiError::Api { status, code, .. } => {
+            if matches!(
+                code.as_deref(),
+                Some("cap_response_invalid" | "not_implemented_hosted")
+            ) {
+                return false;
+            }
+            matches!(*status, 404 | 408 | 409 | 425 | 429 | 500..=599)
+        }
+        ApiError::NotAuthenticated => false,
+    }
+}
+
+/// Outcome of the successful-exit gate
+/// ([`reconcile_success_with_deployment_history`]).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SuccessGate {
+    /// A *current* observation (a request issued at the gate) landed and
+    /// shows this deployment present and not failed, with every pending
+    /// lookup settled: the success is authorized.
+    Confirmed,
+    /// No conclusive current observation: the fresh request never landed
+    /// within the settle budget, or landed without this deployment's row, or
+    /// its lookup failed transiently. The caller keeps the wait running and
+    /// the enclosing deadline governs (cap#220 review follow-up): a stalled
+    /// or flaky history endpoint may delay a ready deploy to its deadline --
+    /// the safe side of the bug this gate exists for -- but success is never
+    /// claimed without the observation that rules out a failed deployment.
+    Inconclusive,
+}
+
+/// Gate a wait's successful exit on deployment history (cap#220 review
+/// follow-up). Readiness alone must not end a wait: a failed deployment can
+/// otherwise proceed to ownership handling before its history answer lands
+/// and the terminal error is never reported. Success is authorized only on a
+/// conclusive current observation; the gate settles the probe's requests
+/// before returning its three-way verdict:
+///
+/// - it always asks for a *current* observation first: the newest answer
+///   the probe already holds may predate the deployment's failure (a
+///   pre-gate non-failure is not authority), so a fresh request goes out at
+///   the exit regardless of the refresh cadence;
+/// - every landed answer is consumed and reported the moment it lands -- a
+///   landed failure is never dropped unobserved and never waits on the rest;
+/// - a pending request keeps the exit waiting, so a stale non-failure
+///   answer can never authorize success while the request that would show
+///   the current state is still in flight;
+/// - [`SuccessGate::Confirmed`] requires the fresh answer to land showing
+///   the deployment present and not failed, with nothing else pending.
+///   Pending, a missing row, a transient lookup error, or budget expiry is
+///   [`SuccessGate::Inconclusive`]: the caller keeps the wait and its probe
+///   running (nothing is aborted) and the enclosing deadline produces the
+///   timeout. The settle is bounded by one per-attempt budget
+///   ([`wait_attempt_budget`], 60 seconds, min'd with the wait's remaining
+///   time), so an inconclusive exit never consumes more than one attempt.
+pub(crate) async fn reconcile_success_with_deployment_history(
+    api: &ApiClient,
+    app_name: &str,
+    deployment_id: &str,
+    wait_deadline: Instant,
+    history: &mut DeploymentHistoryProbe,
+) -> Result<SuccessGate, Box<dyn std::error::Error>> {
+    if deployment_id == "pending" {
+        return Ok(SuccessGate::Confirmed);
+    }
+    let entry_at = Instant::now();
+    history.force_request(api, app_name, wait_deadline);
+    let mut failure: Option<Box<dyn std::error::Error>> = None;
+    let mut fresh_confirmed = false;
+    let settled = history
+        .take_settled_within(wait_attempt_budget(wait_deadline), |issued_at, result| {
+            let current = issued_at >= entry_at;
+            match result {
+                Ok(entries) => match entries.into_iter().find(|d| d.id == deployment_id) {
+                    Some(deployment) if deployment.status == "failed" => {
+                        failure = Some(
+                            template_deployment_failure_message(&deployment, deployment_id).into(),
+                        );
+                        false
+                    }
+                    Some(_) => {
+                        // Only the fresh request's non-failure is authority;
+                        // a stale one may predate the failure.
+                        fresh_confirmed |= current;
+                        true
+                    }
+                    // A missing row is never authority (cap#220 review
+                    // follow-up): without the entry we cannot rule out that
+                    // this deployment is the failed one.
+                    None => true,
+                },
+                // A transient lookup error reads as "no observation", the
+                // same retry predicate as the per-iteration check -- but it
+                // can never authorize success either (cap#220 review
+                // follow-up): a conclusive exit needs a landed non-failure
+                // for this deployment id.
+                Err(error) if should_retry_template_deployment_status_error(&error) => true,
+                Err(error) => {
+                    failure = Some(error.into());
+                    false
+                }
+            }
+        })
+        .await;
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(if fresh_confirmed && settled {
+            SuccessGate::Confirmed
+        } else {
+            SuccessGate::Inconclusive
+        }),
+    }
+}
+
 async fn find_deployment_entry(
     api: &ApiClient,
     app_name: &str,
     deployment_id: &str,
+    wait_deadline: Instant,
+    history: &mut DeploymentHistoryProbe,
 ) -> Result<Option<DeploymentEntry>, ApiError> {
-    Ok(api
-        .list_deployments(app_name)
-        .await?
+    // Non-blocking pickup from the detached history probe (cap#220 review
+    // follow-ups): the apply-start and health waits learn deployment state
+    // only through this lookup, so its request must survive past any
+    // per-attempt budget -- a slow-but-valid `healthy` answer is observed
+    // when it lands instead of being cancelled and turning the wait into a
+    // false timeout.
+    history.ensure_request(api, app_name, wait_deadline);
+    let Some((_issued_at, result)) = history.take_landed().await else {
+        return Ok(None);
+    };
+    Ok(result?
         .into_iter()
         .find(|deployment| deployment.id == deployment_id))
 }
@@ -1378,6 +2090,7 @@ async fn wait_for_deployment_apply_start(
     pb: &ProgressBar,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let start = Instant::now();
+    let mut history = DeploymentHistoryProbe::new();
     loop {
         if start.elapsed() > max_wait {
             pb.abandon_with_message("Deployment apply timed out");
@@ -1388,7 +2101,9 @@ async fn wait_for_deployment_apply_start(
             .into());
         }
 
-        match find_deployment_entry(api, app_name, deployment_id).await {
+        match find_deployment_entry(api, app_name, deployment_id, start + max_wait, &mut history)
+            .await
+        {
             Ok(Some(deployment)) => match deployment.status.as_str() {
                 "pending" => pb.set_message(timed_progress(
                     "Applying deployment: pending",
@@ -1402,7 +2117,30 @@ async fn wait_for_deployment_apply_start(
                         .unwrap_or("deployment failed before apply");
                     return Err(format!("deployment {deployment_id} failed: {detail}").into());
                 }
-                _ => return Ok(()),
+                _ => {
+                    // A success exit must be authorized by a current
+                    // deployment-state observation (cap#220 review
+                    // follow-up): acting on the oldest landed answer and
+                    // returning would drop a newer failure already landed or
+                    // in flight, and an inconclusive observation keeps the
+                    // wait running (the enclosing deadline governs).
+                    if let SuccessGate::Confirmed = reconcile_success_with_deployment_history(
+                        api,
+                        app_name,
+                        deployment_id,
+                        start + max_wait,
+                        &mut history,
+                    )
+                    .await?
+                    {
+                        return Ok(());
+                    }
+                    pb.set_message(timed_progress(
+                        "Applying deployment: confirming state",
+                        start.elapsed(),
+                        max_wait,
+                    ));
+                }
             },
             Ok(None) => pb.set_message(timed_progress(
                 "Applying deployment: waiting for record",
@@ -1431,6 +2169,7 @@ async fn wait_for_deployment_completion(
     let deployment_id = deployment.deployment_id;
     let start = Instant::now();
     let mut terminal_probe_at: Option<Instant> = None;
+    let mut history = DeploymentHistoryProbe::new();
     loop {
         if start.elapsed() > max_wait {
             pb.abandon_with_message("Workload health timed out");
@@ -1457,9 +2196,36 @@ async fn wait_for_deployment_completion(
             return Err(terminal_bootstrap_failure_message(app_name, &diagnostic).into());
         }
 
-        match find_deployment_entry(api, app_name, deployment_id).await {
+        match find_deployment_entry(api, app_name, deployment_id, start + max_wait, &mut history)
+            .await
+        {
             Ok(Some(deployment)) => match deployment.status.as_str() {
-                "healthy" => return Ok(()),
+                "healthy" => {
+                    // The final "Deployed and healthy" exit must be
+                    // authorized by a current deployment-state observation
+                    // (cap#220 review follow-up): acting on the oldest
+                    // landed answer and returning would drop a newer failure
+                    // already landed or in flight -- a false success, not
+                    // just a delayed one -- and an inconclusive observation
+                    // keeps the wait running (the enclosing deadline
+                    // governs).
+                    if let SuccessGate::Confirmed = reconcile_success_with_deployment_history(
+                        api,
+                        app_name,
+                        deployment_id,
+                        start + max_wait,
+                        &mut history,
+                    )
+                    .await?
+                    {
+                        return Ok(());
+                    }
+                    pb.set_message(timed_progress(
+                        "Workload health: confirming state",
+                        start.elapsed(),
+                        max_wait,
+                    ));
+                }
                 "failed" => {
                     let detail = deployment
                         .error_message
@@ -1692,6 +2458,12 @@ pub(crate) async fn claim_initial_ownership(
             );
         }
     };
+    if !deployment.matches_launch_identity(tee.verified_launch_identity().as_ref()) {
+        return Err(
+            "TEE launch identity does not match the signed deployment; no ownership was claimed; retry the deployment"
+                .into(),
+        );
+    }
 
     let challenge = match bounded_request(deadline, tee.bootstrap_challenge()).await {
         Some(challenge) => challenge?,
@@ -1925,8 +2697,141 @@ pub async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> 
             println!("Evidence: {reason}");
         }
     }
+    if let Some(deployment) = &status.deployment {
+        print_deployment_diagnostics(deployment);
+    }
 
     Ok(())
+}
+
+/// One owner-facing sentence for the common lifecycle states (#90). The
+/// strings are fixed tokens from the API contract; only timing context is
+/// appended, never provider or workload text.
+fn deployment_condition_action(
+    condition: &str,
+    phase: Option<&str>,
+    reason: Option<&str>,
+) -> &'static str {
+    if phase == Some("destroying") {
+        // Deletion has no durable background job: the API distinguishes
+        // finite lease quarantine (app_deleting) from poisoned fences
+        // (app_deletion_blocked_by_poisoned_fence). Use the reason to
+        // select the correct action.
+        return match (condition, reason) {
+            ("blocked_by_operation", _) => {
+                "deletion stalled after the delete request ended; run the delete again to resume teardown"
+            }
+            ("waiting_external", Some("app_deletion_blocked_by_poisoned_fence")) => {
+                "deletion blocked by a poisoned resource fence; contact support to clear namespace finalizers"
+            }
+            ("waiting_external", Some("app_deletion_abandoned_waiting_on_foreign_fence")) => {
+                "deletion request expired while a foreign operation still holds the namespace; wait for the Blocked: deadline to pass, then re-run delete to resume"
+            }
+            ("waiting_external", _) => {
+                "deletion in progress; wait for teardown to complete before creating it again"
+            }
+            _ => "the app is being deleted; wait for teardown to complete before creating it again",
+        };
+    }
+    match condition {
+        "progressing" => "wait; the deployment is making progress",
+        "waiting_external" => {
+            "wait; the platform will pick this deployment up automatically at the scheduled time"
+        }
+        "blocked_by_operation" => {
+            "another operation owns this app's mutation lane; wait for it to finish or retry after it completes"
+        }
+        "stalled" => "no worker or retry schedule is recorded; contact support if this persists",
+        "terminal" => match phase {
+            Some("healthy") => "the deployment completed successfully",
+            Some("cancelled") => "the deployment was superseded by a newer deployment",
+            Some("rolled_back") => "the deployment was rolled back to a previous version",
+            Some("failed") => {
+                "the deployment failed; wait for any rollback to finish, then redeploy to try again"
+            }
+            _ => "the deployment failed; redeploy to try again",
+        },
+        _ => "lifecycle details are unavailable from this API instance",
+    }
+}
+
+/// "3m ago" / "in 25s" style relative age for owner-facing timestamps.
+/// Falls back to the raw timestamp when it cannot be parsed.
+fn relative_time(timestamp: &str) -> String {
+    let parsed = chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|parsed| parsed.with_timezone(&chrono::Utc));
+    match parsed {
+        Ok(parsed) => {
+            let delta = chrono::Utc::now().signed_duration_since(parsed);
+            let seconds = delta.num_seconds();
+            if seconds >= 0 {
+                if seconds < 60 {
+                    format!("{timestamp} ({seconds}s ago)")
+                } else if seconds < 3600 {
+                    format!("{timestamp} ({}m ago)", seconds / 60)
+                } else {
+                    format!("{timestamp} ({}h ago)", seconds / 3600)
+                }
+            } else {
+                let seconds = -seconds;
+                if seconds < 60 {
+                    format!("{timestamp} (in {seconds}s)")
+                } else if seconds < 3600 {
+                    format!("{timestamp} (in {}m)", seconds / 60)
+                } else {
+                    format!("{timestamp} (in {}h)", seconds / 3600)
+                }
+            }
+        }
+        Err(_) => timestamp.to_string(),
+    }
+}
+
+fn print_deployment_diagnostics(deployment: &DeploymentDiagnostics) {
+    use colored::Colorize;
+    let phase_colored = match deployment.condition.as_str() {
+        "terminal" if deployment.phase == "failed" => deployment.phase.red().to_string(),
+        "terminal" if deployment.phase == "healthy" => deployment.phase.green().to_string(),
+        "progressing" | "waiting_external" => deployment.phase.yellow().to_string(),
+        "stalled" | "blocked_by_operation" => deployment.phase.red().to_string(),
+        _ => deployment.phase.yellow().to_string(),
+    };
+    println!("Deploy:   {phase_colored} ({})", deployment.condition);
+    if let Some(reason) = &deployment.reason {
+        println!("Reason:   {reason}");
+    }
+    if let Some(last_progress_at) = &deployment.last_progress_at {
+        println!("Progress: {}", relative_time(last_progress_at));
+    }
+    if let Some(attempts) = deployment.attempts {
+        println!("Attempts: {attempts}");
+    }
+    if let Some(next_retry_at) = &deployment.next_retry_at {
+        println!("Retry:    {}", relative_time(next_retry_at));
+    }
+    if let Some(blocked_until) = &deployment.blocked_until {
+        println!(
+            "Blocked:  mutation lane admits retries after {}",
+            relative_time(blocked_until)
+        );
+    }
+    if let Some(blocking_operation) = &deployment.blocking_operation {
+        println!("Holder:   {blocking_operation}");
+    }
+    if let Some(observing_since) = &deployment.observing_since {
+        println!(
+            "Watching: observing since {}",
+            relative_time(observing_since)
+        );
+    }
+    println!(
+        "Action:   {}",
+        deployment_condition_action(
+            &deployment.condition,
+            Some(&deployment.phase),
+            deployment.reason.as_deref()
+        )
+    );
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -2001,33 +2906,44 @@ pub async fn logs(args: LogsArgs) -> Result<(), Box<dyn std::error::Error>> {
     let private_key = load_log_private_key(args.log_private_key_file.as_ref())?;
 
     if args.follow {
-        // Stream logs line by line
-        use tokio::io::AsyncBufReadExt;
         let stream = resp.bytes_stream();
         let reader = tokio_util::io::StreamReader::new(
             stream.map(|result| result.map_err(std::io::Error::other)),
         );
-        let mut lines = tokio::io::BufReader::new(reader).lines();
-        while let Some(line) = lines.next_line().await? {
+        let mut reader = tokio::io::BufReader::new(reader);
+        let mut line = String::new();
+        while read_bounded_log_line(&mut reader, &mut line).await? != 0 {
             print_decrypted_log_frame(&private_key, &line)?;
         }
     } else {
-        // Non-follow mode: bound the buffered read so a hostile API cannot
-        // stream an unbounded "logs" body into CLI memory (the follow-mode
-        // stream below is line-at-a-time and inherently bounded by the
-        // client timeout instead).
+        // A hostile API must not turn a buffered log read into unbounded memory use.
         let bytes = enclava_cli::api_client::read_bounded_body(
             resp,
             enclava_cli::api_client::MAX_API_RESPONSE_BODY_BYTES,
         )
         .await?;
         let body = String::from_utf8_lossy(&bytes);
-        for line in body.lines().filter(|line| !line.trim().is_empty()) {
+        for line in body.lines() {
             print_decrypted_log_frame(&private_key, line)?;
         }
     }
 
     Ok(())
+}
+
+async fn read_bounded_log_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    line: &mut String,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+
+    let limit = enclava_cli::api_client::MAX_API_RESPONSE_BODY_BYTES;
+    line.clear();
+    let read = reader.take((limit + 1) as u64).read_line(line).await?;
+    if read > limit {
+        return Err(enclava_cli::api_client::ApiError::ResponseTooLarge(limit).into());
+    }
+    Ok(read)
 }
 
 fn response_is_encrypted_logs(resp: &reqwest::Response) -> bool {
@@ -2060,14 +2976,19 @@ fn print_decrypted_log_frame(
     private_key: &str,
     line: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!("{}", decrypted_log_frame_output(private_key, line)?);
+    if let Some(output) = decrypted_log_frame_output(private_key, line)? {
+        println!("{output}");
+    }
     Ok(())
 }
 
 fn decrypted_log_frame_output(
     private_key: &str,
     line: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    if line.trim().is_empty() {
+        return Ok(None);
+    }
     let frame: EncryptedLogFrame =
         serde_json::from_str(line).map_err(|err| format!("invalid encrypted log frame: {err}"))?;
     let plaintext = decrypt_log_frame(private_key, &frame).map_err(|err| {
@@ -2077,13 +2998,13 @@ fn decrypted_log_frame_output(
         )
     })?;
     let message = String::from_utf8_lossy(&plaintext);
-    Ok(format!(
+    Ok(Some(format!(
         "{} {} {} {}",
         frame.timestamp,
         frame.container,
         frame.stream,
         sanitize_log_output(message.trim_end())
-    ))
+    )))
 }
 
 #[derive(Subcommand)]
@@ -2755,7 +3676,7 @@ fn destroy_failure_hint(code: Option<&str>, message: &str, app_name: &str) -> Op
         || message.contains("app_delete_teardown_locked");
     if teardown_cause {
         return Some(format!(
-            "the confidential workload is locked and the app remains intact; unlock it with its storage password (`enclava unlock --app {app_name}`), then retry destroy"
+            "the confidential workload is locked and the app remains intact; unlock it with its storage password (`enclava unlock --app {app_name}`), then retry destroy. If the unlock cannot reach the workload at all (the TEE endpoint never came up, e.g. every attempt fails the TEE TLS handshake -- not a transient network error), retrying will not help: contact the operator, or as a last resort `destroy --abandon-teardown` (it leaves the previous owner seed in KBS, which blocks recreating this app name until an operator cleans it up)"
         ));
     }
     match code {

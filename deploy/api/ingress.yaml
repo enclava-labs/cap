@@ -20,10 +20,10 @@ spec:
   ingressClassName: nginx
   tls:
   - hosts:
-    - api.enclava.dev
+    - cap.enclava.dev
     secretName: api-tls
   rules:
-  - host: api.enclava.dev
+  - host: cap.enclava.dev
     http:
       paths:
       - path: /
@@ -60,10 +60,10 @@ spec:
   ingressClassName: nginx
   tls:
   - hosts:
-    - api.enclava.dev
+    - cap.enclava.dev
     secretName: api-tls
   rules:
-  - host: api.enclava.dev
+  - host: cap.enclava.dev
     http:
       paths:
       - path: /auth/device/start

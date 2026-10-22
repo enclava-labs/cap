@@ -182,6 +182,7 @@ fn api_app_for_descriptor(
         signer_identity_subject: Some(descriptor.signer_identity.subject.clone()),
         signer_identity_issuer: Some(descriptor.signer_identity.issuer.clone()),
         signer_identity_set_at: Some("2026-04-01T00:00:00Z".parse().unwrap()),
+        signer_rotation_generation: 1,
         source_provider: None,
         source_repository: None,
         egress_allowlist: sqlx::types::Json(Vec::new()),
@@ -1342,6 +1343,36 @@ fn validates_signed_policy_artifact_with_configured_key() {
 }
 
 #[test]
+fn sign_response_verifies_against_signing_service_pin_and_not_a_trustee_pin() {
+    // cap#118 producer contract: policy artifacts come from the signing
+    // service's /sign endpoint (verify_pubkey_b64 = the service key's public
+    // half). Acceptance verifies them against SIGNING_SERVICE_PUBKEY_HEX; a
+    // distinct platform trustee policy key is a separate in-TEE authority
+    // and must never be loaded into the signing service, so the same
+    // artifact is rejected when checked against the trustee pin.
+    let artifacts = signing_artifacts(descriptor());
+    let signing_service_key = SigningKey::from_bytes(&[0x33; 32]);
+    let artifact = signed_policy_artifact(&artifacts, &signing_service_key);
+    let service_pubkey_hex = hex::encode(signing_service_key.verifying_key().to_bytes());
+    artifacts
+        .validate_signed_artifact(&artifact, &service_pubkey_hex)
+        .expect("/sign output verifies against the signing-service pin");
+
+    let trustee_key = SigningKey::from_bytes(&[0x44; 32]);
+    let trustee_pubkey_hex = hex::encode(trustee_key.verifying_key().to_bytes());
+    let err = artifacts
+        .validate_signed_artifact(&artifact, &trustee_pubkey_hex)
+        .unwrap_err();
+    // The ed25519 check runs first (#128), so a wrong pin surfaces
+    // InvalidSignature — the artifact does not verify against the trustee
+    // pin, which is the cap#118 producer contract.
+    assert!(
+        matches!(err, SigningServiceError::InvalidSignature),
+        "/sign output must not verify against a different pin, got: {err:?}"
+    );
+}
+
+#[test]
 fn validates_customer_supplied_policy_artifact_with_platform_key() {
     let artifacts = signing_artifacts(descriptor());
     let platform_key = SigningKey::from_bytes(&[0x33; 32]);
@@ -1617,7 +1648,9 @@ fn pinned_app_for_descriptor(descriptor: &DeploymentDescriptor) -> ConfidentialA
         descriptor_signing_pubkey: [2; 32],
         org_keyring_fingerprint: [3; 32],
         omit_log_encryption_claim: false,
+        legacy_collapsed_trustee_key: false,
         omit_luks2_header_seal_claim: false,
+        omit_log_spool_bind_claim: false,
     });
     app
 }
@@ -1632,21 +1665,24 @@ fn artifacts_with_expected_hash(
 }
 
 #[test]
-fn modern_render_match_clears_the_legacy_pin() {
+fn modern_render_match_clears_the_legacy_pins() {
     let descriptor = descriptor();
     let mut app = pinned_app_for_descriptor(&descriptor);
-    app.workload_artifact_binding
-        .as_mut()
-        .unwrap()
-        .omit_log_encryption_claim = true;
-    // The artifact was signed over the true modern render (both pins clear);
-    // the stale pin on the app must not affect which render matches.
+    // Stale pins from a previously validated artifact must not survive a
+    // modern match.
+    {
+        let binding = app.workload_artifact_binding.as_mut().unwrap();
+        binding.omit_log_encryption_claim = true;
+        binding.legacy_collapsed_trustee_key = true;
+    }
+    // The artifact was signed over the true modern render (all pins clear);
+    // the stale pins on the app must not affect which render matches.
     let mut modern_app = app.clone();
-    modern_app
-        .workload_artifact_binding
-        .as_mut()
-        .unwrap()
-        .omit_log_encryption_claim = false;
+    {
+        let binding = modern_app.workload_artifact_binding.as_mut().unwrap();
+        binding.omit_log_encryption_claim = false;
+        binding.legacy_collapsed_trustee_key = false;
+    }
     let (_, modern_hash) =
         enclava_engine::manifest::cc_init_data::compute_cc_init_data(&modern_app);
     let artifacts = artifacts_with_expected_hash(
@@ -1656,13 +1692,92 @@ fn modern_render_match_clears_the_legacy_pin() {
     artifacts
         .validate_and_pin_cc_init_data_render(&mut app)
         .expect("modern render must validate");
+    let binding = app.workload_artifact_binding.as_ref().unwrap();
     assert!(
-        !app.workload_artifact_binding
-            .as_ref()
-            .unwrap()
-            .omit_log_encryption_claim,
+        !binding.omit_log_encryption_claim,
         "a modern match must explicitly clear a stale legacy pin"
     );
+    assert!(
+        !binding.legacy_collapsed_trustee_key,
+        "a modern match must explicitly clear a stale collapsed pin"
+    );
+}
+
+#[test]
+fn pre_split_collapsed_trustee_render_match_pins_the_binding() {
+    // cap#118 review follow-up: descriptors signed before the policy-key
+    // split carry an expected_cc_init_data_hash over a render whose trustee
+    // slot held the signing-service key (the collapsed default). The split
+    // must not strand their rollback/unlock/replay re-validation: the
+    // collapsed render is accepted and pinned so every consumer renders the
+    // exact signed bytes until the app is re-signed.
+    let descriptor = descriptor();
+    let mut app = pinned_app_for_descriptor(&descriptor);
+    // Post-split deployment config: two distinct keys.
+    app.attestation.platform_trustee_policy_pubkey_hex = Some("33".repeat(32));
+    app.attestation.signing_service_pubkey_hex = Some("bb".repeat(32));
+    let mut collapsed_app = app.clone();
+    collapsed_app
+        .workload_artifact_binding
+        .as_mut()
+        .unwrap()
+        .legacy_collapsed_trustee_key = true;
+    let (_, collapsed_hash) =
+        enclava_engine::manifest::cc_init_data::compute_cc_init_data(&collapsed_app);
+    let (_, modern_hash) = enclava_engine::manifest::cc_init_data::compute_cc_init_data(&app);
+    assert_ne!(
+        collapsed_hash, modern_hash,
+        "the collapsed layout must differ from the split layout"
+    );
+    let artifacts = artifacts_with_expected_hash(
+        &descriptor,
+        hex::decode(collapsed_hash).unwrap().try_into().unwrap(),
+    );
+    artifacts
+        .validate_and_pin_cc_init_data_render(&mut app)
+        .expect("pre-split collapsed render must validate");
+    let binding = app.workload_artifact_binding.as_ref().unwrap();
+    assert!(
+        binding.legacy_collapsed_trustee_key,
+        "a collapsed-only match must pin the binding to the collapsed render"
+    );
+    assert!(!binding.omit_log_encryption_claim);
+    // Every downstream render reproduces the signed bytes: the trustee slot
+    // renders the signing-service key, exactly as the pre-split API did.
+    let signing_key = "bb".repeat(32);
+    assert_eq!(
+        app.rendered_platform_trustee_policy_pubkey_hex(),
+        Some(signing_key.as_str())
+    );
+}
+
+#[test]
+fn collapsed_and_pre_claim_render_match_pins_both() {
+    // The oldest legacy layout predates both the log_encryption_json claim
+    // and the policy-key split; both pins must be set when that render is
+    // the only match.
+    let descriptor = descriptor();
+    let mut app = pinned_app_for_descriptor(&descriptor);
+    app.attestation.platform_trustee_policy_pubkey_hex = Some("33".repeat(32));
+    app.attestation.signing_service_pubkey_hex = Some("bb".repeat(32));
+    let mut historical_app = app.clone();
+    {
+        let binding = historical_app.workload_artifact_binding.as_mut().unwrap();
+        binding.legacy_collapsed_trustee_key = true;
+        binding.omit_log_encryption_claim = true;
+    }
+    let (_, historical_hash) =
+        enclava_engine::manifest::cc_init_data::compute_cc_init_data(&historical_app);
+    let artifacts = artifacts_with_expected_hash(
+        &descriptor,
+        hex::decode(historical_hash).unwrap().try_into().unwrap(),
+    );
+    artifacts
+        .validate_and_pin_cc_init_data_render(&mut app)
+        .expect("oldest legacy layout must validate");
+    let binding = app.workload_artifact_binding.as_ref().unwrap();
+    assert!(binding.legacy_collapsed_trustee_key);
+    assert!(binding.omit_log_encryption_claim);
 }
 
 #[test]
@@ -1697,17 +1812,25 @@ fn legacy_render_match_pins_the_binding() {
 fn render_mismatch_resets_the_pin_and_errors() {
     let descriptor = descriptor();
     let mut app = pinned_app_for_descriptor(&descriptor);
+    // Stale pins from a previous artifact must not survive a failure.
+    {
+        let binding = app.workload_artifact_binding.as_mut().unwrap();
+        binding.omit_log_encryption_claim = true;
+        binding.legacy_collapsed_trustee_key = true;
+    }
     let artifacts = artifacts_with_expected_hash(&descriptor, [0xaa; 32]);
     let err = artifacts
         .validate_and_pin_cc_init_data_render(&mut app)
         .expect_err("neither render matches");
     assert!(matches!(err, SigningServiceError::Mismatch(_)));
+    let binding = app.workload_artifact_binding.as_ref().unwrap();
     assert!(
-        !app.workload_artifact_binding
-            .as_ref()
-            .unwrap()
-            .omit_log_encryption_claim,
+        !binding.omit_log_encryption_claim,
         "a failed validation must not leave the legacy pin set"
+    );
+    assert!(
+        !binding.legacy_collapsed_trustee_key,
+        "a failed validation must not leave the collapsed pin set"
     );
 }
 
@@ -1775,6 +1898,89 @@ fn seal_claim_render_without_log_encryption_also_matches() {
     assert!(binding.omit_luks2_header_seal_claim);
 }
 
+// --- log_spool_storage render compatibility (cap#289) ---
+
+#[test]
+fn pre_spool_bind_claim_render_match_pins_the_binding() {
+    let descriptor = descriptor();
+    let mut app = pinned_app_for_descriptor(&descriptor);
+    // The claim only exists under the v2 signed layout; give the app a v2
+    // policy so the pin changes the render.
+    let policy_text =
+        "# enclava-cap-volume-layout: guest-memory-v2\npackage agent_policy\n".to_string();
+    app.generated_agent_policy = Some(GeneratedAgentPolicy {
+        policy_sha256: Sha256::digest(policy_text.as_bytes()).into(),
+        policy_text,
+        genpolicy_version_pin: "kata-containers/genpolicy@3.28.0+test".to_string(),
+    });
+    // An artifact signed before the log_spool_storage claim existed hashes
+    // a render without it.
+    let mut pre_spool_app = app.clone();
+    pre_spool_app
+        .workload_artifact_binding
+        .as_mut()
+        .unwrap()
+        .omit_log_spool_bind_claim = true;
+    let (_, pre_spool_hash) =
+        enclava_engine::manifest::cc_init_data::compute_cc_init_data(&pre_spool_app);
+    let artifacts = artifacts_with_expected_hash(
+        &descriptor,
+        hex::decode(pre_spool_hash).unwrap().try_into().unwrap(),
+    );
+    artifacts
+        .validate_and_pin_cc_init_data_render(&mut app)
+        .expect("pre-spool-claim render must validate");
+    let binding = app.workload_artifact_binding.as_ref().unwrap();
+    assert!(
+        binding.omit_log_spool_bind_claim,
+        "a pre-claim-only match must pin the binding to the claim-less render"
+    );
+    assert!(
+        !binding.omit_log_encryption_claim,
+        "the log-encryption pin must stay modern when only the spool claim differs"
+    );
+}
+
+#[test]
+fn spool_gate_unsupported_rejects_claim_bearing_artifacts() {
+    // cap#290 review (init-first rollout): while this API deployment does
+    // not declare the `log_spool_storage` bind capability, an artifact
+    // signed over a claim-bearing render must be REJECTED — a pre-bind
+    // enclava-init parses the additive ConfigMap key but never performs the
+    // state-PVC bind, leaving the spool on the RAM mountpoint. The distinct
+    // diagnostic directs the operator to re-sign after the init rollout.
+    let descriptor = descriptor();
+    let mut app = pinned_app_for_descriptor(&descriptor);
+    // The claim only exists under the v2 signed layout.
+    let policy_text =
+        "# enclava-cap-volume-layout: guest-memory-v2\npackage agent_policy\n".to_string();
+    app.generated_agent_policy = Some(GeneratedAgentPolicy {
+        policy_sha256: Sha256::digest(policy_text.as_bytes()).into(),
+        policy_text,
+        genpolicy_version_pin: "kata-containers/genpolicy@3.28.0+test".to_string(),
+    });
+    let (_, claim_bearing_hash) =
+        enclava_engine::manifest::cc_init_data::compute_cc_init_data(&app);
+    let err = crate::signing_service::pin_matching_cc_init_data_render(
+        &mut app,
+        &claim_bearing_hash,
+        false,
+        false, // deployment does not declare log_spool_storage state-bind
+    )
+    .expect_err("claim-bearing artifact must be rejected while the gate is unsupported");
+    assert!(
+        matches!(&err, SigningServiceError::Mismatch(msg) if msg.contains("log_spool_storage") && msg.contains("re-sign")),
+        "expected a re-sign diagnostic naming log_spool_storage, got: {err:?}"
+    );
+    assert!(
+        !app.workload_artifact_binding
+            .as_ref()
+            .unwrap()
+            .omit_log_spool_bind_claim,
+        "a rejected artifact must not keep any legacy pin"
+    );
+}
+
 // --- claim-less artifacts once sealing is required (cap#244 review) ---
 
 #[test]
@@ -1798,6 +2004,7 @@ fn required_seal_policy_rejects_claim_less_artifacts() {
         &mut app,
         &pre_seal_hash,
         true, // active signed release: luks2_header_seal = required
+        true, // deployment declares log_spool_storage = state-bind-v1
     )
     .expect_err("claim-less artifact must be rejected under a required seal");
     assert!(
@@ -1824,6 +2031,7 @@ fn required_seal_policy_still_accepts_modern_render() {
         &mut app,
         &modern_hash,
         true, // active signed release: luks2_header_seal = required
+        true, // deployment declares log_spool_storage = state-bind-v1
     )
     .expect("modern render must still validate under a required seal");
     let binding = app.workload_artifact_binding.as_ref().unwrap();

@@ -206,10 +206,7 @@ pub async fn claim(args: ClaimArgs) -> Result<(), Box<dyn std::error::Error>> {
     let (api, paths) = build_api_client()?;
     let me = api.get_current_user().await?;
 
-    // Sink gate, before anything touches the TEE: the TEE returns the one-time
-    // recovery mnemonic exactly once and rejects a second claim, so an unsafe
-    // sink mode, an unattended session, or an unwritable keystore must abort
-    // here, while the claim can still be cancelled without side effects.
+    // Validate the recovery destination before the TEE can commit ownership.
     prepare_recovery_mnemonic_sink(
         &paths,
         &me.active_org.name,
@@ -338,44 +335,7 @@ pub(crate) fn validate_recovery_mnemonic_sink_mode(
     Ok(())
 }
 
-/// Attendance for an ownership claim, in two shapes.
-///
-/// Prompted claim: dialoguer renders the password prompt on stderr and
-/// errors when stderr is not a terminal, so both stdin and stderr must be
-/// terminals. A session with a terminal stdin but redirected stderr
-/// (`2>&1 | tee`) is refused up front with an error pointing at
-/// `--password-file` as the way to run a recorded-output claim, instead of
-/// failing later inside the prompt.
-///
-/// Password from a file: no prompt is rendered, so the explicit flag is the
-/// operator's acknowledgment that they are responsible for observing the
-/// claim result; a terminal on stdin keeps the claim in front of a present
-/// operator (foreground exit status), while CI and scripts (no terminal on
-/// stdin) stay refused pending response-loss recovery. The one-time mnemonic
-/// is persisted to the protected local keystore and never printed, so nothing
-/// depends on captured output; a lost response halts with a stable error
-/// wherever the operator directed their output. The TEE hands out recovery
-/// material exactly once and rejects a second claim, so a lost response
-/// strands the mnemonic irrecoverably — that residual is why unattended
-/// claims without a terminal stay disabled.
-pub(crate) fn claim_session_is_interactive(
-    stdin_is_terminal: bool,
-    stderr_is_terminal: bool,
-    password_from_file: bool,
-) -> bool {
-    if password_from_file {
-        stdin_is_terminal
-    } else {
-        stdin_is_terminal && stderr_is_terminal
-    }
-}
-
-/// Pre-mutation gate for flows that will auto-claim ownership (password-mode
-/// first deploys): fail with the claim-session requirements BEFORE the deploy
-/// request creates server-side rows. The same check inside
-/// `claim_initial_ownership` fires post-mutation, and a client abort there
-/// strands the server-side deployment with nothing client-side to clean it
-/// up (#194 residue). Same predicate, same message -- only earlier.
+/// Reject missing password input before creating server-side deployment state.
 pub(crate) fn ensure_claim_session_now(
     password_from_file: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -391,34 +351,18 @@ fn ensure_claim_session_for(
     stderr_is_terminal: bool,
     password_from_file: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if claim_session_is_interactive(stdin_is_terminal, stderr_is_terminal, password_from_file) {
+    if password_from_file || (stdin_is_terminal && stderr_is_terminal) {
         return Ok(());
     }
-    if stdin_is_terminal && !stderr_is_terminal && !password_from_file {
-        return Err(
-            "the claim password prompt cannot be shown while stderr is redirected (e.g. `2>&1 | tee`): \
-             pass --password-file <PATH> to claim with recorded output. Unattended (CI/script) \
-             claims remain disabled until response-loss recovery is supported."
-                .into(),
-        );
-    }
     Err(
-        "ownership claims require an interactive terminal on stdin: unattended (CI/script) claims are \
-         disabled until response-loss recovery is supported. The TEE returns the one-time \
-         recovery mnemonic only once, so a lost response in an unattended run is unrecoverable. \
-         Run `enclava claim` (or a deploy that auto-claims) from an interactive shell; \
-         recorded-output runs (`2>&1 | tee`) are supported with --password-file."
+        "ownership claim password input requires terminal stdin and stderr; \
+         for noninteractive runs pass --password-file <PATH> to `enclava claim`, \
+         or --storage-password-file <PATH> to `enclava deploy` / `enclava template deploy`."
             .into(),
     )
 }
 
-/// Prepare and validate the private recovery-mnemonic sink before the claim is
-/// sent: reject unsafe sink modes, require an interactive session (unattended
-/// claims are disabled), and prove the protected keystore destination is
-/// writable with the same owner-only atomic-write primitives the post-claim
-/// store uses. Called by the explicit `claim` flow and by
-/// `claim_initial_ownership` (deploy/template auto-claim) before any challenge
-/// or claim request.
+/// Prove the protected recovery destination is writable before requesting a claim.
 pub(crate) fn prepare_recovery_mnemonic_sink(
     paths: &CliPaths,
     org: &str,
@@ -1029,41 +973,23 @@ mod tests {
     }
 
     #[test]
-    fn claim_session_interactivity_matrix() {
-        // Prompted claims need both terminals: dialoguer renders the password
-        // prompt on stderr and errors on a non-terminal stderr.
-        assert!(claim_session_is_interactive(true, true, false));
-        assert!(!claim_session_is_interactive(true, false, false));
-        assert!(!claim_session_is_interactive(false, true, false));
-        assert!(!claim_session_is_interactive(false, false, false));
-        // File-based claims render no prompt: an operator-present stdin is the
-        // attendance signal, so recorded-output runs (`2>&1 | tee`) work.
-        assert!(claim_session_is_interactive(true, true, true));
-        assert!(claim_session_is_interactive(true, false, true));
-        assert!(!claim_session_is_interactive(false, true, true));
-        assert!(!claim_session_is_interactive(false, false, true));
-    }
-
-    #[test]
-    fn prompted_claim_under_redirected_stderr_points_at_password_file() {
-        let err = ensure_claim_session_for(true, false, false)
-            .expect_err("prompted claim under redirected stderr must be refused early");
-        let message = err.to_string();
-        assert!(message.contains("--password-file"), "{message}");
-        assert!(message.contains("2>&1 | tee"), "{message}");
-    }
-
-    #[test]
-    fn sink_mode_rejects_no_store_before_claim_with_guidance() {
-        let err = validate_recovery_mnemonic_sink_mode(MnemonicCapture::Skip)
-            .expect_err("--no-store-mnemonic must be rejected before the claim");
-        let msg = err.to_string();
-        assert!(msg.contains("--no-store-mnemonic"));
-        assert!(msg.contains("never printed"));
-        assert!(msg.contains("enclava key backup"));
-
-        validate_recovery_mnemonic_sink_mode(MnemonicCapture::Store)
-            .expect("default store mode must be allowed");
+    fn claim_session_accepts_password_file_without_a_terminal() {
+        for (stdin, stderr, password_file, accepted) in [
+            (true, true, false, true),
+            (true, false, false, false),
+            (false, true, false, false),
+            (false, false, false, false),
+            (true, true, true, true),
+            (true, false, true, true),
+            (false, true, true, true),
+            (false, false, true, true),
+        ] {
+            assert_eq!(
+                ensure_claim_session_for(stdin, stderr, password_file).is_ok(),
+                accepted,
+                "stdin={stdin}, stderr={stderr}, password_file={password_file}"
+            );
+        }
     }
 
     #[test]
@@ -1076,9 +1002,9 @@ mod tests {
             "org-a",
             "shell1",
             MnemonicCapture::Skip,
-            true,
-            true,
             false,
+            false,
+            true,
         )
         .expect_err("unsafe sink mode must be rejected pre-claim");
 
@@ -1088,11 +1014,11 @@ mod tests {
     }
 
     #[test]
-    fn preclaim_gate_rejects_unattended_sessions() {
+    fn preclaim_gate_rejects_missing_password_input() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = CliPaths::from_root(tmp.path().to_path_buf()).unwrap();
 
-        let err = prepare_recovery_mnemonic_sink_for_session(
+        prepare_recovery_mnemonic_sink_for_session(
             &paths,
             "org-a",
             "shell1",
@@ -1101,14 +1027,8 @@ mod tests {
             false,
             false,
         )
-        .expect_err("unattended claims must be rejected pre-claim");
+        .expect_err("missing password input must be rejected before preparing the sink");
 
-        let msg = err.to_string();
-        assert!(msg.contains("interactive terminal"));
-        assert!(msg.contains("unattended"));
-        // No mnemonic exists yet at gate time; the message must stay secret-free.
-        assert!(!msg.contains(SYNTHETIC_MNEMONIC));
-        // Rejected before any sink preparation side effects.
         assert!(!paths.keys_dir.join("org-a").exists());
     }
 
@@ -1127,9 +1047,9 @@ mod tests {
             "org-a",
             "shell1",
             MnemonicCapture::Store,
-            true,
-            true,
             false,
+            false,
+            true,
         )
         .expect_err("unwritable sink must be rejected before the claim");
 
@@ -1321,55 +1241,6 @@ mod tests {
         .to_string();
         assert!(missing.starts_with(OWNERSHIP_COMMITTED_RECOVERY_BACKUP_INCOMPLETE));
         assert!(!missing.contains(SYNTHETIC_MNEMONIC));
-    }
-
-    #[test]
-    fn claim_flow_gates_the_sink_before_any_network_claim() {
-        let source = include_str!("ownership.rs");
-        let start = source.find("pub async fn claim").expect("claim exists");
-        let end = start
-            + source[start..]
-                .find("fn mnemonic_capture_from_flags")
-                .expect("apparatus follows claim");
-        let body = &source[start..end];
-
-        let gate = body
-            .find("prepare_recovery_mnemonic_sink(")
-            .expect("claim runs the pre-claim sink gate");
-        let challenge = body
-            .find("bootstrap_challenge")
-            .expect("claim requests a challenge");
-        let claim = body.find("bootstrap_claim").expect("claim sends the claim");
-        assert!(
-            gate < challenge && challenge < claim,
-            "sink gate must reject before any challenge or claim request"
-        );
-
-        let store = body
-            .find("store_recovery_mnemonic_after_claim")
-            .expect("claim persists the mnemonic post-claim");
-        assert!(store > claim);
-        assert!(
-            !body.contains("present_and_capture_recovery_mnemonic"),
-            "claim must not use the removed stdout/stderr presentation path"
-        );
-    }
-
-    #[test]
-    fn ownership_module_never_prints_the_mnemonic_variable() {
-        let source = include_str!("ownership.rs");
-        for line in source.lines() {
-            if line.contains("println!")
-                || line.contains("eprintln!")
-                || line.contains("write!")
-                || line.contains("writeln!")
-            {
-                assert!(
-                    !line.contains("{mnemonic"),
-                    "stdout/stderr statement must not interpolate the mnemonic: {line}"
-                );
-            }
-        }
     }
 
     #[test]

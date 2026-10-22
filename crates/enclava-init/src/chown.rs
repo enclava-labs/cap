@@ -99,6 +99,77 @@ pub fn chown_recursive(path: &Path, ident: ExecIdentity) -> Result<()> {
     chown(path, ident)
 }
 
+/// [`chown_recursive`] relative to an open directory fd (cap#290 round-2
+/// review): the tree below a host-influenced path can be raced with
+/// symlinks between operations, so traversal stays fd-anchored — every
+/// entry is re-owned with `AT_SYMLINK_NOFOLLOW` (symlink inodes are owned,
+/// never followed) and only entries that open as real directories under
+/// `O_NOFOLLOW` are recursed into. `dir_fd` itself is not re-owned; the
+/// caller owns the mount contract for the directory it opened.
+pub fn chown_recursive_at(dir_fd: std::os::fd::RawFd, ident: ExecIdentity) -> Result<()> {
+    use nix::dir::Dir;
+    use nix::fcntl::{AtFlags, OFlag, openat};
+    use nix::sys::stat::Mode;
+    use nix::unistd::{Gid, Uid, fchownat};
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    const OPEN_DIR_FLAGS: OFlag = OFlag::from_bits_retain(
+        OFlag::O_DIRECTORY.bits() | OFlag::O_NOFOLLOW.bits() | OFlag::O_CLOEXEC.bits(),
+    );
+
+    let mut dir = Dir::openat(Some(dir_fd), ".", OPEN_DIR_FLAGS, Mode::empty())
+        .map_err(|e| InitError::Config(format!("opendir at fd {dir_fd}: {e}")))?;
+    let entries: Vec<_> = dir
+        .iter()
+        .map(|entry| {
+            let entry = entry.map_err(|e| InitError::Config(format!("readdir: {e}")))?;
+            Ok((entry.file_name().to_bytes().to_vec(), entry.file_type()))
+        })
+        .collect::<Result<_>>()?;
+    drop(dir);
+
+    for (name_bytes, file_type) in entries {
+        if name_bytes == b"." || name_bytes == b".." {
+            continue;
+        }
+        let name = std::ffi::CString::new(name_bytes)
+            .map_err(|_| InitError::Config("directory entry contains NUL".to_string()))?;
+        fchownat(
+            Some(dir_fd),
+            name.as_c_str(),
+            Some(Uid::from_raw(ident.uid)),
+            Some(Gid::from_raw(ident.gid)),
+            AtFlags::AT_SYMLINK_NOFOLLOW,
+        )
+        .map_err(|e| InitError::Config(format!("fchownat: {e}")))?;
+        let is_dir = match file_type {
+            Some(nix::dir::Type::Directory) => true,
+            Some(_) => false,
+            // Filesystem did not report the type; stat without following.
+            None => {
+                nix::sys::stat::fstatat(Some(dir_fd), name.as_c_str(), AtFlags::AT_SYMLINK_NOFOLLOW)
+                    .map(|stat| (stat.st_mode & nix::libc::S_IFMT) == nix::libc::S_IFDIR)
+                    .unwrap_or(false)
+            }
+        };
+        if is_dir {
+            // Re-open under O_NOFOLLOW: a directory raced to a symlink
+            // between the type check and the open fails closed with ELOOP
+            // instead of being followed.
+            match openat(Some(dir_fd), name.as_c_str(), OPEN_DIR_FLAGS, Mode::empty()) {
+                Ok(child_fd) => {
+                    // SAFETY: openat returned a fresh owned descriptor.
+                    let child = unsafe { std::os::fd::OwnedFd::from_raw_fd(child_fd) };
+                    chown_recursive_at(child.as_raw_fd(), ident)?;
+                }
+                Err(nix::errno::Errno::ELOOP) | Err(nix::errno::Errno::ENOENT) => {}
+                Err(e) => return Err(InitError::Config(format!("openat: {e}"))),
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,5 +268,48 @@ mod tests {
             link_ctime_before,
             "symlink inode was not re-owned (lchown did not take effect)"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chown_recursive_at_owns_entries_without_following_symlinks() {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::io::AsRawFd;
+
+        let dir = tempdir().unwrap();
+        let nested = dir.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let inner = nested.join("inner");
+        std::fs::write(&inner, b"x").unwrap();
+        // Referent lives OUTSIDE the scanned tree: only the symlink inside
+        // the tree points at it, so any ctime change proves following.
+        let outside_dir = tempdir().unwrap();
+        let outside = outside_dir.path().join("outside");
+        std::fs::write(&outside, b"secret").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        // Same ctime trick as the lchown regression test: a following
+        // chown would bump the referent's ctime.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let outside_ctime = std::fs::metadata(&outside).unwrap().ctime();
+
+        let id = ExecIdentity {
+            uid: nix::unistd::Uid::current().as_raw(),
+            gid: nix::unistd::Gid::current().as_raw(),
+            kind: IdentityKind::Numeric,
+        };
+        let fd = std::fs::File::open(dir.path()).unwrap();
+        chown_recursive_at(fd.as_raw_fd(), id).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&outside).unwrap().ctime(),
+            outside_ctime,
+            "chown_recursive_at followed a symlink to its referent"
+        );
+        assert_eq!(std::fs::metadata(&inner).unwrap().uid(), id.uid);
+        assert_eq!(std::fs::metadata(&nested).unwrap().uid(), id.uid);
+        // The symlink inode itself was re-owned (lchown semantics).
+        assert_eq!(std::fs::symlink_metadata(&link).unwrap().uid(), id.uid);
     }
 }

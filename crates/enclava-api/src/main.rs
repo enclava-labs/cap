@@ -355,6 +355,20 @@ fn load_pubkey_hex_value(
     if raw.len() != 32 {
         anyhow::bail!("invalid {name}: expected 32-byte Ed25519 public key hex");
     }
+    // Same parse enclava-init applies (VerifyingKey::from_bytes): a pin that
+    // is not a valid Ed25519 point would abort in-TEE verification and brick
+    // every workload, so fail startup instead (codex cap#218 P2).
+    let arr: [u8; 32] = raw.try_into().expect("length checked above");
+    let key = ed25519_dalek::VerifyingKey::from_bytes(&arr)
+        .map_err(|e| anyhow::anyhow!("invalid {name}: not a valid Ed25519 public key: {e}"))?;
+    // Small-order keys provide no unforgeability: policy acceptance uses
+    // verify(), not verify_strict(), and a zero signature verifies against a
+    // small-order key for a large share of messages.
+    if key.is_weak() {
+        anyhow::bail!(
+            "invalid {name}: Ed25519 public key has small order and provides no unforgeability"
+        );
+    }
     Ok(Some(value.to_ascii_lowercase()))
 }
 
@@ -414,6 +428,50 @@ fn release_env_value(
     }
 }
 
+/// Loads the two policy-authority pubkeys, each from its own signed release
+/// field (env values must match the signed field exactly). The platform
+/// trustee policy key and the signing-service key are distinct trust
+/// domains: collapsing them into one key is an error, not a fallback
+/// (cap#118).
+fn load_policy_authority_pubkeys(
+    platform_release: Option<&PlatformRelease>,
+) -> anyhow::Result<(Option<String>, Option<String>)> {
+    let platform_trustee_policy_pubkey_hex = load_pubkey_hex_value(
+        "PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX",
+        release_env_value(
+            "PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX",
+            platform_release.map(|release| release.platform_trustee_policy_pubkey_hex.as_str()),
+            false,
+        )?,
+        false,
+    )?;
+    let signing_service_pubkey_hex = load_pubkey_hex_value(
+        "SIGNING_SERVICE_PUBKEY_HEX",
+        release_env_value(
+            "SIGNING_SERVICE_PUBKEY_HEX",
+            platform_release.map(|release| release.signing_service_pubkey_hex.as_str()),
+            false,
+        )?,
+        false,
+    )?;
+    if let (Some(trustee_key), Some(signing_key)) = (
+        &platform_trustee_policy_pubkey_hex,
+        &signing_service_pubkey_hex,
+    ) {
+        // Nested if (not a let chain): let chains need Rust 1.88, workspace
+        // MSRV is 1.85.
+        if trustee_key == signing_key {
+            anyhow::bail!(
+                "PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX and SIGNING_SERVICE_PUBKEY_HEX must be distinct keys (in-TEE policy authority vs signing service); collapsing them is not allowed"
+            );
+        }
+    }
+    Ok((
+        platform_trustee_policy_pubkey_hex,
+        signing_service_pubkey_hex,
+    ))
+}
+
 fn load_attestation_config(
     platform_release: Option<&PlatformRelease>,
 ) -> anyhow::Result<Option<AttestationConfig>> {
@@ -471,18 +529,13 @@ fn load_attestation_config(
     )?;
     let amd_kds_base_url = load_url_env("AMD_KDS_BASE_URL", true)?;
     let trustee_policy_url = load_url_env("TRUSTEE_POLICY_URL", trustee_policy_read_available)?;
-    let release_pubkey =
-        platform_release.map(|release| release.signing_service_pubkey_hex.as_str());
-    let platform_trustee_policy_pubkey_hex = load_pubkey_hex_value(
-        "PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX",
-        release_env_value("PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX", release_pubkey, false)?,
-        false,
-    )?;
-    let signing_service_pubkey_hex = load_pubkey_hex_value(
-        "SIGNING_SERVICE_PUBKEY_HEX",
-        release_env_value("SIGNING_SERVICE_PUBKEY_HEX", release_pubkey, false)?,
-        false,
-    )?;
+    // The platform trustee policy key and the signing-service key are two
+    // distinct trust domains (in-TEE policy authority vs off-cluster signing
+    // service). Each comes from its own signed release field; a release (or
+    // env override) that collapses them into one key is an error, not a
+    // fallback — compromise or revocation of either must not collapse both.
+    let (platform_trustee_policy_pubkey_hex, signing_service_pubkey_hex) =
+        load_policy_authority_pubkeys(platform_release)?;
 
     Ok(AttestationConfig {
         proxy_image: parse_image_ref("ATTESTATION_PROXY_IMAGE", &proxy_image_ref)?,
@@ -750,6 +803,27 @@ async fn main() {
             std::process::exit(1);
         }
         enclava_engine::manifest::cc_init_data::set_luks2_header_seal_claim(&seal_claim);
+
+        // Log-spool state-bind deployment gate (cap#290 review): NOT signed
+        // release metadata — a canonical field would break release-signature
+        // verification on previously released CLIs, so it is a deployment
+        // capability only. Ops sets ENCLAVA_LOG_SPOOL_STORAGE only in the
+        // same package that pins the bind-capable ENCLAVA_INIT_IMAGE; under
+        // a signed release its absence is the unsupported sentinel and must
+        // be installed verbatim so neither the env fallback nor the dev
+        // default can resurrect the claim. A value other than
+        // "state-bind-v1" refuses startup rather than rendering an
+        // unverifiable claim.
+        let spool_claim = env_nonempty("ENCLAVA_LOG_SPOOL_STORAGE").unwrap_or_default();
+        if !matches!(spool_claim.as_str(), "" | "state-bind-v1") {
+            eprintln!(
+                "startup refused: ENCLAVA_LOG_SPOOL_STORAGE {spool_claim:?} is not a valid \
+                 log-spool storage claim (expected unset or \"state-bind-v1\"); it must be set \
+                 only together with the bind-capable ENCLAVA_INIT_IMAGE pin"
+            );
+            std::process::exit(1);
+        }
+        enclava_engine::manifest::cc_init_data::set_log_spool_storage_claim(&spool_claim);
     }
 
     let startup_proxy_image = match release_env_value(
@@ -1210,6 +1284,161 @@ mod tests {
         ] {
             assert!(parse_acme_dns_lookup_settings(None, Some(invalid)).is_err());
         }
+    }
+
+    /// Serializes tests that read or mutate the POLICY_*PUBKEY_HEX process
+    /// env (tests run in parallel threads; an env-mutating test racing an
+    /// env-reading one produces flaky conflicts).
+    static POLICY_ENV_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Isolates the POLICY_*PUBKEY_HEX process env for one test: captures
+    /// the prior values, clears both vars, and on drop restores the exact
+    /// prior state (value or unset). A panic mid-test cannot leak mutations
+    /// into other tests in this binary, and operator-provided values in the
+    /// test environment are preserved instead of erased.
+    struct EnvGuard {
+        prior_trustee: Option<std::ffi::OsString>,
+        prior_signing: Option<std::ffi::OsString>,
+    }
+    impl EnvGuard {
+        fn new() -> Self {
+            let guard = Self {
+                prior_trustee: std::env::var_os("PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX"),
+                prior_signing: std::env::var_os("SIGNING_SERVICE_PUBKEY_HEX"),
+            };
+            unsafe {
+                std::env::remove_var("PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX");
+                std::env::remove_var("SIGNING_SERVICE_PUBKEY_HEX");
+            }
+            guard
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prior_trustee {
+                    Some(value) => std::env::set_var("PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX", value),
+                    None => std::env::remove_var("PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX"),
+                }
+                match &self.prior_signing {
+                    Some(value) => std::env::set_var("SIGNING_SERVICE_PUBKEY_HEX", value),
+                    None => std::env::remove_var("SIGNING_SERVICE_PUBKEY_HEX"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn policy_authority_pubkeys_reject_collapse_to_one_key() {
+        // cap#118: the platform trustee policy key and the signing-service
+        // key are two trust domains. Without a signed release they may come
+        // from env; an operator (or legacy config) that sets both to the
+        // same hex must fail startup instead of silently collapsing the
+        // domains.
+        let _env_mutex = POLICY_ENV_TEST_MUTEX.lock().unwrap();
+        let _guard = EnvGuard::new();
+        let key = "11".repeat(32);
+        unsafe {
+            std::env::set_var("PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX", &key);
+            std::env::set_var("SIGNING_SERVICE_PUBKEY_HEX", &key);
+        }
+        let err = load_policy_authority_pubkeys(None).unwrap_err();
+        assert!(err.to_string().contains("must be distinct keys"));
+
+        // Case variants of the same key must not sneak past the check.
+        unsafe {
+            std::env::set_var(
+                "PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX",
+                key.to_ascii_uppercase(),
+            );
+        }
+        let err = load_policy_authority_pubkeys(None).unwrap_err();
+        assert!(err.to_string().contains("must be distinct keys"));
+    }
+
+    #[test]
+    fn policy_authority_pubkeys_reject_non_point_encoding() {
+        // codex cap#218 P2: enclava-init parses both pins with
+        // VerifyingKey::from_bytes and aborts verification on failure, so a
+        // pin that is not a valid Ed25519 point would brick every workload.
+        // Startup must reject it instead. The compressed encoding of a y
+        // with no Edwards point on the curve (e.g. y = 2 for edwards25519)
+        // is the canonical rejection case.
+        let _env_mutex = POLICY_ENV_TEST_MUTEX.lock().unwrap();
+        let _guard = EnvGuard::new();
+        let non_point = format!("02{}", "00".repeat(31));
+        unsafe {
+            std::env::set_var("PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX", &non_point);
+        }
+        let err = load_policy_authority_pubkeys(None).unwrap_err();
+        assert!(
+            err.to_string().contains("not a valid Ed25519 public key"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn policy_authority_pubkeys_reject_small_order_encoding() {
+        // cap#218 follow-up: policy acceptance uses verify(), not
+        // verify_strict(), and a zero signature verifies against a
+        // small-order key (e.g. 00*32) for a large share of messages — a
+        // small-order pin would accept forged policy artifacts. Fail
+        // startup instead.
+        let _env_mutex = POLICY_ENV_TEST_MUTEX.lock().unwrap();
+        let _guard = EnvGuard::new();
+        unsafe {
+            std::env::set_var("PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX", "00".repeat(32));
+            std::env::set_var("SIGNING_SERVICE_PUBKEY_HEX", "11".repeat(32));
+        }
+        let err = load_policy_authority_pubkeys(None).unwrap_err();
+        assert!(
+            err.to_string().contains("small order"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn policy_authority_pubkeys_load_distinct_release_fields() {
+        // The original bug: both slots were filled from
+        // release.signing_service_pubkey_hex. A release with the new signed
+        // field must supply each slot from its own field (the bundled
+        // envelope's own distinct keys are proven in the lib tests).
+        let _env_mutex = POLICY_ENV_TEST_MUTEX.lock().unwrap();
+        // Clear inherited env too: operator-provided POLICY_*PUBKEY_HEX
+        // values would conflict with the release fields under test.
+        let _guard = EnvGuard::new();
+        let release = PlatformRelease {
+            schema_version: "v1".into(),
+            platform_release_version: "test".into(),
+            signing_service_url: "https://signing.example".into(),
+            signing_service_pubkey_hex: "11".repeat(32),
+            platform_trustee_policy_pubkey_hex: "33".repeat(32),
+            policy_template_id: "t".into(),
+            policy_template_sha256: "00".repeat(32),
+            policy_template_text: String::new(),
+            attestation_proxy_image: "img".into(),
+            caddy_ingress_image: "img".into(),
+            trustee_kbs_url: "https://kbs.example".into(),
+            trustee_kbs_ca_cert_pem: String::new(),
+            tenant_caddy_tls_mode: "acme".into(),
+            tenant_caddy_acme_ca: "https://acme.example".into(),
+            expected_firmware_measurement: "00".repeat(32),
+            expected_runtime_class: "kata-qemu-snp".into(),
+            genpolicy_version: "test".into(),
+            luks2_header_seal: String::new(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+        };
+        let (trustee, signing) =
+            load_policy_authority_pubkeys(Some(&release)).expect("distinct keys load");
+        assert_eq!(
+            trustee.as_deref(),
+            Some(release.platform_trustee_policy_pubkey_hex.as_str())
+        );
+        assert_eq!(
+            signing.as_deref(),
+            Some(release.signing_service_pubkey_hex.as_str())
+        );
+        assert_ne!(trustee, signing);
     }
 
     #[test]

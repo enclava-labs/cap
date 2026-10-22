@@ -26,6 +26,7 @@ fn idempotency_app() -> App {
         ),
         signer_identity_issuer: Some("https://token.actions.githubusercontent.com".to_string()),
         signer_identity_set_at: Some(chrono::Utc::now()),
+        signer_rotation_generation: 1,
         source_provider: Some("github".to_string()),
         source_repository: Some("acme/confidential-app".to_string()),
         egress_allowlist: sqlx::types::Json(Vec::new()),
@@ -164,6 +165,57 @@ fn stored_error_plaintext_is_redacted_from_public_and_generic_responses() {
         assert!(!serialized.contains(STORED_SECRET));
         assert!(!serialized.contains("private-key"));
     }
+}
+
+#[test]
+fn bounded_error_codes_cross_the_public_projection() {
+    // #18: bounded classification codes (e.g. a KBS signed-policy budget
+    // rejection classified as `signed_policy_budget_exceeded`) must reach
+    // the user instead of collapsing to the opaque `deployment_error`.
+    let app = idempotency_app();
+
+    for code in [
+        "signed_policy_budget_exceeded",
+        "kbs_policy_error",
+        "deployment_setup_failed",
+        "deployment_apply_failed",
+        "rollout_timeout",
+        "kubernetes_api_error",
+    ] {
+        let mut public_deployment = idempotency_deployment(&app);
+        public_deployment.error_message = Some(code.to_string());
+        let public = DeploymentResponse::from_deployment(public_deployment, &app);
+        assert_eq!(
+            serde_json::to_value(&public).unwrap()["error_message"],
+            code,
+            "bounded code {code} must be preserved across the public projection"
+        );
+
+        let mut generic_deployment = idempotency_deployment(&app);
+        generic_deployment.error_message = Some(code.to_string());
+        let generic = GenericDeploymentResponse::from_deployment(generic_deployment, &app);
+        assert_eq!(
+            serde_json::to_value(&generic).unwrap()["error_message"],
+            code,
+            "bounded code {code} must be preserved across the generic projection"
+        );
+    }
+}
+
+#[test]
+fn unknown_error_plaintext_still_collapses_to_deployment_error() {
+    let app = idempotency_app();
+
+    let mut public_deployment = idempotency_deployment(&app);
+    public_deployment.error_message =
+        Some("signed policy artifact set exceeds byte budget: 937481 > 921600".to_string());
+    let public = DeploymentResponse::from_deployment(public_deployment, &app);
+    let serialized = serde_json::to_string(&public).unwrap();
+    assert_eq!(
+        serde_json::to_value(&public).unwrap()["error_message"],
+        "deployment_error"
+    );
+    assert!(!serialized.contains("937481"));
 }
 
 #[test]
@@ -521,6 +573,158 @@ fn signed_deploy_validation_precedes_atomic_candidate_commit() {
     assert!(
         deploy_body.contains("persist_workload_artifacts(\n            &mut *tx"),
         "signed artifacts must commit in the same transaction"
+    );
+}
+
+/// #232: a customer-supplied signed policy artifact enters through
+/// resolve_signed_policy_artifact, but the global KBS signed-policy set must
+/// still converge for it — the acceptance that persists the artifact has to
+/// enqueue the global reconciliation generation in the same transaction, and
+/// every other production acceptance of a signed artifact (unlock transition,
+/// rollback, internal PaaS redeploy) must do the same. Convergence is
+/// level-triggered: the background reconciler drains any pending generation,
+/// so losing the enqueue is one way for the serving KBS policy set to lag
+/// the database artifact set.
+#[test]
+fn signed_artifact_acceptance_enqueues_global_policy_reconciliation() {
+    let deploy_source = include_str!("../../deployments.rs");
+    let deploy_body = deploy_source
+        .split("async fn deploy_app_candidate")
+        .nth(1)
+        .expect("deployment candidate function exists")
+        .split("/// GET /apps/{name}/deployments")
+        .next()
+        .expect("deployment candidate function body");
+    let deploy_begin = deploy_body
+        .find("let mut tx = state.db.begin()")
+        .expect("accepted deployment transaction");
+    let deploy_commit = deploy_body
+        .find("tx.commit()")
+        .expect("accepted deployment commit");
+    // The enqueue must live inside the signed persist branch itself, not
+    // merely somewhere before the first commit: the artifact row and the
+    // generation bump have to commit atomically, and an artifact accepted
+    // without the bump is exactly the #232 divergence.
+    let deploy_persist = deploy_body
+        .find("persist_workload_artifacts(")
+        .expect("signed artifact persist branch");
+    let deploy_revocation = deploy_body
+        .find("enqueue_signed_policy_revocation_if_active")
+        .expect("unsigned acceptance revocation branch");
+    let deploy_signed_arm = deploy_body
+        .split("if let (Some(artifacts), Some(signed)) =")
+        .nth(1)
+        .expect("deploy signed persist arm")
+        .split("} else {")
+        .next()
+        .unwrap();
+    let deploy_enqueue = deploy_signed_arm
+        .find("crate::kbs::enqueue_signed_policy_reconciliation(&mut tx)")
+        .expect("deploy signed arm enqueues reconciliation");
+    assert!(
+        deploy_begin < deploy_persist
+            && deploy_signed_arm
+                .find("persist_workload_artifacts(")
+                .unwrap()
+                < deploy_enqueue
+            && deploy_persist < deploy_revocation
+            && deploy_revocation < deploy_commit,
+        "the deploy acceptance that persists a signed artifact (customer-supplied \
+         or platform-signed) must bump the global reconciliation generation in \
+         the same transaction, inside the signed persist branch"
+    );
+
+    let unlock_source = include_str!("../../unlock.rs");
+    let unlock_body = unlock_source
+        .split("async fn commit_unlock_mode_transition")
+        .nth(1)
+        .expect("unlock transition commit function exists")
+        .split("/// GET /apps/{name}/unlock/status")
+        .next()
+        .expect("unlock transition commit function body");
+    let unlock_persist = unlock_body
+        .find("persist_workload_artifacts(")
+        .expect("unlock signed artifact persist branch");
+    let unlock_revocation = unlock_body
+        .find("enqueue_signed_policy_revocation_if_active")
+        .expect("unlock unsigned revocation branch");
+    let unlock_commit = unlock_body
+        .find("tx.commit()")
+        .expect("unlock transition commit");
+    let unlock_signed_arm = unlock_body
+        .split("persist_workload_artifacts(")
+        .nth(1)
+        .expect("unlock signed persist arm")
+        .split("} else {")
+        .next()
+        .unwrap();
+    assert!(
+        unlock_signed_arm.contains("crate::kbs::enqueue_signed_policy_reconciliation(&mut tx)")
+            && unlock_persist < unlock_revocation
+            && unlock_revocation < unlock_commit,
+        "an unlock-mode redeployment that persists a signed artifact must bump \
+         the global reconciliation generation in the same transaction, inside \
+         the signed persist branch"
+    );
+
+    let rollback_source = include_str!("../rollback.rs");
+    let rollback_body = rollback_source
+        .split("pub async fn rollback")
+        .nth(1)
+        .expect("rollback function exists")
+        .split("#[cfg(test)]")
+        .next()
+        .expect("rollback function body");
+    let rollback_arm = rollback_body
+        .find("if rollback_artifacts.is_some() {")
+        .expect("rollback signed-restoration branch");
+    let rollback_revocation = rollback_body
+        .find("enqueue_signed_policy_revocation_if_active")
+        .expect("rollback unsigned revocation branch");
+    let rollback_commit = rollback_body
+        .find("tx.commit()")
+        .expect("rollback generation commit");
+    let rollback_signed_arm = rollback_body
+        .split("if rollback_artifacts.is_some() {")
+        .last()
+        .expect("rollback signed enqueue arm")
+        .split("} else {")
+        .next()
+        .unwrap();
+    assert!(
+        rollback_signed_arm.contains("crate::kbs::enqueue_signed_policy_reconciliation(&mut tx)")
+            && rollback_arm < rollback_revocation
+            && rollback_revocation < rollback_commit,
+        "a rollback that restores a signed artifact must bump the global \
+         reconciliation generation in the signed-restoration branch of the \
+         same transaction"
+    );
+
+    // The internal PaaS deploy route forwards its signed inputs into
+    // deployments::deploy unchanged, so the deploy-leg assertion above covers
+    // it; pin that forwarding so a future divergence cannot silently drop the
+    // reconciliation enqueue.
+    let internal_source = include_str!("../../internal.rs");
+    let forward_body = internal_source
+        .split("pub async fn deploy_paas_app")
+        .nth(1)
+        .expect("internal PaaS deploy route exists")
+        .split("\n}")
+        .next()
+        .expect("internal PaaS deploy route body");
+    let request_build = forward_body
+        .find("crate::routes::deployments::DeployRequest {")
+        .expect("internal PaaS deploy request construction");
+    let dispatch = forward_body
+        .find("crate::routes::deployments::deploy(")
+        .expect("internal PaaS deploy dispatch");
+    let artifact_forward = forward_body
+        .find("signed_policy_artifact: body.signed_policy_artifact")
+        .expect("internal PaaS deploy forwards the customer artifact");
+    assert!(
+        request_build < artifact_forward && artifact_forward < dispatch,
+        "the internal PaaS deploy route must forward the customer-supplied \
+         signed_policy_artifact into the deploy acceptance dispatch"
     );
 }
 
@@ -953,4 +1157,120 @@ async fn external_id_replay_rejects_an_unreleased_terminal_hold() {
         .execute(&pool)
         .await
         .unwrap();
+}
+#[tokio::test]
+async fn public_error_codes_are_persistable_job_codes() {
+    // #18: PUBLIC_DEPLOYMENT_ERROR_CODES must stay a subset of the codes the
+    // deployment_apply_jobs.last_error_code CHECK constraint accepts, or the
+    // classified failure published by publish_apply_failure_with_mutation is
+    // rejected by the database and the real reason never survives. The
+    // constraint list lives in migrations/0082 (widening 0038); this test
+    // fails if either side drifts.
+    let pool = crate::test_support::database_test_pool().await;
+    let constraint_def: String = sqlx::query_scalar(
+        "SELECT pg_get_constraintdef(oid)
+           FROM pg_constraint
+          WHERE conname = 'deployment_apply_jobs_last_error_code_check'
+            AND conrelid = 'deployment_apply_jobs'::regclass",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("load last_error_code constraint definition");
+    for code in PUBLIC_DEPLOYMENT_ERROR_CODES {
+        let needle = format!("'{code}'");
+        assert!(
+            constraint_def.contains(&needle),
+            "PUBLIC_DEPLOYMENT_ERROR_CODES entry `{code}` is rejected by the \
+             deployment_apply_jobs_last_error_code_check constraint; widen \
+             migrations/0082_widen_deployment_apply_jobs_last_error_code.sql",
+        );
+    }
+}
+
+/// Extract every bounded classification code the emitter functions can
+/// return. Each emitter body (`DeploymentJobError::code`, `dns_error_code`,
+/// `DeployError::public_code`, `ApplyError::public_code`,
+/// `KbsPolicyError::public_code`) consists solely of `&'static str` code
+/// literals, so scanning the body for quoted snake_case literals enumerates
+/// the full emitter range — including variants that cannot be constructed in
+/// a unit test (sqlx/kube/reqwest sources).
+fn emitter_error_codes() -> Vec<&'static str> {
+    fn body_after<'a>(source: &'a str, anchor: &str) -> &'a str {
+        let start = source
+            .find(anchor)
+            .unwrap_or_else(|| panic!("anchor `{anchor}` not found in emitter source"));
+        let rest = &source[start..];
+        let end = rest.find("\n}\n").map(|i| i + 2).unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    let mut codes = Vec::new();
+    let deployment_jobs = include_str!("../../../deployment_jobs.rs");
+    let deploy = include_str!("../../../deploy.rs");
+    let kbs = include_str!("../../../kbs.rs");
+    let apply_engine = include_str!("../../../../../enclava-engine/src/apply/engine.rs");
+
+    for (source, anchor) in [
+        (deployment_jobs, "impl DeploymentJobError {"),
+        (deployment_jobs, "fn dns_error_code("),
+        (deploy, "impl DeployError {"),
+        (kbs, "impl KbsPolicyError {"),
+        (apply_engine, "impl ApplyError {"),
+    ] {
+        let body = body_after(source, anchor);
+        let found: Vec<&str> = body
+            .split('"')
+            .skip(1)
+            .step_by(2)
+            .filter(|literal| {
+                !literal.is_empty()
+                    && literal
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+            })
+            .collect();
+        assert!(
+            !found.is_empty(),
+            "no classification codes found after anchor `{anchor}` — parser drift"
+        );
+        codes.extend(found);
+    }
+    codes.sort_unstable();
+    codes.dedup();
+    codes
+}
+
+#[tokio::test]
+async fn every_emitter_error_code_is_persistable_and_public() {
+    // #18: `fail_apply_job_with_mutation` persists `error.code()` verbatim
+    // into `deployment_apply_jobs.last_error_code`. Any code an emitter can
+    // return that the CHECK constraint rejects would roll back the whole
+    // terminalization transaction and strand the job in `running`. Every
+    // emitter code must therefore satisfy the constraint, and — so users see
+    // the real classification — appear in PUBLIC_DEPLOYMENT_ERROR_CODES.
+    let pool = crate::test_support::database_test_pool().await;
+    let constraint_def: String = sqlx::query_scalar(
+        "SELECT pg_get_constraintdef(oid)
+           FROM pg_constraint
+          WHERE conname = 'deployment_apply_jobs_last_error_code_check'
+            AND conrelid = 'deployment_apply_jobs'::regclass",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("load last_error_code constraint definition");
+
+    for code in emitter_error_codes() {
+        let needle = format!("'{code}'");
+        assert!(
+            constraint_def.contains(&needle),
+            "emitter code `{code}` is rejected by the \
+             deployment_apply_jobs_last_error_code_check constraint; widen \
+             migrations/0082_widen_deployment_apply_jobs_last_error_code.sql",
+        );
+        assert!(
+            PUBLIC_DEPLOYMENT_ERROR_CODES.contains(&code),
+            "emitter code `{code}` is missing from PUBLIC_DEPLOYMENT_ERROR_CODES \
+             and would redact to deployment_error",
+        );
+    }
 }

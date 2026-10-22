@@ -86,7 +86,9 @@ spec:
         - name: CAP_DEPLOYMENT_DISPATCH_ENABLED
           value: "false"
         - name: API_URL
-          value: "https://api.enclava.dev"
+          value: "https://cap.enclava.dev"
+        - name: ENCLAVA_PLATFORM_RELEASE_PROFILE
+          value: "production"
         - name: AMD_KDS_BASE_URL
           value: "http://amd-kds-relay.enclava-platform.svc.cluster.local:8080/vcek/v1"
         - name: PLATFORM_DOMAIN

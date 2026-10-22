@@ -12,12 +12,13 @@ use ed25519_dalek::SigningKey;
 use indicatif::{ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
+use enclava_cli::api_types::DeploymentEntry;
 use enclava_cli::{
     api_client::{ApiClient, ApiError, read_bounded_body},
     api_types::{
-        AppResponse, CreateAppRequest, CreateTemplateInstanceRequest, DeploymentEntry,
-        HostedTemplate, HostedTemplateConfigKey, ServiceSpec, SshCommandResponse,
-        TemplateInstanceResponse,
+        AppResponse, CreateAppRequest, CreateTemplateInstanceRequest, HostedTemplate,
+        HostedTemplateConfigKey, ServiceSpec, SshCommandResponse, TemplateInstanceResponse,
     },
     app_config::{
         AppConfig, AppSection, HealthSection, ResourcesSection, StorageSection, UnlockSection,
@@ -29,15 +30,16 @@ use enclava_cli::{
 use enclava_engine::types::WorkloadSecurityProfile;
 
 use crate::commands::app::{
-    BootstrapEndpointStatusDecision, DeploymentWait, SignedDeployBlobParams, StoragePasswordInput,
-    bootstrap_endpoint_status_decision, bounded_request, build_signed_deploy_blobs,
-    claim_initial_ownership, deploy_preflight_needs_claim, deployment_bound_tee_status,
+    BootstrapEndpointStatusDecision, DeploymentHistoryProbe, DeploymentWait,
+    SignedDeployBlobParams, StoragePasswordInput, SuccessGate, bootstrap_endpoint_status_decision,
+    bounded_request, bounded_wait_attempt, build_signed_deploy_blobs, claim_initial_ownership,
+    deploy_preflight_needs_claim, deployment_bound_tee_status,
     deployment_bound_terminal_bootstrap_error,
     deployment_bound_terminal_bootstrap_error_on_channel, ensure_manual_deploy_keyring,
-    fetch_verified_platform_release, generate_log_key_for_app,
-    tee_supplemental_fields_are_consistent, tee_terminal_diagnostic_probe_due, tee_unlock_state,
-    terminal_bootstrap_failure_message, terminal_diagnostic_budget,
-    terminal_diagnostic_probe_with_budget,
+    fail_if_template_deployment_failed, fetch_verified_platform_release, generate_log_key_for_app,
+    reconcile_success_with_deployment_history, tee_supplemental_fields_are_consistent,
+    tee_terminal_diagnostic_probe_due, tee_unlock_state, terminal_bootstrap_failure_message,
+    terminal_diagnostic_budget, terminal_diagnostic_probe_with_budget,
 };
 use crate::commands::config::CONFIG_APPLICATION_NOTE;
 use crate::commands::ownership::{MnemonicCapture, mnemonic_capture_from_flags};
@@ -517,11 +519,21 @@ async fn deploy_with_timings(
     )?;
     let customer_config_hold = response.customer_config_hold;
     let customer_config_hold_remaining_ms = response.customer_config_hold_remaining_ms;
+    // cap#220 review: a missing `cap_deployment_id` must not become a
+    // permanent "pending" exemption -- that silently disables every
+    // terminal-failure check (including the #18 signed-policy rejection)
+    // for the rest of the flow. CAP records the signed descriptor's
+    // `deploy_id` as the deployment id for a fresh deploy (the PaaS
+    // forwards the descriptor unchanged), so the signed id is the
+    // authoritative fallback; if CAP substituted a different id, lookups
+    // for the signed id simply observe nothing -- exactly the pre-fix
+    // behavior -- and can never misattribute another rollout's failure.
     let deployment_id = response
         .deployment
         .cap_deployment_id
         .as_deref()
-        .unwrap_or("pending")
+        .filter(|id| !id.is_empty() && *id != "pending")
+        .unwrap_or(&trusted_deployment.deploy_id)
         .to_string();
     if customer_config_hold && deployment_id == "pending" {
         return Err("PaaS held the workload roll but did not return a deployment id".into());
@@ -1543,11 +1555,13 @@ async fn wait_for_template_bootstrap_endpoint(
     // so the release reserve survives; unheld deploys keep start + max_wait.
     let wait_deadline = hold_deadline.map_or(start + max_wait, |hold| hold.min(start + max_wait));
     let mut tee = None;
+    let mut history = DeploymentHistoryProbe::new();
 
     loop {
-        fail_if_template_deployment_failed(api, app_name, deployment_id, Some(wait_deadline))
-            .await?;
-        if Instant::now() > wait_deadline {
+        // Check the wait deadline before polling deployment history: once
+        // the budget is gone the wait must return instead of issuing one
+        // more request that could outlive it (cap#220 review).
+        if Instant::now() >= wait_deadline {
             pb.abandon_with_message("TEE ownership timed out");
             return Err(format!(
                 "TEE ownership for app {app_name} did not become ready within {}; run `enclava status --app {app_name}` for the latest state",
@@ -1555,6 +1569,18 @@ async fn wait_for_template_bootstrap_endpoint(
             )
             .into());
         }
+        // Fail fast on a terminalized deployment before any endpoint fetch
+        // (#18). Every request in this loop is cut at the finite per-attempt
+        // budget, so a stalled response can never consume the wait (cap#220
+        // review).
+        fail_if_template_deployment_failed(
+            api,
+            app_name,
+            deployment_id,
+            wait_deadline,
+            &mut history,
+        )
+        .await?;
 
         pb.set_message(timed_progress(
             "TEE ownership: waiting for attested endpoint",
@@ -1564,8 +1590,8 @@ async fn wait_for_template_bootstrap_endpoint(
         if tee.is_none() {
             // A deadline cut is indistinguishable from a transient failure:
             // the loop's own expiry check reports the wait timeout.
-            let acquired = match bounded_request(
-                Some(wait_deadline),
+            let acquired = match bounded_wait_attempt(
+                wait_deadline,
                 timings.run(
                     DeployPhase::BootstrapEndpointAcquisition,
                     api.get_unlock_endpoint(app_name),
@@ -1606,15 +1632,15 @@ async fn wait_for_template_bootstrap_endpoint(
         let tee = tee
             .as_ref()
             .expect("TEE client must exist after endpoint acquisition");
-        match bounded_request(
-            Some(wait_deadline),
+        match bounded_wait_attempt(
+            wait_deadline,
             timings.run(DeployPhase::BootstrapAttestation, tee.attest_receipt_key()),
         )
         .await
         {
             Some(Ok((_attestation, attested_tee))) => {
-                match bounded_request(
-                    Some(wait_deadline),
+                match bounded_wait_attempt(
+                    wait_deadline,
                     timings.run(
                         DeployPhase::BootstrapChallenge,
                         attested_tee.bootstrap_challenge(),
@@ -1622,7 +1648,11 @@ async fn wait_for_template_bootstrap_endpoint(
                 )
                 .await
                 {
-                    Some(Ok(_)) => {
+                    Some(Ok(_))
+                        if deployment.matches_launch_identity(
+                            attested_tee.verified_launch_identity().as_ref(),
+                        ) =>
+                    {
                         // A terminal diagnostic read over this attested,
                         // SPKI-pinned channel outranks a reachable challenge
                         // endpoint: stop before attempting any claim, but only
@@ -1643,8 +1673,23 @@ async fn wait_for_template_bootstrap_endpoint(
                                 terminal_bootstrap_failure_message(app_name, &diagnostic).into()
                             );
                         }
-                        pb.set_message("Ownership claim endpoint ready");
-                        return Ok(true);
+                        // Readiness alone must not end the wait (cap#220
+                        // review follow-up): the success must be authorized
+                        // by a current deployment-state observation, and an
+                        // inconclusive one keeps the wait running (the
+                        // enclosing deadline governs).
+                        if let SuccessGate::Confirmed = reconcile_success_with_deployment_history(
+                            api,
+                            app_name,
+                            deployment_id,
+                            start + max_wait,
+                            &mut history,
+                        )
+                        .await?
+                        {
+                            pb.set_message("Ownership claim endpoint ready");
+                            return Ok(true);
+                        }
                     }
                     Some(Err(_)) => {
                         // One safe status read decides the challenge-failure
@@ -1687,8 +1732,19 @@ async fn wait_for_template_bootstrap_endpoint(
                                     ));
                                 }
                                 BootstrapEndpointStatusDecision::AlreadyClaimed => {
-                                    pb.set_message("Ownership already claimed");
-                                    return Ok(false);
+                                    if let SuccessGate::Confirmed =
+                                        reconcile_success_with_deployment_history(
+                                            api,
+                                            app_name,
+                                            deployment_id,
+                                            start + max_wait,
+                                            &mut history,
+                                        )
+                                        .await?
+                                    {
+                                        pb.set_message("Ownership already claimed");
+                                        return Ok(false);
+                                    }
                                 }
                                 BootstrapEndpointStatusDecision::Waiting => {
                                     pb.set_message(timed_progress(
@@ -1707,9 +1763,8 @@ async fn wait_for_template_bootstrap_endpoint(
                             }
                         }
                     }
-                    // A cut is not a challenge failure: no fallback reads;
-                    // the loop's expiry reports the wait timeout.
-                    None => {
+                    // An old unclaimed guest or an expired read must not authorize a new claim.
+                    Some(Ok(_)) | None => {
                         pb.set_message(timed_progress(
                             "TEE ownership: waiting for claim endpoint",
                             start.elapsed(),
@@ -1736,7 +1791,7 @@ async fn wait_for_template_bootstrap_endpoint(
     }
 }
 
-fn should_retry_template_bootstrap_endpoint_error(error: &ApiError) -> bool {
+pub(crate) fn should_retry_template_bootstrap_endpoint_error(error: &ApiError) -> bool {
     match error {
         ApiError::Http(error) => should_retry_api_transport_error(error),
         // A body that fails to decode or breaches the size cap will not
@@ -1754,7 +1809,7 @@ fn should_retry_template_bootstrap_endpoint_error(error: &ApiError) -> bool {
     }
 }
 
-fn should_retry_api_transport_error(error: &reqwest::Error) -> bool {
+pub(crate) fn should_retry_api_transport_error(error: &reqwest::Error) -> bool {
     error.is_timeout() || error.is_connect() || error.is_request()
 }
 
@@ -2449,6 +2504,10 @@ async fn wait_for_paas_managed_config_keys(
     delivery_id: Option<&str>,
     progress: &ProgressBar,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let deployment_id = deployment.deployment_id;
+    let start = Instant::now();
+    let deadline = hold_deadline.map_or(start + timeout, |hold| hold.min(start + timeout));
+    let mut history = DeploymentHistoryProbe::new();
     let expected = expected_keys
         .iter()
         .map(|key| key.trim())
@@ -2456,14 +2515,38 @@ async fn wait_for_paas_managed_config_keys(
         .map(str::to_string)
         .collect::<Vec<_>>();
     if expected.is_empty() {
+        // Nothing to wait for -- but readiness alone must not end the wait
+        // (cap#220 review follow-up): the success must be authorized by a
+        // current deployment-state observation. Keep asking until one lands
+        // or the wait deadline governs.
+        loop {
+            match reconcile_success_with_deployment_history(
+                api,
+                instance_name,
+                deployment_id,
+                deadline,
+                &mut history,
+            )
+            .await?
+            {
+                SuccessGate::Confirmed => break,
+                SuccessGate::Inconclusive => {
+                    if Instant::now() >= deadline {
+                        return Err(format!(
+                            "deployment state for app {instance_name} could not be confirmed within {}; inspect progress with `enclava status --app {instance_name}`",
+                            format_duration(timeout)
+                        )
+                        .into());
+                    }
+                    tokio::time::sleep(template_config_delivery_retry_delay()).await;
+                }
+            }
+        }
         return Ok(());
     }
-    let deployment_id = deployment.deployment_id;
-    let start = Instant::now();
     // The hold deadline caps the whole wait so a budget larger than the
     // remaining hold still stops at the hold, preserving the release
     // reserve. Unheld deploys keep start + timeout.
-    let deadline = hold_deadline.map_or(start + timeout, |hold| hold.min(start + timeout));
     // Bound every in-flight read in this loop by the wait's own `deadline`
     // — the tighter of the roll hold and the requested phase budget —
     // matching the terminal-diagnostic probe below. Bounding by the hold
@@ -2476,6 +2559,7 @@ async fn wait_for_paas_managed_config_keys(
     // `deadline`, so at the deadline the loop can no longer poll for fresh
     // counts before it must answer.
     let mut last_missing = expected.clone();
+
     progress.set_message(managed_config_progress_message(
         0,
         expected.len(),
@@ -2484,8 +2568,6 @@ async fn wait_for_paas_managed_config_keys(
         delivery_id.is_some() && !delivered_receipt,
     ));
     loop {
-        fail_if_template_deployment_failed(api, instance_name, deployment_id, read_deadline)
-            .await?;
         // Enforce the phase deadline before each read: once reads are bounded
         // by `deadline`, a cut at the deadline is indistinguishable from an
         // expiry, so the expiry is reported here — with the last
@@ -2501,6 +2583,17 @@ async fn wait_for_paas_managed_config_keys(
             )
             .into());
         }
+        // Bounded by the wait's remaining budget (cap#220 review); the loop
+        // deadline above already guarantees the budget is positive here.
+        fail_if_template_deployment_failed(
+            api,
+            instance_name,
+            deployment_id,
+            deadline,
+            &mut history,
+        )
+        .await?;
+
         // TLS provisioning starts around the claim, so a terminal bootstrap
         // diagnostic must stop this post-claim wait promptly. The probe is
         // bound to the expected deployment via CAP before and after the
@@ -2518,7 +2611,7 @@ async fn wait_for_paas_managed_config_keys(
         // Poll this call's delivery receipt first: a matching `delivered`
         // satisfies every expected key regardless of metadata timestamps.
         if !delivered_receipt && let Some(receipt) = delivery_id {
-            match poll_managed_delivery_status(api, instance_name, receipt, read_deadline).await? {
+            match poll_managed_delivery_status(api, instance_name, receipt, deadline).await? {
                 ManagedDeliveryPoll::Delivered => delivered_receipt = true,
                 ManagedDeliveryPoll::Pending => {}
                 ManagedDeliveryPoll::Failed(status) => {
@@ -2529,7 +2622,7 @@ async fn wait_for_paas_managed_config_keys(
                 }
             }
         }
-        match bounded_request(read_deadline, api.list_config_keys(instance_name)).await {
+        match bounded_wait_attempt(deadline, api.list_config_keys(instance_name)).await {
             Some(Ok(response)) => {
                 let observed = response
                     .keys
@@ -2559,7 +2652,22 @@ async fn wait_for_paas_managed_config_keys(
                     delivery_id.is_some() && !delivered_receipt,
                 ));
                 if missing.is_empty() {
-                    return Ok(());
+                    // Readiness alone must not end the wait (cap#220 review
+                    // follow-up): the success must be authorized by a
+                    // current deployment-state observation, and an
+                    // inconclusive one keeps the wait running (the
+                    // enclosing deadline governs).
+                    if let SuccessGate::Confirmed = reconcile_success_with_deployment_history(
+                        api,
+                        instance_name,
+                        deployment_id,
+                        deadline,
+                        &mut history,
+                    )
+                    .await?
+                    {
+                        return Ok(());
+                    }
                 }
                 if Instant::now() >= deadline {
                     return Err(format!(
@@ -2586,6 +2694,17 @@ async fn wait_for_paas_managed_config_keys(
                 }
             }
             Some(Err(error)) => return Err(error.into()),
+            None if Instant::now() < deadline => {
+                // The read was cut at the per-attempt budget with wait time
+                // remaining (cap#220 review follow-up): a single stalled
+                // read must not fail the whole wait, so retry on the next
+                // tick exactly like a retryable transport error.
+                progress.set_message(timed_progress(
+                    "Platform config: status check retrying",
+                    start.elapsed(),
+                    timeout,
+                ));
+            }
             None => {
                 return Err(format!(
                     "platform config status for app {instance_name} did not become available within {}: this wait's deadline was reached with the status read still in flight; this command did not deliver customer config; retry `enclava config get --app {instance_name}`",
@@ -2612,15 +2731,20 @@ enum ManagedDeliveryPoll {
 /// Read this call's delivery receipt once. Unknown or not-yet-observed
 /// receipts are treated as still pending so a replica lag cannot stall the
 /// wait, while retryable transport failures keep waiting under the normal
-/// deadline handling. `deadline` bounds this read — the caller passes the
-/// wait's own read deadline so a stalled request cannot outlive the phase.
+/// deadline handling. `deadline` bounds this read like every other
+/// synchronous request in the wait: cut at the 60s per-attempt budget and
+/// never beyond the wait's remaining time (cap#220 review follow-up — a
+/// stalled delivery-status read must not hold the loop until the client's
+/// 900s request timeout). A read cut at the per-attempt budget with wait
+/// time remaining is reported as pending: the caller's loop deadline
+/// reports the timeout, not one stalled read.
 async fn poll_managed_delivery_status(
     api: &ApiClient,
     instance_name: &str,
     delivery_id: &str,
-    deadline: Option<Instant>,
+    deadline: Instant,
 ) -> Result<ManagedDeliveryPoll, Box<dyn std::error::Error>> {
-    match bounded_request(
+    match bounded_wait_attempt(
         deadline,
         api.managed_config_delivery_status(instance_name, delivery_id),
     )
@@ -2650,6 +2774,11 @@ async fn poll_managed_delivery_status(
             Ok(ManagedDeliveryPoll::Pending)
         }
         Some(Err(error)) => Err(error.into()),
+        None if Instant::now() < deadline => {
+            // Cut at the per-attempt budget with the wait still open: treat
+            // as pending and let the caller's deadline check decide expiry.
+            Ok(ManagedDeliveryPoll::Pending)
+        }
         None => Err(
             "this wait's deadline was reached with the delivery status read still in flight".into(),
         ),
@@ -3409,6 +3538,7 @@ async fn wait_for_paas_ssh_command(
 ) -> Result<SshCommandResponse, Box<dyn std::error::Error>> {
     let deployment_id = deployment.deployment_id;
     let start = Instant::now();
+    let mut history = DeploymentHistoryProbe::new();
     let mut terminal_probe_at: Option<Instant> = None;
     while start.elapsed() < timeout {
         progress.set_message(timed_progress(
@@ -3417,8 +3547,15 @@ async fn wait_for_paas_ssh_command(
             timeout,
         ));
         // Post-release on the deploy flow and unheld on the standalone
-        // resumption: no pre-release deadline applies to this wait.
-        fail_if_template_deployment_failed(api, app_name, deployment_id, None).await?;
+        // resumption: the wait budget still bounds the history request.
+        fail_if_template_deployment_failed(
+            api,
+            app_name,
+            deployment_id,
+            start + timeout,
+            &mut history,
+        )
+        .await?;
         // Post-claim wait: one deployment-bound attested status read covers
         // both stop conditions -- a terminal bootstrap diagnostic, and a
         // password-mode relock (the pod rolled, the TEE came back locked, and
@@ -3446,25 +3583,60 @@ async fn wait_for_paas_ssh_command(
                 .into());
             }
         }
-        let response = match api.get_template_ssh_command(app_name).await {
-            Ok(response) => response,
-            Err(error) if should_retry_paas_ssh_command_error(&error) => {
-                progress.set_message(timed_progress(
-                    "Stable SSH endpoint: status check retrying",
-                    start.elapsed(),
-                    timeout,
-                ));
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                continue;
-            }
-            Err(error) => return Err(paas_ssh_command_api_error(error)),
-        };
+        let response =
+            match bounded_wait_attempt(start + timeout, api.get_template_ssh_command(app_name))
+                .await
+            {
+                Some(Ok(response)) => response,
+                Some(Err(error)) if should_retry_paas_ssh_command_error(&error) => {
+                    progress.set_message(timed_progress(
+                        "Stable SSH endpoint: status check retrying",
+                        start.elapsed(),
+                        timeout,
+                    ));
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+                // The attempt outlived its per-attempt budget (cap#220 review):
+                // retry instead of letting a stalled endpoint consume the wait.
+                None => {
+                    progress.set_message(timed_progress(
+                        "Stable SSH endpoint: status check retrying",
+                        start.elapsed(),
+                        timeout,
+                    ));
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+                Some(Err(error)) => return Err(paas_ssh_command_api_error(error)),
+            };
         validate_ssh_command_response(&response, stable_endpoint, expected_app_url)?;
         if response.status == "ready" {
-            return Ok(response);
-        }
-        if let Some(response) =
+            // Readiness alone must not end the wait (cap#220 review
+            // follow-up): the success must be authorized by a current
+            // deployment-state observation, and an inconclusive one keeps
+            // the wait running (the enclosing deadline governs).
+            if let SuccessGate::Confirmed = reconcile_success_with_deployment_history(
+                api,
+                app_name,
+                deployment_id,
+                start + timeout,
+                &mut history,
+            )
+            .await?
+            {
+                return Ok(response);
+            }
+        } else if let Some(response) =
             fetch_direct_ssh_command_response(&response, stable_endpoint, expected_app_url).await?
+            && let SuccessGate::Confirmed = reconcile_success_with_deployment_history(
+                api,
+                app_name,
+                deployment_id,
+                start + timeout,
+                &mut history,
+            )
+            .await?
         {
             return Ok(response);
         }
@@ -3486,11 +3658,11 @@ async fn latest_deployment_id(api: &ApiClient, app_name: &str) -> Result<Option<
         .map(|deployment| deployment.id))
 }
 
-/// Stop a wait when CAP reports the deployment failed. A held deploy's
-/// pre-release deadline bounds the status read: a cut is an unreadable
-/// status -- never a guessed failure -- so the enclosing wait's own expiry
-/// governs. Unheld callers pass `None` and keep the unbounded read.
-async fn fail_if_template_deployment_failed(
+/// Test fixture for the legacy synchronous history read. Production template
+/// waits use the shared detached `DeploymentHistoryProbe`; the held wait's
+/// deadline also bounds its readiness requests.
+#[cfg(test)]
+async fn fail_if_held_template_deployment_failed(
     api: &ApiClient,
     app_name: &str,
     deployment_id: &str,
@@ -3513,6 +3685,7 @@ async fn fail_if_template_deployment_failed(
     }
 }
 
+#[cfg(test)]
 async fn template_deployment_failure(
     api: &ApiClient,
     app_name: &str,
@@ -3529,6 +3702,7 @@ async fn template_deployment_failure(
         .map(|deployment| template_deployment_failure_message(deployment, deployment_id)))
 }
 
+#[cfg(test)]
 fn template_deployment_failure_message(
     deployment: &DeploymentEntry,
     deployment_id: &str,
@@ -3540,6 +3714,7 @@ fn template_deployment_failure_message(
     format!("deployment {deployment_id} failed: {detail}")
 }
 
+#[cfg(test)]
 fn should_retry_template_deployment_status_error(error: &ApiError) -> bool {
     match error {
         ApiError::Http(error) => should_retry_api_transport_error(error),
@@ -4113,7 +4288,9 @@ fn ensure_ssh_command_matches_endpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::app::should_retry_template_deployment_status_error;
     use std::io::{Read, Write};
+    use terminal_delivery_support::deployment_entry_json;
 
     #[tokio::test]
     async fn bootstrap_subphase_timings_are_nested_fixed_and_opt_in() {
@@ -5516,7 +5693,7 @@ mod tests {
         let started = Instant::now();
         tokio::time::timeout(
             Duration::from_secs(2),
-            fail_if_template_deployment_failed(&api, "shell", "deploy-1", Some(deadline)),
+            fail_if_held_template_deployment_failed(&api, "shell", "deploy-1", Some(deadline)),
         )
         .await
         .expect("deployment status must respect the hold deadline")
@@ -6069,6 +6246,10 @@ mod tests {
                         "updated_at": "2026-10-12T10:00:01Z"
                     }]
                 }))
+            } else if path.ends_with("/deployments") {
+                Some(serde_json::json!([deployment_entry_json(
+                    "deploy-1", "healthy"
+                )]))
             } else {
                 None
             }
@@ -6108,6 +6289,10 @@ mod tests {
                         "updated_at": "2026-10-12T10:00:00Z"
                     }]
                 }))
+            } else if path.ends_with("/deployments") {
+                Some(serde_json::json!([deployment_entry_json(
+                    "deploy-1", "healthy"
+                )]))
             } else {
                 None
             }
@@ -6153,6 +6338,10 @@ mod tests {
                         "updated_at": "2026-10-12T10:00:00Z"
                     }]
                 }))
+            } else if path.ends_with("/deployments") {
+                Some(serde_json::json!([deployment_entry_json(
+                    "deploy-1", "healthy"
+                )]))
             } else {
                 None
             }
@@ -6472,6 +6661,37 @@ mod tests {
 
         assert!(body.contains("Stable SSH endpoint: waiting for readiness"));
         assert!(!body.contains("waiting for relay registration"));
+    }
+
+    #[test]
+    fn missing_cap_deployment_id_falls_back_to_the_signed_descriptors_id() {
+        // cap#220 review: a hosted template response that omits
+        // `cap_deployment_id` must not freeze the literal "pending" for the
+        // whole flow -- that permanently disables every terminal-failure
+        // check (including the #18 signed-policy rejection) and the
+        // success-exit reconciliation. The signed descriptor's `deploy_id`
+        // is the authoritative fallback: CAP records it as the deployment id
+        // for a fresh signed deploy, and if CAP substituted a different id,
+        // lookups for the signed id simply observe nothing (the pre-fix
+        // behavior) instead of misattributing another rollout's failure.
+        let source = include_str!("template.rs");
+        let fn_start = source
+            .find("async fn deploy_with_timings")
+            .expect("deploy flow exists");
+        let fn_end = source[fn_start..]
+            .find("async fn prepare_template_log_key")
+            .expect("log key helper follows the deploy flow")
+            + fn_start;
+        let body = &source[fn_start..fn_end];
+
+        assert!(
+            body.contains(".filter(|id| !id.is_empty() && *id != \"pending\")"),
+            "the missing-id fallback must not accept empty or \"pending\" ids: {body}"
+        );
+        assert!(
+            body.contains(".unwrap_or(&trusted_deployment.deploy_id)"),
+            "the signed descriptor's deploy_id must be the fallback: {body}"
+        );
     }
 
     #[test]
@@ -7277,28 +7497,6 @@ mod tests {
                 "log_key_id": "shell-logs",
                 "log_private_key_file": "/tmp/shell-logs.x25519"
             })
-        );
-    }
-
-    #[test]
-    fn template_deployment_failure_message_includes_api_error_detail() {
-        let deployment = DeploymentEntry {
-            id: "deploy-123".to_string(),
-            status: "failed".to_string(),
-            image_digest: None,
-            error_message: Some(
-                "KBS policy error: signed policy artifact set exceeds byte budget".to_string(),
-            ),
-            template_slug: Some("debian-ssh-frp".to_string()),
-            template_version: Some("2026.07.03".to_string()),
-            template_expected: Default::default(),
-            created_at: "2026-07-03T15:48:25Z".to_string(),
-            completed_at: None,
-        };
-
-        assert_eq!(
-            template_deployment_failure_message(&deployment, "deploy-123"),
-            "deployment deploy-123 failed: KBS policy error: signed policy artifact set exceeds byte budget"
         );
     }
 

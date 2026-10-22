@@ -22,7 +22,7 @@ path = "src/bin/cap_migrate.rs"
 [dependencies]
 anyhow = { workspace = true }
 enclava-engine = { workspace = true }
-enclava-common = { workspace = true, features = ["outbound-http"] }
+enclava-common = { workspace = true, features = ["outbound-http", "release-profiles"] }
 tokio = { workspace = true }
 axum = { workspace = true }
 sqlx = { workspace = true }
@@ -61,15 +61,22 @@ http = "1"
 http-body-util = "0.1"
 httpdate = "1"
 bytes = "1"
+tokio-rustls = { workspace = true }
+# Evidence-authenticated TEE channel (cap#206): SNP report parsing for the
+# KDS VCEK fallback, builtin ARK/ASK roots, and structured report
+# extraction. AMD chain/signature verification itself runs on
+# enclava-verifier primitives. `openssl` matches enclava-cli's sev features
+# so the vendored OpenSSL build unifies, and doubles as the test-only
+# anchor sync guard this manifest previously carried under dev-deps.
+sev = { version = "7.1.0", default-features = false, features = ["snp", "openssl", "serde"] }
 
 [features]
-prod-strict = ["enclava-engine/prod-strict"]
+prod-strict = ["enclava-engine/prod-strict", "enclava-common/prod-strict"]
 
 [dev-dependencies]
 axum-test = "20"
 tower = { version = "0.5", features = ["util"] }
 rcgen = "0.14"
-tokio-rustls = { workspace = true }
 # start_paused for the pull-secret cleanup tests: the delete conflict backoff
 # (~60 s budget) and the finalizer poll (30 s) run in simulated time.
 tokio = { version = "1", features = ["full", "test-util"] }
@@ -80,11 +87,3 @@ tokio = { version = "1", features = ["full", "test-util"] }
 # Re-verify matcher semantics on ANY bump (patch included) — see the
 # classifier invariant comment in src/lib.rs.
 matchit = "=0.8.4"
-# Test-only anchor sync guard: the unlock transition quote gate pins the
-# builtin AMD ARK roots as SHA-256 constants. This dev-dependency lets a
-# test assert the pins stay byte-identical to the sev crate's builtin
-# roots (the same source the CLI's ark_is_pinned_to_builtin_root reads
-# live), so a sev bump that rotates a root fails CI instead of silently
-# rejecting every unlock transition. Features must match enclava-cli's
-# sev dependency so the vendored OpenSSL build unifies.
-sev = { version = "7.1.0", default-features = false, features = ["snp", "openssl", "serde"] }
