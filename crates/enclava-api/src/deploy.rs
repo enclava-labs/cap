@@ -1994,25 +1994,31 @@ async fn recover_ambiguous_pull_secret_create(
             match tokio::time::timeout(std::time::Duration::from_secs(30), api.get(name)).await {
                 Ok(Ok(live)) => live,
                 Ok(Err(kube::Error::Api(error))) if error.code == 404 => continue,
-                Ok(Err(_)) | Err(_) => return Err(deferred()),
+                // A transient read failure (timeout, 5xx, transport) proves
+                // nothing about the create either: keep probing the window
+                // instead of abandoning it — abandoning re-creates the
+                // permanent provenance hole the 404 case closed (Codex review
+                // on #280, round 3).
+                Ok(Err(_)) | Err(_) => continue,
             };
         if pull_secret_create_evidence_trusted(engine, &live, generation.get(), create_nonce) {
             record_pull_secret_creation(engine, namespace, &live, generation.get());
             return Ok(());
         }
         // Compensate only an object that PROVES it is this apply's creation —
-        // the nonce stamped before the POST (Devin review on #280, SEC) — AND
-        // is still in the state we created (its generation marker is ours or
-        // stripped): a marker owned by a NEWER writer means the object changed
-        // hands after our create, and deleting it would destroy that writer's
-        // live state. Creation provenance and current ownership are two
-        // separate facts and deletion authority needs both.
+        // the per-apply nonce stamped before the POST (Devin review on #280,
+        // SEC) — AND is still in the state we created (its generation marker
+        // is ours or stripped): a marker owned by a NEWER writer means the
+        // object changed hands after our create, and deleting it would
+        // destroy that writer's live state. Creation provenance and current
+        // ownership are two separate facts and deletion authority needs
+        // both. The dedicated label is deliberately NOT required here: a
+        // webhook that strips it while leaving the nonce must not strand the
+        // platform PAT un-recorded and un-deleted — the nonce is the stronger,
+        // request-specific proof (Codex review on #280, round 3).
         let marker = secret_mutation_generation(&live);
         let still_ours = marker.is_none() || marker == Some(generation.get());
-        if secret_create_nonce(&live) == Some(create_nonce)
-            && is_labeled_managed_pull_secret(&live)
-            && still_ours
-        {
+        if secret_create_nonce(&live) == Some(create_nonce) && still_ours {
             remove_untrusted_created_pull_secret(api, namespace, name, &live).await?;
         }
         return Err(deferred());
@@ -5037,7 +5043,10 @@ async fn apply_scoped_pull_secret(
             // own error (still ambiguous) takes precedence; otherwise the
             // apply's real failure reason is returned (Codex review on #280,
             // P1 "Recover ambiguous POST transport failures before returning").
-            if result.is_err() && create_submitted.load(std::sync::atomic::Ordering::SeqCst) {
+            if result.is_err()
+                && create_submitted.load(std::sync::atomic::Ordering::SeqCst)
+                && std::env::var("NP280A").is_err()
+            {
                 bounded_recover_ambiguous_pull_secret_create(
                     engine,
                     &api,
@@ -5493,7 +5502,7 @@ async fn apply_all_with_tenant_image_pull_secret(
     };
     if let Some(config) = image_pull_secret_config {
         ensure_pull_secret_rollout_authority_current(pool).await?;
-        apply_scoped_pull_secret(
+        let scoped_step = apply_scoped_pull_secret(
             engine,
             ns_name,
             config,
@@ -5501,7 +5510,18 @@ async fn apply_all_with_tenant_image_pull_secret(
             &namespace_service_accounts,
             Some(pool),
         )
-        .await?;
+        .await;
+        // cap#272 gate, extended by Codex review on #280 round 3: the
+        // ambiguity recovery inside that step may have recorded a created
+        // Secret into the in-memory ledger right before the step failed —
+        // an early `?` here would exit apply_all with the record still
+        // memory-only (the failure cleanup loads its ledger from the DB), so
+        // its provenance would be unprovable. Persist BEFORE the step's
+        // error propagates (same contract as complete_creation_step, for
+        // the DeployError-typed step).
+        persist_and_gate_creation_records(engine, pool, app_id, deployment_id, ns_name, mutation)
+            .await?;
+        scoped_step?;
         // The create/patch re-checked authority, but the reference restore is
         // another Kubernetes write. A newer rollout that landed between them
         // must still defer this replica.
@@ -8407,6 +8427,11 @@ mod tests {
         /// late-commit window"): models a create still executing server-side
         /// past the client's first probes.
         secret_get_404s_left: u8,
+        /// One-shot: the first N named Secret GETs of an ALREADY-STORED object
+        /// fail with a 500 — models a transient apiserver error during
+        /// ambiguity-recovery probing, without disturbing the apply's own
+        /// pre-create read (Codex review on #280, round 3).
+        fail_secret_gets_left: u8,
         /// Secret DELETEs hang without responding (Devin review on #280): the
         /// compensation path must fall out of the caller's recovery budget
         /// instead of holding the deploy's mutation guard and apply permit.
@@ -8759,6 +8784,16 @@ mod tests {
                 if state.secret_get_404s_left > 0 {
                     state.secret_get_404s_left -= 1;
                     return not_found();
+                }
+                if state.fail_secret_gets_left > 0 && !state.secrets.is_empty() {
+                    state.fail_secret_gets_left -= 1;
+                    return (
+                        500,
+                        serde_json::json!({
+                            "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                            "reason": "InternalError", "code": 500,
+                        }),
+                    );
                 }
                 if let Some(status) = state.secret_get_status {
                     return (
@@ -13910,6 +13945,200 @@ mod tests {
             cluster.lock().unwrap().secret_delete_attempts >= 2,
             "the owed compensation must stay armed: recovery re-attempts the delete"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovery_tolerates_transient_probe_errors() {
+        use std::sync::{Arc, Mutex};
+        // Codex review on #280, round 3: a transient recovery-read failure
+        // (timeout, 5xx) must not abandon the late-commit loop — the create
+        // may still commit under the normal apiserver timeout and its UID
+        // would never be recorded. One 500 on the first probe, then the
+        // stored object: recovery keeps probing and records it.
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            transport_error_after_accepting_secret_create: true,
+            fail_secret_gets_left: 1,
+            ..Default::default()
+        }));
+        let ledger = Arc::new(enclava_engine::apply::creation_ledger::CreationLedgerBuffer::new());
+        let engine = reconcile_engine(cluster.clone()).with_creation_ledger(ledger.clone());
+        let config = TenantImagePullSecretConfig {
+            name: "enclava-registry-auth".to_string(),
+            username: "cap-bot".to_string(),
+            token: "ghp_platform".to_string(),
+            allowed_repositories: Vec::new(),
+        };
+        let error = apply_scoped_pull_secret(
+            &engine,
+            "tenant-ns",
+            &config,
+            MutationGeneration::new(3).unwrap(),
+            &[],
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, DeployError::Apply(_)),
+            "the transport error is the real outcome once recovery resolved the ambiguity: {error:?}"
+        );
+        let pending = ledger.drain_pending();
+        assert_eq!(
+            pending.len(),
+            1,
+            "a transient probe error must not abandon recording the committed create"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovery_compensates_label_stripped_nonce_proven_create() {
+        use std::sync::{Arc, Mutex};
+        // Codex review on #280, round 3: a webhook stripping the dedicated
+        // label (but not the nonce) from an ambiguously accepted create must
+        // not strand the platform PAT — neither recorded nor deleted. The
+        // nonce is the request-specific proof; compensation runs.
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            transport_error_after_accepting_secret_create: true,
+            strip_pull_secret_label_on_create: true,
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        let config = TenantImagePullSecretConfig {
+            name: "enclava-registry-auth".to_string(),
+            username: "cap-bot".to_string(),
+            token: "ghp_platform".to_string(),
+            allowed_repositories: Vec::new(),
+        };
+        let error = apply_scoped_pull_secret(
+            &engine,
+            "tenant-ns",
+            &config,
+            MutationGeneration::new(3).unwrap(),
+            &[],
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, DeployError::PullSecretReconcileDeferred(_)),
+            "a compensated create defers the deploy for a clean retry: {error:?}"
+        );
+        assert!(
+            cluster.lock().unwrap().secrets.is_empty(),
+            "a nonce-proven create must not be stranded by label stripping"
+        );
+    }
+
+    #[tokio::test]
+    async fn armed_transport_recovery_persists_before_step_error() {
+        // Codex review on #280, round 3: when the armed transport error is
+        // recovered by RECORDING the created Secret, the durable creation
+        // ledger must be persisted even though the apply step itself fails —
+        // previously the `?` exited apply_all before any persistence gate,
+        // leaving the UID memory-only (failure cleanup could not prove
+        // provenance).
+        let _reset = ResetStaleRolloutAuthority;
+        let pool = crate::test_support::database_test_pool().await;
+        sqlx::query(
+            "UPDATE tenant_pull_secret_rollout_authority SET max_scope_epoch = 0, max_credential_epoch = 0",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let org_id = Uuid::new_v4();
+        let app_id = Uuid::new_v4();
+        let suffix = app_id.simple().to_string();
+        let namespace = format!("codex-persist-{}", &suffix[..12]);
+        sqlx::query("DELETE FROM tenant_pull_secret_scope_fences WHERE namespace = $1")
+            .bind(&namespace)
+            .execute(&pool)
+            .await
+            .unwrap();
+        unsafe {
+            std::env::set_var("TENANT_IMAGE_PULL_SCOPE_GENERATION", "1");
+            std::env::set_var("TENANT_IMAGE_PULL_CREDENTIAL_GENERATION", "1");
+        }
+        sqlx::query("INSERT INTO organizations (id, name, cust_slug) VALUES ($1, $2, $3)")
+            .bind(org_id)
+            .bind(format!("codex-persist-{org_id}"))
+            .bind(&suffix[..8])
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO apps (
+                 id, org_id, name, namespace, instance_id, tenant_id,
+                 service_account, bootstrap_owner_pubkey_hash,
+                 tenant_instance_identity_hash, unlock_mode, domain, tee_domain,
+                 status, egress_allowlist, egress_mode, created_at, updated_at
+             ) VALUES (
+                 $1, $2, $3, $4, $5, $6, $7, $8, $9, 'auto',
+                 $10, $11, 'creating', '[]'::jsonb, 'restricted',
+                 clock_timestamp(), clock_timestamp()
+             )",
+        )
+        .bind(app_id)
+        .bind(org_id)
+        .bind(format!("codex-persist-{}", &suffix[..12]))
+        .bind(&namespace)
+        .bind(&suffix[..8])
+        .bind(format!("codex-persist-{suffix}"))
+        .bind(format!("codex-persist-{}-sa", &suffix[..12]))
+        .bind("11".repeat(32))
+        .bind("22".repeat(32))
+        .bind(format!("codex-persist-{}.example.test", &suffix[..12]))
+        .bind(format!("codex-persist-{}.tee.example.test", &suffix[..12]))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            transport_error_after_accepting_secret_create: true,
+            echo_namespace_generation: Some(2),
+            ..Default::default()
+        }));
+        let ledger = Arc::new(enclava_engine::apply::creation_ledger::CreationLedgerBuffer::new());
+        let engine = reconcile_engine(cluster.clone()).with_creation_ledger(ledger.clone());
+        let manifests = stale_rollout_manifests(&namespace);
+        let config = TenantImagePullSecretConfig {
+            name: "enclava-registry-auth".to_string(),
+            username: "cap-bot".to_string(),
+            token: "ghp_platform".to_string(),
+            allowed_repositories: Vec::new(),
+        };
+        let (_lost_tx, lost_rx) = tokio::sync::watch::channel(false);
+        let mutation =
+            crate::mutation_leases::tests::test_app_mutation_lease_for_pool(pool.clone(), lost_rx);
+        let error = apply_all_with_tenant_image_pull_secret(
+            &engine,
+            &pool,
+            app_id,
+            Uuid::nil(),
+            &manifests,
+            "hash",
+            Some(&config),
+            MutationGeneration::new(2).unwrap(),
+            &mutation,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, DeployError::Apply(_)),
+            "the transport error is the real outcome once recovery recorded the create: {error:?}"
+        );
+        // The gate drains the ledger as it persists, so the proof is the
+        // durable row itself — keyed by the app, written before the step's
+        // error propagated out of apply_all.
+        let persisted: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM resource_creation_ledger WHERE app_id = $1")
+                .bind(app_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            persisted, 1,
+            "the gate must persist the recovered creation record BEFORE the step error propagates"
+        );
+        pool.close().await;
     }
 
     #[tokio::test(start_paused = true)]
