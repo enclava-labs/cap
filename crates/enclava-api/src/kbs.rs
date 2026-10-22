@@ -4056,7 +4056,7 @@ resource_bindings := {
                         },
                         data: Some(BTreeMap::from([(
                             "resource-policy".to_string(),
-                            "package policy\n\ndefault allow := false\n".to_string(),
+                            "package policy\nresource_bindings := {}\nowner_resource_bindings := {}\ndefault allow := false\n".to_string(),
                         )])),
                         ..Default::default()
                     }),
@@ -4098,6 +4098,7 @@ resource_bindings := {
                         }),
                         status: Some(k8s_openapi::api::apps::v1::DeploymentStatus {
                             observed_generation: Some(1),
+                            replicas: Some(1),
                             updated_replicas: Some(1),
                             available_replicas: Some(1),
                             ..Default::default()
@@ -4159,6 +4160,7 @@ resource_bindings := {
                                 updated.status =
                                     Some(k8s_openapi::api::apps::v1::DeploymentStatus {
                                         observed_generation: Some(generation),
+                                        replicas: Some(1),
                                         updated_replicas: Some(1),
                                         available_replicas: Some(1),
                                         ..Default::default()
@@ -4223,6 +4225,10 @@ resource_bindings := {
         let (_cleanup, pool) =
             crate::test_support::isolated_database_test_pool("kbs_signed_policy").await;
         let (org_id, app_id) = insert_test_app(&pool, "creating").await;
+        // Eligibility checks the artifact signer against the org keyring
+        // (signer-withdrawal machinery): keep it active for the fixture.
+        let signer = "bb".repeat(32);
+        insert_test_keyring_version(&pool, org_id, 1, &[&signer]).await;
         let deployment_id = Uuid::new_v4();
         insert_test_deployment(&pool, org_id, app_id, deployment_id, "healthy", Utc::now()).await;
         set_test_setup_state(&pool, deployment_id, "accepted").await;
@@ -4261,15 +4267,19 @@ resource_bindings := {
         };
 
         // The fixture has an eligible artifact but no pending generation. The
-        // mode guard leaves the existing ConfigMap unchanged.
+        // mode guard keeps the artifact out of the serving policy (legacy Rego
+        // convergence may normalize the base body, but nothing signed publishes).
         let fake = FakeKubeState::new();
         reconcile_pending_signed_policy_artifacts_with_client(&pool, &config, None, fake.client())
             .await
             .expect("reconcile is a no-op on a skipped enqueue");
-        assert_eq!(
-            fake.configmap_policy().await,
-            Some("package policy\n\ndefault allow := false\n".to_string()),
-            "without a pending generation, the serving KBS policy remains unchanged"
+        let policy = fake
+            .configmap_policy()
+            .await
+            .expect("serving policy present");
+        assert!(
+            !is_signed_policy_artifact_body(&policy),
+            "without a pending generation, no signed artifact may reach the serving KBS policy"
         );
         let desired: i64 = sqlx::query_scalar(
             "SELECT desired_generation FROM kbs_signed_policy_reconciliation WHERE singleton",
