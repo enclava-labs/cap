@@ -1305,7 +1305,11 @@ fn concurrent_deploy_owns_pull_secret(mode: PullSecretDeleteMode, actual: i64) -
 /// held. Treat that object as fenced, not as completed residue. Once the lease
 /// is released, an unannotated legacy secret remains removable.
 fn observed_generation_blocks_removal(mode: PullSecretDeleteMode, actual: Option<i64>) -> bool {
-    match actual {
+    // Nonpositive markers are as invalid as unparsable ones (Codex review on
+    // #280, P1): real namespace generations are positive, so a webhook
+    // rewriting the annotation to 0 or a negative must not make the object
+    // compare as "older than" an active lease and escape its protection.
+    match actual.filter(|generation| *generation > 0) {
         Some(actual) => generation_blocks_pull_secret_removal(mode, actual),
         None => matches!(
             mode,
@@ -1321,7 +1325,7 @@ fn observed_generation_blocks_removal(mode: PullSecretDeleteMode, actual: Option
 /// not let a stale sweep detach a reference the held lease's deploy just
 /// attached.
 fn observed_concurrent_deploy_owns(mode: PullSecretDeleteMode, actual: Option<i64>) -> bool {
-    match actual {
+    match actual.filter(|generation| *generation > 0) {
         Some(actual) => concurrent_deploy_owns_pull_secret(mode, actual),
         None => matches!(
             mode,
@@ -1394,6 +1398,15 @@ const PULL_SECRET_CREATE_NONCE_ANNOTATION: &str = "enclava.dev/pull-secret-creat
 /// in ~2 s while the POST is still executing.
 const PULL_SECRET_CREATE_LATE_COMMIT_WINDOW: std::time::Duration =
     std::time::Duration::from_secs(75);
+// Coupling (Devin review on #280): the window is sized on kube-apiserver's
+// default 60s `--request-timeout`, which bounds the stalled POST's server-side
+// execution. A commit after the window implies a non-default apiserver
+// configuration — it is NOT impossible, and its residue is owned, not lost:
+// the mutation lease's reclaim quarantine keeps the namespace fenced, and the
+// stale sweep removes a labeled pull secret once its lease releases (an
+// unproven late object is removable residue exactly like an unannotated legacy
+// secret). The platform PAT of such a late create therefore stays readable at
+// most until the next sweep pass, never forever.
 
 /// Interval between late-commit-window absence probes.
 const PULL_SECRET_CREATE_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
@@ -4187,15 +4200,34 @@ async fn cleanup_stale_tenant_image_pull_secrets(pool: &PgPool) -> Result<bool, 
         // lost insert means a deploy claimed the namespace after the
         // snapshot; keep generation 0 so that write stays protected.
         let published_missing_row = if snapshot.is_none() {
-            match publish_missing_namespace_pull_secret_lease(pool, namespace).await {
-                Ok(inserted) => inserted,
-                Err(error) => {
+            // Codex review on #280, P1: a concurrent transaction holding the
+            // same lease key open would make this INSERT ... ON CONFLICT wait
+            // indefinitely under the mutation guard — bound it by the same
+            // namespace budget as every other await here.
+            match tokio::time::timeout(
+                remaining_namespace_budget(),
+                publish_missing_namespace_pull_secret_lease(pool, namespace),
+            )
+            .await
+            {
+                Ok(Ok(inserted)) => inserted,
+                Ok(Err(error)) => {
                     converged = false;
                     tracing::warn!(
                         %namespace,
                         %error,
                         "tenant image pull secret cleanup sweep: failed to publish a released \
                          lease for a namespace with no row — treating it as not converged"
+                    );
+                    continue;
+                }
+                Err(_) => {
+                    converged = false;
+                    tracing::warn!(
+                        %namespace,
+                        "tenant image pull secret cleanup sweep: publishing a released lease \
+                         for a namespace with no row exceeded the namespace budget — treating \
+                         it as not converged"
                     );
                     continue;
                 }
@@ -4901,13 +4933,13 @@ async fn apply_scoped_pull_secret(
                         .await
                     {
                         Ok(applied) => {
-                            // A received response resolves the create
-                            // ambiguity: only a LOST response keeps the create
-                            // candidate armed for recovery (Codex review on
-                            // #280, P1 "Clear the create flag after a
-                            // definitive response").
-                            create_submitted_in_apply
-                                .store(false, std::sync::atomic::Ordering::SeqCst);
+                            // The response resolves the CREATE ambiguity, but
+                            // the candidate stays armed until the confirmed
+                            // create is fully dispositioned — recorded or
+                            // compensated with removal CONFIRMED (Codex review
+                            // on #280, P1 "Keep confirmed-create compensation
+                            // armed until removal"): a compensation cut off by
+                            // the outer budget must remain recoverable.
                             // Codex review on #243, round 2, P1 "verify
                             // creation evidence returned by the Secret POST":
                             // a mutating admission webhook can strip the
@@ -4932,6 +4964,8 @@ async fn apply_scoped_pull_secret(
                                     &applied,
                                 )
                                 .await?;
+                                create_submitted_in_apply
+                                    .store(false, std::sync::atomic::Ordering::SeqCst);
                                 return Err(DeployError::Validation(format!(
                                     "created pull secret {namespace}/{} came back without trusted \
                                  creation evidence (annotation value or field ownership; \
@@ -4947,6 +4981,8 @@ async fn apply_scoped_pull_secret(
                                 &applied,
                                 generation.get(),
                             );
+                            create_submitted_in_apply
+                                .store(false, std::sync::atomic::Ordering::SeqCst);
                             return Ok(());
                         }
                         Err(kube::Error::Api(error)) if error.code == 409 => {
@@ -4959,14 +4995,21 @@ async fn apply_scoped_pull_secret(
                                 .store(false, std::sync::atomic::Ordering::SeqCst);
                             continue;
                         }
-                        Err(kube::Error::Api(error)) => {
+                        Err(kube::Error::Api(error)) if (400..500).contains(&error.code) => {
+                            // A 4xx is a definitive refusal: nothing of ours
+                            // exists to ledger or compensate.
                             create_submitted_in_apply
                                 .store(false, std::sync::atomic::Ordering::SeqCst);
                             return Err(DeployError::Apply(kube::Error::Api(error).into()));
                         }
-                        // A transport error is not a response: the POST may
+                        // Anything else — a transport error, or a 5xx Api
+                        // response — is NOT a definitive outcome: the POST may
                         // still commit server-side, so the create candidate
-                        // stays armed for recovery.
+                        // stays armed and the wrapper below routes the armed
+                        // failure through the same ambiguity recovery used for
+                        // a timed-out future (Codex review on #280, P1
+                        // "Recover ambiguous POST transport failures before
+                        // returning").
                         Err(error) => return Err(DeployError::Apply(error.into())),
                     }
                 }
@@ -4986,7 +5029,28 @@ async fn apply_scoped_pull_secret(
         )))
     };
     match tokio::time::timeout(PULL_SECRET_NAMESPACE_RECONCILE_TIMEOUT, apply).await {
-        Ok(result) => result,
+        Ok(result) => {
+            // A failed apply that left the create candidate armed is as
+            // ambiguous as a timed-out future: its POST (or its owed
+            // compensation) may still land server-side. Resolve the ambiguity
+            // through the same bounded recovery before returning — recovery's
+            // own error (still ambiguous) takes precedence; otherwise the
+            // apply's real failure reason is returned (Codex review on #280,
+            // P1 "Recover ambiguous POST transport failures before returning").
+            if result.is_err() && create_submitted.load(std::sync::atomic::Ordering::SeqCst) {
+                bounded_recover_ambiguous_pull_secret_create(
+                    engine,
+                    &api,
+                    namespace,
+                    &config.name,
+                    generation,
+                    true,
+                    &create_nonce,
+                )
+                .await?;
+            }
+            result
+        }
         Err(_) => {
             bounded_recover_ambiguous_pull_secret_create(
                 engine,
@@ -8347,6 +8411,18 @@ mod tests {
         /// compensation path must fall out of the caller's recovery budget
         /// instead of holding the deploy's mutation guard and apply permit.
         stall_secret_deletes: bool,
+        /// Secret DELETEs are accepted but remove nothing: the removal poll
+        /// is the only notice the object survived (Codex review on #280, P1
+        /// "Keep confirmed-create compensation armed until removal").
+        noop_secret_deletes: bool,
+        /// Count every Secret DELETE the fake routes (asserts that recovery
+        /// re-attempted a compensation the apply itself never finished).
+        secret_delete_attempts: u32,
+        /// POST is accepted (object stored) and then the response FAILS with
+        /// a transport error (Codex review on #280, P1 "Recover ambiguous
+        /// POST transport failures before returning"): the create is as
+        /// ambiguous as a timeout and must reach recovery.
+        transport_error_after_accepting_secret_create: bool,
         /// Simulate a mutating admission webhook that strips
         /// RESOURCE_CREATED_BY_ANNOTATION from an ACCEPTED Secret create
         /// (Codex review on #243, round 2, P1): the stored/returned object
@@ -8496,6 +8572,27 @@ mod tests {
                                 .body(Body::from(serde_json::to_vec(&value).unwrap()))
                                 .unwrap(),
                         );
+                    }
+                    let accept_then_error = {
+                        let state = cluster.lock().unwrap();
+                        state.transport_error_after_accepting_secret_create
+                            && method.as_str() == "POST"
+                            && path.contains("/secrets")
+                    };
+                    if accept_then_error {
+                        let _ = {
+                            let mut state = cluster.lock().unwrap();
+                            route_fake_cluster(
+                                &mut state,
+                                method.as_str(),
+                                &path,
+                                query.as_deref(),
+                                &body,
+                            )
+                        };
+                        return Err(std::io::Error::other(
+                            "simulated transport failure after the create was accepted",
+                        ));
                     }
                     // Stalled-API-server simulation (Codex review on #243, P1
                     // follow-up): the label-selected Secret list hangs far
@@ -8917,6 +9014,18 @@ mod tests {
                 )
             }
             ("secrets", "DELETE") => {
+                state.secret_delete_attempts += 1;
+                if state.noop_secret_deletes {
+                    // Accepted, but nothing is removed: model a finalizer or
+                    // wedged API that keeps the object alive after DELETE
+                    // acceptance.
+                    return (
+                        200,
+                        serde_json::json!({
+                            "kind": "Status", "apiVersion": "v1", "status": "Success", "code": 200,
+                        }),
+                    );
+                }
                 if let Some(replacement) = state.replace_on_delete.take() {
                     // The tenant replaces the secret between the cleanup's
                     // ownership check and its delete (review finding on #243).
@@ -13677,6 +13786,129 @@ mod tests {
         assert!(
             cluster.lock().unwrap().secrets.is_empty(),
             "the unmarked accepted PAT must be compensated before the deferred error"
+        );
+    }
+
+    #[test]
+    fn nonpositive_generation_markers_are_invalid_not_ownership() {
+        // Codex review on #280, P1: a webhook rewriting the annotation to 0 or
+        // a negative must fall into the missing-marker branch — real
+        // generations are positive — instead of comparing as "older than" an
+        // active lease and escaping its protection.
+        let held = PullSecretDeleteMode::Unfenced {
+            namespace_generation: 5,
+            lease_held: true,
+        };
+        let released = PullSecretDeleteMode::Unfenced {
+            namespace_generation: 5,
+            lease_held: false,
+        };
+        for mode in [held, released] {
+            let missing = observed_generation_blocks_removal(mode, None);
+            let missing_owns = observed_concurrent_deploy_owns(mode, None);
+            for invalid in [Some(0), Some(-3), Some(i64::MIN)] {
+                assert_eq!(
+                    observed_generation_blocks_removal(mode, invalid),
+                    missing,
+                    "nonpositive markers must behave exactly like missing ones"
+                );
+                assert_eq!(
+                    observed_concurrent_deploy_owns(mode, invalid),
+                    missing_owns,
+                    "nonpositive markers must behave exactly like missing ones"
+                );
+            }
+        }
+        // Positive markers keep their real ownership semantics: a generation
+        // strictly below the snapshot never blocks removal.
+        assert!(!observed_generation_blocks_removal(
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 5,
+                lease_held: true,
+            },
+            Some(4)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn armed_transport_error_routes_through_ambiguity_recovery() {
+        use std::sync::{Arc, Mutex};
+        // Codex review on #280, P1 "Recover ambiguous POST transport failures
+        // before returning": the create is ACCEPTED (stored) and the response
+        // fails at the transport — as ambiguous as a timeout. The armed
+        // failure must reach recovery, which dispositions the stored object
+        // (here: evidence-untrusted via a stripped creation annotation, so the
+        // nonce-proven compensation removes it) instead of leaving an
+        // untracked platform PAT behind.
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            transport_error_after_accepting_secret_create: true,
+            strip_creation_evidence_on_create: true,
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        let config = TenantImagePullSecretConfig {
+            name: "enclava-registry-auth".to_string(),
+            username: "cap-bot".to_string(),
+            token: "ghp_platform".to_string(),
+            allowed_repositories: Vec::new(),
+        };
+        let error = apply_scoped_pull_secret(
+            &engine,
+            "tenant-ns",
+            &config,
+            MutationGeneration::new(3).unwrap(),
+            &[],
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, DeployError::PullSecretReconcileDeferred(_)),
+            "an armed transport failure must resolve its ambiguity before returning: {error:?}"
+        );
+        assert!(
+            cluster.lock().unwrap().secrets.is_empty(),
+            "the stored create must be dispositioned by recovery, not left untracked"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_compensation_stays_armed_for_recovery() {
+        use std::sync::{Arc, Mutex};
+        // Codex review on #280, P1 "Keep confirmed-create compensation armed
+        // until removal": the create comes back without trusted evidence and
+        // the compensating DELETE never removes anything. The candidate must
+        // stay armed, so the outer timeout's recovery re-attempts the
+        // compensation (delete attempts: the apply's own + recovery's).
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            strip_creation_evidence_on_create: true,
+            noop_secret_deletes: true,
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster.clone());
+        let config = TenantImagePullSecretConfig {
+            name: "enclava-registry-auth".to_string(),
+            username: "cap-bot".to_string(),
+            token: "ghp_platform".to_string(),
+            allowed_repositories: Vec::new(),
+        };
+        let error = apply_scoped_pull_secret(
+            &engine,
+            "tenant-ns",
+            &config,
+            MutationGeneration::new(3).unwrap(),
+            &[],
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, DeployError::PullSecretReconcileDeferred(_)),
+            "an unremoved platform PAT must surface as deferred, not success: {error:?}"
+        );
+        assert!(
+            cluster.lock().unwrap().secret_delete_attempts >= 2,
+            "the owed compensation must stay armed: recovery re-attempts the delete"
         );
     }
 
