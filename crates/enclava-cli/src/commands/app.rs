@@ -3591,7 +3591,7 @@ pub struct DestroyArgs {
     /// App name (defaults to enclava.toml app.name)
     #[arg(long)]
     pub app: Option<String>,
-    /// Skip confirmation prompt
+    /// Skip confirmation prompt (the noninteractive path; destroys immediately)
     #[arg(long)]
     pub force: bool,
     /// Finish the destroy even if the confidential workload teardown cannot
@@ -3606,6 +3606,14 @@ pub async fn destroy(args: DestroyArgs) -> Result<(), Box<dyn std::error::Error>
     let (api, _paths, _cli_config) = build_api_client()?;
 
     if !args.force {
+        // Guard before the prompts: a piped run must refuse with guidance, not
+        // dialoguer's bare "not a terminal" -- that dead end is what pushed the
+        // 2026-10-22 ops matrix to `--force`, which deletes without prompting.
+        ensure_destroy_confirm_terminal(
+            std::io::IsTerminal::is_terminal(&std::io::stdin()),
+            std::io::IsTerminal::is_terminal(&std::io::stderr()),
+        )?;
+
         let confirm = dialoguer::Confirm::new()
             .with_prompt(format!(
                 "This will permanently destroy '{app_name}' and all its data. Continue?"
@@ -3629,16 +3637,42 @@ pub async fn destroy(args: DestroyArgs) -> Result<(), Box<dyn std::error::Error>
         }
     }
 
+    run_destroy(&api, &app_name, args.abandon_teardown).await
+}
+
+/// Reject noninteractive confirmation before any prompt or request is made.
+fn ensure_destroy_confirm_terminal(
+    stdin_is_terminal: bool,
+    stderr_is_terminal: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if stdin_is_terminal && stderr_is_terminal {
+        return Ok(());
+    }
+    Err(
+        "app destroy confirmation requires terminal stdin and stderr; \
+         for noninteractive runs pass --force to skip confirmation \
+         (the destroy starts immediately without a prompt)."
+            .into(),
+    )
+}
+
+/// The mutating half of `destroy`: the CLI's only app-delete call site,
+/// reached solely after `--force` or a completed interactive confirmation.
+async fn run_destroy(
+    api: &ApiClient,
+    app_name: &str,
+    abandon_teardown: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let spinner = ProgressBar::new_spinner();
     spinner.set_style(ProgressStyle::default_spinner().template("{spinner:.red} {msg}")?);
     spinner.set_message(format!("Destroying {app_name}..."));
     spinner.enable_steady_tick(Duration::from_millis(100));
 
     let result = api
-        .delete_app_with_options(&app_name, args.abandon_teardown)
+        .delete_app_with_options(app_name, abandon_teardown)
         .await;
     if let Err(ApiError::Api { code, message, .. }) = &result
-        && let Some(hint) = destroy_failure_hint(code.as_deref(), message, &app_name)
+        && let Some(hint) = destroy_failure_hint(code.as_deref(), message, app_name)
     {
         spinner.finish_with_message(format!("Destroy of '{app_name}' did not complete."));
         eprintln!("Hint: {hint}");
@@ -3647,7 +3681,7 @@ pub async fn destroy(args: DestroyArgs) -> Result<(), Box<dyn std::error::Error>
 
     spinner.finish_with_message(format!("App '{app_name}' destroyed."));
 
-    if args.abandon_teardown {
+    if abandon_teardown {
         println!(
             "Note: destroy completed with --abandon-teardown, which proceeds past a failed workload teardown. If the teardown could not complete, the previous owner seed may remain in KBS and recreating '{app_name}' will be refused until an operator erases it and clears the recorded waiver; if the workload was already gone (or its teardown had completed), no waiver is recorded and recreation is unaffected."
         );

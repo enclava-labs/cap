@@ -4155,3 +4155,64 @@ mod terminal_diagnostics {
         assert!(source.contains("bootstrap_status_within(terminal_diagnostic_budget"));
     }
 }
+
+#[tokio::test]
+async fn destroy_refusal_has_no_side_effects_and_force_reaches_the_delete_api() {
+    use std::io::{Read as _, Write as _};
+
+    // Noninteractive refusal: the guard rejects with the actionable wording
+    // (terminal requirement + the deliberate --force path) and is pure, so a
+    // piped run can never reach the prompts or the API.
+    let refused = ensure_destroy_confirm_terminal(false, true)
+        .expect_err("piped stdin must refuse the destroy confirmation");
+    let refusal = refused.to_string();
+    assert!(
+        refusal.contains("terminal stdin and stderr") && refusal.contains("--force"),
+        "refusal must name the terminal requirement and the --force path: {refusal}"
+    );
+    assert!(ensure_destroy_confirm_terminal(true, true).is_ok());
+
+    // Ordering pin: guard -> confirmation prompt -> cancellation return ->
+    // the only mutating call, so refusal/cancellation can never delete first.
+    let source = include_str!("../../app.rs").replace("\r\n", "\n");
+    let destroy_fn = &source[source.find("pub async fn destroy").expect("destroy exists")..];
+    let guard = destroy_fn
+        .find("ensure_destroy_confirm_terminal(")
+        .expect("noninteractive guard wired");
+    let prompt = destroy_fn
+        .find("dialoguer::Confirm::new()")
+        .expect("interactive confirmation present");
+    let cancel = destroy_fn
+        .find("Destroy cancelled.")
+        .expect("cancellation return present");
+    let delete = destroy_fn
+        .find("run_destroy(")
+        .expect("delete runs through the shared mutating helper");
+    assert!(
+        guard < prompt && prompt < cancel && cancel < delete,
+        "confirmation must gate every mutating request (guard={guard}, prompt={prompt}, cancel={cancel}, delete={delete})"
+    );
+
+    // Force path: exactly one DELETE for the named app reaches the API.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0_u8; 4096];
+        let n = stream.read(&mut buf).unwrap();
+        let response = "HTTP/1.1 204 No Content\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+        stream.write_all(response.as_bytes()).unwrap();
+        String::from_utf8_lossy(&buf[..n]).to_string()
+    });
+
+    let api = ApiClient::new(&format!("http://{addr}"), Some("test-token".to_string()));
+    run_destroy(&api, "shell", false)
+        .await
+        .expect("a forced destroy succeeds against the API");
+
+    let request = handle.join().unwrap();
+    assert!(
+        request.starts_with("DELETE /apps/shell HTTP/1.1"),
+        "force destroy must send exactly the app delete request, got: {request}"
+    );
+}
