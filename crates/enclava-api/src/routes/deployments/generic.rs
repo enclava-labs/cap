@@ -111,6 +111,12 @@ pub struct GenericDeploymentResponse {
     /// projections; consumers must use this observation to decide whether a
     /// healthy/running projection is current.
     pub observation: LiveObservation,
+    /// The sidecar's last recorded fixed bootstrap phase while not ready,
+    /// exact-matched against the fixed init-stage vocabulary at the TEE
+    /// probe trust boundary. Diagnostic only: absent when unreported,
+    /// unrecognized, or ready, and it never influences status or readiness.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_init_stage: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -164,6 +170,7 @@ impl GenericDeploymentResponse {
             customer_config_hold_until: None,
             customer_config_hold_remaining_ms: None,
             observation: LiveObservation::not_observed(),
+            last_init_stage: None,
         }
     }
 
@@ -439,6 +446,7 @@ pub async fn get_generic_deployment(
     let observation = observed.observation;
     let mut response =
         GenericDeploymentResponse::from_deployment(deployment, &app).with_observation(observation);
+    response.last_init_stage = observed.last_init_stage;
     if let Some(runtime_failure) = runtime_failure {
         response.status = "failed".to_string();
         response.app_status = "failed".to_string();
