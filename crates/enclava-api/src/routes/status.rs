@@ -31,6 +31,27 @@ const TEE_STATUS_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// almost the whole outer allowance (#219 review).
 const TEE_STATUS_REQUEST_TIMEOUT_MARGIN: Duration = Duration::from_millis(250);
 
+/// The exact fixed-vocabulary phases the tenant sidecar may report through
+/// the optional `last_init_stage` field of `/.well-known/confidential/status`
+/// (enclava-init `record_stage`, in boot order). Only an exact match is ever
+/// carried into owner-facing status; unknown, malformed, overlong, or
+/// non-string values are dropped so arbitrary remote strings can never reach
+/// operator/browser plaintext, and a ready app omits the field upstream.
+pub(crate) const LAST_INIT_STAGES: [&str; 12] = [
+    "loading config",
+    "validating signed config",
+    "verifying trustee policy",
+    "waiting for owner seed",
+    "opening luks volumes",
+    "preparing mount ownership",
+    "provisioning static tls certificate",
+    "writing component seeds",
+    "waiting for workload containers",
+    "binding workload mount namespaces",
+    "seeding caddy runtime handoff",
+    "marking ready",
+];
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LiveObservationState {
@@ -85,6 +106,12 @@ pub struct AppStatusResponse {
     pub pod_status: Option<String>,
     pub tee_status: Option<String>,
     pub storage_status: Option<String>,
+    /// The sidecar's last recorded fixed bootstrap phase while not ready,
+    /// exact-matched against [`LAST_INIT_STAGES`] at the probe trust boundary.
+    /// Diagnostic only: absent when unreported, unrecognized, or ready, and
+    /// it never influences status, readiness, or freshness semantics.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_init_stage: Option<&'static str>,
     pub observation: LiveObservation,
     /// Durable lifecycle diagnosis for the active deployment (#90): phase,
     /// condition, reason, and retry/lease timing projected from the apply
@@ -122,6 +149,7 @@ struct TeeEvidenceFields {
     tee_status: Option<String>,
     storage_status: Option<String>,
     live_state: Option<String>,
+    last_init_stage: Option<&'static str>,
     supplemental_fields_malformed: bool,
 }
 
@@ -140,6 +168,7 @@ pub(crate) struct ObservedAppStatus {
     tee_status: Option<String>,
     storage_status: Option<String>,
     live_state: Option<String>,
+    pub(crate) last_init_stage: Option<&'static str>,
     runtime_failure: Option<RuntimeFailureEvidence>,
 }
 
@@ -221,6 +250,7 @@ pub async fn app_status(
         pod_status: observed.pod_status,
         tee_status: observed.tee_status,
         storage_status: observed.storage_status,
+        last_init_stage: observed.last_init_stage,
         observation: observed.observation,
         deployment,
     }))
@@ -724,6 +754,18 @@ fn tee_evidence_fields(body: &Value) -> TeeEvidenceFields {
             .or_else(|| body.get("state"))
             .and_then(Value::as_str)
             .map(str::to_ascii_lowercase),
+        // Exact-match trust boundary: a non-string, unknown, or overlong
+        // stage is dropped (None), never echoed, and never marks the
+        // supplemental evidence malformed — readiness semantics are untouched.
+        last_init_stage: body
+            .get("last_init_stage")
+            .and_then(Value::as_str)
+            .and_then(|stage| {
+                LAST_INIT_STAGES
+                    .iter()
+                    .find(|known| **known == stage)
+                    .copied()
+            }),
         supplemental_fields_malformed,
     }
 }
@@ -754,6 +796,7 @@ fn classify_live_observation_for_deployment(
             None,
             None,
             None,
+            None,
         );
     };
     if !pod.found {
@@ -761,6 +804,7 @@ fn classify_live_observation_for_deployment(
             LiveObservationState::Partial,
             LiveObservationReason::PodNotFound,
             observed_at,
+            None,
             None,
             None,
             None,
@@ -776,6 +820,7 @@ fn classify_live_observation_for_deployment(
             observed_at,
             pod.deployment_id,
             pod.phase,
+            None,
             None,
             None,
             None,
@@ -796,6 +841,7 @@ fn classify_live_observation_for_deployment(
             None,
             None,
             None,
+            None,
             pod.runtime_failure,
         );
     }
@@ -809,6 +855,7 @@ fn classify_live_observation_for_deployment(
             observed_at,
             pod.deployment_id,
             pod.phase,
+            None,
             None,
             None,
             None,
@@ -826,6 +873,7 @@ fn classify_live_observation_for_deployment(
                 None,
                 None,
                 None,
+                None,
                 pod.runtime_failure,
             );
         }
@@ -836,6 +884,7 @@ fn classify_live_observation_for_deployment(
                 observed_at,
                 pod.deployment_id,
                 pod.phase,
+                None,
                 None,
                 None,
                 None,
@@ -856,6 +905,7 @@ fn classify_live_observation_for_deployment(
             fields.pod_status,
             fields.tee_status,
             fields.storage_status,
+            fields.last_init_stage,
             pod.runtime_failure,
         );
     }
@@ -879,6 +929,7 @@ fn classify_live_observation_for_deployment(
             fields.pod_status,
             fields.tee_status,
             fields.storage_status,
+            fields.last_init_stage,
             pod.runtime_failure,
         );
     }
@@ -896,6 +947,7 @@ fn classify_live_observation_for_deployment(
             fields.pod_status,
             fields.tee_status,
             fields.storage_status,
+            fields.last_init_stage,
             pod.runtime_failure,
         );
     }
@@ -914,6 +966,7 @@ fn classify_live_observation_for_deployment(
             fields.pod_status,
             fields.tee_status,
             fields.storage_status,
+            fields.last_init_stage,
             pod.runtime_failure,
         );
     }
@@ -927,6 +980,7 @@ fn classify_live_observation_for_deployment(
             fields.pod_status,
             fields.tee_status,
             fields.storage_status,
+            fields.last_init_stage,
             pod.runtime_failure,
         );
     }
@@ -948,6 +1002,7 @@ fn classify_live_observation_for_deployment(
             tee_status: fields.tee_status,
             storage_status: fields.storage_status,
             live_state: fields.live_state,
+            last_init_stage: fields.last_init_stage,
             runtime_failure: pod.runtime_failure,
         };
     }
@@ -963,6 +1018,7 @@ fn classify_live_observation_for_deployment(
         tee_status: fields.tee_status,
         storage_status: fields.storage_status,
         live_state: fields.live_state,
+        last_init_stage: fields.last_init_stage,
         runtime_failure: pod.runtime_failure,
     }
 }
@@ -977,6 +1033,7 @@ fn incomplete_observation(
     pod_status: Option<String>,
     tee_status: Option<String>,
     storage_status: Option<String>,
+    last_init_stage: Option<&'static str>,
     runtime_failure: Option<RuntimeFailureEvidence>,
 ) -> ObservedAppStatus {
     ObservedAppStatus {
@@ -991,6 +1048,7 @@ fn incomplete_observation(
         tee_status,
         storage_status,
         live_state: None,
+        last_init_stage,
         runtime_failure,
     }
 }
@@ -1230,6 +1288,65 @@ mod tests {
             observed.observation.reason,
             Some(LiveObservationReason::TeeMalformed)
         );
+    }
+
+    #[test]
+    fn last_init_stage_is_carried_only_as_an_exact_vocabulary_literal() {
+        // Trust boundary for untrusted sidecar metadata: only an exact fixed
+        // literal is carried; unknown, padded, overlong, and non-string values
+        // are never echoed and never alter readiness evidence.
+        let recognized = tee_evidence_fields(&json!({
+            "pod_status": "Running",
+            "tee_status": "ready",
+            "storage_status": "unlocked",
+            "state": "locked",
+            "last_init_stage": "waiting for owner seed"
+        }));
+        assert_eq!(recognized.last_init_stage, Some("waiting for owner seed"));
+        assert!(!recognized.supplemental_fields_malformed);
+
+        for rejected in [
+            "waiting for owner seed ",
+            " waiting for owner seed",
+            "waiting-for-owner-seed",
+            "definitely not a phase; <script>alert(1)</script>",
+            &"x".repeat(4096),
+        ] {
+            let fields = tee_evidence_fields(&json!({
+                "pod_status": "Running",
+                "tee_status": "ready",
+                "storage_status": "unlocked",
+                "state": "locked",
+                "last_init_stage": rejected
+            }));
+            assert_eq!(fields.last_init_stage, None, "{rejected}");
+            assert!(!fields.supplemental_fields_malformed, "{rejected}");
+        }
+        let non_string = tee_evidence_fields(&json!({
+            "pod_status": "Running",
+            "tee_status": "ready",
+            "storage_status": "unlocked",
+            "state": "locked",
+            "last_init_stage": 7
+        }));
+        assert_eq!(non_string.last_init_stage, None);
+        assert!(!non_string.supplemental_fields_malformed);
+
+        // A recognized stage rides through a non-ready partial observation.
+        let observed = classify_live_observation(
+            complete_pod(Uuid::new_v4()),
+            TeeEvidence::Available(recognized),
+            observed_at(),
+        );
+        assert_eq!(observed.observation.state, LiveObservationState::Partial);
+        assert_eq!(observed.last_init_stage, Some("waiting for owner seed"));
+
+        // No reported stage (ready sidecar): missing stays missing on a
+        // fresh observation.
+        let ready =
+            classify_live_observation(complete_pod(Uuid::new_v4()), complete_tee(), observed_at());
+        assert_eq!(ready.observation.state, LiveObservationState::Fresh);
+        assert_eq!(ready.last_init_stage, None);
     }
 
     #[test]
