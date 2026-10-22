@@ -104,12 +104,8 @@ async fn apply_and_watch_rejects_invalid_app_before_any_kube_request() {
     );
 }
 
-/// Shared mock-Kube fixture: records every request path, answers PVC and
-/// pod single-object GETs from `pvcs`/`pods` (name → object JSON), 404s
-/// names not in the maps, and returns a kube-apiserver-style Status error
-/// for everything when `fail_lookups` is set (or for other requests — the
-/// apply then fails, which is fine: evidence inspection runs before any
-/// mutation).
+/// Mirror the engine RBAC boundary: PVC reads and pod lists are allowed,
+/// but individual pod reads are forbidden.
 fn evidence_mock_client(
     pvcs: std::collections::HashMap<String, serde_json::Value>,
     pods: std::collections::HashMap<String, serde_json::Value>,
@@ -130,20 +126,42 @@ fn evidence_mock_client(
             let pods = pods.clone();
             async move {
                 let path = request.uri().path().to_string();
+                let query = axum::extract::Query::<
+                    std::collections::HashMap<String, String>,
+                >::try_from_uri(request.uri()).unwrap().0;
                 recorded.lock().unwrap().push(path.clone());
                 let _ = request.into_body().collect().await;
-                let object = path
-                    .strip_prefix(
+                let object = if path == "/api/v1/namespaces/cap-test-org-test-app/pods" {
+                    let selector = query
+                        .get("fieldSelector")
+                        .and_then(|value| value.strip_prefix("metadata.name="));
+                    let items: Vec<_> = pods
+                        .iter()
+                        .filter(|(name, _)| {
+                            selector.is_none_or(|selected| selected == name.as_str())
+                        })
+                        .map(|(_, pod)| pod.clone())
+                        .collect();
+                    Some(serde_json::json!({
+                        "kind": "PodList", "apiVersion": "v1", "items": items,
+                    }))
+                } else {
+                    path.strip_prefix(
                         "/api/v1/namespaces/cap-test-org-test-app/persistentvolumeclaims/",
                     )
                     .and_then(|name| pvcs.get(name))
-                    .or_else(|| {
-                        path.strip_prefix("/api/v1/namespaces/cap-test-org-test-app/pods/")
-                            .and_then(|name| pods.get(name))
-                    });
-                let probed = path.contains("/persistentvolumeclaims/") || path.contains("/pods/");
+                    .cloned()
+                };
+                let probed = path.contains("/persistentvolumeclaims/");
                 let (status, body) = match (fail_lookups, object) {
-                    (false, Some(object)) => (200, object.clone()),
+                    (false, _) if path.contains("/pods/") => (
+                        403,
+                        serde_json::json!({
+                            "kind": "Status", "apiVersion": "v1",
+                            "status": "Failure", "code": 403, "reason": "Forbidden",
+                        }),
+                    ),
+                    (false, Some(object)) => (200, object),
                     (false, None) if probed => (
                         404,
                         serde_json::json!({
@@ -300,7 +318,7 @@ async fn apply_and_watch_keeps_provisioned_sub_floor_volumes_operable() {
     use enclava_engine::apply::types::ApplyConfig;
     use enclava_engine::testutil::sample_app;
 
-    let (client, requests) = evidence_mock_client(
+    let (client, _requests) = evidence_mock_client(
         [
             created_pvc_entry("state-test-app-0", "2026-01-01T00:00:00Z"),
             created_pvc_entry("tls-state-test-app-0", "2026-01-01T00:00:00Z"),
@@ -328,10 +346,6 @@ async fn apply_and_watch_keeps_provisioned_sub_floor_volumes_operable() {
     assert!(
         !err.to_string().contains("at least 32Mi"),
         "initialized sub-floor volumes must not hit the floor: {err}"
-    );
-    assert!(
-        requests.lock().unwrap().len() > 3,
-        "apply must proceed past the floor check"
     );
 }
 

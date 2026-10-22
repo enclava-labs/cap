@@ -1,6 +1,6 @@
 [package]
 name = "enclava-cli"
-version = "0.1.0"
+version = "0.1.1"
 edition.workspace = true
 
 [lib]
@@ -13,7 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
-enclava-common = { workspace = true, features = ["outbound-http"] }
+enclava-common = { workspace = true, features = ["outbound-http", "release-profiles"] }
 enclava-verifier = { path = "../enclava-verifier" }
 enclava-engine = { path = "../enclava-engine" }
 tokio = { workspace = true }
@@ -67,8 +67,9 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [features]
-prod-strict = []
+prod-strict = ["enclava-common/prod-strict"]
 
 [dev-dependencies]
 enclava-engine = { path = "../enclava-engine", features = ["testutil"] }
 parking_lot = "0.12"
+tokio = { workspace = true, features = ["test-util"] }

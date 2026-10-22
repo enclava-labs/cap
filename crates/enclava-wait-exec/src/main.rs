@@ -2,7 +2,7 @@ use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -212,15 +212,34 @@ fn encrypted_log_config_from_raw_env(
         .trim()
         .to_string();
     validate_sentinel_name(&container)?;
+    // A set env path is used verbatim (non-prod-strict only): the operator
+    // pairs this writer's spool with the relay's explicitly. Only the
+    // default location gets the key-namespaced file name so a recipient
+    // change can never interleave with the previous generation's spool.
     let spool_path = env::var_os("ENCLAVA_LOG_SPOOL_PATH")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_LOG_SPOOL_DIR).join(format!("{container}.jsonl")));
+        .unwrap_or_else(|| {
+            PathBuf::from(DEFAULT_LOG_SPOOL_DIR).join(spool_file_name(&container, &recipient))
+        });
     Ok(Some(EncryptedLogConfig {
         recipient,
         context,
         spool_path,
         container,
     }))
+}
+
+/// Spool file name `<container>-<recipient_digest>.jsonl` (cap#290 round-2
+/// review): the recipient's canonical `sha256:`-prefixed base64url digest
+/// (as verified by `validate_public_key`) namespaces the file so a key
+/// rotation spools to a distinct file and the guest-side generation
+/// cleanup can retire the previous generation's file.
+fn spool_file_name(container: &str, recipient: &LogEncryptionPublicKey) -> String {
+    let digest = recipient
+        .public_key_sha256
+        .strip_prefix("sha256:")
+        .unwrap_or(&recipient.public_key_sha256);
+    format!("{container}-{digest}.jsonl")
 }
 
 #[cfg(not(feature = "prod-strict"))]
@@ -368,8 +387,11 @@ fn encrypted_log_config_from_handoff_at(path: &Path) -> Result<Option<EncryptedL
     };
     let container = handoff_container_name()?;
     // Spool pinned to the dedicated log spool dir: the host-controlled
-    // ENCLAVA_LOG_SPOOL_PATH env is not honored in prod-strict.
-    let spool_path = PathBuf::from(DEFAULT_LOG_SPOOL_DIR).join(format!("{container}.jsonl"));
+    // ENCLAVA_LOG_SPOOL_PATH env is not honored in prod-strict. The file
+    // name is key-namespaced on the signed recipient (cap#290 round-2
+    // review).
+    let spool_path =
+        PathBuf::from(DEFAULT_LOG_SPOOL_DIR).join(spool_file_name(&container, &recipient));
     Ok(Some(EncryptedLogConfig {
         recipient,
         context,
@@ -385,20 +407,23 @@ fn run_with_encrypted_logs(
 ) -> Result<i32, String> {
     install_signal_forwarding()?;
     let mut spool = open_log_spool(&logs.spool_path)?;
-    // The spool lives on the shared `logs` emptyDir, which SURVIVES a
-    // container restart without replacing the Pod — and so do the frames
-    // the previous wrapper process wrote. Sequence numbers must therefore
-    // stay monotonic across the restart, not restart at 1: the relay's
-    // rotation dedup is the SET of sequences it actually sent (round-14 —
-    // never a max frontier), and a reset sequence that collides with a set
-    // member is silently suppressed as an apparent rotation replay. Scan
-    // the surviving spool tail (the rotation-retained window is the only
-    // part whose sequences a connected relay can still hold in its dedup
-    // set) for the highest frame sequence and resume from it. Non-frame
-    // lines are skipped; a spool with no
-    // parseable frame sequences resumes at 1.
-    let sequence_start = initial_spool_sequence(&mut spool)?;
+    // The spool survives container restarts (and, under the state bind,
+    // pod replacement) — and so do the frames the previous wrapper wrote.
+    // Sequence numbers must stay monotonic across the restart, not restart
+    // at 1: the relay's rotation dedup is the SET of sequences it actually
+    // sent (round-14 — never a max frontier), and a reset sequence that
+    // collides with a set member is silently suppressed as an apparent
+    // rotation replay. Resume above the highest sequence in BOTH the
+    // bounded spool-tail scan and the sequence sidecar: direct workload
+    // appends can push every genuine frame out of the scan window, but
+    // the sidecar records the last sequence this wrapper issued.
+    let tail_start = initial_spool_sequence(&mut spool)?;
+    let sidecar_path = sequence_sidecar_path(&logs.spool_path);
+    let mut sequence_sidecar = open_sequence_sidecar(&sidecar_path);
+    let sidecar_last = sequence_sidecar.as_mut().and_then(read_sequence_sidecar);
+    let sequence_start = resume_sequence(tail_start, sidecar_last);
     let spool = Arc::new(Mutex::new(spool));
+    let sequence_sidecar = Arc::new(Mutex::new(sequence_sidecar));
     let sequence = Arc::new(AtomicU64::new(sequence_start));
     let mut child = Command::new(&program)
         .args(&args)
@@ -433,6 +458,7 @@ fn run_with_encrypted_logs(
         logs.clone(),
         Arc::clone(&spool),
         Arc::clone(&sequence),
+        Arc::clone(&sequence_sidecar),
     );
     let stderr_thread = spawn_log_forwarder(
         stderr,
@@ -440,6 +466,7 @@ fn run_with_encrypted_logs(
         logs,
         Arc::clone(&spool),
         Arc::clone(&sequence),
+        sequence_sidecar,
     );
 
     let status = child
@@ -525,13 +552,70 @@ fn open_log_spool(path: &Path) -> Result<File, String> {
     Ok(file)
 }
 
-/// Highest frame sequence present in the surviving spool, plus one. Called
-/// once at wrapper startup so a restarted process resumes sequence numbers
-/// ABOVE everything the previous process wrote (the `logs` emptyDir and its
-/// spool survive container restarts; the relay's rotation dedup would drop
-/// post-restart frames whose reset sequences land at or below its retained
-/// frontier). The spool is bounded by the rotation threshold, so one
-/// startup scan is cheap; lines that do not parse as frames are skipped.
+/// Sidecar holding the last sequence this wrapper issued, next to the
+/// spool (`<spool>.seq`). The bounded startup tail scan cannot see genuine
+/// frames a workload buried under direct appends, so resume also consults
+/// this record (cap#290 round-3 review). It lives in the same
+/// workload-writable directory, so it is a resume hint, never trust
+/// material: opens are O_NOFOLLOW, non-regular entries are ignored, and
+/// every failure is best-effort (the tail scan alone still resumes).
+fn sequence_sidecar_path(spool_path: &Path) -> PathBuf {
+    let mut path = spool_path.as_os_str().to_owned();
+    path.push(".seq");
+    PathBuf::from(path)
+}
+
+fn open_sequence_sidecar(path: &Path) -> Option<File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .mode(0o640)
+        .custom_flags(O_NOFOLLOW)
+        .open(path)
+        .ok()?;
+    match file.metadata() {
+        Ok(meta) if meta.is_file() => Some(file),
+        _ => None,
+    }
+}
+
+fn read_sequence_sidecar(file: &mut File) -> Option<u64> {
+    file.seek(SeekFrom::Start(0)).ok()?;
+    let mut buf = Vec::new();
+    Read::by_ref(file).take(32).read_to_end(&mut buf).ok()?;
+    String::from_utf8_lossy(&buf).trim().parse::<u64>().ok()
+}
+
+fn persist_sequence_sidecar(file: &mut File, sequence: u64) -> io::Result<()> {
+    let record = format!("{sequence}\n");
+    file.write_all_at(record.as_bytes(), 0)?;
+    file.set_len(record.len() as u64)
+}
+
+/// Resume point across a restart: above both the tail scan and the last
+/// sidecar-recorded issued sequence, with the same wrap reserve the scan
+/// applies (a forged sidecar near u64::MAX merely loses headroom).
+fn resume_sequence(tail_scan_start: u64, sidecar_last: Option<u64>) -> u64 {
+    const WRAP_RESERVE: u64 = 65_536;
+    let sidecar_start = sidecar_last
+        .map(|last| last.saturating_add(1).min(u64::MAX - WRAP_RESERVE))
+        .unwrap_or(1);
+    tail_scan_start.max(sidecar_start)
+}
+
+/// Highest frame sequence present in the surviving spool tail, plus one.
+/// Called once at wrapper startup so a restarted process resumes sequence
+/// numbers ABOVE everything the previous process wrote (the spool survives
+/// container restarts and, under the state bind, pod replacement; the
+/// relay's rotation dedup would drop post-restart frames whose reset
+/// sequences land at or below its retained frontier). A writer-produced
+/// spool is bounded by the rotation threshold, but the directory is
+/// workload-writable and a retained file can be grown far past it by
+/// direct writes, so the scan itself is TOTAL-bounded to the last
+/// `LOG_SPOOL_ROTATE_BYTES + MAX_SPOOL_LINE_BYTES` (cap#290 round-3
+/// review): writer sequences are monotonic, so the maximum lives in that
+/// tail; a forged sequence in the discarded head can at worst be ignored.
 /// The spool directory is workload-writable, so the scan is over
 /// attacker-influenced content: a forged `{"sequence":u64::MAX}` line must
 /// not wrap the resumed counter to 0 (round-14 self-check Critical), so
@@ -556,8 +640,28 @@ fn open_log_spool(path: &Path) -> Result<File, String> {
 /// connected relay dedup set references — and it cannot be a
 /// writer-produced frame at all (those are capped well below the bound).
 fn initial_spool_sequence(spool: &mut File) -> Result<u64, String> {
+    const MAX_STARTUP_SCAN_BYTES: u64 = LOG_SPOOL_ROTATE_BYTES + MAX_SPOOL_LINE_BYTES;
+    let len = spool
+        .metadata()
+        .map_err(|err| format!("failed to stat log spool for sequence scan: {err}"))?
+        .len();
+    let scan_start = len.saturating_sub(MAX_STARTUP_SCAN_BYTES);
+    // When the window opens mid-record, the first record read is a
+    // fragment: discard it rather than let a crafted suffix parse as a
+    // frame. The byte before the window tells us whether we are aligned.
+    let mut discard_first_record = false;
+    if scan_start > 0 {
+        spool
+            .seek(SeekFrom::Start(scan_start - 1))
+            .map_err(|err| format!("failed to seek log spool for sequence scan: {err}"))?;
+        let mut prev = [0u8; 1];
+        spool
+            .read_exact(&mut prev)
+            .map_err(|err| format!("failed to read log spool for sequence scan: {err}"))?;
+        discard_first_record = prev[0] != b'\n';
+    }
     spool
-        .seek(SeekFrom::Start(0))
+        .seek(SeekFrom::Start(scan_start))
         .map_err(|err| format!("failed to seek log spool for sequence scan: {err}"))?;
     let read_err = |err: io::Error| format!("failed to read log spool for sequence scan: {err}");
     let mut max_sequence = 0u64;
@@ -609,6 +713,11 @@ fn initial_spool_sequence(spool: &mut File) -> Result<u64, String> {
                 // EOF mid-oversized-record: incomplete tail, skip.
                 break;
             }
+            discard_first_record = false;
+            continue;
+        }
+        if discard_first_record {
+            discard_first_record = false;
             continue;
         }
         // Complete record INCLUDING its terminating newline. Strip the
@@ -651,11 +760,14 @@ fn spawn_log_forwarder<R>(
     logs: EncryptedLogConfig,
     spool: Arc<Mutex<File>>,
     sequence: Arc<AtomicU64>,
+    sequence_sidecar: Arc<Mutex<Option<File>>>,
 ) -> thread::JoinHandle<Result<(), String>>
 where
     R: Read + Send + 'static,
 {
-    thread::spawn(move || forward_encrypted_logs(reader, stream, &logs, &spool, &sequence))
+    thread::spawn(move || {
+        forward_encrypted_logs(reader, stream, &logs, &spool, &sequence, &sequence_sidecar)
+    })
 }
 
 /// Allocate the next log-frame sequence without ever WRAPPING (round-18
@@ -695,6 +807,7 @@ fn forward_encrypted_logs<R>(
     logs: &EncryptedLogConfig,
     spool: &Arc<Mutex<File>>,
     sequence: &AtomicU64,
+    sequence_sidecar: &Arc<Mutex<Option<File>>>,
 ) -> Result<(), String>
 where
     R: Read,
@@ -804,19 +917,32 @@ where
         // a partial NDJSON line that the next successful append would extend
         // into a permanently malformed record.
         let pre_write_len = spool.metadata().map(|metadata| metadata.len()).unwrap_or(0);
-        if let Err(err) = spool
+        match spool
             .write_all(&frame_with_newline)
             .and_then(|_| spool.flush())
         {
-            if spool.set_len(pre_write_len).is_ok() {
-                let _ = spool.seek(SeekFrom::Start(pre_write_len));
+            Ok(()) => {
+                // Best-effort: record the issued sequence so a restart
+                // resumes above it even if direct appends later bury this
+                // frame outside the bounded startup scan window.
+                if let Ok(mut sidecar) = sequence_sidecar.lock()
+                    && let Some(file) = sidecar.as_mut()
+                    && persist_sequence_sidecar(file, sequence_number).is_err()
+                {
+                    *sidecar = None;
+                }
             }
-            dropped_frames += 1;
-            if dropped_frames == 1 || dropped_frames % 1000 == 0 {
-                eprintln!(
-                    "enclava-wait-exec: encrypted log spool write failed \
-                     ({dropped_frames} frames dropped so far): {err}"
-                );
+            Err(err) => {
+                if spool.set_len(pre_write_len).is_ok() {
+                    let _ = spool.seek(SeekFrom::Start(pre_write_len));
+                }
+                dropped_frames += 1;
+                if dropped_frames == 1 || dropped_frames % 1000 == 0 {
+                    eprintln!(
+                        "enclava-wait-exec: encrypted log spool write failed \
+                         ({dropped_frames} frames dropped so far): {err}"
+                    );
+                }
             }
         }
     }
@@ -1646,6 +1772,16 @@ mod tests {
             "11111111-1111-1111-1111-111111111111"
         );
         assert_eq!(config.container, "web");
+        // The spool path is key-namespaced on the signed recipient digest
+        // (cap#290 round-2 review).
+        let expected = format!(
+            "web-{}.jsonl",
+            keypair.public_key_sha256.strip_prefix("sha256:").unwrap()
+        );
+        assert_eq!(
+            config.spool_path,
+            PathBuf::from(DEFAULT_LOG_SPOOL_DIR).join(expected)
+        );
         unsafe {
             env::remove_var("ENCLAVA_LOG_DEPLOYMENT_ID");
             env::remove_var("ENCLAVA_CONTAINER_NAME");
@@ -1656,6 +1792,7 @@ mod tests {
     #[test]
     #[cfg(feature = "prod-strict")]
     fn handoff_with_unsupported_algorithm_fails() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let keypair = enclava_common::log_encryption::generate_log_keypair();
         let path = unique_handoff_path("badalg");
         let claim = serde_json::json!({
@@ -1790,6 +1927,51 @@ mod tests {
         assert_eq!(config.context.app_name, "secure-app");
         assert_eq!(config.context.deployment_id, "deploy-123");
         assert_eq!(config.container, "web");
+
+        // Default spool path is key-namespaced on the recipient digest.
+        let expected = format!(
+            "web-{}.jsonl",
+            keypair.public_key_sha256.strip_prefix("sha256:").unwrap()
+        );
+        assert_eq!(
+            config.spool_path,
+            PathBuf::from(DEFAULT_LOG_SPOOL_DIR).join(&expected)
+        );
+
+        // An env-provided spool path is used verbatim: the operator pairs
+        // this writer's spool with the relay's explicitly in dev.
+        unsafe {
+            env::set_var("ENCLAVA_LOG_SPOOL_PATH", "/tmp/spools/legacy.jsonl");
+        }
+        let config = encrypted_log_config_from_env("web").unwrap().unwrap();
+        assert_eq!(config.spool_path, PathBuf::from("/tmp/spools/legacy.jsonl"));
+        unsafe {
+            env::remove_var("ENCLAVA_LOG_SPOOL_PATH");
+        }
+    }
+
+    #[test]
+    fn spool_file_name_is_namespaced_by_recipient_digest() {
+        // cap#290 round-2 review: distinct recipients must produce distinct
+        // spool files so a key rotation never interleaves generations.
+        let recipient_of =
+            |pair: &enclava_common::log_encryption::LogEncryptionKeyPair| LogEncryptionPublicKey {
+                key_id: "test-key".to_string(),
+                public_key_base64url: pair.public_key_base64url.clone(),
+                public_key_sha256: pair.public_key_sha256.clone(),
+            };
+        let a = recipient_of(&enclava_common::log_encryption::generate_log_keypair());
+        let b = recipient_of(&enclava_common::log_encryption::generate_log_keypair());
+        let name_a = spool_file_name("web", &a);
+        let name_b = spool_file_name("web", &b);
+        assert_ne!(name_a, name_b);
+        assert_eq!(
+            name_a,
+            format!(
+                "web-{}.jsonl",
+                a.public_key_sha256.strip_prefix("sha256:").unwrap()
+            )
+        );
     }
 
     // ---- spool rotation (round-3 review) ----
@@ -1920,6 +2102,9 @@ mod tests {
         };
 
         let sequence = Arc::new(AtomicU64::new(1));
+        let sequence_sidecar = Arc::new(Mutex::new(open_sequence_sidecar(&sequence_sidecar_path(
+            &path,
+        ))));
         let handles: Vec<_> = ["stdout", "stderr"]
             .iter()
             .map(|stream| {
@@ -1929,13 +2114,22 @@ mod tests {
                 let reader = std::io::Cursor::new(input);
                 let spool = Arc::clone(&spool);
                 let sequence = Arc::clone(&sequence);
+                let sequence_sidecar = Arc::clone(&sequence_sidecar);
                 let logs = logs.clone();
                 let stream: &'static str = match *stream {
                     "stdout" => "stdout",
                     _ => "stderr",
                 };
                 thread::spawn(move || {
-                    forward_encrypted_logs(reader, stream, &logs, &spool, &sequence).unwrap()
+                    forward_encrypted_logs(
+                        reader,
+                        stream,
+                        &logs,
+                        &spool,
+                        &sequence,
+                        &sequence_sidecar,
+                    )
+                    .unwrap()
                 })
             })
             .collect();
@@ -1958,6 +2152,11 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 800, "both streams' 400 frames must be on disk");
+        assert_eq!(
+            fs::read_to_string(sequence_sidecar_path(&path)).unwrap(),
+            "800\n",
+            "sidecar records the last issued sequence for restart resume"
+        );
     }
 
     /// Rotation is projected against the incoming frame: the spool never
@@ -2068,6 +2267,7 @@ mod tests {
         };
 
         let sequence = Arc::new(AtomicU64::new(1));
+        let sequence_sidecar = Arc::new(Mutex::new(None));
         // `before`, one blank line, `after`, then a record whose length is an
         // EXACT multiple of the cap followed by `next`: the boundary newline
         // must be consumed by the reader, not become an empty frame.
@@ -2075,7 +2275,15 @@ mod tests {
         input.push_str(&"a".repeat(MAX_LOG_RECORD_BYTES));
         input.push_str("\nnext\n");
         let reader = std::io::Cursor::new(input);
-        forward_encrypted_logs(reader, "stdout", &logs, &spool, &sequence).unwrap();
+        forward_encrypted_logs(
+            reader,
+            "stdout",
+            &logs,
+            &spool,
+            &sequence,
+            &sequence_sidecar,
+        )
+        .unwrap();
 
         // Exactly 5 frames: before, blank, after, capped record, next — the
         // genuine blank record preserved, no fabricated empty frame at the cap.
@@ -2188,6 +2396,62 @@ mod tests {
         std::fs::write(&path, "not-json\nalso not json\n").unwrap();
         let mut spool = open_log_spool(&path).unwrap();
         assert_eq!(initial_spool_sequence(&mut spool).unwrap(), 1);
+    }
+
+    /// cap#290 round-3 review: the persistent spool is workload-writable
+    /// and can be grown far past the writer's rotation cap by direct
+    /// appends. The startup scan must stay total-bounded to the tail
+    /// window instead of reading the whole retained file before spawn.
+    #[test]
+    fn initial_spool_sequence_scans_only_the_tail_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.jsonl");
+        let frame = |seq: u64| format!(r#"{{"version":"enclava-log-frame-v1","sequence":{seq}}}"#);
+        let mut body = format!("{}\n", frame(999));
+        // Push the high-sequence head frame outside the scan window.
+        let filler = "x".repeat(1023) + "\n";
+        for _ in 0..((LOG_SPOOL_ROTATE_BYTES + MAX_SPOOL_LINE_BYTES) / 1024 + 1) {
+            body.push_str(&filler);
+        }
+        body.push_str(&format!("{}\n", frame(10)));
+        std::fs::write(&path, body).unwrap();
+        let mut spool = open_log_spool(&path).unwrap();
+        assert_eq!(initial_spool_sequence(&mut spool).unwrap(), 11);
+    }
+
+    #[test]
+    fn resume_sequence_prefers_sidecar_above_tail_scan() {
+        // Genuine frames buried outside the bounded tail window: the
+        // sidecar's last-issued sequence must win so restarted numbering
+        // never re-issues a sequence a connected relay already delivered.
+        assert_eq!(resume_sequence(11, Some(100)), 101);
+        assert_eq!(resume_sequence(418, Some(10)), 418);
+        assert_eq!(resume_sequence(418, None), 418);
+        assert_eq!(
+            resume_sequence(1, Some(u64::MAX)),
+            u64::MAX - 65_536,
+            "forged sidecar near MAX is clamped inside the wrap reserve"
+        );
+    }
+
+    #[test]
+    fn sequence_sidecar_round_trips_and_rejects_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool_path = dir.path().join("web-abc.jsonl");
+        let sidecar_path = sequence_sidecar_path(&spool_path);
+        let mut sidecar = open_sequence_sidecar(&sidecar_path).unwrap();
+        assert_eq!(read_sequence_sidecar(&mut sidecar), None);
+        persist_sequence_sidecar(&mut sidecar, 42).unwrap();
+        assert_eq!(read_sequence_sidecar(&mut sidecar), Some(42));
+        drop(sidecar);
+
+        // A symlinked sidecar is ignored, never followed.
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"999\n").unwrap();
+        let link = dir.path().join("web-def.jsonl.seq");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(open_sequence_sidecar(&link).is_none());
+        assert_eq!(std::fs::read(&target).unwrap(), b"999\n");
     }
 
     /// Round-14 self-check Critical: the spool directory is

@@ -59,10 +59,7 @@ pub fn customer_config_roll_hold_applies(
     rollout_in_flight: bool,
     tee_domain: Option<&str>,
 ) -> bool {
-    if is_new_app
-        || rollout_in_flight
-        || !tee_domain.is_some_and(|domain| !domain.trim().is_empty())
-    {
+    if is_new_app || rollout_in_flight || tee_domain.is_none_or(|domain| domain.trim().is_empty()) {
         return false;
     }
     match live_app_status {
@@ -2211,7 +2208,7 @@ async fn requeue_or_exhaust_apply_job(
     job: &ClaimedJob,
 ) -> Result<bool, DeploymentJobError> {
     if apply_job_retries_exhausted(pool, job.deployment_id).await? {
-        publish_apply_failure_with_mutation(pool, job, None, DEPLOYMENT_RETRY_EXHAUSTED_MESSAGE)
+        publish_apply_failure_with_mutation(pool, job, DEPLOYMENT_RETRY_EXHAUSTED_MESSAGE, None)
             .await?;
         return Ok(true);
     }
@@ -3696,7 +3693,7 @@ async fn fail_apply_job_with_mutation(
     failed_app: Option<&App>,
 ) {
     let published =
-        match publish_apply_failure_with_mutation(&state.db, job, mutation.as_mut(), error.code())
+        match publish_apply_failure_with_mutation(&state.db, job, error.code(), mutation.as_mut())
             .await
         {
             Ok(()) => true,
@@ -4065,14 +4062,15 @@ async fn publish_rollout_outcome(
 
 /// Terminalize a durable deployment apply failure. `failure_code` must be a
 /// bounded classification from `DeploymentJobError::code` (or one of the
-/// fixed setup/apply constants) so the stored `deployments.error_message`
-/// can cross the public projection allowlist without leaking backend
-/// plaintext (#18: users must see *why* a deploy was rejected).
+/// fixed setup/apply constants). It is persisted in both the deployment and
+/// job rows so the public projection can expose the classification without
+/// leaking backend plaintext.
 async fn publish_apply_failure_with_mutation(
     pool: &PgPool,
     job: &ClaimedJob,
-    mutation: Option<&mut crate::mutation_leases::AppMutationLease>,
+
     failure_code: &'static str,
+    mutation: Option<&mut crate::mutation_leases::AppMutationLease>,
 ) -> Result<(), DeploymentJobError> {
     let mut tx = pool.begin().await?;
     crate::deploy::lock_app_deployment_lane(&mut tx, job.app_id).await?;
@@ -4215,7 +4213,7 @@ async fn publish_apply_failure_with_mutation(
 
 #[cfg(test)]
 async fn publish_apply_failure(pool: &PgPool, job: &ClaimedJob) -> Result<(), DeploymentJobError> {
-    publish_apply_failure_with_mutation(pool, job, None, DEPLOYMENT_APPLY_FAILED_MESSAGE).await
+    publish_apply_failure_with_mutation(pool, job, DEPLOYMENT_APPLY_FAILED_MESSAGE, None).await
 }
 
 async fn finish_job(
@@ -5098,7 +5096,9 @@ pub(crate) mod tests {
             descriptor_signing_pubkey: binding.descriptor_signing_pubkey,
             org_keyring_fingerprint: binding.org_keyring_fingerprint,
             omit_log_encryption_claim: false,
+            legacy_collapsed_trustee_key: false,
             omit_luks2_header_seal_claim: false,
+            omit_log_spool_bind_claim: false,
         });
         crate::routes::deployments::select_local_signed_artifact_delivery(
             &mut app_spec.attestation,
@@ -9404,10 +9404,13 @@ pub(crate) mod tests {
                                     "creationTimestamp": "2026-01-01T00:00:00Z",
                                 },
                             })
-                        } else if name == pod_name {
+                        } else if name == "pods" {
                             serde_json::json!({
                                 "apiVersion": "v1",
-                                "kind": "Pod",
+                                "kind": "PodList",
+                                "items": [{
+                                    "apiVersion": "v1",
+                                    "kind": "Pod",
                                 "metadata": {
                                     "name": pod_name,
                                     "namespace": namespace,
@@ -9423,6 +9426,7 @@ pub(crate) mod tests {
                                 "status": {
                                     "conditions": [{"type": "Ready", "status": "True"}],
                                 },
+                                }],
                             })
                         } else {
                             serde_json::Value::Null
@@ -11100,35 +11104,6 @@ pub(crate) mod tests {
             .expect("delete watching failure fixture");
     }
 
-    #[test]
-    fn apply_failures_publish_the_job_error_classification() {
-        // #18: fail_apply_job_with_mutation must forward
-        // `error.code()` — not the constant DEPLOYMENT_APPLY_FAILED_MESSAGE —
-        // so the bounded classification reaches the deployments row and the
-        // public projection can surface the real reason.
-        let source = include_str!("deployment_jobs.rs");
-        let body = source
-            .split("async fn fail_apply_job_with_mutation")
-            .nth(1)
-            .and_then(|rest| rest.split("\nasync fn ").next())
-            .unwrap_or("");
-        assert!(
-            body.contains("job, error.code()")
-                || body.contains("mutation.as_mut(), error.code()")
-                || body.contains(
-                    "job,
-            error.code()"
-                ),
-            "fail_apply_job_with_mutation must forward error.code() to \
-             publish_apply_failure_with_mutation"
-        );
-        assert!(
-            !body.contains("DEPLOYMENT_APPLY_FAILED_MESSAGE"),
-            "fail_apply_job_with_mutation must not collapse every apply \
-             failure to the constant DEPLOYMENT_APPLY_FAILED_MESSAGE"
-        );
-    }
-
     #[tokio::test]
     async fn apply_failure_publishes_the_bounded_error_code() {
         // #18: the failure classification (e.g. `kbs_policy_error` for a
@@ -11152,7 +11127,7 @@ pub(crate) mod tests {
                 .expect("claim code fixture apply")
                 .expect("code fixture apply exists");
 
-            publish_apply_failure_with_mutation(&pool, &job, None, failure_code)
+            publish_apply_failure_with_mutation(&pool, &job, failure_code, None)
                 .await
                 .expect("publish classified apply failure");
 

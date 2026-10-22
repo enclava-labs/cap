@@ -255,6 +255,7 @@ fn options_with_runtime_class(runtime_class: &str) -> CcInitDataOptions {
         kbs_ca_cert_pem: None,
         runtime_class: runtime_class.to_string(),
         luks2_header_seal: "adopt".to_string(),
+        log_spool_storage: "state-bind-v1".to_string(),
     }
 }
 
@@ -325,7 +326,9 @@ fn toml_contains_workload_artifact_binding_when_present() {
         descriptor_signing_pubkey: [0xcd; 32],
         org_keyring_fingerprint: [0xef; 32],
         omit_log_encryption_claim: false,
+        legacy_collapsed_trustee_key: false,
         omit_luks2_header_seal_claim: false,
+        omit_log_spool_bind_claim: false,
     });
     let toml = build_toml(&app);
     assert!(toml.contains(&format!("descriptor_core_hash = \"{}\"", "ab".repeat(32))));
@@ -594,7 +597,9 @@ fn log_encryption_claim_is_bound_to_cc_init_data() {
         descriptor_signing_pubkey: [0u8; 32],
         org_keyring_fingerprint: [0u8; 32],
         omit_log_encryption_claim: true,
+        legacy_collapsed_trustee_key: false,
         omit_luks2_header_seal_claim: false,
+        omit_log_spool_bind_claim: false,
     });
     let legacy_toml = build_toml(&legacy);
     let legacy_value: toml::Value = toml::from_str(&legacy_toml).unwrap();
@@ -634,4 +639,79 @@ fn data_claims_carry_luks2_header_seal_rollout_gate() {
     // build.)
     assert_eq!(validate_luks2_header_seal_claim("required"), "required");
     assert_eq!(validate_luks2_header_seal_claim("adopt"), "adopt");
+}
+
+#[test]
+fn v2_log_spool_storage_claim_is_bound_to_cc_init_data() {
+    let mut app = sample_app();
+    let policy_text = "# enclava-cap-volume-layout: guest-memory-v2\npackage agent_policy\n";
+    app.generated_agent_policy = Some(GeneratedAgentPolicy {
+        policy_text: policy_text.to_string(),
+        policy_sha256: Sha256::digest(policy_text.as_bytes()).into(),
+        genpolicy_version_pin: "kata-containers/genpolicy@3.28.0+test".to_string(),
+    });
+    app.log_encryption = Some(enclava_engine::types::LogEncryptionConfig {
+        algorithm: "x25519-hpke-v1".to_string(),
+        key_id: "logs-prod".to_string(),
+        public_key_base64url: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+        public_key_sha256: "sha256:Zmh6rfhivXdsj8GLjp-OIAiXFIVu4jOzkCpZHQ1fKSU".to_string(),
+    });
+    let toml = build_toml(&app);
+    let value: toml::Value = toml::from_str(&toml).unwrap();
+    let data = value.get("data").and_then(toml::Value::as_table).unwrap();
+    assert_eq!(
+        data.get("log_spool_storage").and_then(toml::Value::as_str),
+        Some("state-bind-v1"),
+        "v2 + encrypted logging binds the spool to the encrypted state PVC"
+    );
+
+    // `omit_log_spool_bind_claim` reproduces the pre-claim byte layout for
+    // artifacts signed before this field existed.
+    let mut legacy = app.clone();
+    legacy.workload_artifact_binding = Some(WorkloadArtifactBinding {
+        descriptor_core_hash: [0u8; 32],
+        descriptor_signing_pubkey: [0u8; 32],
+        org_keyring_fingerprint: [0u8; 32],
+        omit_log_encryption_claim: false,
+        legacy_collapsed_trustee_key: false,
+        omit_luks2_header_seal_claim: false,
+        omit_log_spool_bind_claim: true,
+    });
+    let legacy_toml = build_toml(&legacy);
+    let legacy_value: toml::Value = toml::from_str(&legacy_toml).unwrap();
+    let legacy_data = legacy_value
+        .get("data")
+        .and_then(toml::Value::as_table)
+        .unwrap();
+    assert!(
+        legacy_data.get("log_spool_storage").is_none(),
+        "omit_log_spool_bind_claim must reproduce the pre-claim byte layout"
+    );
+
+    // Absent for older layouts and for v2 without encrypted logging.
+    let mut v1_app = app.clone();
+    let v1_text =
+        "# enclava-cap-volume-layout: guest-memory-v1\npackage agent_policy\n".to_string();
+    v1_app.generated_agent_policy = Some(GeneratedAgentPolicy {
+        policy_sha256: Sha256::digest(v1_text.as_bytes()).into(),
+        policy_text: v1_text,
+        genpolicy_version_pin: "kata-containers/genpolicy@3.28.0+test".to_string(),
+    });
+    let v1_toml = build_toml(&v1_app);
+    let v1_value: toml::Value = toml::from_str(&v1_toml).unwrap();
+    let v1_data = v1_value
+        .get("data")
+        .and_then(toml::Value::as_table)
+        .unwrap();
+    assert!(v1_data.get("log_spool_storage").is_none());
+
+    let mut no_log = app.clone();
+    no_log.log_encryption = None;
+    let no_log_toml = build_toml(&no_log);
+    let no_log_value: toml::Value = toml::from_str(&no_log_toml).unwrap();
+    let no_log_data = no_log_value
+        .get("data")
+        .and_then(toml::Value::as_table)
+        .unwrap();
+    assert!(no_log_data.get("log_spool_storage").is_none());
 }

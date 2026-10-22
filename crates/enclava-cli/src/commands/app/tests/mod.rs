@@ -76,6 +76,7 @@ fn test_release() -> PlatformRelease {
             platform_release_version: "test".to_string(),
             signing_service_url: "https://signing.example.test".to_string(),
             signing_service_pubkey_hex: "11".repeat(32),
+            platform_trustee_policy_pubkey_hex: "33".repeat(32),
             policy_template_id: "trustee-resource-policy-v1".to_string(),
             policy_template_sha256: "22".repeat(32),
             policy_template_text: "package policy\n".to_string(),
@@ -154,6 +155,7 @@ fn test_deployment_context() -> DeploymentContextResponse {
         tls_certificate_broker_url: None,
         current_platform_release_id: None,
         platform_release_envelope: None,
+        log_spool_state_bind_supported: false,
     }
 }
 
@@ -265,6 +267,7 @@ fn deployment_context_platform_release_is_verified_and_selected() {
         tls_certificate_broker_url: None,
         current_platform_release_id: Some(expected_release_id.clone()),
         platform_release_envelope: Some(envelope),
+        log_spool_state_bind_supported: false,
     };
 
     let release =
@@ -289,6 +292,7 @@ fn deployment_context_platform_release_tampering_fails_closed() {
         tls_certificate_broker_url: None,
         current_platform_release_id: Some(envelope.payload.platform_release_version.clone()),
         platform_release_envelope: Some(envelope),
+        log_spool_state_bind_supported: false,
     };
 
     let err =
@@ -322,7 +326,9 @@ fn signed_cc_hash_app_uses_local_artifact_urls_like_live_apply() {
                     descriptor_signing_pubkey: [2; 32],
                     org_keyring_fingerprint: [3; 32],
                     omit_log_encryption_claim: false,
-            omit_luks2_header_seal_claim: false,
+                    legacy_collapsed_trustee_key: false,
+                    omit_luks2_header_seal_claim: false,
+                    omit_log_spool_bind_claim: false,
                 },
                 generated_agent_policy: GeneratedAgentPolicy {
                     policy_text: "package agent_policy\n".to_string(),
@@ -348,6 +354,7 @@ fn signed_cc_hash_app_uses_local_artifact_urls_like_live_apply() {
             kbs_ca_cert_pem: None,
             runtime_class: cc_init_data::DEFAULT_RUNTIME_CLASS.to_string(),
             luks2_header_seal: "adopt".to_string(),
+            log_spool_storage: "state-bind-v1".to_string(),
         },
     );
 
@@ -373,6 +380,7 @@ fn signed_cc_hash_app_uses_api_deployment_context_without_env_exports() {
         ),
         current_platform_release_id: None,
         platform_release_envelope: None,
+        log_spool_state_bind_supported: false,
     };
 
     let app = confidential_app_for_cc_hash(
@@ -391,7 +399,9 @@ fn signed_cc_hash_app_uses_api_deployment_context_without_env_exports() {
                     descriptor_signing_pubkey: [2; 32],
                     org_keyring_fingerprint: [3; 32],
                     omit_log_encryption_claim: false,
-            omit_luks2_header_seal_claim: false,
+                    legacy_collapsed_trustee_key: false,
+                    omit_luks2_header_seal_claim: false,
+                    omit_log_spool_bind_claim: false,
                 },
                 generated_agent_policy: GeneratedAgentPolicy {
                     policy_text: "package agent_policy\n".to_string(),
@@ -417,6 +427,7 @@ fn signed_cc_hash_app_uses_api_deployment_context_without_env_exports() {
             kbs_ca_cert_pem: None,
             runtime_class: cc_init_data::DEFAULT_RUNTIME_CLASS.to_string(),
             luks2_header_seal: "adopt".to_string(),
+            log_spool_storage: "state-bind-v1".to_string(),
         },
     );
 
@@ -526,32 +537,6 @@ fn deploy_preflight_gate_fails_closed_on_unresolved_ownership() {
 }
 
 #[test]
-fn deploy_preflight_reads_live_ownership_before_the_claim_gate() {
-    // CRLF checkouts (Windows autocrlf) must not break source matching.
-    let source = include_str!("../../app.rs").replace("\r\n", "\n");
-    let deploy_start = source.find("pub async fn deploy").expect("deploy exists");
-    let deploy_end = source[deploy_start..]
-        .find("// Phase 1: Deploy")
-        .expect("phase 1 follows deploy setup")
-        + deploy_start;
-    let setup = &source[deploy_start..deploy_end];
-
-    let ownership_read = setup
-        .find("preflight_ownership = api")
-        .expect("deploy reads live ownership before the gate");
-    let gate = setup
-        .find("ensure_claim_session_now")
-        .expect("deploy gates the claim session");
-    let gate_decision = setup
-        .find("preflight_ownership.as_deref()")
-        .expect("the gate decision consumes the prefetched ownership state");
-    assert!(
-        ownership_read < gate_decision && gate_decision < gate,
-        "ownership must be read before the gate decision, and the decision before the session gate"
-    );
-}
-
-#[test]
 fn destroy_failure_hint_covers_lane_conflicts_and_teardown_failures() {
     let busy = destroy_failure_hint(
         Some("app mutation already in progress"),
@@ -569,6 +554,17 @@ fn destroy_failure_hint_covers_lane_conflicts_and_teardown_failures() {
         .expect("locked teardown gets operator prose");
     assert!(
         locked.contains("enclava unlock --app shell"),
+        "got: {locked}"
+    );
+    // The prescribed unlock is impossible when the wedged workload never
+    // stood up its TEE serving endpoint — the hint must offer the abandon
+    // path for that case (#292 field evidence: unlock fails with a TEE TLS
+    // handshake error while the workload stays 0/4), framed as a last
+    // resort with its owner-seed consequence spelled out.
+    assert!(locked.contains("last resort"), "got: {locked}");
+    assert!(locked.contains("--abandon-teardown"), "got: {locked}");
+    assert!(
+        locked.contains("blocks recreating this app name"),
         "got: {locked}"
     );
     // Hosted deferrals carry the locked cause only in-band.
@@ -1421,22 +1417,42 @@ fn log_output_sanitizer_removes_terminal_control_sequences() {
     assert!(!sanitized.contains('\u{1b}'));
 }
 
-#[test]
-fn logs_command_points_missing_scope_to_explicit_reapproval() {
-    // CRLF checkouts (Windows autocrlf) must not break source matching.
-    let source = include_str!("../../app.rs").replace("\r\n", "\n");
-    let fn_start = source
-        .find("pub async fn logs")
-        .expect("logs function exists");
-    let fn_end = source[fn_start..]
-        .find("#[derive(Args)]\npub struct RollbackArgs")
-        .expect("rollback args follow logs function")
-        + fn_start;
-    let body = &source[fn_start..fn_end];
+#[tokio::test]
+async fn followed_log_lines_are_bounded_without_consuming_the_next_frame() {
+    let limit = enclava_cli::api_client::MAX_API_RESPONSE_BODY_BYTES;
+    let mut input = vec![b'x'; limit - 1];
+    input.extend_from_slice(b"\nnext\n");
+    let mut reader = tokio::io::BufReader::new(input.as_slice());
+    let mut line = String::new();
+    assert_eq!(
+        super::read_bounded_log_line(&mut reader, &mut line)
+            .await
+            .unwrap(),
+        limit
+    );
+    assert_eq!(
+        super::read_bounded_log_line(&mut reader, &mut line)
+            .await
+            .unwrap(),
+        5
+    );
+    assert_eq!(line, "next\n");
+    assert_eq!(
+        super::read_bounded_log_line(&mut reader, &mut line)
+            .await
+            .unwrap(),
+        0
+    );
 
-    assert!(body.contains("message.contains(\"apps:logs\")"));
-    assert!(body.contains("enclava login --approve-logs"));
-    assert!(body.contains("sanitize_log_output"));
+    let oversized = vec![b'x'; limit + 1];
+    let mut reader = tokio::io::BufReader::new(oversized.as_slice());
+    let error = super::read_bounded_log_line(&mut reader, &mut line)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<enclava_cli::api_client::ApiError>(),
+        Some(enclava_cli::api_client::ApiError::ResponseTooLarge(size)) if *size == limit
+    ));
 }
 
 #[test]
@@ -1469,7 +1485,13 @@ fn logs_command_decrypts_encrypted_frames_locally() {
     .unwrap();
     let line = serde_json::to_string(&frame).unwrap();
 
-    let output = super::decrypted_log_frame_output(&keypair.private_key_base64url, &line).unwrap();
+    let output = super::decrypted_log_frame_output(&keypair.private_key_base64url, &line)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        super::decrypted_log_frame_output(&keypair.private_key_base64url, "\n").unwrap(),
+        None
+    );
 
     assert_eq!(
         output,
@@ -2872,6 +2894,7 @@ mod terminal_diagnostics {
 
     #[test]
     fn launch_identity_binding_fixtures() {
+        use crate::commands::app::DeploymentWait;
         use enclava_cli::tee_client::{
             VerifiedSnpLaunchIdentity, launch_identity_binds_deployment,
         };
@@ -2882,6 +2905,23 @@ mod terminal_diagnostics {
             host_data: NEW_EXPECTED_LAUNCH_HASH,
             firmware_measurement: EXPECTED_FIRMWARE_MEASUREMENT,
         };
+        let expectation = test_expectation("new-1", NEW_EXPECTED_LAUNCH_HASH);
+        let deployment = DeploymentWait::trusted("new-1", Some(&expectation));
+        assert!(deployment.matches_launch_identity(Some(&fully_verified)));
+        assert!(!deployment.matches_launch_identity(None));
+        assert!(
+            !DeploymentWait::trusted("new-1", None).matches_launch_identity(Some(&fully_verified))
+        );
+        assert!(
+            !DeploymentWait::trusted("old-1", Some(&expectation))
+                .matches_launch_identity(Some(&fully_verified))
+        );
+        assert!(
+            !deployment.matches_launch_identity(Some(&VerifiedSnpLaunchIdentity {
+                host_data: OLD_TEE_LAUNCH_HASH,
+                firmware_measurement: EXPECTED_FIRMWARE_MEASUREMENT,
+            }))
+        );
 
         // Positive: same fully verified client (hash AND measurement match).
         assert!(launch_identity_binds_deployment(

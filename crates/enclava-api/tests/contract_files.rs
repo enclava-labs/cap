@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf};
+use std::{collections::HashSet, fs, path::PathBuf};
 
 #[test]
 fn paas_internal_logs_contract() {
@@ -50,8 +50,8 @@ fn ci_serializes_tests_that_share_postgres_authority() {
 
 #[test]
 fn dockerfiles_pin_base_images_by_digest() {
-    // Mutable tags can be repointed by the registry at any time; every FROM
-    // must carry the immutable digest that was reviewed (issue #140).
+    // Mutable tags can be repointed by the registry at any time; every external
+    // FROM must carry the immutable digest that was reviewed.
     let mut checked = 0;
     for entry in fs::read_dir(workspace_root().join("crates"))
         .expect("list crates")
@@ -61,13 +61,20 @@ fn dockerfiles_pin_base_images_by_digest() {
         let Ok(content) = fs::read_to_string(&dockerfile) else {
             continue;
         };
+        let mut stages = HashSet::new();
         for line in content.lines() {
             let Some(rest) = line.strip_prefix("FROM ") else {
                 continue;
             };
-            let image = rest.split_whitespace().next().unwrap_or("");
-            assert_is_digest_pinned(&dockerfile, image);
-            checked += 1;
+            let mut words = rest.split_whitespace();
+            let image = words.next().unwrap_or("");
+            if !stages.contains(image) {
+                assert_is_digest_pinned(&dockerfile, image);
+                checked += 1;
+            }
+            if words.next() == Some("AS") {
+                stages.insert(words.next().expect("Dockerfile stage name"));
+            }
         }
     }
     assert!(

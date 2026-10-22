@@ -258,17 +258,8 @@ pub(crate) fn deploy_needs_initial_claim(
     }
 }
 
-/// The pre-mutation claim gate's decision: the post-submit
-/// [`deploy_needs_initial_claim`] predicate, except that unresolved
-/// ownership fails CLOSED before submission. The status read is a TEE
-/// query: a window that closes between this read and the post-submit one
-/// is exactly the strand this gate exists to prevent, so an unreadable
-/// state gates. The cost -- an unattended redeploy of an already-claimed
-/// app while its TEE status is unreachable now needs a session -- leaves
-/// no residue, while the strand leaves a submitted deployment with no
-/// claimant. The post-submit predicate keeps its own None fallback
-/// unchanged (gating there would strand claimed redeploys in the claim
-/// wait instead).
+/// Unresolved ownership requires claim-ready password input before submission,
+/// so a first deployment cannot be stranded by a missing password prompt.
 pub(crate) fn deploy_preflight_needs_claim(
     is_password_mode: bool,
     ownership_state: Option<&str>,
@@ -723,7 +714,8 @@ async fn set_deploy_config(
     value: &str,
     token: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + Duration::from_secs(60);
+    // First-boot encrypted storage can still be initializing after the ownership claim.
+    let deadline = Instant::now() + Duration::from_secs(240);
     loop {
         match tee.config_set(key, value, token).await {
             Err(error) if should_retry_deploy_config(&error) && Instant::now() < deadline => {
@@ -817,6 +809,19 @@ impl<'a> DeploymentWait<'a> {
                     && expectation.deploy_id == deployment_id
             }),
         }
+    }
+
+    pub(crate) fn matches_launch_identity(
+        self,
+        identity: Option<&enclava_cli::tee_client::VerifiedSnpLaunchIdentity>,
+    ) -> bool {
+        self.expectation.is_some_and(|expectation| {
+            enclava_cli::tee_client::launch_identity_binds_deployment(
+                identity,
+                &expectation.expected_cc_init_data_hash,
+                &expectation.expected_firmware_measurement,
+            )
+        })
     }
 }
 
@@ -2453,6 +2458,12 @@ pub(crate) async fn claim_initial_ownership(
             );
         }
     };
+    if !deployment.matches_launch_identity(tee.verified_launch_identity().as_ref()) {
+        return Err(
+            "TEE launch identity does not match the signed deployment; no ownership was claimed; retry the deployment"
+                .into(),
+        );
+    }
 
     let challenge = match bounded_request(deadline, tee.bootstrap_challenge()).await {
         Some(challenge) => challenge?,
@@ -2895,33 +2906,44 @@ pub async fn logs(args: LogsArgs) -> Result<(), Box<dyn std::error::Error>> {
     let private_key = load_log_private_key(args.log_private_key_file.as_ref())?;
 
     if args.follow {
-        // Stream logs line by line
-        use tokio::io::AsyncBufReadExt;
         let stream = resp.bytes_stream();
         let reader = tokio_util::io::StreamReader::new(
             stream.map(|result| result.map_err(std::io::Error::other)),
         );
-        let mut lines = tokio::io::BufReader::new(reader).lines();
-        while let Some(line) = lines.next_line().await? {
+        let mut reader = tokio::io::BufReader::new(reader);
+        let mut line = String::new();
+        while read_bounded_log_line(&mut reader, &mut line).await? != 0 {
             print_decrypted_log_frame(&private_key, &line)?;
         }
     } else {
-        // Non-follow mode: bound the buffered read so a hostile API cannot
-        // stream an unbounded "logs" body into CLI memory (the follow-mode
-        // stream below is line-at-a-time and inherently bounded by the
-        // client timeout instead).
+        // A hostile API must not turn a buffered log read into unbounded memory use.
         let bytes = enclava_cli::api_client::read_bounded_body(
             resp,
             enclava_cli::api_client::MAX_API_RESPONSE_BODY_BYTES,
         )
         .await?;
         let body = String::from_utf8_lossy(&bytes);
-        for line in body.lines().filter(|line| !line.trim().is_empty()) {
+        for line in body.lines() {
             print_decrypted_log_frame(&private_key, line)?;
         }
     }
 
     Ok(())
+}
+
+async fn read_bounded_log_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    line: &mut String,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+
+    let limit = enclava_cli::api_client::MAX_API_RESPONSE_BODY_BYTES;
+    line.clear();
+    let read = reader.take((limit + 1) as u64).read_line(line).await?;
+    if read > limit {
+        return Err(enclava_cli::api_client::ApiError::ResponseTooLarge(limit).into());
+    }
+    Ok(read)
 }
 
 fn response_is_encrypted_logs(resp: &reqwest::Response) -> bool {
@@ -2954,14 +2976,19 @@ fn print_decrypted_log_frame(
     private_key: &str,
     line: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!("{}", decrypted_log_frame_output(private_key, line)?);
+    if let Some(output) = decrypted_log_frame_output(private_key, line)? {
+        println!("{output}");
+    }
     Ok(())
 }
 
 fn decrypted_log_frame_output(
     private_key: &str,
     line: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    if line.trim().is_empty() {
+        return Ok(None);
+    }
     let frame: EncryptedLogFrame =
         serde_json::from_str(line).map_err(|err| format!("invalid encrypted log frame: {err}"))?;
     let plaintext = decrypt_log_frame(private_key, &frame).map_err(|err| {
@@ -2971,13 +2998,13 @@ fn decrypted_log_frame_output(
         )
     })?;
     let message = String::from_utf8_lossy(&plaintext);
-    Ok(format!(
+    Ok(Some(format!(
         "{} {} {} {}",
         frame.timestamp,
         frame.container,
         frame.stream,
         sanitize_log_output(message.trim_end())
-    ))
+    )))
 }
 
 #[derive(Subcommand)]
@@ -3649,7 +3676,7 @@ fn destroy_failure_hint(code: Option<&str>, message: &str, app_name: &str) -> Op
         || message.contains("app_delete_teardown_locked");
     if teardown_cause {
         return Some(format!(
-            "the confidential workload is locked and the app remains intact; unlock it with its storage password (`enclava unlock --app {app_name}`), then retry destroy"
+            "the confidential workload is locked and the app remains intact; unlock it with its storage password (`enclava unlock --app {app_name}`), then retry destroy. If the unlock cannot reach the workload at all (the TEE endpoint never came up, e.g. every attempt fails the TEE TLS handshake -- not a transient network error), retrying will not help: contact the operator, or as a last resort `destroy --abandon-teardown` (it leaves the previous owner seed in KBS, which blocks recreating this app name until an operator cleans it up)"
         ));
     }
     match code {

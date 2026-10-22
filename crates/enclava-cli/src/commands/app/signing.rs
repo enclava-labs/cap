@@ -1,5 +1,17 @@
 use super::*;
 
+/// The server's app `id` must be a UUID; a non-UUID (observed: the app name
+/// served for rows without a CAP identity yet) otherwise surfaces as a raw
+/// uuid crate error with no field or remediation context.
+fn parse_app_id(id: &str) -> Result<Uuid, Box<dyn std::error::Error>> {
+    Uuid::parse_str(id).map_err(|err| {
+        format!(
+            "app id returned by the platform is not a UUID (got {id:?}; {err}) -- the app              row may be incomplete; retry the deploy once any app quota or in-flight              operation clears, or contact the operator if it persists"
+        )
+        .into()
+    })
+}
+
 fn parse_hex32(name: &str, value: &str) -> Result<[u8; 32], Box<dyn std::error::Error>> {
     let bytes = hex::decode(value.trim())?;
     bytes
@@ -20,20 +32,23 @@ fn confirmed_bootstrap_state(state: &str) -> bool {
 
 pub(crate) fn platform_release_from_deployment_context(
     deployment_context: &DeploymentContextResponse,
+    api_url: &str,
 ) -> Result<Option<PlatformRelease>, Box<dyn std::error::Error>> {
-    platform_release_from_deployment_context_with_verifier(deployment_context, verify_envelope)
+    let profile = enclava_common::release_profiles::bundled()?.for_api(api_url)?;
+    platform_release_from_deployment_context_with_verifier(deployment_context, |envelope| {
+        verify_envelope(envelope, profile)
+    })
 }
 
 pub(crate) async fn fetch_verified_platform_release(
     api: &ApiClient,
     paths: &enclava_cli::config::CliPaths,
 ) -> Result<(DeploymentContextResponse, PlatformRelease), Box<dyn std::error::Error>> {
+    enclava_common::release_profiles::bundled()?.for_api(api.origin())?;
     let deployment_context = api.deployment_context().await?;
-    let release = match platform_release_from_deployment_context(&deployment_context)? {
+    let release = match platform_release_from_deployment_context(&deployment_context, api.origin())?
+    {
         Some(release) => {
-            // Anti-downgrade baseline is per-API (an environment may serve an
-            // older active release than this CLI bundles); the bundled
-            // baseline applies only to local env-path overrides.
             enclava_cli::platform_release::enforce_release_not_older_than_last_accepted(
                 &paths.api_release_baseline,
                 api.origin(),
@@ -57,7 +72,7 @@ pub(crate) async fn fetch_verified_platform_release(
                 )
                 .into());
             }
-            PlatformRelease::load_verified()?
+            PlatformRelease::load_verified(api.origin())?
         }
     };
     Ok((deployment_context, release))
@@ -326,7 +341,7 @@ pub(crate) fn confidential_app_for_cc_hash(
     };
 
     Ok(ConfidentialApp {
-        app_id: Uuid::parse_str(&app.id)?,
+        app_id: parse_app_id(&app.id)?,
         deployment_id,
         name: app.name.clone(),
         namespace: app.namespace.clone(),
@@ -382,7 +397,9 @@ pub(crate) fn confidential_app_for_cc_hash(
             trustee_policy_url: None,
             local_workload_artifacts_json: Some("{}".to_string()),
             local_trustee_policy_json: Some("{}".to_string()),
-            platform_trustee_policy_pubkey_hex: Some(release.signing_service_pubkey_hex.clone()),
+            platform_trustee_policy_pubkey_hex: Some(
+                release.platform_trustee_policy_pubkey_hex.clone(),
+            ),
             signing_service_pubkey_hex: Some(release.signing_service_pubkey_hex.clone()),
             verification_material: None,
         },
@@ -594,6 +611,16 @@ pub(crate) async fn build_signed_deploy_blobs(
     }
 
     let (deployment_context, release) = fetch_verified_platform_release(api, paths).await?;
+
+    // cap#290 review (version-skew): the log-spool bind gate is an API
+    // DEPLOYMENT capability read from deployment-context, deliberately NOT
+    // signed release metadata — a canonical signed field would break
+    // release-signature verification on every previously released CLI, so
+    // ops declares it in the API environment (atomically with the
+    // bind-capable ENCLAVA_INIT_IMAGE pin) and it affects
+    // availability/persistence only. Older APIs omit the field and default
+    // to false; their pre-bind init cannot act on the claim anyway.
+    let log_spool_state_bind_supported = deployment_context.log_spool_state_bind_supported;
     let policy_template_sha256 = release.policy_template_sha256_bytes()?;
     let _signing_service_pubkey = release.signing_service_pubkey_bytes()?;
     let proxy_image = enclava_common::image::ImageRef::parse(&release.attestation_proxy_image)?;
@@ -608,7 +635,7 @@ pub(crate) async fn build_signed_deploy_blobs(
 
     let (org_id, org_name, deployer_key) = ensure_manual_deploy_keyring(api, paths, true).await?;
 
-    let app_id = Uuid::parse_str(&app.id)?;
+    let app_id = parse_app_id(&app.id)?;
     let trusted_owner = load_trusted_owner(&org_id)?
         .ok_or("org owner pubkey is not trusted; run `enclava org keyring trust` or `enclava org keyring init`")?;
     let keyring_envelope = load_keyring_envelope(&org_id).map_err(|err| {
@@ -732,13 +759,20 @@ pub(crate) async fn build_signed_deploy_blobs(
     // the binding to the claim-less render so both producers hash identical
     // bytes; the guest side defaults a missing claim to the rollout-window
     // ("adopt") semantics. Releases carrying the field sign the full render.
+    // The `log_spool_storage` claim follows the deployment-context gate
+    // (cap#290 review): an API whose deployment does not declare the
+    // state-bind capability renders claim-less cc_init_data, so the signed
+    // render must omit the claim AND the ConfigMap enablement to hash
+    // identical bytes.
     let release_carries_seal_claim = !release.luks2_header_seal.is_empty();
     let workload_artifact_binding = WorkloadArtifactBinding {
         descriptor_core_hash,
         descriptor_signing_pubkey: deployer_key.public.to_bytes(),
         org_keyring_fingerprint,
         omit_log_encryption_claim: false,
+        legacy_collapsed_trustee_key: false,
         omit_luks2_header_seal_claim: !release_carries_seal_claim,
+        omit_log_spool_bind_claim: !log_spool_state_bind_supported,
     };
     let (generated_agent_policy, log_encryption) =
         fetch_generated_agent_policy(api, &release, &descriptor).await?;
@@ -774,6 +808,14 @@ pub(crate) async fn build_signed_deploy_blobs(
         // signed value, so the signed expected_cc_init_data_hash can only
         // match when both producers agree by construction.
         luks2_header_seal: release.luks2_header_seal_claim(),
+        // Same deployment-context sourcing as the binding flag: empty means
+        // the serving API's deployment does not declare the bind capability
+        // and no log_spool_storage claim is rendered.
+        log_spool_storage: if log_spool_state_bind_supported {
+            "state-bind-v1".to_string()
+        } else {
+            String::new()
+        },
     };
     let cc_init_data_hash: [u8; 32] =
         Sha256::digest(cc_init_data::build_toml_with_options(&cc_app, &cc_init_options).as_bytes())

@@ -5,37 +5,30 @@ on:
     tags: ['v*']
 
 env:
-  ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX: ${{ secrets.ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX }}
-  ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON: ${{ secrets.ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON }}
+  ENCLAVA_PLATFORM_RELEASE_PROFILES_JSON: ${{ secrets.ENCLAVA_PLATFORM_RELEASE_PROFILES_JSON }}
 
 jobs:
-  require-platform-release-root:
-    name: Require platform-release root
+  verify-platform-release-profiles:
+    name: Verify common platform-release profiles
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Materialize production platform-release envelope
+      - name: Materialize common platform-release profiles
         run: |
-          if [[ -n "$ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON" ]]; then
-            printf '%s' "$ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON" > crates/enclava-cli/platform-release.json
-          fi
+          test -n "$ENCLAVA_PLATFORM_RELEASE_PROFILES_JSON"
+          printf '%s' "$ENCLAVA_PLATFORM_RELEASE_PROFILES_JSON" > crates/enclava-common/platform-release-profiles.json
 
-      - name: Require production platform-release root
-        run: bash scripts/require-platform-release-root.sh
-
-      # The shell gate can only compare pubkeys; verify the full envelope
-      # signature and payload invariants before any artifact is built.
-      - name: Verify bundled platform-release envelope
+      - name: Verify every signed profile baseline
         run: |
-          cargo run --locked --release -p enclava-cli --example platform-release -- verify \
-            crates/enclava-cli/platform-release.json "$ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX"
+          cargo run --locked --release -p enclava-cli --example platform-release -- verify-profiles \
+            crates/enclava-common/platform-release-profiles.json
 
   build-linux:
     name: Build Linux binaries
-    needs: require-platform-release-root
+    needs: verify-platform-release-profiles
     strategy:
       matrix:
         include:
@@ -59,12 +52,11 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Materialize production platform-release envelope
+      - name: Materialize common platform-release profiles
         shell: bash
         run: |
-          if [[ -n "$ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON" ]]; then
-            printf '%s' "$ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON" > crates/enclava-cli/platform-release.json
-          fi
+          test -n "$ENCLAVA_PLATFORM_RELEASE_PROFILES_JSON"
+          printf '%s' "$ENCLAVA_PLATFORM_RELEASE_PROFILES_JSON" > crates/enclava-common/platform-release-profiles.json
 
       - name: Build binary
         run: |
@@ -83,7 +75,7 @@ jobs:
 
   build-windows:
     name: Build Windows binaries
-    needs: require-platform-release-root
+    needs: verify-platform-release-profiles
     runs-on: windows-latest
 
     steps:
@@ -91,14 +83,11 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      # Materialize the production envelope before compiling so the CLI's
-      # bundled fallback (include_str!) is signed by the pinned root.
-      - name: Materialize production platform-release envelope
+      - name: Materialize common platform-release profiles
         shell: bash
         run: |
-          if [[ -n "$ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON" ]]; then
-            printf '%s' "$ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON" > crates/enclava-cli/platform-release.json
-          fi
+          test -n "$ENCLAVA_PLATFORM_RELEASE_PROFILES_JSON"
+          printf '%s' "$ENCLAVA_PLATFORM_RELEASE_PROFILES_JSON" > crates/enclava-common/platform-release-profiles.json
 
       # Vendored OpenSSL builds with no-asm automatically when nasm is absent.
       # crt-static: link the MSVC runtime statically so the artifact runs on
@@ -121,7 +110,7 @@ jobs:
 
   build-macos:
     name: Build macOS binaries
-    needs: require-platform-release-root
+    needs: verify-platform-release-profiles
     runs-on: macos-latest
     strategy:
       matrix:
@@ -140,12 +129,11 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Materialize production platform-release envelope
+      - name: Materialize common platform-release profiles
         shell: bash
         run: |
-          if [[ -n "$ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON" ]]; then
-            printf '%s' "$ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON" > crates/enclava-cli/platform-release.json
-          fi
+          test -n "$ENCLAVA_PLATFORM_RELEASE_PROFILES_JSON"
+          printf '%s' "$ENCLAVA_PLATFORM_RELEASE_PROFILES_JSON" > crates/enclava-common/platform-release-profiles.json
 
       - name: Build binary
         run: |
@@ -164,7 +152,7 @@ jobs:
 
   build-web-verifier:
     name: Build local HTML/WASM verifier
-    needs: require-platform-release-root
+    needs: verify-platform-release-profiles
     runs-on: ubuntu-latest
 
     steps:
@@ -175,7 +163,10 @@ jobs:
           targets: wasm32-unknown-unknown
 
       - name: Install matching wasm-bindgen CLI
-        run: cargo install wasm-bindgen-cli --version 0.2.118 --locked
+        uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2
+        with:
+          tool: wasm-bindgen-cli@0.2.118
+          fallback: none
 
       - name: Build deterministic web release
         run: ./web/verifier/build.sh

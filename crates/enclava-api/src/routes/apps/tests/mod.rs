@@ -564,16 +564,85 @@ async fn deletion_retry_preserves_teardown_requirement_before_policy_revocation(
     let (_cleanup, pool) =
         crate::test_support::isolated_database_test_pool("cap_delete_teardown_retry").await;
     let (org_id, user_id, app_id) = insert_signer_rotation_app(&pool, None, None).await;
+    let descriptor_hash: Vec<u8> = (0..32).collect();
+    let deploy_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO deployments (id, org_id, app_id, status, spec_snapshot)
+         VALUES ($1, $2, $3, 'healthy', '{}'::jsonb)",
+    )
+    .bind(deploy_id)
+    .bind(org_id)
+    .bind(app_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let artifact = serde_json::json!({
+        "metadata": {
+            "app_id": app_id,
+            "deploy_id": deploy_id,
+            "descriptor_core_hash": hex::encode(&descriptor_hash),
+            "descriptor_signing_pubkey": "bb".repeat(32),
+            "platform_release_version": "platform-test",
+            "policy_template_id": "trustee-resource-policy-v1",
+            "policy_template_sha256": "cc".repeat(32),
+            "agent_policy_sha256": "11".repeat(32),
+            "genpolicy_version_pin": "kata-containers/genpolicy@3.28.0+test",
+            "signed_at": "2026-04-01T12:30:00+00:00",
+            "key_id": "policy-test-key"
+        },
+        "rego_text": "package policy\n",
+        "rego_sha256": "dd".repeat(32),
+        "agent_policy_text": "package agent_policy\n",
+        "agent_policy_sha256": "11".repeat(32),
+        "signature": "ee".repeat(64),
+        "verify_pubkey_b64": "ZmFrZS1wdWJrZXk="
+    });
+    sqlx::query(
+        "INSERT INTO workload_artifacts (
+             descriptor_core_hash, app_id, deploy_id, descriptor_payload,
+             descriptor_signature, descriptor_signing_key_id,
+             org_keyring_payload, org_keyring_signature, signed_policy_artifact
+         ) VALUES ($1, $2, $3, '{}'::jsonb, $4, 'test-key', '{}'::jsonb, $5, $6)",
+    )
+    .bind(&descriptor_hash)
+    .bind(app_id)
+    .bind(deploy_id)
+    .bind(vec![1_u8; 64])
+    .bind(vec![2_u8; 64])
+    .bind(&artifact)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let signing_key_id = uuid::Uuid::new_v4();
+    sqlx::query("INSERT INTO user_signing_keys (id, user_id, pubkey) VALUES ($1, $2, $3)")
+        .bind(signing_key_id)
+        .bind(user_id)
+        .bind(vec![0xbb_u8; 32])
+        .execute(&pool)
+        .await
+        .unwrap();
+    let keyring = serde_json::json!({
+        "org_id": org_id,
+        "version": 1,
+        "members": [{
+            "user_id": user_id,
+            "pubkey": "bb".repeat(32),
+            "role": "owner",
+            "added_at": "2026-01-01T00:00:00Z"
+        }],
+        "updated_at": "2026-01-01T00:00:00Z"
+    });
+    sqlx::query("INSERT INTO org_keyrings (org_id, version, keyring_payload, signature, signing_key_id) VALUES ($1, 1, $2, $3, $4)")
+        .bind(org_id)
+        .bind(serde_json::to_vec(&keyring).unwrap())
+        .bind(vec![9_u8; 64])
+        .bind(signing_key_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let provider = Arc::new(tokio::sync::Mutex::new(KbsPolicyProvider::new(true)));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    let (attempts_tx, mut attempts_rx) = tokio::sync::mpsc::channel(2);
-    let server = tokio::spawn(async move {
-        for _ in 0..2 {
-            let (stream, _) = listener.accept().await.unwrap();
-            attempts_tx.send(()).await.unwrap();
-            drop(stream);
-        }
-    });
     let app_name: String =
         sqlx::query_scalar("UPDATE apps SET tee_domain = $2 WHERE id = $1 RETURNING name")
             .bind(app_id)
@@ -587,9 +656,21 @@ async fn deletion_retry_preserves_teardown_requirement_before_policy_revocation(
     .execute(&pool)
     .await
     .unwrap();
-    let policy_before = read_withdrawal_reconciliation_state(&pool).await;
     let mut state = unreachable_tee_state();
     state.db = pool.clone();
+    state.kbs_policy = Some(test_kbs_policy_config());
+    crate::kbs::TEST_KUBE_CLIENT
+        .scope(
+            kbs_policy_kube_client(provider.clone()),
+            crate::kbs::reconcile_pending_signed_policy_artifacts(&pool, state.kbs_policy.as_ref()),
+        )
+        .await
+        .expect("publish the running workload's authority");
+    let policy_before = provider.lock().await.configmap["data"]["policy.rego"].clone();
+    let published: serde_json::Value =
+        serde_json::from_str(policy_before.as_str().unwrap()).unwrap();
+    assert_eq!(published["artifacts"].as_array().unwrap().len(), 1);
+    assert_eq!(published["artifacts"][0]["metadata"], artifact["metadata"]);
     let mut auth = crate::test_support::auth_context(Role::Owner, &["apps:write"]);
     auth.org_id = org_id;
     auth.user_id = user_id;
@@ -597,11 +678,14 @@ async fn deletion_retry_preserves_teardown_requirement_before_policy_revocation(
     for _ in 0..2 {
         let (status, Json(body)) = tokio::time::timeout(
             Duration::from_secs(3),
-            super::delete_app(
-                auth.clone(),
-                State(state.clone()),
-                Path(app_name.clone()),
-                axum::body::Bytes::new(),
+            crate::kbs::TEST_KUBE_CLIENT.scope(
+                kbs_policy_kube_client(provider.clone()),
+                super::delete_app(
+                    auth.clone(),
+                    State(state.clone()),
+                    Path(app_name.clone()),
+                    axum::body::Bytes::new(),
+                ),
             ),
         )
         .await
@@ -609,27 +693,44 @@ async fn deletion_retry_preserves_teardown_requirement_before_policy_revocation(
         .expect_err("an unavailable TEE must block both deletion attempts");
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert_eq!(body["error"], "app_delete_teardown_unavailable");
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(1), attempts_rx.recv())
+        // The fixture has no signed deployment descriptor to bind SNP
+        // evidence. Deletion must fail before contacting the TEE or issuing
+        // its protected bearer, while preserving authority for a retry.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
                 .await
-                .expect("each deletion attempt must contact the TEE"),
-            Some(())
+                .is_err(),
+            "teardown must not contact an unauthenticated TEE"
         );
         let app_status: String = sqlx::query_scalar("SELECT status::text FROM apps WHERE id = $1")
             .bind(app_id)
             .fetch_one(&pool)
             .await
             .unwrap();
-        // Main's atomic-delete semantics restore the pre-delete status when a
-        // failed teardown left the app untouched (reason: app_restored).
+        // A failed teardown without supersession restores the running app.
         assert_eq!(app_status, "running");
         assert_eq!(
-            read_withdrawal_reconciliation_state(&pool).await,
+            provider.lock().await.configmap["data"]["policy.rego"],
             policy_before,
             "failed confidential teardown must not revoke the workload's KBS authority"
         );
+        let withdrawn: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM withdrawn_signer_artifacts WHERE app_id = $1")
+                .bind(app_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(withdrawn, 0, "failed teardown must not withdraw authority");
+        let teardown_state: (bool, Option<chrono::DateTime<chrono::Utc>>) = sqlx::query_as(
+            "SELECT workload_teardown_required, workload_teardown_completed_at FROM apps WHERE id = $1",
+        )
+        .bind(app_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(teardown_state, (true, None));
     }
-    server.await.unwrap();
+    crate::test_support::drop_isolated_database("cap_delete_teardown_retry", pool).await;
 }
 
 #[test]
@@ -3088,27 +3189,14 @@ async fn signer_rotation_refuses_when_signed_mode_activates_while_it_waits_for_t
 
 #[tokio::test]
 async fn abandon_teardown_proceeds_past_unreachable_workload() {
-    let pool = crate::test_support::database_test_pool().await;
+    // An isolated per-test database: the shared test database's global
+    // kbs_signed_policy_reconciliation singleton and kbs_policy/edge_config
+    // fences are mutated by other tests (and sibling CI worktrees sharing
+    // the PostgreSQL server), which would fail the delete at the KBS
+    // publication step before teardown is ever attempted.
+    let (_db_cleanup, pool) =
+        crate::test_support::isolated_database_test_pool("cap_abandon_teardown_delete").await;
     let auth = unique_admin_auth();
-    // Pre-flight: a previously failed run may have leaked this test-owned
-    // organization and its (fixed-domain) fences into finite reclaim
-    // quarantine, which would fail every later attempt as Busy. Wipe and
-    // start clean.
-    sqlx::query("DELETE FROM organizations WHERE id = $1")
-        .bind(auth.org_id)
-        .execute(&pool)
-        .await
-        .expect("clear abandon test organization");
-    sqlx::query(
-        "DELETE FROM external_resource_mutation_leases
-          WHERE resource_key IN ('abandon-test.example.test',
-                                 'abandon-test.tee.example.test')
-             OR (resource_key = 'global' AND resource_scope IN ('edge_config', 'kbs_policy')
-                 AND reclaim_after <> 'infinity'::timestamptz)",
-    )
-    .execute(&pool)
-    .await
-    .expect("clear abandon test fences");
     // Unique slug (not the historic fixed one): the app domain — and with it
     // the dns/edge mutation fences — derives from it, so concurrent tests
     // cannot fence each other out.
@@ -3297,39 +3385,16 @@ async fn abandon_teardown_proceeds_past_unreachable_workload() {
         .unwrap();
     assert_eq!(abandoned, "deleting");
 
-    // Release the fences the mid-tail failure left behind (their reclaim
-    // quarantine would otherwise outlive the test).
-    sqlx::query(
-        "UPDATE app_mutation_leases
-            SET locked_until = clock_timestamp() - interval '2 seconds',
-                reclaim_after = clock_timestamp() - interval '1 second'
-          WHERE app_id = $1",
-    )
-    .bind(app_id)
-    .execute(&pool)
-    .await
-    .expect("expire app mutation lease");
-    sqlx::query(
-        "UPDATE external_resource_mutation_leases
-            SET locked_until = clock_timestamp() - interval '2 seconds',
-                reclaim_after = clock_timestamp() - interval '1 second'
-          WHERE operation_id = $1 AND reclaim_after <> 'infinity'::timestamptz",
-    )
-    .bind(app_id)
-    .execute(&pool)
-    .await
-    .expect("expire external resource leases");
-
-    sqlx::query("DELETE FROM organizations WHERE id = $1")
-        .bind(auth.org_id)
-        .execute(&pool)
-        .await
-        .expect("delete abandon test organization");
+    crate::test_support::drop_isolated_database("cap_abandon_teardown_delete", pool).await;
 }
 
 #[tokio::test]
 async fn teardown_failure_after_supersede_keeps_deleting() {
-    let pool = crate::test_support::database_test_pool().await;
+    // Same shared-database exposure as the abandon test above: another
+    // test's signed-policy singleton bump or global fence would fail the
+    // delete at the KBS publication step before the teardown is reached.
+    let (_db_cleanup, pool) =
+        crate::test_support::isolated_database_test_pool("cap_supersede_teardown_delete").await;
     let auth = unique_admin_auth();
     let org_id = auth.org_id;
     let suffix = uuid::Uuid::new_v4().simple().to_string();
@@ -3468,23 +3533,206 @@ async fn teardown_failure_after_supersede_keeps_deleting() {
         "the watching deployment was superseded by the delete flip"
     );
 
-    // Expire this attempt's finite lease quarantine so the teardown cascades.
-    for statement in [
-        "DELETE FROM app_mutation_leases WHERE app_id = $1",
-        "UPDATE external_resource_mutation_leases
-            SET locked_until = clock_timestamp() - interval '2 seconds',
-                reclaim_after = clock_timestamp() - interval '1 second'
-          WHERE operation_id = $1 AND reclaim_after <> 'infinity'::timestamptz",
-    ] {
-        sqlx::query(statement)
-            .bind(app_id)
-            .execute(&pool)
-            .await
-            .expect("expire attempt lease quarantine");
-    }
-    sqlx::query("DELETE FROM organizations WHERE id = $1")
-        .bind(org_id)
+    crate::test_support::drop_isolated_database("cap_supersede_teardown_delete", pool).await;
+}
+
+#[tokio::test]
+async fn non_running_app_with_seed_evidence_requires_teardown_on_destroy() {
+    // Regression for the stale_owner_seed-on-normal-destroy defect: the
+    // durable `workload_teardown_required` flag used to record
+    // `status == running` only, so a fully deployed workload whose recorded
+    // status was 'failed' or 'creating' (e.g. a redeploy left the app row
+    // non-running while its TEE stayed live, or a destroy landing mid-boot)
+    // skipped the confidential teardown, deleted the namespace, and reported
+    // success while `soft_delete_owner_binding` recorded a waiver — blocking
+    // every same-name recreate with 409 stale_owner_seed.
+    let (_db_cleanup, pool) =
+        crate::test_support::isolated_database_test_pool("cap_seed_evidence_delete").await;
+    let auth = unique_admin_auth();
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    sqlx::query(
+        "INSERT INTO users (id, display_name)
+         VALUES ($1, 'Seed Evidence Delete Test') ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(auth.user_id)
+    .execute(&pool)
+    .await
+    .expect("insert user");
+    sqlx::query("INSERT INTO organizations (id, name, cust_slug) VALUES ($1, $2, $3)")
+        .bind(auth.org_id)
+        .bind(format!("seed-evidence-{}", &suffix[..8]))
+        .bind(&suffix[..8])
         .execute(&pool)
         .await
-        .expect("delete fixture organization");
+        .expect("insert organization");
+    sqlx::query(
+        "INSERT INTO memberships (user_id, org_id, role, removed_at)
+         VALUES ($1, $2, 'admin'::role_enum, NULL)",
+    )
+    .bind(auth.user_id)
+    .bind(auth.org_id)
+    .execute(&pool)
+    .await
+    .expect("insert membership");
+    sqlx::query(
+        "UPDATE kbs_signed_policy_reconciliation
+            SET desired_generation = 0, configmap_generation = 0,
+                applied_generation = 0",
+    )
+    .execute(&pool)
+    .await
+    .expect("reset signed policy reconciliation");
+
+    let mut state = unreachable_tee_state();
+    state.db = pool.clone();
+
+    let teardown_state = |app_id: uuid::Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_as::<_, (bool, Option<chrono::DateTime<chrono::Utc>>)>(
+                "SELECT workload_teardown_required, workload_teardown_completed_at
+                   FROM apps WHERE id = $1",
+            )
+            .bind(app_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read teardown state")
+        }
+    };
+
+    for recorded_status in ["failed", "creating", "stopped"] {
+        let app_id = uuid::Uuid::new_v4();
+        let app_suffix = app_id.simple().to_string();
+        let app_name = format!("seed-ev-{}", &app_suffix[..8]);
+        let namespace = format!("cap-{}", &app_suffix[..8]);
+        let domain = format!("{}-se.example.test", &app_suffix[..8]);
+        let tee_domain = format!("{}-se.tee.example.test", &app_suffix[..8]);
+        sqlx::query(
+            "INSERT INTO apps (
+                 id, org_id, name, namespace, instance_id, tenant_id,
+                 service_account, bootstrap_owner_pubkey_hash,
+                 tenant_instance_identity_hash, domain, tee_domain, status
+             ) VALUES ($1, $2, $5, $6, $7, $7, 'cap-seed-sa',
+                       $3, $4, $8, $9, $10::app_status_enum)",
+        )
+        .bind(app_id)
+        .bind(auth.org_id)
+        .bind("00".repeat(32))
+        .bind("11".repeat(32))
+        .bind(&app_name)
+        .bind(&namespace)
+        .bind(&app_suffix)
+        .bind(&domain)
+        .bind(&tee_domain)
+        .bind(recorded_status)
+        .execute(&pool)
+        .await
+        .expect("insert non-running app");
+        // Seed evidence: a terminal deployment row means this app's owner
+        // seed may already exist in KBS even though the recorded status is
+        // not 'running'.
+        sqlx::query(
+            "INSERT INTO deployments (id, org_id, app_id, status, spec_snapshot)
+             VALUES ($1, $2, $3, 'healthy'::deploy_status_enum, '{}'::jsonb)",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(auth.org_id)
+        .bind(app_id)
+        .execute(&pool)
+        .await
+        .expect("insert healthy deployment row");
+
+        for attempt in 0..2 {
+            let Err((status, body)) = crate::routes::apps::delete_app_before(
+                auth.clone(),
+                State(state.clone()),
+                Path(app_name.clone()),
+                None,
+                false,
+            )
+            .await
+            else {
+                panic!(
+                    "{recorded_status} attempt {attempt}: destroy of an app with \
+                     seed evidence returned success — it must fail on \
+                     confidential teardown instead of recording a waiver"
+                );
+            };
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "{:?}", body.0);
+            assert_eq!(
+                body.0["error"], "app_delete_teardown_unavailable",
+                "teardown must be attempted (and fail here) rather than skipped"
+            );
+            assert_eq!(
+                body.0["reason"], "app_restored",
+                "a nothing-touched failure restores the pre-delete status"
+            );
+            let app_status: String =
+                sqlx::query_scalar("SELECT status::text FROM apps WHERE id = $1")
+                    .bind(app_id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("read post-failure status");
+            assert_eq!(app_status, recorded_status);
+            assert_eq!(
+                teardown_state(app_id).await,
+                (true, None),
+                "{recorded_status} attempt {attempt}: seed evidence must persist \
+                 workload_teardown_required for every retry"
+            );
+            let waivers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kbs_owner_seed_waivers")
+                .fetch_one(&pool)
+                .await
+                .expect("count waivers");
+            assert_eq!(
+                waivers, 0,
+                "a normal destroy must never record a waiver without --abandon-teardown"
+            );
+        }
+    }
+
+    // Control: a non-running app with NO deployment or binding rows has no
+    // seed to erase, so its destroy still skips teardown — it proceeds to the
+    // provider steps and fails there (no cluster in tests), proving the
+    // skip is now evidence-based, not status-based.
+    let fresh_app_id = uuid::Uuid::new_v4();
+    let app_suffix = fresh_app_id.simple().to_string();
+    let app_name = format!("seed-nv-{}", &app_suffix[..8]);
+    sqlx::query(
+        "INSERT INTO apps (
+             id, org_id, name, namespace, instance_id, tenant_id,
+             service_account, bootstrap_owner_pubkey_hash,
+             tenant_instance_identity_hash, domain, tee_domain, status
+         ) VALUES ($1, $2, $5, $6, $7, $7, 'cap-seed-sa',
+                   $3, $4, $8, $9, 'failed'::app_status_enum)",
+    )
+    .bind(fresh_app_id)
+    .bind(auth.org_id)
+    .bind("00".repeat(32))
+    .bind("11".repeat(32))
+    .bind(&app_name)
+    .bind(format!("cap-{}", &app_suffix[..8]))
+    .bind(&app_suffix)
+    .bind(format!("{}-nv.example.test", &app_suffix[..8]))
+    .bind(format!("{}-nv.tee.example.test", &app_suffix[..8]))
+    .execute(&pool)
+    .await
+    .expect("insert never-deployed app");
+
+    let (status, body) =
+        crate::routes::apps::delete_app_before(auth, State(state), Path(app_name), None, false)
+            .await
+            .expect_err("a never-deployed app fails later, at the provider steps");
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{:?}", body.0);
+    assert_ne!(
+        body.0["error"], "app_delete_teardown_unavailable",
+        "a never-deployed app must still skip the unreachable TEE teardown"
+    );
+    assert_eq!(
+        teardown_state(fresh_app_id).await,
+        (false, None),
+        "never-deployed apps keep teardown_required=false"
+    );
+
+    crate::test_support::drop_isolated_database("cap_seed_evidence_delete", pool).await;
 }

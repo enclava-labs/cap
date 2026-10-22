@@ -216,7 +216,7 @@ Release builds also require:
 | --- | --- |
 | `API_KEY_HMAC_PEPPER` or `API_KEY_HMAC_PEPPER_BASE64` | Pepper for HMAC-format API keys. Must be at least 32 bytes. |
 | `TRUSTEE_POLICY_READ_AVAILABLE=true` | Enables the supported signed-policy and in-TEE verification path. |
-| `ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX` | Compile-time root public key used to verify the bundled or supplied platform release. |
+| `ENCLAVA_PLATFORM_RELEASE_PROFILE` | Required API runtime profile: `dev`, `preprod`, or `production`. Must match the `API_URL` origin. |
 
 For production deploys with policy-read mode enabled:
 
@@ -231,7 +231,8 @@ For production deploys with policy-read mode enabled:
 | `TRUSTEE_ATTESTATION_VERIFY_URL` | Trustee callback endpoint used by CAP workload artifact and TLS broker routes. Must be an `https://` URL: release builds reject `http://` verify URLs at startup (the verify bearer token must never transit cleartext), and the trustee client refuses cleartext requests in all builds. |
 | `TRUSTEE_ATTESTATION_VERIFY_BEARER_TOKEN` | Bearer token CAP sends to the Trustee verification endpoint. Required when `TRUSTEE_ATTESTATION_VERIFY_URL` is set. |
 | `PLATFORM_SIGNING_SERVICE_URL` | Policy signing service endpoint, unless supplied by the platform release. |
-| `SIGNING_SERVICE_PUBKEY_HEX` or `PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX` | Ed25519 public key used to verify signed policy artifacts, unless supplied by the platform release. |
+| `PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX` | Ed25519 public key of the platform trustee policy authority (in-TEE policy verification), unless supplied by the platform release. |
+| `SIGNING_SERVICE_PUBKEY_HEX` | Ed25519 public key of the off-cluster signing service that produces signed policy artifacts (`/sign`); policy acceptance verifies against this key. Distinct from `PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX`: they are two trust domains, and setting both to the same key fails startup. Never load the trustee policy private key into the signing service — that would collapse the two domains again. |
 
 ## Optional Integrations
 
@@ -320,23 +321,57 @@ CAP_EGRESS_ALLOW_INTERNAL_HOSTS (without CAP_ALLOW_PRODUCTION_INTERNAL_EGRESS=tr
 Release builds also require `API_KEY_HMAC_PEPPER` or
 `API_KEY_HMAC_PEPPER_BASE64`, and `TRUSTEE_POLICY_READ_AVAILABLE=true`.
 
+## Noninteractive CLI ownership claims
+
+Agents and CI can use `enclava deploy --storage-password-file PATH`,
+`enclava template deploy --storage-password-file PATH`, or
+`enclava claim --password-file PATH` without terminal stdin or stderr.
+Without a password file, password prompts require both streams to be terminals.
+
+Keep `ENCLAVA_STATE_DIR` on persistent private storage. Before claiming, the CLI
+validates the protected recovery-mnemonic destination; after claiming, it stores
+the mnemonic atomically with owner-only permissions and filesystem syncs. It
+never prints the mnemonic. `--no-store-mnemonic` remains invalid for claims.
+Export an encrypted backup with `enclava key backup` and retain it off-machine.
+
+The TEE still returns the recovery mnemonic only once. A lost claim response or
+failed mnemonic write exits nonzero and halts dependent actions; when ownership
+is known to have committed, the error is
+`ownership_committed_recovery_backup_incomplete`. Ownership is not rolled back.
+Do not blindly retry a claim or treat this as a completed backup. A terminal
+does not provide response-loss recovery either.
+
 ## Platform Release
 
-The API and CLI load the bundled
-`crates/enclava-cli/platform-release.json` unless
-`ENCLAVA_PLATFORM_RELEASE_PATH` points at another signed release envelope.
+API and CLI images embed the same
+`crates/enclava-common/platform-release-profiles.json` bundle. It contains
+exactly `dev`, `preprod`, and `production`, each with `api_origins`,
+`root_pubkey_hex`, and a signed `baseline` envelope. The CLI selects the profile
+from the configured API origin, never from a server-supplied root. The API
+requires `ENCLAVA_PLATFORM_RELEASE_PROFILE` and a matching `API_URL`.
+Unknown origins, missing/unknown production profiles, and credential-bearing
+URLs fail closed.
+
+`ENCLAVA_PLATFORM_RELEASE_PATH` still selects an environment-owned signed runtime
+envelope. Without it, the selected profile's baseline is loaded. The committed
+bundle uses public test keys; release builds and publication reject it.
 
 Release verification checks:
 
-- envelope signature against `ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX`;
+- envelope signature against the selected profile's compiled root;
+- signing-service key and Trustee CA equal the selected baseline's installation
+  identity, including when environments share a release root;
+- `platform_trustee_policy_pubkey_hex` is present and distinct from
+  `signing_service_pubkey_hex` (the in-TEE policy authority and the
+  off-cluster signing service are separate trust domains);
 - digest pins for platform sidecar images;
 - HTTPS Trustee KBS URL;
 - HTTPS tenant Caddy ACME CA URL;
 - genpolicy version;
 - policy template hash;
 - runtime class expected by the engine;
-- API overrides must not predate the binary's bundled release; equal timestamps
-  with different signed payloads are rejected.
+- API envelopes and CLI file overrides must not predate the selected profile's
+  baseline; equal timestamps with different signed payloads are rejected.
 
 The API compares overrides only with its compiled bundle. Accepting a newer
 override does not change that minimum: a previous signed override can be
@@ -347,36 +382,99 @@ Existing database-schema compatibility and CLI per-API release-history checks
 still apply; this is not a guarantee that any older API image or client will
 accept a rollback.
 
+API-served CLI releases may predate the compiled baseline for that installation;
+the existing persisted per-API history remains their rollback floor. Updating
+one environment's runtime envelope does not change another profile's floor.
+Changing a signing-service key or Trustee CA requires a reviewed common profile
+bundle and new common artifacts; another environment's signed envelope is not
+an authorized identity rotation.
+
 When the signed release supplies a value, an explicit environment override must
 match it exactly or startup fails.
 
+### Upgrading across the policy-key split (cap#118)
+
+Signed deployment artifacts pin the exact hash of their rendered
+`cc_init_data`, which includes the policy-key claims. Artifacts signed
+before the platform trustee policy key was split from the signing-service
+key were rendered with the collapsed layout (trustee slot = signing-service
+key). Such artifacts — rollback targets, unlock transitions, queued-job
+replays — still validate after the upgrade: when only the collapsed render
+matches the signed hash, the API pins the artifact to that layout and every
+consumer (statefulset, enclava-init ConfigMap, KBS policy/TLS bindings)
+renders the exact signed bytes, so the workload boots exactly as it did
+before the upgrade. No workload-artifact re-signing is required before
+rollout; re-deploying (re-signing) an app moves it to the split layout. The
+same render-pin mechanism covers artifacts signed before the
+`log_encryption_json` claim existed (`omit_log_encryption_claim`), before
+the `luks2_header_seal` claim existed (`omit_luks2_header_seal_claim`), and
+before the `log_spool_storage` claim existed (`omit_log_spool_bind_claim`).
+The production platform-release envelope is the exception: the new
+`platform_trustee_policy_pubkey_hex` field is required with no default, so
+re-sign the production envelope with a distinct trustee key before
+deploying this binary — an old envelope will not load.
+
+The `log_spool_storage` claim is gated by the API deployment, not the
+signed release (cap#290 review), and enablement is two-phase — never flip
+the gate in the same step that first ships the bind-capable init:
+
+1. Deploy the API with the new `ENCLAVA_INIT_IMAGE` pin and
+   `ENCLAVA_LOG_SPOOL_STORAGE` **unset**. Renders stay claim-less.
+2. Redeploy a workload and verify the bind-capable init digest is the one
+   actually running in its live manifest/pod (`imageID`), per the
+   init-first rule above.
+3. Only then set `ENCLAVA_LOG_SPOOL_STORAGE="state-bind-v1"` on
+   enclava-api and restart it. From that point the API reports the
+   capability in deployment-context, signers render the claim, and every
+   workload the API renders carries the verified init pin.
+
+Until phase 3, claim-bearing artifacts are rejected for re-signing.
+
 ### Rotating the production root
 
-The committed `platform-release.json` is signed by a well-known dev fixture
-root whose seed is public. Publishing requires a production root held outside
-this repository; gates reject the fixture root and any root that does not sign
-the envelope the build bundles, so the root and the envelope always rotate
-together:
+The committed profile bundle uses a well-known public fixture root. Publishing
+requires one approved bundle containing all three installations' public roots,
+signed baselines and API origins. Existing installations keep their authorities;
+do not generate new keys merely to adopt shared images. For an explicitly
+approved root rotation:
 
 1. Generate the production root offline:
    `openssl genpkey -algorithm ed25519 -out root.pem`
    (`openssl pkey -in root.pem -noout -text` shows the seed and pubkey hex.)
-2. Sign the payload with the repository's canonical encoding. Keep the seed
+2. Prepare `payload.json`: a copy of the current release payload with the
+   fields you are rotating. It MUST include a `platform_trustee_policy_pubkey_hex`
+   distinct from `signing_service_pubkey_hex` — releases that omit the field or
+   collapse the two keys onto one key are rejected (the in-TEE policy authority
+   and the signing service are separate trust domains). The committed payload
+   pins the public dev-fixture trustee key: REPLACE that pin with a freshly
+   generated trustee key — keeping the committed value is rejected at signing
+   and verification time (its seed is public, so anyone with the repo could
+   forge policy envelopes). Generate the trustee policy keypair with its own
+   offline seed, never reused as the signing-service or root key.
+3. Sign the payload with the repository's canonical encoding. Keep the seed
    in a protected file and redirect it into the helper — it never appears in
    argv or shell history:
    `cargo run --locked -p enclava-cli --example platform-release -- sign \
    payload.json < root-seed.hex > platform-release.json`
-3. Sanity-check it: `cargo run --locked -p enclava-cli --example \
+4. Sanity-check it: `cargo run --locked -p enclava-cli --example \
    platform-release -- verify platform-release.json <root-pubkey-hex>`
-4. Set both repository secrets in one sitting:
-   `ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX` (pubkey hex) and
-   `ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON` (the signed envelope contents).
+5. Update the affected profile's public root and signed baseline in the common
+   bundle, retaining the other two profiles. Verify every profile:
 
-Release workflows materialize the envelope secret over
-`crates/enclava-cli/platform-release.json` before building, verify its full
-signature against the pinned root, and embed it in every published binary and
-image. With only one of the two secrets set (or neither), publishing fails
-closed.
+   ```console
+   cargo run --locked -p enclava-cli --example platform-release -- \
+     verify-profiles crates/enclava-common/platform-release-profiles.json
+   ```
+
+6. Set the single repository secret `ENCLAVA_PLATFORM_RELEASE_PROFILES_JSON`
+   to that complete public bundle. It must contain no private keys.
+
+Release workflows materialize this same bundle before building API, migration
+and CLI artifacts. The helper verifies every baseline's canonical signature;
+`prod-strict` rejects missing profiles, malformed roots and the fixture root.
+Promote the resulting digest unchanged between environments. Runtime profile,
+domains, measurements, signed overrides and credentials remain deployment data.
+This supports the three managed environments, not arbitrary-domain installation.
 
 ## Images
 
@@ -405,6 +503,8 @@ Before using it outside local experimentation:
 - pin the API image digest in `deploy/api/kustomization.yaml`;
 - add the required production environment variables;
 - configure service account/RBAC for only the tenant resources CAP owns;
+  Pod readiness and volume-initialization checks use name-scoped pod lists;
+  keep individual pod GET and `pods/log` access denied.
 - configure network policy for PostgreSQL, Trustee/KBS, policy signing,
   registry metadata, DNS, and tenant TEE callbacks;
 - decide whether CAP-managed DNS and KBS policy management are required.
@@ -422,6 +522,10 @@ While an unreleased hold is active, another deploy or rollback cannot
 supersede its delivery. Release or expiry permits the next operation;
 explicit deletion remains available. Expiry never applies the replacement
 and preserves the running workload's signed or legacy KBS authority.
+
+CLI 0.1.1 allows each config key up to 240 seconds for retryable first-boot
+initialization, matching template deployment. Terminal bootstrap errors still
+fail immediately; a ready config store adds no delay.
 
 Deploy the PaaS response contract first: every held response, including a
 replay, must carry a fresh CAP database-clock
@@ -481,12 +585,38 @@ Roll out and recover as follows:
    compatibility.
 
 
+## TEE Teardown Authentication
+
+The TEE leaf is self-signed and boot-scoped. Before minting a teardown bearer
+token, the API verifies fresh nonce-bound SNP evidence under pinned AMD roots,
+binding the TLS SPKI and receipt-key hash to the app's admitted init-data and
+firmware identity. Its app-scoped KBS authority includes rollback and prior
+healthy deployments, but excludes held, withdrawn, and removed-signer artifacts.
+
+Normal deletion requires teardown whenever deployments or owner bindings show
+that a seed may exist, even if the app row is no longer `running`. An unreachable
+TEE fails closed; skipping erasure requires explicit `--abandon-teardown` and
+leaves the existing same-name recreation guard in force.
+
+`AMD_KDS_BASE_URL` includes `/vcek/v1`; its default is
+`https://kdsintf.amd.com/vcek/v1`. An internal HTTP collateral relay is supported
+without relaxing AMD certificate-chain, HWID/TCB, or debug-policy checks.
+Ordinary teardown attestation does not add CRL freshness checking; unlock
+transition verification remains separate.
+
 ## Keyring Revocation Completion
 
 In signed-policy mode, keyring uploads and owner rotations confirm success only
 after the filtered KBS policy has converged. A `503` response with code
 `keyring_policy_reconciliation_pending` means the keyring change committed, but
 policy publication is still unconfirmed. It does not mean the keyring rolled back.
+
+Confidential teardown admission uses the same signer eligibility as policy
+publication: only owner/admin/deployer keys in the latest org keyring qualify,
+withdrawn artifacts stay excluded, and unreleased customer-config holds add no
+authority. Deletion does not restore revoked signer authority. Its projected
+required policy must fit the shared byte budget unless deletion leaves that
+policy the same size or smaller.
 
 Retry the same request after restoring KBS availability. Internal PaaS callers
 must retain the same idempotency key when the response is stamped `deferred`.

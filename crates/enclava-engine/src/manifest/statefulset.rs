@@ -14,7 +14,7 @@ use crate::manifest::containers::{
     build_app_container, build_attestation_proxy_container, build_caddy_container,
     build_enclava_init_container, build_enclava_tools_init_container, legacy_bootstrap_enabled,
 };
-use crate::manifest::volumes::{build_volume_claim_templates, build_volumes};
+use crate::manifest::volumes::{build_volume_claim_templates, build_volumes, logs_volume_included};
 use crate::types::ConfidentialApp;
 
 pub fn generate_statefulset(app: &ConfidentialApp) -> StatefulSet {
@@ -108,7 +108,12 @@ pub fn generate_statefulset(app: &ConfidentialApp) -> StatefulSet {
             build_caddy_container(app),
             build_enclava_init_container(app),
         ];
-        (Some(vec![build_enclava_tools_init_container()]), containers)
+        (
+            Some(vec![build_enclava_tools_init_container(
+                logs_volume_included(app),
+            )]),
+            containers,
+        )
     };
 
     let volumes = build_volumes(app);

@@ -7,7 +7,7 @@ on:
     paths:
       - ".github/workflows/api-image.yml"
       - "scripts/render-api-release-manifest.sh"
-      - "scripts/require-platform-release-root.sh"
+      - "scripts/install-cargo-chef.sh"
       - "scripts/test-api-image-workflow.sh"
       - "scripts/test-verify-api-image-ref.sh"
       - "scripts/verify-api-image-ref.bash"
@@ -15,6 +15,8 @@ on:
       - "deploy/api/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "crates/*/Cargo.toml"
+      - "vendor/rdrand-0.8.3/**"
       - "crates/enclava-api/**"
       - "crates/enclava-appraiser/**"
       # The release stage compiles the whole enclava-cli crate for the
@@ -27,7 +29,7 @@ on:
     paths:
       - ".github/workflows/api-image.yml"
       - "scripts/render-api-release-manifest.sh"
-      - "scripts/require-platform-release-root.sh"
+      - "scripts/install-cargo-chef.sh"
       - "scripts/test-api-image-workflow.sh"
       - "scripts/test-verify-api-image-ref.sh"
       - "scripts/verify-api-image-ref.bash"
@@ -35,6 +37,8 @@ on:
       - "deploy/api/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "crates/*/Cargo.toml"
+      - "vendor/rdrand-0.8.3/**"
       - "crates/enclava-api/**"
       - "crates/enclava-appraiser/**"
       # The release stage compiles the whole enclava-cli crate for the
@@ -51,10 +55,34 @@ on:
         type: string
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && 'pr' || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
+  warm-debug-dependencies:
+    name: Cache API debug dependencies
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Cache debug dependencies
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: ./crates/enclava-api/Dockerfile
+          target: debug-dependencies
+          push: false
+          provenance: false
+          cache-from: type=gha,scope=api-debug
+          cache-to: type=gha,mode=max,scope=api-debug
+
   validate:
     name: Validate API image
     if: github.event_name == 'pull_request'
@@ -95,7 +123,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
 
-      # Test-only well-known fixture; never a Dockerfile default. PR validation only.
+      # The committed profile bundle is only for non-publishing debug builds.
       - name: Build image
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
@@ -104,8 +132,8 @@ jobs:
           target: runtime-debug
           push: false
           provenance: false
-          build-args: |
-            ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX=5b9437adeaffbe8f41b13d96ed49d2f51cd6c266cd8ecc284b0552ec4912b8dd
+          cache-from: type=gha,scope=api-debug
+          cache-to: type=gha,mode=max,scope=api-debug
 
       - name: Build appraiser image
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
@@ -114,6 +142,8 @@ jobs:
           file: ./crates/enclava-appraiser/Dockerfile
           push: false
           provenance: false
+          cache-from: type=gha,scope=appraiser
+          cache-to: type=gha,mode=max,scope=appraiser
 
   publish:
     name: Publish signed API image
@@ -156,6 +186,10 @@ jobs:
             echo "::error::Manual image tags must match ^manual-[a-z0-9][a-z0-9_.-]{0,119}$."
             exit 1
           fi
+          if (( ${#VERSION_TAG} > 128 )); then
+            echo "::error::Manual image tag exceeds Docker's 128-character limit."
+            exit 1
+          fi
 
       - name: Validate pushed tag name
         # Belt and braces: the env:-bound WORKFLOW_REF below already prevents
@@ -170,6 +204,11 @@ jobs:
         run: |
           if [[ ! "$PUSHED_REF" =~ ^refs/tags/v[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
             echo "::error::Pushed tag names must match ^v[A-Za-z0-9][A-Za-z0-9._-]*$ (same alphabet as SIGNER_SUBJECT_PATTERN in scripts/verify-api-image-ref.bash)."
+            exit 1
+          fi
+          image_tag="${PUSHED_REF#refs/tags/}"
+          if (( ${#image_tag} > 128 )); then
+            echo "::error::Pushed image tag exceeds Docker's 128-character limit."
             exit 1
           fi
 
@@ -191,18 +230,12 @@ jobs:
             type=sha,prefix=
             type=raw,value=${{ github.event.inputs.version_tag }},enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version_tag != '' }}
 
-      - name: Materialize production platform-release envelope
+      - name: Materialize common platform-release profiles
         env:
-          ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON: ${{ secrets.ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON }}
+          ENCLAVA_PLATFORM_RELEASE_PROFILES_JSON: ${{ secrets.ENCLAVA_PLATFORM_RELEASE_PROFILES_JSON }}
         run: |
-          if [[ -n "$ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON" ]]; then
-            printf '%s' "$ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON" > crates/enclava-cli/platform-release.json
-          fi
-
-      - name: Require platform-release root
-        env:
-          ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX: ${{ secrets.ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX }}
-        run: bash scripts/require-platform-release-root.sh
+          test -n "$ENCLAVA_PLATFORM_RELEASE_PROFILES_JSON"
+          printf '%s' "$ENCLAVA_PLATFORM_RELEASE_PROFILES_JSON" > crates/enclava-common/platform-release-profiles.json
 
       # Every pushed image is a prod-strict release build; the debug stage is
       # reserved for PR validation and local compose.
@@ -216,10 +249,8 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX=${{ secrets.ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=api-release
+          cache-to: type=gha,mode=max,scope=api-release
           provenance: true
 
       - name: Set up Kustomize

@@ -58,6 +58,52 @@ cargo audit --ignore RUSTSEC-2023-0071
 cargo deny check advisories sources
 ```
 
+CI and API image workflow concurrency is scoped by workflow and pull-request
+number, falling back to the Git ref for non-PR events. New runs supersede older
+runs for the same PR; unrelated PRs must not cancel each other's checks.
+
+The test and build jobs use the same pinned `Swatinem/rust-cache` action as the
+CLI checks, with job- and compiler-specific cache keys. CI and release verifier
+jobs install the pinned, checksum-verified prebuilt `wasm-bindgen-cli`, without
+falling back to compiling it from source.
+
+Docker layer caches use separate scopes for each image and profile:
+`api-debug`, `api-release`, `init-debug`, `init-release`, and `appraiser`.
+New scopes need a successful run to warm. GitHub's branch restrictions still
+apply: PR caches do not seed `main`. These caches do not preserve Dockerfile
+cache-mount contents across runners.
+
+API builds use `cargo-chef` 0.1.78 to cache compiled dependencies separately
+from application sources. The installer uses checksum-pinned binaries on amd64
+and arm64, and builds the same locked version on other Rust image architectures.
+The recipe tracks workspace manifests and `Cargo.lock`; the real vendored
+`rdrand` patch is also copied before dependency compilation. Cargo sources and
+compiled dependencies stay in exported layers rather than ephemeral cache mounts.
+
+Main pushes seed `api-debug` with the `debug-dependencies` target in a separate,
+non-publishing job so newly opened PRs can restore compiled dependencies.
+
+Release dependency compilation uses separate CLI-example and API `prod-strict`
+passes because their resolved dependency features differ. Real sources, the
+signed envelope, and the root pin are applied afterward; the existing root,
+signature, and trust-root checks still gate the final binaries. Source-only
+edits can reuse dependency layers; manifest, lockfile, and vendored-source
+changes invalidate them. Measure a source-edit rebuild, not just an unchanged
+commit rerun, and include cache export/import costs when comparing CI times.
+
+## Shared signed API image
+
+The API image pins the platform-release root and verifies its bundled signed
+envelope as a downgrade floor at build time. A pre-trustee-key envelope may
+serve only as that floor; it is never a usable runtime release. Each environment
+mounts its own current-schema, root-signed envelope at
+`ENCLAVA_PLATFORM_RELEASE_PATH`. Startup rejects a missing or invalid trustee
+policy key and refuses releases older than the image's verified floor. A new
+envelope must have a later signed `created_at` than a different bundled floor.
+Do not replace the shared CI envelope with one environment's release or
+remove the floor to make a build pass. Deploying a new image requires a
+compatible signed runtime envelope in every target environment.
+
 ## Local API
 
 ```bash

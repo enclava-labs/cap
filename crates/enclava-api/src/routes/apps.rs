@@ -161,6 +161,7 @@ enum AppDeleteFailure {
     KbsOwnerBinding,
     KbsTlsBinding,
     KbsPolicy,
+    KbsPolicyBudget,
 }
 
 impl AppDeleteFailure {
@@ -179,6 +180,7 @@ impl AppDeleteFailure {
             Self::KbsOwnerBinding => "app_delete_kbs_owner_binding_failed",
             Self::KbsTlsBinding => "app_delete_kbs_tls_binding_failed",
             Self::KbsPolicy => "app_delete_kbs_policy_failed",
+            Self::KbsPolicyBudget => "app_delete_kbs_policy_budget_exceeded",
         }
     }
 
@@ -188,7 +190,7 @@ impl AppDeleteFailure {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
             Self::DnsOutsideManagedZone => StatusCode::BAD_REQUEST,
-            Self::DnsHostnameInUse => StatusCode::CONFLICT,
+            Self::DnsHostnameInUse | Self::KbsPolicyBudget => StatusCode::CONFLICT,
             Self::TeardownLocked => StatusCode::LOCKED,
             Self::TeardownEndpoint
             | Self::DnsUnavailable
@@ -359,6 +361,26 @@ fn requires_workload_teardown(status: AppStatus) -> bool {
     matches!(status, AppStatus::Running)
 }
 
+// Recorded status can lag a live TEE; use the same seed evidence as the waiver guard.
+async fn teardown_required_pre_delete(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    app: &App,
+) -> Result<bool, sqlx::Error> {
+    if requires_workload_teardown(app.status) {
+        return Ok(true);
+    }
+    sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM deployments WHERE app_id = $1
+         ) OR EXISTS(
+             SELECT 1 FROM kbs_owner_bindings WHERE app_id = $1
+         )",
+    )
+    .bind(app.id)
+    .fetch_one(&mut **tx)
+    .await
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct WorkloadTeardownDecision {
     required: bool,
@@ -382,7 +404,7 @@ async fn request_workload_teardown(
         tracing::info!(
             app_id = %app.id,
             code = "app_delete_teardown_not_required",
-            "skipping workload teardown endpoint for non-running app"
+            "skipping workload teardown endpoint: no owner-seed evidence"
         );
         return Ok(());
     }
@@ -395,6 +417,81 @@ async fn request_workload_teardown(
         return Ok(());
     }
 
+    let domain = app.tee_domain.as_deref().unwrap_or(&app.domain);
+
+    // The per-boot leaf must be attested before a teardown token is issued.
+    let tee_http_client = if crate::routes::logs::accepts_invalid_tenant_tee_certs() {
+        let mut relaxed = state.tee_http_client.clone();
+        // The public tee origin is unreachable from inside the cluster on
+        // hairpin-blocked deployments (pods cannot reach their own external
+        // edge address), which made every teardown POST time out and the
+        // TEE-side owner-seed erasure fail open. Prefer the instance tenant
+        // Gateway dataplane via the shared bounded resolver; every failure
+        // mode falls back to the public client — the pre-Gateway behavior,
+        // which on a Gateway deployment still carries the original defect
+        // (#204): if teardown-unavailable symptoms persist after this
+        // ships, the fallback is the first place to look.
+        if let Some(client) = crate::routes::logs::resolved_tenant_tee_client(
+            app.id,
+            &app.name,
+            &app.namespace,
+            domain,
+        )
+        .await
+        {
+            relaxed = client;
+        }
+        relaxed
+    } else {
+        let identities =
+            match crate::tee_attestation::load_teardown_identities(&state.db, app).await {
+                Ok(identities) => identities,
+                Err(error) => {
+                    tracing::warn!(
+                        app_id = %app.id,
+                        category = error.category(),
+                        reason = error.reason(),
+                        code = "app_delete_teardown_attestation",
+                        "workload teardown identity unavailable"
+                    );
+                    return Err(app_delete_failure(
+                        app.id,
+                        AppDeleteFailure::TeardownEndpoint,
+                        error.category(),
+                    ));
+                }
+            };
+        let gateway_ip =
+            crate::routes::logs::resolve_tenant_gateway_ip(app.id, &app.name, &app.namespace).await;
+        match crate::tee_attestation::attest_teardown_channel(
+            domain,
+            gateway_ip,
+            &identities,
+            state
+                .attestation
+                .as_ref()
+                .and_then(|config| config.amd_kds_base_url.as_deref()),
+        )
+        .await
+        {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::warn!(
+                    app_id = %app.id,
+                    category = error.category(),
+                    reason = error.reason(),
+                    code = "app_delete_teardown_attestation",
+                    "workload teardown endpoint failed attestation"
+                );
+                return Err(app_delete_failure(
+                    app.id,
+                    AppDeleteFailure::TeardownEndpoint,
+                    error.category(),
+                ));
+            }
+        }
+    };
+
     let token = crate::auth::jwt::issue_config_token(
         &state.signing_key,
         auth.user_id,
@@ -405,24 +502,8 @@ async fn request_workload_teardown(
     )
     .map_err(|error| app_delete_failure(app.id, AppDeleteFailure::TeardownToken, error))?;
 
-    let domain = app.tee_domain.as_deref().unwrap_or(&app.domain);
-
-    // The public tee origin is unreachable from inside the cluster on
-    // hairpin-blocked deployments (pods cannot reach their own external
-    // edge address), which made every teardown POST time out and the
-    // TEE-side owner-seed erasure fail open. Prefer the instance tenant
-    // Gateway dataplane via the shared bounded resolver; every failure
-    // mode falls back to the public client — the pre-Gateway behavior,
-    // which on a Gateway deployment still carries the original defect
-    // (#204): if teardown-unavailable symptoms persist after this ships,
-    // the fallback is the first place to look.
     let mut teardown_state = state.clone();
-    if let Some(client) =
-        crate::routes::logs::resolved_tenant_tee_client(app.id, &app.name, &app.namespace, domain)
-            .await
-    {
-        teardown_state.tee_http_client = client;
-    }
+    teardown_state.tee_http_client = tee_http_client;
     post_workload_teardown(&teardown_state, app, &token, &workload_teardown_url(domain)).await
 }
 
@@ -549,6 +630,12 @@ async fn persist_workload_teardown_completed(
         .bind(app_id)
         .execute(&mut *tx)
         .await?;
+    // The completed marker removes teardown pins from the selector. Publish
+    // its new desired generation in this same commit so a process loss cannot
+    // strand the old body behind an already-applied generation.
+    crate::kbs::enqueue_signed_policy_revocation_if_active(&mut tx)
+        .await
+        .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
     tx.commit().await?;
     Ok(())
 }
@@ -1683,8 +1770,71 @@ pub(crate) async fn delete_app_before(
             .map_err(|_| internal_server_error())?;
         return Err((
             StatusCode::CONFLICT,
-            Json(serde_json::json!({"error": "app resource authority changed; retry deletion"})),
+            Json(serde_json::json!({ "error": "app resource authority changed; retry deletion" })),
         ));
+    }
+    let pre_delete_teardown_required = teardown_required_pre_delete(&mut phase_tx, &phase_app)
+        .await
+        .map_err(|_| internal_server_error())?;
+    // Admission control for the teardown policy pin (Codex security finding
+    // 4a27950: teardown candidates can exhaust the global KBS policy budget).
+    // A teardown-pending workload keeps required, retention-exempt signed
+    // policy authority for as long as it can still be serving, and the byte
+    // budget fail-closes the whole reconciliation when the required set
+    // overflows — stacked deletions would then wedge every app's policy
+    // convergence. Refuse the delete here, under the global kbs_policy fence
+    // and before the pin exists, when this app's teardown unit no longer fits.
+    // Nothing is dropped from the policy to make a delete fit. `abandon_teardown`
+    // proceeds anyway: its deletion completes in this flow (the pin stays
+    // transient), and the operator override must remain reachable to unwind a
+    // wedged budget.
+    if !abandon_teardown {
+        // Mirrors the CASE below: a retry of an already-deleting app keeps
+        // its pin; anything else pins exactly when teardown is required.
+        // A teardown that already completed contributes no policy authority
+        // (the selector requires `workload_teardown_completed_at IS NULL`),
+        // so its deletion retry must bypass admission — otherwise a tight
+        // budget could 409 the only operation that removes the app.
+        let pin_will_apply = if phase_app.status == AppStatus::Deleting {
+            let (teardown_required, teardown_completed): (
+                bool,
+                Option<chrono::DateTime<chrono::Utc>>,
+            ) = sqlx::query_as(
+                "SELECT workload_teardown_required, workload_teardown_completed_at
+                   FROM apps WHERE id = $1",
+            )
+            .bind(phase_app.id)
+            .fetch_one(&mut *phase_tx)
+            .await
+            .map_err(|_| internal_server_error())?;
+            teardown_required && teardown_completed.is_none()
+        } else {
+            pre_delete_teardown_required
+        };
+        if pin_will_apply {
+            let fits = crate::kbs::teardown_unit_fits_signed_policy_budget(
+                &state.db,
+                state.kbs_policy.as_ref(),
+                phase_app.id,
+            )
+            .await
+            .map_err(|_| internal_server_error())?;
+            if !fits {
+                delete_mutation
+                    .finish_in_tx(&mut phase_tx)
+                    .await
+                    .map_err(|_| internal_server_error())?;
+                phase_tx
+                    .commit()
+                    .await
+                    .map_err(|_| internal_server_error())?;
+                return Err(app_delete_failure(
+                    phase_app.id,
+                    AppDeleteFailure::KbsPolicyBudget,
+                    (),
+                ));
+            }
+        }
     }
     sqlx::query(
         "UPDATE apps
@@ -1697,7 +1847,7 @@ pub(crate) async fn delete_app_before(
           WHERE id = $1",
     )
     .bind(phase_app.id)
-    .bind(requires_workload_teardown(phase_app.status))
+    .bind(pre_delete_teardown_required)
     .execute(&mut *phase_tx)
     .await
     .map_err(|_| internal_server_error())?;
@@ -1730,6 +1880,31 @@ pub(crate) async fn delete_app_before(
                 return Err(internal_server_error());
             }
         };
+    // The deleting selector and its desired generation must commit atomically.
+    // A crash between these writes would otherwise strand teardown authority
+    // behind an already-applied generation (same-generation body changes are
+    // rejected by the policy reconciler).
+    let publication_needed = if phase_app.status == AppStatus::Deleting {
+        let (required, completed): (bool, Option<chrono::DateTime<chrono::Utc>>) = sqlx::query_as(
+            "SELECT workload_teardown_required, workload_teardown_completed_at
+                   FROM apps WHERE id = $1",
+        )
+        .bind(phase_app.id)
+        .fetch_one(&mut *phase_tx)
+        .await
+        .map_err(|_| internal_server_error())?;
+        required && completed.is_none()
+    } else {
+        pre_delete_teardown_required
+    };
+    let publish_enqueued = if publication_needed {
+        crate::kbs::enqueue_signed_policy_revocation_if_active(&mut phase_tx)
+            .await
+            .map_err(|_| internal_server_error())?
+            .is_some()
+    } else {
+        false
+    };
     phase_tx
         .commit()
         .await
@@ -1790,18 +1965,93 @@ pub(crate) async fn delete_app_before(
         .await
         .map_err(|_| internal_server_error())?;
 
-    let teardown = delete_mutation
-        .guard_provider(request_workload_teardown(
-            &state,
-            &auth,
-            &deleting_app,
-            WorkloadTeardownDecision {
-                required: teardown_required,
-                completed: teardown_completed_at.is_some(),
-            },
-        ))
-        .await
-        .map_err(|_| internal_server_error())?;
+    // Publish the admitted teardown unit before any workload is asked to
+    // erase its owner seed (Codex review on 3b168c73): with retention 1 or
+    // prior byte trimming an artifact the deleting selector pins may still
+    // be absent from Trustee. The phase transaction atomically enqueued the
+    // selector change; converge it here under the global kbs_policy fence.
+    // A reconcile
+    // failure flows into the same handling as a teardown failure below
+    // (restore-or-keep disposition, lease released in the lane) — except a
+    // budget failure whose full teardown unit is already live, which proceeds
+    // to teardown instead of demanding an over-budget republication.
+    let teardown = if teardown_required && teardown_completed_at.is_none() {
+        if publish_enqueued {
+            match delete_mutation
+                .guard_provider(crate::kbs::reconcile_pending_signed_policy_artifacts(
+                    &state.db,
+                    state.kbs_policy.as_ref(),
+                ))
+                .await
+                .map_err(|_| internal_server_error())?
+            {
+                Ok(()) => None,
+                Err(error) => {
+                    // A delete admitted as non-growing (its teardown unit
+                    // does not grow the required set) must still reach
+                    // teardown when the required set is already over budget
+                    // (e.g. the byte limit was lowered below the published
+                    // set): republication of the still-over-budget unit
+                    // fail-closes, but the exact authority may already be
+                    // live — teardown authorization is evaluated against the
+                    // live policy, and the required set shrinks once
+                    // teardown completes. Any other reconcile failure keeps
+                    // failing the delete as before.
+                    let already_published = matches!(
+                        error,
+                        crate::kbs::KbsPolicyError::SignedPolicyBudgetExceeded { .. }
+                    ) && match (
+                        state.kbs_policy.as_ref(),
+                        kube::Client::try_default().await,
+                    ) {
+                        (Some(config), Ok(client)) => crate::kbs::teardown_unit_already_published(
+                            &state.db,
+                            config,
+                            client,
+                            deleting_app.id,
+                        )
+                        .await
+                        .unwrap_or(false),
+                        _ => false,
+                    };
+                    if already_published {
+                        tracing::warn!(
+                            app_id = %deleting_app.id,
+                            code = "kbs_teardown_unit_already_published",
+                            "skipping over-budget republication for a non-growing delete; \
+                             the live policy already carries this app's teardown unit"
+                        );
+                        None
+                    } else {
+                        Some(app_delete_failure(
+                            deleting_app.id,
+                            AppDeleteFailure::KbsPolicy,
+                            error,
+                        ))
+                    }
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let teardown = match teardown {
+        Some(failure) => Err(failure),
+        None => delete_mutation
+            .guard_provider(request_workload_teardown(
+                &state,
+                &auth,
+                &deleting_app,
+                WorkloadTeardownDecision {
+                    required: teardown_required,
+                    completed: teardown_completed_at.is_some(),
+                },
+            ))
+            .await
+            .map_err(|_| internal_server_error())?,
+    };
     if let Err(failure) = teardown {
         if !abandon_teardown {
             // A failed teardown exits before any fenced resource is touched:
@@ -1834,6 +2084,13 @@ pub(crate) async fn delete_app_before(
                 .execute(&mut *delete_lane)
                 .await
                 .map_err(|_| internal_server_error())?;
+                // The pre-teardown publication was content-bound to the
+                // deleting selector. Restoring the app changes that selector;
+                // enqueue a fresh generation in the same transaction so the
+                // periodic reconciler can revoke deletion-only authority.
+                crate::kbs::enqueue_signed_policy_revocation_if_active(&mut delete_lane)
+                    .await
+                    .map_err(|_| internal_server_error())?;
             }
             // Merely dropping the lease would hold the cluster-wide
             // edge_config and kbs_policy fences through reclaim quarantine
@@ -1872,6 +2129,65 @@ pub(crate) async fn delete_app_before(
             code = "app_delete_teardown_abandoned",
             "proceeding with deletion after failed workload teardown (operator override)"
         );
+        // The override must be able to unwind a wedged budget (Codex review on
+        // 3b168c73): with the completion marker still NULL the deleting-app
+        // selector keeps pinning this app's retention-exempt artifacts, and
+        // the mandatory reconciliation below would fail with the same
+        // SignedPolicyBudgetExceeded the override exists to escape. The
+        // workload is confirmed unreachable, so its pin protects nothing.
+        // Record the waiver explicitly first — the later owner-binding
+        // soft-delete only waives while the marker is NULL, so stamping the
+        // marker now would silently drop the same-name-recreate guard — then
+        // stamp the marker. Both run in a short transaction committed
+        // independently of the delete lane (like the teardown marker itself):
+        // an open-lane write would hold the waiver row lock against the later
+        // soft delete from the pool, and would stay invisible to the
+        // reconciliation below until the lane commits.
+        let mut abandon_tx = state
+            .db
+            .begin()
+            .await
+            .map_err(|_| internal_server_error())?;
+        sqlx::query(
+            "INSERT INTO kbs_owner_seed_waivers (binding_key, app_id, org_name, app_name)
+             SELECT $2, app.id, org.name, app.name
+               FROM apps AS app
+               JOIN organizations AS org ON org.id = app.org_id
+              WHERE app.id = $1
+             ON CONFLICT (binding_key) DO UPDATE
+                SET app_id = EXCLUDED.app_id,
+                    org_name = EXCLUDED.org_name,
+                    app_name = EXCLUDED.app_name,
+                    waived_at = now()",
+        )
+        .bind(deleting_app.id)
+        .bind(crate::kbs::owner_binding_key_for(
+            &deleting_app.namespace,
+            &deleting_app.name,
+        ))
+        .execute(&mut *abandon_tx)
+        .await
+        .map_err(|_| internal_server_error())?;
+        sqlx::query(
+            "UPDATE apps
+                SET workload_teardown_completed_at =
+                        COALESCE(workload_teardown_completed_at, clock_timestamp()),
+                    updated_at = clock_timestamp()
+              WHERE id = $1",
+        )
+        .bind(deleting_app.id)
+        .execute(&mut *abandon_tx)
+        .await
+        .map_err(|_| internal_server_error())?;
+        // The override's completed marker removes this app from the selector.
+        // Do not leave that body change at the already-applied generation.
+        crate::kbs::enqueue_signed_policy_revocation_if_active(&mut abandon_tx)
+            .await
+            .map_err(|_| internal_server_error())?;
+        abandon_tx
+            .commit()
+            .await
+            .map_err(|_| internal_server_error())?;
     }
 
     // The running workload needs its current KBS authorization to erase the
