@@ -7978,13 +7978,13 @@ mod tests {
         /// UID) with a NEWER mutation generation — the self-check race on
         /// #243, where the rewrite that causes the 409 must not be deleted.
         annotate_generation_on_delete: Option<i64>,
-        /// Simulate a stalled API server (Codex review on #243, P1 follow-up):
-        /// the label-selected Secret list hangs until the caller's per-
-        /// namespace budget cancels it.
         /// Stall every namespace GET far beyond the sweep's per-namespace
         /// budget: `namespace_absent` must fall through on its own timeout
         /// instead of hanging the sweep (review on #306).
         stall_namespace_gets: bool,
+        /// Simulate a stalled API server (Codex review on #243, P1 follow-up):
+        /// the label-selected Secret list hangs until the caller's per-
+        /// namespace budget cancels it.
         stall_secrets_list: bool,
         /// Fail ServiceAccount patches that ADD an `imagePullSecrets` entry
         /// (reference restores) with a 500 this many times — the durable
