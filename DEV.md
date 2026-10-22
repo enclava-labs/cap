@@ -12,7 +12,11 @@ cargo test --workspace --all-features
 ```
 
 Workspace tests include the API integration suite, so set `DATABASE_URL` to a
-disposable PostgreSQL database or use the targeted commands below.
+disposable PostgreSQL database or use the targeted commands below. The role in
+`DATABASE_URL` must also have the CREATEDB attribute (`ALTER ROLE "<role>"
+WITH CREATEDB` as a superuser): tests whose fixtures must not share state
+provision uniquely named per-test databases, migrate them, and drop them
+when the test finishes.
 
 `enclava-cli` links to OpenSSL, and `enclava-init` links to `libcryptsetup`.
 On Debian/Ubuntu, install the native development packages:
