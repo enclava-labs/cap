@@ -19,7 +19,7 @@ use enclava_engine::types::{
     AttestationConfig, BindMount, ConfidentialApp, Container, DomainSpec, EgressMode,
     LogEncryptionConfig, StorageSpec, WorkloadArtifactBinding, WorkloadSecurityProfile,
 };
-use k8s_openapi::api::core::v1::{Secret, ServiceAccount};
+use k8s_openapi::api::core::v1::{Namespace, Secret, ServiceAccount};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::{
     Api, Resource as _,
@@ -1328,6 +1328,16 @@ const PULL_SECRET_DELETION_POLL_DEADLINE: std::time::Duration = std::time::Durat
 /// whose healthy traversal exceeds a whole-pass budget).
 const PULL_SECRET_NAMESPACE_RECONCILE_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(180);
+
+/// The absence probe's cap. Grounded in the platform, not tuning: kube-apiserver's
+/// default `--request-timeout` is 60s — a namespace GET either answers within
+/// that or never (reviews on #306, rounds 4–5: an unbounded probe starves the
+/// mutation guard and reconcile when GETs stall while Secret requests stay
+/// healthy; a too-small one wedges admission on slow-but-valid 404s). At this
+/// cap every legitimately answerable 404 fits, and a stalled GET still leaves
+/// two-thirds of the namespace budget for the guard and reconcile — under
+/// which a healthy Secret API reconciles this namespace to convergence.
+const NAMESPACE_ABSENCE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The mutation generation a live Secret carries, if any (`None` covers both
 /// unannotated legacy secrets and unparsable annotation values).
@@ -3536,6 +3546,9 @@ pub async fn cleanup_stale_tenant_image_pull_secrets_at_startup(pool: &PgPool) -
 /// is visited on every attempt, and a stalled namespace only fails itself —
 /// while a stalled Kubernetes API server still degrades to "not converged,
 /// retried with bounded backoff" instead of hanging anything forever.
+/// The `budget` is the namespace's REMAINING single deadline — the probe,
+/// mutation guard, and this reconciliation draw from one shared window, so
+/// a stalled probe cannot buy a second full one (codex review on #306).
 async fn sweep_namespace_with_budget(
     engine: &ApplyEngine,
     namespace: &str,
@@ -3543,9 +3556,10 @@ async fn sweep_namespace_with_budget(
     settings: &PullSecretSettings,
     scope: &PullSecretAccountScope,
     delete_mode: PullSecretDeleteMode,
+    budget: std::time::Duration,
 ) -> Result<bool, DeployError> {
     match tokio::time::timeout(
-        PULL_SECRET_NAMESPACE_RECONCILE_TIMEOUT,
+        budget,
         reconcile_managed_pull_secrets(
             engine,
             namespace,
@@ -3561,7 +3575,7 @@ async fn sweep_namespace_with_budget(
         Err(_) => {
             tracing::error!(
                 %namespace,
-                budget_secs = PULL_SECRET_NAMESPACE_RECONCILE_TIMEOUT.as_secs(),
+                budget_secs = budget.as_secs(),
                 "tenant image pull secret cleanup sweep: reconciling this namespace exceeded \
                  its budget (stalled Kubernetes API?); treating it as not converged and \
                  continuing with the remaining namespaces"
@@ -3581,6 +3595,33 @@ async fn sweep_namespace_with_budget(
 /// `imagePullSecrets` attachment.
 type NamespacePullSecretInventory =
     std::collections::BTreeMap<String, Vec<(String, Option<Vec<ImageRef>>)>>;
+
+/// True only on an explicit NotFound. A namespace that does not exist cannot
+/// hold a stale pull secret, so the sweep skips its app rows entirely (#305):
+/// a `deleting` row whose namespace is already gone — or a blocked create
+/// whose namespace never materialized because admission was closed — must not
+/// keep workload admission closed fleet-wide. Any other outcome (the
+/// namespace exists, or the API server answered something other than
+/// NotFound) falls through to the normal reconcile, preserving today's
+/// behavior; the per-deploy cleanup remains the hard gate for everything that
+/// does exist.
+async fn namespace_absent(
+    engine: &ApplyEngine,
+    namespace: &str,
+    budget: std::time::Duration,
+) -> bool {
+    let api: Api<Namespace> = Api::all(engine.client().clone());
+    // Draws from the namespace's shared deadline, not a fresh window
+    // (review on #306): a stalled API server must not hang the sweep on
+    // this probe — a timeout falls through to the normal reconcile, which
+    // spends only what is left of the same budget and reports its own
+    // outcome.
+    let probe = tokio::time::timeout(budget, api.get(namespace));
+    matches!(
+        probe.await,
+        Ok(Err(kube::Error::Api(error))) if error.code == 404
+    )
+}
 
 async fn cleanup_stale_tenant_image_pull_secrets(pool: &PgPool) -> Result<bool, DeployError> {
     let settings = PullSecretSettings::from_env();
@@ -3825,8 +3866,44 @@ async fn cleanup_stale_tenant_image_pull_secrets(pool: &PgPool) -> Result<bool, 
             );
             continue;
         }
+        // Authority rechecks above stay in force for absent namespaces too
+        // (review on #306): a stale replica must still defer when a newer
+        // epoch was raised mid-sweep — and the guard below is what makes
+        // the rechecks stick for the skip path (see its comment). Nothing
+        // to clean in an absent namespace, and the per-deploy cleanup gates
+        // whatever deploy later creates it.
+        // One shared deadline per namespace covers the probe, the mutation
+        // guard, and the reconcile (codex review on #306): a stalled step
+        // must not buy a second full window — once the budget is spent the
+        // remaining steps time out immediately, the namespace reports
+        // unconverged for this pass, and the next sweep cycle retries it.
+        let namespace_deadline_started = tokio::time::Instant::now();
+        let remaining_namespace_budget = || {
+            PULL_SECRET_NAMESPACE_RECONCILE_TIMEOUT
+                .saturating_sub(namespace_deadline_started.elapsed())
+        };
+        // Probe BEFORE taking the guard — it is a read-only GET that needs
+        // no mutation fence, and running it under the guard held the shared
+        // advisory lock across a network op (Devin review on #306, rounds
+        // 3–4: a stalled or merely slow GET then either blocked a newer
+        // replica's exclusive authority publication or surrendered too
+        // early and resurrected the admission wedge on slow API servers).
+        // Absence is only ACCEPTED afterwards, under the guard: its epoch
+        // read under the shared advisory lock is the authority fence (codex
+        // review on #306, round 2) — a fleet epoch raised before the guard
+        // is caught there and defers this stale replica, and none can be
+        // raised between that read and the skip because the exclusive side
+        // waits on our shared hold. An in-flight, not-yet-published raise
+        // matches present-namespace mid-pass semantics: the next sweep's
+        // start-of-sweep authority read defers the whole pass.
+        let namespace_is_absent = namespace_absent(
+            &engine,
+            namespace,
+            remaining_namespace_budget().min(NAMESPACE_ABSENCE_PROBE_TIMEOUT),
+        )
+        .await;
         let _mutation_guard = match tokio::time::timeout(
-            PULL_SECRET_NAMESPACE_RECONCILE_TIMEOUT,
+            remaining_namespace_budget(),
             pull_secret_mutation_guard(pool),
         )
         .await
@@ -3837,6 +3914,14 @@ async fn cleanup_stale_tenant_image_pull_secrets(pool: &PgPool) -> Result<bool, 
                 continue;
             }
         };
+        if namespace_is_absent {
+            tracing::info!(
+                %namespace,
+                "tenant image pull secret cleanup sweep: namespace does not exist — \
+                 skipping (no stale secret can live there)"
+            );
+            continue;
+        }
         let (namespace_generation, lease_held) =
             lease_rows.get(namespace).copied().unwrap_or((0, false));
         match sweep_namespace_with_budget(
@@ -3849,6 +3934,7 @@ async fn cleanup_stale_tenant_image_pull_secrets(pool: &PgPool) -> Result<bool, 
                 namespace_generation,
                 lease_held,
             },
+            remaining_namespace_budget(),
         )
         .await
         {
@@ -7892,6 +7978,10 @@ mod tests {
         /// UID) with a NEWER mutation generation — the self-check race on
         /// #243, where the rewrite that causes the 409 must not be deleted.
         annotate_generation_on_delete: Option<i64>,
+        /// Stall every namespace GET far beyond the sweep's per-namespace
+        /// budget: `namespace_absent` must fall through on its own timeout
+        /// instead of hanging the sweep (review on #306).
+        stall_namespace_gets: bool,
         /// Simulate a stalled API server (Codex review on #243, P1 follow-up):
         /// the label-selected Secret list hangs until the caller's per-
         /// namespace budget cancels it.
@@ -8038,10 +8128,20 @@ mod tests {
                         let named_secret_get = method.as_str() == "GET"
                             && path.contains("/secrets/")
                             && !path.trim_end_matches('/').ends_with("/secrets");
+                        let namespace_get = method.as_str() == "GET"
+                            && path
+                                .trim_start_matches('/')
+                                .starts_with("api/v1/namespaces/")
+                            && path
+                                .trim_start_matches("/api/v1/namespaces/")
+                                .trim_end_matches('/')
+                                .find('/')
+                                .is_none();
                         (state.stall_secrets_list
                             && method.as_str() == "GET"
                             && path.trim_end_matches('/').ends_with("/secrets"))
                             || (state.stall_secret_gets && named_secret_get)
+                            || (state.stall_namespace_gets && namespace_get)
                     };
                     if stall {
                         tokio::time::sleep(std::time::Duration::from_secs(600)).await;
@@ -9122,6 +9222,102 @@ mod tests {
         );
     }
 
+    /// #305: the discovery 404 path above only covers out-of-scope
+    /// namespaces — an IN-scope app whose namespace is absent drives the
+    /// configured-secret ensure into the same 404 and wedges admission. The
+    /// sweep now skips absent namespaces before any reconcile (#305), and
+    /// `namespace_absent` is the gate: true only on an explicit NotFound,
+    /// false whenever the namespace answers (or the API server errors — that
+    /// falls through to the reconcile, preserving today's behavior).
+    #[tokio::test]
+    async fn namespace_absent_is_true_only_on_explicit_not_found() {
+        use std::sync::{Arc, Mutex};
+
+        let missing = Arc::new(Mutex::new(FakeCluster {
+            namespace_missing: true,
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(missing);
+        assert!(
+            namespace_absent(&engine, "gone-ns", PULL_SECRET_NAMESPACE_RECONCILE_TIMEOUT).await,
+            "a namespace the API server answers NotFound for is absent"
+        );
+
+        let live = Arc::new(Mutex::new(FakeCluster {
+            echo_namespace_generation: Some(7),
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(live);
+        assert!(
+            !namespace_absent(&engine, "live-ns", PULL_SECRET_NAMESPACE_RECONCILE_TIMEOUT).await,
+            "a namespace that answers is not absent"
+        );
+    }
+
+    /// Review on #306: a stalled API server must not hang the sweep on the
+    /// probe — the bounded GET falls through (treated as not-absent) and the
+    /// budgeted reconcile decides.
+    #[tokio::test(start_paused = true)]
+    async fn namespace_absent_falls_through_when_the_probe_stalls() {
+        use std::sync::{Arc, Mutex};
+
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            stall_namespace_gets: true,
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster);
+        assert!(
+            !namespace_absent(&engine, "any-ns", PULL_SECRET_NAMESPACE_RECONCILE_TIMEOUT).await,
+            "a stalled probe must fall through to the reconcile path instead of hanging"
+        );
+    }
+
+    /// Codex review on #306 (P2): the probe and the reconciliation share ONE
+    /// per-namespace deadline — an exhausted budget must not buy a second
+    /// full window. With the namespace budget already spent, a stalled probe
+    /// and a stalled reconcile both fall through immediately (no fresh
+    /// 180 s window each), so a namespace can never cost more than one
+    /// budget per sweep pass.
+    #[tokio::test(start_paused = true)]
+    async fn exhausted_shared_budget_does_not_buy_a_second_window() {
+        use std::sync::{Arc, Mutex};
+
+        let cluster = Arc::new(Mutex::new(FakeCluster {
+            stall_namespace_gets: true,
+            stall_secrets_list: true,
+            ..Default::default()
+        }));
+        let engine = reconcile_engine(cluster);
+
+        let started = tokio::time::Instant::now();
+        assert!(
+            !namespace_absent(&engine, "any-ns", std::time::Duration::ZERO).await,
+            "an exhausted budget makes the probe fall through without a fresh window"
+        );
+        let converged = sweep_namespace_with_budget(
+            &engine,
+            "any-ns",
+            &[],
+            &reconcile_settings(),
+            &PullSecretAccountScope::uniform(false),
+            PullSecretDeleteMode::Unfenced {
+                namespace_generation: 0,
+                lease_held: false,
+            },
+            std::time::Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !converged,
+            "an exhausted budget reports the namespace unconverged, not converged"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "both steps must fall through immediately: the shared budget is one window, not one per step"
+        );
+    }
+
     /// Self-check blocking finding on #243 ("a delete conflict is treated as
     /// a clean removal"): Kubernetes 409s both for a replaced object and for
     /// the SAME managed secret merely updated between the ownership read and
@@ -9966,6 +10162,7 @@ mod tests {
                 namespace_generation: 0,
                 lease_held: false,
             },
+            PULL_SECRET_NAMESPACE_RECONCILE_TIMEOUT,
         )
         .await
         .unwrap();
@@ -9988,6 +10185,7 @@ mod tests {
                 namespace_generation: 0,
                 lease_held: false,
             },
+            PULL_SECRET_NAMESPACE_RECONCILE_TIMEOUT,
         )
         .await
         .unwrap();
