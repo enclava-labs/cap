@@ -86,6 +86,11 @@ pub struct AppStatusResponse {
     pub tee_status: Option<String>,
     pub storage_status: Option<String>,
     pub observation: LiveObservation,
+    /// Durable lifecycle diagnosis for the active deployment (#90): phase,
+    /// condition, reason, and retry/lease timing projected from the apply
+    /// job and mutation lease. Additive and derived from recorded rows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deployment: Option<crate::routes::diagnostics::DeploymentDiagnostics>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -199,6 +204,12 @@ pub async fn app_status(
     let recorded_status = format!("{:?}", app.status).to_lowercase();
     let observed = observe_app_status(&state, &app).await;
     let status = observed.effective_status(&recorded_status);
+    // The deployment block is additive diagnosis (#90): a failure of this
+    // projection must never take the primary status response down. Degrade
+    // to omitting the block, exactly when diagnosis is hardest.
+    let deployment = crate::routes::diagnostics::deployment_diagnostics(&state.db, &app)
+        .await
+        .ok();
 
     Ok(Json(AppStatusResponse {
         app_name: app.name,
@@ -211,6 +222,7 @@ pub async fn app_status(
         tee_status: observed.tee_status,
         storage_status: observed.storage_status,
         observation: observed.observation,
+        deployment,
     }))
 }
 

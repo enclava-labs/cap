@@ -2,6 +2,7 @@ pub mod apps;
 pub mod auth;
 pub mod config;
 pub mod deployments;
+pub mod diagnostics;
 pub mod domains;
 pub mod internal;
 pub mod logs;

@@ -2762,8 +2762,9 @@ mod tests {
     /// and releases the slot — new connections are then served again.
     #[test]
     fn over_capacity_gets_503_and_vanished_clients_release_slots() {
-        use std::io::{Read as _, Write as _};
+        use std::io::{BufRead as _, BufReader, Read as _, Write as _};
         use std::net::{TcpListener, TcpStream};
+        use std::time::Instant;
 
         let dir = tempfile::tempdir().unwrap();
         let spool_path = dir.path().join("spool.jsonl");
@@ -2797,6 +2798,22 @@ mod tests {
                   Host: x\r\n\r\n",
             )
             .unwrap();
+        held_client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        {
+            let mut reader = BufReader::new(&mut held_client);
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap() != 0 {
+                if line == "\r\n" {
+                    break;
+                }
+                line.clear();
+            }
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(line, "{\"sequence\":1}\n");
+        }
 
         // Over budget: rejected at accept — the request is never read.
         let mut rejected = TcpStream::connect(addr).unwrap();
@@ -2812,28 +2829,25 @@ mod tests {
 
         // Vanish silently: only the liveness probe can reap this session.
         drop(held_client);
-        let mut served = String::new();
-        for _ in 0..40 {
-            thread::sleep(Duration::from_millis(50));
-            let mut attempt = TcpStream::connect(addr).unwrap();
-            attempt
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            attempt
-                .write_all(
-                    b"GET /.well-known/confidential/logs?container=app HTTP/1.1\r\n\
-                      Host: x\r\n\r\n",
-                )
-                .unwrap();
-            let mut body = String::new();
-            attempt.read_to_string(&mut body).unwrap();
-            if body.contains("200") {
-                served = body;
-                break;
-            }
+        // An unread rejected request can reset TCP; test recovery only after the slot is free.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while slots.active() != 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
         }
+        let mut attempt = TcpStream::connect(addr).unwrap();
+        attempt
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        attempt
+            .write_all(
+                b"GET /.well-known/confidential/logs?container=app HTTP/1.1\r\n\
+                  Host: x\r\n\r\n",
+            )
+            .unwrap();
+        let mut served = String::new();
+        attempt.read_to_string(&mut served).unwrap();
         assert!(
-            served.contains("\"sequence\":1"),
+            served.starts_with("HTTP/1.1 200") && served.contains("\"sequence\":1"),
             "a freed slot must serve new connections again (dead-client reap); got: {served:?}"
         );
     }

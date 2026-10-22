@@ -38,6 +38,152 @@ CAP API is a stateless HTTP service backed by PostgreSQL. At startup it:
 The API can start without every optional integration, but real confidential
 workload deploys require the platform services below.
 
+## Owner Rotation Recovery
+
+Owner-rotation state spans five append-only migrations:
+
+| Migration | Purpose |
+| --- | --- |
+| `0062_org_rotation_directives.sql` | Consume-once ledger of accepted rotation-directive digests. |
+| `0063_org_keyrings_created_at_clock.sql` | `org_keyrings.created_at` defaults to `clock_timestamp()` so freshness bounds measure real insertion time, not transaction start. |
+| `0064_org_rotation_intents.sql` | Presentation record for each authenticated, signature-verified directive; proof of presentation only, never of upstream success. |
+| `0065_org_keyrings_created_at_watermark.sql` | Floors directive version-recency checks for pre-0063 rows with legacy `created_at` semantics. |
+| `0066_org_rotation_upstream_receipts.sql` | Receipts binding a validated signing-service `rotate-owner` response (owner version, `rotated_at`) to the exact directive and normalized keyring digests. |
+
+Note on `0064`'s in-file comment: the SQL comment inside
+`0064_org_rotation_intents.sql` is historical and byte-frozen (sqlx
+checksums applied migration bytes, and this file's checksum is already
+recorded in databases), and it describes the earlier intent-row waiver that
+`0066` superseded. Do not read it as current semantics. An intent row is
+proof of presentation only: it never grants an authority or freshness waiver.
+New distinct presentations are capped at 50 per org per rolling hour (HTTP
+429); exact replays of recorded directive/keyring digests remain exempt, so
+the quota does not block retrying an already-recorded recovery. The
+expired-retry waiver is granted exclusively by a matching
+`org_rotation_upstream_receipts` row (see `expired_rotation_waived_by_receipt`
+in `routes/orgs.rs`); a captured or unactioned presentation is inert.
+
+Recovery semantics: a rotation directive is first-use bounded by its
+`signed_at` max-age. An expired retry of a new-version rotation is accepted
+only when a committed upstream receipt proves that this exact request's
+`rotate-owner` RPC succeeded and the signing service's current owner
+(replacement pubkey, version, `last_changed_at`) still matches the receipt.
+Rotations whose upstream response was lost before this deployment -- or any
+drift without a matching receipt -- are not waived; the owner must sign and
+present a fresh directive.
+If the initiator loses owner access after the upstream RPC, another current
+org owner can finish the exact receipt-bound request while the replacement
+key still has an active registration. The removed owner remains denied;
+fresh rotations still require the caller's own active signing-key
+registration.
+
+Successor-version keyring writes are fenced on the live owner authority:
+after an org has a configured signing service or any recorded rotation
+history, a `PUT` keyring request for a new version requires the service to
+be reachable and to report either no owner (`not_configured`) or exactly the
+current pinned owner. An unreachable, malformed, or owner-mismatched
+authority rejects the write (502/409), and an org with rotation history but
+no service configuration rejects with 503 until the configuration is
+restored. New keyring versions therefore depend on signing-service
+availability once owner rotation is in play; exact same-version replays and
+rotation receipt retries are unaffected.
+
+Cutover notes for `0066`:
+
+- Migrations run at API startup. During rollout, old API pods never mint
+  receipts; drain old pods cleanly (let in-flight requests finish before
+  terminating them) rather than leaving a mixed fleet serving rotations.
+- Never backfill `org_rotation_upstream_receipts`: presentation alone is
+  not proof of upstream success.
+- Keep historical intent/directive/keyring rows and applied migration files
+  unchanged; do not repair recovery by rewriting ledgers or checksums.
+
+## Quarantined Org Reinitialization
+
+Migration `0061_org_keyring_payload_shape.sql` archives removed keyrings in
+`org_keyring_repairs`. If the CURRENT keyring is malformed, it removes every
+keyring version of that org; a clean current version that survives retains
+its authority. Migration `0085_org_keyring_shape_recoveries.sql` records orgs
+that lost all versions in the durable `org_keyring_shape_recoveries` table,
+including the highest quarantined version needed to resolve the displaced
+signer. The archive is provenance, not the recovery gate: removing archive
+rows does not remove the marker or make the org a fresh initialization.
+
+For a marked org, `PUT .../keyring` with version 1 must pass the fenced
+recovery path under the org signing-authority lane:
+
+- When a live signing-service owner exists, the replacement keyring signer
+  must match that owner. A different signer receives HTTP `409`.
+- With no live owner registration, or with no configured service and no
+  rotation history, the signer must match the highest quarantined version's
+  signing key, resolved through `org_keyring_repairs.signing_key_id` and
+  `user_signing_keys`. A mismatch receives `409`; unavailable provenance
+  receives `503`.
+- A configured but unreachable or malformed service fails closed rather
+  than falling back to the archive. Rotation history without a configured
+  service also fails closed (`503`); restore the service configuration first.
+- The caller must still be an active org owner, and the replacement envelope
+  must be validly signed by an active signing key registered to that caller.
+
+The accepted recovery deletes the **marker**, not the archive, in the same
+transaction immediately before inserting the replacement version 1. A failed
+insert rolls the marker deletion back. Migration `0085` installs the database
+`BEFORE INSERT` fence `org_keyrings_fence_quarantine_recovery`, which rejects
+any keyring insertion while the marker remains. Older binaries cannot bypass
+recovery by uploading an unrestricted first version after the migration.
+
+`0085` checks both remaining markers and live/archive version collisions,
+regardless of whether the earlier divergent `0061` marker table exists. It
+removes every live generation of an affected org and restores or retains its
+marker from the original archive. Marker absence is not proof of authorization:
+earlier successor handlers could consume a marker after an unfenced version-1
+capture. Even legitimate recoveries with archive-colliding versions must repeat
+the fenced upload, because this migration cannot distinguish them from those
+captures. Clean survivors without a marker or archive collision remain intact.
+Inspect migration notices and expect affected orgs to need a fresh fenced
+version-1 upload.
+Drain old API replicas before resuming writes; the database fence is a
+fail-closed guard, not support for mixed-version operation or reader rollback.
+
+Preserve the archive, marker, signing-key provenance, and applied migration
+bytes. Do not manually delete recovery state or disable the trigger to force
+initialization. If the required signing key is lost or no active caller-owned
+registration is available, normal reinitialization cannot proceed. Escalate
+for operator-assisted recovery based on verified out-of-band owner intent;
+there is no supported archive-deletion bypass.
+
+## Internal Keyring API Deferred Responses
+
+The internal keyring endpoints (`PUT /internal/paas/orgs/{org}/keyring`,
+`POST /internal/paas/orgs/{org}/keyring/rotate-owner`) now defer a
+publication-pending failure instead of failing the request outright. When
+the keyring mutation is committed but KBS policy reconciliation cannot be
+confirmed (503 `keyring_policy_reconciliation_pending`), the request's
+idempotency record is checkpointed and the caller receives
+409 `idempotency_request_in_progress` with `retryable: true`,
+`disposition: retry_same_key`, `idempotency_disposition: "deferred"` and
+`cause: keyring_policy_reconciliation_pending`. A retry with the same
+idempotency key resumes the deferred request -- the checkpoint keeps that
+pending code out of the fail-closed disposition -- and re-confirms publication
+instead of repeating the mutation. An unrelated 5xx on that reclaim is not
+rewritten as publication-pending. Authority mismatches and uncertain upstream
+writes terminalize as `idempotency_recovery_required`
+(`reconcile_then_retry_with_new_key`) so the same key cannot re-issue the
+mutation. The checkpointed lease is the short (~5 s) retry interval, not a
+terminal outcome.
+
+Cross-project rollout gate (AGENTS.md): the CAP internal API response shape
+changed, so update and test enclava-paas against this response **before**
+deploying CAP API. Retries must keep the original idempotency key:
+enclava-paas forwards a caller-supplied `Idempotency-Key` deterministically
+(namespaced `paas:{org}:sha256(key)`), but when the caller sends none it
+derives a per-attempt random key (`cli_cap_idempotency_key`), so a plain
+retry would open a new CAP idempotency record instead of resuming the
+deferred one. Hosted keyring flows must therefore carry a stable
+`Idempotency-Key` (caller-supplied, or a PaaS-derived deterministic key as
+the template config-token retry already does) before CAP API with this
+change is deployed.
+
 ## Required Services
 
 Production deploys need:
@@ -70,7 +216,7 @@ Release builds also require:
 | --- | --- |
 | `API_KEY_HMAC_PEPPER` or `API_KEY_HMAC_PEPPER_BASE64` | Pepper for HMAC-format API keys. Must be at least 32 bytes. |
 | `TRUSTEE_POLICY_READ_AVAILABLE=true` | Enables the supported signed-policy and in-TEE verification path. |
-| `ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX` | Compile-time root public key used to verify the bundled or supplied platform release. |
+| `ENCLAVA_PLATFORM_RELEASE_PROFILE` | Required API runtime profile: `dev`, `preprod`, or `production`. Must match the `API_URL` origin. |
 
 For production deploys with policy-read mode enabled:
 
@@ -85,7 +231,8 @@ For production deploys with policy-read mode enabled:
 | `TRUSTEE_ATTESTATION_VERIFY_URL` | Trustee callback endpoint used by CAP workload artifact and TLS broker routes. Must be an `https://` URL: release builds reject `http://` verify URLs at startup (the verify bearer token must never transit cleartext), and the trustee client refuses cleartext requests in all builds. |
 | `TRUSTEE_ATTESTATION_VERIFY_BEARER_TOKEN` | Bearer token CAP sends to the Trustee verification endpoint. Required when `TRUSTEE_ATTESTATION_VERIFY_URL` is set. |
 | `PLATFORM_SIGNING_SERVICE_URL` | Policy signing service endpoint, unless supplied by the platform release. |
-| `SIGNING_SERVICE_PUBKEY_HEX` or `PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX` | Ed25519 public key used to verify signed policy artifacts, unless supplied by the platform release. |
+| `PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX` | Ed25519 public key of the platform trustee policy authority (in-TEE policy verification), unless supplied by the platform release. |
+| `SIGNING_SERVICE_PUBKEY_HEX` | Ed25519 public key of the off-cluster signing service that produces signed policy artifacts (`/sign`); policy acceptance verifies against this key. Distinct from `PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX`: they are two trust domains, and setting both to the same key fails startup. Never load the trustee policy private key into the signing service — that would collapse the two domains again. |
 
 ## Optional Integrations
 
@@ -108,7 +255,7 @@ For production deploys with policy-read mode enabled:
 | `GHCR_USERNAME` and `GHCR_TOKEN` | Optional credentials used to create tenant namespace image-pull secrets for private GHCR images. Requires `TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES` — startup is refused without it (issue #225). |
 | `TENANT_IMAGE_PULL_SECRET_NAME` | Tenant image-pull secret name. Defaults to `enclava-registry-auth` when GHCR credentials are configured. |
 | `TENANT_IMAGE_PULL_CREDENTIAL_GENERATION` | Monotonically increasing unsigned rotation epoch (defaults to 0). Bump it whenever `GHCR_USERNAME`/`GHCR_TOKEN` changes; newer replicas annotate refreshed Secrets with this epoch and older replicas skip refresh when the Secret carries a higher epoch. Without a bump, mixed replicas cannot distinguish old credentials from new. |
-| `TENANT_IMAGE_PULL_SCOPE_GENERATION` | Monotonically increasing unsigned repository-scope rollout epoch (defaults to 0). Bump it on every repository-scope change — expansion AND narrowing. A newer replica stamps managed Secrets with this epoch; an older replica that observes a Secret carrying a higher epoch defers (requeueable) instead of re-creating, refreshing, or re-attaching credentials the newer rollout removed, and its sweep cannot certify the namespace converged — so its workload admission stays closed until it is upgraded or retired. Do not change the scope while older replicas remain: once a narrowing rollout deletes the stamped Secret, a pre-marker replica has nothing to compare against and would re-create the platform PAT on the next deployment. |
+| `TENANT_IMAGE_PULL_SCOPE_GENERATION` | Monotonically increasing unsigned repository-scope rollout epoch (defaults to 0). After all replicas run a version with scope fencing, bump this on every repository-scope change — expansion AND narrowing. A newer replica stamps managed Secrets; older replicas refuse to delete/refresh higher-epoch Secrets and keep their workload admission closed until they are upgraded or retired, even when their inventory mutation generation is current. Do not change the scope while pre-fence replicas remain: those binaries cannot honor the marker. Narrowing is additionally fenced outside the deletable Secret: every sweep and deploy records the epoch it acted under in the shared `tenant_pull_secret_scope_fences` table, so after a narrowing rollout deletes a Secret, an older replica running the broader configuration defers (requeueable) instead of recreating the platform PAT on the next deployment — its workload admission likewise stays closed until it is upgraded or retired. A rollout-wide authority (`tenant_pull_secret_rollout_authority`, round-3 review) extends the same contract to namespaces the newer rollout has not swept yet (including brand-new namespaces with no fence row and namespaces without a live Secret to carry the credential epoch): once ANY replica records a newer scope or credential epoch, every older replica defers all tenant pull-secret work fleet-wide until upgraded. |
 | `TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES` | Required comma-separated scope for the tenant pull secret when GHCR credentials are set (startup is refused otherwise). Use `registry/repository` for exact matches or `registry/repository/*` for subrepositories — only a single trailing `/*` is a wildcard, and any other `*` (including repeated suffixes like `registry/repository/*/*`) is rejected instead of being widened. Entries must use the workload-image reference grammar (`registry` = dotted host or `host:port`, no scheme; repository path components cannot be empty, `.`, `..`, or carry `:tag`/`@digest` suffixes) and must live under the literal `ghcr.io` host — the generated secret's only auth entry is `ghcr.io` (made from `GHCR_USERNAME`/`GHCR_TOKEN`), so a scope at any other registry would expose the platform token to workloads that can never use it. A scope such as `ghcr.io/org/private:latest` or `https://ghcr.io/org/private` can never match a digest-pinned workload image and is rejected at startup instead of silently withholding the pull secret from affected workloads. Every entry must parse; an invalid entry refuses startup and the error names the offending entries instead of being silently dropped. The secret is only attached when every container image in a workload matches the scope — it is never attached to arbitrary tenant namespaces. Managed pull secrets are removed from single-app namespaces on out-of-scope deploys; shared namespaces use the namespace-wide sweep so one app cannot erase another's credentials — and the sweep decides per app: when a shared namespace's apps split across the scope boundary, the Secret stays for the still-matching apps while the no-longer-matching apps' `imagePullSecrets` attachments are cleared (with durable repair intent, so a later broadening re-attaches them without waiting for a redeploy). Cleanup is name-independent — every secret carrying the `cap.enclava.dev/tenant-image-pull-secret=true` label is discovered under any name, so changing or removing `TENANT_IMAGE_PULL_SECRET_NAME` cannot strand an old platform PAT (a renamed secret stays only while a generated ServiceAccount still references it, i.e. until that workload redeploys), and stale `imagePullSecrets` references are cleared from the generated ServiceAccounts alongside the delete. Only CAP-generated secrets are ever deleted and only their references are cleared — secrets carrying the dedicated `cap.enclava.dev/tenant-image-pull-secret=true` label (the cleanup's discovery/deletion selector; it also carries the generic `managed-by: enclava-platform` marker), or pre-label legacy secrets whose embedded credentials match the configured GHCR pair; a tenant-owned look-alike under the same name is never deleted and its ServiceAccount references keep working. Discovery selects the dedicated label only, so no other managed Secret can ever enter the sweep. Kept legacy secrets are adopted (labeled) as soon as they are seen in a still-in-scope namespace, so the ownership proof survives the GHCR token rotation; upgrade and rotate in this order: upgrade to this version while the old token is still configured (so the sweep can prove and label pre-label secrets), then rotate the token — rotating first leaves unlabeled legacy secrets unverifiable and therefore in place. After a rotation, kept configured-name secrets in still-in-scope namespaces are refreshed to the current `GHCR_USERNAME`/`GHCR_TOKEN` by the sweep (the write is pinned to the live object's resourceVersion and ownership-proven, so tenant look-alikes are never touched) — pods pull with the new credential without waiting for a redeploy. Reference clears carry durable repair intent on the ServiceAccount (`cap.enclava.dev/pending-pull-secret-reference-repairs`), so a transiently failed restoration after a mid-cleanup replacement is completed by the next sweep instead of silently converging with the ServiceAccount detached. Until the first sweep converges (e.g. during a Kubernetes outage at startup), workload admission stays closed (`deploy_blocked`) and a background reconciler retries with bounded backoff, opening admission and the deployment dispatcher together as soon as a sweep converges — a transient failure no longer requires a restart. |
 | `COSIGN_REGISTRY_ALLOWED_HOSTS` | Required when `COSIGN_REGISTRY_BEARER_TOKEN` or `COSIGN_REGISTRY_USERNAME`/`COSIGN_REGISTRY_PASSWORD` is set (startup is refused otherwise). Comma-separated patterns: `host[:port]`, `*.host[:port]`, or `*`; invalid patterns refuse startup. Matching is case-insensitive, against the OCI-resolved registry and token-realm authority. Bare hosts match only the scheme's default port (443 for HTTPS, 80 for opted-in HTTP); explicit default ports match implicit ones. Wildcards match the base and one-label subdomains, never other ports. Docker Hub `docker.io` and `index.docker.io` are equivalent credential scopes; guarded Hub prechecks use `registry-1.docker.io`. Basic credentials are exchanged for a pull-scoped bearer token by CAP, with the actual token destination checked against this list and token redirects disabled. List token hosts too (e.g. `auth.docker.io`). Token realms require HTTPS unless `COSIGN_ALLOW_HTTP_REGISTRY=true` is explicitly enabled, even with `*`. Raw Basic credentials are never given to OCI; missing/non-Bearer challenges, rejected realms, and failed exchanges fail verification explicitly, not anonymously. Basic-only registries are not supported by this hardened path. Legacy `GHCR_TOKEN` credentials retain an implicit HTTPS/default-port `ghcr.io` realm scope without requiring this list. Bare `*` authorizes every host (see the production acknowledgment below). |
 | `COSIGN_REGISTRY_ALLOW_ALL_HOSTS=true` | Required in release builds when `COSIGN_REGISTRY_ALLOWED_HOSTS` contains a bare `*` AND a platform cosign registry credential (`COSIGN_REGISTRY_BEARER_TOKEN` or a complete `COSIGN_REGISTRY_USERNAME`/`COSIGN_REGISTRY_PASSWORD` pair) is configured: an explicit second acknowledgment that forwarding the platform cosign registry credentials to every tenant-chosen registry host is intended in production (the same bar as `CAP_ALLOW_PRODUCTION_INTERNAL_EGRESS`). With no credential configured the wildcard is inert — nothing can be forwarded — so staging the allowlist before enabling credentials is not startup-fatal. Release builds without it refuse to start; debug builds warn only. Setting only one of `COSIGN_REGISTRY_USERNAME`/`COSIGN_REGISTRY_PASSWORD` is always a startup error: an incomplete pair attaches no credential and every private-registry verification would silently run anonymously. |
@@ -122,6 +269,17 @@ For production deploys with policy-read mode enabled:
 | `KBS_SIGNED_POLICY_MAX_BYTES` | Maximum serialized signed policy artifact set bytes written to the shared KBS policy ConfigMap. Defaults to 900 KiB, below Kubernetes' 1 MiB ConfigMap data limit. |
 
 Rollout coordination: the registry-credential scope gates (`TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES`, `COSIGN_REGISTRY_ALLOWED_HOSTS`) are startup-fatal whenever the corresponding `GHCR_*`/`COSIGN_REGISTRY_*` credentials are set. Land these variables in the environment manifests (e.g. `enclava-ops-manifests`) before or together with this image — an existing environment that carries the credentials without the scopes will crash-loop on this version (AGENTS.md cross-project dependency schema).
+
+Apply `0088_tenant_pull_secret_scope_fences.sql` before starting this API,
+including on a fresh database. The API requires both fence tables; it does not
+fall back to annotation-only scoping. Drain pre-fence API writers before the
+cutover: those binaries cannot honor the database authority. Scope epochs are
+monotonic; never lower them to permit an older writer. The shared mutation guard
+disables `idle_in_transaction_session_timeout` for its own transaction only.
+Created pull Secrets must retain the dedicated managed label and its field
+ownership. Missing evidence triggers UID/resourceVersion-conditional deletion;
+admission stays closed until removal is observed as 404. A tenant replacement
+at the configured name never satisfies platform-credential convergence.
 
 ## Common Defaults
 
@@ -163,23 +321,57 @@ CAP_EGRESS_ALLOW_INTERNAL_HOSTS (without CAP_ALLOW_PRODUCTION_INTERNAL_EGRESS=tr
 Release builds also require `API_KEY_HMAC_PEPPER` or
 `API_KEY_HMAC_PEPPER_BASE64`, and `TRUSTEE_POLICY_READ_AVAILABLE=true`.
 
+## Noninteractive CLI ownership claims
+
+Agents and CI can use `enclava deploy --storage-password-file PATH`,
+`enclava template deploy --storage-password-file PATH`, or
+`enclava claim --password-file PATH` without terminal stdin or stderr.
+Without a password file, password prompts require both streams to be terminals.
+
+Keep `ENCLAVA_STATE_DIR` on persistent private storage. Before claiming, the CLI
+validates the protected recovery-mnemonic destination; after claiming, it stores
+the mnemonic atomically with owner-only permissions and filesystem syncs. It
+never prints the mnemonic. `--no-store-mnemonic` remains invalid for claims.
+Export an encrypted backup with `enclava key backup` and retain it off-machine.
+
+The TEE still returns the recovery mnemonic only once. A lost claim response or
+failed mnemonic write exits nonzero and halts dependent actions; when ownership
+is known to have committed, the error is
+`ownership_committed_recovery_backup_incomplete`. Ownership is not rolled back.
+Do not blindly retry a claim or treat this as a completed backup. A terminal
+does not provide response-loss recovery either.
+
 ## Platform Release
 
-The API and CLI load the bundled
-`crates/enclava-cli/platform-release.json` unless
-`ENCLAVA_PLATFORM_RELEASE_PATH` points at another signed release envelope.
+API and CLI images embed the same
+`crates/enclava-common/platform-release-profiles.json` bundle. It contains
+exactly `dev`, `preprod`, and `production`, each with `api_origins`,
+`root_pubkey_hex`, and a signed `baseline` envelope. The CLI selects the profile
+from the configured API origin, never from a server-supplied root. The API
+requires `ENCLAVA_PLATFORM_RELEASE_PROFILE` and a matching `API_URL`.
+Unknown origins, missing/unknown production profiles, and credential-bearing
+URLs fail closed.
+
+`ENCLAVA_PLATFORM_RELEASE_PATH` still selects an environment-owned signed runtime
+envelope. Without it, the selected profile's baseline is loaded. The committed
+bundle uses public test keys; release builds and publication reject it.
 
 Release verification checks:
 
-- envelope signature against `ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX`;
+- envelope signature against the selected profile's compiled root;
+- signing-service key and Trustee CA equal the selected baseline's installation
+  identity, including when environments share a release root;
+- `platform_trustee_policy_pubkey_hex` is present and distinct from
+  `signing_service_pubkey_hex` (the in-TEE policy authority and the
+  off-cluster signing service are separate trust domains);
 - digest pins for platform sidecar images;
 - HTTPS Trustee KBS URL;
 - HTTPS tenant Caddy ACME CA URL;
 - genpolicy version;
 - policy template hash;
 - runtime class expected by the engine;
-- API overrides must not predate the binary's bundled release; equal timestamps
-  with different signed payloads are rejected.
+- API envelopes and CLI file overrides must not predate the selected profile's
+  baseline; equal timestamps with different signed payloads are rejected.
 
 The API compares overrides only with its compiled bundle. Accepting a newer
 override does not change that minimum: a previous signed override can be
@@ -190,36 +382,99 @@ Existing database-schema compatibility and CLI per-API release-history checks
 still apply; this is not a guarantee that any older API image or client will
 accept a rollback.
 
+API-served CLI releases may predate the compiled baseline for that installation;
+the existing persisted per-API history remains their rollback floor. Updating
+one environment's runtime envelope does not change another profile's floor.
+Changing a signing-service key or Trustee CA requires a reviewed common profile
+bundle and new common artifacts; another environment's signed envelope is not
+an authorized identity rotation.
+
 When the signed release supplies a value, an explicit environment override must
 match it exactly or startup fails.
 
+### Upgrading across the policy-key split (cap#118)
+
+Signed deployment artifacts pin the exact hash of their rendered
+`cc_init_data`, which includes the policy-key claims. Artifacts signed
+before the platform trustee policy key was split from the signing-service
+key were rendered with the collapsed layout (trustee slot = signing-service
+key). Such artifacts — rollback targets, unlock transitions, queued-job
+replays — still validate after the upgrade: when only the collapsed render
+matches the signed hash, the API pins the artifact to that layout and every
+consumer (statefulset, enclava-init ConfigMap, KBS policy/TLS bindings)
+renders the exact signed bytes, so the workload boots exactly as it did
+before the upgrade. No workload-artifact re-signing is required before
+rollout; re-deploying (re-signing) an app moves it to the split layout. The
+same render-pin mechanism covers artifacts signed before the
+`log_encryption_json` claim existed (`omit_log_encryption_claim`), before
+the `luks2_header_seal` claim existed (`omit_luks2_header_seal_claim`), and
+before the `log_spool_storage` claim existed (`omit_log_spool_bind_claim`).
+The production platform-release envelope is the exception: the new
+`platform_trustee_policy_pubkey_hex` field is required with no default, so
+re-sign the production envelope with a distinct trustee key before
+deploying this binary — an old envelope will not load.
+
+The `log_spool_storage` claim is gated by the API deployment, not the
+signed release (cap#290 review), and enablement is two-phase — never flip
+the gate in the same step that first ships the bind-capable init:
+
+1. Deploy the API with the new `ENCLAVA_INIT_IMAGE` pin and
+   `ENCLAVA_LOG_SPOOL_STORAGE` **unset**. Renders stay claim-less.
+2. Redeploy a workload and verify the bind-capable init digest is the one
+   actually running in its live manifest/pod (`imageID`), per the
+   init-first rule above.
+3. Only then set `ENCLAVA_LOG_SPOOL_STORAGE="state-bind-v1"` on
+   enclava-api and restart it. From that point the API reports the
+   capability in deployment-context, signers render the claim, and every
+   workload the API renders carries the verified init pin.
+
+Until phase 3, claim-bearing artifacts are rejected for re-signing.
+
 ### Rotating the production root
 
-The committed `platform-release.json` is signed by a well-known dev fixture
-root whose seed is public. Publishing requires a production root held outside
-this repository; gates reject the fixture root and any root that does not sign
-the envelope the build bundles, so the root and the envelope always rotate
-together:
+The committed profile bundle uses a well-known public fixture root. Publishing
+requires one approved bundle containing all three installations' public roots,
+signed baselines and API origins. Existing installations keep their authorities;
+do not generate new keys merely to adopt shared images. For an explicitly
+approved root rotation:
 
 1. Generate the production root offline:
    `openssl genpkey -algorithm ed25519 -out root.pem`
    (`openssl pkey -in root.pem -noout -text` shows the seed and pubkey hex.)
-2. Sign the payload with the repository's canonical encoding. Keep the seed
+2. Prepare `payload.json`: a copy of the current release payload with the
+   fields you are rotating. It MUST include a `platform_trustee_policy_pubkey_hex`
+   distinct from `signing_service_pubkey_hex` — releases that omit the field or
+   collapse the two keys onto one key are rejected (the in-TEE policy authority
+   and the signing service are separate trust domains). The committed payload
+   pins the public dev-fixture trustee key: REPLACE that pin with a freshly
+   generated trustee key — keeping the committed value is rejected at signing
+   and verification time (its seed is public, so anyone with the repo could
+   forge policy envelopes). Generate the trustee policy keypair with its own
+   offline seed, never reused as the signing-service or root key.
+3. Sign the payload with the repository's canonical encoding. Keep the seed
    in a protected file and redirect it into the helper — it never appears in
    argv or shell history:
    `cargo run --locked -p enclava-cli --example platform-release -- sign \
    payload.json < root-seed.hex > platform-release.json`
-3. Sanity-check it: `cargo run --locked -p enclava-cli --example \
+4. Sanity-check it: `cargo run --locked -p enclava-cli --example \
    platform-release -- verify platform-release.json <root-pubkey-hex>`
-4. Set both repository secrets in one sitting:
-   `ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX` (pubkey hex) and
-   `ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON` (the signed envelope contents).
+5. Update the affected profile's public root and signed baseline in the common
+   bundle, retaining the other two profiles. Verify every profile:
 
-Release workflows materialize the envelope secret over
-`crates/enclava-cli/platform-release.json` before building, verify its full
-signature against the pinned root, and embed it in every published binary and
-image. With only one of the two secrets set (or neither), publishing fails
-closed.
+   ```console
+   cargo run --locked -p enclava-cli --example platform-release -- \
+     verify-profiles crates/enclava-common/platform-release-profiles.json
+   ```
+
+6. Set the single repository secret `ENCLAVA_PLATFORM_RELEASE_PROFILES_JSON`
+   to that complete public bundle. It must contain no private keys.
+
+Release workflows materialize this same bundle before building API, migration
+and CLI artifacts. The helper verifies every baseline's canonical signature;
+`prod-strict` rejects missing profiles, malformed roots and the fixture root.
+Promote the resulting digest unchanged between environments. Runtime profile,
+domains, measurements, signed overrides and credentials remain deployment data.
+This supports the three managed environments, not arbitrary-domain installation.
 
 ## Images
 
@@ -248,6 +503,8 @@ Before using it outside local experimentation:
 - pin the API image digest in `deploy/api/kustomization.yaml`;
 - add the required production environment variables;
 - configure service account/RBAC for only the tenant resources CAP owns;
+  Pod readiness and volume-initialization checks use name-scoped pod lists;
+  keep individual pod GET and `pods/log` access denied.
 - configure network policy for PostgreSQL, Trustee/KBS, policy signing,
   registry metadata, DNS, and tenant TEE callbacks;
 - decide whether CAP-managed DNS and KBS policy management are required.
@@ -265,6 +522,10 @@ While an unreleased hold is active, another deploy or rollback cannot
 supersede its delivery. Release or expiry permits the next operation;
 explicit deletion remains available. Expiry never applies the replacement
 and preserves the running workload's signed or legacy KBS authority.
+
+CLI 0.1.1 allows each config key up to 240 seconds for retryable first-boot
+initialization, matching template deployment. Terminal bootstrap errors still
+fail immediately; a ready config store adds no delay.
 
 Deploy the PaaS response contract first: every held response, including a
 replay, must carry a fresh CAP database-clock
@@ -322,6 +583,132 @@ Roll out and recover as follows:
 4. Verify the public boot, claim/unlock, HTTPS, and persistence flow before
    treating the rollout as accepted. CI alone does not establish runtime
    compatibility.
+
+
+## TEE Teardown Authentication
+
+The TEE leaf is self-signed and boot-scoped. Before minting a teardown bearer
+token, the API verifies fresh nonce-bound SNP evidence under pinned AMD roots,
+binding the TLS SPKI and receipt-key hash to the app's admitted init-data and
+firmware identity. Its app-scoped KBS authority includes rollback and prior
+healthy deployments, but excludes held, withdrawn, and removed-signer artifacts.
+
+Normal deletion requires teardown whenever deployments or owner bindings show
+that a seed may exist, even if the app row is no longer `running`. An unreachable
+TEE fails closed; skipping erasure requires explicit `--abandon-teardown` and
+leaves the existing same-name recreation guard in force.
+
+`AMD_KDS_BASE_URL` includes `/vcek/v1`; its default is
+`https://kdsintf.amd.com/vcek/v1`. An internal HTTP collateral relay is supported
+without relaxing AMD certificate-chain, HWID/TCB, or debug-policy checks.
+Ordinary teardown attestation does not add CRL freshness checking; unlock
+transition verification remains separate.
+
+## Keyring Revocation Completion
+
+In signed-policy mode, keyring uploads and owner rotations confirm success only
+after the filtered KBS policy has converged. A `503` response with code
+`keyring_policy_reconciliation_pending` means the keyring change committed, but
+policy publication is still unconfirmed. It does not mean the keyring rolled back.
+
+Confidential teardown admission uses the same signer eligibility as policy
+publication: only owner/admin/deployer keys in the latest org keyring qualify,
+withdrawn artifacts stay excluded, and unreleased customer-config holds add no
+authority. Deletion does not restore revoked signer authority. Its projected
+required policy must fit the shared byte budget unless deletion leaves that
+policy the same size or smaller.
+
+Retry the same request after restoring KBS availability. Internal PaaS callers
+must retain the same idempotency key when the response is stamped `deferred`.
+For CLI owner-rotation recovery, reuse the encrypted replacement backup:
+
+```bash
+enclava key rotate-owner --backup-out ./owner-replacement.json \
+  --passphrase-file ./backup.pass --yes
+```
+
+Preserve both the replacement backup and the previous backup until a
+fresh login and deployment succeed. Use the updated API and CLI together; drain
+old API replicas before relying on these completion semantics.
+
+`enclava key setup` and owner rotation confirm the accepted keyring's
+publication before finalizing local state, so they require the acting owner's
+keyring write authority and a reachable policy publication path. `enclava key
+restore` is read-and-verify: it validates the signed remote keyring and works
+for any active member whose derived key is still Owner in that keyring,
+without requiring keyring write permission or KBS availability.
+
+Setup also attempts signing-service bootstrap after confirming an existing
+keyring, using the accepted envelope's signing owner even when the caller owns
+a different authorized key. Bootstrap failures stop setup before local authority
+is stored, except for the existing optional-service HTTP `503` compatibility
+case. Successful key setup therefore does not certify signing-service readiness.
+
+## Signer Rotation Completion
+
+In signed-policy mode, missing KBS publication configuration rejects a signer
+rotation before changing the app or consuming its single-use token. This check
+runs under the app authority locks and serializes with signed-mode activation.
+Restore the configuration and retry the same request.
+
+After a rotation commits, a public API publication failure returns HTTP `503`
+with `signer_rotation_publication_pending`. Internal PaaS callers receive a `deferred`
+disposition and must retry with the same idempotency key and request body. CAP
+retains the committed response and retries publication only; it does not consume
+the rotation token or apply the mutation again. Unrelated, uncertain failures
+remain fail-closed and require recovery rather than automatic mutation replay.
+
+CAP checks the committed signer and its database-maintained generation under
+authority lanes before and after publication. The generation is captured inside
+the authority transaction and stored only as private checkpoint metadata, never
+in the successful app response. A later rotation, including a rotation away and
+back to the same identity, app deletion, or deletion in progress terminates a
+still-pending operation with HTTP `409` and `signer_rotation_superseded`. Internal
+callers receive a terminal `completed` disposition; repeating that key returns
+the same conflict without another token consumption. Already completed receipts
+continue to replay their recorded historical result.
+
+Older or malformed publication checkpoints without a verifiable generation fail closed with
+a terminal `idempotency_recovery_required` / `reconcile_then_retry_with_new_key`
+disposition. Repeating that key replays the same terminal result; it does not
+re-execute the mutation or retry indefinitely. Reconcile the app's current signer
+and policy publication before choosing a recovery request with a new key.
+
+The database withdrawal trigger tracks every identity update that commits.
+A separate deferred constraint trigger rejects a non-initial identity change
+unless the same transaction inserted the rotation token's jti into
+`consumed_signer_rotation_tokens`. Older replicas verify the JWT and update
+`apps` without that insert, so their rotation fails closed instead of
+consuming the token off-ledger. Drain old API replicas before relying on
+these semantics: older checkpoint readers do not understand the new
+generation, so mixed-version operation and reader rollback are unsupported.
+
+A currently authorized org owner may confirm an already committed signer
+identity without a new rotation token. The stateless public endpoint confirms
+the current identity, not the historical event behind an earlier request;
+event-attributed retries require the internal idempotency checkpoint. A
+confirmation cannot change the signer or consume another token. A real identity
+transition still requires a fresh, bound, single-use token.
+
+A withdrawn legacy TLS binding stays withdrawn even if a newer artifact has the
+same image and init-data measurements. Those measurements do not bind the old
+entry to the new workload instance. Fresh deployments must authorize through
+signed-policy candidates instead of readmitting the old legacy binding.
+
+Legacy Rego publication is confirmed only when the Trustee pod template carries
+the token for the configured ConfigMap namespace, name, policy key, content hash,
+and publication event, and that rollout is ready. A content update atomically
+persists a new event token in the ConfigMap's publication-token annotation.
+Retries reuse it after a crash, including when an intervening policy write must
+be repaired back to identical bytes. An unmarked legacy install needs one
+adoption rollout; converged retries write neither the ConfigMap nor the Deployment.
+Changes to labels, unrelated data keys, or resourceVersion alone do not restart
+Trustee when the policy content and publication event are unchanged.
+A failed Deployment update is retried. If the template token was already
+stored, retries wait for that rollout without creating another generation.
+Both legacy and signed publication wait for old replicas to leave and all
+updated replicas to become available. Changed policy content or a signed-authority
+handoff during confirmation must be reconciled before success is returned.
 
 ## Smoke Checks
 

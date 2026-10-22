@@ -110,6 +110,19 @@ pub struct WorkloadArtifactBinding {
     /// modern layout (`false`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub omit_log_encryption_claim: bool,
+    /// Render-compatibility pin for artifacts signed before the cap#118
+    /// policy-key split. Pre-split renders filled the platform trustee
+    /// policy slot with the signing-service key (the collapsed default), so
+    /// a descriptor signed back then carries an `expected_cc_init_data_hash`
+    /// over that collapsed layout. When artifact validation detects that
+    /// only the collapsed render matches, it sets this flag so every
+    /// downstream consumer (statefulset, enclava-init ConfigMap, KBS
+    /// policy/TLS binding) renders the exact bytes the artifact was signed
+    /// over — the artifact boots exactly as it did pre-split until it is
+    /// re-signed. Freshly signed artifacts always render the split layout
+    /// (`false`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub legacy_collapsed_trustee_key: bool,
     /// Render-compatibility pin for pre-seal-rollout signed artifacts
     /// (cap#242): artifacts signed before the `luks2_header_seal` claim
     /// existed carry an `expected_cc_init_data_hash` computed over a render
@@ -118,6 +131,14 @@ pub struct WorkloadArtifactBinding {
     /// ("adopt"), so those artifacts keep their original semantics.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub omit_luks2_header_seal_claim: bool,
+    /// Render-compatibility pin for artifacts signed before the
+    /// `log_spool_storage` cc_init_data claim existed (cap#289): they carry
+    /// an `expected_cc_init_data_hash` computed over a render without the
+    /// claim. Same mechanism as `omit_log_encryption_claim`; a claim-less
+    /// render keeps the pre-v2 disk-backed log spool semantics, so those
+    /// artifacts boot exactly as they did pre-change.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub omit_log_spool_bind_claim: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -460,5 +481,40 @@ impl ConfidentialApp {
     /// KBS TLS resource type for generic `resource_bindings`.
     pub fn tls_resource_type(&self) -> String {
         format!("{}-tls", self.owner_instance_id())
+    }
+
+    /// Platform trustee policy key as it must appear in rendered manifests
+    /// (cc_init_data TOML and the enclava-init ConfigMap, which enclava-init
+    /// cross-checks against each other).
+    ///
+    /// Artifacts pinned to [`WorkloadArtifactBinding::legacy_collapsed_trustee_key`]
+    /// were signed over a pre-cap#118 render whose trustee slot held the
+    /// signing-service key, so their renders reproduce that collapsed value
+    /// — the exact bytes the artifact was signed over. Unpinned (fresh)
+    /// renders use the dedicated trustee policy key.
+    pub fn rendered_platform_trustee_policy_pubkey_hex(&self) -> Option<&str> {
+        if self
+            .workload_artifact_binding
+            .as_ref()
+            .is_some_and(|binding| binding.legacy_collapsed_trustee_key)
+        {
+            // The pin is only set once a render that included the
+            // signing-service key matched the artifact's signed hash, so the
+            // signing key is always present here. The `.or(...)` fallback is
+            // unreachable in practice; it only keeps the helper total — it
+            // cannot reproduce a signed value that never contained the
+            // trustee key.
+            return self
+                .attestation
+                .signing_service_pubkey_hex
+                .as_deref()
+                .or(self
+                    .attestation
+                    .platform_trustee_policy_pubkey_hex
+                    .as_deref());
+        }
+        self.attestation
+            .platform_trustee_policy_pubkey_hex
+            .as_deref()
     }
 }

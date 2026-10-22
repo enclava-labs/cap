@@ -3,7 +3,10 @@
 use enclava_engine::manifest::cc_init_data;
 use enclava_engine::manifest::enclava_init_config::generate_enclava_init_configmap;
 use enclava_engine::testutil::sample_app;
-use enclava_engine::types::{LogEncryptionConfig, WorkloadSecurityProfile};
+use enclava_engine::types::{
+    LogEncryptionConfig, WorkloadArtifactBinding, WorkloadSecurityProfile,
+};
+use sha2::{Digest, Sha256};
 
 #[test]
 fn cm_name_is_per_app() {
@@ -140,6 +143,74 @@ fn config_toml_renders_public_log_encryption_metadata_only() {
             "log encryption config must not render private material hint {forbidden}"
         );
     }
+}
+
+#[test]
+fn config_toml_renders_spool_storage_only_for_v2_state_bind() {
+    // cap#289: under the v2 signed layout + encrypted logging the spool
+    // re-binds onto the encrypted state PVC; the section carries
+    // spool-storage so enclava-init can cross-check it against the signed
+    // log_spool_storage claim. Any other layout omits the key.
+    let mut app = sample_app();
+    app.log_encryption = Some(LogEncryptionConfig {
+        algorithm: "x25519-hpke-v1".to_string(),
+        key_id: "logs-prod".to_string(),
+        public_key_base64url: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+        public_key_sha256: "sha256:Zmh6rfhivXdsj8GLjp-OIAiXFIVu4jOzkCpZHQ1fKSU".to_string(),
+    });
+
+    let rendered = |app: &enclava_engine::types::ConfidentialApp| {
+        let cm = generate_enclava_init_configmap(app);
+        let toml_text = cm.data.as_ref().unwrap().get("config.toml").unwrap();
+        let parsed: toml::Value = toml::from_str(toml_text).unwrap();
+        parsed
+            .get("log-encryption")
+            .and_then(|s| s.get("spool-storage"))
+            .and_then(toml::Value::as_str)
+            .map(str::to_string)
+    };
+
+    // No signed policy: legacy layout keeps the disk spool, no key.
+    assert_eq!(rendered(&app), None);
+
+    // v1 layout: Memory bootstrap emptyDirs, still the disk spool.
+    let mut v1 = app.clone();
+    let v1_text =
+        "# enclava-cap-volume-layout: guest-memory-v1\npackage agent_policy\n".to_string();
+    v1.generated_agent_policy = Some(enclava_engine::types::GeneratedAgentPolicy {
+        policy_text: v1_text.clone(),
+        policy_sha256: Sha256::digest(v1_text.as_bytes()).into(),
+        genpolicy_version_pin: "kata-containers/genpolicy@3.28.0+test".to_string(),
+    });
+    assert_eq!(rendered(&v1), None);
+
+    // v2 layout + encrypted logging: state-bind-v1.
+    let mut v2 = app.clone();
+    let v2_text =
+        "# enclava-cap-volume-layout: guest-memory-v2\npackage agent_policy\n".to_string();
+    v2.generated_agent_policy = Some(enclava_engine::types::GeneratedAgentPolicy {
+        policy_text: v2_text.clone(),
+        policy_sha256: Sha256::digest(v2_text.as_bytes()).into(),
+        genpolicy_version_pin: "kata-containers/genpolicy@3.28.0+test".to_string(),
+    });
+    assert_eq!(rendered(&v2).as_deref(), Some("state-bind-v1"));
+
+    // v2 without encrypted logging: no section at all.
+    let mut v2_no_log = v2.clone();
+    v2_no_log.log_encryption = None;
+    assert_eq!(rendered(&v2_no_log), None);
+
+    // Pinned to a pre-claim render: the section matches the signed bytes.
+    v2.workload_artifact_binding = Some(WorkloadArtifactBinding {
+        descriptor_core_hash: [0u8; 32],
+        descriptor_signing_pubkey: [0u8; 32],
+        org_keyring_fingerprint: [0u8; 32],
+        omit_log_encryption_claim: false,
+        legacy_collapsed_trustee_key: false,
+        omit_luks2_header_seal_claim: false,
+        omit_log_spool_bind_claim: true,
+    });
+    assert_eq!(rendered(&v2), None);
 }
 
 #[test]
@@ -299,4 +370,53 @@ fn config_toml_prefers_local_verification_artifacts_when_present() {
     assert!(
         toml_text.contains("trustee-policy-url = \"file:///etc/enclava-init/trustee-policy.json\"")
     );
+}
+
+#[test]
+fn legacy_collapsed_trustee_pin_renders_the_signing_key_consistently() {
+    // cap#118 review follow-up: artifacts pinned to the pre-split collapsed
+    // layout carry the signing-service key in the trustee slot of their
+    // signed cc_init_data bytes. Both the measured cc_init_data and the
+    // enclava-init ConfigMap must render that exact value — init
+    // cross-checks the ConfigMap section against the signed claims, so any
+    // divergence between the two renderers would brick the boot.
+    let mut app = sample_app();
+    app.attestation.trustee_policy_read_available = true;
+    app.attestation.workload_artifacts_url =
+        Some("http://cap-api.cap.svc.cluster.local/api/v1/workload/artifacts".to_string());
+    app.attestation.trustee_policy_url =
+        Some("http://kbs.trustee.svc/resource-policy/default/body".to_string());
+    app.attestation.platform_trustee_policy_pubkey_hex = Some("33".repeat(32));
+    app.attestation.signing_service_pubkey_hex = Some("bb".repeat(32));
+    app.workload_artifact_binding = Some(WorkloadArtifactBinding {
+        descriptor_core_hash: [0u8; 32],
+        descriptor_signing_pubkey: [0u8; 32],
+        org_keyring_fingerprint: [0u8; 32],
+        omit_log_encryption_claim: false,
+        legacy_collapsed_trustee_key: true,
+        omit_luks2_header_seal_claim: false,
+        omit_log_spool_bind_claim: false,
+    });
+
+    let collapsed = "bb".repeat(32);
+    let split = "33".repeat(32);
+    let cm = generate_enclava_init_configmap(&app);
+    let data = cm.data.as_ref().unwrap();
+    let toml_text = data.get("config.toml").unwrap();
+    let cc_toml = data.get("cc-init-data.toml").unwrap();
+    assert!(toml_text.contains(&format!(
+        "platform-trustee-policy-pubkey-hex = \"{collapsed}\""
+    )));
+    assert!(!toml_text.contains(&split));
+    assert!(cc_toml.contains(&format!(
+        "platform_trustee_policy_pubkey_hex = \"{collapsed}\""
+    )));
+    assert!(!cc_toml.contains(&split));
+    assert_eq!(cc_toml, &cc_init_data::build_toml(&app));
+
+    // Unpinned renders keep using the dedicated trustee policy key.
+    app.workload_artifact_binding = None;
+    let cm = generate_enclava_init_configmap(&app);
+    let toml_text = cm.data.as_ref().unwrap().get("config.toml").unwrap();
+    assert!(toml_text.contains(&format!("platform-trustee-policy-pubkey-hex = \"{split}\"")));
 }

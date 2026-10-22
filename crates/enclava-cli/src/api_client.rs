@@ -3,6 +3,11 @@ use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use sha2::{Digest, Sha256};
 
 /// Typed HTTP client for the Enclava Platform API.
+///
+/// `Clone` is cheap (the underlying `reqwest::Client` is an `Arc`) and shares
+/// one connection pool; detached background requests (e.g. the deployment
+/// history feed in the deploy waits) clone the client to move it into a task.
+#[derive(Clone)]
 pub struct ApiClient {
     base_url: String,
     origin: String,
@@ -498,6 +503,20 @@ impl ApiClient {
         read_bounded_json(resp).await
     }
 
+    pub async fn get_deployment_diagnostics(
+        &self,
+        app_name: &str,
+    ) -> Result<DeploymentDiagnostics, ApiError> {
+        let resp = self
+            .http
+            .get(self.url(&format!("/apps/{app_name}/deployment/diagnostics")))
+            .headers(self.auth_headers()?)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        read_bounded_json(resp).await
+    }
+
     pub async fn get_logs(
         &self,
         app_name: &str,
@@ -507,14 +526,30 @@ impl ApiClient {
         if follow {
             url.push_str("?follow=true");
         }
-        let resp = self
-            .http
-            .get(&url)
-            .headers(self.auth_headers()?)
-            .send()
-            .await?;
-        let resp = self.check_response(resp).await?;
-        Ok(resp)
+        let streaming_http = follow.then(|| {
+            http_client_builder_for(&self.base_url)
+                .build()
+                .expect("failed to build HTTP client")
+        });
+        let http = streaming_http.as_ref().unwrap_or(&self.http);
+        let request = async {
+            let resp = http.get(&url).headers(self.auth_headers()?).send().await?;
+            self.check_response(resp).await
+        };
+        if follow {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(API_REQUEST_TIMEOUT_SECONDS),
+                request,
+            )
+            .await
+            .map_err(|_| ApiError::Api {
+                status: 0,
+                code: Some("request_timeout".to_string()),
+                message: "HTTP request timed out".to_string(),
+            })?
+        } else {
+            request.await
+        }
     }
 
     pub async fn list_log_keys(&self, app_name: &str) -> Result<LogEncryptionKeyList, ApiError> {
@@ -907,13 +942,19 @@ pub const MAX_API_RESPONSE_BODY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_API_ERROR_BODY_BYTES: usize = 64 * 1024;
 
 fn http_client_for(url: &str) -> reqwest::Client {
+    http_client_builder_for(url)
+        .timeout(std::time::Duration::from_secs(API_REQUEST_TIMEOUT_SECONDS))
+        .build()
+        .expect("failed to build HTTP client")
+}
+
+fn http_client_builder_for(url: &str) -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .user_agent(format!("enclava-cli/{}", env!("CARGO_PKG_VERSION")))
         .https_only(!loopback_http_url(url))
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(API_REQUEST_TIMEOUT_SECONDS))
-        .build()
-        .expect("failed to build HTTP client")
+        .connect_timeout(std::time::Duration::from_secs(API_REQUEST_TIMEOUT_SECONDS))
+        .read_timeout(std::time::Duration::from_secs(API_REQUEST_TIMEOUT_SECONDS))
 }
 
 /// Bounded body read shared by every JSON decode: the declared
@@ -1049,6 +1090,91 @@ fn compose_api_error(status_code: u16, body: ApiErrorBody) -> (Option<String>, S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn follow_logs_outlives_the_regular_request_deadline() {
+        use std::time::Duration;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                while reader.read_line(&mut line).await.unwrap() != 0 {
+                    if line == "\r\n" {
+                        break;
+                    }
+                    line.clear();
+                }
+                let mut stream = reader.into_inner();
+                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: close\r\n\r\nfirst\n").await.unwrap();
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let _ = stream.write_all(b"second\n").await;
+            }
+        });
+        let mut client = ApiClient::new(&base_url, Some("test-session".to_string()));
+        client.http = reqwest::Client::builder()
+            .timeout(Duration::from_millis(50))
+            .build()
+            .unwrap();
+
+        let response = client.get_logs("test-app", true).await.unwrap();
+        assert_eq!(response.text().await.unwrap(), "first\nsecond\n");
+        let response = client.get_logs("test-app", false).await;
+        let error = match response {
+            Ok(response) => response.bytes().await.unwrap_err(),
+            Err(ApiError::Http(error)) => error,
+            Err(error) => panic!("unexpected request error: {error}"),
+        };
+        assert!(error.is_timeout());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn follow_error_body_has_a_total_deadline_despite_trickling_data() {
+        use std::time::Duration;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let (headers_sent, headers_received) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            stream.set_nodelay(true).unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            while reader.read_line(&mut line).await.unwrap() != 0 {
+                if line == "\r\n" {
+                    break;
+                }
+                line.clear();
+            }
+            let mut stream = reader.into_inner();
+            stream.write_all(b"HTTP/1.1 403 Forbidden\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").await.unwrap();
+            headers_sent.send(()).unwrap();
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if stream.write_all(b"1\r\nx\r\n").await.is_err() {
+                    break;
+                }
+            }
+        });
+        let client = ApiClient::new(&base_url, Some("test-session".to_string()));
+        let request = tokio::spawn(async move { client.get_logs("test-app", true).await });
+        headers_received.await.unwrap();
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        let error = request.await.unwrap().unwrap_err();
+        server.abort();
+        let _ = server.await;
+        assert!(
+            matches!(error, ApiError::Api { status: 0, code: Some(code), .. } if code == "request_timeout")
+        );
+        assert!(started.elapsed() < Duration::from_secs(API_REQUEST_TIMEOUT_SECONDS * 2));
+    }
 
     #[test]
     fn api_error_message_carries_lane_hints_in_band() {

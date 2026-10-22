@@ -31,6 +31,17 @@ fn internal_server_error() -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
+/// Publication failures must not disguise an already-committed rotation as an
+/// uncertain mutation failure.
+pub(crate) const SIGNER_ROTATION_PUBLICATION_PENDING_CODE: &str =
+    "signer_rotation_publication_pending";
+
+/// Terminal disposition for a committed rotation whose identity a later
+/// authority replaced before publication was confirmed: the app's live
+/// signer identity is authoritative, so callers must not receive the
+/// superseded rotation's saved response.
+pub(crate) const SIGNER_ROTATION_SUPERSEDED_CODE: &str = "signer_rotation_superseded";
+
 /// Lease-window columns the busy hint derives from: the holding operation's
 /// kind, its renewable lock expiry, and the reclaim-quarantine deadline.
 /// Poisoned/parked fences carry `reclaim_after = infinity` (never claimable),
@@ -150,6 +161,7 @@ enum AppDeleteFailure {
     KbsOwnerBinding,
     KbsTlsBinding,
     KbsPolicy,
+    KbsPolicyBudget,
 }
 
 impl AppDeleteFailure {
@@ -168,6 +180,7 @@ impl AppDeleteFailure {
             Self::KbsOwnerBinding => "app_delete_kbs_owner_binding_failed",
             Self::KbsTlsBinding => "app_delete_kbs_tls_binding_failed",
             Self::KbsPolicy => "app_delete_kbs_policy_failed",
+            Self::KbsPolicyBudget => "app_delete_kbs_policy_budget_exceeded",
         }
     }
 
@@ -177,7 +190,7 @@ impl AppDeleteFailure {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
             Self::DnsOutsideManagedZone => StatusCode::BAD_REQUEST,
-            Self::DnsHostnameInUse => StatusCode::CONFLICT,
+            Self::DnsHostnameInUse | Self::KbsPolicyBudget => StatusCode::CONFLICT,
             Self::TeardownLocked => StatusCode::LOCKED,
             Self::TeardownEndpoint
             | Self::DnsUnavailable
@@ -348,6 +361,26 @@ fn requires_workload_teardown(status: AppStatus) -> bool {
     matches!(status, AppStatus::Running)
 }
 
+// Recorded status can lag a live TEE; use the same seed evidence as the waiver guard.
+async fn teardown_required_pre_delete(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    app: &App,
+) -> Result<bool, sqlx::Error> {
+    if requires_workload_teardown(app.status) {
+        return Ok(true);
+    }
+    sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM deployments WHERE app_id = $1
+         ) OR EXISTS(
+             SELECT 1 FROM kbs_owner_bindings WHERE app_id = $1
+         )",
+    )
+    .bind(app.id)
+    .fetch_one(&mut **tx)
+    .await
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct WorkloadTeardownDecision {
     required: bool,
@@ -371,7 +404,7 @@ async fn request_workload_teardown(
         tracing::info!(
             app_id = %app.id,
             code = "app_delete_teardown_not_required",
-            "skipping workload teardown endpoint for non-running app"
+            "skipping workload teardown endpoint: no owner-seed evidence"
         );
         return Ok(());
     }
@@ -384,6 +417,81 @@ async fn request_workload_teardown(
         return Ok(());
     }
 
+    let domain = app.tee_domain.as_deref().unwrap_or(&app.domain);
+
+    // The per-boot leaf must be attested before a teardown token is issued.
+    let tee_http_client = if crate::routes::logs::accepts_invalid_tenant_tee_certs() {
+        let mut relaxed = state.tee_http_client.clone();
+        // The public tee origin is unreachable from inside the cluster on
+        // hairpin-blocked deployments (pods cannot reach their own external
+        // edge address), which made every teardown POST time out and the
+        // TEE-side owner-seed erasure fail open. Prefer the instance tenant
+        // Gateway dataplane via the shared bounded resolver; every failure
+        // mode falls back to the public client — the pre-Gateway behavior,
+        // which on a Gateway deployment still carries the original defect
+        // (#204): if teardown-unavailable symptoms persist after this
+        // ships, the fallback is the first place to look.
+        if let Some(client) = crate::routes::logs::resolved_tenant_tee_client(
+            app.id,
+            &app.name,
+            &app.namespace,
+            domain,
+        )
+        .await
+        {
+            relaxed = client;
+        }
+        relaxed
+    } else {
+        let identities =
+            match crate::tee_attestation::load_teardown_identities(&state.db, app).await {
+                Ok(identities) => identities,
+                Err(error) => {
+                    tracing::warn!(
+                        app_id = %app.id,
+                        category = error.category(),
+                        reason = error.reason(),
+                        code = "app_delete_teardown_attestation",
+                        "workload teardown identity unavailable"
+                    );
+                    return Err(app_delete_failure(
+                        app.id,
+                        AppDeleteFailure::TeardownEndpoint,
+                        error.category(),
+                    ));
+                }
+            };
+        let gateway_ip =
+            crate::routes::logs::resolve_tenant_gateway_ip(app.id, &app.name, &app.namespace).await;
+        match crate::tee_attestation::attest_teardown_channel(
+            domain,
+            gateway_ip,
+            &identities,
+            state
+                .attestation
+                .as_ref()
+                .and_then(|config| config.amd_kds_base_url.as_deref()),
+        )
+        .await
+        {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::warn!(
+                    app_id = %app.id,
+                    category = error.category(),
+                    reason = error.reason(),
+                    code = "app_delete_teardown_attestation",
+                    "workload teardown endpoint failed attestation"
+                );
+                return Err(app_delete_failure(
+                    app.id,
+                    AppDeleteFailure::TeardownEndpoint,
+                    error.category(),
+                ));
+            }
+        }
+    };
+
     let token = crate::auth::jwt::issue_config_token(
         &state.signing_key,
         auth.user_id,
@@ -394,24 +502,8 @@ async fn request_workload_teardown(
     )
     .map_err(|error| app_delete_failure(app.id, AppDeleteFailure::TeardownToken, error))?;
 
-    let domain = app.tee_domain.as_deref().unwrap_or(&app.domain);
-
-    // The public tee origin is unreachable from inside the cluster on
-    // hairpin-blocked deployments (pods cannot reach their own external
-    // edge address), which made every teardown POST time out and the
-    // TEE-side owner-seed erasure fail open. Prefer the instance tenant
-    // Gateway dataplane via the shared bounded resolver; every failure
-    // mode falls back to the public client — the pre-Gateway behavior,
-    // which on a Gateway deployment still carries the original defect
-    // (#204): if teardown-unavailable symptoms persist after this ships,
-    // the fallback is the first place to look.
     let mut teardown_state = state.clone();
-    if let Some(client) =
-        crate::routes::logs::resolved_tenant_tee_client(app.id, &app.name, &app.namespace, domain)
-            .await
-    {
-        teardown_state.tee_http_client = client;
-    }
+    teardown_state.tee_http_client = tee_http_client;
     post_workload_teardown(&teardown_state, app, &token, &workload_teardown_url(domain)).await
 }
 
@@ -538,6 +630,12 @@ async fn persist_workload_teardown_completed(
         .bind(app_id)
         .execute(&mut *tx)
         .await?;
+    // The completed marker removes teardown pins from the selector. Publish
+    // its new desired generation in this same commit so a process loss cannot
+    // strand the old body behind an already-applied generation.
+    crate::kbs::enqueue_signed_policy_revocation_if_active(&mut tx)
+        .await
+        .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
     tx.commit().await?;
     Ok(())
 }
@@ -1041,6 +1139,11 @@ pub(crate) async fn prepare_app_candidate(
         signer_identity_set_at: (body.signer_identity_subject.is_some()
             || body.signer_identity_issuer.is_some())
         .then_some(now),
+        // An initial identity set counts as the first rotation event (the
+        // generation trigger only bumps on UPDATE, so seed it here).
+        signer_rotation_generation: i64::from(
+            body.signer_identity_subject.is_some() || body.signer_identity_issuer.is_some(),
+        ),
         source_provider: body
             .source_provider
             .map(SourceProvider::as_str)
@@ -1134,12 +1237,13 @@ pub async fn create_app(
         service_account, bootstrap_owner_pubkey_hash, tenant_instance_identity_hash,
          unlock_mode, domain, tee_domain,
          signer_identity_subject, signer_identity_issuer, signer_identity_set_at,
-        source_provider, source_repository, egress_allowlist, egress_mode)
-         SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10::unlock_enum, $11, $12, $13, $14, $15, $16, $17, $18, $19
-         WHERE NOT EXISTS (
-             SELECT 1 FROM kbs_owner_seed_waivers
-              WHERE binding_key = $20
-         )",
+         signer_rotation_generation,
+         source_provider, source_repository, egress_allowlist, egress_mode)
+          SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10::unlock_enum, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20
+          WHERE NOT EXISTS (
+              SELECT 1 FROM kbs_owner_seed_waivers
+               WHERE binding_key = $21
+          )",
     )
     .bind(app_id)
     .bind(app_candidate.org_id)
@@ -1156,6 +1260,7 @@ pub async fn create_app(
     .bind(app_candidate.signer_identity_subject.as_deref())
     .bind(app_candidate.signer_identity_issuer.as_deref())
     .bind(app_candidate.signer_identity_set_at)
+    .bind(app_candidate.signer_rotation_generation)
     .bind(app_candidate.source_provider.as_deref())
     .bind(app_candidate.source_repository.as_deref())
     .bind(&app_candidate.egress_allowlist)
@@ -1665,8 +1770,71 @@ pub(crate) async fn delete_app_before(
             .map_err(|_| internal_server_error())?;
         return Err((
             StatusCode::CONFLICT,
-            Json(serde_json::json!({"error": "app resource authority changed; retry deletion"})),
+            Json(serde_json::json!({ "error": "app resource authority changed; retry deletion" })),
         ));
+    }
+    let pre_delete_teardown_required = teardown_required_pre_delete(&mut phase_tx, &phase_app)
+        .await
+        .map_err(|_| internal_server_error())?;
+    // Admission control for the teardown policy pin (Codex security finding
+    // 4a27950: teardown candidates can exhaust the global KBS policy budget).
+    // A teardown-pending workload keeps required, retention-exempt signed
+    // policy authority for as long as it can still be serving, and the byte
+    // budget fail-closes the whole reconciliation when the required set
+    // overflows — stacked deletions would then wedge every app's policy
+    // convergence. Refuse the delete here, under the global kbs_policy fence
+    // and before the pin exists, when this app's teardown unit no longer fits.
+    // Nothing is dropped from the policy to make a delete fit. `abandon_teardown`
+    // proceeds anyway: its deletion completes in this flow (the pin stays
+    // transient), and the operator override must remain reachable to unwind a
+    // wedged budget.
+    if !abandon_teardown {
+        // Mirrors the CASE below: a retry of an already-deleting app keeps
+        // its pin; anything else pins exactly when teardown is required.
+        // A teardown that already completed contributes no policy authority
+        // (the selector requires `workload_teardown_completed_at IS NULL`),
+        // so its deletion retry must bypass admission — otherwise a tight
+        // budget could 409 the only operation that removes the app.
+        let pin_will_apply = if phase_app.status == AppStatus::Deleting {
+            let (teardown_required, teardown_completed): (
+                bool,
+                Option<chrono::DateTime<chrono::Utc>>,
+            ) = sqlx::query_as(
+                "SELECT workload_teardown_required, workload_teardown_completed_at
+                   FROM apps WHERE id = $1",
+            )
+            .bind(phase_app.id)
+            .fetch_one(&mut *phase_tx)
+            .await
+            .map_err(|_| internal_server_error())?;
+            teardown_required && teardown_completed.is_none()
+        } else {
+            pre_delete_teardown_required
+        };
+        if pin_will_apply {
+            let fits = crate::kbs::teardown_unit_fits_signed_policy_budget(
+                &state.db,
+                state.kbs_policy.as_ref(),
+                phase_app.id,
+            )
+            .await
+            .map_err(|_| internal_server_error())?;
+            if !fits {
+                delete_mutation
+                    .finish_in_tx(&mut phase_tx)
+                    .await
+                    .map_err(|_| internal_server_error())?;
+                phase_tx
+                    .commit()
+                    .await
+                    .map_err(|_| internal_server_error())?;
+                return Err(app_delete_failure(
+                    phase_app.id,
+                    AppDeleteFailure::KbsPolicyBudget,
+                    (),
+                ));
+            }
+        }
     }
     sqlx::query(
         "UPDATE apps
@@ -1679,7 +1847,7 @@ pub(crate) async fn delete_app_before(
           WHERE id = $1",
     )
     .bind(phase_app.id)
-    .bind(requires_workload_teardown(phase_app.status))
+    .bind(pre_delete_teardown_required)
     .execute(&mut *phase_tx)
     .await
     .map_err(|_| internal_server_error())?;
@@ -1712,6 +1880,31 @@ pub(crate) async fn delete_app_before(
                 return Err(internal_server_error());
             }
         };
+    // The deleting selector and its desired generation must commit atomically.
+    // A crash between these writes would otherwise strand teardown authority
+    // behind an already-applied generation (same-generation body changes are
+    // rejected by the policy reconciler).
+    let publication_needed = if phase_app.status == AppStatus::Deleting {
+        let (required, completed): (bool, Option<chrono::DateTime<chrono::Utc>>) = sqlx::query_as(
+            "SELECT workload_teardown_required, workload_teardown_completed_at
+                   FROM apps WHERE id = $1",
+        )
+        .bind(phase_app.id)
+        .fetch_one(&mut *phase_tx)
+        .await
+        .map_err(|_| internal_server_error())?;
+        required && completed.is_none()
+    } else {
+        pre_delete_teardown_required
+    };
+    let publish_enqueued = if publication_needed {
+        crate::kbs::enqueue_signed_policy_revocation_if_active(&mut phase_tx)
+            .await
+            .map_err(|_| internal_server_error())?
+            .is_some()
+    } else {
+        false
+    };
     phase_tx
         .commit()
         .await
@@ -1772,18 +1965,93 @@ pub(crate) async fn delete_app_before(
         .await
         .map_err(|_| internal_server_error())?;
 
-    let teardown = delete_mutation
-        .guard_provider(request_workload_teardown(
-            &state,
-            &auth,
-            &deleting_app,
-            WorkloadTeardownDecision {
-                required: teardown_required,
-                completed: teardown_completed_at.is_some(),
-            },
-        ))
-        .await
-        .map_err(|_| internal_server_error())?;
+    // Publish the admitted teardown unit before any workload is asked to
+    // erase its owner seed (Codex review on 3b168c73): with retention 1 or
+    // prior byte trimming an artifact the deleting selector pins may still
+    // be absent from Trustee. The phase transaction atomically enqueued the
+    // selector change; converge it here under the global kbs_policy fence.
+    // A reconcile
+    // failure flows into the same handling as a teardown failure below
+    // (restore-or-keep disposition, lease released in the lane) — except a
+    // budget failure whose full teardown unit is already live, which proceeds
+    // to teardown instead of demanding an over-budget republication.
+    let teardown = if teardown_required && teardown_completed_at.is_none() {
+        if publish_enqueued {
+            match delete_mutation
+                .guard_provider(crate::kbs::reconcile_pending_signed_policy_artifacts(
+                    &state.db,
+                    state.kbs_policy.as_ref(),
+                ))
+                .await
+                .map_err(|_| internal_server_error())?
+            {
+                Ok(()) => None,
+                Err(error) => {
+                    // A delete admitted as non-growing (its teardown unit
+                    // does not grow the required set) must still reach
+                    // teardown when the required set is already over budget
+                    // (e.g. the byte limit was lowered below the published
+                    // set): republication of the still-over-budget unit
+                    // fail-closes, but the exact authority may already be
+                    // live — teardown authorization is evaluated against the
+                    // live policy, and the required set shrinks once
+                    // teardown completes. Any other reconcile failure keeps
+                    // failing the delete as before.
+                    let already_published = matches!(
+                        error,
+                        crate::kbs::KbsPolicyError::SignedPolicyBudgetExceeded { .. }
+                    ) && match (
+                        state.kbs_policy.as_ref(),
+                        kube::Client::try_default().await,
+                    ) {
+                        (Some(config), Ok(client)) => crate::kbs::teardown_unit_already_published(
+                            &state.db,
+                            config,
+                            client,
+                            deleting_app.id,
+                        )
+                        .await
+                        .unwrap_or(false),
+                        _ => false,
+                    };
+                    if already_published {
+                        tracing::warn!(
+                            app_id = %deleting_app.id,
+                            code = "kbs_teardown_unit_already_published",
+                            "skipping over-budget republication for a non-growing delete; \
+                             the live policy already carries this app's teardown unit"
+                        );
+                        None
+                    } else {
+                        Some(app_delete_failure(
+                            deleting_app.id,
+                            AppDeleteFailure::KbsPolicy,
+                            error,
+                        ))
+                    }
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let teardown = match teardown {
+        Some(failure) => Err(failure),
+        None => delete_mutation
+            .guard_provider(request_workload_teardown(
+                &state,
+                &auth,
+                &deleting_app,
+                WorkloadTeardownDecision {
+                    required: teardown_required,
+                    completed: teardown_completed_at.is_some(),
+                },
+            ))
+            .await
+            .map_err(|_| internal_server_error())?,
+    };
     if let Err(failure) = teardown {
         if !abandon_teardown {
             // A failed teardown exits before any fenced resource is touched:
@@ -1816,6 +2084,13 @@ pub(crate) async fn delete_app_before(
                 .execute(&mut *delete_lane)
                 .await
                 .map_err(|_| internal_server_error())?;
+                // The pre-teardown publication was content-bound to the
+                // deleting selector. Restoring the app changes that selector;
+                // enqueue a fresh generation in the same transaction so the
+                // periodic reconciler can revoke deletion-only authority.
+                crate::kbs::enqueue_signed_policy_revocation_if_active(&mut delete_lane)
+                    .await
+                    .map_err(|_| internal_server_error())?;
             }
             // Merely dropping the lease would hold the cluster-wide
             // edge_config and kbs_policy fences through reclaim quarantine
@@ -1854,6 +2129,65 @@ pub(crate) async fn delete_app_before(
             code = "app_delete_teardown_abandoned",
             "proceeding with deletion after failed workload teardown (operator override)"
         );
+        // The override must be able to unwind a wedged budget (Codex review on
+        // 3b168c73): with the completion marker still NULL the deleting-app
+        // selector keeps pinning this app's retention-exempt artifacts, and
+        // the mandatory reconciliation below would fail with the same
+        // SignedPolicyBudgetExceeded the override exists to escape. The
+        // workload is confirmed unreachable, so its pin protects nothing.
+        // Record the waiver explicitly first — the later owner-binding
+        // soft-delete only waives while the marker is NULL, so stamping the
+        // marker now would silently drop the same-name-recreate guard — then
+        // stamp the marker. Both run in a short transaction committed
+        // independently of the delete lane (like the teardown marker itself):
+        // an open-lane write would hold the waiver row lock against the later
+        // soft delete from the pool, and would stay invisible to the
+        // reconciliation below until the lane commits.
+        let mut abandon_tx = state
+            .db
+            .begin()
+            .await
+            .map_err(|_| internal_server_error())?;
+        sqlx::query(
+            "INSERT INTO kbs_owner_seed_waivers (binding_key, app_id, org_name, app_name)
+             SELECT $2, app.id, org.name, app.name
+               FROM apps AS app
+               JOIN organizations AS org ON org.id = app.org_id
+              WHERE app.id = $1
+             ON CONFLICT (binding_key) DO UPDATE
+                SET app_id = EXCLUDED.app_id,
+                    org_name = EXCLUDED.org_name,
+                    app_name = EXCLUDED.app_name,
+                    waived_at = now()",
+        )
+        .bind(deleting_app.id)
+        .bind(crate::kbs::owner_binding_key_for(
+            &deleting_app.namespace,
+            &deleting_app.name,
+        ))
+        .execute(&mut *abandon_tx)
+        .await
+        .map_err(|_| internal_server_error())?;
+        sqlx::query(
+            "UPDATE apps
+                SET workload_teardown_completed_at =
+                        COALESCE(workload_teardown_completed_at, clock_timestamp()),
+                    updated_at = clock_timestamp()
+              WHERE id = $1",
+        )
+        .bind(deleting_app.id)
+        .execute(&mut *abandon_tx)
+        .await
+        .map_err(|_| internal_server_error())?;
+        // The override's completed marker removes this app from the selector.
+        // Do not leave that body change at the already-applied generation.
+        crate::kbs::enqueue_signed_policy_revocation_if_active(&mut abandon_tx)
+            .await
+            .map_err(|_| internal_server_error())?;
+        abandon_tx
+            .commit()
+            .await
+            .map_err(|_| internal_server_error())?;
     }
 
     // The running workload needs its current KBS authorization to erase the
@@ -2199,6 +2533,23 @@ pub(crate) async fn delete_app_before(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Release the KBS fence after a failed publish whose failure provably has
+/// no Kubernetes write in flight (see
+/// `KbsPolicyError::provider_write_may_be_in_flight`): nothing retries inside
+/// this request anymore, so do not leave the KBS fence claimed for the lease
+/// quarantine window. A failure that MAY have sent a mutating request must
+/// instead drop the lease untouched and keep the reclaim quarantine, so the
+/// possibly in-flight write cannot overlap the next publisher.
+async fn release_finished_lease(lease: crate::mutation_leases::ResourceMutationLease) {
+    if let Err(error) = lease.finish().await {
+        tracing::warn!(
+            error = %error,
+            error_code = "kbs_policy_lease_finish_failed",
+            "failed to release the KBS policy fence after a failed publish"
+        );
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct RotateSignerRequest {
     pub subject: String,
@@ -2308,16 +2659,16 @@ pub async fn issue_signer_rotation_token_route(
         Json(serde_json::json!({"error": "app signer authority is unavailable"})),
     ))?;
 
-    let previous_subject = app
-        .signer_identity_subject
-        .clone()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    let previous_issuer = app
-        .signer_identity_issuer
-        .clone()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
+    // Preserve the exact stored bytes: rotate_signer_commit builds its
+    // expected claims from the untrimmed database values and verifies the
+    // token against them byte-for-byte, so trimming the previous identity
+    // here would make every issued token for a whitespace-padded stored
+    // identity fail verification and strand the signer (Codex review
+    // finding on #187). The None/None classification below must likewise
+    // mirror rotate_signer_commit's is_initial_set check, which is also
+    // based on the raw stored values.
+    let previous_subject = app.signer_identity_subject.clone();
+    let previous_issuer = app.signer_identity_issuer.clone();
     let (previous_subject, previous_issuer) = match (previous_subject, previous_issuer) {
         (Some(subject), Some(issuer)) => (subject, issuer),
         (None, None) => {
@@ -2383,18 +2734,308 @@ pub async fn issue_signer_rotation_token_route(
     }))
 }
 
+fn signer_publication_pending_error() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "error": "signer_rotation_publication_pending",
+            "code": SIGNER_ROTATION_PUBLICATION_PENDING_CODE,
+            "message": "the signer rotation committed but its KBS policy publication is still pending; retry with the same parameters to complete publication",
+            "context": "rotate_signer",
+            "committed": true,
+            "retryable": true,
+        })),
+    )
+}
+
+fn signer_rotation_superseded_error() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "error": SIGNER_ROTATION_SUPERSEDED_CODE,
+            "code": SIGNER_ROTATION_SUPERSEDED_CODE,
+            "message": "the committed signer rotation was superseded by a later authority before its publication was confirmed; the app's live signer identity is authoritative",
+            "context": "rotate_signer",
+            "committed": true,
+            "retryable": false,
+        })),
+    )
+}
+
+// Release authority lanes before external KBS work; reacquire to detect
+// supersession. The generation comparison catches a rotate-back (A -> B ->
+// C -> B): the same identity pair returns through a NEW authority event, and
+// only the generation captured with the commit distinguishes the two
+// occurrences. A DB failure keeps the committed rotation pending, never
+// reported as supersession.
+async fn confirm_committed_signer_identity(
+    state: &AppState,
+    app_id: Uuid,
+    expected_subject: &str,
+    expected_issuer: &str,
+    expected_generation: i64,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|_| signer_publication_pending_error())?;
+    let org_id: Uuid = sqlx::query_scalar("SELECT org_id FROM apps WHERE id = $1")
+        .bind(app_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| signer_publication_pending_error())?
+        .ok_or_else(signer_rotation_superseded_error)?;
+    crate::signing_service::lock_org_signing_authority_lane(&mut tx, org_id)
+        .await
+        .map_err(|_| signer_publication_pending_error())?;
+    crate::deploy::lock_app_deployment_lane(&mut tx, app_id)
+        .await
+        .map_err(|_| signer_publication_pending_error())?;
+    let live: Option<(Option<String>, Option<String>, i64)> = sqlx::query_as(
+        "SELECT signer_identity_subject, signer_identity_issuer, signer_rotation_generation
+           FROM apps
+          WHERE id = $1
+            AND status <> 'deleting'::app_status_enum",
+    )
+    .bind(app_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|_| signer_publication_pending_error())?;
+    tx.rollback()
+        .await
+        .map_err(|_| signer_publication_pending_error())?;
+    match live {
+        Some((subject, issuer, generation))
+            if subject.as_deref() == Some(expected_subject)
+                && issuer.as_deref() == Some(expected_issuer)
+                && generation == expected_generation =>
+        {
+            Ok(())
+        }
+        _ => Err(signer_rotation_superseded_error()),
+    }
+}
+
+/// Recheck committed authority around publication without holding its lanes
+/// across external KBS I/O.
+pub(crate) async fn reconcile_signer_publication(
+    state: &AppState,
+    app_id: Uuid,
+    expected_subject: &str,
+    expected_issuer: &str,
+    expected_generation: i64,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    confirm_committed_signer_identity(
+        state,
+        app_id,
+        expected_subject,
+        expected_issuer,
+        expected_generation,
+    )
+    .await?;
+    if state.kbs_policy.is_none() {
+        // The shared confirm helper fails closed exactly when signed-policy
+        // mode is active without configuration, and performs no write on an
+        // unsigned, unconfigured install. A recorded legacy publication
+        // obligation (migration 0069) is the exception: it proves a
+        // signer-bearing legacy policy was rendered at least once, so
+        // confirming success here would report a rotation as published
+        // while that previously rendered policy can keep authorizing the
+        // rotated-out signer (Codex review finding on #187). Report the
+        // publication-pending error instead, exactly like the signed-mode
+        // without-configuration case.
+        let mut obligation_tx = state
+            .db
+            .begin()
+            .await
+            .map_err(|_| signer_publication_pending_error())?;
+        // Lock the same sentinel the legacy publication critical section
+        // holds, so this confirmation cannot report success while a
+        // publication that read the pre-rotation bindings is still in
+        // flight on a configured replica; it reports the
+        // publication-pending error exactly like the signed-mode
+        // without-configuration case instead.
+        let sentinel_present = crate::kbs::lock_legacy_publication_sentinel(&mut *obligation_tx)
+            .await
+            .map_err(|_| signer_publication_pending_error())?;
+        let obligation_recorded = !sentinel_present
+            || crate::kbs::read_legacy_publication_obligation(&mut *obligation_tx)
+                .await
+                .map_err(|_| signer_publication_pending_error())?;
+        obligation_tx
+            .commit()
+            .await
+            .map_err(|_| signer_publication_pending_error())?;
+        if obligation_recorded {
+            tracing::warn!(
+                app_id = %app_id,
+                error_code = SIGNER_ROTATION_PUBLICATION_PENDING_CODE,
+                "signer rotation committed; a legacy KBS publication obligation is recorded without KBS configuration"
+            );
+            return Err(signer_publication_pending_error());
+        }
+        if let Err(error) = crate::kbs::confirm_keyring_kbs_publication(state).await {
+            tracing::warn!(
+                app_id = %app_id,
+                %error,
+                error_code = SIGNER_ROTATION_PUBLICATION_PENDING_CODE,
+                "signer rotation committed; KBS policy reconciliation pending"
+            );
+            return Err(signer_publication_pending_error());
+        }
+        return confirm_committed_signer_identity(
+            state,
+            app_id,
+            expected_subject,
+            expected_issuer,
+            expected_generation,
+        )
+        .await;
+    }
+    let lease = match crate::mutation_leases::claim_resources(
+        state,
+        "kbs_signer_rotation_policy",
+        Uuid::new_v4(),
+        vec![crate::mutation_leases::ResourceFence::kbs_policy()],
+    )
+    .await
+    {
+        Ok(lease) => lease,
+        Err(error) => {
+            tracing::warn!(
+                app_id = %app_id,
+                error = %error,
+                error_code = "kbs_policy_fence_unavailable",
+                "signer rotation committed but KBS policy reconciliation fence was unavailable"
+            );
+            return Err(signer_publication_pending_error());
+        }
+    };
+    match lease
+        .guard_provider(crate::kbs::reconcile_policy(
+            &state.db,
+            state.kbs_policy.as_ref(),
+        ))
+        .await
+    {
+        Err(error) => {
+            // guard_provider cancels the provider future when the lease
+            // heartbeat dies mid-write: the Kubernetes mutating request may
+            // already have reached (or may yet reach) the API server. Drop
+            // the lease untouched so the fence stays owned through the
+            // reclaim quarantine and that write cannot overlap the next
+            // publisher; the committed rotation stays retryable and the
+            // background reconciler converges once the quarantine expires.
+            tracing::warn!(
+                app_id = %app_id,
+                error = %error,
+                error_code = "kbs_policy_fence_unavailable",
+                "signer rotation committed but lost the KBS policy fence during reconciliation; retaining the fence through reclaim quarantine"
+            );
+            return Err(signer_publication_pending_error());
+        }
+        Ok(Err(error)) if error.provider_write_may_be_in_flight() => {
+            // An uncertain Kubernetes mutating write (bounded_kube_write
+            // timeout or transport/API failure) carries the same in-flight
+            // ambiguity as a lost heartbeat: drop the lease untouched instead
+            // of clearing the fence a possibly in-flight write still needs.
+            tracing::warn!(
+                app_id = %app_id,
+                error = %error,
+                error_code = "kbs_policy_reconciliation_failed",
+                "signer rotation committed but KBS policy reconciliation failed with an uncertain provider write; retaining the fence through reclaim quarantine"
+            );
+            return Err(signer_publication_pending_error());
+        }
+        Ok(Err(error)) => {
+            // The failure provably has no provider write in flight (see
+            // KbsPolicyError::provider_write_may_be_in_flight), so nothing
+            // can land late: release the fence instead of holding the
+            // cluster-wide kbs_policy resource through the quarantine window.
+            tracing::warn!(
+                app_id = %app_id,
+                error = %error,
+                error_code = "kbs_policy_reconciliation_failed",
+                "signer rotation committed but KBS policy reconciliation failed"
+            );
+            release_finished_lease(lease).await;
+            return Err(signer_publication_pending_error());
+        }
+        Ok(Ok(())) => {}
+    }
+    if let Err(error) = lease.finish().await {
+        tracing::warn!(
+            app_id = %app_id,
+            error = %error,
+            error_code = "kbs_policy_lease_finish_failed",
+            "signer rotation reconciled KBS policy but failed to release the fence cleanly"
+        );
+        return Err(signer_publication_pending_error());
+    }
+    // Authority may change during external publication.
+    confirm_committed_signer_identity(
+        state,
+        app_id,
+        expected_subject,
+        expected_issuer,
+        expected_generation,
+    )
+    .await?;
+    Ok(())
+}
+
 /// PATCH /apps/{name}/signer -- rotate the per-app cosign / Fulcio identity.
 /// Owner-only. Requires an email confirmation token tied to the requesting
-/// user's verified email address.
+/// user's verified email address. The identity commits before KBS
+/// publication is confirmed, so a publication failure is reported
+/// explicitly as committed-but-pending, never as a rolled-back success.
 pub async fn rotate_signer(
     auth: AuthContext,
     State(state): State<AppState>,
     Path(app_name): Path<String>,
     Json(body): Json<RotateSignerRequest>,
 ) -> Result<Json<AppResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let (app, signer_rotation_generation) =
+        rotate_signer_commit(auth, &state, &app_name, body).await?;
+    let expected_subject = app
+        .signer_identity_subject
+        .as_deref()
+        .ok_or_else(internal_server_error)?;
+    let expected_issuer = app
+        .signer_identity_issuer
+        .as_deref()
+        .ok_or_else(internal_server_error)?;
+    reconcile_signer_publication(
+        &state,
+        app.id,
+        expected_subject,
+        expected_issuer,
+        signer_rotation_generation,
+    )
+    .await?;
+    Ok(Json(app))
+}
+
+/// Commit the signer rotation (or initial set) without confirming KBS
+/// publication. Split out of the public route so the internal idempotent
+/// wrapper can persist the committed result as a publication checkpoint:
+/// the email confirmation token is single-use, so a same-key retry of a
+/// committed rotation may only reconcile publication and replay the saved
+/// result, never re-run this mutation. Returns the committed app response
+/// together with the signer rotation generation established by this
+/// transaction (or the current one for the read-only same-identity
+/// confirmation): a deferred retry compares it against the live generation
+/// so a rotate-back through a later authority event counts as superseded.
+pub(crate) async fn rotate_signer_commit(
+    auth: AuthContext,
+    state: &AppState,
+    app_name: &str,
+    body: RotateSignerRequest,
+) -> Result<(AppResponse, i64), (StatusCode, Json<serde_json::Value>)> {
     scopes::require_owner(&auth)?;
     scopes::require_scope(&auth, "apps:write")?;
-    ensure_management_write_allowed(&state, &auth).await?;
+    ensure_management_write_allowed(state, &auth).await?;
 
     let subject = body.subject.trim().to_string();
     let issuer = body.issuer.trim().to_string();
@@ -2407,7 +3048,7 @@ pub async fn rotate_signer(
 
     let app_lookup: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
         .bind(auth.org_id)
-        .bind(&app_name)
+        .bind(app_name)
         .fetch_optional(&state.db)
         .await
         .map_err(|_| internal_server_error())?
@@ -2447,7 +3088,7 @@ pub async fn rotate_signer(
     )
     .bind(app_lookup.id)
     .bind(auth.org_id)
-    .bind(&app_name)
+    .bind(app_name)
     .fetch_optional(&mut *tx)
     .await
     .map_err(|_| internal_server_error())?
@@ -2456,10 +3097,115 @@ pub async fn rotate_signer(
         Json(serde_json::json!({"error": "app signer authority is unavailable"})),
     ))?;
 
+    if state.kbs_policy.is_none() {
+        // Signed-mode activation must serialize with this decision, including
+        // activations committed while the rotation waited for its app lane.
+        let signed_policy_mode_active: bool = sqlx::query_scalar(
+            "SELECT desired_generation > 0
+               FROM kbs_signed_policy_reconciliation
+              WHERE singleton
+              FOR UPDATE",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| internal_server_error())?;
+        if signed_policy_mode_active {
+            let error = crate::kbs::KbsPolicyError::NotConfigured;
+            tracing::warn!(
+                app = %app_name,
+                org_id = %auth.org_id,
+                %error,
+                error_code = "kbs_publication_not_configured",
+                "refusing signer rotation: signed-policy mode is active without KBS configuration"
+            );
+            tx.rollback().await.map_err(|_| internal_server_error())?;
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "signed-policy mode is active but KBS publication is not configured; refusing to commit a signer rotation that could not be published",
+                    "code": "kbs_publication_not_configured",
+                })),
+            ));
+        }
+        // A recorded legacy publication obligation (migration 0069) proves
+        // this install rendered a signer-bearing legacy policy at least
+        // once, so without KBS configuration the rotated-out signer could
+        // stay authorized by that previously published policy while this
+        // rotation reports success (Codex review finding on #187). Refuse
+        // exactly like the signed-mode arm: the refusal precedes every
+        // token, identity, withdrawal, and audit mutation and leaves the
+        // request retryable. An install that never rendered such a policy
+        // has no marker and keeps rotating exactly as before.
+        // Take the publication-obligation sentinel FOR UPDATE on the
+        // identity transaction: this serializes the refusal decision with
+        // an in-flight legacy publication on a configured replica (the
+        // reconciler holds the same lock across its binding read and
+        // ConfigMap write), so a rotation cannot commit while a publication
+        // that read the pre-rotation bindings is still about to write them.
+        let sentinel_present = crate::kbs::lock_legacy_publication_sentinel(&mut *tx)
+            .await
+            .map_err(|_| internal_server_error())?;
+        // Even without a signer-bearing publication marker, an unsigned
+        // legacy binding may already be live. Initializing its signer changes
+        // the Rego render source but owes no withdrawal generation, so an
+        // unconfigured reconciler would incorrectly confirm success. Read
+        // under the app lane and publication sentinel, before the identity
+        // update, to exclude that unpublishable transition.
+        let unsigned_binding_would_change =
+            if app.signer_identity_subject.is_none() && app.signer_identity_issuer.is_none() {
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS (SELECT 1 FROM kbs_tls_bindings
+                                WHERE app_id = $1 AND deleted_at IS NULL)",
+                )
+                .bind(app.id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|_| internal_server_error())?
+            } else {
+                false
+            };
+        if !sentinel_present
+            || crate::kbs::read_legacy_publication_obligation(&mut *tx)
+                .await
+                .map_err(|_| internal_server_error())?
+            || unsigned_binding_would_change
+        {
+            let error = crate::kbs::KbsPolicyError::NotConfigured;
+            tracing::warn!(
+                app = %app_name,
+                org_id = %auth.org_id,
+                %error,
+                error_code = "kbs_publication_not_configured",
+                "refusing signer rotation: a legacy KBS publication obligation is recorded without KBS configuration"
+            );
+            tx.rollback().await.map_err(|_| internal_server_error())?;
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "a legacy KBS publication obligation is recorded but KBS publication is not configured; refusing to commit a signer rotation that could not be published",
+                    "code": "kbs_publication_not_configured",
+                })),
+            ));
+        }
+    }
+
     let previous_subject = app.signer_identity_subject.clone();
     let previous_issuer = app.signer_identity_issuer.clone();
 
     let is_initial_set = previous_subject.is_none() && previous_issuer.is_none();
+
+    // A current-identity confirmation cannot mutate authority or consume a
+    // token. Release the lanes before the caller takes the global publication
+    // fence; the generation still comes from the row read under the lanes so
+    // the confirmation fences rotations that commit after it.
+    if previous_subject.as_deref() == Some(subject.as_str())
+        && previous_issuer.as_deref() == Some(issuer.as_str())
+    {
+        let signer_rotation_generation = app.signer_rotation_generation;
+        tx.rollback().await.map_err(|_| internal_server_error())?;
+        return Ok((app.into(), signer_rotation_generation));
+    }
+
     let confirmation_token = body
         .email_confirmation_token
         .as_deref()
@@ -2475,6 +3221,10 @@ pub async fn rotate_signer(
         ));
     }
 
+    // Claims of the verified rotation token; present for every non-initial
+    // rotation (consumed atomically below, issue #119).
+    let mut signer_rotation_claims = None;
+
     if !is_initial_set {
         let expected = SignerRotationTokenInput {
             user_id: auth.user_id,
@@ -2485,7 +3235,10 @@ pub async fn rotate_signer(
             new_subject: subject.clone(),
             new_issuer: issuer.clone(),
         };
-        verify_signer_rotation_token(
+        // Consume the token's jti atomically with the rotation below: a
+        // token that was already used for this exact rotation is rejected
+        // (issue #119).
+        let claims = verify_signer_rotation_token(
             state.hmac_key.as_ref(),
             confirmation_token.expect("checked above"),
             &expected,
@@ -2496,6 +3249,7 @@ pub async fn rotate_signer(
                 Json(serde_json::json!({"error": "invalid email_confirmation_token"})),
             )
         })?;
+        signer_rotation_claims = Some(claims);
     }
 
     sqlx::query(
@@ -2513,9 +3267,68 @@ pub async fn rotate_signer(
     .await
     .map_err(|_| internal_server_error())?;
 
-    // Audit. TODO(phase-2): the rotated signer_identity must be re-rendered
-    // into the KBS Rego policy for this app once the Phase 2 policy
-    // templates land.
+    if !is_initial_set {
+        let claims = signer_rotation_claims
+            .take()
+            .expect("non-initial rotations verify a token above");
+        // Consume the token's jti atomically with the rotation below. A jti
+        // that was already consumed is a replay: roll back this transaction
+        // (the signer UPDATE above has not committed) and refuse (issue
+        // #119).
+        let consumed = sqlx::query(
+            "INSERT INTO consumed_signer_rotation_tokens (
+                 jti, user_id, org_id, app_id, subject, issuer, expires_at
+             )
+             VALUES ($1, $2, $3, $4, $5, $6, to_timestamp($7))
+             ON CONFLICT (jti) DO NOTHING",
+        )
+        .bind(&claims.jti)
+        .bind(auth.user_id)
+        .bind(auth.org_id)
+        .bind(app.id)
+        .bind(&subject)
+        .bind(&issuer)
+        .bind(claims.exp)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| internal_server_error())?
+        .rows_affected();
+        if consumed == 0 {
+            tracing::warn!(
+                app_id = %app.id,
+                user_id = %auth.user_id,
+                "rejected replayed signer rotation token"
+            );
+            tx.rollback().await.map_err(|_| internal_server_error())?;
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error": "invalid email_confirmation_token"})),
+            ));
+        }
+
+        // The apps UPDATE above fired migration 0067's
+        // apps_signer_rotation_withdrawal trigger inside this transaction:
+        // it withdrew the retained artifacts signed under the previous
+        // identity, carried the new identity into kbs_tls_bindings (the
+        // legacy Rego render source), and owed one deferred
+        // withdrawal_bumps_owed generation bump while signed-policy mode is
+        // active (issue #119).  The jti insert above is what satisfies the
+        // deferred consumption fence: a pre-0067 replica that runs only the
+        // UPDATE cannot commit the rotation, so the single-use token cannot
+        // be spent off-ledger and replayed after a rotate-back.  Fail-closed
+        // semantics: signed artifacts are immutable, so the app leaves the
+        // signed-policy set until the next deployment commits an artifact
+        // signed under the new identity.
+    }
+
+    // Audit. In signed mode rotation withdraws the previous signer's
+    // artifacts from KBS policy (fail-closed; the new identity becomes live
+    // when the next deployment commits an artifact signed under it). In
+    // legacy mode the updated kbs_tls_bindings carry the new identity into
+    // the re-rendered Rego policy directly. The initial set owes no
+    // revocation, but it still reconciles: an existing legacy binding of a
+    // previously-unsigned app must start admitting the new identity now,
+    // not at the next deployment.
     let action = if is_initial_set {
         "app.signer.set"
     } else {
@@ -2546,7 +3359,8 @@ pub async fn rotate_signer(
         .map_err(|_| internal_server_error())?;
     tx.commit().await.map_err(|_| internal_server_error())?;
 
-    Ok(Json(app.into()))
+    let signer_rotation_generation = app.signer_rotation_generation;
+    Ok((app.into(), signer_rotation_generation))
 }
 
 #[cfg(test)]

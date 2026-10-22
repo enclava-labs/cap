@@ -64,6 +64,18 @@ enclava status
 enclava key backup --out enclava-recovery.json
 ```
 
+For encrypted workload logs, use the current CLI and the tenant's log private key:
+
+```bash
+enclava logs --follow --log-private-key-file /path/to/log-key.x25519
+```
+
+Approve `apps:logs` with `enclava login --approve-logs` if the session lacks it.
+Successful follow streams have no total deadline; initial headers, error bodies
+and ordinary API requests remain bounded.
+Blank-line keepalives preserve idle streams without printing fake log messages.
+Each encrypted record is size-bounded before decoding.
+
 Images may be digest-pinned or tagged (`enclava deploy --image
 <registry>/<image>:<tag>`). The CLI resolves tags to a content digest before
 signing; CAP independently resolves the image and checks that the digests agree.
@@ -89,6 +101,14 @@ enclava template ssh-command --name shell --wait
 
 Those commands are convenience flows for hosted templates. They are not required
 for the core manual deploy path.
+
+An interrupted first template deployment can be retried with the same command.
+For CAP's single-replica automatic rollouts, applying changed init data replaces
+only an unready Pod owned by a ledger-recorded StatefulSet and still using the
+old init data. Deletion checks the live StatefulSet generation and the Pod UID
+and resource version, retains PVCs, and uses normal graceful termination.
+The CLI requires the signed deployment's attested launch identity both while
+waiting for bootstrap and on the client that submits the ownership claim.
 
 ## Local Development
 
@@ -122,7 +142,7 @@ Common checks:
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo test --workspace -- --test-threads=1
 cargo test --doc
 ```
 
@@ -133,11 +153,16 @@ features.
 When local native dependencies are unavailable, run targeted checks:
 
 ```bash
-cargo test -p enclava-api --lib
+cargo test -p enclava-api --lib -- --test-threads=1
 cargo test -p enclava-cli
 cargo test -p enclava-engine
-cargo test --workspace --exclude enclava-init
+cargo test --workspace --exclude enclava-init -- --test-threads=1
 ```
+
+Database-backed API library tests require a dedicated local PostgreSQL superuser,
+as in CI: isolated fixtures create/drop databases, and schema-guard tests mutate
+system catalogs. Run the full suite serially because remaining fixtures share
+global provider fences. Never point these tests at a persistent environment.
 
 API integration tests need PostgreSQL:
 

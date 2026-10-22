@@ -99,7 +99,7 @@ impl DescriptorPlatformBinding {
 }
 
 const DEFAULT_SIGNING_SERVICE_TIMEOUT_SECONDS: u64 = 120;
-const ORG_SIGNING_AUTHORITY_LANE_DOMAIN: i32 = 0x5349_474e;
+pub(crate) const ORG_SIGNING_AUTHORITY_LANE_DOMAIN: i32 = 0x5349_474e;
 
 /// Build the platform binding for descriptor validation from the API runtime
 /// state and the app's persisted memory limit (which selects the small vs
@@ -118,7 +118,7 @@ pub fn descriptor_platform_binding_for(
     )
 }
 
-fn org_signing_advisory_key(id: Uuid) -> i32 {
+pub(crate) fn org_signing_advisory_key(id: Uuid) -> i32 {
     let bytes = id.as_bytes();
     let a = u32::from_be_bytes(bytes[0..4].try_into().expect("UUID word"));
     let b = u32::from_be_bytes(bytes[4..8].try_into().expect("UUID word"));
@@ -141,6 +141,28 @@ pub async fn lock_org_signing_authority_lane(
         .execute(&mut **tx)
         .await?;
     Ok(())
+}
+
+/// Acquire the signing-authority lane and return the authoritative
+/// "now" observed strictly after the lock is held.
+///
+/// The lane is a blocking advisory lock: callers can queue behind other
+/// signing-authority writers (which perform signing-service requests while
+/// holding it) for longer than any freshness window. A reference time
+/// captured before locking therefore describes the past, not the moment
+/// the caller's own checks run. This reads clock_timestamp() from the
+/// already-locked transaction so freshness bounds use the post-acquisition
+/// instant on the same clock that witnesses org_keyrings.created_at
+/// (migration 0063).
+pub async fn lock_org_signing_authority_lane_now(
+    tx: &mut Transaction<'_, Postgres>,
+    org_id: Uuid,
+) -> Result<DateTime<Utc>, sqlx::Error> {
+    lock_org_signing_authority_lane(tx, org_id).await?;
+    let now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&mut **tx)
+        .await?;
+    Ok(now)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -495,7 +517,9 @@ impl DeploymentSigningArtifacts {
             descriptor_signing_pubkey: self.descriptor_signing_pubkey,
             org_keyring_fingerprint: self.org_keyring_fingerprint,
             omit_log_encryption_claim: false,
+            legacy_collapsed_trustee_key: false,
             omit_luks2_header_seal_claim: false,
+            omit_log_spool_bind_claim: false,
         }
     }
 
@@ -691,19 +715,26 @@ impl DeploymentSigningArtifacts {
     }
 
     /// Validate the cc_init_data hash rendered from `app` against this
-    /// artifact's signed expectation, accepting either the modern render
-    /// (with the `log_encryption_json` claim) or — for artifacts signed
-    /// before the claim existed — the legacy render without it. When only
-    /// the legacy render matches, the app's artifact binding is pinned to
-    /// `omit_log_encryption_claim` so every downstream consumer
-    /// (statefulset, KBS policy/TLS bindings) renders the exact bytes the
-    /// artifact was signed over. The artifact then boots exactly as it did
-    /// pre-change, but encrypted logging is OFF until the app is re-signed:
-    /// the legacy render carries no claim, so init publishes the explicit
-    /// disabled marker and prod-strict wait-exec never falls back to
-    /// env-supplied key material. Logs are discarded, not emitted in
-    /// plaintext. This is backwards compatibility, not a trust downgrade;
-    /// fresh signings always match the modern render.
+    /// artifact's signed expectation, accepting any legacy byte layout
+    /// artifacts were historically signed over:
+    ///
+    /// - the modern render (with the `log_encryption_json` claim and the
+    ///   split cap#118 policy keys),
+    /// - the pre-claim render without the `log_encryption_json` claim,
+    /// - the pre-cap#118 collapsed render (trustee slot = signing-service
+    ///   key), with or without the claim.
+    ///
+    /// When only a legacy render matches, the app's artifact binding is
+    /// pinned to that layout so every downstream consumer (statefulset,
+    /// enclava-init ConfigMap, KBS policy/TLS bindings) renders the exact
+    /// bytes the artifact was signed over. The artifact then boots exactly
+    /// as it did when it was signed: a pre-claim match runs with encrypted
+    /// logging OFF (the legacy render carries no claim, so init publishes
+    /// the explicit disabled marker and prod-strict wait-exec never falls
+    /// back to env-supplied key material; logs are discarded, not emitted in
+    /// plaintext), and a collapsed match reproduces the collapsed trustee
+    /// claim until the app is re-signed. This is backwards compatibility,
+    /// not a trust downgrade; fresh signings always match the modern render.
     pub fn validate_and_pin_cc_init_data_render(
         &self,
         app: &mut enclava_engine::types::ConfidentialApp,
@@ -719,13 +750,27 @@ impl DeploymentSigningArtifacts {
         // rejecting that rollback. Affected artifacts must be re-signed.
         let seal_required =
             enclava_engine::manifest::cc_init_data::luks2_header_seal_claim() == "required";
-        pin_matching_cc_init_data_render(app, &expected, seal_required)
+        // cap#290 review: the `log_spool_storage` claim may only be
+        // accepted/emitted once this API deployment declares the bind
+        // capability (installed at startup from its deployment
+        // environment, reported to signers via deployment-context). While
+        // the deployment does not declare it, claim-bearing artifacts are
+        // rejected with a re-sign diagnostic.
+        let spool_bind_supported =
+            enclava_engine::manifest::cc_init_data::log_spool_bind_supported();
+        pin_matching_cc_init_data_render(app, &expected, seal_required, spool_bind_supported)
     }
 
+    /// `signing_service_pubkey_hex` is the public key of the off-cluster
+    /// signing service that produced the artifact: policy artifacts come
+    /// from `/sign`, so the acceptance authority is the signing-service key
+    /// (a response signed with any other key is rejected). The platform
+    /// trustee policy key (cap#118) is a separate, in-TEE trust domain and
+    /// must never be loaded into the signing service.
     pub fn validate_signed_artifact(
         &self,
         artifact: &SignedPolicyArtifact,
-        signing_service_pubkey_hex: &str,
+        policy_authority_pubkey_hex: &str,
     ) -> Result<(), SigningServiceError> {
         // Field caps, then the platform signature over the canonical blob,
         // then semantic payload compares (#128). Hashing rego_text to build
@@ -733,7 +778,7 @@ impl DeploymentSigningArtifacts {
         // mismatch diagnostic is gated behind a valid platform signature.
         validate_signed_artifact_field_caps(artifact)?;
         let rego_hash: [u8; 32] = Sha256::digest(artifact.rego_text.as_bytes()).into();
-        verify_signed_policy_artifact(artifact, &rego_hash, signing_service_pubkey_hex)?;
+        verify_signed_policy_artifact(artifact, &rego_hash, policy_authority_pubkey_hex)?;
         self.validate_signed_artifact_common(artifact, &rego_hash)?;
         Ok(())
     }
@@ -1316,6 +1361,11 @@ fn verify_signed_policy_artifact_with_pubkey(
     // also disagrees — no semantic signal before the crypto check.
     let verifying_key = VerifyingKey::from_bytes(expected_pubkey)
         .map_err(|_| SigningServiceError::Mismatch(pubkey_field.into()))?;
+    // A weak (small-order) key verifies zero-signature forgeries under
+    // verify(); reject before the crypto check (cap#218 follow-up).
+    if verifying_key.is_weak() {
+        return Err(SigningServiceError::Mismatch(pubkey_field.into()));
+    }
     let signature = Signature::from_bytes(&decode_signature(&artifact.signature)?);
     // #128: building the signing input parses attacker-controlled metadata
     // (UUID/hex fields). A malformed field must surface the same error as a
@@ -1740,9 +1790,10 @@ impl LoadedWorkloadArtifacts {
 /// (cap#244 review): try the render-compatibility combinations, newest
 /// layout first, and pin the exact one the artifact was signed over so
 /// every downstream consumer (statefulset, KBS policy, TLS binding,
-/// ConfigMap transport) renders identical bytes. The two legacy flags
+/// ConfigMap transport) renders identical bytes. The legacy flags
 /// cover artifacts signed before the `log_encryption_json` claim
-/// (cap#204-era) and before the `luks2_header_seal` rollout claim
+/// (cap#204-era), before the cap#118 policy-key split (collapsed
+/// trustee key), and before the `luks2_header_seal` rollout claim
 /// (cap#242) existed; a claim-less seal render keeps the guest-side
 /// rollout-window ("adopt") default, so those artifacts boot exactly
 /// as they did pre-change.
@@ -1753,27 +1804,68 @@ impl LoadedWorkloadArtifacts {
 /// accepting one would let a hostile host replay an unsealed header and
 /// have it adopted despite the fleet-wide release rejecting that rollback.
 /// Affected artifacts must be re-signed against the current release.
+///
+/// `spool_bind_supported` (this API's deployment gate declares
+/// `log_spool_storage: state-bind-v1`, cap#290 review) is the init-first
+/// rollout gate: a claim-bearing spool render is only legitimate once the
+/// deployed enclava-init performs the state-PVC bind, so while the
+/// deployment does not declare the capability such renders must not be
+/// accepted — a pre-bind init would parse the ConfigMap key yet leave the
+/// spool on the RAM mountpoint. An artifact matching ONLY a claim-bearing
+/// render gets a re-sign diagnostic instead of a generic hash mismatch.
 fn pin_matching_cc_init_data_render(
     app: &mut enclava_engine::types::ConfidentialApp,
     expected_hash_hex: &str,
     seal_required: bool,
+    spool_bind_supported: bool,
 ) -> Result<(), SigningServiceError> {
-    for (omit_log, omit_seal) in [(false, false), (true, false), (false, true), (true, true)] {
+    // Set when a claim-bearing spool render reproduced the signed hash
+    // while this deployment does not declare the `log_spool_storage` bind.
+    let mut claim_bearing_spool_match = false;
+    for omit_seal in [false, true] {
         if omit_seal && seal_required {
             continue;
         }
-        if let Some(binding) = app.workload_artifact_binding.as_mut() {
-            binding.omit_log_encryption_claim = omit_log;
-            binding.omit_luks2_header_seal_claim = omit_seal;
-        }
-        let (_, hash) = enclava_engine::manifest::cc_init_data::compute_cc_init_data(app);
-        if hash == expected_hash_hex {
-            return Ok(());
+        for collapsed_trustee in [false, true] {
+            for omit_log in [false, true] {
+                for omit_spool_bind in [false, true] {
+                    if let Some(binding) = app.workload_artifact_binding.as_mut() {
+                        binding.omit_log_encryption_claim = omit_log;
+                        binding.omit_luks2_header_seal_claim = omit_seal;
+                        binding.legacy_collapsed_trustee_key = collapsed_trustee;
+                        binding.omit_log_spool_bind_claim = omit_spool_bind;
+                    }
+                    let (_, hash) =
+                        enclava_engine::manifest::cc_init_data::compute_cc_init_data(app);
+                    if hash == expected_hash_hex {
+                        // Claim-bearing spool renders are only acceptable
+                        // once the deployment declares the deployed init
+                        // understands the claim.
+                        if !omit_spool_bind && !spool_bind_supported {
+                            claim_bearing_spool_match = true;
+                            continue;
+                        }
+                        return Ok(());
+                    }
+                }
+            }
         }
     }
     if let Some(binding) = app.workload_artifact_binding.as_mut() {
         binding.omit_log_encryption_claim = false;
         binding.omit_luks2_header_seal_claim = false;
+        binding.legacy_collapsed_trustee_key = false;
+        binding.omit_log_spool_bind_claim = false;
+    }
+    if claim_bearing_spool_match {
+        return Err(SigningServiceError::Mismatch(
+            "expected_cc_init_data_hash (artifact was signed over a \
+             log_spool_storage claim-bearing render but this API deployment \
+             does not declare the log_spool_storage state-bind capability; \
+             re-sign the artifact after the init rollout ships an \
+             enclava-init that understands the claim)"
+                .into(),
+        ));
     }
     if seal_required {
         return Err(SigningServiceError::Mismatch(
@@ -1903,7 +1995,9 @@ fn decode_loaded_workload_artifacts(
             descriptor_signing_pubkey,
             org_keyring_fingerprint,
             omit_log_encryption_claim: false,
+            legacy_collapsed_trustee_key: false,
             omit_luks2_header_seal_claim: false,
+            omit_log_spool_bind_claim: false,
         },
         trustee_policy_json: trustee_policy_json(&signed_policy_artifact)?,
         workload_artifacts_json: serde_json::to_string(&artifacts_json)?,
@@ -2070,7 +2164,9 @@ pub async fn load_workload_artifact_binding(
             descriptor_signing_pubkey,
             org_keyring_fingerprint: keyring_fingerprint(&org_keyring),
             omit_log_encryption_claim: false,
+            legacy_collapsed_trustee_key: false,
             omit_luks2_header_seal_claim: false,
+            omit_log_spool_bind_claim: false,
         },
         signed_policy_artifact,
     )))

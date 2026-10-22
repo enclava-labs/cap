@@ -8,73 +8,35 @@ use std::path::Path;
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use enclava_common::canonical::ce_v1_bytes;
+use enclava_common::release_profiles::{self, ProfileError, ReleaseProfile};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+#[cfg(test)]
 const BUNDLED_PLATFORM_RELEASE: &str = include_str!("../../enclava-cli/platform-release.json");
 
-#[cfg(any(test, feature = "prod-strict"))]
-const FORBIDDEN_FIXTURE_RELEASE_ROOT_PUBKEY_HEX: &str =
-    "5b9437adeaffbe8f41b13d96ed49d2f51cd6c266cd8ecc284b0552ec4912b8dd";
-
 #[cfg(test)]
-const TEST_FIXTURE_RELEASE_ROOT_PUBKEY_HEX: &str = FORBIDDEN_FIXTURE_RELEASE_ROOT_PUBKEY_HEX;
+const TEST_FIXTURE_RELEASE_ROOT_PUBKEY_HEX: &str = release_profiles::FIXTURE_ROOT;
 
-#[cfg(any(test, feature = "prod-strict"))]
-// ponytail: manual compare, u8::eq_ignore_ascii_case is not const at MSRV 1.85
-#[allow(clippy::manual_ignore_case_cmp)]
-const fn eq_ignore_ascii_case(a: &str, b: &str) -> bool {
-    let a = a.as_bytes();
-    let b = b.as_bytes();
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut i = 0;
-    while i < a.len() {
-        if a[i].to_ascii_lowercase() != b[i].to_ascii_lowercase() {
-            return false;
-        }
-        i += 1;
-    }
-    true
+/// Public half of the dev-fixture trustee policy seed (c1*32) committed with
+/// crates/enclava-cli/scripts/generate-platform-release.py. Rejected for any
+/// release not signed by the dev fixture root (see verify_envelope).
+const DEV_FIXTURE_TRUSTEE_POLICY_PUBKEY_HEX: &str =
+    "acdcc8494d458f44a7aaac1d6a84ec624daee88436db2ae26e67ba645a106228";
+
+fn fixture_trustee_policy_pubkey() -> Vec<u8> {
+    hex::decode(DEV_FIXTURE_TRUSTEE_POLICY_PUBKEY_HEX).expect("static hex decodes")
 }
 
-#[cfg(any(test, feature = "prod-strict"))]
-const fn is_forbidden_fixture_root(root: &str) -> bool {
-    eq_ignore_ascii_case(root, FORBIDDEN_FIXTURE_RELEASE_ROOT_PUBKEY_HEX)
+/// Decoded dev-fixture release root (pubkey 5b9437ad...): releases signed by
+/// it may pin the fixture trustee key; production roots may not.
+fn fixture_root_pubkey() -> [u8; 32] {
+    hex::decode("5b9437adeaffbe8f41b13d96ed49d2f51cd6c266cd8ecc284b0552ec4912b8dd")
+        .expect("static hex decodes")
+        .try_into()
+        .expect("32 bytes")
 }
-
-/// 64 ASCII hex characters (either case) = a 32-byte key.
-#[cfg(any(test, feature = "prod-strict"))]
-const fn is_hex32_root(root: &str) -> bool {
-    let bytes = root.as_bytes();
-    if bytes.len() != 64 {
-        return false;
-    }
-    let mut i = 0;
-    while i < bytes.len() {
-        let c = bytes[i].to_ascii_lowercase();
-        if !(c.is_ascii_digit() || (c >= b'a' && c <= b'f')) {
-            return false;
-        }
-        i += 1;
-    }
-    true
-}
-
-#[cfg(all(not(test), feature = "prod-strict"))]
-const _: () = {
-    match option_env!("ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX") {
-        Some(root) if is_forbidden_fixture_root(root) => {
-            panic!("prod-strict builds must not pin the committed fixture platform-release root");
-        }
-        Some(root) if is_hex32_root(root) => {}
-        _ => panic!(
-            "prod-strict builds require ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX to be set to a 32-byte hex pubkey"
-        ),
-    }
-};
 
 #[derive(Debug, Error)]
 pub enum PlatformReleaseError {
@@ -89,8 +51,8 @@ pub enum PlatformReleaseError {
         field: &'static str,
         message: String,
     },
-    #[error("platform release root pubkey is not configured at compile time")]
-    MissingRootPubkey,
+    #[error(transparent)]
+    Profile(#[from] ProfileError),
     #[error(
         "platform release signature pubkey is not the pinned root: this build pins {pinned}, the release declares {signing}; verify the target platform and, if this is an expected root rotation, update this enclava-api deployment using a trusted build with the expected pin"
     )]
@@ -123,6 +85,11 @@ pub struct PlatformRelease {
     pub platform_release_version: String,
     pub signing_service_url: String,
     pub signing_service_pubkey_hex: String,
+    // Deserialization of a pre-field *bundled baseline* is allowed only for
+    // verifying its old signed bytes. Runtime release validation still
+    // requires a distinct, nonempty trustee key.
+    #[serde(default)]
+    pub platform_trustee_policy_pubkey_hex: String,
     pub policy_template_id: String,
     pub policy_template_sha256: String,
     pub policy_template_text: String,
@@ -163,10 +130,25 @@ impl PlatformRelease {
     }
 
     pub fn signing_service_pubkey_bytes(&self) -> Result<[u8; 32], PlatformReleaseError> {
-        hex32(
+        let bytes = hex32(
             "signing_service_pubkey_hex",
             &self.signing_service_pubkey_hex,
-        )
+        )?;
+        require_ed25519_point("signing_service_pubkey_hex", &bytes)?;
+        Ok(bytes)
+    }
+
+    /// Dedicated in-TEE policy authority key. Must differ from
+    /// `signing_service_pubkey_hex`: the two are distinct trust domains
+    /// (in-TEE policy authority vs off-cluster signing service) and a
+    /// release that collapses them is rejected at validation time.
+    pub fn platform_trustee_policy_pubkey_bytes(&self) -> Result<[u8; 32], PlatformReleaseError> {
+        let bytes = hex32(
+            "platform_trustee_policy_pubkey_hex",
+            &self.platform_trustee_policy_pubkey_hex,
+        )?;
+        require_ed25519_point("platform_trustee_policy_pubkey_hex", &bytes)?;
+        Ok(bytes)
     }
 
     /// Effective LUKS2 header-seal rollout claim: the signed value when the
@@ -183,25 +165,37 @@ impl PlatformRelease {
 
 impl PlatformReleaseEnvelope {
     pub fn load_verified() -> Result<Self, PlatformReleaseError> {
+        let name = std::env::var("ENCLAVA_PLATFORM_RELEASE_PROFILE").ok();
+        let profile = release_profiles::server_profile(name.as_deref())?;
+        if let Ok(api_url) = std::env::var("API_URL") {
+            let expected = release_profiles::bundled()?.for_api(&api_url)?;
+            if !std::ptr::eq(profile, expected) {
+                return Err(ProfileError("selected profile does not match API_URL".into()).into());
+            }
+        } else if cfg!(feature = "prod-strict") {
+            return Err(
+                ProfileError("API_URL is required to bind the selected profile".into()).into(),
+            );
+        }
         let override_path = std::env::var("ENCLAVA_PLATFORM_RELEASE_PATH")
             .ok()
             .filter(|path| !path.trim().is_empty());
-        let raw = match &override_path {
-            Some(path) => std::fs::read_to_string(Path::new(path))?,
-            None => BUNDLED_PLATFORM_RELEASE.to_string(),
-        };
-        Self::load_verified_from_raw(&raw, override_path.is_some())
+        let override_raw = override_path
+            .map(|path| std::fs::read_to_string(Path::new(&path)))
+            .transpose()?;
+        Self::load_verified_from_raw(
+            override_raw.as_deref().unwrap_or(profile.baseline.get()),
+            profile,
+        )
     }
 
     fn load_verified_from_raw(
         raw: &str,
-        override_active: bool,
+        profile: &ReleaseProfile,
     ) -> Result<Self, PlatformReleaseError> {
         let envelope: PlatformReleaseEnvelope = serde_json::from_str(raw)?;
-        verify_envelope(envelope.clone())?;
-        if override_active {
-            enforce_release_not_older_than_bundled(&envelope.payload)?;
-        }
+        verify_envelope(envelope.clone(), profile)?;
+        enforce_release_not_older_than_bundled(&envelope.payload, profile)?;
         Ok(envelope)
     }
 }
@@ -214,20 +208,27 @@ impl PlatformReleaseEnvelope {
 /// rather than silently disabling the check.
 pub fn enforce_release_not_older_than_bundled(
     release: &PlatformRelease,
+    profile: &ReleaseProfile,
 ) -> Result<(), PlatformReleaseError> {
-    let bundled: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE)?;
+    let bundled = verify_signed_baseline(profile.baseline.get(), &profile.root_pubkey_hex)?;
+    enforce_release_not_older_than_baseline(release, &bundled.payload)
+}
+
+fn enforce_release_not_older_than_baseline(
+    release: &PlatformRelease,
+    baseline: &PlatformRelease,
+) -> Result<(), PlatformReleaseError> {
     let candidate_ts = parse_release_timestamp(&release.created_at)?;
-    let bundled_ts = parse_release_timestamp(&bundled.payload.created_at)?;
+    let bundled_ts = parse_release_timestamp(&baseline.created_at)?;
     if candidate_ts < bundled_ts
         || (candidate_ts == bundled_ts
-            && canonical_platform_release_bytes(release)?
-                != canonical_platform_release_bytes(&bundled.payload)?)
+            && canonical_platform_release_bytes(release)? != canonical_baseline_bytes(baseline)?)
     {
         return Err(PlatformReleaseError::DowngradeRefused {
             override_version: release.platform_release_version.clone(),
             override_created: release.created_at.clone(),
-            bundled_version: bundled.payload.platform_release_version.clone(),
-            bundled_created: bundled.payload.created_at.clone(),
+            bundled_version: baseline.platform_release_version.clone(),
+            bundled_created: baseline.created_at.clone(),
         });
     }
     Ok(())
@@ -246,14 +247,75 @@ fn parse_release_timestamp(
 
 pub fn verify_envelope(
     envelope: PlatformReleaseEnvelope,
+    profile: &ReleaseProfile,
 ) -> Result<PlatformRelease, PlatformReleaseError> {
-    #[cfg(test)]
-    let configured_root = option_env!("ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX")
-        .unwrap_or(TEST_FIXTURE_RELEASE_ROOT_PUBKEY_HEX);
-    #[cfg(not(test))]
-    let configured_root = option_env!("ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX")
-        .ok_or(PlatformReleaseError::MissingRootPubkey)?;
-    let pinned = hex32("ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX", configured_root)?;
+    let release = verify_envelope_with_root(envelope, &profile.root_pubkey_hex)?;
+    profile.require_installation_identity(
+        &release.signing_service_pubkey_hex,
+        &release.trustee_kbs_ca_cert_pem,
+    )?;
+    Ok(release)
+}
+
+fn verify_envelope_with_root(
+    envelope: PlatformReleaseEnvelope,
+    root: &str,
+) -> Result<PlatformRelease, PlatformReleaseError> {
+    let canonical = canonical_platform_release_bytes(&envelope.payload)?;
+    let signing = verify_root_signature(&envelope, root, &canonical)?;
+    let actual_template_hash = hex::encode(Sha256::digest(
+        envelope.payload.policy_template_text.as_bytes(),
+    ));
+    if actual_template_hash != envelope.payload.policy_template_sha256 {
+        return Err(PlatformReleaseError::TemplateHashMismatch);
+    }
+    refuse_fixture_keys_outside_fixture_root(&envelope.payload, &signing)?;
+    validate_release_payload(&envelope.payload)?;
+    Ok(envelope.payload)
+}
+
+// Only the compiled-in downgrade floor may use the pre-trustee signed
+// encoding. A release selected for runtime use always goes through
+// verify_envelope and cannot omit the dedicated policy authority.
+fn verify_signed_baseline(
+    raw: &str,
+    root: &str,
+) -> Result<PlatformReleaseEnvelope, PlatformReleaseError> {
+    let value: serde_json::Value = serde_json::from_str(raw)?;
+    let pre_trustee = value
+        .get("payload")
+        .and_then(|payload| payload.get("platform_trustee_policy_pubkey_hex"))
+        .is_none();
+    let envelope: PlatformReleaseEnvelope = serde_json::from_value(value)?;
+    if !pre_trustee {
+        verify_envelope_with_root(envelope.clone(), root)?;
+        return Ok(envelope);
+    }
+    let canonical = canonical_baseline_bytes(&envelope.payload)?;
+    let signing = verify_root_signature(&envelope, root, &canonical)?;
+    if envelope.payload.schema_version != "v1" {
+        return Err(PlatformReleaseError::InvalidField {
+            field: "schema_version",
+            message: "expected v1".to_string(),
+        });
+    }
+    parse_release_timestamp(&envelope.payload.created_at)?;
+    let actual_template_hash = hex::encode(Sha256::digest(
+        envelope.payload.policy_template_text.as_bytes(),
+    ));
+    if actual_template_hash != envelope.payload.policy_template_sha256 {
+        return Err(PlatformReleaseError::TemplateHashMismatch);
+    }
+    refuse_fixture_keys_outside_fixture_root(&envelope.payload, &signing)?;
+    Ok(envelope)
+}
+
+fn verify_root_signature(
+    envelope: &PlatformReleaseEnvelope,
+    root: &str,
+    canonical: &[u8],
+) -> Result<[u8; 32], PlatformReleaseError> {
+    let pinned = hex32("root_pubkey_hex", root)?;
     let signing = hex32("signing_pubkey", &envelope.signing_pubkey)?;
     if signing != pinned {
         return Err(PlatformReleaseError::RootMismatch {
@@ -274,28 +336,75 @@ pub fn verify_envelope(
         }
     })?;
     let signature = Signature::from_bytes(&signature_arr);
-    let canonical = canonical_platform_release_bytes(&envelope.payload)?;
     verifying_key
-        .verify(&canonical, &signature)
+        .verify(canonical, &signature)
         .map_err(|err| PlatformReleaseError::BadSignature(err.to_string()))?;
+    Ok(signing)
+}
 
-    let actual_template_hash = hex::encode(Sha256::digest(
-        envelope.payload.policy_template_text.as_bytes(),
-    ));
-    if actual_template_hash != envelope.payload.policy_template_sha256 {
-        return Err(PlatformReleaseError::TemplateHashMismatch);
+/// cap#118: the dev-fixture trustee policy key's seed is public (c1*32,
+/// committed with the generator). A non-fixture root must never sign a
+/// release that pins it in either key slot: while both keys are pinned,
+/// policy signatures verify against the signing-service key (#217), and
+/// once the trustee key becomes the policy authority its slot matters
+/// directly — a public-seed key in either slot would let anyone with the
+/// repo forge policy envelopes the TEE accepts. Mirrored verbatim in
+/// enclava-cli (keep both in sync).
+pub fn refuse_fixture_keys_outside_fixture_root(
+    release: &PlatformRelease,
+    signing_pubkey: &[u8; 32],
+) -> Result<(), PlatformReleaseError> {
+    if *signing_pubkey == fixture_root_pubkey() {
+        return Ok(());
     }
-    validate_release_payload(&envelope.payload)?;
-    Ok(envelope.payload)
+    for (field, value) in [
+        (
+            "platform_trustee_policy_pubkey_hex",
+            &release.platform_trustee_policy_pubkey_hex,
+        ),
+        (
+            "signing_service_pubkey_hex",
+            &release.signing_service_pubkey_hex,
+        ),
+    ] {
+        if hex::decode(value)? == fixture_trustee_policy_pubkey() {
+            return Err(PlatformReleaseError::InvalidField {
+                field,
+                message:
+                    "dev-fixture trustee policy key is only allowed under the dev fixture root"
+                        .to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 pub fn canonical_platform_release_bytes(
     release: &PlatformRelease,
 ) -> Result<Vec<u8>, PlatformReleaseError> {
+    canonical_release_bytes(release, false)
+}
+
+fn canonical_baseline_bytes(release: &PlatformRelease) -> Result<Vec<u8>, PlatformReleaseError> {
+    canonical_release_bytes(
+        release,
+        release.platform_trustee_policy_pubkey_hex.is_empty(),
+    )
+}
+
+fn canonical_release_bytes(
+    release: &PlatformRelease,
+    pre_trustee: bool,
+) -> Result<Vec<u8>, PlatformReleaseError> {
     let signing_service_pubkey = hex32(
         "signing_service_pubkey_hex",
         &release.signing_service_pubkey_hex,
     )?;
+    let platform_trustee_policy_pubkey = if pre_trustee {
+        None
+    } else {
+        Some(release.platform_trustee_policy_pubkey_bytes()?)
+    };
     let policy_template_sha256 = release.policy_template_sha256_bytes()?;
     let expected_firmware_measurement = release.expected_firmware_measurement_bytes()?;
     let mut records: Vec<(&str, &[u8])> = vec![
@@ -347,6 +456,15 @@ pub fn canonical_platform_release_bytes(
         ),
         ("genpolicy_version", release.genpolicy_version.as_bytes()),
     ];
+    if let Some(ref platform_trustee_policy_pubkey) = platform_trustee_policy_pubkey {
+        records.insert(
+            5,
+            (
+                "platform_trustee_policy_pubkey",
+                platform_trustee_policy_pubkey,
+            ),
+        );
+    }
     // The seal-rollout claim is signed when present (cap#244 review), but
     // only then: releases signed before the field existed carry no such
     // record and must keep verifying byte-for-byte, so the record is
@@ -394,6 +512,13 @@ fn validate_release_payload(release: &PlatformRelease) -> Result<(), PlatformRel
         "signing_service_pubkey_hex",
         &release.signing_service_pubkey_hex,
     )?;
+    let platform_trustee_policy_pubkey = release.platform_trustee_policy_pubkey_bytes()?;
+    if platform_trustee_policy_pubkey == release.signing_service_pubkey_bytes()? {
+        return Err(PlatformReleaseError::InvalidField {
+            field: "platform_trustee_policy_pubkey_hex",
+            message: "platform trustee policy key must be distinct from the signing-service key (two trust domains must not share one key)".to_string(),
+        });
+    }
     hex32("policy_template_sha256", &release.policy_template_sha256)?;
     hex32(
         "expected_firmware_measurement",
@@ -506,14 +631,131 @@ fn hex32(field: &'static str, value: &str) -> Result<[u8; 32], PlatformReleaseEr
         })
 }
 
+/// A pin that the consumers cannot parse must fail release ingestion, not
+/// tenant boots: enclava-init's `parse_pubkey` calls
+/// `VerifyingKey::from_bytes` and aborts verification on failure, so one
+/// malformed key in a signed release would prevent every workload from
+/// starting. Verify the exact Ed25519 point encoding the consumers enforce
+/// (codex cap#218 P2).
+fn require_ed25519_point(
+    field: &'static str,
+    bytes: &[u8; 32],
+) -> Result<(), PlatformReleaseError> {
+    let key = ed25519_dalek::VerifyingKey::from_bytes(bytes).map_err(|err| {
+        PlatformReleaseError::InvalidField {
+            field,
+            message: format!("not a valid Ed25519 public key: {err}"),
+        }
+    })?;
+    // Small-order keys (identity, 00*32, torsion points) provide no
+    // unforgeability: policy acceptance uses verify(), not verify_strict(),
+    // and a zero signature verifies against a small-order key for a large
+    // share of messages. Reject at ingestion so a placeholder pin cannot
+    // accept forged policy artifacts (mirror check in enclava-init
+    // parse_pubkey).
+    if key.is_weak() {
+        return Err(PlatformReleaseError::InvalidField {
+            field,
+            message: "Ed25519 public key has small order and provides no unforgeability"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::Signer;
+
+    fn test_profile() -> &'static ReleaseProfile {
+        release_profiles::bundled().unwrap().named("dev").unwrap()
+    }
+
+    #[test]
+    fn startup_rejects_cross_installation_release_under_a_shared_root() {
+        let profiles = release_profiles::bundled().unwrap();
+        let preprod = profiles.named("preprod").unwrap();
+        let production = profiles.named("production").unwrap();
+        let mut envelope: PlatformReleaseEnvelope =
+            serde_json::from_str(preprod.baseline.get()).unwrap();
+        envelope.payload.created_at = "2099-01-01T00:00:00Z".into();
+        let raw = serde_json::to_string(&sign_envelope_with_dev_key(envelope.payload)).unwrap();
+        PlatformReleaseEnvelope::load_verified_from_raw(&raw, preprod).unwrap();
+        assert!(matches!(
+            PlatformReleaseEnvelope::load_verified_from_raw(&raw, production),
+            Err(PlatformReleaseError::Profile(_)),
+        ));
+    }
+
+    fn signed_pre_trustee_baseline() -> String {
+        let mut envelope: PlatformReleaseEnvelope =
+            serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
+        envelope.payload.platform_trustee_policy_pubkey_hex.clear();
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0xc0; 32]);
+        envelope.signature = hex::encode(
+            signing_key
+                .sign(&canonical_baseline_bytes(&envelope.payload).unwrap())
+                .to_bytes(),
+        );
+        let mut value = serde_json::to_value(envelope).unwrap();
+        value["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("platform_trustee_policy_pubkey_hex");
+        serde_json::to_string(&value).unwrap()
+    }
+
+    #[test]
+    fn legacy_signed_baseline_is_only_a_downgrade_floor() {
+        let raw = signed_pre_trustee_baseline();
+        let baseline = verify_signed_baseline(&raw, TEST_FIXTURE_RELEASE_ROOT_PUBKEY_HEX).unwrap();
+        assert!(
+            baseline
+                .payload
+                .platform_trustee_policy_pubkey_hex
+                .is_empty()
+        );
+        let old_runtime: PlatformReleaseEnvelope = serde_json::from_str(&raw).unwrap();
+        assert!(verify_envelope(old_runtime, test_profile()).is_err());
+
+        let mut current: PlatformReleaseEnvelope =
+            serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
+        assert!(matches!(
+            enforce_release_not_older_than_baseline(&current.payload, &baseline.payload),
+            Err(PlatformReleaseError::DowngradeRefused { .. })
+        ));
+        current.payload.created_at = "2099-01-01T00:00:00Z".into();
+        enforce_release_not_older_than_baseline(&current.payload, &baseline.payload).unwrap();
+
+        let mut altered: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        altered["payload"]["platform_release_version"] = "tampered".into();
+        assert!(matches!(
+            verify_signed_baseline(&altered.to_string(), TEST_FIXTURE_RELEASE_ROOT_PUBKEY_HEX),
+            Err(PlatformReleaseError::BadSignature(_))
+        ));
+        altered = serde_json::from_str(&raw).unwrap();
+        altered["payload"]["platform_trustee_policy_pubkey_hex"] = "".into();
+        assert!(
+            verify_signed_baseline(&altered.to_string(), TEST_FIXTURE_RELEASE_ROOT_PUBKEY_HEX)
+                .is_err()
+        );
+
+        let mut stripped: serde_json::Value =
+            serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
+        stripped["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("platform_trustee_policy_pubkey_hex");
+        assert!(matches!(
+            verify_signed_baseline(&stripped.to_string(), TEST_FIXTURE_RELEASE_ROOT_PUBKEY_HEX),
+            Err(PlatformReleaseError::BadSignature(_))
+        ));
+    }
 
     #[test]
     fn verifier_reports_mismatched_declared_root() {
-        let pinned = option_env!("ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX")
-            .unwrap_or(TEST_FIXTURE_RELEASE_ROOT_PUBKEY_HEX);
+        let pinned = TEST_FIXTURE_RELEASE_ROOT_PUBKEY_HEX;
         let mut foreign_root = hex32("test root", pinned).unwrap();
         foreign_root[0] ^= 1;
         let declared = hex::encode(foreign_root);
@@ -521,7 +763,8 @@ mod tests {
             serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
         envelope.signing_pubkey = declared.clone();
 
-        let error = verify_envelope(envelope).expect_err("a foreign root must fail verification");
+        let error = verify_envelope(envelope, test_profile())
+            .expect_err("a foreign root must fail verification");
         assert!(matches!(error, PlatformReleaseError::RootMismatch { .. }));
         let message = error.to_string();
         assert!(message.contains(&pinned.to_ascii_lowercase()));
@@ -529,37 +772,52 @@ mod tests {
     }
 
     #[test]
-    fn fixture_root_is_detected_case_insensitively() {
-        assert!(is_forbidden_fixture_root(
-            TEST_FIXTURE_RELEASE_ROOT_PUBKEY_HEX
-        ));
-        assert!(is_forbidden_fixture_root(
-            &TEST_FIXTURE_RELEASE_ROOT_PUBKEY_HEX.to_ascii_uppercase()
-        ));
-        assert!(!is_forbidden_fixture_root(
-            "0000000000000000000000000000000000000000000000000000000000000001"
-        ));
-    }
-
-    #[test]
-    fn hex32_root_shape_is_validated() {
-        assert!(is_hex32_root(
-            "0000000000000000000000000000000000000000000000000000000000000001"
-        ));
-        // Uppercase hex is still a valid key (hex::decode accepts it).
-        assert!(is_hex32_root(
-            "000000000000000000000000000000000000000000000000000000000000000A"
-        ));
-        assert!(!is_hex32_root(""));
-        assert!(!is_hex32_root(
-            "000000000000000000000000000000000000000000000000000000000000001"
-        ));
-        assert!(!is_hex32_root(
-            "00000000000000000000000000000000000000000000000000000000000000010"
-        ));
-        assert!(!is_hex32_root(
-            "zzzz000000000000000000000000000000000000000000000000000000000001"
-        ));
+    fn fixture_trustee_policy_key_is_rejected_under_a_non_fixture_root() {
+        // cap#118: the dev-fixture trustee seed is public (c1*32). A
+        // production root signing a release that still pins the fixture
+        // trustee key would let anyone with the repo forge policies.
+        // The gate sits in verify_envelope: with a fixture root it passes
+        // (the bundled envelope proves that), so exercise it by hand with a
+        // non-fixture signing root.
+        // NOTE: this API-side twin only asserts the gate's constants; the
+        // full negative coverage (re-signing the envelope under a production
+        // root and asserting verify_envelope rejects) lives in the CLI
+        // crate's twin test — fixture_trustee_policy_key_is_rejected_...
+        // in crates/enclava-cli/src/platform_release.rs. Keep both in sync
+        // (the gate logic and constants are deliberately duplicated).
+        let raw: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
+        assert_eq!(
+            raw.payload.platform_trustee_policy_pubkey_hex,
+            DEV_FIXTURE_TRUSTEE_POLICY_PUBKEY_HEX
+        );
+        assert_ne!(
+            fixture_root_pubkey(),
+            [0u8; 32],
+            "sanity: fixture root is a real key"
+        );
+        // The gate condition itself: non-fixture root + fixture trustee key.
+        let trustee = fixture_trustee_policy_pubkey();
+        assert_ne!(fixture_root_pubkey().to_vec(), trustee);
+        // Real negatives through the same gate verify_envelope calls (the
+        // full re-sign path lives in the CLI crate's twin tests): a
+        // non-fixture root must be refused in EITHER slot, while the
+        // fixture root may pin the fixture trustee key.
+        let raw: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
+        let prod_root = [0x42u8; 32];
+        let err = refuse_fixture_keys_outside_fixture_root(&raw.payload, &prod_root).unwrap_err();
+        assert!(
+            matches!(err, PlatformReleaseError::InvalidField { field, .. } if field == "platform_trustee_policy_pubkey_hex"),
+            "expected trustee-slot fixture rejection, got: {err:?}"
+        );
+        let mut payload = raw.payload.clone();
+        payload.signing_service_pubkey_hex = DEV_FIXTURE_TRUSTEE_POLICY_PUBKEY_HEX.to_string();
+        payload.platform_trustee_policy_pubkey_hex = "bb".repeat(32);
+        let err = refuse_fixture_keys_outside_fixture_root(&payload, &prod_root).unwrap_err();
+        assert!(
+            matches!(err, PlatformReleaseError::InvalidField { field, .. } if field == "signing_service_pubkey_hex"),
+            "expected signing-slot fixture rejection, got: {err:?}"
+        );
+        refuse_fixture_keys_outside_fixture_root(&raw.payload, &fixture_root_pubkey()).unwrap();
     }
 
     #[test]
@@ -581,8 +839,87 @@ mod tests {
             .payload
             .platform_release_version
             .push_str("-tampered");
-        let err = verify_envelope(tampered).unwrap_err();
+        let err = verify_envelope(tampered, test_profile()).unwrap_err();
         assert!(matches!(err, PlatformReleaseError::BadSignature(_)));
+    }
+
+    #[test]
+    fn bundled_release_carries_a_distinct_platform_trustee_policy_key() {
+        // cap#118: the in-TEE policy authority and the off-cluster signing
+        // service are two trust domains. The bundled signed release must pin
+        // a dedicated trustee policy key that differs from the
+        // signing-service key.
+        let release = PlatformRelease::load_verified().unwrap();
+        let trustee = release.platform_trustee_policy_pubkey_bytes().unwrap();
+        let signing = release.signing_service_pubkey_bytes().unwrap();
+        assert_ne!(trustee, signing);
+    }
+
+    #[test]
+    fn release_payload_rejects_collapsed_trustee_and_signing_keys() {
+        // A release (hand-crafted or mis-rotated) that collapses the two
+        // trust domains onto one key must fail validation, not fall back.
+        let raw: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
+        let mut payload = raw.payload;
+        payload.platform_trustee_policy_pubkey_hex = payload.signing_service_pubkey_hex.clone();
+        let err = validate_release_payload(&payload).unwrap_err();
+        assert!(
+            matches!(err, PlatformReleaseError::InvalidField { field, .. } if field == "platform_trustee_policy_pubkey_hex")
+        );
+    }
+
+    #[test]
+    fn release_payload_rejects_non_point_policy_keys() {
+        // codex cap#218 P2: both pins are parsed with
+        // VerifyingKey::from_bytes by the consumers (enclava-init
+        // parse_pubkey) and abort verification on failure, so a pin that is
+        // not a valid Ed25519 point would brick every workload at boot.
+        // Ingestion must reject it instead. The compressed encoding of a
+        // y with no Edwards point on the curve (e.g. y = 2 for
+        // edwards25519) is the canonical rejection case.
+        let raw: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
+        let non_point = format!("02{}", "00".repeat(31));
+        let mut payload = raw.payload.clone();
+        payload.platform_trustee_policy_pubkey_hex = non_point.clone();
+        let err = validate_release_payload(&payload).unwrap_err();
+        assert!(
+            matches!(err, PlatformReleaseError::InvalidField { field, message }
+                if field == "platform_trustee_policy_pubkey_hex"
+                    && message.contains("not a valid Ed25519 public key"))
+        );
+        let mut payload = raw.payload;
+        payload.signing_service_pubkey_hex = non_point;
+        let err = validate_release_payload(&payload).unwrap_err();
+        assert!(
+            matches!(err, PlatformReleaseError::InvalidField { field, message }
+                if field == "signing_service_pubkey_hex"
+                    && message.contains("not a valid Ed25519 public key"))
+        );
+    }
+
+    #[test]
+    fn release_payload_rejects_small_order_policy_keys() {
+        // cap#218 follow-up: policy acceptance uses verify(), not
+        // verify_strict(), and a zero signature verifies against a
+        // small-order key (e.g. 00*32) for a large share of messages —
+        // such a pin accepts forged policy artifacts.
+        let raw: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
+        let mut payload = raw.payload.clone();
+        payload.signing_service_pubkey_hex = "00".repeat(32);
+        let err = validate_release_payload(&payload).unwrap_err();
+        assert!(
+            matches!(&err, PlatformReleaseError::InvalidField { field, message }
+                if *field == "signing_service_pubkey_hex" && message.contains("small order")),
+            "unexpected error: {err:?}"
+        );
+        let mut payload = raw.payload;
+        payload.platform_trustee_policy_pubkey_hex = "00".repeat(32);
+        let err = validate_release_payload(&payload).unwrap_err();
+        assert!(
+            matches!(&err, PlatformReleaseError::InvalidField { field, message }
+                if *field == "platform_trustee_policy_pubkey_hex" && message.contains("small order")),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]
@@ -705,12 +1042,12 @@ mod tests {
     #[test]
     fn bundled_not_older_than_itself_and_newer_passes() {
         let bundled = bundled_payload();
-        assert!(enforce_release_not_older_than_bundled(&bundled).is_ok());
+        assert!(enforce_release_not_older_than_bundled(&bundled, test_profile()).is_ok());
 
         let mut newer = bundled.clone();
         newer.created_at = "2999-01-01T00:00:00Z".to_string();
         newer.platform_release_version = "dev-2999.01.01-x".to_string();
-        assert!(enforce_release_not_older_than_bundled(&newer).is_ok());
+        assert!(enforce_release_not_older_than_bundled(&newer, test_profile()).is_ok());
     }
 
     #[test]
@@ -719,7 +1056,7 @@ mod tests {
         stale.created_at = "2020-01-01T00:00:00Z".to_string();
         stale.platform_release_version = "zzz-newer-suffix".to_string();
         assert!(matches!(
-            enforce_release_not_older_than_bundled(&stale),
+            enforce_release_not_older_than_bundled(&stale, test_profile()),
             Err(PlatformReleaseError::DowngradeRefused { .. })
         ));
     }
@@ -730,7 +1067,7 @@ mod tests {
         divergent.platform_release_version =
             format!("{}-divergent", divergent.platform_release_version);
         assert!(matches!(
-            enforce_release_not_older_than_bundled(&divergent),
+            enforce_release_not_older_than_bundled(&divergent, test_profile()),
             Err(PlatformReleaseError::DowngradeRefused { .. })
         ));
     }
@@ -740,7 +1077,7 @@ mod tests {
         let mut broken = bundled_payload();
         broken.created_at = "not-a-timestamp".to_string();
         assert!(matches!(
-            enforce_release_not_older_than_bundled(&broken),
+            enforce_release_not_older_than_bundled(&broken, test_profile()),
             Err(PlatformReleaseError::InvalidField {
                 field: "created_at",
                 ..
@@ -781,18 +1118,19 @@ mod tests {
         let mut payload = bundled_payload();
         payload.luks2_header_seal = "required".to_string();
         let envelope = sign_envelope_with_dev_key(payload);
-        let verified = verify_envelope(envelope.clone()).unwrap();
+        let verified = verify_envelope(envelope.clone(), test_profile()).unwrap();
         assert_eq!(verified.luks2_header_seal_claim(), "required");
 
         let mut tampered = envelope.clone();
         tampered.payload.luks2_header_seal = "adopt".to_string();
-        let err = verify_envelope(tampered).expect_err("flip must break the signature");
+        let err =
+            verify_envelope(tampered, test_profile()).expect_err("flip must break the signature");
         assert!(matches!(err, PlatformReleaseError::BadSignature(_)));
 
         let mut stripped = envelope;
         stripped.payload.luks2_header_seal = String::new();
-        let err =
-            verify_envelope(stripped).expect_err("stripping the field must break the signature");
+        let err = verify_envelope(stripped, test_profile())
+            .expect_err("stripping the field must break the signature");
         assert!(matches!(err, PlatformReleaseError::BadSignature(_)));
     }
 
@@ -812,7 +1150,8 @@ mod tests {
         assert!(payload.luks2_header_seal.is_empty());
 
         let envelope = sign_envelope_with_dev_key(payload);
-        let verified = verify_envelope(envelope).expect("pre-field envelope must keep verifying");
+        let verified = verify_envelope(envelope, test_profile())
+            .expect("pre-field envelope must keep verifying");
         assert_eq!(verified.luks2_header_seal_claim(), "adopt");
     }
 
@@ -829,9 +1168,9 @@ mod tests {
     #[test]
     fn valid_signature_does_not_admit_a_release_older_than_the_bundle() {
         let raw = resigned_envelope_with_created_at("2020-01-01T00:00:00Z");
-        verify_envelope(serde_json::from_str(&raw).unwrap()).unwrap();
+        verify_envelope(serde_json::from_str(&raw).unwrap(), test_profile()).unwrap();
         assert!(matches!(
-            PlatformReleaseEnvelope::load_verified_from_raw(&raw, true),
+            PlatformReleaseEnvelope::load_verified_from_raw(&raw, test_profile()),
             Err(PlatformReleaseError::DowngradeRefused { .. })
         ));
     }
@@ -844,11 +1183,12 @@ mod tests {
             "2999-01-01T00:00:00Z",
         ] {
             let raw = resigned_envelope_with_created_at(timestamp);
-            let loaded = PlatformReleaseEnvelope::load_verified_from_raw(&raw, true).unwrap();
+            let loaded =
+                PlatformReleaseEnvelope::load_verified_from_raw(&raw, test_profile()).unwrap();
             assert_eq!(loaded.payload.created_at, timestamp);
         }
-        PlatformReleaseEnvelope::load_verified_from_raw(BUNDLED_PLATFORM_RELEASE, false).unwrap();
-        PlatformReleaseEnvelope::load_verified_from_raw(BUNDLED_PLATFORM_RELEASE, true).unwrap();
+        PlatformReleaseEnvelope::load_verified_from_raw(BUNDLED_PLATFORM_RELEASE, test_profile())
+            .unwrap();
     }
 
     #[test]
@@ -856,7 +1196,7 @@ mod tests {
         let mut divergent = bundled_payload();
         divergent.trustee_kbs_url = "https://different.example".into();
         assert!(matches!(
-            enforce_release_not_older_than_bundled(&divergent),
+            enforce_release_not_older_than_bundled(&divergent, test_profile()),
             Err(PlatformReleaseError::DowngradeRefused { .. })
         ));
     }

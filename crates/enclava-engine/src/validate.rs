@@ -1,3 +1,5 @@
+use std::path::Component;
+
 use enclava_common::log_encryption;
 use enclava_common::validate::validate_fqdn;
 
@@ -43,6 +45,8 @@ pub enum ValidationError {
     InvalidAttestationPubkey { field: &'static str, detail: String },
     #[error("log_encryption config is invalid: {0}")]
     InvalidLogEncryption(String),
+    #[error("storage path {path:?} is invalid: {detail}")]
+    InvalidStoragePath { path: String, detail: String },
 }
 
 /// Validates that a ConfidentialApp spec is well-formed.
@@ -209,6 +213,53 @@ pub fn validate_app(app: &ConfidentialApp) -> Result<(), ValidationError> {
         }
     }
 
+    // cap#290 review: the v2 log spool lives at <state-root>/.enclava/
+    // log-spool and is bind-mounted over /run/enclava-logs. A tenant
+    // storage_path mapping onto the reserved .enclava state subdir would
+    // share that directory with the spool, so wait-exec could append to
+    // and rotate tenant files as encrypted-log data; a storage_path whose
+    // guest mount covers the spool target (the dir itself, an ancestor
+    // that would shadow the bind, or a descendant the bind would mount
+    // over) collides the same way. Reject both at validation instead of
+    // rendering a corrupting manifest, and require enough state PVC for
+    // the 32 MiB rotation cap plus temp/headroom.
+    if crate::manifest::enclava_init_config::log_spool_state_bind(app) {
+        // Exact rational compare — no rounding: a fractional quantity just
+        // under the floor (e.g. 127.5Mi) must not ceil past it.
+        if let Some((numerator, scale)) = binary_quantity_mib_parts(&app.storage.app_data.size)
+            && numerator < LOG_SPOOL_MIN_STATE_MIB * 10u128.pow(scale)
+        {
+            return Err(ValidationError::InvalidStorageSize {
+                field: "storage.app_data.size",
+                detail: format!(
+                    "guest-memory-v2 log spool binds to the state PVC and needs at \
+                     least {LOG_SPOOL_MIN_STATE_MIB}Mi (32Mi rotation cap plus \
+                     rotation-temp and fs/platform headroom), got {:?}",
+                    app.storage.app_data.size
+                ),
+            });
+        }
+        for container in &app.containers {
+            for path in &container.storage_paths {
+                if crate::manifest::enclava_init_config::storage_subdir(path) == ".enclava" {
+                    return Err(ValidationError::InvalidStoragePath {
+                        path: path.clone(),
+                        detail: "maps onto the platform-reserved \".enclava\" state subdir"
+                            .to_string(),
+                    });
+                }
+                if mount_path_covers_log_spool_target(path) {
+                    return Err(ValidationError::InvalidStoragePath {
+                        path: path.clone(),
+                        detail: "covers /run/enclava-logs, the encrypted log spool \
+                                 bind target"
+                            .to_string(),
+                    });
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -256,6 +307,41 @@ fn validate_storage_size(field: &'static str, value: &str) -> Result<(), String>
 /// `MIN_VOLUME_BYTES` — keep the two bounds identical.
 pub const MIN_VOLUME_SIZE_MIB: u128 = 32;
 
+/// Fresh-state floor for `storage.app_data.size` when the v2 signed layout
+/// re-binds the encrypted log spool onto the state PVC (`log_spool_state_bind`).
+/// The spool dir holds a 32 MiB live file plus a rotation temp copy, and the
+/// filesystem/platform need headroom on top (cap#290 round-2 review).
+pub const LOG_SPOOL_MIN_STATE_MIB: u128 = 128;
+
+/// Whether a guest mount path covers the encrypted log spool bind target
+/// `/run/enclava-logs` (cap#290 round-2 review): equal, an ancestor that
+/// would shadow the bind (e.g. `/run`, `/`), or a descendant the bind
+/// would mount over (`/run/enclava-logs/sub`). Comparison is lexical on
+/// normalized components (`.` skipped); a `..` segment fails closed as
+/// covering — such paths are invalid downstream anyway.
+fn mount_path_covers_log_spool_target(path: &str) -> bool {
+    fn normal_components(path: &str) -> Option<Vec<std::ffi::OsString>> {
+        let mut out = Vec::new();
+        for component in std::path::Path::new(path).components() {
+            match component {
+                Component::Normal(part) => out.push(part.to_os_string()),
+                Component::CurDir => {}
+                Component::ParentDir => return None,
+                Component::RootDir | Component::Prefix(_) => {}
+            }
+        }
+        Some(out)
+    }
+    let Some(mount) = normal_components(path) else {
+        return true;
+    };
+    let Some(target) = normal_components("/run/enclava-logs") else {
+        return true;
+    };
+    (mount.len() <= target.len() && target.starts_with(&mount))
+        || (target.len() <= mount.len() && mount.starts_with(&target))
+}
+
 /// Validate that a persistent-volume size is a positive binary quantity of
 /// at least [`MIN_VOLUME_SIZE_MIB`]. Shared by API admission paths; exact
 /// rational compare (numerator / 10^scale Mi) — no float rounding.
@@ -295,6 +381,17 @@ fn binary_quantity_parts(trimmed: &str) -> Option<(&str, u128)> {
         .find_map(|(suffix, multiplier)| trimmed.strip_suffix(*suffix).map(|n| (n, *multiplier)))
 }
 
+/// `(numerator, scale)` of a binary quantity in Mi units — an exact
+/// rational (`value_mib = numerator / 10^scale`) so floors can compare
+/// against `MIN * 10^scale` without floats or rounding (mirroring
+/// `validate_persistent_volume_size_for_fresh_provisioning`). `None` for
+/// grammar-invalid values; callers that already ran the storage grammar
+/// may treat that as "no floor opinion".
+fn binary_quantity_mib_parts(value: &str) -> Option<(u128, u32)> {
+    let (number, multiplier) = binary_quantity_parts(value.trim())?;
+    validate_scaled_decimal(number, multiplier).ok()
+}
+
 /// Whether a persistent-volume size parses as a valid binary quantity that
 /// is strictly below [`MIN_VOLUME_SIZE_MIB`]. Only these sizes can need the
 /// fresh-format floor's cluster check; callers must still run
@@ -302,10 +399,7 @@ fn binary_quantity_parts(trimmed: &str) -> Option<(&str, u128)> {
 /// admission error, and grammar-invalid values return false here (they are
 /// rejected by the validator/limits path, not waived by claim evidence).
 pub fn is_sub_floor_volume_size(value: &str) -> bool {
-    let Some((number, multiplier)) = binary_quantity_parts(value) else {
-        return false;
-    };
-    let Ok((numerator, scale)) = validate_scaled_decimal(number, multiplier) else {
+    let Some((numerator, scale)) = binary_quantity_mib_parts(value) else {
         return false;
     };
     numerator < MIN_VOLUME_SIZE_MIB * 10u128.pow(scale)
@@ -433,6 +527,32 @@ fn validate_attestation_pubkey(
         return Err(ValidationError::InvalidAttestationPubkey {
             field,
             detail: "must be 64 lowercase hex characters (Ed25519 public key)".to_string(),
+        });
+    }
+    // cap#218 follow-up: mirror the release-ingestion checks — the key must
+    // decompress to an Edwards point that is not small-order. Policy
+    // acceptance uses verify(), not verify_strict(), and a zero signature
+    // verifies against a small-order key for a large share of messages.
+    let raw = hex::decode(value).map_err(|_| ValidationError::InvalidAttestationPubkey {
+        field,
+        detail: "must be 64 lowercase hex characters (Ed25519 public key)".to_string(),
+    })?;
+    let arr: [u8; 32] = raw
+        .try_into()
+        .map_err(|_| ValidationError::InvalidAttestationPubkey {
+            field,
+            detail: "must be 64 lowercase hex characters (Ed25519 public key)".to_string(),
+        })?;
+    let key = ed25519_dalek::VerifyingKey::from_bytes(&arr).map_err(|_| {
+        ValidationError::InvalidAttestationPubkey {
+            field,
+            detail: "not a decompressible Ed25519 public key".to_string(),
+        }
+    })?;
+    if key.is_weak() {
+        return Err(ValidationError::InvalidAttestationPubkey {
+            field,
+            detail: "Ed25519 public key has small order and provides no unforgeability".to_string(),
         });
     }
     Ok(())

@@ -5,7 +5,7 @@ edition.workspace = true
 
 [dependencies]
 serde = { workspace = true, optional = true }
-serde_json = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true, features = ["raw_value"] }
 uuid = { version = "1", default-features = false, features = ["serde"], optional = true }
 chrono = { workspace = true, optional = true }
 sha2 = { workspace = true }
@@ -36,4 +36,8 @@ runtime = [
     "descriptor",
 ]
 outbound-http = ["dep:reqwest", "dep:tokio", "dep:tracing"]
+release-profiles = ["dep:serde", "dep:serde_json", "dep:reqwest"]
 prod-strict = []
+
+[build-dependencies]
+serde_json = { workspace = true }

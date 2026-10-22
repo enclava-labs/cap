@@ -1,6 +1,6 @@
 use clap::Subcommand;
 
-use enclava_cli::api_client::ApiClient;
+use enclava_cli::api_client::{ApiClient, ApiError};
 use enclava_cli::app_config::AppConfig;
 use enclava_cli::config::{self, CliPaths};
 use enclava_cli::tee_client::TeeClient;
@@ -125,27 +125,86 @@ pub async fn run(cmd: ConfigCommand) -> Result<(), Box<dyn std::error::Error>> {
         ConfigCommand::Unset { key, app } => {
             let app_name = resolve_app_name(&app)?;
             let (api, _paths, _cli_config) = build_api_client()?;
+            // Read-only lookups first (review on #307): a token without
+            // apps:read must fail HERE, cleanly, not after the store delete —
+            // every step below may mutate.
             let app_info = api.get_app(&app_name).await?;
 
-            let token_resp = api.get_config_token(&app_name).await?;
+            // Store first, guest second (#304): the required-key guard lives
+            // on the meta delete, so it must be able to refuse BEFORE the
+            // TEE key is removed — a refused unset must mutate nothing. The
+            // meta delete is idempotent (204 whether or not the row existed),
+            // so a retry after a TEE-side failure re-runs it harmlessly and
+            // retries the TEE delete.
+            match api.delete_config_meta(&app_name, &key).await {
+                Ok(()) => {}
+                // Indeterminate outcome (review on #307): transport errors,
+                // and gateway/server 5xx — the request may have reached and
+                // been applied upstream — leave the store possibly unset
+                // while the TEE copy certainly remains. Same partial state
+                // as a TEE-side failure below; the retry is safe either way.
+                Err(
+                    error @ (ApiError::Http(_)
+                    | ApiError::Api {
+                        status: 500..=599, ..
+                    }),
+                ) => {
+                    eprintln!(
+                        "Warning: the outcome of removing {key} from the config store for app \
+                         {app_name} is unknown ({error}) — it may already be unset there. Retry \
+                         with `enclava config unset {key} --app {app_name}` (the store delete is \
+                         idempotent) to complete the removal."
+                    );
+                    return Err(error.into());
+                }
+                // A definite client-side answer (guard refusal, unknown app,
+                // permissions): nothing was mutated — propagate as-is.
+                Err(error) => return Err(error.into()),
+            }
 
-            let tee = token_resp
-                .tee_url
-                .as_deref()
-                .map(|tee_url| {
-                    TeeClient::from_config_url_with_resolve_ip(tee_url, token_resp.tee_resolve_ip)
-                })
-                .unwrap_or_else(|| {
-                    let tee_domain = app_info.tee_domain.as_deref().unwrap_or(&app_info.domain);
-                    TeeClient::new_with_resolve_ip(tee_domain, token_resp.tee_resolve_ip)
-                });
-            let (_attestation, tee) = tee.attest_receipt_key().await?;
-            tee.config_unset(&key, &token_resp.token).await?;
+            // Every remaining step reads or mutates the TEE. Any failure in
+            // the phase leaves the partial state (store unset, delivered copy
+            // possibly still in place) — so the whole phase reports it, not
+            // just the final TEE delete.
+            let tee_phase: Result<(), Box<dyn std::error::Error>> = async {
+                let token_resp = api.get_config_token(&app_name).await?;
+
+                let tee = token_resp
+                    .tee_url
+                    .as_deref()
+                    .map(|tee_url| {
+                        TeeClient::from_config_url_with_resolve_ip(
+                            tee_url,
+                            token_resp.tee_resolve_ip,
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        let tee_domain = app_info.tee_domain.as_deref().unwrap_or(&app_info.domain);
+                        TeeClient::new_with_resolve_ip(tee_domain, token_resp.tee_resolve_ip)
+                    });
+                let (_attestation, tee) = tee.attest_receipt_key().await?;
+                tee.config_unset(&key, &token_resp.token).await?;
+                Ok(())
+            }
+            .await;
+            if let Err(error) = tee_phase {
+                // The store is already unset; the guest may keep the delivered
+                // copy until this succeeds. Fail toward availability with the
+                // state spelled out: the command exits non-zero and the
+                // suggested retry completes the TEE-side removal. A running
+                // workload keeps its already-consumed value until restart —
+                // removing the stored key never revokes it from the process.
+                eprintln!(
+                    "Warning: {key} was removed from the config store for app \
+                     {app_name}, but the TEE copy could not be removed ({error}). Retry with \
+                     `enclava config unset {key} --app {app_name}` to complete the removal; a \
+                     running workload keeps using its already-consumed value until it restarts."
+                );
+                return Err(error);
+            }
             // The key is removed from the TEE store from here on; emit the
             // application note before any later step can fail the command.
             println!("{CONFIG_APPLICATION_NOTE}");
-
-            api.delete_config_meta(&app_name, &key).await?;
 
             println!("Unset {key}.");
         }
@@ -227,10 +286,12 @@ mod tests {
             .expect("unset names the next-boot application contract");
         let meta_delete = unset_body
             .find("delete_config_meta")
-            .expect("unset deletes key metadata after the TEE deletion");
+            .expect("unset deletes key metadata before the TEE deletion");
         assert!(
-            tee_delete < unset_note && unset_note < meta_delete,
-            "unset prints the application note after the TEE deletion and before the metadata delete can fail the command"
+            meta_delete < tee_delete && tee_delete < unset_note,
+            "unset runs the store-side guard first, then the TEE deletion, then prints the \
+             application note — a refused unset must mutate nothing, and the note must not \
+             print while a step can still fail the command (#304)"
         );
     }
 
@@ -275,6 +336,27 @@ mod tests {
         assert!(
             attest < config_unset,
             "config unset must verify attestation/SPKI binding before deleting config"
+        );
+    }
+
+    #[test]
+    fn config_unset_stores_meta_delete_before_any_tee_mutation() {
+        let source = include_str!("config.rs");
+        let unset_start = source
+            .find("ConfigCommand::Unset { key, app } =>")
+            .expect("unset command branch exists");
+        let body = &source[unset_start..];
+
+        let meta_delete = body
+            .find("delete_config_meta")
+            .expect("config unset must delete the store metadata");
+        let config_unset = body
+            .find("config_unset")
+            .expect("config unset must delete value");
+        assert!(
+            meta_delete < config_unset,
+            "config unset must run the store-side guard (delete_config_meta) before the TEE \
+             key is removed — a refused unset must mutate nothing (#304)"
         );
     }
 }

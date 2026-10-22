@@ -19,6 +19,53 @@ use crate::manifest::enclava_init_config;
 use crate::types::ConfidentialApp;
 
 const GUEST_MEMORY_LAYOUT_MARKER: &str = "# enclava-cap-volume-layout: guest-memory-v1\n";
+/// Signed volume layout that keeps bootstrap emptyDirs RAM-backed like v1
+/// but re-binds the workload log spool onto the encrypted state PVC
+/// (cap#289): Kata's block-encrypted emptyDir sizes disk.img from the host
+/// FS, so the ext4 inode-init through the LUKS device (~32GiB on ~2TiB)
+/// evicts the pod on the 4Gi logs emptyDir limit.
+const GUEST_MEMORY_V2_LAYOUT_MARKER: &str = "# enclava-cap-volume-layout: guest-memory-v2\n";
+
+/// The signed volume layout an app's generated agent policy pins. v1 and
+/// v2 policies both select RAM-backed bootstrap emptyDirs; v2 additionally
+/// moves the workload log spool onto the encrypted state PVC (see
+/// [`logs_volume_included`]). Unmarked policies keep the historical
+/// disk-backed layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VolumeLayout {
+    Legacy,
+    GuestMemoryV1,
+    GuestMemoryV2,
+}
+
+pub(crate) fn volume_layout(app: &ConfidentialApp) -> VolumeLayout {
+    // The signer binds this exact prefix into the policy hash/signature.
+    // Retry and rollback retain their stored policy and therefore its layout.
+    // Unmarked policies (including the local fallback) keep historical disks.
+    let Some(policy) = app.generated_agent_policy.as_ref() else {
+        return VolumeLayout::Legacy;
+    };
+    if policy
+        .policy_text
+        .starts_with(GUEST_MEMORY_V2_LAYOUT_MARKER)
+    {
+        VolumeLayout::GuestMemoryV2
+    } else if policy.policy_text.starts_with(GUEST_MEMORY_LAYOUT_MARKER) {
+        VolumeLayout::GuestMemoryV1
+    } else {
+        VolumeLayout::Legacy
+    }
+}
+
+/// Whether the shared "logs" emptyDir exists at all. Under the v2 layout
+/// with no encrypted logging the spool path is unused: no volume, no mount,
+/// and no spool-dir provisioning in the tools container. With encrypted
+/// logging the volume survives as a small Memory mountpoint that
+/// enclava-init re-binds onto the encrypted state PVC. Older layouts keep
+/// the disk-backed spool unconditionally.
+pub(crate) fn logs_volume_included(app: &ConfidentialApp) -> bool {
+    !(volume_layout(app) == VolumeLayout::GuestMemoryV2 && app.log_encryption.is_none())
+}
 
 /// Names of the StatefulSet volumeClaimTemplates CAP renders. PVCs created
 /// from them are named `<vct>-<statefulset>-<ordinal>`; cleanup identifies
@@ -40,44 +87,22 @@ pub fn provisioned_pod_name(statefulset: &str) -> String {
     format!("{statefulset}-0")
 }
 
-/// Disk-backed bound for the workload log spool emptyDir. The relay tails at
-/// most MAX_TAIL_BYTES per container (2 MiB today) and enclava-wait-exec
-/// rotates its spool at 32 MiB (retaining the newest 8 MiB), so the spool's
-/// own steady-state footprint is ~40 MiB — the rotation is the inner fence
-/// keeping a chatty workload from dying by ENOSPC/SIGPIPE.
-///
-/// The outer bound must additionally survive the volume's OTHER writer
-/// (#223): kata's direct-assigned-volume staging places a sparse dm-integrity
-/// `disk.img` on this volume (~98 GiB apparent; real blocks grow at a
-/// phase-dependent ~6.5–70 MB/s, bursts ~100 MB/s, re-running from 0 on
-/// every pod boot). Kubelet measures real usage against sizeLimit — loosely:
-/// its poll lags, and under the pre-#223 64Mi cap pods were evicted at
-/// ~2.3 GB real usage, in a ~61 s loop a pre-ready pod can never escape
-/// (each eviction restarts the writer).
-///
-/// 4 GiB rests on the only hypothesis under which a moderate fence works
-/// (#223, n=2, unproven): both sampled generations ended at an identical
-/// ~2.3–2.4 GB real usage despite different growth rates (52 vs 70 MB/s),
-/// consistent with the write phase completing there. If growth instead
-/// never settles, 4 GiB is crossed in ~60–85 s at 52–70 MB/s (~43 s at a
-/// 100 MB/s burst) — inside the ~3 min first-deploy window — and the fence
-/// must rise past ~12 GiB or the kata-side root sizing fix must land; both
-/// stay tracked in #223. No pod has survived past ~2.4 GB under the old
-/// fence, so this raise is what makes the question answerable: a one-time
-/// 15-minute first-deploy usage watch after rollout decides it (plateau at
-/// or below the fence = settles). Either way the bound still fences a true
-/// runaway per pod, loosely, where an unbounded volume would not (#138).
+/// Disk-backed bound for the shared workload log spool AND Kata's
+/// direct-assigned-volume staging — legacy (pre-v2) layouts only. The spool
+/// rotates at 32 MiB, but staging has used ~2.3–2.4 GiB of real blocks on
+/// first boot (#223). A 64Mi bound evicts the pod before readiness and each
+/// restart repeats staging from zero. Keep the 4Gi outer fence for layouts
+/// that still size the spool from host disk; the v2 layout re-binds the
+/// spool onto the encrypted state PVC instead (cap#289).
 const LOGS_EMPTY_DIR_SIZE_LIMIT: &str = "4Gi";
 
 pub fn build_volumes(app: &ConfidentialApp) -> Vec<Volume> {
     let legacy = legacy_bootstrap_enabled();
-    // The signer binds this exact prefix into the policy hash/signature.
-    // Retry and rollback retain their stored policy and therefore its layout.
-    // Unmarked policies (including the local fallback) keep historical disks.
-    let guest_memory = app
-        .generated_agent_policy
-        .as_ref()
-        .is_some_and(|policy| policy.policy_text.starts_with(GUEST_MEMORY_LAYOUT_MARKER));
+    let layout = volume_layout(app);
+    let guest_memory = matches!(
+        layout,
+        VolumeLayout::GuestMemoryV1 | VolumeLayout::GuestMemoryV2
+    );
     let bootstrap_empty_dir = |size: &str| {
         if guest_memory {
             EmptyDirVolumeSource {
@@ -93,15 +118,37 @@ pub fn build_volumes(app: &ConfidentialApp) -> Vec<Volume> {
             }
         }
     };
-    let mut v = vec![
-        Volume {
-            name: "logs".to_string(),
-            empty_dir: Some(EmptyDirVolumeSource {
+    let mut v = Vec::new();
+    if logs_volume_included(app) {
+        // Under the v2 layout the encrypted log spool is a small
+        // RAM-backed mountpoint: enclava-init re-binds it onto a directory
+        // on the encrypted state PVC after LUKS unlock, so the spool never
+        // provisions host disk storage (cap#289). Claim-less v2 artifacts
+        // (omit_log_spool_bind_claim pinned by hash validation) keep this
+        // same mountpoint on purpose: their signed agent policy encodes
+        // tmpfs storage for it, so rendering the legacy disk volume would
+        // violate that policy. The guest then skips the state bind and the
+        // spool stays on guest tmpfs — the declared 1Mi is not forwarded
+        // as a guest hard bound (bootstrap-mountpoint pattern, below), so
+        // the only degradation is spool persistence, not capacity.
+        let empty_dir = if layout == VolumeLayout::GuestMemoryV2 {
+            EmptyDirVolumeSource {
+                medium: Some("Memory".to_string()),
+                size_limit: Some(Quantity("1Mi".to_string())),
+            }
+        } else {
+            EmptyDirVolumeSource {
                 medium: None,
                 size_limit: Some(Quantity(LOGS_EMPTY_DIR_SIZE_LIMIT.to_string())),
-            }),
+            }
+        };
+        v.push(Volume {
+            name: "logs".to_string(),
+            empty_dir: Some(empty_dir),
             ..Default::default()
-        },
+        });
+    }
+    v.extend([
         Volume {
             name: "ownership-signal".to_string(),
             empty_dir: Some(EmptyDirVolumeSource {
@@ -119,7 +166,7 @@ pub fn build_volumes(app: &ConfidentialApp) -> Vec<Volume> {
             }),
             ..Default::default()
         },
-    ];
+    ]);
     if legacy {
         v.push(Volume {
             name: "secure-pv-bootstrap".to_string(),

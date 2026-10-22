@@ -41,7 +41,7 @@ responses:
     headers:
       cache_control: no-store
       x_enclava_log_format: encrypted-jsonl; version=enclava-log-frame-v1
-    body: newline-delimited EncryptedLogFrame JSON objects
+    body: newline-delimited EncryptedLogFrame JSON objects with ignorable blank-line keepalives during idle follow
     reason: CAP brokers ciphertext produced inside the confidential workload boundary
     plaintext: forbidden
   encrypted_logs_required:
