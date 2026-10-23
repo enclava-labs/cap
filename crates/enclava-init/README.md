@@ -106,6 +106,54 @@ resume that recorded deadline verbatim across restarts and release worker
 slots after each 90-second observation slice. Password owner wait remains
 separately nonterminal.
 
+### Numeric volume profiling
+
+`/run/enclava/init-stats.json` retains its version-1 boot fields and adds
+`volume_profile_version: 1` and `volume_profiles.state` / `volume_profiles.tls`.
+Read it through the tenant's authenticated connection, not Kubernetes workload
+logs. Ordinary boot failures also attempt to publish the summary; process
+termination cannot guarantee a final record. Check `init_start_unix` before
+using a retained file as evidence for a particular boot.
+
+Each volume has `device_bytes`, `scanned_bytes`, `initialized_bytes`, and a
+fixed twelve-entry `stages` array. Its indices are:
+
+| Index | Stage | Nesting |
+| --- | --- | --- |
+| 0 | Header probe / existing-keyslot inspection | Top level |
+| 1 | Full-device blank scan | Top level; fresh devices only |
+| 2 | Cryptsetup CLI format | Top level; includes the CLI's internal integrity work |
+| 3 | Libcryptsetup fallback | Top level; only after CLI failure |
+| 4 | Libcryptsetup format | Inside fallback |
+| 5 | Fallback keyslot creation | Inside fallback |
+| 6 | Fallback integrity initialization | Inside fallback |
+| 7 | Fallback integrity final sync | Inside integrity initialization |
+| 8 | Header validation and sealing | Top level |
+| 9 | Authenticated open | Top level |
+| 10 | Filesystem creation | Top level; fresh devices only |
+| 11 | Mount | Top level |
+
+Entries record `calls`, `failures`, `elapsed_us`, self and reaped-child
+user/system CPU microseconds, combined `input_blocks` / `output_blocks` from
+`getrusage`, and init-cgroup throttled periods/microseconds. These block
+counters are not application bytes or a count of physical Longhorn replica
+writes. Self CPU includes other init-process threads; child usage includes
+waited-for helpers. The profiler never resets counters or falls back to an
+ancestor cgroup.
+
+`counters_available` is a bitmask: 1 = self usage, 2 = child usage, 4 = cgroup
+throttling. Combined block deltas require both usage bits. A missing bit means
+unavailable, not observed zero; `calls=0` means the stage was not reached.
+Zero `device_bytes` means its best-effort size observation was unavailable.
+`initialized_bytes` counts explicit fallback writes only: zero does not prove
+that the CLI skipped integrity initialization. No paths, formatter output,
+error text, headers, keys or tenant data enter this numeric schema.
+
+Stage elapsed time excludes its own counter-sampling overhead. Nested stages
+are not additive with their parents; compare top-level sums with the existing
+per-volume duration and retain the residual. Profiling does not change volume
+format/open decisions, cryptographic parameters, readiness or error handling.
+
 ## Verification Chain
 
 When policy-read mode is enabled, `enclava-init` verifies:
