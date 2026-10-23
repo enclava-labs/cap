@@ -2697,6 +2697,24 @@ pub async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> 
             println!("Evidence: {reason}");
         }
     }
+    // Config-store completeness: a template deploy's customer-config phase is
+    // CLI-driven and does not resume on its own, so an interrupted deploy can
+    // leave the guest waiting on a required key while this status reads healthy.
+    // The config store is the delivery source of truth; compare it with the
+    // template's required keys and name the recovery.
+    if let Some(app) = app_metadata.as_ref()
+        && let Some(slug) = app.template_slug.as_deref()
+        && let Some(missing) = template_missing_config_keys(&api, slug, &app_name).await
+        && !missing.is_empty()
+    {
+        println!("Config:   {}", "INCOMPLETE".red());
+        println!("Missing:  {}", missing.join(", "));
+        println!(
+            "          the deploy's config delivery is client-driven and does not resume on its own;"
+        );
+        println!("          if no deploy is in progress, re-run it to finish delivery");
+    }
+
     if let Some(deployment) = &status.deployment {
         print_deployment_diagnostics(deployment);
     }
@@ -2840,6 +2858,48 @@ enum StableSshEndpointState {
     Ready(String),
     Missing,
     Invalid,
+}
+
+/// Required template config keys that the app's config store does not hold
+/// (the store is the delivery source of truth). `None` when inapplicable or a
+/// lookup fails — this advisory check must never fail `status`.
+async fn template_missing_config_keys(
+    api: &ApiClient,
+    template_slug: &str,
+    app_name: &str,
+) -> Option<Vec<String>> {
+    let templates = api.list_templates().await.ok()?;
+    let template = templates.iter().find(|entry| entry.slug == template_slug)?;
+    let delivered = api.list_config_keys(app_name).await.ok()?;
+    // Customer-channel keys only (same cut as the template deploy's
+    // customer-vs-managed split): managed keys are delivered by a durable
+    // server-side event that retries on its own, so only customer keys can
+    // strand when the deploy client dies before writing them.
+    Some(missing_required_config_keys(
+        template
+            .config_keys
+            .iter()
+            .filter(|entry| {
+                entry.required && !template.paas_managed_config_keys.contains(&entry.key)
+            })
+            .map(|entry| entry.key.clone()),
+        delivered.keys.into_iter().map(|entry| entry.key),
+    ))
+}
+
+/// Sorted, deduplicated set difference of required minus delivered keys.
+fn missing_required_config_keys(
+    required: impl IntoIterator<Item = String>,
+    delivered: impl IntoIterator<Item = String>,
+) -> Vec<String> {
+    let delivered: std::collections::HashSet<String> = delivered.into_iter().collect();
+    let mut missing: Vec<String> = required
+        .into_iter()
+        .filter(|key| !delivered.contains(key))
+        .collect();
+    missing.sort();
+    missing.dedup();
+    missing
 }
 
 fn stable_ssh_endpoint_state_from_app(app: &AppResponse) -> StableSshEndpointState {

@@ -451,6 +451,41 @@ fn deploy_unlocks_existing_password_storage_even_without_config_push() {
 }
 
 #[test]
+fn missing_required_config_keys_reports_only_undelivered_keys() {
+    assert_eq!(
+        missing_required_config_keys(
+            vec![
+                "DEBIAN_SSH_AUTHORIZED_KEYS".to_string(),
+                "FRP_SERVER_ADDR".to_string(),
+            ],
+            vec!["FRP_SERVER_ADDR".to_string()],
+        ),
+        vec!["DEBIAN_SSH_AUTHORIZED_KEYS".to_string()]
+    );
+    assert!(
+        missing_required_config_keys(
+            vec!["FRP_SERVER_ADDR".to_string()],
+            vec![
+                "DEBIAN_SSH_AUTHORIZED_KEYS".to_string(),
+                "FRP_SERVER_ADDR".to_string(),
+            ],
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn missing_required_config_keys_is_sorted_and_deduplicated() {
+    assert_eq!(
+        missing_required_config_keys(
+            vec!["B".to_string(), "A".to_string(), "B".to_string()],
+            std::iter::empty::<String>(),
+        ),
+        vec!["A".to_string(), "B".to_string()]
+    );
+}
+
+#[test]
 fn stable_ssh_endpoint_from_app_requires_debian_ssh_template_metadata() {
     let mut app = test_app_response();
     assert_eq!(
