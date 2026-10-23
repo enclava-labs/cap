@@ -73,6 +73,11 @@ impl Default for VolumeProfile {
 }
 
 impl VolumeProfile {
+    pub fn format_completed(&self) -> bool {
+        let seal = &self.stages[Stage::HeaderSeal as usize];
+        seal.calls != 0 && seal.failures == 0
+    }
+
     pub fn run<T, E>(
         &mut self,
         stage: Stage,
@@ -211,6 +216,17 @@ mod tests {
         }
         numeric_only(&json);
         assert!(!json.to_string().contains("PRIVATE_KEY_OR_PROVIDER_ERROR"));
+    }
+
+    #[test]
+    fn completed_format_survives_later_filesystem_failure() {
+        let mut profile = VolumeProfile::default();
+        assert!(!profile.format_completed());
+        profile.run(Stage::HeaderSeal, |_| Ok::<_, ()>(())).unwrap();
+        let result = profile.run(Stage::Mkfs, |_| Err::<(), _>("filesystem failed"));
+        assert_eq!(result, Err("filesystem failed"));
+        assert!(profile.format_completed());
+        assert_eq!(profile.stages[Stage::Mkfs as usize].failures, 1);
     }
 
     #[test]

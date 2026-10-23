@@ -148,6 +148,11 @@ Zero `device_bytes` means its best-effort size observation was unavailable.
 `initialized_bytes` counts explicit fallback writes only: zero does not prove
 that the CLI skipped integrity initialization. No paths, formatter output,
 error text, headers, keys or tenant data enter this numeric schema.
+Per-volume elapsed time is recorded on ordinary errors as well as success.
+`volume_formatted=1` means fresh formatting and header sealing completed, even
+if a later open, mkfs or mount failed. Zero never proves an untouched device:
+a failed formatting attempt can already have changed storage. These fields
+are diagnostics, never authorization to reformat or reuse a failed volume.
 
 Stage elapsed time excludes its own counter-sampling overhead. Nested stages
 are not additive with their parents; compare top-level sums with the existing

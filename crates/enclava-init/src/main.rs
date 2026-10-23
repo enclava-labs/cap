@@ -1412,7 +1412,7 @@ fn open_luks_volumes(
     // hardening floor before touching any volume.
     luks2_seal::ensure_cryptsetup_floor()?;
     let state_phase = stats.elapsed_ms();
-    let state_opened = open_one_volume(
+    let state_result = open_one_volume(
         &cfg.state,
         owner,
         // The passphrase stays derived from the signed per-volume
@@ -1422,20 +1422,20 @@ fn open_luks_volumes(
         seeds::STATE_HEADER_MAC_INFO,
         luks_policy,
         &mut stats.state_profile,
-    )
-    .with_context(|| format!("opening state volume {}", cfg.state.device))?;
-    stats.record_state_volume(state_phase, state_opened.formatted);
+    );
+    stats.record_state_volume(state_phase, stats.state_profile.format_completed());
+    state_result.with_context(|| format!("opening state volume {}", cfg.state.device))?;
     let tls_phase = stats.elapsed_ms();
-    let tls_opened = open_one_volume(
+    let tls_result = open_one_volume(
         &cfg.tls_state,
         owner,
         &cfg.tls_state.hkdf_info,
         seeds::TLS_STATE_HEADER_MAC_INFO,
         luks_policy,
         &mut stats.tls_profile,
-    )
-    .with_context(|| format!("opening tls-state volume {}", cfg.tls_state.device))?;
-    stats.record_tls_volume(tls_phase, tls_opened.formatted);
+    );
+    stats.record_tls_volume(tls_phase, stats.tls_profile.format_completed());
+    tls_result.with_context(|| format!("opening tls-state volume {}", cfg.tls_state.device))?;
     stats.record_post_luks_memory();
     Ok(())
 }
