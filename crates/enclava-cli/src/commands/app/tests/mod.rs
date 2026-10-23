@@ -451,6 +451,13 @@ fn deploy_unlocks_existing_password_storage_even_without_config_push() {
 }
 
 #[test]
+fn template_version_matches_registry_requires_exact_deployed_version() {
+    assert!(template_version_matches_registry(Some("1.0.0"), "1.0.0"));
+    assert!(!template_version_matches_registry(Some("1.0.0"), "2.0.0"));
+    assert!(!template_version_matches_registry(None, "1.0.0"));
+}
+
+#[test]
 fn missing_required_config_keys_reports_only_undelivered_keys() {
     assert_eq!(
         missing_required_config_keys(
