@@ -2697,6 +2697,26 @@ pub async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> 
             println!("Evidence: {reason}");
         }
     }
+    // Config completeness per platform metadata: a template deploy's
+    // customer-config phase is CLI-driven and does not resume on its own, so an
+    // interrupted deploy can leave the guest waiting on a required key while
+    // this status reads healthy. Compare the template's required customer keys
+    // against the platform's config metadata and name the recovery.
+    if let Some(app) = app_metadata.as_ref()
+        && let Some(missing) = template_missing_config_keys(&api, app, &app_name).await
+        && !missing.is_empty()
+    {
+        println!("Config:   {}", "INCOMPLETE (per platform metadata)".red());
+        println!("Missing:  {}", missing.join(", "));
+        println!(
+            "          the deploy's config delivery is client-driven and does not resume on its own;"
+        );
+        println!(
+            "          if no deploy is in progress, re-run it to finish delivery (also heals a"
+        );
+        println!("          key stored in the TEE whose platform-metadata sync failed)");
+    }
+
     if let Some(deployment) = &status.deployment {
         print_deployment_diagnostics(deployment);
     }
@@ -2840,6 +2860,65 @@ enum StableSshEndpointState {
     Ready(String),
     Missing,
     Invalid,
+}
+
+/// Required template config keys that the app's platform config metadata does
+/// not record as set. `None` when inapplicable or a lookup fails — this
+/// advisory check must never fail `status`. Note the comparison is against
+/// metadata, not an authoritative TEE key read: a key stored in the TEE whose
+/// metadata sync failed shows as missing here (the printed recovery heals
+/// that case too).
+async fn template_missing_config_keys(
+    api: &ApiClient,
+    app: &AppResponse,
+    app_name: &str,
+) -> Option<Vec<String>> {
+    let template_slug = app.template_slug.as_deref()?;
+    let templates = api.list_templates().await.ok()?;
+    let template = templates.iter().find(|entry| entry.slug == template_slug)?;
+    if !template_version_matches_registry(app.template_version.as_deref(), &template.version) {
+        return None;
+    }
+    let delivered = api.list_config_keys(app_name).await.ok()?;
+    // Customer-channel keys only (same cut as the template deploy's
+    // customer-vs-managed split): managed keys are delivered by a durable
+    // server-side event that retries on its own, so only customer keys can
+    // strand when the deploy client dies before writing them.
+    Some(missing_required_config_keys(
+        template
+            .config_keys
+            .iter()
+            .filter(|entry| {
+                entry.required && !template.paas_managed_config_keys.contains(&entry.key)
+            })
+            .map(|entry| entry.key.clone()),
+        delivered.keys.into_iter().map(|entry| entry.key),
+    ))
+}
+
+/// The advisory compares against the registry's CURRENT required keys, which
+/// are only in force for apps deployed on exactly that template version;
+/// historical requirements are not available, so other versions are skipped.
+fn template_version_matches_registry(
+    app_template_version: Option<&str>,
+    registry_version: &str,
+) -> bool {
+    app_template_version == Some(registry_version)
+}
+
+/// Sorted, deduplicated set difference of required minus delivered keys.
+fn missing_required_config_keys(
+    required: impl IntoIterator<Item = String>,
+    delivered: impl IntoIterator<Item = String>,
+) -> Vec<String> {
+    let delivered: std::collections::HashSet<String> = delivered.into_iter().collect();
+    let mut missing: Vec<String> = required
+        .into_iter()
+        .filter(|key| !delivered.contains(key))
+        .collect();
+    missing.sort();
+    missing.dedup();
+    missing
 }
 
 fn stable_ssh_endpoint_state_from_app(app: &AppResponse) -> StableSshEndpointState {
