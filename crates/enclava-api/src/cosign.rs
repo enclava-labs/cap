@@ -3889,6 +3889,29 @@ mod tests {
         let payload = include_bytes!("cosign_testdata/managed-key.artifact.txt");
         let bundle =
             Bundle::from_json(include_str!("cosign_testdata/managed-key.bundle.json")).unwrap();
+        let entry = &bundle.verification_material.tlog_entries[0];
+        let SignatureContent::MessageSignature(signature) = &bundle.content else {
+            panic!("managed-key fixture must carry a message signature");
+        };
+        // Rewrap the published proof without changing its signed body or artifact.
+        let legacy = serde_json::json!({
+            "SignedEntryTimestamp": B64.encode(
+                entry.inclusion_promise.as_ref().unwrap().signed_entry_timestamp.as_bytes()
+            ),
+            "Payload": {
+                "body": B64.encode(entry.canonicalized_body.as_bytes()),
+                "integratedTime": entry.integrated_time.unwrap().as_second(),
+                "logIndex": entry.log_index.as_i64(),
+                "logID": hex::encode(entry.log_id.key_id.as_bytes()),
+            }
+        });
+        let bundle = normalize_signature_bundle(
+            payload,
+            signature.signature.as_bytes().to_vec(),
+            &legacy.to_string(),
+            Vec::new(),
+        )
+        .unwrap();
         let signer = finish_verification(&verifier, &policy, payload, bundle.clone())
             .expect("published managed-key signature must verify");
         assert_eq!(signer.rekor_log_index, Some(771_488_337));
