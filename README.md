@@ -114,7 +114,7 @@ waiting for bootstrap and on the client that submits the ownership claim.
 
 Requirements:
 
-- Rust 1.85 or newer;
+- Rust 1.87 or newer;
 - Docker Compose for the local API/PostgreSQL stack;
 - `pkg-config` and OpenSSL development headers (`libssl-dev`), required even
   for a standalone `cargo install enclava-cli`;

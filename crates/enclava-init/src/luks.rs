@@ -407,10 +407,10 @@ fn validate_existing_mapper(
                     status.keysize_bits
                 )));
             }
-            if !status
+            if status
                 .integrity
                 .as_deref()
-                .is_some_and(|value| value == INTEGRITY_LIB)
+                .is_none_or(|value| value != INTEGRITY_LIB)
             {
                 return Err(InitError::Luks(format!(
                     "existing mapper {mapping_name} reports integrity {:?}, expected \

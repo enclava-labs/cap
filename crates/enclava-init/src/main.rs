@@ -2045,8 +2045,8 @@ fn bind_log_spool_to_state(
     if !log_spool_capacity_sufficient(total_bytes) {
         anyhow::bail!(
             "log spool state filesystem has only {total_bytes} bytes total capacity; \
-             need at least {} (32Mi spool rotation plus temp and fs/platform headroom)",
-            LOG_SPOOL_MIN_STATE_BYTES
+             need at least {LOG_SPOOL_MIN_STATE_BYTES} (32Mi spool rotation plus temp and \
+             fs/platform headroom)"
         );
     }
     let source = format!("/proc/self/fd/{}", spool_dir.as_raw_fd());
