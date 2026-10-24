@@ -910,10 +910,9 @@ pub async fn verify_image(
     )
     .await?;
 
-    // Resolve the source manifest (the old `triangulate`): binds a mutable
-    // tag in `image_ref` to exactly the digest being verified.
-    let (_, source_image_digest) = client
-        .pull_manifest_raw(&image, &auth, MANIFEST_TYPES)
+    // Bind a mutable source reference to exactly the image digest being verified.
+    let source_image_digest = client
+        .fetch_manifest_digest(&image, &auth)
         .await
         .map_err(|e| {
             CosignError::VerificationFailed(format!("failed to triangulate signature image: {e}"))
