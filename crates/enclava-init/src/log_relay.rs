@@ -545,10 +545,10 @@ impl DeliveredSequences {
     fn insert(&mut self, sequence: u64) {
         if self.set.insert(sequence) {
             self.insertion_order.push_back(sequence);
-            if self.set.len() > DELIVERED_SET_CAP {
-                if let Some(evicted) = self.insertion_order.pop_front() {
-                    self.set.remove(&evicted);
-                }
+            if self.set.len() > DELIVERED_SET_CAP
+                && let Some(evicted) = self.insertion_order.pop_front()
+            {
+                self.set.remove(&evicted);
             }
         }
     }
@@ -625,10 +625,10 @@ impl WithheldContent {
     fn insert(&mut self, hash: u128) {
         if self.hashes.insert(hash) {
             self.insertion_order.push_back(hash);
-            if self.hashes.len() > WITHHELD_SET_CAP {
-                if let Some(evicted) = self.insertion_order.pop_front() {
-                    self.hashes.remove(&evicted);
-                }
+            if self.hashes.len() > WITHHELD_SET_CAP
+                && let Some(evicted) = self.insertion_order.pop_front()
+            {
+                self.hashes.remove(&evicted);
             }
         }
     }
@@ -2659,7 +2659,7 @@ mod tests {
                 let _ = spool.write_all(line.as_bytes());
                 let _ = spool.flush();
                 written += 1;
-                if written % 64 == 0 {
+                if written.is_multiple_of(64) {
                     thread::yield_now();
                 }
             }

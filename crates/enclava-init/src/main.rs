@@ -1284,10 +1284,9 @@ fn parse_positive_u32(value: &str) -> Option<u32> {
 fn kbs_proxy_health_url(kbs_url: &str) -> String {
     if let Ok(value) = std::env::var("ENCLAVA_INIT_ATTESTATION_PROXY_HEALTH_URL")
         .or_else(|_| std::env::var("ATTESTATION_PROXY_HEALTH_URL"))
+        && !value.trim().is_empty()
     {
-        if !value.trim().is_empty() {
-            return value;
-        }
+        return value;
     }
 
     let trimmed = kbs_url.trim_end_matches('/');

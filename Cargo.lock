@@ -1464,6 +1464,7 @@ dependencies = [
  "matchit",
  "nostr",
  "oci-client",
+ "p256",
  "rand 0.8.6",
  "rcgen",
  "reqwest 0.13.2",

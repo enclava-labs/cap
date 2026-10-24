@@ -867,7 +867,7 @@ where
         // sequences — counted and logged like a spool write failure below.
         let Some(sequence_number) = next_sequence(sequence) else {
             exhausted_frames += 1;
-            if exhausted_frames == 1 || exhausted_frames % 1000 == 0 {
+            if exhausted_frames == 1 || exhausted_frames.is_multiple_of(1000) {
                 eprintln!(
                     "enclava-wait-exec: encrypted log sequence space exhausted, dropping \
                      {stream} frame ({exhausted_frames} frames dropped so far)"
@@ -937,7 +937,7 @@ where
                     let _ = spool.seek(SeekFrom::Start(pre_write_len));
                 }
                 dropped_frames += 1;
-                if dropped_frames == 1 || dropped_frames % 1000 == 0 {
+                if dropped_frames == 1 || dropped_frames.is_multiple_of(1000) {
                     eprintln!(
                         "enclava-wait-exec: encrypted log spool write failed \
                          ({dropped_frames} frames dropped so far): {err}"

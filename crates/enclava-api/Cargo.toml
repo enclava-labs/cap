@@ -50,6 +50,7 @@ hmac = { workspace = true }
 subtle = { workspace = true }
 tower_governor = { workspace = true }
 sigstore-verify = { workspace = true }
+p256 = { version = "0.14", default-features = false, features = ["arithmetic", "pkcs8"] }
 jiff = { workspace = true }
 oci-client = { workspace = true }
 hickory-resolver = { workspace = true }

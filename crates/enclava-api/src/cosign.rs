@@ -33,6 +33,7 @@ use chrono::{DateTime, Utc};
 use futures::StreamExt as _;
 use oci_client::Reference;
 use oci_client::secrets::RegistryAuth as Auth;
+use p256::pkcs8::{DecodePublicKey as _, EncodePublicKey as _};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sha2::{Digest as _, Sha256};
@@ -813,14 +814,16 @@ fn build_sigstore_policy(policy: &VerificationPolicy) -> Result<SigstorePolicy, 
         VerificationPolicy::PublicKey { pem } => {
             let key = DerPublicKey::from_pem(pem)
                 .map_err(|e| CosignError::InvalidPolicy(format!("invalid public key PEM: {e}")))?;
-            if !matches!(
-                sigstore_verify::crypto::KeyAlgorithm::from_spki(&key),
-                Ok(sigstore_verify::crypto::KeyAlgorithm::EcdsaP256)
-            ) {
-                return Err(CosignError::InvalidPolicy(
-                    "only ECDSA P-256 public keys are accepted".to_string(),
-                ));
-            }
+            // Normalize point encodings before the verifier compares complete SPKI bytes.
+            let key = p256::PublicKey::from_public_key_der(key.as_bytes()).map_err(|e| {
+                CosignError::InvalidPolicy(format!(
+                    "only ECDSA P-256 public keys are accepted: {e}"
+                ))
+            })?;
+            let key = key.to_public_key_der().map_err(|e| {
+                CosignError::InvalidPolicy(format!("invalid ECDSA P-256 public key encoding: {e}"))
+            })?;
+            let key = DerPublicKey::new(key.into_vec());
             // `verify_tlog` stays enabled (the default): public-key signatures
             // must still carry verified Rekor evidence, exactly as documented.
             Ok(SigstorePolicy::PublicKey(PublicKeyVerificationPolicy::new(
@@ -3836,6 +3839,23 @@ mod tests {
         let signer = verify_tag_layer(&verifier, &policy, &layer, FLUX_IMAGE_DIGEST)
             .expect("a matching key pin must accept a logged signature with a certificate");
         assert_eq!(signer.subject.as_deref(), Some(FLUX_SIGNER_SUBJECT));
+        let compressed_policy = build_sigstore_policy(&VerificationPolicy::PublicKey {
+            pem: concat!(
+                "-----BEGIN PUBLIC KEY-----\n",
+                "MDkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDIgACcN+MOmkZ7MV4qqFlmIJwfHHEFgSA\n",
+                "SBiNKcdc2VTzJy0=\n",
+                "-----END PUBLIC KEY-----\n",
+            )
+            .into(),
+        })
+        .unwrap();
+        let compressed_signer =
+            verify_tag_layer(&verifier, &compressed_policy, &layer, FLUX_IMAGE_DIGEST)
+                .expect("an equivalent compressed P-256 pin must authorize the same signer");
+        assert_eq!(
+            compressed_signer.subject.as_deref(),
+            Some(FLUX_SIGNER_SUBJECT)
+        );
         let wrong_policy = build_sigstore_policy(&VerificationPolicy::PublicKey {
             pem: concat!(
                 "-----BEGIN PUBLIC KEY-----\n",
