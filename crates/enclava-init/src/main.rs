@@ -109,6 +109,14 @@ fn report_failure(error: &anyhow::Error) {
 
 fn run() -> Result<()> {
     let mut stats = init_stats::BootStats::begin();
+    let result = run_with_stats(&mut stats);
+    if result.is_err() {
+        let _ = stats.write(&init_stats::stats_path_for(&ready_file_path()));
+    }
+    result
+}
+
+fn run_with_stats(stats: &mut init_stats::BootStats) -> Result<()> {
     record_stage("loading config").ok();
     let cfg_path = std::env::var("ENCLAVA_INIT_CONFIG")
         .map(PathBuf::from)
@@ -162,7 +170,7 @@ fn run() -> Result<()> {
     open_luks_volumes(
         &cfg,
         &owner,
-        &mut stats,
+        stats,
         &luks_rollout_policy(cc_init_data.as_deref())?,
     )?;
     record_stage("preparing mount ownership").ok();
@@ -1404,7 +1412,7 @@ fn open_luks_volumes(
     // hardening floor before touching any volume.
     luks2_seal::ensure_cryptsetup_floor()?;
     let state_phase = stats.elapsed_ms();
-    let state_opened = open_one_volume(
+    let state_result = open_one_volume(
         &cfg.state,
         owner,
         // The passphrase stays derived from the signed per-volume
@@ -1413,19 +1421,21 @@ fn open_luks_volumes(
         &cfg.state.hkdf_info,
         seeds::STATE_HEADER_MAC_INFO,
         luks_policy,
-    )
-    .with_context(|| format!("opening state volume {}", cfg.state.device))?;
-    stats.record_state_volume(state_phase, state_opened.formatted);
+        &mut stats.state_profile,
+    );
+    stats.record_state_volume(state_phase, stats.state_profile.format_completed());
+    state_result.with_context(|| format!("opening state volume {}", cfg.state.device))?;
     let tls_phase = stats.elapsed_ms();
-    let tls_opened = open_one_volume(
+    let tls_result = open_one_volume(
         &cfg.tls_state,
         owner,
         &cfg.tls_state.hkdf_info,
         seeds::TLS_STATE_HEADER_MAC_INFO,
         luks_policy,
-    )
-    .with_context(|| format!("opening tls-state volume {}", cfg.tls_state.device))?;
-    stats.record_tls_volume(tls_phase, tls_opened.formatted);
+        &mut stats.tls_profile,
+    );
+    stats.record_tls_volume(tls_phase, stats.tls_profile.format_completed());
+    tls_result.with_context(|| format!("opening tls-state volume {}", cfg.tls_state.device))?;
     stats.record_post_luks_memory();
     Ok(())
 }
@@ -1442,6 +1452,7 @@ fn open_one_volume(
     // the MAC key cannot be steered by config data.
     header_mac_info: &[u8],
     policy: &luks::LuksOpenPolicy,
+    profile: &mut enclava_init::volume_profile::VolumeProfile,
 ) -> Result<luks::LuksOpened> {
     // Distinct HKDF branches: the volume passphrase and the header MAC key
     // must never share material (cap#242).
@@ -1450,13 +1461,19 @@ fn open_one_volume(
         derive_volume_key(owner, header_mac_info)?,
     );
     let device = Path::new(&vol.device);
+    profile.device_bytes = std::fs::File::open(device)
+        .and_then(|mut file| std::io::Seek::seek(&mut file, std::io::SeekFrom::End(0)))
+        .unwrap_or(0);
     let opened = luks::format_if_unformatted_then_open_with_policy(
         device,
         &vol.mapping_name,
         &keys,
         policy,
+        profile,
     )?;
-    luks::mount(&opened.mapper_path, Path::new(&vol.mount_path))?;
+    profile.run(enclava_init::volume_profile::Stage::Mount, |_| {
+        luks::mount(&opened.mapper_path, Path::new(&vol.mount_path))
+    })?;
     tracing::info!(
         device = %vol.device,
         mapper = %opened.mapper_path.display(),
@@ -2045,8 +2062,7 @@ fn bind_log_spool_to_state(
     if !log_spool_capacity_sufficient(total_bytes) {
         anyhow::bail!(
             "log spool state filesystem has only {total_bytes} bytes total capacity; \
-             need at least {LOG_SPOOL_MIN_STATE_BYTES} (32Mi spool rotation plus temp and \
-             fs/platform headroom)"
+             need at least {LOG_SPOOL_MIN_STATE_BYTES} (32Mi spool rotation plus temp and fs/platform headroom)"
         );
     }
     let source = format!("/proc/self/fd/{}", spool_dir.as_raw_fd());
