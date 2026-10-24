@@ -1,0 +1,1 @@
+{"critical":{"identity":{"docker-reference":"ghcr.io/fluxcd/source-controller"},"image":{"docker-manifest-digest":"sha256:11c8e14df885eff86586533d9941293ec8a1e9fff71bacf119edc79fdf3c63e3"},"type":"cosign container image signature"},"optional":null}
