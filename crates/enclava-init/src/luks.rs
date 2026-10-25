@@ -34,8 +34,8 @@ use std::time::{Duration, Instant};
 
 use libcryptsetup_rs::{
     CryptInit, CryptParamsLuks2, CryptParamsLuks2Ref, CryptPbkdfType, consts::flags::CryptActivate,
-    consts::flags::CryptDeactivate, consts::flags::CryptPbkdf, consts::vals::CryptKdf,
-    consts::vals::EncryptionFormat,
+    consts::flags::CryptDeactivate, consts::flags::CryptPbkdf, consts::flags::CryptWipe,
+    consts::vals::CryptKdf, consts::vals::CryptWipePattern, consts::vals::EncryptionFormat,
 };
 
 use crate::errors::{InitError, Result};
@@ -64,9 +64,8 @@ const VOLUME_KEY_BYTES: usize = 96;
 /// Library spelling of the integrity algorithm (the CLI spells it
 /// `hmac-sha256`; see [`INTEGRITY_CLI`]).
 const INTEGRITY_LIB: &str = "hmac(sha256)";
-/// Zero-write chunk for integrity-tag initialization through the wipe
-/// mapper (4 MiB keeps write amplification bounded on large volumes).
-const INTEGRITY_WIPE_CHUNK: usize = 4 * 1024 * 1024;
+// Match cryptsetup's integrity wipe batching.
+const WIPE_BLOCK_BYTES: usize = 1024 * 1024;
 /// CLI spelling of the integrity algorithm.
 const INTEGRITY_CLI: &str = "hmac-sha256";
 
@@ -943,8 +942,11 @@ fn initialize_integrity_tags(
             ))
         })?;
 
-    let result =
-        write_zeros_through_mapper(&PathBuf::from(format!("/dev/mapper/{wipe_name}")), profile);
+    let result = wipe_integrity_tags(
+        dev,
+        &PathBuf::from(format!("/dev/mapper/{wipe_name}")),
+        profile,
+    );
     let deactivate = dev
         .activate_handle()
         .deactivate(&wipe_name, CryptDeactivate::empty())
@@ -967,30 +969,45 @@ fn unguessable_suffix() -> String {
     format!("{}-{counter}-{nanos:x}", std::process::id())
 }
 
-fn write_zeros_through_mapper(mapper_path: &Path, profile: &mut VolumeProfile) -> Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .open(mapper_path)
-        .map_err(|e| InitError::Luks(format!("open {}: {e}", mapper_path.display())))?;
-    let len = file
-        .seek(SeekFrom::End(0))
-        .map_err(|e| InitError::Luks(format!("seek {}: {e}", mapper_path.display())))?;
-    file.seek(SeekFrom::Start(0))
-        .map_err(|e| InitError::Luks(format!("seek {}: {e}", mapper_path.display())))?;
+/// Retain completed initialization bytes even if the native wipe later fails.
+unsafe extern "C" fn wipe_progress(
+    _size: u64,
+    offset: u64,
+    usrptr: *mut std::os::raw::c_void,
+) -> std::os::raw::c_int {
+    // SAFETY: `usrptr` is the `Option<&mut VolumeProfile>` passed to `wipe()`
+    // for exactly this synchronous call; cryptsetup does not store it.
+    let profile = unsafe { &mut *(usrptr.cast::<VolumeProfile>()) };
+    profile.initialized_bytes = offset;
+    0
+}
 
-    let zeros = vec![0u8; INTEGRITY_WIPE_CHUNK];
-    let mut remaining = len;
-    while remaining > 0 {
-        let chunk = &zeros[..zeros.len().min(remaining as usize)];
-        file.write_all(chunk)
-            .map_err(|e| InitError::Luks(format!("zero {}: {e}", mapper_path.display())))?;
-        remaining -= chunk.len() as u64;
-        profile.initialized_bytes += chunk.len() as u64;
-    }
-    profile.run(Stage::IntegritySync, |_| {
-        file.sync_all()
-            .map_err(|e| InitError::Luks(format!("sync {}: {e}", mapper_path.display())))
-    })
+/// Use cryptsetup's full-device zero wipe and final sync to initialize every tag.
+fn wipe_integrity_tags(
+    dev: &mut libcryptsetup_rs::CryptDevice,
+    mapper_path: &Path,
+    profile: &mut VolumeProfile,
+) -> Result<()> {
+    let len = OpenOptions::new()
+        .read(true)
+        .open(mapper_path)
+        .and_then(|mut file| file.seek(SeekFrom::End(0)))
+        .map_err(|e| InitError::Luks(format!("probe {}: {e}", mapper_path.display())))?;
+    // Zero offset/length covers the full mapper; flags 0 retains the final sync.
+    dev.wipe_handle()
+        .wipe(
+            mapper_path,
+            CryptWipePattern::Zero,
+            0,
+            0,
+            WIPE_BLOCK_BYTES,
+            CryptWipe::empty(),
+            Some(wipe_progress),
+            Some(&mut *profile),
+        )
+        .map_err(|e| InitError::Luks(format!("wipe {}: {e}", mapper_path.display())))?;
+    profile.initialized_bytes = len;
+    Ok(())
 }
 
 fn format_with_cryptsetup_cli(device: &Path, key: &DerivedSeed) -> Result<()> {
@@ -1536,6 +1553,74 @@ pub fn mount(mapper_path: &Path, mount_point: &Path) -> Result<()> {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+
+    struct WipeAbort {
+        profile: VolumeProfile,
+        abort_at_offset: u64,
+    }
+
+    unsafe extern "C" fn aborting_progress(
+        size: u64,
+        offset: u64,
+        usrptr: *mut std::os::raw::c_void,
+    ) -> std::os::raw::c_int {
+        // SAFETY: synchronous cryptsetup callback; `usrptr` is our WipeAbort,
+        // alive for the whole `crypt_wipe` call on this thread.
+        let state = unsafe { &mut *(usrptr.cast::<WipeAbort>()) };
+        // SAFETY: pointer to the state's own profile field, same lifetime.
+        unsafe {
+            wipe_progress(
+                size,
+                offset,
+                (&mut state.profile as *mut VolumeProfile).cast(),
+            )
+        };
+        if offset >= state.abort_at_offset {
+            1
+        } else {
+            0
+        }
+    }
+
+    #[test]
+    fn crypt_wipe_reports_partial_progress_when_aborted() {
+        const LEN: usize = 8 * 1024 * 1024;
+        const BLOCK: usize = 1024 * 1024;
+        let path = std::env::temp_dir().join(format!("enclava-wipe-test-{}", unguessable_suffix()));
+        std::fs::write(&path, vec![0xFFu8; LEN]).expect("create wipe test file");
+
+        let mut dev = CryptInit::init(&path).expect("crypt_init on temp file");
+        let mut state = WipeAbort {
+            profile: VolumeProfile::default(),
+            abort_at_offset: BLOCK as u64,
+        };
+        let result = dev.wipe_handle().wipe(
+            &path,
+            CryptWipePattern::Zero,
+            0,
+            0,
+            BLOCK,
+            CryptWipe::empty(),
+            Some(aborting_progress),
+            Some(&mut state),
+        );
+        assert!(result.is_err(), "aborting callback must fail the wipe");
+
+        let bytes = std::fs::read(&path).expect("read wiped file");
+        assert!(
+            bytes[..BLOCK].iter().all(|byte| *byte == 0),
+            "completed prefix must be zeroed"
+        );
+        assert!(
+            bytes[BLOCK..].iter().all(|byte| *byte == 0xFF),
+            "suffix beyond the abort offset must be untouched"
+        );
+        assert_eq!(
+            state.profile.initialized_bytes, BLOCK as u64,
+            "partial progress must be counted on failure"
+        );
+        std::fs::remove_file(&path).ok();
+    }
 
     #[test]
     fn format_decision_only_formats_blank_unformatted_devices() {

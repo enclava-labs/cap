@@ -127,7 +127,7 @@ fixed twelve-entry `stages` array. Its indices are:
 | 4 | Libcryptsetup format | Inside fallback |
 | 5 | Fallback keyslot creation | Inside fallback |
 | 6 | Fallback integrity initialization | Inside fallback |
-| 7 | Fallback integrity final sync | Inside integrity initialization |
+| 7 | Fallback integrity final sync | Reserved, always 0: the final device sync runs inside the libcryptsetup wipe counted at index 6 |
 | 8 | Header validation and sealing | Top level |
 | 9 | Authenticated open | Top level |
 | 10 | Filesystem creation | Top level; fresh devices only |
