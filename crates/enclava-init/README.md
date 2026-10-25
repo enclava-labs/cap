@@ -174,6 +174,11 @@ Any mismatch fails startup before encrypted volumes are opened or seeds are
 released. The check consumes the same signed `cc_init_data` bytes as the
 ConfigMap transport cross-check.
 
+Attestation-agent token responses are capped at 512 KiB before typed JSON
+decoding, for both declared-length and streamed bodies. EAR tokens include
+signed policy claims; larger workload commands can exceed 64 KiB without
+exceeding the supported policy size.
+
 ## TLS State
 
 Tenant Caddy receives seed and certificate material from the TLS-state volume.
