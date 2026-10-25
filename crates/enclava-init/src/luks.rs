@@ -34,8 +34,8 @@ use std::time::{Duration, Instant};
 
 use libcryptsetup_rs::{
     CryptInit, CryptParamsLuks2, CryptParamsLuks2Ref, CryptPbkdfType, consts::flags::CryptActivate,
-    consts::flags::CryptDeactivate, consts::flags::CryptPbkdf, consts::vals::CryptKdf,
-    consts::vals::EncryptionFormat,
+    consts::flags::CryptDeactivate, consts::flags::CryptPbkdf, consts::flags::CryptWipe,
+    consts::vals::CryptKdf, consts::vals::CryptWipePattern, consts::vals::EncryptionFormat,
 };
 
 use crate::errors::{InitError, Result};
@@ -64,9 +64,8 @@ const VOLUME_KEY_BYTES: usize = 96;
 /// Library spelling of the integrity algorithm (the CLI spells it
 /// `hmac-sha256`; see [`INTEGRITY_CLI`]).
 const INTEGRITY_LIB: &str = "hmac(sha256)";
-/// Zero-write chunk for integrity-tag initialization through the wipe
-/// mapper (4 MiB keeps write amplification bounded on large volumes).
-const INTEGRITY_WIPE_CHUNK: usize = 4 * 1024 * 1024;
+// Match cryptsetup's integrity wipe batching.
+const WIPE_BLOCK_BYTES: usize = 1024 * 1024;
 /// CLI spelling of the integrity algorithm.
 const INTEGRITY_CLI: &str = "hmac-sha256";
 
@@ -943,8 +942,11 @@ fn initialize_integrity_tags(
             ))
         })?;
 
-    let result =
-        write_zeros_through_mapper(&PathBuf::from(format!("/dev/mapper/{wipe_name}")), profile);
+    let result = wipe_integrity_tags(
+        dev,
+        &PathBuf::from(format!("/dev/mapper/{wipe_name}")),
+        profile,
+    );
     let deactivate = dev
         .activate_handle()
         .deactivate(&wipe_name, CryptDeactivate::empty())
@@ -967,30 +969,33 @@ fn unguessable_suffix() -> String {
     format!("{}-{counter}-{nanos:x}", std::process::id())
 }
 
-fn write_zeros_through_mapper(mapper_path: &Path, profile: &mut VolumeProfile) -> Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
+/// Use cryptsetup's full-device zero wipe and final sync to initialize every tag.
+fn wipe_integrity_tags(
+    dev: &mut libcryptsetup_rs::CryptDevice,
+    mapper_path: &Path,
+    profile: &mut VolumeProfile,
+) -> Result<()> {
+    let len = OpenOptions::new()
+        .read(true)
         .open(mapper_path)
-        .map_err(|e| InitError::Luks(format!("open {}: {e}", mapper_path.display())))?;
-    let len = file
-        .seek(SeekFrom::End(0))
-        .map_err(|e| InitError::Luks(format!("seek {}: {e}", mapper_path.display())))?;
-    file.seek(SeekFrom::Start(0))
-        .map_err(|e| InitError::Luks(format!("seek {}: {e}", mapper_path.display())))?;
-
-    let zeros = vec![0u8; INTEGRITY_WIPE_CHUNK];
-    let mut remaining = len;
-    while remaining > 0 {
-        let chunk = &zeros[..zeros.len().min(remaining as usize)];
-        file.write_all(chunk)
-            .map_err(|e| InitError::Luks(format!("zero {}: {e}", mapper_path.display())))?;
-        remaining -= chunk.len() as u64;
-        profile.initialized_bytes += chunk.len() as u64;
-    }
-    profile.run(Stage::IntegritySync, |_| {
-        file.sync_all()
-            .map_err(|e| InitError::Luks(format!("sync {}: {e}", mapper_path.display())))
-    })
+        .and_then(|mut file| file.seek(SeekFrom::End(0)))
+        .map_err(|e| InitError::Luks(format!("probe {}: {e}", mapper_path.display())))?;
+    // offset 0, length 0 wipes the full mapper; flags 0 keeps upstream
+    // defaults (O_DIRECT allowed, no per-block fsync).
+    dev.wipe_handle()
+        .wipe(
+            mapper_path,
+            CryptWipePattern::Zero,
+            0,
+            0,
+            WIPE_BLOCK_BYTES,
+            CryptWipe::empty(),
+            None,
+            None::<&mut ()>,
+        )
+        .map_err(|e| InitError::Luks(format!("wipe {}: {e}", mapper_path.display())))?;
+    profile.initialized_bytes = len;
+    Ok(())
 }
 
 fn format_with_cryptsetup_cli(device: &Path, key: &DerivedSeed) -> Result<()> {
