@@ -969,6 +969,19 @@ fn unguessable_suffix() -> String {
     format!("{}-{counter}-{nanos:x}", std::process::id())
 }
 
+/// Retain completed initialization bytes even if the native wipe later fails.
+unsafe extern "C" fn wipe_progress(
+    _size: u64,
+    offset: u64,
+    usrptr: *mut std::os::raw::c_void,
+) -> std::os::raw::c_int {
+    // SAFETY: `usrptr` is the `Option<&mut VolumeProfile>` passed to `wipe()`
+    // for exactly this synchronous call; cryptsetup does not store it.
+    let profile = unsafe { &mut *(usrptr.cast::<VolumeProfile>()) };
+    profile.initialized_bytes = offset;
+    0
+}
+
 /// Use cryptsetup's full-device zero wipe and final sync to initialize every tag.
 fn wipe_integrity_tags(
     dev: &mut libcryptsetup_rs::CryptDevice,
@@ -980,8 +993,7 @@ fn wipe_integrity_tags(
         .open(mapper_path)
         .and_then(|mut file| file.seek(SeekFrom::End(0)))
         .map_err(|e| InitError::Luks(format!("probe {}: {e}", mapper_path.display())))?;
-    // offset 0, length 0 wipes the full mapper; flags 0 keeps upstream
-    // defaults (O_DIRECT allowed, no per-block fsync).
+    // Zero offset/length covers the full mapper; flags 0 retains the final sync.
     dev.wipe_handle()
         .wipe(
             mapper_path,
@@ -990,8 +1002,8 @@ fn wipe_integrity_tags(
             0,
             WIPE_BLOCK_BYTES,
             CryptWipe::empty(),
-            None,
-            None::<&mut ()>,
+            Some(wipe_progress),
+            Some(&mut *profile),
         )
         .map_err(|e| InitError::Luks(format!("wipe {}: {e}", mapper_path.display())))?;
     profile.initialized_bytes = len;
@@ -1541,6 +1553,74 @@ pub fn mount(mapper_path: &Path, mount_point: &Path) -> Result<()> {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+
+    struct WipeAbort {
+        profile: VolumeProfile,
+        abort_at_offset: u64,
+    }
+
+    unsafe extern "C" fn aborting_progress(
+        size: u64,
+        offset: u64,
+        usrptr: *mut std::os::raw::c_void,
+    ) -> std::os::raw::c_int {
+        // SAFETY: synchronous cryptsetup callback; `usrptr` is our WipeAbort,
+        // alive for the whole `crypt_wipe` call on this thread.
+        let state = unsafe { &mut *(usrptr.cast::<WipeAbort>()) };
+        // SAFETY: pointer to the state's own profile field, same lifetime.
+        unsafe {
+            wipe_progress(
+                size,
+                offset,
+                (&mut state.profile as *mut VolumeProfile).cast(),
+            )
+        };
+        if offset >= state.abort_at_offset {
+            1
+        } else {
+            0
+        }
+    }
+
+    #[test]
+    fn crypt_wipe_reports_partial_progress_when_aborted() {
+        const LEN: usize = 8 * 1024 * 1024;
+        const BLOCK: usize = 1024 * 1024;
+        let path = std::env::temp_dir().join(format!("enclava-wipe-test-{}", unguessable_suffix()));
+        std::fs::write(&path, vec![0xFFu8; LEN]).expect("create wipe test file");
+
+        let mut dev = CryptInit::init(&path).expect("crypt_init on temp file");
+        let mut state = WipeAbort {
+            profile: VolumeProfile::default(),
+            abort_at_offset: BLOCK as u64,
+        };
+        let result = dev.wipe_handle().wipe(
+            &path,
+            CryptWipePattern::Zero,
+            0,
+            0,
+            BLOCK,
+            CryptWipe::empty(),
+            Some(aborting_progress),
+            Some(&mut state),
+        );
+        assert!(result.is_err(), "aborting callback must fail the wipe");
+
+        let bytes = std::fs::read(&path).expect("read wiped file");
+        assert!(
+            bytes[..BLOCK].iter().all(|byte| *byte == 0),
+            "completed prefix must be zeroed"
+        );
+        assert!(
+            bytes[BLOCK..].iter().all(|byte| *byte == 0xFF),
+            "suffix beyond the abort offset must be untouched"
+        );
+        assert_eq!(
+            state.profile.initialized_bytes, BLOCK as u64,
+            "partial progress must be counted on failure"
+        );
+        std::fs::remove_file(&path).ok();
+    }
 
     #[test]
     fn format_decision_only_formats_blank_unformatted_devices() {
