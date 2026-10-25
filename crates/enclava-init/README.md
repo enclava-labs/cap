@@ -188,25 +188,37 @@ writes the returned certificate chain into the shared Caddy runtime directory.
 
 ## Volume Integrity
 
-Fresh LUKS2 volumes are formatted AES-256-XTS with `hmac(sha256)` integrity
-(dm-integrity), so ciphertext tampering turns into an I/O error at read time.
-Both format paths request it: `cryptsetup luksFormat --integrity hmac-sha256`
+Fresh LUKS2 volumes use 4096-byte sectors, AES-256-XTS and `hmac(sha256)`
+integrity (dm-integrity), so ciphertext tampering becomes a read-time I/O error.
+Both format paths request the same layout: the cryptsetup CLI
 and the libcryptsetup fallback. The fallback initializes tags through a
 temporary private, no-journal mapping, then closes it; normal opens retain
 journaled integrity. Both paths write the entire data area at first format.
 
-Volumes formatted before integrity support stay as they are: they are
-detected by their LUKS2 header and opened without reformatting.
+Both format paths use a fixed Argon2id keyslot budget: **4 passes, 262144 KiB
+(256 MiB), one lane**, with benchmarking disabled. The CLI uses
+`--pbkdf argon2id --pbkdf-force-iterations 4 --pbkdf-memory 262144 --pbkdf-parallel 1`;
+the library sets the same budget for format and keyslot creation with
+`CRYPT_PBKDF_NO_BENCHMARK`. CPU throttling therefore cannot change the chosen
+work factors or add per-volume calibration. Password-to-owner-seed derivation
+is unchanged. The 512-MiB init container limit must cover the KDF plus the
+remaining process and header material.
+
+This is a greenfield format cutover: only 4096-byte, HMAC-integrity headers
+are accepted. Older 512-byte and non-integrity layouts fail closed; there is
+no conversion or compatibility path. Existing nonblank devices are never
+automatically reformatted or deleted.
 
 Encryption makes the initial zeros non-sparse: reserve the full requested
 capacity on every Longhorn replica, not just the filesystem's used bytes.
 Use native Longhorn scheduling without logical overprovisioning and retain
 its free-space reserve. Header, journal and tag overhead also reduce usable
-capacity. With 512-byte sectors, the 32-byte tags alone add 6.25% overhead.
+capacity. With 4096-byte sectors, 32-byte tags alone add 0.78125% overhead.
 
 Before changing an environment's init pin, qualify its exact Kata guest
-kernel with `cryptsetup --integrity hmac-sha256` on a disposable block PVC,
-including close/reopen and data persistence. `CONFIG_DM_INTEGRITY=y`, or a
+kernel with the 4096-byte integrity layout on disposable block storage,
+including both format paths, ext4 persistence, authenticated close/reopen and
+corruption rejection. `CONFIG_DM_INTEGRITY=y`, or a
 loadable target plus its matching module, is required separately from
 dm-crypt. A healthy existing volume is not proof: it needs no new integrity
 target. Do not enable mandatory integrity in an unqualified environment.
@@ -225,10 +237,11 @@ never-ready volume.
 cargo test -p enclava-init --lib
 ```
 
-LUKS integration tests need root, `/dev/mapper` control, dm-crypt and
-dm-integrity kernel support, `cryptsetup`, `mkfs.ext4`/`e2fsck`, and a
-writable `/run/enclava`. They use disposable backing files and random
-per-test mapper names and close their mappings even on failure:
+Run LUKS integration tests in an isolated disposable VM: they need root,
+`/dev/mapper` control, loop devices, dm-crypt and dm-integrity kernel support,
+cryptsetup 2.8.1 or newer at `/usr/local/sbin/cryptsetup`, `mkfs.ext4`, and
+tmpfs-backed `/run/enclava-luks`. They create disposable backing files and
+test mapper names. Missing prerequisites cause skips, not storage validation:
 
 ```bash
 sudo cargo test -p enclava-init --features luks-integration
