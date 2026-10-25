@@ -24,7 +24,7 @@
 //!    is no verify-then-use window on host-controlled bytes.
 //! 3. **Strict metadata validation** at format, open, and adoption: exactly
 //!    one keyslot (0, luks2, argon2id, raw area `aes-xts-plain64`), no
-//!    tokens, exactly one crypt segment (`aes-xts-plain64`, sector 512),
+//!    tokens, exactly one crypt segment (`aes-xts-plain64`, sector 4096),
 //!    one digest bound to keyslot 0 and segment 0, and a layout where
 //!    `data_offset == 2*hdr_size + keyslots_size`. A `cipher_null`-swapped
 //!    header fails these checks before cryptsetup is ever invoked.
@@ -193,25 +193,6 @@ pub enum HeaderSeal {
     InterruptedSeal,
 }
 
-/// Volume-integrity layout of a LUKS2 header (cap#248 interop).
-///
-/// cap#248 (now on main) formats every fresh volume with dm-integrity
-/// `hmac(sha256)` tags: the volume key grows to 96 bytes (64 AES-XTS + 32
-/// HMAC) and segment 0 carries an `integrity` object. Headers written by
-/// the pre-#248 implementation (and any pre-existing fleet volumes) have a
-/// 64-byte volume key and no integrity segment. Both are accepted by
-/// strict validation; which one was seen is reported to the caller so the
-/// live-mapper checks can validate the matching dm stack (cap#244 review).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VolumeIntegrity {
-    /// dm-integrity `hmac(sha256)` tags; 96-byte volume key (64 cipher +
-    /// 32 HMAC); activated as a stacked `<name>` over `<name>_dif` mapper.
-    HmacSha256,
-    /// Pre-#248 layout: no integrity segment, 64-byte volume key, plain
-    /// dm-crypt mapper directly over the backing device.
-    None,
-}
-
 /// The full authenticated header region `[0, data_offset)` read from disk.
 pub struct Luks2Region {
     pub bytes: Vec<u8>,
@@ -351,21 +332,20 @@ pub fn parse_layout(json: &Value) -> Result<Luks2Layout> {
     })
 }
 
-/// Strict validation of LUKS2 metadata against the exact shapes enclava-init
+/// Strict validation of LUKS2 metadata against the exact shape enclava-init
 /// formats: single keyslot 0 (argon2id, raw `aes-xts-plain64` area), no
-/// tokens, single `aes-xts-plain64` crypt segment at 512-byte sectors, one
+/// tokens, single `aes-xts-plain64` crypt segment at 4096-byte sectors, one
 /// sha256 digest binding keyslot 0 to segment 0.
 ///
-/// Two on-disk shapes are accepted (cap#248 interop, cap#244 review):
-/// the dm-integrity layout every current format produces (96-byte keyslot
-/// key = 64 AES-XTS + 32 HMAC, segment 0 `integrity: hmac(sha256)`) and
-/// the legacy pre-integrity layout (64-byte key, no integrity object).
-/// Anything else — a stripped integrity object, a different integrity
-/// algorithm, or a key size that matches neither layout — is refused.
+/// Sector size is exactly 4096: headers at the old 512-byte sector layout
+/// (or any other value) fail closed — greenfield format, no read
+/// compatibility or migration path. The sector size lives inside the
+/// MAC-authenticated header region, so a host cannot flip it without
+/// failing the seal.
 ///
-/// This is the ToB-recommended fallback floor and the adoption gate: a
-/// `cipher_null`-swapped header fails here, before cryptsetup runs.
-pub fn validate_metadata_strict(json: &Value, layout: &Luks2Layout) -> Result<VolumeIntegrity> {
+/// A 96-byte volume key includes the 64-byte AES-XTS key and the 32-byte
+/// HMAC key. Missing or weakened integrity is refused before activation.
+pub fn validate_metadata_strict(json: &Value, layout: &Luks2Layout) -> Result<()> {
     let keyslots = json
         .get("keyslots")
         .and_then(|v| v.as_object())
@@ -377,38 +357,25 @@ pub fn validate_metadata_strict(json: &Value, layout: &Luks2Layout) -> Result<Vo
     }
     let ks = &keyslots["0"];
     expect_str(ks, "type", "luks2", "keyslot 0 type")?;
-    // Segment 0's integrity object decides the expected volume-key size
-    // (cap#248 interop): 96 bytes with hmac(sha256) tags, 64 for the
-    // legacy plain dm-crypt layout. Validated once here, then enforced
-    // on both the keyslot key size and the area key size below.
     let seg = &json
         .get("segments")
         .and_then(|v| v.as_object())
         .ok_or_else(|| luks_error("LUKS2 metadata missing segments".into()))?["0"];
-    let integrity = match seg.get("integrity") {
-        None => VolumeIntegrity::None,
-        Some(Value::Null) => VolumeIntegrity::None,
-        Some(obj @ Value::Object(_)) => {
-            expect_str(obj, "type", "hmac(sha256)", "segment 0 integrity type").map_err(|_| {
-                luks_error(
-                    "strict header validation: segment 0 integrity must be hmac(sha256) \
-                     (unknown or weakened integrity algorithm refused)"
-                        .into(),
-                )
-            })?;
-            VolumeIntegrity::HmacSha256
-        }
-        Some(_) => {
-            return Err(luks_error(
-                "strict header validation: segment 0 integrity must be an object or absent".into(),
-            ));
-        }
-    };
-    let expected_key_size = match integrity {
-        VolumeIntegrity::HmacSha256 => 96,
-        VolumeIntegrity::None => 64,
-    };
-    expect_u64(ks, "key_size", expected_key_size, "keyslot 0 key_size")?;
+    let integrity = object_field(seg, "integrity", "segment 0 integrity")?;
+    expect_str(
+        integrity,
+        "type",
+        "hmac(sha256)",
+        "segment 0 integrity type",
+    )
+    .map_err(|_| {
+        luks_error(
+            "strict header validation: segment 0 integrity must be hmac(sha256) \
+                 (unknown or weakened integrity algorithm refused)"
+                .into(),
+        )
+    })?;
+    expect_u64(ks, "key_size", 96, "keyslot 0 key_size")?;
 
     let af = object_field(ks, "af", "keyslot 0 af")?;
     expect_str(af, "type", "luks1", "keyslot 0 af type")?;
@@ -486,7 +453,7 @@ pub fn validate_metadata_strict(json: &Value, layout: &Luks2Layout) -> Result<Vo
                 .into(),
         )
     })?;
-    expect_u64(seg, "sector_size", 512, "segment 0 sector_size")?;
+    expect_u64(seg, "sector_size", 4096, "segment 0 sector_size")?;
     expect_str(seg, "iv_tweak", "0", "segment 0 iv_tweak")?;
     expect_str(seg, "size", "dynamic", "segment 0 size")?;
     let seg_offset = parse_json_u64_field(seg, "offset")?;
@@ -512,19 +479,17 @@ pub fn validate_metadata_strict(json: &Value, layout: &Luks2Layout) -> Result<Vo
     expect_str_list(digest, "keyslots", &["0"], "digest 0 keyslots")?;
     expect_str_list(digest, "segments", &["0"], "digest 0 segments")?;
 
-    Ok(integrity)
+    Ok(())
 }
 
 /// Region-level validation: both metadata copies must parse, carry the LUKS2
 /// magic (reversed in the secondary copy, as cryptsetup writes it), and be
-/// byte-identical in JSON; then strict shape validation runs. Returns the
-/// volume's integrity layout so callers can validate the matching live dm
-/// stack (cap#248 interop).
+/// byte-identical in JSON; then strict shape validation runs.
 ///
 /// Requiring copy equality removes cryptsetup's higher-seqid copy selection
 /// as an attacker-controlled degree of freedom during adoption; for sealed
 /// headers any divergence already breaks the MAC.
-pub fn validate_region(region: &Luks2Region) -> Result<VolumeIntegrity> {
+pub fn validate_region(region: &Luks2Region) -> Result<()> {
     let copy2 = &region.bytes[LUKS2_METADATA_COPY_SIZE..2 * LUKS2_METADATA_COPY_SIZE];
     if !has_luks2_magic(copy2, true) {
         return Err(luks_error(
@@ -918,15 +883,15 @@ mod tests {
       "keyslots":{
         "0":{
           "type":"luks2",
-          "key_size":64,
+          "key_size":96,
           "af":{"type":"luks1","stripes":4000,"hash":"sha256"},
-          "area":{"type":"raw","offset":"32768","size":"258048","encryption":"aes-xts-plain64","key_size":64},
-          "kdf":{"type":"argon2id","time":4,"memory":704452,"cpus":4,"salt":"AA=="}
+          "area":{"type":"raw","offset":"32768","size":"385024","encryption":"aes-xts-plain64","key_size":64},
+          "kdf":{"type":"argon2id","time":4,"memory":262144,"cpus":1,"salt":"AA=="}
         }
       },
       "tokens":{},
       "segments":{
-        "0":{"type":"crypt","offset":"16777216","size":"dynamic","iv_tweak":"0","encryption":"aes-xts-plain64","sector_size":512}
+        "0":{"type":"crypt","offset":"16777216","size":"dynamic","iv_tweak":"0","encryption":"aes-xts-plain64","sector_size":4096,"integrity":{"type":"hmac(sha256)","journal_encryption":"none","journal_integrity":"none"}}
       },
       "digests":{
         "0":{"type":"pbkdf2","keyslots":["0"],"segments":["0"],"hash":"sha256","iterations":114774,"salt":"AA==","digest":"AA=="}
@@ -959,10 +924,26 @@ mod tests {
         Luks2Region { bytes, layout }
     }
 
-    fn edited_json(mutate: fn(&mut Value)) -> String {
+    fn edited_json(mutate: impl Fn(&mut Value)) -> String {
         let mut v: Value = serde_json::from_str(VALID_JSON).unwrap();
         mutate(&mut v);
         v.to_string()
+    }
+
+    /// Rewrite the JSON area of the given metadata copies with `mutate`
+    /// applied (compact re-serialization, NUL padding restored), simulating
+    /// a hostile host editing the unauthenticated header bytes in place.
+    fn rewrite_json(region: &mut Luks2Region, copies: &[usize], mutate: impl Fn(&mut Value)) {
+        let mut json = parse_json_copy(&region.bytes[..LUKS2_METADATA_COPY_SIZE]).unwrap();
+        mutate(&mut json);
+        let text = serde_json::to_string(&json).unwrap();
+        let area_len = LUKS2_METADATA_COPY_SIZE - LUKS2_JSON_SUB_OFFSET;
+        assert!(text.len() < area_len, "rewritten json must fit its area");
+        for &copy in copies {
+            let start = copy + LUKS2_JSON_SUB_OFFSET;
+            region.bytes[start..start + area_len].fill(0);
+            region.bytes[start..start + text.len()].copy_from_slice(text.as_bytes());
+        }
     }
 
     fn assert_rejects(json: &str, needle: &str) {
@@ -979,53 +960,25 @@ mod tests {
     }
 
     #[test]
-    fn valid_metadata_passes_strict_validation() {
-        let region = synth_region(VALID_JSON);
-        let json = parse_json_copy(&region.bytes[..LUKS2_METADATA_COPY_SIZE]).unwrap();
-        let integrity =
-            validate_metadata_strict(&json, &region.layout).expect("valid header passes");
-        assert_eq!(integrity, VolumeIntegrity::None);
-        assert_eq!(region.layout.data_offset, 16777216);
-        assert_eq!(region.layout.keyslots_size, 16744448);
-    }
-
-    #[test]
-    fn cap248_dm_integrity_header_passes_strict_validation() {
-        // Exact shape captured from `cryptsetup luksFormat --integrity
-        // hmac-sha256` (cap#248's formatter, now on main): 96-byte keyslot
-        // key, area key_size still 64, segment 0 integrity object. The
-        // fixture mirrors a real header produced by cryptsetup 2.7.0.
-        let json = edited_json(|v| {
-            v["keyslots"]["0"]["key_size"] = 96.into();
-            v["keyslots"]["0"]["area"]["size"] = "385024".into();
-            v["segments"]["0"]["integrity"] = serde_json::json!({
-                "type": "hmac(sha256)",
-                "journal_encryption": "none",
-                "journal_integrity": "none"
-            });
-        });
-        let region = synth_region(&json);
-        let parsed = parse_json_copy(&region.bytes[..LUKS2_METADATA_COPY_SIZE]).unwrap();
-        let integrity =
-            validate_metadata_strict(&parsed, &region.layout).expect("integrity header passes");
-        assert_eq!(integrity, VolumeIntegrity::HmacSha256);
-    }
-
-    #[test]
-    fn integrity_key_size_mismatch_is_refused() {
-        // integrity object present but a 64-byte key: neither layout.
+    fn missing_integrity_or_wrong_key_size_is_refused() {
         assert_rejects(
-            &edited_json(|v| {
-                v["segments"]["0"]["integrity"] = serde_json::json!({"type": "hmac(sha256)"});
-            }),
+            &edited_json(|v| v["keyslots"]["0"]["key_size"] = 64.into()),
             "key_size",
         );
-        // 96-byte key without an integrity object: neither layout.
+        for replacement in [Value::Null, Value::String("hmac(sha256)".into())] {
+            assert_rejects(
+                &edited_json(|v| v["segments"]["0"]["integrity"] = replacement.clone()),
+                "integrity",
+            );
+        }
         assert_rejects(
             &edited_json(|v| {
-                v["keyslots"]["0"]["key_size"] = 96.into();
+                v["segments"]["0"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("integrity");
             }),
-            "key_size",
+            "integrity",
         );
     }
 
@@ -1087,11 +1040,85 @@ mod tests {
     }
 
     #[test]
-    fn non_default_sector_size_is_refused() {
+    fn legacy_512_sector_size_is_refused() {
+        // Greenfield: only the 4096-byte-sector format exists. A header at
+        // the old 512-byte sector size fails closed; there is no read
+        // compatibility or migration path.
         assert_rejects(
-            &edited_json(|v| v["segments"]["0"]["sector_size"] = 4096.into()),
+            &edited_json(|v| v["segments"]["0"]["sector_size"] = 512.into()),
             "sector_size",
         );
+    }
+
+    #[test]
+    fn other_power_of_two_sector_sizes_are_refused() {
+        for bad in [0u64, 1024, 2048, 8192, 1u64 << 20] {
+            assert_rejects(
+                &edited_json(|v| v["segments"]["0"]["sector_size"] = bad.into()),
+                "sector_size",
+            );
+        }
+    }
+
+    #[test]
+    fn non_numeric_sector_size_is_refused() {
+        // JSON typing stays strict: sector_size is a number, so a string
+        // or null must not be coerced into acceptance.
+        assert_rejects(
+            &edited_json(|v| v["segments"]["0"]["sector_size"] = "4096".into()),
+            "sector_size",
+        );
+        assert_rejects(
+            &edited_json(|v| v["segments"]["0"]["sector_size"] = Value::Null),
+            "sector_size",
+        );
+    }
+
+    #[test]
+    fn sealed_sector_size_change_without_remac_fails_authentication() {
+        let mac_key = DerivedSeed([0x24u8; 32]);
+
+        // A sealed 4096 header authenticates...
+        let sealed = |json: &str| {
+            let mut region = synth_region(json);
+            let slot = compute_header_mac(&region.bytes, &mac_key).unwrap();
+            for copy in [0, LUKS2_METADATA_COPY_SIZE] {
+                let start = copy + HEADER_MAC_SLOT_OFFSET;
+                region.bytes[start..start + HEADER_MAC_LEN].copy_from_slice(&slot);
+            }
+            region
+        };
+        let region = sealed(VALID_JSON);
+        assert_eq!(
+            verify_header_seal(&region, &mac_key).expect("sealed check"),
+            HeaderSeal::Sealed
+        );
+
+        // ...but flipping the authenticated sector_size 4096 -> 512 without
+        // the MAC key fails the seal when the forged JSON replaces BOTH
+        // copies (copies stay identical; the shape check refuses 512 too).
+        let mut both = sealed(VALID_JSON);
+        rewrite_json(&mut both, &[0, LUKS2_METADATA_COPY_SIZE], |v| {
+            v["segments"]["0"]["sector_size"] = 512.into();
+        });
+        let err = verify_header_seal(&both, &mac_key).expect_err("forged 512 in both copies");
+        assert!(err.to_string().contains("MAC mismatch"));
+        let json = parse_json_copy(&both.bytes[..LUKS2_METADATA_COPY_SIZE]).unwrap();
+        assert!(
+            validate_metadata_strict(&json, &both.layout).is_err(),
+            "forged 512 shape must also fail strict validation"
+        );
+
+        // Tampering only ONE copy additionally trips the both-copies
+        // equality check.
+        let mut one = sealed(VALID_JSON);
+        rewrite_json(&mut one, &[0], |v| {
+            v["segments"]["0"]["sector_size"] = 512.into();
+        });
+        let err = verify_header_seal(&one, &mac_key).expect_err("forged 512 in one copy");
+        assert!(err.to_string().contains("MAC mismatch"));
+        let err = validate_region(&one).expect_err("divergent metadata copies");
+        assert!(err.to_string().contains("copies differ"));
     }
 
     #[test]
