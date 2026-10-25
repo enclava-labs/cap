@@ -632,13 +632,9 @@ fn resume_sequence(tail_scan_start: u64, sidecar_last: Option<u64>) -> u64 {
 /// the whole volume (4 GiB) — before the child even spawned — and on a
 /// constrained app container that is a persistent wrapper OOM/restart loop
 /// while the same spool remains. Records are now read through a capped
-/// reader (MAX_SPOOL_LINE_BYTES) and oversized or incomplete records are
-/// consumed-and-SKIPPED without ever being buffered whole. Skipping is
-/// safe for sequence recovery: only newline-terminated records can ever
-/// have been delivered by the relay (it withholds in-flight fragments),
-/// so an oversized or incomplete record cannot hold a sequence any
-/// connected relay dedup set references — and it cannot be a
-/// writer-produced frame at all (those are capped well below the bound).
+/// reader (MAX_SPOOL_LINE_BYTES), without buffering oversized records whole.
+/// An incomplete EOF is removed before new appends; the relay withholds such
+/// fragments, so they cannot have been delivered or advance its sequence frontier.
 fn initial_spool_sequence(spool: &mut File) -> Result<u64, String> {
     const MAX_STARTUP_SCAN_BYTES: u64 = LOG_SPOOL_ROTATE_BYTES + MAX_SPOOL_LINE_BYTES;
     let len = spool
@@ -667,6 +663,8 @@ fn initial_spool_sequence(spool: &mut File) -> Result<u64, String> {
     let mut max_sequence = 0u64;
     let mut reader = BufReader::new(&mut *spool);
     let mut line: Vec<u8> = Vec::new();
+    let mut read_offset = scan_start;
+    let mut complete_offset = 0;
     loop {
         line.clear();
         // Bounded per-record read: the take cap is one past
@@ -680,6 +678,7 @@ fn initial_spool_sequence(spool: &mut File) -> Result<u64, String> {
         if n == 0 {
             break;
         }
+        read_offset += n as u64;
         if !line.ends_with(b"\n") {
             if (n as u64) < MAX_SPOOL_LINE_BYTES + 1 {
                 // Incomplete trailing record (writer mid-append when the
@@ -701,11 +700,13 @@ fn initial_spool_sequence(spool: &mut File) -> Result<u64, String> {
                 match available.iter().position(|&b| b == b'\n') {
                     Some(i) => {
                         reader.consume(i + 1);
+                        read_offset += (i + 1) as u64;
                         terminated = true;
                     }
                     None => {
                         let m = available.len();
                         reader.consume(m);
+                        read_offset += m as u64;
                     }
                 }
             }
@@ -713,9 +714,11 @@ fn initial_spool_sequence(spool: &mut File) -> Result<u64, String> {
                 // EOF mid-oversized-record: incomplete tail, skip.
                 break;
             }
+            complete_offset = read_offset;
             discard_first_record = false;
             continue;
         }
+        complete_offset = read_offset;
         if discard_first_record {
             discard_first_record = false;
             continue;
@@ -733,6 +736,13 @@ fn initial_spool_sequence(spool: &mut File) -> Result<u64, String> {
         {
             max_sequence = sequence;
         }
+    }
+    drop(reader);
+    if complete_offset < read_offset && (complete_offset > 0 || scan_start == 0) {
+        // A torn EOF must not become a prefix of the first frame after restart.
+        spool
+            .set_len(complete_offset)
+            .map_err(|err| format!("failed to discard incomplete log spool tail: {err}"))?;
     }
     // Wrap guard before +1: a forged sequence adjacent to u64::MAX must
     // not wrap the counter to 0, which would make every post-restart
@@ -2367,6 +2377,61 @@ mod tests {
         reassembled.extend_from_slice(&second);
         reassembled.extend_from_slice(&third);
         assert_eq!(reassembled, input.as_bytes());
+    }
+
+    #[test]
+    fn restart_discards_torn_suffix_before_appending() {
+        for suffix_bytes in [1532, MAX_SPOOL_LINE_BYTES as usize + 4096] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("spool.jsonl");
+            let retained = b"{\"sequence\":416}\n{\"sequence\":417}\n";
+            let mut spool = open_log_spool(&path).unwrap();
+            spool.write_all(retained).unwrap();
+            spool.write_all(&vec![0; suffix_bytes]).unwrap();
+            drop(spool);
+
+            let mut spool = open_log_spool(&path).unwrap();
+            let sequence = initial_spool_sequence(&mut spool).unwrap();
+            writeln!(spool, "{{\"sequence\":{sequence}}}").unwrap();
+
+            let content = fs::read_to_string(&path).unwrap();
+            let sequences: Vec<u64> = content
+                .lines()
+                .map(|line| {
+                    serde_json::from_str::<serde_json::Value>(line)
+                        .expect("retained and newly appended frames must remain valid JSON")
+                        ["sequence"]
+                        .as_u64()
+                        .unwrap()
+                })
+                .collect();
+            assert_eq!(sequences, [416, 417, 418]);
+            assert!(content.as_bytes().starts_with(retained));
+        }
+    }
+
+    #[test]
+    fn restart_discards_an_incomplete_first_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.jsonl");
+        fs::write(&path, [0; 1532]).unwrap();
+        let mut spool = open_log_spool(&path).unwrap();
+        let sequence = initial_spool_sequence(&mut spool).unwrap();
+        writeln!(spool, "{{\"sequence\":{sequence}}}").unwrap();
+        let frame: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(frame["sequence"], 1);
+    }
+
+    #[test]
+    fn restart_recovery_preserves_an_unscanned_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.jsonl");
+        let mut spool = open_log_spool(&path).unwrap();
+        writeln!(spool, "{{\"sequence\":417}}").unwrap();
+        let oversized_len = LOG_SPOOL_ROTATE_BYTES + MAX_SPOOL_LINE_BYTES + 4096;
+        spool.set_len(oversized_len).unwrap();
+        assert_eq!(initial_spool_sequence(&mut spool).unwrap(), 1);
+        assert_eq!(spool.metadata().unwrap().len(), oversized_len);
     }
 
     /// Cross-restart sequence monotonicity (round-8 review finding): the

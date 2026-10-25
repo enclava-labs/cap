@@ -76,6 +76,12 @@ and ordinary API requests remain bounded.
 Blank-line keepalives preserve idle streams without printing fake log messages.
 Each encrypted record is size-bounded before decoding.
 
+For an encrypted-state-backed spool, restart recovery removes an incomplete EOF
+from the writer's bounded spool before appending new frames, preserving complete
+retained records. Abrupt guest loss can still lose unflushed newest logs.
+Already malformed, newline-terminated records are not silently discarded;
+preserve diagnostic evidence rather than clearing the spool or its PVC.
+
 Images may be digest-pinned or tagged (`enclava deploy --image
 <registry>/<image>:<tag>`). The CLI resolves tags to a content digest before
 signing; CAP independently resolves the image and checks that the digests agree.
