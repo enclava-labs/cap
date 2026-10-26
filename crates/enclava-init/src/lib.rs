@@ -58,6 +58,7 @@ pub mod socket;
 pub mod tls_certificate;
 pub mod trustee_verify;
 pub mod unlock;
+pub mod volume_profile;
 pub mod writes;
 
 #[cfg(test)]

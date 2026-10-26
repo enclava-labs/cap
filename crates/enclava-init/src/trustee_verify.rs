@@ -427,11 +427,9 @@ fn request_error(context: &str, url: &str, err: reqwest::Error) -> InitError {
     InitError::Kbs(format!("{context} {url}: {err}; debug={err:?}"))
 }
 
-/// Hard cap for the KBS attestation-token response: the legitimate payload
-/// is a small JWT (a few KiB); anything larger is hostile. Kept tiny so the
-/// subsequent JSON decode cannot amplify a hostile body past the sidecar
-/// ceiling (#216 review: byte caps alone do not bound decoded memory).
-const KBS_ATTESTATION_TOKEN_BODY_LIMIT_BYTES: usize = 64 * 1024;
+/// EAR tokens include signed policy claims, not just a small identity JWT.
+/// Bound the encoded claims and AA keypair envelope without truncating valid policies.
+const KBS_ATTESTATION_TOKEN_BODY_LIMIT_BYTES: usize = 512 * 1024;
 
 #[derive(Deserialize)]
 struct KbsAttestationTokenPayload {

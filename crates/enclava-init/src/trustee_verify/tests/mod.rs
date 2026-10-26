@@ -778,6 +778,73 @@ fn resolve_kbs_attestation_token_prefers_env_token() {
 }
 
 #[test]
+fn resolves_large_attestation_tokens_without_allowing_unbounded_responses() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+
+    for chunked in [false, true] {
+        for (token_bytes, accepted) in [
+            (96 * 1024, true),
+            (KBS_ATTESTATION_TOKEN_BODY_LIMIT_BYTES, false),
+        ] {
+            let token = "a".repeat(token_bytes);
+            let body = serde_json::to_string(&serde_json::json!({
+                "token": token,
+                "tee_keypair": "synthetic-key-material"
+            }))
+            .unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = BufReader::new(stream);
+                let mut line = String::new();
+                while request.read_line(&mut line).unwrap() != 0 && line != "\r\n" {
+                    line.clear();
+                }
+                let mut stream = request.into_inner();
+                // An over-limit reader may close before the server finishes writing.
+                if chunked {
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+                        body.len(),
+                        body
+                    );
+                } else {
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                }
+            });
+            let result = resolve_kbs_attestation_token(
+                None,
+                &format!("http://{address}/aa/token?token_type=kbs"),
+                Duration::from_secs(5),
+            );
+            server.join().unwrap();
+            if accepted {
+                assert_eq!(result.unwrap(), token, "chunked={chunked}");
+            } else {
+                assert!(
+                    matches!(result, Err(InitError::Kbs(message)) if message.contains("byte limit")),
+                    "chunked={chunked}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn parse_kbs_attestation_token_payload_rejects_missing_token() {
     let err = parse_kbs_attestation_token_payload(br#"{}"#).unwrap_err();
     assert!(matches!(err, InitError::Kbs(msg) if msg.contains("missing token")));

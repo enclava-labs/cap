@@ -2,7 +2,7 @@
 yanked = "deny"
 unmaintained = "none"
 ignore = [
-    { id = "RUSTSEC-2023-0071", reason = "No upstream fix (patched = []). rsa 0.9.10 reaches CAP via enclava-verifier (declared for cfg(test)-only interop tests), openidconnect (sigstore JWK public-key verify) and sqlx-mysql (unused DB backend). LSP-verified 2026-10-21: the only RsaPrivateKey/SigningKey references in the workspace are amd.rs cfg(test) interop tests with ephemeral keys; shipped code performs public-key operations only (pkcs1 DER decode, p384 ECDSA, hand-rolled modpow with public exponent). Revisit before any RSA private-key use, or when sigstore moves off openidconnect/rsa 0.9.x." },
+    { id = "RUSTSEC-2023-0071", reason = "No upstream fix (patched = []). rsa 0.9.10 reaches CAP via enclava-verifier (cfg(test)-only interop tests) and sqlx-mysql (unused DB backend). The only RsaPrivateKey/SigningKey references are amd.rs cfg(test) interop tests with ephemeral keys; shipped RSA code performs public-key operations only (PKCS#1 DER decode and hand-rolled modpow with a public exponent). Revisit before any RSA private-key use or when these dependencies drop rsa 0.9.x." },
     # Tracked transitive advisories with no actionable fix today (issue #140).
     # All are unreachable from CAP's own code paths; each is pinned by a
     # direct dependency that must accept it before we can drop the entry.

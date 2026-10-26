@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use enclava_init::errors::Result;
+use enclava_init::volume_profile::VolumeProfile;
 use enclava_init::writes;
 
 /// Fixed schema version. Consumers must treat missing fields as absent, not
@@ -39,6 +40,8 @@ pub struct BootStats {
     tee_verify_ms: u64,
     component_seeds_ms: u64,
     bind_mounts_ms: u64,
+    pub state_profile: VolumeProfile,
+    pub tls_profile: VolumeProfile,
 }
 
 impl BootStats {
@@ -56,6 +59,8 @@ impl BootStats {
             tee_verify_ms: 0,
             component_seeds_ms: 0,
             bind_mounts_ms: 0,
+            state_profile: VolumeProfile::default(),
+            tls_profile: VolumeProfile::default(),
         }
     }
 
@@ -117,6 +122,8 @@ impl BootStats {
                 "\"total_to_ready\":{total}",
                 "}},",
                 "\"volume_formatted\":{{\"state\":{state_fmt},\"tls\":{tls_fmt}}},",
+                "\"volume_profile_version\":1,",
+                "\"volume_profiles\":{{\"state\":{state_profile},\"tls\":{tls_profile}}},",
                 "\"guest_mem_total_bytes\":{mem_total},",
                 "\"guest_mem_available_bytes\":{{",
                 "\"init_start\":{mem_start},",
@@ -137,6 +144,9 @@ impl BootStats {
             total = self.elapsed_ms(),
             state_fmt = self.state_volume.formatted as u8,
             tls_fmt = self.tls_volume.formatted as u8,
+            state_profile =
+                serde_json::to_string(&self.state_profile).expect("numeric volume profile"),
+            tls_profile = serde_json::to_string(&self.tls_profile).expect("numeric volume profile"),
             mem_total = self.guest_mem_total_bytes,
             mem_start = self.mem_available_start_bytes,
             mem_post_luks = self.mem_available_post_luks_bytes,
@@ -237,6 +247,8 @@ mod tests {
             tee_verify_ms: 40,
             component_seeds_ms: 50,
             bind_mounts_ms: 60,
+            state_profile: VolumeProfile::default(),
+            tls_profile: VolumeProfile::default(),
         };
         let value: serde_json::Value = serde_json::from_str(&stats.to_json()).expect("valid json");
         assert_eq!(value["version"], 1);
