@@ -8,7 +8,7 @@ use enclava_engine::manifest::containers::{
     build_caddy_container, build_enclava_init_container, build_enclava_tools_init_container,
 };
 use enclava_engine::manifest::volumes::build_volumes;
-use enclava_engine::testutil::{sample_app, sample_password_app};
+use enclava_engine::testutil::sample_app;
 use enclava_engine::types::{
     CaddyTlsMode, GeneratedAgentPolicy, LogEncryptionConfig, WorkloadSecurityProfile,
 };
@@ -249,32 +249,8 @@ fn app_container_has_no_kubernetes_subpath_mounts() {
 }
 
 #[test]
-fn app_container_uses_tcp_readiness_without_liveness() {
-    let c = build_app_container(&sample_app());
-    assert!(c.liveness_probe.is_none());
-
-    let startup = c.startup_probe.as_ref().unwrap();
-    assert_eq!(
-        startup.tcp_socket.as_ref().unwrap().port,
-        k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(3000)
-    );
-    assert!(startup.http_get.is_none());
-    assert_eq!(startup.period_seconds, Some(10));
-    assert_eq!(startup.failure_threshold, Some(180));
-
-    let readiness = c.readiness_probe.as_ref().unwrap();
-    assert_eq!(
-        readiness.tcp_socket.as_ref().unwrap().port,
-        k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(3000)
-    );
-    assert!(readiness.http_get.is_none());
-    assert_eq!(readiness.initial_delay_seconds, Some(0));
-    assert_eq!(readiness.period_seconds, Some(10));
-}
-
-#[test]
 fn password_app_container_omits_startup_probe_while_waiting_for_unlock() {
-    let c = build_app_container(&sample_password_app());
+    let c = build_app_container(&sample_app());
     assert!(c.startup_probe.is_none());
     assert!(c.liveness_probe.is_none());
 
@@ -379,7 +355,7 @@ fn proxy_container_name_and_port() {
 }
 
 #[test]
-fn proxy_container_can_create_sev_guest_device_for_auto_unlock() {
+fn proxy_container_creates_sev_guest_device_for_password_workloads() {
     let c = build_attestation_proxy_container(&sample_app());
     let sc = c.security_context.as_ref().unwrap();
     assert_eq!(sc.run_as_non_root, Some(false));

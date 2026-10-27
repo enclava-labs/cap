@@ -47,11 +47,20 @@ pub enum ValidationError {
     InvalidLogEncryption(String),
     #[error("storage path {path:?} is invalid: {detail}")]
     InvalidStoragePath { path: String, detail: String },
+    #[error(
+        "auto_unlock_disabled: auto-unlock workloads cannot be applied; the app must use password unlock"
+    )]
+    AutoUnlockDisabled,
 }
 
 /// Validates that a ConfidentialApp spec is well-formed.
 /// Does NOT check cluster state or tier limits -- those are API-level concerns.
 pub fn validate_app(app: &ConfidentialApp) -> Result<(), ValidationError> {
+    // Runtime backstop for every engine caller: auto-unlock is hard-disabled,
+    // so no auto workload may reach manifest rendering or cluster mutation.
+    if app.unlock_mode == enclava_common::types::UnlockMode::Auto {
+        return Err(ValidationError::AutoUnlockDisabled);
+    }
     validate_name(&app.name)?;
 
     // Namespace, service account, and tenant id are interpolated into

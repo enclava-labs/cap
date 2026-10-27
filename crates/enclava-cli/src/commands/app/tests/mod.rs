@@ -160,13 +160,14 @@ fn test_deployment_context() -> DeploymentContextResponse {
 }
 
 #[test]
-fn create_unlock_mode_validation_rejects_auto_with_workaround() {
-    // auto is a post-claim transition (via `auto-unlock enable`), never a first-deploy
-    // mode — there is no owner seed to wrap at create time.
+fn create_unlock_mode_validation_rejects_auto() {
+    // auto is hard-disabled: no enable path exists to turn a first-deploy
+    // auto app operational, so create-time validation refuses with the
+    // stable code.
     let err = validate_create_unlock_mode("auto").unwrap_err();
     assert!(
-        err.contains("auto-unlock enable"),
-        "error should name the workaround: {err}",
+        err.starts_with("auto_unlock_disabled"),
+        "refusal must carry the stable code: {err}",
     );
     assert!(validate_create_unlock_mode("password").is_ok());
 }

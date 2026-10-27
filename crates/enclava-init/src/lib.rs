@@ -47,7 +47,6 @@ fn env_override_for(raw: Option<&str>) -> Option<String> {
 pub mod chown;
 pub mod config;
 pub mod errors;
-pub mod kbs_fetch;
 pub mod log_relay;
 pub mod luks;
 pub mod luks2_seal;
@@ -204,7 +203,8 @@ mod tests {
         // Deliberately NOT gated (platform-set in prod manifests or
         // timing-only knobs, see PR #136): ENCLAVA_INIT_CONFIG,
         // ENCLAVA_INIT_STAY_ALIVE, ENCLAVA_INIT_UNLOCK_SOCKET_GID,
-        // ENCLAVA_INIT_WAIT_FOR_CONTAINERS*, KBS_FETCH_*/KBS_PROXY_HEALTH_*.
+        // ENCLAVA_INIT_WAIT_FOR_CONTAINERS*,
+        // ENCLAVA_INIT_KBS_PROXY_HEALTH_POLL_SECONDS/KBS_PROXY_HEALTH_POLL_SECONDS.
         for var in [
             "ENCLAVA_INIT_READY_FILE",
             "ENCLAVA_INIT_ERROR_FILE",

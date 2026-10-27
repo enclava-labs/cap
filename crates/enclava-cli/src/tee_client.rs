@@ -693,20 +693,8 @@ impl TeeClient {
         Ok(())
     }
 
-    /// Enable auto-unlock (KBS-attestation-gated seed wrap, not VMPCK sealing).
-    pub async fn enable_auto_unlock(&self, password: &str) -> Result<(), TeeError> {
-        let body = serde_json::json!({ "password": password });
-        let resp = self
-            .http
-            .post(self.url("/enable-auto-unlock"))
-            .json(&body)
-            .send()
-            .await?;
-        self.check_response(resp).await?;
-        Ok(())
-    }
-
-    /// Disable auto-unlock (remove the KBS-gated seed wrap).
+    /// Disable auto-unlock (remove the KBS-gated seed wrap). The matching
+    /// enable call is removed: the platform refuses to arm auto-unlock.
     pub async fn disable_auto_unlock(&self, password: &str) -> Result<(), TeeError> {
         let body = serde_json::json!({ "password": password });
         let resp = self

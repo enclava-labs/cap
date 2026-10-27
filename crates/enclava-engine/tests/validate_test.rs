@@ -1,19 +1,25 @@
-use enclava_engine::testutil::{sample_app, sample_password_app};
+use enclava_engine::testutil::sample_app;
 use enclava_engine::validate::ValidationError;
 use enclava_engine::validate::validate_app;
 use enclava_engine::validate::validate_persistent_volume_size_for_fresh_provisioning;
 use sha2::{Digest, Sha256};
 
 #[test]
-fn valid_auto_app_passes() {
+fn valid_password_app_passes() {
     let app = sample_app();
-    validate_app(&app).expect("sample auto app should be valid");
+    validate_app(&app).expect("password app should be valid");
 }
 
 #[test]
-fn valid_password_app_passes() {
-    let app = sample_password_app();
-    validate_app(&app).expect("password app should be valid");
+fn rejects_auto_unlock_workload() {
+    // Runtime backstop: no caller may apply an auto-unlock workload.
+    let mut app = sample_app();
+    app.unlock_mode = enclava_common::types::UnlockMode::Auto;
+    let err = validate_app(&app).unwrap_err();
+    assert!(
+        err.to_string().starts_with("auto_unlock_disabled"),
+        "rejection must carry the stable code: {err}"
+    );
 }
 
 #[test]

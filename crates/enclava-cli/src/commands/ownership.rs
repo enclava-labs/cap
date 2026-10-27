@@ -69,7 +69,7 @@ pub struct ChangePasswordArgs {
 
 #[derive(Subcommand)]
 pub enum AutoUnlockCommand {
-    /// Enable automatic unlock (owner seed wrapped for KBS-attestation-gated release)
+    /// Removed: auto-unlock cannot be enabled anymore (refuses immediately)
     Enable {
         /// App name (defaults to enclava.toml app.name)
         #[arg(long)]
@@ -127,9 +127,8 @@ fn is_unimplemented_hosted(err: &ApiError) -> bool {
 }
 
 /// Capability preflight before any TEE mutation (the seal at
-/// `tee.enable_auto_unlock`/`tee.disable_auto_unlock` must never run before
-/// this passes — enclava-paas#189's half-enabled residue is exactly what this
-/// guards).
+/// `tee.disable_auto_unlock` must never run before this passes —
+/// enclava-paas#189's half-enabled residue is exactly what this guards).
 ///
 /// The probe carries an intentionally invalid mode, so it can never be a
 /// valid mutation: every handler lineage parses the mode string before
@@ -721,87 +720,12 @@ pub async fn change_password(args: ChangePasswordArgs) -> Result<(), Box<dyn std
 
 pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
-        AutoUnlockCommand::Enable {
-            app,
-            image,
-            password_file,
-        } => {
-            let app_name = resolve_app_name(&app)?;
-            let (api, paths) = build_api_client()?;
-            ensure_unlock_mode_change_supported(&api, &app_name).await?;
-            let cli_config = config::load_config(&paths)?;
-            let creds = config::load_credentials(&paths)?;
-            let app_config = AppConfig::find_and_load()?;
-            let app_meta = api.get_app(&app_name).await?;
-            // Resolve the local password source before any remote mutation:
-            // blob signing bootstraps the org keyring/signing authority, and a
-            // missing or unreadable --password-file must not leave that
-            // half-done for a command that never ran.
-            let password = secret_from_file_or_prompt(
-                password_file.as_deref(),
-                "password",
-                "Unlock password (to authorize auto-unlock wrapping)",
-                None,
-                "--password-file",
-            )?;
-            println!("Signing auto-unlock redeploy descriptor for {app_name}...");
-            let signed_blobs =
-                super::app::build_signed_deploy_blobs(super::app::SignedDeployBlobParams {
-                    api: &api,
-                    paths: &paths,
-                    cli_config: &cli_config,
-                    creds: &creds,
-                    app: &app_meta,
-                    app_config: &app_config,
-                    image: &image,
-                    target_unlock_mode: Some("auto"),
-                    workload_security_profile: WorkloadSecurityProfile::Restricted,
-                })
-                .await?;
-            let endpoint = resolve_tee_endpoint(&api, &app_name).await?;
-            let tee = TeeClient::new_with_resolve_ip(&endpoint.tee_url, endpoint.tee_resolve_ip);
-            let (mut transition_attestation, tee) = tee.attest_receipt_key().await?;
-            // CRL collateral is transition-specific: fetch it here, not in
-            // the shared attestation path, so ordinary TEE operations keep
-            // working through a KDS outage.
-            tee.complete_transition_quote_crl(&mut transition_attestation)
-                .await?;
-
-            println!("Enabling auto-unlock for {app_name}...");
-            tee.enable_auto_unlock(&password).await?;
-            println!("KBS-gated seed wrap created inside the TEE.");
-
-            let transition_receipt = tee
-                .sign_unlock_mode_transition(
-                    &app_meta.id,
-                    &app_meta.unlock_mode,
-                    "auto",
-                    &transition_attestation,
-                )
-                .await?;
-            let transition = api
-                .update_unlock_mode(
-                    &app_name,
-                    &UpdateUnlockModeRequest {
-                        mode: "auto-unlock".to_string(),
-                        transition_receipt: Some(transition_receipt),
-                        transition_attestation: Some(transition_attestation),
-                        customer_descriptor_blob: Some(signed_blobs.customer_descriptor_blob),
-                        org_keyring_blob: Some(signed_blobs.org_keyring_blob),
-                        signed_policy_artifact: Some(signed_blobs.signed_policy_artifact),
-                    },
-                )
-                .await?;
-            match transition.deployment_id {
-                Some(id) => println!(
-                    "CAP unlock mode updated to {}. Redeploy started: {id}",
-                    transition.unlock_mode
-                ),
-                None => println!("CAP unlock mode already set to {}.", transition.unlock_mode),
-            }
-            println!("Auto-unlock enabled. Restarts no longer require a password.");
-            Ok(())
-        }
+        AutoUnlockCommand::Enable { .. } => Err(
+            "auto_unlock_disabled: auto-unlock enable is no longer available; \
+             apps use password unlock, and `enclava auto-unlock disable` converts \
+             a legacy auto-unlock app"
+                .into(),
+        ),
         AutoUnlockCommand::Disable {
             app,
             image,
@@ -914,61 +838,21 @@ mod tests {
         )));
     }
 
-    #[test]
-    fn unlock_mode_preflight_precedes_the_tee_seal() {
-        // The helper's "no TEE changes were made" promise is only true while
-        // the probe runs before the manifest load (so a 501 is not masked by a
-        // raw file error) AND before both TEE seals. Pin all three call sites.
-        let source = include_str!("ownership.rs");
-        let call = ["ensure_unlock_mode_change_supported(", "&api, &app_name)"].concat();
-        assert_eq!(
-            source.matches(call.as_str()).count(),
-            2,
-            "both Enable and Disable arms must probe"
-        );
-        let probe = source.find(call.as_str()).expect("preflight wired");
-        let manifest = source
-            .find("let app_config = AppConfig::find_and_load()?")
-            .expect("manifest load present");
+    #[tokio::test]
+    async fn enable_subcommand_refuses_before_any_remote_call() {
+        // The refusal must not depend on a local enclava.toml, stored
+        // credentials, or network reachability: dummy args must fail with the
+        // stable code before any resolution step runs.
+        let error = auto_unlock(AutoUnlockCommand::Enable {
+            app: Some("never-resolved".to_string()),
+            image: "ghcr.io/acme/app@sha256:".to_string() + &"a".repeat(64),
+            password_file: None,
+        })
+        .await
+        .expect_err("enable must refuse");
         assert!(
-            probe < manifest,
-            "the probe must run before the manifest load so a 501 is not masked by a raw file error"
-        );
-        for seal in [
-            "tee.enable_auto_unlock(&password)",
-            "tee.disable_auto_unlock(&password)",
-        ] {
-            let seal_at = source.find(seal).expect("seal call present");
-            assert!(
-                probe < seal_at,
-                "the probe must run before the TEE seal or the no-TEE-changes promise is a lie"
-            );
-        }
-    }
-
-    #[test]
-    fn unlock_mode_probe_contract_is_strict() {
-        // Exactly three probe outcomes are acceptable: the receipt-less 400
-        // (surface implemented, nothing mutated), the hosted placeholder 501
-        // (mapped to the not-implemented error), and everything else must
-        // propagate before any TEE work. Pin the match arms so a refactor
-        // cannot silently swallow a rejection again.
-        let source = include_str!("ownership.rs");
-        // Needle pieces are split so each assert cannot pass against its own
-        // literal in this test's source.
-        let arm_400 = ["Err(ApiError::Api { status: 400, .. })", " => Ok(())"].concat();
-        assert!(
-            source.contains(arm_400.as_str()),
-            "only the side-effect-free 400 may pass the preflight"
-        );
-        let arm_propagate = ["Err(err) => Err(err", ".into())"].concat();
-        assert!(
-            source.contains(arm_propagate.as_str()),
-            "other rejections (auth, freeze gates, transport) must propagate, not be discarded"
-        );
-        assert!(
-            source.contains("mode: \"__capability_probe__\".to_string()"),
-            "the probe must carry an invalid mode so it can never be a valid mutation"
+            error.to_string().starts_with("auto_unlock_disabled"),
+            "refusal must carry the stable code: {error}"
         );
     }
 

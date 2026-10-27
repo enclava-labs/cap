@@ -5,6 +5,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Component;
 use std::thread;
+use std::time::Instant;
 
 const DEFAULT_WAIT_FOR_CONTAINERS_TIMEOUT_SECONDS: u64 = 120;
 
