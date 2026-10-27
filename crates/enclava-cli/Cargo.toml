@@ -17,7 +17,7 @@ enclava-common = { workspace = true, features = ["outbound-http", "release-profi
 enclava-verifier = { path = "../enclava-verifier" }
 enclava-engine = { path = "../enclava-engine" }
 tokio = { workspace = true }
-clap = { workspace = true }
+clap = { workspace = true, features = ["env"] }
 toml = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }

@@ -167,6 +167,9 @@ pub async fn prepare(args: PrepareArgs) -> Result<(), Box<dyn std::error::Error>
         if args.yes {
             return Ok(true);
         }
+        super::interactive::require_prompt(
+            "pass --yes to update the existing files without confirmation",
+        )?;
         Confirm::new()
             .with_prompt("Update existing Enclava files?")
             .default(false)

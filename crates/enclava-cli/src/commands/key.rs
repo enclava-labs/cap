@@ -876,16 +876,20 @@ async fn rotate_owner(
     if owner_members.len() != 1 {
         return Err("current keyring does not contain exactly one pinned owner entry".into());
     }
-    if !yes
-        && !dialoguer::Confirm::new()
+    if !yes {
+        super::interactive::require_prompt(
+            "pass --yes to rotate the owner key without confirmation",
+        )?;
+        if !dialoguer::Confirm::new()
             .with_prompt(format!(
                 "Rotate owner key for {}? The encrypted replacement backup must remain available",
                 me.active_org.name
             ))
             .default(false)
             .interact()?
-    {
-        return Err("owner rotation cancelled; no remote authority was changed".into());
+        {
+            return Err("owner rotation cancelled; no remote authority was changed".into());
+        }
     }
 
     register_public_key(&api, &replacement_owner.public).await?;

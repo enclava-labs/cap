@@ -423,11 +423,17 @@ async fn run_keyring(cmd: KeyringCommand) -> Result<(), Box<dyn std::error::Erro
                  Verify this fingerprint with the org owner over an out-of-band channel.",
                 fingerprint(&pk)
             );
-            let confirm = yes
-                || dialoguer::Confirm::new()
+            let confirm = if yes {
+                true
+            } else {
+                super::interactive::require_prompt(
+                    "pass --yes to confirm trust on first use without prompting",
+                )?;
+                dialoguer::Confirm::new()
                     .with_prompt("Confirm trust on first use?")
                     .default(false)
-                    .interact()?;
+                    .interact()?
+            };
             if !confirm {
                 return Err("trust declined".into());
             }

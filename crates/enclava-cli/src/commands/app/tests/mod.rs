@@ -4197,3 +4197,51 @@ mod terminal_diagnostics {
         assert!(source.contains("bootstrap_status_within(terminal_diagnostic_budget"));
     }
 }
+
+#[test]
+fn status_json_payload_carries_diagnostics_with_stable_shape() {
+    let status = enclava_cli::api_types::AppStatus {
+        app_name: "demo".to_string(),
+        status: "running".to_string(),
+        pod_phase: None,
+        tee_status: Some("unlocked".to_string()),
+        unlock_status: Some("unlocked".to_string()),
+        domain: "demo.example".to_string(),
+        last_deployed: None,
+        tee_error: None,
+        observation: None,
+        deployment: None,
+    };
+
+    let payload = status_json_payload(
+        &status,
+        &StableSshEndpointState::Ready("ssh://endpoint".to_string()),
+        Some("12s"),
+        &["DEBIAN_SSH_AUTHORIZED_KEYS".to_string()],
+    )
+    .expect("serializes");
+    assert_eq!(payload["app_name"], "demo");
+    assert_eq!(payload["tee_status"], "unlocked");
+    assert_eq!(payload["stable_ssh_endpoint"]["state"], "ready");
+    assert_eq!(payload["stable_ssh_endpoint"]["endpoint"], "ssh://endpoint");
+    assert_eq!(payload["tee_acme_retry_after"], "12s");
+    assert_eq!(
+        payload["missing_config_keys"][0],
+        "DEBIAN_SSH_AUTHORIZED_KEYS"
+    );
+    assert!(payload["tee_error"].is_null(), "absent fields stay null");
+
+    let payload = status_json_payload(
+        &status,
+        &StableSshEndpointState::NotStableTemplate,
+        None,
+        &[],
+    )
+    .expect("serializes");
+    assert_eq!(
+        payload["stable_ssh_endpoint"]["state"],
+        "not_stable_template"
+    );
+    assert!(payload["tee_acme_retry_after"].is_null());
+    assert_eq!(payload["missing_config_keys"], serde_json::json!([]));
+}

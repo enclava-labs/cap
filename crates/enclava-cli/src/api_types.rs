@@ -549,7 +549,7 @@ pub struct DeploymentContextResponse {
 
 // --- Status ---
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct AppStatusObservation {
     pub state: String,
     #[serde(default)]
@@ -568,7 +568,7 @@ pub struct AppStatusObservation {
     pub drifted: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct AppStatus {
     pub app_name: String,
     pub status: String,
@@ -590,7 +590,7 @@ pub struct AppStatus {
 /// Owner-facing lifecycle projection of the active deployment (#90):
 /// normalized phase, condition, redacted reason code, and retry/lease
 /// timing. Rendered by `enclava status` as one actionable block.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct DeploymentDiagnostics {
     pub phase: String,
     pub condition: String,

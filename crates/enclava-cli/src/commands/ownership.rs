@@ -2,7 +2,6 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::{Args, Subcommand};
 use dialoguer::{Confirm, Input, Password};
 use ed25519_dalek::{Signer, SigningKey};
-use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -340,8 +339,8 @@ pub(crate) fn ensure_claim_session_now(
     password_from_file: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     ensure_claim_session_for(
-        std::io::IsTerminal::is_terminal(&std::io::stdin()),
-        std::io::IsTerminal::is_terminal(&std::io::stderr()),
+        super::interactive::stdin_interactive(),
+        super::interactive::stderr_interactive(),
         password_from_file,
     )
 }
@@ -375,8 +374,8 @@ pub(crate) fn prepare_recovery_mnemonic_sink(
         org,
         app,
         capture,
-        io::stdin().is_terminal(),
-        io::stderr().is_terminal(),
+        super::interactive::stdin_interactive(),
+        super::interactive::stderr_interactive(),
         password_from_file,
     )
 }
@@ -517,7 +516,7 @@ pub async fn recover(args: RecoverArgs) -> Result<(), Box<dyn std::error::Error>
         TeeClient::new_for_ownership_with_resolve_ip(&endpoint.tee_url, endpoint.tee_resolve_ip);
     let (_attestation, tee) = tee.attest_receipt_key().await?;
 
-    let is_tty = io::stdin().is_terminal();
+    let is_tty = super::interactive::stdin_interactive();
 
     // An explicit file must take priority even when local state is unreadable.
     let mnemonic = match load_recovery_mnemonic(
@@ -652,8 +651,8 @@ pub(crate) fn secret_from_file_or_prompt(
         prompt,
         confirmation,
         flag,
-        io::stdin().is_terminal(),
-        io::stderr().is_terminal(),
+        super::interactive::stdin_interactive(),
+        super::interactive::stderr_interactive(),
     )
 }
 

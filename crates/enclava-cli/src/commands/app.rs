@@ -5,7 +5,6 @@ use indicatif::{ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha256};
 use std::{
     fs::OpenOptions,
-    io::IsTerminal,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -167,6 +166,9 @@ impl StoragePasswordInput {
         match &self.value {
             Some(value) => Ok(value.clone()),
             None => {
+                super::interactive::require_prompt(
+                    "pass --storage-password-file <PATH> to provide the storage password non-interactively",
+                )?;
                 // A pty with no stdin feeder blocks here forever (nohup
                 // script-class runs), so name the non-interactive path in
                 // whatever log the operator will eventually read.
@@ -186,6 +188,9 @@ impl StoragePasswordInput {
         match &self.value {
             Some(value) => Ok(value.clone()),
             None => {
+                super::interactive::require_prompt(
+                    "pass --storage-password-file <PATH> to provide the storage password non-interactively",
+                )?;
                 eprintln!(
                     "Reading the unlock password from the terminal; \
                      unattended runs must pass --storage-password-file <PATH>."
@@ -209,7 +214,7 @@ fn storage_password_prompt_available() -> bool {
     // Both terminals, mirroring secret_from_file_or_prompt's prompted path:
     // dialoguer renders password prompts on stderr, so a piped stderr cannot
     // host the prompt. Recorded-output runs (`2>&1 | tee`) use the file flags.
-    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
+    super::interactive::prompts_available()
 }
 
 fn deploy_should_unlock_before_config(
@@ -2581,6 +2586,9 @@ pub struct StatusArgs {
     /// App name (defaults to enclava.toml app.name)
     #[arg(long)]
     pub app: Option<String>,
+    /// Print machine-readable JSON on stdout instead of the human report
+    #[arg(long)]
+    pub json: bool,
 }
 
 fn status_with_attested_tee_state(api_status: &str, tee_state: &str) -> String {
@@ -2590,6 +2598,33 @@ fn status_with_attested_tee_state(api_status: &str, tee_state: &str) -> String {
         "unclaimed" if api_status == "failed" => "creating".to_string(),
         _ => api_status.to_string(),
     }
+}
+
+/// Machine-readable status payload: the API status object plus the CLI-derived
+/// diagnostics, with a stable shape (nulls where absent).
+fn status_json_payload(
+    status: &enclava_cli::api_types::AppStatus,
+    stable_ssh_endpoint: &StableSshEndpointState,
+    tee_acme_retry_after: Option<&str>,
+    missing_config_keys: &[String],
+) -> Result<serde_json::Value, serde_json::Error> {
+    let mut out = serde_json::to_value(status)?;
+    out["stable_ssh_endpoint"] = match stable_ssh_endpoint {
+        StableSshEndpointState::Ready(endpoint) => {
+            serde_json::json!({"state": "ready", "endpoint": endpoint})
+        }
+        StableSshEndpointState::Missing => serde_json::json!({"state": "missing"}),
+        StableSshEndpointState::Invalid => serde_json::json!({"state": "invalid"}),
+        StableSshEndpointState::NotStableTemplate => {
+            serde_json::json!({"state": "not_stable_template"})
+        }
+    };
+    out["tee_acme_retry_after"] = match tee_acme_retry_after {
+        Some(retry_after) => serde_json::json!(retry_after),
+        None => serde_json::Value::Null,
+    };
+    out["missing_config_keys"] = serde_json::json!(missing_config_keys);
+    Ok(out)
 }
 
 pub async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -2638,6 +2673,27 @@ pub async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> 
                     .map(str::to_string);
             }
         }
+    }
+
+    // Config completeness per platform metadata: a template deploy's
+    // customer-config phase is CLI-driven and does not resume on its own, so an
+    // interrupted deploy can leave the guest waiting on a required key while
+    // this status reads healthy. Compare the template's required customer keys
+    // against the platform's config metadata and name the recovery.
+    let missing_config_keys = match app_metadata.as_ref() {
+        Some(app) => template_missing_config_keys(&api, app, &app_name).await,
+        None => None,
+    };
+
+    if args.json {
+        let payload = status_json_payload(
+            &status,
+            &stable_ssh_endpoint,
+            tee_acme_retry_after.as_deref(),
+            missing_config_keys.as_deref().unwrap_or(&[]),
+        )?;
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        return Ok(());
     }
 
     let status_colored = match status.status.as_str() {
@@ -2697,13 +2753,7 @@ pub async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> 
             println!("Evidence: {reason}");
         }
     }
-    // Config completeness per platform metadata: a template deploy's
-    // customer-config phase is CLI-driven and does not resume on its own, so an
-    // interrupted deploy can leave the guest waiting on a required key while
-    // this status reads healthy. Compare the template's required customer keys
-    // against the platform's config metadata and name the recovery.
-    if let Some(app) = app_metadata.as_ref()
-        && let Some(missing) = template_missing_config_keys(&api, app, &app_name).await
+    if let Some(missing) = &missing_config_keys
         && !missing.is_empty()
     {
         println!("Config:   {}", "INCOMPLETE (per platform metadata)".red());
@@ -3541,6 +3591,9 @@ pub async fn rollback(args: RollbackArgs) -> Result<(), Box<dyn std::error::Erro
 
         // Default to the immediately previous deployment
         let previous = &deployments[1];
+        super::interactive::require_prompt(
+            "pass --to <deployment-id> to roll back without confirmation",
+        )?;
         let confirm = dialoguer::Confirm::new()
             .with_prompt(format!("Roll back to deployment {}?", &previous.id[..8]))
             .default(true)
@@ -3685,6 +3738,7 @@ pub async fn destroy(args: DestroyArgs) -> Result<(), Box<dyn std::error::Error>
     let (api, _paths, _cli_config) = build_api_client()?;
 
     if !args.force {
+        super::interactive::require_prompt("pass --force to destroy without confirmation")?;
         let confirm = dialoguer::Confirm::new()
             .with_prompt(format!(
                 "This will permanently destroy '{app_name}' and all its data. Continue?"
