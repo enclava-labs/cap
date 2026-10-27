@@ -351,7 +351,7 @@ async fn load_desired_edge_apps(pool: &PgPool) -> Result<Vec<DesiredEdgeApp>, sq
                 organization.cust_slug AS org_slug
            FROM apps AS app
            JOIN organizations AS organization ON organization.id = app.org_id
-           JOIN LATERAL (
+           LEFT JOIN LATERAL (
                 SELECT deployment.status
                   FROM deployments AS deployment
                  WHERE deployment.app_id = app.id
@@ -373,9 +373,12 @@ async fn load_desired_edge_apps(pool: &PgPool) -> Result<Vec<DesiredEdgeApp>, sq
                  LIMIT 1
            ) AS latest ON true
           WHERE (
-                app.status IN (
-                    'creating'::app_status_enum,
-                    'running'::app_status_enum
+                (
+                    latest.status IS NOT NULL
+                    AND app.status IN (
+                        'creating'::app_status_enum,
+                        'running'::app_status_enum
+                    )
                 )
                 -- A deleting app whose confidential teardown is still pending
                 -- must keep its routes: the teardown POST dials the app's TEE
@@ -2465,6 +2468,21 @@ mod tests {
         assert!(
             !ids.contains(&skip_app),
             "a deleting app that never required teardown must drop out"
+        );
+
+        sqlx::query(
+            "UPDATE deployments SET status = 'failed'::deploy_status_enum WHERE app_id = $1",
+        )
+        .bind(pending_app)
+        .execute(&pool)
+        .await
+        .expect("fail the only deployment before teardown completes");
+        let desired = load_desired_edge_apps(&pool)
+            .await
+            .expect("load teardown routes without a healthy deployment");
+        assert!(
+            desired.iter().any(|app| app.app_id == pending_app),
+            "failed deployments must not remove a pending confidential teardown route"
         );
 
         for cleanup_org in [running_org, pending_org, done_org, skip_org] {
