@@ -201,6 +201,20 @@ mod tests {
     }
 
     #[test]
+    fn provider_flags_are_mutually_exclusive() {
+        for argv in [
+            vec!["enclava", "signup", "--email", "--nostr"],
+            vec!["enclava", "login", "--email", "--nostr"],
+        ] {
+            assert!(
+                Cli::try_parse_from(&argv).is_err(),
+                "contradictory providers must fail at parse: {}",
+                argv.join(" ")
+            );
+        }
+    }
+
+    #[test]
     fn deployment_progress_formats_counts_and_deadlines() {
         assert_eq!(
             counted_progress("Platform config", 7, 13),

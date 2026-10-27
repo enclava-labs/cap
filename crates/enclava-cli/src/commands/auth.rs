@@ -26,10 +26,10 @@ pub struct LoginArgs {
     #[arg(long = "approve-logs")]
     pub approve_logs: bool,
     /// Authenticate with Nostr identity (NIP-98)
-    #[arg(long)]
+    #[arg(long, conflicts_with = "email")]
     pub nostr: bool,
     /// Authenticate with email + password
-    #[arg(long)]
+    #[arg(long, conflicts_with = "nostr")]
     pub email: bool,
     /// Replace an existing saved session without prompting
     #[arg(long)]
@@ -51,10 +51,10 @@ pub struct LoginArgs {
 #[derive(Args)]
 pub struct SignupArgs {
     /// Sign up with email + password
-    #[arg(long)]
+    #[arg(long, conflicts_with = "nostr")]
     pub email: bool,
     /// Sign up with a Nostr identity (npub)
-    #[arg(long)]
+    #[arg(long, conflicts_with = "email")]
     pub nostr: bool,
     /// Email address for `--email` signup (skips the prompt)
     #[arg(long = "email-address", requires = "email")]
