@@ -6216,7 +6216,17 @@ pub(crate) fn build_confidential_app_from_rows(
     }
 
     let unlock_mode = match app.unlock_mode {
-        crate::models::UnlockMode::Auto => CommonUnlockMode::Auto,
+        // Hard-disabled: no deployment, redeploy, rollback, or transition
+        // reapply may build an auto-unlock workload from stored state. The
+        // auto->password transition commits the password row before this
+        // builder runs, so conversion redeploys are unaffected.
+        crate::models::UnlockMode::Auto => {
+            return Err(DeployError::Validation(format!(
+                "{}: app {} is recorded as auto-unlock; transition it to password mode",
+                crate::routes::apps::AUTO_UNLOCK_DISABLED_REJECTION,
+                app.name
+            )));
+        }
         crate::models::UnlockMode::Password => CommonUnlockMode::Password,
     };
     let egress_mode = app.egress_mode.parse::<EgressMode>().map_err(|error| {
@@ -6605,6 +6615,35 @@ mod tests {
         )
     }
 
+    #[test]
+    fn stored_auto_unlock_app_cannot_build_a_workload() {
+        // The shared apply authority must refuse every deployment lineage
+        // (deploy, redeploy, rollback, transition reapply) for a stored-auto
+        // app: no auto-unlock workload may ever be rendered again.
+        let mut app = queued_apply_app();
+        app.unlock_mode = crate::models::UnlockMode::Auto;
+        let snapshot = queued_apply_snapshot('a');
+        let error = build_confidential_app_from_rows(
+            &app,
+            uuid::Uuid::new_v4(),
+            &test_attestation_config(),
+            "api-signing-key",
+            "https://api.enclava.dev",
+            &snapshot.containers,
+            &snapshot.resources,
+        )
+        .expect_err("stored-auto app must not build a workload");
+        match error {
+            DeployError::Validation(message) => {
+                assert!(
+                    message.starts_with("auto_unlock_disabled"),
+                    "rejection must carry the stable code: {message}"
+                );
+            }
+            other => panic!("expected validation rejection, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn queued_apply_renders_its_captured_rows_after_later_state_changes() {
         let app = queued_apply_app();
@@ -6691,25 +6730,6 @@ mod tests {
                 error_message: None,
                 terminal: true,
             }
-        );
-    }
-
-    #[test]
-    fn auto_redeploy_timeout_still_fails() {
-        let outcome = classify_rollout_result(
-            Ok(EngineDeployStatus::timed_out(
-                "rollout did not complete within 600s",
-            )),
-            AppStatus::Running,
-            crate::models::UnlockMode::Auto,
-        );
-
-        assert_eq!(outcome.deploy_status, "failed");
-        assert_eq!(outcome.app_status, "failed");
-        assert!(outcome.terminal);
-        assert_eq!(
-            outcome.error_message.as_deref(),
-            Some(PERSISTED_DEPLOYMENT_ERROR_MESSAGE)
         );
     }
 
@@ -7631,12 +7651,13 @@ mod tests {
         // A restarted observer anchors at `observing_since`: once the
         // cumulative rollout budget is spent, the slice ends immediately and
         // returns the engine timeout classification instead of restarting a
-        // fresh initialization budget.
-        let mut auto_app = queued_apply_app();
-        auto_app.unlock_mode = crate::models::UnlockMode::Auto;
+        // fresh initialization budget. A stopped redeploy does not classify
+        // as an owner wait, so budget exhaustion stays terminal.
+        let mut app = queued_apply_app();
+        app.status = AppStatus::Stopped;
         let budget = fresh_initialization_budget("32Mi", "32Mi");
         let outcome = DeploymentRollout::observe_only(
-            auto_app,
+            app,
             rollout_test_engine(),
             "deadline-manifest".to_string(),
             expired_rollout_anchor(budget),
@@ -7657,9 +7678,11 @@ mod tests {
         // A redeploy whose volumes are already initialized carries only the
         // base rollout budget. A 2 Ti manifest must NOT inherit a
         // multi-hour first-boot allowance: once the recorded base budget is
-        // spent, the cumulative deadline ends the rollout normally.
+        // spent, the cumulative deadline ends the rollout normally. A stopped
+        // redeploy does not classify as an owner wait, so exhaustion stays
+        // terminal.
         let mut app = queued_apply_app();
-        app.unlock_mode = crate::models::UnlockMode::Auto;
+        app.status = AppStatus::Stopped;
         let outcome = DeploymentRollout::observe_only(
             app,
             rollout_test_engine(),
@@ -7685,7 +7708,7 @@ mod tests {
         // than any size-derived budget still expires, a record larger than
         // one still keeps observing. Neither recomputes.
         let mut expired_app = queued_apply_app();
-        expired_app.unlock_mode = crate::models::UnlockMode::Auto;
+        expired_app.status = AppStatus::Stopped;
         let recorded_small = std::time::Duration::from_secs(1);
         let expired = DeploymentRollout::observe_only(
             expired_app,
@@ -7701,8 +7724,7 @@ mod tests {
         assert_eq!(expired.deploy_status, "failed");
         assert!(expired.terminal);
 
-        let mut waiting_app = queued_apply_app();
-        waiting_app.unlock_mode = crate::models::UnlockMode::Auto;
+        let waiting_app = queued_apply_app();
         let waiting = DeploymentRollout::observe_only(
             waiting_app,
             rollout_test_engine(),
@@ -7997,8 +8019,7 @@ mod tests {
     async fn large_volume_initialization_keeps_observing_after_base_deadline() {
         // The recorded first-boot budget extends past the base deadline: 30
         // minutes into observation a fresh 2 Ti render is still watching.
-        let mut app = queued_apply_app();
-        app.unlock_mode = crate::models::UnlockMode::Auto;
+        let app = queued_apply_app();
         let outcome = DeploymentRollout::observe_only(
             app,
             rollout_test_engine(),

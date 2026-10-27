@@ -123,14 +123,6 @@ fn render_config_toml(app: &ConfidentialApp) -> String {
     out.push_str(&format!("caddy-gid = {CADDY_GID}\n"));
     out.push_str(&format!("argon2-salt-hex = \"{}\"\n", argon2_salt_hex(app)));
 
-    if app.unlock_mode == UnlockMode::Auto {
-        out.push_str(&format!("kbs-url = \"{LOCAL_OWNER_SEED_RESOURCE_URL}\"\n"));
-        out.push_str(&format!(
-            "kbs-resource-path = \"{}\"\n",
-            app.owner_resource_path()
-        ));
-    }
-
     if app.attestation.trustee_policy_read_available {
         out.push_str("trustee-policy-read-available = true\n");
         out.push_str("cc-init-data-path = \"/etc/enclava-init/cc-init-data.toml\"\n");

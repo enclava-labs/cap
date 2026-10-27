@@ -674,7 +674,11 @@ pub(crate) async fn build_signed_deploy_blobs(
             }
         }
     } else {
-        return Err("ENCLAVA_TENANT_INSTANCE_IDENTITY_HASH is required to sign auto-unlock deployment descriptor".into());
+        return Err(
+            "auto_unlock_disabled: only password-mode apps can be signed for deploy; \
+             convert the auto-unlock app with `enclava auto-unlock disable`"
+                .into(),
+        );
     };
     let bootstrap_pubkey_hash = if let Some(value) = app.bootstrap_owner_pubkey_hash.clone() {
         value

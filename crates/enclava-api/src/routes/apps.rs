@@ -4,10 +4,7 @@ use axum::{
     http::StatusCode,
 };
 use chrono::Duration;
-use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::auth::jwt::{
@@ -22,6 +19,20 @@ use crate::source_provider::{
 use crate::state::{AppState, CapManagementMode};
 use enclava_engine::types::{EgressMode, EgressRule};
 use sqlx::types::Json as SqlJson;
+
+/// Stable rejection code for every auto-unlock admission guard, matching the
+/// proxy's guest-visible `auto_unlock_disabled` 403 body. Auto-unlock is
+/// hard-disabled: creation, mode transitions, and applies of stored-auto apps
+/// all refuse with this marker (HTTP 403 where the surface maps it).
+pub(crate) const AUTO_UNLOCK_DISABLED_REJECTION: &str = "auto_unlock_disabled";
+
+/// The 403 form of [`AUTO_UNLOCK_DISABLED_REJECTION`] for HTTP surfaces.
+pub(crate) fn auto_unlock_disabled_response() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({"error": AUTO_UNLOCK_DISABLED_REJECTION})),
+    )
+}
 
 /// Helper function for consistent internal server error responses
 fn internal_server_error() -> (StatusCode, Json<serde_json::Value>) {
@@ -959,12 +970,12 @@ pub(crate) fn derive_identity(
             }
             hash.to_lowercase()
         }
-        "auto" => {
-            // Platform generates Ed25519 keypair for auto-unlock apps
-            let keypair = SigningKey::generate(&mut OsRng);
-            let pubkey_bytes = keypair.verifying_key().to_bytes();
-            let hash = Sha256::digest(pubkey_bytes);
-            hex::encode(hash)
+        // Auto-unlock creation is hard-disabled (no generated bootstrap key,
+        // no auto-mode apps): every create lineage — public, hosted, and
+        // generic create-if-missing — derives identity here, so this is the
+        // single refusal point ahead of any side effect.
+        "auto" | "auto-unlock" => {
+            return Err(AUTO_UNLOCK_DISABLED_REJECTION.to_string());
         }
         _ => return Err(format!("invalid unlock_mode: {unlock_mode}")),
     };
@@ -1078,10 +1089,14 @@ pub(crate) async fn prepare_app_candidate(
             body.bootstrap_pubkey_hash.as_deref(),
         )
         .map_err(|error| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": error})),
-            )
+            if error == AUTO_UNLOCK_DISABLED_REJECTION {
+                auto_unlock_disabled_response()
+            } else {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": error})),
+                )
+            }
         })?;
     // Every create path derives the KBS owner binding key from the tenant
     // namespace and app name, so it is identical across incarnations of the
@@ -1113,7 +1128,6 @@ pub(crate) async fn prepare_app_candidate(
         )
     })?;
     let unlock_mode = match body.unlock_mode.as_str() {
-        "auto" => crate::models::UnlockMode::Auto,
         "password" => crate::models::UnlockMode::Password,
         _ => unreachable!("derive_identity validates unlock_mode"),
     };

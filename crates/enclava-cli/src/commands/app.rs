@@ -301,19 +301,17 @@ pub struct CreateArgs {
     pub signer_issuer: String,
 }
 
-/// Auto-unlock is only reachable via `enclava auto-unlock enable` after a password-mode
-/// claim has established the owner seed inside the TEE (the CLI then wraps that seed
-/// for attestation-gated KBS release). At `create` time no claim has happened, so there
-/// is no seed to wrap — `unlock.mode = "auto"` is always a category error. Fail fast
-/// with the workaround rather than letting enclava-init time out (~60s) fetching a KBS
-/// wrap-key that nothing provisions.
+/// Auto-unlock is hard-disabled platform-wide: the CLI no longer implements
+/// `auto-unlock enable`, the proxy refuses to arm the seal, and init no
+/// longer auto-releases seeds. `unlock.mode = "auto"` can never succeed, so
+/// fail fast instead of letting the deploy hit server-side rejection.
 fn validate_create_unlock_mode(mode: &str) -> Result<(), &'static str> {
     match mode {
         "auto" => Err(
-            "auto-unlock cannot be set at first deploy: the owner seed is \
-             established by a password-mode claim. Set `unlock.mode = \"password\"` for \
-             the first deploy, then run `enclava auto-unlock enable` to wrap the seed \
-             for attestation-gated release on restarts.",
+            "auto_unlock_disabled: auto-unlock cannot be created anymore. \
+             Set `unlock.mode = \"password\"` — password apps stay unlockable \
+             with `enclava unlock`, and `enclava auto-unlock disable` converts \
+             a legacy auto-unlock app.",
         ),
         _ => Ok(()),
     }

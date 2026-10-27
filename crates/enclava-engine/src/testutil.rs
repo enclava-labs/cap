@@ -10,7 +10,8 @@ use uuid::Uuid;
 pub const TEST_PUBKEY_HASH: &str =
     "aabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccdd";
 
-/// A minimal valid ConfidentialApp for testing (auto-unlock mode).
+/// A minimal valid ConfidentialApp for testing (password mode; auto-unlock
+/// workloads are refused by `validate_app`).
 pub fn sample_app() -> ConfidentialApp {
     let tenant_id = "test-org".to_string();
     let instance_id = "test-org-a1b2c3d4".to_string();
@@ -48,7 +49,7 @@ pub fn sample_app() -> ConfidentialApp {
             is_primary: true,
         }],
         storage: StorageSpec::new("10Gi", "2Gi"),
-        unlock_mode: UnlockMode::Auto,
+        unlock_mode: UnlockMode::Password,
         domain: DomainSpec {
             platform_domain: "test-app.abcd1234.enclava.dev".to_string(),
             tee_domain: "test-app.abcd1234.tee.enclava.dev".to_string(),
@@ -91,11 +92,4 @@ pub fn sample_app() -> ConfidentialApp {
         workload_artifact_binding: None,
         generated_agent_policy: None,
     }
-}
-
-/// A password-mode app with identity fields populated.
-pub fn sample_password_app() -> ConfidentialApp {
-    let mut app = sample_app();
-    app.unlock_mode = UnlockMode::Password;
-    app
 }

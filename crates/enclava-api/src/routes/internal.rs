@@ -388,7 +388,10 @@ pub struct SyncPaaSEntitlementRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct InternalCreateAppRequest {
     pub name: String,
-    #[serde(default = "default_auto_unlock_mode")]
+    // Defaults to password, never auto: a hosted create that omits the mode
+    // must fail closed (missing bootstrap_pubkey_hash) instead of silently
+    // arming auto-unlock.
+    #[serde(default = "default_unlock_mode")]
     pub unlock_mode: String,
     #[serde(default)]
     pub bootstrap_pubkey_hash: Option<String>,
@@ -462,8 +465,8 @@ fn default_active_status() -> String {
     "active".to_string()
 }
 
-fn default_auto_unlock_mode() -> String {
-    "auto".to_string()
+fn default_unlock_mode() -> String {
+    "password".to_string()
 }
 
 fn json_error(
@@ -3580,7 +3583,13 @@ pub async fn create_paas_app(
             &body.unlock_mode,
             body.bootstrap_pubkey_hash.as_deref(),
         )
-        .map_err(|error| json_error(StatusCode::BAD_REQUEST, error))?;
+        .map_err(|error| {
+            if error == crate::routes::apps::AUTO_UNLOCK_DISABLED_REJECTION {
+                crate::routes::apps::auto_unlock_disabled_response()
+            } else {
+                json_error(StatusCode::BAD_REQUEST, error)
+            }
+        })?;
     // Same-name recreate guard as the public create path: the hosted create
     // derives its own identity instead of going through prepare_app_candidate,
     // so the check runs here explicitly and the 409 passes through as-is.
@@ -5970,7 +5979,7 @@ mod tests {
     fn create_app_request_without_resources_serializes_legacy_form() {
         let request = InternalCreateAppRequest {
             name: "app".to_string(),
-            unlock_mode: "auto".to_string(),
+            unlock_mode: "password".to_string(),
             bootstrap_pubkey_hash: None,
             signer_identity_subject: None,
             signer_identity_issuer: None,
@@ -10855,8 +10864,8 @@ mod tests {
             create_headers.clone(),
             Json(InternalCreateAppRequest {
                 name: app_name.clone(),
-                unlock_mode: "auto".into(),
-                bootstrap_pubkey_hash: None,
+                unlock_mode: "password".into(),
+                bootstrap_pubkey_hash: Some("00".repeat(32)),
                 signer_identity_subject: None,
                 signer_identity_issuer: None,
                 egress_allowlist: vec![],
@@ -10879,8 +10888,8 @@ mod tests {
                     create_headers,
                     Json(InternalCreateAppRequest {
                         name: app_name.clone(),
-                        unlock_mode: "auto".into(),
-                        bootstrap_pubkey_hash: None,
+                        unlock_mode: "password".into(),
+                        bootstrap_pubkey_hash: Some("00".repeat(32)),
                         signer_identity_subject: None,
                         signer_identity_issuer: None,
                         egress_allowlist: vec![],

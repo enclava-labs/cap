@@ -64,6 +64,16 @@ enclava status
 enclava key backup --out enclava-recovery.json
 ```
 
+New apps and deployments are password-only. Auto-unlock creation, enable requests
+and `enclava auto-unlock enable` fail with `auto_unlock_disabled`; the guest never
+fetches its owner seed automatically. After guest replacement, use
+`enclava unlock --app NAME --password-file PATH` with the existing storage password.
+
+For a legacy auto-mode app, run
+`enclava auto-unlock disable --app NAME --image REPO@sha256:DIGEST --password-file PATH`
+from its original `enclava.toml` workspace before redeploying. This preserves the
+owner seed and volumes, but cannot revoke a previously copied auto-sealed seed.
+
 For encrypted workload logs, use the current CLI and the tenant's log private key:
 
 ```bash

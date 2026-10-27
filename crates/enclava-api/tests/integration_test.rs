@@ -300,7 +300,8 @@ fn generic_deployment_body(
         "app": {
             "name": app_name,
             "create_if_missing": true,
-            "unlock_mode": "auto"
+            "unlock_mode": "password",
+            "bootstrap_pubkey_hash": "0000000000000000000000000000000000000000000000000000000000000000"
         },
         "source": {
             "provider": provider,
@@ -1555,7 +1556,8 @@ async fn paas_managed_orgs_fail_closed_and_block_public_writes() {
         .authorization_bearer(&session_token)
         .json(&serde_json::json!({
             "name": format!("blocked-{}", &suffix[..8]),
-            "unlock_mode": "auto",
+            "unlock_mode": "password",
+            "bootstrap_pubkey_hash": "0000000000000000000000000000000000000000000000000000000000000000",
         }))
         .await;
     public_create.assert_status(StatusCode::FORBIDDEN);
@@ -1627,7 +1629,8 @@ async fn paas_internal_domain_challenge_does_not_reenter_public_write_guard() {
     )
     .json(&serde_json::json!({
         "name": app_name,
-        "unlock_mode": "auto",
+        "unlock_mode": "password",
+            "bootstrap_pubkey_hash": "0000000000000000000000000000000000000000000000000000000000000000",
     }))
     .await
     .assert_status(StatusCode::CREATED);
@@ -1714,7 +1717,8 @@ async fn paas_internal_config_sync_bypasses_public_paas_managed_write_guard() {
     )
     .json(&serde_json::json!({
         "name": app_name,
-        "unlock_mode": "auto",
+        "unlock_mode": "password",
+            "bootstrap_pubkey_hash": "0000000000000000000000000000000000000000000000000000000000000000",
     }))
     .await;
     create_app.assert_status(StatusCode::CREATED);
@@ -2940,7 +2944,8 @@ async fn rejected_signed_deployments_leave_existing_and_candidate_container_rows
         .authorization_bearer(&session_token)
         .json(&serde_json::json!({
             "name": app_name,
-            "unlock_mode": "auto",
+            "unlock_mode": "password",
+            "bootstrap_pubkey_hash": "0000000000000000000000000000000000000000000000000000000000000000",
             "signer_identity_subject": github_signer_subject(),
             "signer_identity_issuer": github_signer_issuer(),
         }))
@@ -3249,7 +3254,8 @@ async fn paas_internal_generic_deployment_uses_synced_entitlement_and_signer_pre
     )
     .json(&serde_json::json!({
         "name": app_name,
-        "unlock_mode": "auto",
+        "unlock_mode": "password",
+            "bootstrap_pubkey_hash": "0000000000000000000000000000000000000000000000000000000000000000",
     }))
     .await
     .assert_status(StatusCode::CREATED);
@@ -3327,7 +3333,8 @@ async fn app_logs_fail_closed_until_encrypted_streaming_exists() {
         .authorization_bearer(&session_token)
         .json(&serde_json::json!({
             "name": app_name,
-            "unlock_mode": "auto",
+            "unlock_mode": "password",
+            "bootstrap_pubkey_hash": "0000000000000000000000000000000000000000000000000000000000000000",
             "signer_identity_subject": "repo:enclava/logs:ref:refs/heads/main",
             "signer_identity_issuer": "https://token.actions.githubusercontent.com"
         }))
@@ -3416,7 +3423,8 @@ async fn paas_internal_app_logs_fail_closed_after_actor_validation() {
     )
     .json(&serde_json::json!({
         "name": app_name,
-        "unlock_mode": "auto",
+        "unlock_mode": "password",
+            "bootstrap_pubkey_hash": "0000000000000000000000000000000000000000000000000000000000000000",
     }))
     .await
     .assert_status(StatusCode::CREATED);
@@ -3457,7 +3465,8 @@ async fn custom_domain_verified_challenge_cannot_replay_after_expiry() {
         .authorization_bearer(&session_token)
         .json(&serde_json::json!({
             "name": app_name,
-            "unlock_mode": "auto",
+            "unlock_mode": "password",
+            "bootstrap_pubkey_hash": "0000000000000000000000000000000000000000000000000000000000000000",
         }))
         .await;
     create.assert_status(StatusCode::CREATED);
@@ -3528,7 +3537,8 @@ async fn custom_domain_verified_challenge_rechecks_txt_within_window() {
         .authorization_bearer(&session_token)
         .json(&serde_json::json!({
             "name": app_name,
-            "unlock_mode": "auto",
+            "unlock_mode": "password",
+            "bootstrap_pubkey_hash": "0000000000000000000000000000000000000000000000000000000000000000",
         }))
         .await;
     create.assert_status(StatusCode::CREATED);
@@ -4062,7 +4072,8 @@ async fn existing_app_storage_resize_is_refused_before_persistence() {
         .authorization_bearer(&session_token)
         .json(&serde_json::json!({
             "name": app_name,
-            "unlock_mode": "auto",
+            "unlock_mode": "password",
+            "bootstrap_pubkey_hash": "0000000000000000000000000000000000000000000000000000000000000000",
         }))
         .await
         .assert_status(StatusCode::CREATED);
@@ -4134,7 +4145,8 @@ async fn existing_app_storage_resize_is_refused_before_persistence() {
         .authorization_bearer(&session_token)
         .json(&serde_json::json!({
             "name": fresh_app_name,
-            "unlock_mode": "auto",
+            "unlock_mode": "password",
+            "bootstrap_pubkey_hash": "0000000000000000000000000000000000000000000000000000000000000000",
         }))
         .await
         .assert_status(StatusCode::CREATED);
@@ -4235,7 +4247,8 @@ async fn deployment_diagnostics_projects_live_apply_job_over_http() {
         .authorization_bearer(&session_token)
         .json(&serde_json::json!({
             "name": app_name,
-            "unlock_mode": "auto",
+            "unlock_mode": "password",
+            "bootstrap_pubkey_hash": "0000000000000000000000000000000000000000000000000000000000000000",
         }))
         .await
         .assert_status(StatusCode::CREATED);
@@ -4354,7 +4367,8 @@ async fn deployment_diagnostics_no_deployment_app_is_unknown_not_500() {
         .authorization_bearer(&session_token)
         .json(&serde_json::json!({
             "name": app_name,
-            "unlock_mode": "auto",
+            "unlock_mode": "password",
+            "bootstrap_pubkey_hash": "0000000000000000000000000000000000000000000000000000000000000000",
         }))
         .await
         .assert_status(StatusCode::CREATED);
@@ -4389,7 +4403,8 @@ async fn deployment_diagnostics_terminal_rollout_failure_is_failed_not_healthy()
         .authorization_bearer(&session_token)
         .json(&serde_json::json!({
             "name": app_name,
-            "unlock_mode": "auto",
+            "unlock_mode": "password",
+            "bootstrap_pubkey_hash": "0000000000000000000000000000000000000000000000000000000000000000",
         }))
         .await
         .assert_status(StatusCode::CREATED);
@@ -4445,7 +4460,8 @@ async fn deployment_diagnostics_watch_slice_gap_is_watching_not_queued() {
         .authorization_bearer(&session_token)
         .json(&serde_json::json!({
             "name": app_name,
-            "unlock_mode": "auto",
+            "unlock_mode": "password",
+            "bootstrap_pubkey_hash": "0000000000000000000000000000000000000000000000000000000000000000",
         }))
         .await
         .assert_status(StatusCode::CREATED);
@@ -4508,7 +4524,8 @@ async fn deployment_diagnostics_reports_foreign_lease_blocker() {
         .authorization_bearer(&session_token)
         .json(&serde_json::json!({
             "name": app_name,
-            "unlock_mode": "auto",
+            "unlock_mode": "password",
+            "bootstrap_pubkey_hash": "0000000000000000000000000000000000000000000000000000000000000000",
         }))
         .await
         .assert_status(StatusCode::CREATED);
