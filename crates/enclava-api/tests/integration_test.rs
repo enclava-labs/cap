@@ -1904,7 +1904,11 @@ async fn paas_internal_desired_state_contract_is_authenticated_mapped_and_idempo
         server.post(&format!("/internal/paas/orgs/{paas_org_id}/apps")),
         &format!("desired-state-app-{suffix}"),
     )
-    .json(&serde_json::json!({"name": app_name}))
+    .json(&serde_json::json!({
+        "name": app_name,
+        "unlock_mode": "password",
+        "bootstrap_pubkey_hash": "00".repeat(32),
+    }))
     .await
     .assert_status(StatusCode::CREATED);
     sqlx::query(
@@ -2063,7 +2067,11 @@ async fn paas_internal_stop_waits_for_pending_deployment_observation() {
         server.post(&format!("/internal/paas/orgs/{paas_org_id}/apps")),
         &format!("desired-state-pending-app-{suffix}"),
     )
-    .json(&serde_json::json!({"name": app_name}))
+    .json(&serde_json::json!({
+        "name": app_name,
+        "unlock_mode": "password",
+        "bootstrap_pubkey_hash": "00".repeat(32),
+    }))
     .await
     .assert_status(StatusCode::CREATED);
     sqlx::query("UPDATE apps SET status = 'running'::app_status_enum WHERE name = $1")
@@ -2331,7 +2339,11 @@ async fn paas_internal_stale_desired_state_replay_does_not_undo_newer_intent() {
         server.post(&format!("/internal/paas/orgs/{paas_org_id}/apps")),
         &format!("desired-state-stale-app-{suffix}"),
     )
-    .json(&serde_json::json!({"name": app_name}))
+    .json(&serde_json::json!({
+        "name": app_name,
+        "unlock_mode": "password",
+        "bootstrap_pubkey_hash": "00".repeat(32),
+    }))
     .await
     .assert_status(StatusCode::CREATED);
     sqlx::query("UPDATE apps SET status = 'stopped'::app_status_enum WHERE name = $1")
@@ -2404,7 +2416,11 @@ async fn paas_internal_desired_state_contention_retries_with_the_same_operation_
         server.post(&format!("/internal/paas/orgs/{paas_org_id}/apps")),
         &format!("desired-state-contention-app-{suffix}"),
     )
-    .json(&serde_json::json!({"name": app_name}))
+    .json(&serde_json::json!({
+        "name": app_name,
+        "unlock_mode": "password",
+        "bootstrap_pubkey_hash": "00".repeat(32),
+    }))
     .await
     .assert_status(StatusCode::CREATED);
     let app_id: Uuid = sqlx::query_scalar("SELECT id FROM apps WHERE name = $1")
@@ -2503,7 +2519,11 @@ async fn paas_internal_desired_state_rechecks_failed_status_after_claim() {
         server.post(&format!("/internal/paas/orgs/{paas_org_id}/apps")),
         &format!("desired-state-race-app-{suffix}"),
     )
-    .json(&serde_json::json!({"name": app_name}))
+    .json(&serde_json::json!({
+        "name": app_name,
+        "unlock_mode": "password",
+        "bootstrap_pubkey_hash": "00".repeat(32),
+    }))
     .await
     .assert_status(StatusCode::CREATED);
     sqlx::query("UPDATE apps SET status = 'stopped'::app_status_enum WHERE name = $1")
@@ -2685,7 +2705,11 @@ async fn paas_internal_desired_state_convergence_releases_the_deployment_lane() 
         server.post(&format!("/internal/paas/orgs/{paas_org_id}/apps")),
         &format!("desired-state-lane-app-{suffix}"),
     )
-    .json(&serde_json::json!({"name": app_name}))
+    .json(&serde_json::json!({
+        "name": app_name,
+        "unlock_mode": "password",
+        "bootstrap_pubkey_hash": "00".repeat(32),
+    }))
     .await
     .assert_status(StatusCode::CREATED);
     sqlx::query("UPDATE apps SET status = 'running'::app_status_enum WHERE name = $1")
