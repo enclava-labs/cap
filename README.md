@@ -117,8 +117,9 @@ The CLI requires the signed deployment's attested launch identity both while
 waiting for bootstrap and on the client that submits the ownership claim.
 
 Apps awaiting required confidential teardown retain their public routes even if
-every deployment has failed. Routes are removed after teardown completes;
-deleting a failed app does not bypass its storage or ownership checks.
+every deployment has failed or a failed delete restored the app's prior status.
+Routes are removed after teardown completes; deleting a failed app does not
+bypass its storage or ownership checks.
 
 ## Local Development
 
