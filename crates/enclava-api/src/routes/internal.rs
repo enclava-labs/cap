@@ -388,9 +388,7 @@ pub struct SyncPaaSEntitlementRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct InternalCreateAppRequest {
     pub name: String,
-    // Defaults to password, never auto: a hosted create that omits the mode
-    // must fail closed (missing bootstrap_pubkey_hash) instead of silently
-    // arming auto-unlock.
+    // Preserve durable retry hashes; new requests with this legacy default are refused.
     #[serde(default = "default_unlock_mode")]
     pub unlock_mode: String,
     #[serde(default)]
@@ -466,7 +464,7 @@ fn default_active_status() -> String {
 }
 
 fn default_unlock_mode() -> String {
-    "password".to_string()
+    "auto".to_string()
 }
 
 fn json_error(
