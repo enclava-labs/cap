@@ -109,6 +109,7 @@ mod tests {
                     "--npub <NPUB> and --nsec-file <PATH>",
                 ][..],
             ),
+            (include_str!("ownership.rs"), &["--new-password-file"][..]),
             (
                 include_str!("prepare.rs"),
                 &["pass --yes to update the existing files without confirmation"][..],

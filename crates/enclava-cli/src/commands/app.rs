@@ -2601,29 +2601,42 @@ fn status_with_attested_tee_state(api_status: &str, tee_state: &str) -> String {
 }
 
 /// Machine-readable status payload: the API status object plus the CLI-derived
-/// diagnostics, with a stable shape (nulls where absent).
+/// diagnostics, with a stable shape — every key is always present and absent or
+/// unverified values are `null` (never a value that reads as a verified result).
 fn status_json_payload(
     status: &enclava_cli::api_types::AppStatus,
     stable_ssh_endpoint: &StableSshEndpointState,
     tee_acme_retry_after: Option<&str>,
-    missing_config_keys: &[String],
+    missing_config_keys: Option<&[String]>,
 ) -> Result<serde_json::Value, serde_json::Error> {
     let mut out = serde_json::to_value(status)?;
     out["stable_ssh_endpoint"] = match stable_ssh_endpoint {
         StableSshEndpointState::Ready(endpoint) => {
             serde_json::json!({"state": "ready", "endpoint": endpoint})
         }
-        StableSshEndpointState::Missing => serde_json::json!({"state": "missing"}),
-        StableSshEndpointState::Invalid => serde_json::json!({"state": "invalid"}),
+        StableSshEndpointState::Missing => {
+            serde_json::json!({"state": "missing", "endpoint": null})
+        }
+        StableSshEndpointState::Invalid => {
+            serde_json::json!({"state": "invalid", "endpoint": null})
+        }
         StableSshEndpointState::NotStableTemplate => {
-            serde_json::json!({"state": "not_stable_template"})
+            serde_json::json!({"state": "not_stable_template", "endpoint": null})
+        }
+        StableSshEndpointState::Unknown => {
+            serde_json::json!({"state": "unknown", "endpoint": null})
         }
     };
     out["tee_acme_retry_after"] = match tee_acme_retry_after {
         Some(retry_after) => serde_json::json!(retry_after),
         None => serde_json::Value::Null,
     };
-    out["missing_config_keys"] = serde_json::json!(missing_config_keys);
+    // `null` means the completeness check did not run (non-template app or a
+    // metadata lookup failed); only `[]` means verified complete.
+    out["missing_config_keys"] = match missing_config_keys {
+        Some(keys) => serde_json::json!(keys),
+        None => serde_json::Value::Null,
+    };
     Ok(out)
 }
 
@@ -2638,7 +2651,7 @@ pub async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> 
     let stable_ssh_endpoint = app_metadata
         .as_ref()
         .map(stable_ssh_endpoint_state_from_app)
-        .unwrap_or(StableSshEndpointState::NotStableTemplate);
+        .unwrap_or(StableSshEndpointState::Unknown);
     let mut tee_acme_retry_after: Option<String> = None;
     if let Ok(endpoint) = api.get_unlock_endpoint(&app_name).await {
         let tee = TeeClient::new_for_ownership_with_resolve_ip(
@@ -2690,7 +2703,7 @@ pub async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> 
             &status,
             &stable_ssh_endpoint,
             tee_acme_retry_after.as_deref(),
-            missing_config_keys.as_deref().unwrap_or(&[]),
+            missing_config_keys.as_deref(),
         )?;
         println!("{}", serde_json::to_string_pretty(&payload)?);
         return Ok(());
@@ -2721,7 +2734,7 @@ pub async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> 
                 "Stable SSH endpoint metadata invalid; redeploy the template so PaaS reserves a stable SSH endpoint"
             );
         }
-        StableSshEndpointState::NotStableTemplate => {}
+        StableSshEndpointState::NotStableTemplate | StableSshEndpointState::Unknown => {}
     }
     if let Some(phase) = &status.pod_phase {
         println!("Pod:      {phase}");
@@ -2910,6 +2923,8 @@ enum StableSshEndpointState {
     Ready(String),
     Missing,
     Invalid,
+    /// App metadata could not be read, so the endpoint state is unknown.
+    Unknown,
 }
 
 /// Required template config keys that the app's platform config metadata does

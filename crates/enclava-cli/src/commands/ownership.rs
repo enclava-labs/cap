@@ -546,13 +546,13 @@ pub async fn recover(args: RecoverArgs) -> Result<(), Box<dyn std::error::Error>
         }
     };
 
-    let new_password = match args.new_password_file.as_ref() {
-        Some(path) => keys::read_secret_file(path, "new password")?,
-        None => Password::new()
-            .with_prompt("New unlock password")
-            .with_confirmation("Confirm password", "Passwords don't match")
-            .interact()?,
-    };
+    let new_password = secret_from_file_or_prompt(
+        args.new_password_file.as_deref(),
+        "new password",
+        "New unlock password",
+        Some(("Confirm password", "Passwords don't match")),
+        "--new-password-file",
+    )?;
 
     println!("Recovering {app_name}...");
     if let Err(err) = tee.recover(&mnemonic, &new_password).await {
