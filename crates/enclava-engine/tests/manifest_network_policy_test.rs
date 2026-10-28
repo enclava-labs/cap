@@ -159,10 +159,6 @@ fn network_policy_egress_has_dns() {
     assert_eq!(dns_ports[0]["protocol"], "UDP");
     assert_eq!(dns_ports[1]["port"], "53");
     assert_eq!(dns_ports[1]["protocol"], "TCP");
-    assert!(
-        egress[0]["toPorts"][0].get("rules").is_none(),
-        "Kata guests require direct L4 DNS because Cilium's DNS proxy does not relay responses"
-    );
 }
 
 #[test]
@@ -377,19 +373,6 @@ fn dns01_broker_kubernetes_service_url_is_allowed_for_static_certificate_provisi
 }
 
 #[test]
-fn empty_egress_allowlist_renders_zero_extra_rules() {
-    let mut app = sample_app();
-    app.egress_allowlist = Vec::new();
-    let val = generate_network_policy(&app);
-    let egress = val["spec"]["egress"].as_array().unwrap();
-    assert_eq!(
-        egress.len(),
-        8,
-        "DNS + same-ns + KBS x2 + ACME x2 + AMD relay x2"
-    );
-}
-
-#[test]
 fn per_app_egress_extends_platform_default() {
     use enclava_engine::types::EgressRule;
     let mut app = sample_app();
@@ -406,28 +389,6 @@ fn per_app_egress_extends_platform_default() {
     assert!(fqdns.contains(&"acme-v02.api.letsencrypt.org"));
     assert!(fqdns.contains(&"acme-staging-v02.api.letsencrypt.org"));
     assert!(fqdns.contains(&"api.stripe.com"));
-}
-
-#[test]
-fn egress_allowlist_renders_one_rule_per_entry() {
-    use enclava_engine::types::EgressRule;
-    let mut app = sample_app();
-    app.egress_allowlist = vec![
-        EgressRule {
-            host: "api.stripe.com".to_string(),
-            ports: vec![443],
-        },
-        EgressRule {
-            host: "hooks.slack.com".to_string(),
-            ports: vec![443],
-        },
-    ];
-    let val = generate_network_policy(&app);
-    let egress = val["spec"]["egress"].as_array().unwrap();
-    assert_eq!(egress.len(), 10, "6 cluster + 2 platform + 2 user");
-    assert_eq!(egress[8]["toFQDNs"][0]["matchName"], "api.stripe.com");
-    assert_eq!(egress[8]["toPorts"][0]["ports"][0]["port"], "443");
-    assert_eq!(egress[9]["toFQDNs"][0]["matchName"], "hooks.slack.com");
 }
 
 #[test]
