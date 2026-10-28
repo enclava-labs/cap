@@ -54,8 +54,12 @@ blocking_rollout_rules:
 required_checks:
   - rustup run stable cargo fmt --all -- --check
   - rustup run stable cargo clippy --workspace --all-targets -- -D warnings
-  - rustup run stable cargo test --workspace
-  - rustup run stable cargo test --doc
+  # Independent packages at default concurrency; doctests run inside each
+  # selection, so no separate cargo test --doc is needed:
+  - rustup run stable cargo test --locked --workspace --exclude enclava-api --exclude enclava-cli --exclude enclava-init --exclude enclava-wait-exec
+  # Shared-state packages (Postgres provider fences, env/path mutation) must
+  # stay serialized:
+  - DATABASE_URL=postgresql://test:test@localhost:5432/test rustup run stable cargo test --locked --workspace --exclude enclava-common --exclude enclava-engine --exclude enclava-appraiser --exclude enclava-verifier --exclude enclava-verifier-wasm -- --test-threads=1
   - rustup run stable cargo audit --ignore RUSTSEC-2023-0071
   - rustup run stable cargo deny check advisories sources
   - rustup run stable cargo build --workspace

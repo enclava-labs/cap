@@ -98,11 +98,34 @@ jobs:
       - name: Run clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Run tests
-        # Database-backed tests share one PostgreSQL service and exercise
-        # intentionally global provider fences. Serialize them so independent
-        # fixtures cannot contend through that shared authority.
-        run: cargo test --workspace -- --test-threads=1
+      - name: Run tests (independent packages)
+        # Packages without a database, process-global env/path mutation, or
+        # fixed-port fixture run at Cargo's default test concurrency. Adding a
+        # package here without checking those shared states is unsafe; add it
+        # to the serialized selection below instead.
+        run: >-
+          cargo test --locked --workspace
+          --exclude enclava-api
+          --exclude enclava-cli
+          --exclude enclava-init
+          --exclude enclava-wait-exec
+
+      - name: Run tests (shared-state packages, serialized)
+        # These packages must stay serialized: enclava-api fixtures share the
+        # PostgreSQL service's global provider fences, while enclava-cli,
+        # enclava-init, and enclava-wait-exec tests mutate process-global
+        # environment or init surface paths. Cargo runs package test binaries
+        # sequentially anyway; --test-threads=1 keeps each binary's tests
+        # from racing that global state. Default-feature doctests run here
+        # and above, so no separate cargo test --doc step is needed.
+        run: >-
+          cargo test --locked --workspace
+          --exclude enclava-common
+          --exclude enclava-engine
+          --exclude enclava-appraiser
+          --exclude enclava-verifier
+          --exclude enclava-verifier-wasm
+          -- --test-threads=1
         env:
           DATABASE_URL: postgresql://test:test@localhost:5432/test
 
@@ -125,9 +148,6 @@ jobs:
         # compiled defaults, mirroring enclava-init). Bin unit tests only:
         # the integration tests exercise the dev-build env-override behavior.
         run: cargo test --locked -p enclava-wait-exec --bins --features prod-strict -- --test-threads=1
-
-      - name: Run doctests
-        run: cargo test --doc
 
       - name: Run appraiser API conformance
         run: |
