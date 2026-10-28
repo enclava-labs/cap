@@ -5,6 +5,7 @@ pub mod describe;
 pub mod descriptor;
 pub mod domains;
 pub mod init;
+pub mod interactive;
 pub mod key;
 pub mod org;
 pub mod ownership;
@@ -40,6 +41,16 @@ pub(crate) fn format_duration(duration: Duration) -> String {
     about = "Deploy confidential apps in hardware-encrypted enclaves"
 )]
 pub struct Cli {
+    /// Never prompt: take deterministic defaults or fail with the flag that
+    /// replaces the prompt (also honored as env ENCLAVA_NO_INPUT: any value
+    /// except a falsey one — empty, 0, f, false, n, no, off — disables prompts)
+    #[arg(
+        long,
+        global = true,
+        env = "ENCLAVA_NO_INPUT",
+        value_parser = clap::builder::FalseyValueParser::new()
+    )]
+    pub no_input: bool,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -47,7 +58,7 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Command {
     /// Create an account
-    Signup,
+    Signup(auth::SignupArgs),
     /// Authenticate with the platform
     Login(auth::LoginArgs),
     /// Show authenticated user and active organization
@@ -112,8 +123,9 @@ pub enum Command {
 }
 
 pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+    interactive::set_no_input(cli.no_input);
     match cli.command {
-        Command::Signup => auth::signup().await,
+        Command::Signup(args) => auth::signup(args).await,
         Command::Login(args) => auth::login(args).await,
         Command::Whoami => auth::whoami().await,
         Command::Logout => auth::logout().await,
@@ -146,6 +158,61 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_input_is_a_global_flag() {
+        for argv in [
+            vec!["enclava", "--no-input", "status"],
+            vec!["enclava", "status", "--no-input"],
+        ] {
+            let label = argv.join(" ");
+            let cli = Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{label}: {e}"));
+            assert!(cli.no_input, "{label}");
+        }
+        let cli = Cli::try_parse_from(["enclava", "status"]).expect("default parses");
+        assert!(!cli.no_input);
+    }
+
+    #[test]
+    fn credential_flags_require_their_method() {
+        assert!(
+            Cli::try_parse_from(["enclava", "login", "--email-address", "a@example.com"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "enclava",
+                "login",
+                "--email",
+                "--email-address",
+                "a@example.com",
+                "--password-file",
+                "/tmp/p",
+            ])
+            .is_ok()
+        );
+        assert!(Cli::try_parse_from(["enclava", "login", "--nostr", "--npub", "npub1x"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["enclava", "login", "--nostr", "--nsec-file", "/tmp/n"]).is_ok()
+        );
+        assert!(Cli::try_parse_from(["enclava", "signup", "--npub", "npub1x"]).is_err());
+        assert!(Cli::try_parse_from(["enclava", "signup", "--nostr", "--npub", "npub1x"]).is_ok());
+        assert!(Cli::try_parse_from(["enclava", "login", "--replace-session"]).is_ok());
+        assert!(Cli::try_parse_from(["enclava", "status", "--json"]).is_ok());
+    }
+
+    #[test]
+    fn provider_flags_are_mutually_exclusive() {
+        for argv in [
+            vec!["enclava", "signup", "--email", "--nostr"],
+            vec!["enclava", "login", "--email", "--nostr"],
+        ] {
+            assert!(
+                Cli::try_parse_from(&argv).is_err(),
+                "contradictory providers must fail at parse: {}",
+                argv.join(" ")
+            );
+        }
+    }
 
     #[test]
     fn deployment_progress_formats_counts_and_deadlines() {

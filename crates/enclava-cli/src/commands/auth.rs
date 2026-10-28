@@ -9,6 +9,7 @@ use enclava_cli::api_types::{
     SignupRequest,
 };
 use enclava_cli::config::{self, CliPaths, Credentials};
+use enclava_cli::keys;
 
 #[derive(Args)]
 pub struct LoginArgs {
@@ -25,11 +26,48 @@ pub struct LoginArgs {
     #[arg(long = "approve-logs")]
     pub approve_logs: bool,
     /// Authenticate with Nostr identity (NIP-98)
-    #[arg(long)]
+    #[arg(long, conflicts_with = "email")]
     pub nostr: bool,
     /// Authenticate with email + password
-    #[arg(long)]
+    #[arg(long, conflicts_with = "nostr")]
     pub email: bool,
+    /// Replace an existing saved session without prompting
+    #[arg(long)]
+    pub replace_session: bool,
+    /// Email address for `--email` login (skips the prompt)
+    #[arg(long = "email-address", requires = "email")]
+    pub email_address: Option<String>,
+    /// Read the account password from a file for `--email` login (non-interactive)
+    #[arg(long = "password-file", requires = "email")]
+    pub password_file: Option<std::path::PathBuf>,
+    /// Nostr public key (npub1...) for `--nostr` login (skips the prompt)
+    #[arg(long, requires = "nostr")]
+    pub npub: Option<String>,
+    /// Read the Nostr private key (nsec1...) from a file for `--nostr` login (non-interactive)
+    #[arg(long = "nsec-file", requires = "nostr")]
+    pub nsec_file: Option<std::path::PathBuf>,
+}
+
+#[derive(Args)]
+pub struct SignupArgs {
+    /// Sign up with email + password
+    #[arg(long, conflicts_with = "nostr")]
+    pub email: bool,
+    /// Sign up with a Nostr identity (npub)
+    #[arg(long, conflicts_with = "email")]
+    pub nostr: bool,
+    /// Email address for `--email` signup (skips the prompt)
+    #[arg(long = "email-address", requires = "email")]
+    pub email_address: Option<String>,
+    /// Read the account password from a file for `--email` signup (non-interactive)
+    #[arg(long = "password-file", requires = "email")]
+    pub password_file: Option<std::path::PathBuf>,
+    /// Display name for `--email` signup (optional)
+    #[arg(long = "display-name", requires = "email")]
+    pub display_name: Option<String>,
+    /// Nostr public key (npub1...) for `--nostr` signup (skips the prompt)
+    #[arg(long, requires = "nostr")]
+    pub npub: Option<String>,
 }
 
 const DIRECT_PROVIDERS: &[(&str, &str)] = &[("Email", "email"), ("Nostr (npub)", "nostr")];
@@ -161,7 +199,7 @@ fn build_nip98_login_event(
         .map_err(|e| format!("failed to sign NIP-98 event: {e}"))
 }
 
-pub async fn signup() -> Result<(), Box<dyn std::error::Error>> {
+pub async fn signup(args: SignupArgs) -> Result<(), Box<dyn std::error::Error>> {
     let paths = CliPaths::resolve()?;
     let cli_config = config::load_config(&paths)?;
 
@@ -173,9 +211,14 @@ pub async fn signup() -> Result<(), Box<dyn std::error::Error>> {
         return Err(no_supported_method_error(discovery.as_ref(), "sign up").into());
     }
 
-    let provider = if available.len() == 1 {
+    let provider = if args.email {
+        "email"
+    } else if args.nostr {
+        "nostr"
+    } else if available.len() == 1 {
         available[0].1
     } else {
+        super::interactive::require_prompt("pass --email or --nostr to choose the signup method")?;
         let labels: Vec<_> = available.iter().map(|(l, _)| *l).collect();
         let selection = Select::new()
             .with_prompt("Sign up with")
@@ -192,15 +235,39 @@ pub async fn signup() -> Result<(), Box<dyn std::error::Error>> {
     let client = ApiClient::new(&auth_api_url, None);
 
     let req = if provider == "email" {
-        let email: String = Input::new().with_prompt("Email").interact_text()?;
-        let password = Password::new()
-            .with_prompt("Password")
-            .with_confirmation("Confirm password", "Passwords don't match")
-            .interact()?;
-        let display_name: String = Input::new()
-            .with_prompt("Display name (optional)")
-            .allow_empty(true)
-            .interact_text()?;
+        let email: String = match args.email_address {
+            Some(email) => email,
+            None => {
+                super::interactive::require_prompt(
+                    "pass --email-address <EMAIL> and --password-file <PATH> to sign up \
+                     non-interactively",
+                )?;
+                Input::new().with_prompt("Email").interact_text()?
+            }
+        };
+        let password = match args.password_file {
+            Some(path) => keys::read_secret_file(&path, "account password")?,
+            None => {
+                super::interactive::require_prompt(
+                    "pass --email-address <EMAIL> and --password-file <PATH> to sign up \
+                     non-interactively",
+                )?;
+                Password::new()
+                    .with_prompt("Password")
+                    .with_confirmation("Confirm password", "Passwords don't match")
+                    .interact()?
+            }
+        };
+        // The display name is optional; absent input falls back to none
+        // instead of prompting in a non-interactive session.
+        let display_name: String = match args.display_name {
+            Some(display_name) => display_name,
+            None if super::interactive::prompts_available() => Input::new()
+                .with_prompt("Display name (optional)")
+                .allow_empty(true)
+                .interact_text()?,
+            None => String::new(),
+        };
 
         SignupRequest {
             provider: "email".to_string(),
@@ -214,9 +281,17 @@ pub async fn signup() -> Result<(), Box<dyn std::error::Error>> {
             },
         }
     } else {
-        let npub: String = Input::new()
-            .with_prompt("Nostr public key (npub1...)")
-            .interact_text()?;
+        let npub: String = match args.npub {
+            Some(npub) => npub,
+            None => {
+                super::interactive::require_prompt(
+                    "pass --npub <NPUB> to sign up non-interactively",
+                )?;
+                Input::new()
+                    .with_prompt("Nostr public key (npub1...)")
+                    .interact_text()?
+            }
+        };
 
         SignupRequest {
             provider: "nostr".to_string(),
@@ -257,7 +332,11 @@ pub async fn login(args: LoginArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let existing_creds = config::load_credentials(&paths)?;
-    if existing_creds.session_token.is_some() {
+    if existing_creds.session_token.is_some() && !args.replace_session {
+        super::interactive::require_prompt(
+            "pass --replace-session to replace the saved session without prompting, \
+             or run `enclava logout` first",
+        )?;
         let confirm = dialoguer::Confirm::new()
             .with_prompt("Already logged in. Replace existing session?")
             .default(true)
@@ -284,6 +363,9 @@ pub async fn login(args: LoginArgs) -> Result<(), Box<dyn std::error::Error>> {
         let provider = if available.len() == 1 {
             available[0].1
         } else {
+            super::interactive::require_prompt(
+                "pass --email or --nostr to choose the login method",
+            )?;
             let labels: Vec<_> = available.iter().map(|(l, _)| *l).collect();
             let selection = Select::new()
                 .with_prompt("Log in with")
@@ -306,12 +388,28 @@ pub async fn login(args: LoginArgs) -> Result<(), Box<dyn std::error::Error>> {
     let client = ApiClient::new(&auth_api_url, None);
 
     let req = if use_nostr {
-        let npub: String = Input::new()
-            .with_prompt("Nostr public key (npub1...)")
-            .interact_text()?;
-        let nsec_str: String = Password::new()
-            .with_prompt("Nostr private key (nsec1...)")
-            .interact()?;
+        let npub: String = match args.npub {
+            Some(npub) => npub,
+            None => {
+                super::interactive::require_prompt(
+                    "pass --npub <NPUB> and --nsec-file <PATH> to log in non-interactively",
+                )?;
+                Input::new()
+                    .with_prompt("Nostr public key (npub1...)")
+                    .interact_text()?
+            }
+        };
+        let nsec_str: String = match args.nsec_file {
+            Some(path) => keys::read_secret_file(&path, "nostr private key")?,
+            None => {
+                super::interactive::require_prompt(
+                    "pass --npub <NPUB> and --nsec-file <PATH> to log in non-interactively",
+                )?;
+                Password::new()
+                    .with_prompt("Nostr private key (nsec1...)")
+                    .interact()?
+            }
+        };
 
         let secret_key =
             nostr::SecretKey::parse(&nsec_str).map_err(|e| format!("invalid nsec key: {e}"))?;
@@ -337,8 +435,26 @@ pub async fn login(args: LoginArgs) -> Result<(), Box<dyn std::error::Error>> {
             nostr_event: Some(signed_event_json),
         }
     } else {
-        let email: String = Input::new().with_prompt("Email").interact_text()?;
-        let password = Password::new().with_prompt("Password").interact()?;
+        let email: String = match args.email_address {
+            Some(email) => email,
+            None => {
+                super::interactive::require_prompt(
+                    "pass --email-address <EMAIL> and --password-file <PATH> to log in \
+                     non-interactively",
+                )?;
+                Input::new().with_prompt("Email").interact_text()?
+            }
+        };
+        let password = match args.password_file {
+            Some(path) => keys::read_secret_file(&path, "account password")?,
+            None => {
+                super::interactive::require_prompt(
+                    "pass --email-address <EMAIL> and --password-file <PATH> to log in \
+                     non-interactively",
+                )?;
+                Password::new().with_prompt("Password").interact()?
+            }
+        };
 
         LoginRequest {
             provider: "email".to_string(),
@@ -790,6 +906,11 @@ mod tests {
                 approve_logs: false,
                 nostr: false,
                 email: false,
+                replace_session: false,
+                email_address: None,
+                password_file: None,
+                npub: None,
+                nsec_file: None,
             },
             paths.clone(),
             configured,

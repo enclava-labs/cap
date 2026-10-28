@@ -4198,3 +4198,77 @@ mod terminal_diagnostics {
         assert!(source.contains("bootstrap_status_within(terminal_diagnostic_budget"));
     }
 }
+
+#[test]
+fn status_json_payload_carries_diagnostics_with_stable_shape() {
+    let status = enclava_cli::api_types::AppStatus {
+        app_name: "demo".to_string(),
+        status: "running".to_string(),
+        pod_phase: None,
+        tee_status: Some("unlocked".to_string()),
+        unlock_status: Some("unlocked".to_string()),
+        domain: "demo.example".to_string(),
+        last_deployed: None,
+        tee_error: None,
+        observation: None,
+        deployment: None,
+    };
+
+    let missing = vec!["DEBIAN_SSH_AUTHORIZED_KEYS".to_string()];
+    let payload = status_json_payload(
+        &status,
+        &StableSshEndpointState::Ready("ssh://endpoint".to_string()),
+        Some("12s"),
+        Some(&missing),
+    )
+    .expect("serializes");
+    assert_eq!(payload["app_name"], "demo");
+    assert_eq!(payload["tee_status"], "unlocked");
+    assert_eq!(payload["stable_ssh_endpoint"]["state"], "ready");
+    assert_eq!(payload["stable_ssh_endpoint"]["endpoint"], "ssh://endpoint");
+    assert_eq!(payload["tee_acme_retry_after"], "12s");
+    assert_eq!(
+        payload["missing_config_keys"][0],
+        "DEBIAN_SSH_AUTHORIZED_KEYS"
+    );
+    assert!(payload["tee_error"].is_null(), "absent fields stay null");
+
+    // Every non-ready state keeps the endpoint key as explicit null, and an
+    // unverified completeness check must not read as verified-complete ([]).
+    for (state, name) in [
+        (StableSshEndpointState::Missing, "missing"),
+        (StableSshEndpointState::Invalid, "invalid"),
+        (
+            StableSshEndpointState::NotStableTemplate,
+            "not_stable_template",
+        ),
+        (StableSshEndpointState::Unknown, "unknown"),
+    ] {
+        let payload = status_json_payload(&status, &state, None, None).expect("serializes");
+        assert_eq!(payload["stable_ssh_endpoint"]["state"], name);
+        assert!(
+            payload["stable_ssh_endpoint"]
+                .get("endpoint")
+                .is_some_and(|value| value.is_null()),
+            "{name} keeps the endpoint key as null"
+        );
+        assert!(
+            payload["missing_config_keys"].is_null(),
+            "{name}: an unverified completeness check serializes as null"
+        );
+        assert!(payload["tee_acme_retry_after"].is_null());
+    }
+
+    let payload = status_json_payload(
+        &status,
+        &StableSshEndpointState::NotStableTemplate,
+        None,
+        Some(&[]),
+    )
+    .expect("serializes");
+    assert_eq!(
+        payload["missing_config_keys"],
+        serde_json::json!([]),
+        "[] means the check ran and found none missing"
+    );
+}
