@@ -162,7 +162,7 @@ pub fn generate_statefulset(app: &ConfidentialApp) -> StatefulSet {
                     security_context: Some(PodSecurityContext {
                         fs_group: Some(10001),
                         fs_group_change_policy: Some("OnRootMismatch".to_string()),
-                        supplemental_groups: Some(vec![6]),
+                        supplemental_groups: Some(vec![0, 6]),
                         ..Default::default()
                     }),
                     init_containers,
