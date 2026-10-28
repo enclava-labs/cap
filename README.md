@@ -163,23 +163,14 @@ Common checks:
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
-# Packages proven free of shared mutable test state, at normal concurrency:
-cargo test --locked \
-  -p enclava-common -p enclava-engine -p enclava-appraiser \
-  -p enclava-verifier -p enclava-verifier-wasm
-# Everything else (Postgres provider fences, process-global env/path
-# mutation) stays serialized; doctests run once inside each selection:
-DATABASE_URL=postgresql://test:test@localhost:5432/test \
-  cargo test --locked --workspace \
-  --exclude enclava-common --exclude enclava-engine \
-  --exclude enclava-appraiser --exclude enclava-verifier \
-  --exclude enclava-verifier-wasm -- --test-threads=1
+cargo test --workspace -- --test-threads=1
 ```
 
-Do not serialize the whole workspace out of habit: only the second selection
-needs `--test-threads=1`. Do not run `cargo test --workspace` unfiltered
-either — the shared-state packages above race their own global fixtures
-under default concurrency.
+The workspace test run already includes every package's doctests, so a
+separate `cargo test --doc` is redundant. The suite must stay serialized:
+API fixtures share global PostgreSQL provider fences, and enclava-cli,
+enclava-init, and enclava-wait-exec tests mutate process-global
+environment or init surface paths.
 
 Do not use `--all-features` as the default workspace test command. Some feature
 combinations intentionally fail, such as `prod-strict` with debug/test-only
@@ -189,10 +180,9 @@ When local native dependencies are unavailable, run targeted checks:
 
 ```bash
 cargo test -p enclava-api --lib -- --test-threads=1
-cargo test -p enclava-cli -- --test-threads=1
+cargo test -p enclava-cli
 cargo test -p enclava-engine
-cargo test --workspace --exclude enclava-init --exclude enclava-api \
-  --exclude enclava-cli --exclude enclava-wait-exec
+cargo test --workspace --exclude enclava-init -- --test-threads=1
 ```
 
 Database-backed API library tests require a dedicated local PostgreSQL superuser,

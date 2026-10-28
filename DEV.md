@@ -54,8 +54,8 @@ The Python checks require `pytest`; install it in your local virtualenv if
 `python3 -m pytest` is not available.
 
 CI runs the Rust dependency gates after installing `cargo-audit` and
-`cargo-deny` (workspace doctests already run inside the two default test
-selections):
+`cargo-deny` (workspace doctests already run inside `cargo test --workspace`,
+so CI has no separate doctest step):
 
 ```bash
 cargo audit --ignore RUSTSEC-2023-0071
