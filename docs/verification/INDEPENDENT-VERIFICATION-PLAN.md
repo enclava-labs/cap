@@ -760,7 +760,7 @@ In addition to phase-specific native/WASM, fixture, conformance, browser, and ad
 ```bash
 rustup run stable cargo fmt --all -- --check
 rustup run stable cargo clippy --workspace --all-targets -- -D warnings
-rustup run stable cargo test --locked --workspace --exclude enclava-api --exclude enclava-cli --exclude enclava-init --exclude enclava-wait-exec
+rustup run stable cargo test --locked -p enclava-common -p enclava-engine -p enclava-appraiser -p enclava-verifier -p enclava-verifier-wasm
 DATABASE_URL=postgresql://test:test@localhost:5432/test rustup run stable cargo test --locked --workspace --exclude enclava-common --exclude enclava-engine --exclude enclava-appraiser --exclude enclava-verifier --exclude enclava-verifier-wasm -- --test-threads=1
 rustup run stable cargo audit --ignore RUSTSEC-2023-0071
 rustup run stable cargo deny check advisories sources

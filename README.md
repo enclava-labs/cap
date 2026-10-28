@@ -163,12 +163,12 @@ Common checks:
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
-# Packages that share no mutable test state, at normal concurrency:
-cargo test --locked --workspace \
-  --exclude enclava-api --exclude enclava-cli \
-  --exclude enclava-init --exclude enclava-wait-exec
-# Packages whose fixtures mutate process-global env/paths or share the
-# PostgreSQL provider fences; doctests run once inside both selections:
+# Packages proven free of shared mutable test state, at normal concurrency:
+cargo test --locked \
+  -p enclava-common -p enclava-engine -p enclava-appraiser \
+  -p enclava-verifier -p enclava-verifier-wasm
+# Everything else (Postgres provider fences, process-global env/path
+# mutation) stays serialized; doctests run once inside each selection:
 DATABASE_URL=postgresql://test:test@localhost:5432/test \
   cargo test --locked --workspace \
   --exclude enclava-common --exclude enclava-engine \
