@@ -3610,7 +3610,7 @@ pub async fn create_paas_app(
     )
     .await?;
 
-    sqlx::query(
+    let insert = sqlx::query(
         "INSERT INTO apps (
             id, org_id, name, namespace, instance_id, tenant_id, service_account,
             bootstrap_owner_pubkey_hash, tenant_instance_identity_hash,
@@ -3642,7 +3642,13 @@ pub async fn create_paas_app(
     .bind(sqlx::types::Json(egress_allowlist.clone()))
     .bind(egress_mode.as_str())
     .bind(crate::kbs::owner_binding_key_for(&namespace, &body.name))
-    .execute(&mut *tx)
+    ;
+    let inserted = crate::routes::apps::insert_app_if_owner_seed_fresh(
+        &mut tx,
+        insert,
+        &namespace,
+        &body.name,
+    )
     .await
     .map_err(|error| {
         if error.to_string().contains("duplicate key") || error.to_string().contains("unique") {
@@ -3651,29 +3657,7 @@ pub async fn create_paas_app(
             db_error()
         }
     })?;
-    // The waiver guard above runs before this transaction, and under READ
-    // COMMITTED the insert's NOT EXISTS is evaluated on its statement
-    // snapshot — an abandoned destroy committing while the insert waits out
-    // the old row's unique constraint is invisible to both. Two guards close
-    // it: zero rows inserted means the NOT EXISTS filtered the create (a
-    // waiver existed at statement time — the recheck alone must not decide
-    // this, because the waiver can be cleared between the filtered insert
-    // and the lookup, e.g. by a teardown retry completing, and proceeding
-    // would fail the dependent inserts on the missing app row); the recheck
-    // then takes a fresh statement snapshot in this transaction and sees
-    // every waiver committed while the insert was blocked.
-    let insert_result = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM apps WHERE id = $1")
-        .bind(app_id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|_| db_error())?;
-    if insert_result == 0 {
-        return Err(json_error(StatusCode::CONFLICT, "stale_owner_seed"));
-    }
-    if crate::kbs::owner_seed_waiver_recorded_in_tx(&mut tx, &namespace, &body.name)
-        .await
-        .map_err(|_| db_error())?
-    {
+    if !inserted {
         return Err(json_error(StatusCode::CONFLICT, "stale_owner_seed"));
     }
     sqlx::query(

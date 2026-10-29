@@ -172,6 +172,8 @@ including encoded and empty path segments. CI rejects direct Rust-source reads
 in tests; declarative artifact checks and `prod-strict` build gates remain.
 The deployment freeze admits writes only for explicit method/`MatchedPath`
 pairs; newly mounted routes remain blocked until their authority is reviewed.
+All three app-create paths use `insert_app_if_owner_seed_fresh` so the INSERT
+and fresh waiver read cannot drift apart; a rejected insert aborts its transaction.
 
 ## Runtime Contract Notes
 
