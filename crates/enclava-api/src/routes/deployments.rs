@@ -2141,10 +2141,29 @@ pub async fn deployment_history(
         )
     })?;
 
+    // The recorded rows only learn a terminal runtime failure (e.g. a
+    // guest start error) when the apply job gives up; the live
+    // deployment-scoped overlay marks exactly that row `failed` with its
+    // bounded code here instead, so a waiting client observes the real
+    // terminal state from this same history endpoint (cap#335).
+    let observed =
+        crate::routes::status::observe_app_status_for_deployment(&state, &app, None).await;
+
     Ok(Json(
         deployments
             .into_iter()
-            .map(|d| DeploymentResponse::from_deployment(d, &app))
+            .map(|d| {
+                let runtime_failure = observed
+                    .runtime_failure_matches_deployment(d.id)
+                    .then(|| observed.runtime_failure_public_message())
+                    .flatten();
+                let mut response = DeploymentResponse::from_deployment(d, &app);
+                if let Some(runtime_failure) = runtime_failure {
+                    response.status = "failed".to_string();
+                    response.error_message = Some(runtime_failure);
+                }
+                response
+            })
             .collect(),
     ))
 }

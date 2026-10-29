@@ -1681,6 +1681,11 @@ const LANDED_PICKUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 ///   deadline issues nothing), a landed answer is never dropped (a request
 ///   is only ever superseded while still pending), and the probe -- with
 ///   every request it holds -- is dropped when the wait returns.
+///   `GET /apps/{name}/deployments` projects the server's live overlay:
+///   a terminal runtime failure (e.g. a guest start error) marks the
+///   exact deployment's row `failed` with its bounded code long before
+///   the apply job's recorded verdict (cap#335), so one request is
+///   authority in both direct and hosted modes.
 pub(crate) struct DeploymentHistoryProbe {
     in_flight: VecDeque<HistoryRequest>,
     refresh_age: Duration,
