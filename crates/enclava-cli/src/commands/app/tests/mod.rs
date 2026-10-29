@@ -1544,12 +1544,14 @@ pub(crate) fn dev_json_attestation_body(request_target: &str) -> String {
 
 /// An isolated CLI state directory: config.toml + credentials.toml pointing
 /// at a stub API, `ENCLAVA_STATE_DIR` set, and optionally the process CWD
-/// moved into the directory. Everything is restored on drop.
+/// moved into the directory. State, attestation/TLS settings and CWD are restored on drop.
 pub(crate) struct IsolatedStateEnv {
     _guard: std::sync::MutexGuard<'static, ()>,
     _dir: tempfile::TempDir,
     prev_state_dir: Option<std::ffi::OsString>,
     prev_dev_attestation: Option<std::ffi::OsString>,
+    prev_tee_tls_mode: Option<std::ffi::OsString>,
+    prev_tee_accept_invalid_certs: Option<std::ffi::OsString>,
     prev_cwd: Option<std::path::PathBuf>,
 }
 
@@ -1575,6 +1577,11 @@ impl Drop for IsolatedStateEnv {
         Self::restore_var(
             "ENCLAVA_TEE_DEV_ALLOW_JSON_REPORT_DATA_ONLY",
             self.prev_dev_attestation.take(),
+        );
+        Self::restore_var("ENCLAVA_TEE_TLS_MODE", self.prev_tee_tls_mode.take());
+        Self::restore_var(
+            "ENCLAVA_TEE_ACCEPT_INVALID_CERTS",
+            self.prev_tee_accept_invalid_certs.take(),
         );
         if let Some(cwd) = self.prev_cwd.take() {
             let _ = std::env::set_current_dir(cwd);
@@ -1608,6 +1615,8 @@ pub(crate) fn isolated_state_env(api_url: &str, cwd_to_root: bool) -> IsolatedSt
     .unwrap();
     let prev_state_dir = std::env::var_os("ENCLAVA_STATE_DIR");
     let prev_dev_attestation = std::env::var_os("ENCLAVA_TEE_DEV_ALLOW_JSON_REPORT_DATA_ONLY");
+    let prev_tee_tls_mode = std::env::var_os("ENCLAVA_TEE_TLS_MODE");
+    let prev_tee_accept_invalid_certs = std::env::var_os("ENCLAVA_TEE_ACCEPT_INVALID_CERTS");
     unsafe {
         std::env::set_var("ENCLAVA_STATE_DIR", dir.path());
     }
@@ -1623,6 +1632,8 @@ pub(crate) fn isolated_state_env(api_url: &str, cwd_to_root: bool) -> IsolatedSt
         _dir: dir,
         prev_state_dir,
         prev_dev_attestation,
+        prev_tee_tls_mode,
+        prev_tee_accept_invalid_certs,
         prev_cwd,
     }
 }
