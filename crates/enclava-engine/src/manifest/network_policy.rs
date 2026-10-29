@@ -4,12 +4,12 @@ use crate::types::{AttestationConfig, ConfidentialApp, EgressMode, EgressRule};
 
 /// Platform-default FQDN egress allowlist.
 ///
-/// Hardcoded so the operator cannot quietly drop these. Caddy needs ACME
-/// reachability to issue and renew TLS certs. AMD KDS traffic uses the internal
-/// relay below because Kata guests cannot use Cilium's DNS proxy.
+/// Caddy needs ACME, and the confidential guest pulls signed images from GHCR.
 const PLATFORM_DEFAULT_FQDNS: &[&str] = &[
     "acme-v02.api.letsencrypt.org",
     "acme-staging-v02.api.letsencrypt.org",
+    "ghcr.io",
+    "pkg-containers.githubusercontent.com",
 ];
 
 const PUBLIC_INTERNET_CIDR: &str = "0.0.0.0/0";
@@ -114,7 +114,8 @@ pub fn generate_network_policy(app: &ConfidentialApp) -> Value {
                     "ports": [
                         { "port": "53", "protocol": "UDP" },
                         { "port": "53", "protocol": "TCP" }
-                    ]
+                    ],
+                    "rules": { "dns": [{ "matchPattern": "*" }] }
                 }
             ]
         }),

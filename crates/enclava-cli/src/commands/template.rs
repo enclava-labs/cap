@@ -8058,7 +8058,6 @@ mod tests {
     mod terminal_delivery_support {
         use base64::Engine as _;
         use std::net::SocketAddr;
-        use std::sync::{Mutex, OnceLock};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         pub(crate) use std::sync::Mutex as TestMutex;
@@ -8187,8 +8186,7 @@ mod tests {
         }
 
         pub(crate) fn tls_env_lock() -> std::sync::MutexGuard<'static, ()> {
-            static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-            LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+            crate::commands::env_lock()
         }
 
         pub(crate) fn deployment_entry_json(id: &str, status: &str) -> serde_json::Value {

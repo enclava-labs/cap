@@ -64,6 +64,16 @@ enclava status
 enclava key backup --out enclava-recovery.json
 ```
 
+New apps and deployments are password-only. Auto-unlock creation, enable requests
+and `enclava auto-unlock enable` fail with `auto_unlock_disabled`; the guest never
+fetches its owner seed automatically. After guest replacement, use
+`enclava unlock --app NAME --password-file PATH` with the existing storage password.
+
+For a legacy auto-mode app, run
+`enclava auto-unlock disable --app NAME --image REPO@sha256:DIGEST --password-file PATH`
+from its original `enclava.toml` workspace before redeploying. This preserves the
+owner seed and volumes, but cannot revoke a previously copied auto-sealed seed.
+
 For encrypted workload logs, use the current CLI and the tenant's log private key:
 
 ```bash
@@ -75,6 +85,12 @@ Successful follow streams have no total deadline; initial headers, error bodies
 and ordinary API requests remain bounded.
 Blank-line keepalives preserve idle streams without printing fake log messages.
 Each encrypted record is size-bounded before decoding.
+
+For an encrypted-state-backed spool, restart recovery removes an incomplete EOF
+from the writer's bounded spool before appending new frames, preserving complete
+retained records. Abrupt guest loss can still lose unflushed newest logs.
+Already malformed, newline-terminated records are not silently discarded;
+preserve diagnostic evidence rather than clearing the spool or its PVC.
 
 Images may be digest-pinned or tagged (`enclava deploy --image
 <registry>/<image>:<tag>`). The CLI resolves tags to a content digest before
@@ -110,11 +126,29 @@ and resource version, retains PVCs, and uses normal graceful termination.
 The CLI requires the signed deployment's attested launch identity both while
 waiting for bootstrap and on the client that submits the ownership claim.
 
+If a deploy or template rollout fails terminally at startup (for example a
+guest start error), the CLI reports the typed failure and exits promptly
+instead of timing out; run `enclava status --app <name>` for the recorded
+detail.
+
+Apps awaiting required confidential teardown retain their public routes even if
+every deployment has failed or a failed delete restored the app's prior status.
+Routes are removed after teardown completes; deleting a failed app does not
+bypass its storage or ownership checks.
+
+If an app delete errors after its namespace deletion begins, the app's
+namespace mutation fence stays armed instead of risking name reuse. The
+periodic fence reconciler releases it automatically once Kubernetes reports
+the namespace gone — no manual lease edits — while a live or still-Terminating
+namespace keeps it fenced. Other stranded `kubernetes_namespace` fences
+remain an operator path; see
+[runbooks/kubernetes-mutation-fence-recovery.md](runbooks/kubernetes-mutation-fence-recovery.md).
+
 ## Local Development
 
 Requirements:
 
-- Rust 1.85 or newer;
+- Rust 1.88 or newer;
 - Docker Compose for the local API/PostgreSQL stack;
 - `pkg-config` and OpenSSL development headers (`libssl-dev`), required even
   for a standalone `cargo install enclava-cli`;
@@ -143,8 +177,13 @@ Common checks:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace -- --test-threads=1
-cargo test --doc
 ```
+
+The workspace test run already includes every package's doctests, so a
+separate `cargo test --doc` is redundant. The suite must stay serialized:
+API fixtures share global PostgreSQL provider fences, and enclava-cli,
+enclava-init, and enclava-wait-exec tests mutate process-global
+environment or init surface paths.
 
 Do not use `--all-features` as the default workspace test command. Some feature
 combinations intentionally fail, such as `prod-strict` with debug/test-only
@@ -189,6 +228,9 @@ Security-relevant behavior is built into both the API and runtime path:
 - release builds reject debug bypass flags;
 - platform sidecars and workload images are expected to be digest-pinned;
 - workload images are verified against configured signer identity;
+- private tenant-image pulls require authentication inside the TEE; host
+  registry credentials alone do not authorize them. Never release a platform
+  registry token to a tenant guest;
 - deployment descriptors, org keyrings, generated policies, and signed policy
   artifacts are bound together before deploy;
 - `enclava-init` verifies the in-TEE trust chain before releasing app secrets or

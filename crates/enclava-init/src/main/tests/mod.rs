@@ -6,40 +6,11 @@ use enclava_init::tls_certificate::TlsBrokerFailure;
 use serde_json::json;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
-use std::sync::{Arc, Mutex};
 use tempfile::tempdir;
 
 /// Serializes tests that mutate the failure-reporting environment
 /// variables, so parallel test threads cannot observe each other's paths.
 static FAILURE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Serializes tests that mutate the KBS retry environment variables.
-static KBS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// tracing writer that captures formatted events into a shared buffer, so
-/// tests can assert on the actual retry-path log output.
-#[derive(Clone)]
-struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
-
-impl std::io::Write for CapturedWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-#[derive(Clone)]
-struct CapturedMaker(Arc<Mutex<Vec<u8>>>);
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedMaker {
-    type Writer = CapturedWriter;
-    fn make_writer(&'a self) -> Self::Writer {
-        CapturedWriter(self.0.clone())
-    }
-}
 
 struct FailureEnvGuard {
     _dir: tempfile::TempDir,
@@ -228,71 +199,6 @@ fn recovery_clears_stale_failure_file() {
     // Clearing again (no stale error) stays a no-op.
     clear_error_file(&error_file_path());
     assert!(!env.error.exists());
-}
-
-#[test]
-fn kbs_fetch_retry_logging_carries_only_safe_bounded_metadata() {
-    let _env_lock = KBS_ENV_LOCK.lock().unwrap();
-    unsafe {
-        std::env::set_var("ENCLAVA_INIT_KBS_FETCH_RETRIES", "2");
-        std::env::set_var("ENCLAVA_INIT_KBS_FETCH_RETRY_SLEEP_SECONDS", "1");
-    }
-
-    // The KBS URL is supplied signed-config input whose path/query may
-    // carry secret markers; kbs_fetch embeds the complete URL in its error
-    // text, so the actual retry path must log only bounded metadata.
-    const SYNTHETIC_KBS_URL_SENTINEL: &str = "SYNTHETIC-KBS-URL-SECRET";
-    let mut client = kbs_fetch::KbsClient::new(
-        format!("http://127.0.0.1:9/cdh/resource?marker={SYNTHETIC_KBS_URL_SENTINEL}"),
-        "default/app-owner/seed-encrypted".to_string(),
-    );
-    client.timeout = std::time::Duration::from_millis(200);
-
-    let captured = Arc::new(Mutex::new(Vec::new()));
-    let subscriber = tracing_subscriber::fmt()
-        .json()
-        .with_max_level(tracing::Level::DEBUG)
-        .with_writer(CapturedMaker(captured.clone()))
-        .finish();
-
-    let result =
-        tracing::subscriber::with_default(subscriber, || fetch_wrap_key_with_retries(&client));
-
-    assert!(result.is_err(), "unroutable KBS URL must fail the fetch");
-    let events = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
-    assert!(
-        events.contains("KBS autounlock fetch failed; retrying"),
-        "retry warning must still be emitted: {events}"
-    );
-    assert!(
-        events.contains("\"attempt\":1"),
-        "attempt metadata: {events}"
-    );
-    assert!(
-        events.contains("\"attempts\":2"),
-        "attempts metadata: {events}"
-    );
-    assert!(
-        events.contains("\"error\":\"kbs_fetch_failed\""),
-        "bounded error code: {events}"
-    );
-    assert!(
-        events.contains("\"retry_sleep_seconds\":1"),
-        "retry sleep metadata: {events}"
-    );
-    assert!(
-        !events.contains(SYNTHETIC_KBS_URL_SENTINEL),
-        "retry logging leaked the supplied URL secret marker: {events}"
-    );
-    assert!(
-        !events.contains("127.0.0.1:9"),
-        "retry logging leaked the request URL: {events}"
-    );
-
-    unsafe {
-        std::env::remove_var("ENCLAVA_INIT_KBS_FETCH_RETRIES");
-        std::env::remove_var("ENCLAVA_INIT_KBS_FETCH_RETRY_SLEEP_SECONDS");
-    }
 }
 
 #[test]
@@ -702,44 +608,6 @@ fn attestation_proxy_bind_plan_is_empty_even_with_app_data_binds() {
             .len(),
         1
     );
-}
-
-#[test]
-fn kbs_proxy_health_url_strips_cdh_resource_suffix() {
-    assert_eq!(
-        kbs_proxy_health_url("http://127.0.0.1:8081/cdh/resource"),
-        "http://127.0.0.1:8081/health"
-    );
-    assert_eq!(
-        kbs_proxy_health_url("http://127.0.0.1:8081/cdh/resource/"),
-        "http://127.0.0.1:8081/health"
-    );
-    assert_eq!(
-        kbs_proxy_health_url("http://127.0.0.1:8081/custom"),
-        "http://127.0.0.1:8081/custom/health"
-    );
-}
-
-#[test]
-fn local_kbs_proxy_detection_matches_loopback_8081() {
-    assert!(is_local_kbs_proxy_url("http://127.0.0.1:8081/cdh/resource"));
-    assert!(is_local_kbs_proxy_url("http://localhost:8081/cdh/resource"));
-    assert!(!is_local_kbs_proxy_url(
-        "http://127.0.0.1:8080/cdh/resource"
-    ));
-    assert!(!is_local_kbs_proxy_url(
-        "http://127.0.0.1:8006/cdh/resource"
-    ));
-    assert!(!is_local_kbs_proxy_url(
-        "https://kbs.example.test/cdh/resource"
-    ));
-}
-
-#[test]
-fn kbs_proxy_health_accepts_ready_statuses() {
-    assert!(kbs_proxy_health_status_is_ready(200));
-    assert!(kbs_proxy_health_status_is_ready(423));
-    assert!(!kbs_proxy_health_status_is_ready(503));
 }
 
 fn unsigned_config() -> Config {
@@ -1531,8 +1399,18 @@ fn init_surface_env_overrides_resolve_through_env_override() {
 #[test]
 #[cfg(feature = "prod-strict")]
 fn prod_strict_failure_exit_never_stays_alive() {
+    // A host-set keep-alive must be ignored under prod-strict: set a truthy
+    // value so the assertion exercises the gate instead of passing vacuously.
+    let _env_lock = FAILURE_ENV_LOCK.lock().unwrap();
+    let previous = std::env::var_os("ENCLAVA_INIT_STAY_ALIVE");
+    unsafe { std::env::set_var("ENCLAVA_INIT_STAY_ALIVE", "1") };
+    let enabled = stay_alive_after_failure_enabled();
+    match previous {
+        Some(value) => unsafe { std::env::set_var("ENCLAVA_INIT_STAY_ALIVE", value) },
+        None => unsafe { std::env::remove_var("ENCLAVA_INIT_STAY_ALIVE") },
+    }
     assert!(
-        !stay_alive_after_failure_enabled(),
+        !enabled,
         "prod-strict must fail fast so orchestration observes failed boots"
     );
 }

@@ -47,9 +47,5 @@ fn all_apps_have_identity_fields() {
     assert!(!app.bootstrap_owner_pubkey_hash.is_empty());
     assert!(!app.tenant_instance_identity_hash.is_empty());
     assert_eq!(app.tenant_instance_identity_hash.len(), 64);
-
-    let pwd = enclava_engine::testutil::sample_password_app();
-    assert!(!pwd.bootstrap_owner_pubkey_hash.is_empty());
-    assert!(!pwd.tenant_instance_identity_hash.is_empty());
-    assert_eq!(pwd.tenant_instance_identity_hash.len(), 64);
+    assert_eq!(app.unlock_mode, enclava_common::types::UnlockMode::Password);
 }

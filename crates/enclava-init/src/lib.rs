@@ -47,7 +47,6 @@ fn env_override_for(raw: Option<&str>) -> Option<String> {
 pub mod chown;
 pub mod config;
 pub mod errors;
-pub mod kbs_fetch;
 pub mod log_relay;
 pub mod luks;
 pub mod luks2_seal;
@@ -58,6 +57,7 @@ pub mod socket;
 pub mod tls_certificate;
 pub mod trustee_verify;
 pub mod unlock;
+pub mod volume_profile;
 pub mod writes;
 
 #[cfg(test)]

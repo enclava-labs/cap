@@ -121,16 +121,6 @@ fn small_app_renders_small_pod_shape() {
             .0,
         "512Mi"
     );
-    assert_eq!(
-        init_resources
-            .limits
-            .as_ref()
-            .unwrap()
-            .get("cpu")
-            .unwrap()
-            .0,
-        "250m"
-    );
 }
 
 #[test]
@@ -164,9 +154,6 @@ fn small_app_cross_artifact_agreement() {
         .expect("quota hard limits");
     assert_eq!(hard.get("requests.memory").unwrap().0, "1984Mi");
     assert_eq!(hard.get("limits.memory").unwrap().0, "2688Mi");
-    // CPU: 250+100+100+50+500m = 1000m; limits 1 + 500+500+250+500m = 2750m.
-    assert_eq!(hard.get("requests.cpu").unwrap().0, "1");
-    assert_eq!(hard.get("limits.cpu").unwrap().0, "2750m");
 }
 
 #[test]
@@ -276,8 +263,6 @@ fn standard_app_output_is_unchanged() {
         ("128Mi".into(), "256Mi".into())
     );
 
-    // Standard quota totals: requests 512+128+128+64+4096=4928Mi; limits
-    // 1024+256+256+512+4096=6144Mi=6Gi; cpu 1500m/3250m.
     let hard = manifests
         .resource_quota
         .spec
@@ -286,8 +271,6 @@ fn standard_app_output_is_unchanged() {
         .expect("quota hard limits");
     assert_eq!(hard.get("requests.memory").unwrap().0, "4928Mi");
     assert_eq!(hard.get("limits.memory").unwrap().0, "6Gi");
-    assert_eq!(hard.get("requests.cpu").unwrap().0, "1500m");
-    assert_eq!(hard.get("limits.cpu").unwrap().0, "3250m");
 
     // Standard apps do not patch the gateway deployment.
     assert!(

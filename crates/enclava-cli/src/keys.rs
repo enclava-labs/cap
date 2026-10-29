@@ -1252,7 +1252,6 @@ pub struct RegisterPublicKeyRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
     #[cfg(windows)]
     #[test]
@@ -1267,13 +1266,8 @@ mod tests {
         assert_mode_0600(&path).unwrap();
     }
 
-    // Serialise tests that mutate $HOME (test impacts a shared global).
-    static HOME_LOCK: Mutex<()> = Mutex::new(());
-    // Serialise tests that change the process working directory.
-    static CWD_LOCK: Mutex<()> = Mutex::new(());
-
     fn with_isolated_home<F: FnOnce()>(f: F) {
-        let _guard = HOME_LOCK.lock().unwrap();
+        let _guard = crate::env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let prev = std::env::var_os("HOME");
         unsafe {
@@ -1535,7 +1529,7 @@ mod tests {
         // rename the file and then report ENOENT, because sync_parent_dir
         // opened the empty parent path "". cwd is process-global, so serialize
         // like the HOME mutations above and restore before asserting.
-        let _guard = CWD_LOCK.lock().unwrap();
+        let _guard = crate::env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(tmp.path()).unwrap();
@@ -1589,7 +1583,7 @@ mod tests {
         // without ever flushing the current directory holding the new state
         // root's entry — leaving the state root creation non-durable. The walk
         // must reach the directory containing the relative state root.
-        let _guard = CWD_LOCK.lock().unwrap();
+        let _guard = crate::env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(tmp.path()).unwrap();

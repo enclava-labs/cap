@@ -351,7 +351,7 @@ async fn load_desired_edge_apps(pool: &PgPool) -> Result<Vec<DesiredEdgeApp>, sq
                 organization.cust_slug AS org_slug
            FROM apps AS app
            JOIN organizations AS organization ON organization.id = app.org_id
-           JOIN LATERAL (
+           LEFT JOIN LATERAL (
                 SELECT deployment.status
                   FROM deployments AS deployment
                  WHERE deployment.app_id = app.id
@@ -373,17 +373,18 @@ async fn load_desired_edge_apps(pool: &PgPool) -> Result<Vec<DesiredEdgeApp>, sq
                  LIMIT 1
            ) AS latest ON true
           WHERE (
-                app.status IN (
-                    'creating'::app_status_enum,
-                    'running'::app_status_enum
+                (
+                    latest.status IS NOT NULL
+                    AND app.status IN (
+                        'creating'::app_status_enum,
+                        'running'::app_status_enum
+                    )
                 )
-                -- A deleting app whose confidential teardown is still pending
-                -- must keep its routes: the teardown POST dials the app's TEE
-                -- edge route, and dropping it here strands every retry once the
-                -- delete failure path releases the shared edge fence.
+                -- Failed teardown can restore the app's prior status. Keep
+                -- its routes until teardown completes so the owner can unlock
+                -- the TEE before retrying deletion.
                 OR (
-                    app.status = 'deleting'::app_status_enum
-                    AND app.workload_teardown_required
+                    app.workload_teardown_required
                     AND app.workload_teardown_completed_at IS NULL
                 )
                 -- A failed app whose earlier deployment is still healthy
@@ -2421,7 +2422,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn teardown_pending_deleting_apps_keep_their_edge_routes() {
+    async fn teardown_pending_apps_keep_their_edge_routes() {
         let pool = database_test_pool().await;
 
         let (running_org, running_app) =
@@ -2465,6 +2466,49 @@ mod tests {
         assert!(
             !ids.contains(&skip_app),
             "a deleting app that never required teardown must drop out"
+        );
+
+        sqlx::query(
+            "UPDATE deployments SET status = 'failed'::deploy_status_enum WHERE app_id = $1",
+        )
+        .bind(pending_app)
+        .execute(&pool)
+        .await
+        .expect("fail the only deployment before teardown completes");
+        let desired = load_desired_edge_apps(&pool)
+            .await
+            .expect("load teardown routes without a healthy deployment");
+        assert!(
+            desired.iter().any(|app| app.app_id == pending_app),
+            "failed deployments must not remove a pending confidential teardown route"
+        );
+
+        sqlx::query("UPDATE apps SET status = 'failed'::app_status_enum WHERE id = $1")
+            .bind(pending_app)
+            .execute(&pool)
+            .await
+            .expect("restore the failed app after teardown fails");
+        let desired = load_desired_edge_apps(&pool)
+            .await
+            .expect("load teardown routes after restoring the app status");
+        assert!(
+            desired.iter().any(|app| app.app_id == pending_app),
+            "restoring the app status must preserve the owner's unlock route"
+        );
+
+        sqlx::query(
+            "UPDATE apps SET workload_teardown_completed_at = clock_timestamp() WHERE id = $1",
+        )
+        .bind(pending_app)
+        .execute(&pool)
+        .await
+        .expect("complete confidential teardown");
+        let desired = load_desired_edge_apps(&pool)
+            .await
+            .expect("load routes after confidential teardown completes");
+        assert!(
+            !desired.iter().any(|app| app.app_id == pending_app),
+            "a failed app without a healthy deployment must lose its route after teardown"
         );
 
         for cleanup_org in [running_org, pending_org, done_org, skip_org] {

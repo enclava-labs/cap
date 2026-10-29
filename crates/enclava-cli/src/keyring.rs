@@ -453,26 +453,24 @@ mod tests {
 
     #[test]
     fn keyring_state_uses_configured_cli_root() {
-        let _guard = env_state_lock();
+        let _guard = crate::env_lock();
         let temp = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("ENCLAVA_STATE_DIR");
         unsafe { std::env::set_var("ENCLAVA_STATE_DIR", temp.path()) };
         let org_id = Uuid::new_v4();
         let dir = state_dir(&org_id).unwrap();
-        unsafe { std::env::remove_var("ENCLAVA_STATE_DIR") };
+        match previous {
+            Some(value) => unsafe { std::env::set_var("ENCLAVA_STATE_DIR", value) },
+            None => unsafe { std::env::remove_var("ENCLAVA_STATE_DIR") },
+        }
         assert_eq!(dir, temp.path().join("state").join(org_id.to_string()));
-    }
-
-    fn env_state_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap()
     }
 
     #[test]
     fn keyring_store_refuses_version_rollback() {
-        let _guard = env_state_lock();
+        let _guard = crate::env_lock();
         let temp = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("ENCLAVA_STATE_DIR");
         unsafe { std::env::set_var("ENCLAVA_STATE_DIR", temp.path()) };
         let org_id = Uuid::new_v4();
 
@@ -520,14 +518,17 @@ mod tests {
         let envelope_v4 = sign_keyring(&owner, v4);
         store_keyring_envelope(&org_id, &envelope_v4).unwrap();
         assert_eq!(load_keyring_envelope(&org_id).unwrap().keyring.version, 4);
-
-        unsafe { std::env::remove_var("ENCLAVA_STATE_DIR") };
+        match previous {
+            Some(value) => unsafe { std::env::set_var("ENCLAVA_STATE_DIR", value) },
+            None => unsafe { std::env::remove_var("ENCLAVA_STATE_DIR") },
+        }
     }
 
     #[test]
     fn keyring_store_refuses_to_replace_a_corrupt_cache() {
-        let _guard = env_state_lock();
+        let _guard = crate::env_lock();
         let temp = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("ENCLAVA_STATE_DIR");
         unsafe { std::env::set_var("ENCLAVA_STATE_DIR", temp.path()) };
         let org_id = Uuid::new_v4();
         fs::write(keyring_envelope_path(&org_id).unwrap(), "{not-json").unwrap();
@@ -543,6 +544,9 @@ mod tests {
             "{not-json"
         );
 
-        unsafe { std::env::remove_var("ENCLAVA_STATE_DIR") };
+        match previous {
+            Some(value) => unsafe { std::env::set_var("ENCLAVA_STATE_DIR", value) },
+            None => unsafe { std::env::remove_var("ENCLAVA_STATE_DIR") },
+        }
     }
 }

@@ -224,8 +224,12 @@ async fn freeze_workload_authority_mutations(
     request: Request,
     next: Next,
 ) -> Response {
+    let matched_path = request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map_or("", |path| path.as_str());
     if state.deployment_dispatch_is_enabled()
-        || !is_workload_authority_mutation(request.method(), request.uri().path())
+        || !is_workload_authority_mutation(request.method(), matched_path)
     {
         return next.run(request).await;
     }
@@ -241,83 +245,41 @@ async fn freeze_workload_authority_mutations(
         .into_response()
 }
 
-/// Classify whether a request is a tenant workload-authority mutation that
-/// the deployment freeze gate must block while dispatch is disabled.
-///
-/// Invariant: this function must classify the raw segments the router will
-/// match — the only deliberate divergence is the leading/trailing slash
-/// trim described below, which is fail-closed. Axum dispatches through
-/// matchit, which matches the raw (still percent-encoded) URI path, splits
-/// parameters on a literal `/` only, and never decodes `%2F` or resolves
-/// `.`/`..` segments (there is no `NormalizePath` layer in
-/// `build_router_inner`). The gate therefore also splits on literal `/`
-/// and compares raw segments: `%2F` inside a segment is NOT a separator
-/// here, because it is not one to the router either.
-///
-/// The invariant is enforced by
-/// `workload_gate_classification_agrees_with_axum_dispatch`, which drives
-/// the real router (built by `build_router_inner`, PaasManaged so the
-/// internal routes are mounted) and asserts gate classification ↔ actual
-/// dispatch agreement on every pattern instantiated with poisoned
-/// parameter values (empty, dot segments, %2F encodings), plus explicit
-/// match/miss pins for the raw variants below: an axum/matchit update that
-/// changes raw-path semantics (decoding %2F, resolving dot segments,
-/// tolerating trailing slashes) fails that test instead of silently
-/// breaking alignment.
-///
-/// A path that matches no allow pattern below is a mutation (deny-by-default),
-/// so raw variants such as `/apps%2Fdemo/deploy`, `//apps//demo//deploy`,
-/// `/apps/demo/deploy/`, or `/apps/./demo/deploy` are all blocked: the
-/// router would not serve them as allow-listed control-plane writes.
-///
-/// Interior empty segments (`//`) are preserved, because the matcher treats
-/// an empty path parameter as a value: `PUT /internal/paas/orgs//keyring`
-/// is dispatched to the keyring handler with an empty `paas_org_id`, so the
-/// gate must see the five-segment shape (mutation), not a collapsed
-/// four-segment shape that would hit the org-upsert allow rule. Only the
-/// leading/trailing slashes are trimmed; that divergence from the matcher
-/// is fail-closed (a trailing slash can only make a path look like a
-/// shorter allow pattern the router would not serve, or leave it
-/// deny-by-default).
-/// Do NOT "normalize" by percent-decoding or resolving dot segments before
-/// matching: that rewrites the path into shapes the router never selected,
-/// and can only move requests from the blocked set into the allowed set
-/// (fail-open). For example, decoding `/apps/x%2F..%2F..%2Fauth%2Flogin/deploy`
-/// — which the router dispatches to the deploy handler — would make it look
-/// like an `auth`-prefixed control-plane write and let it through the gate.
-fn is_workload_authority_mutation(method: &Method, path: &str) -> bool {
+/// Only explicitly allowed method/route pairs bypass the deployment freeze.
+/// Axum's matched pattern prevents new static routes, encoded parameters, or
+/// renamed routes from inheriting a raw-path prefix exemption.
+fn is_workload_authority_mutation(method: &Method, matched_path: &str) -> bool {
     if matches!(method, &Method::GET | &Method::HEAD | &Method::OPTIONS) {
         return false;
     }
 
-    // Split on literal '/' with interior empty segments preserved (see the
-    // invariant comment above): an empty segment is a parameter value to
-    // matchit, not a separator to collapse.
-    let segments = path.trim_matches('/').split('/').collect::<Vec<_>>();
-
-    if method == Method::DELETE
-        && matches!(
-            segments.as_slice(),
-            ["apps", _] | ["internal", "paas", "orgs", _, "apps", _]
-        )
-    {
-        return false;
-    }
-
-    if matches!(segments.as_slice(), ["internal", "paas", ..]) {
-        return !(method == Method::PUT
-            && matches!(
-                segments.as_slice(),
-                ["internal", "paas", "orgs", _]
-                    | ["internal", "paas", "orgs", _, "entitlements"]
-                    | ["internal", "paas", "orgs", _, "members", _]
-            ));
-    }
-
-    let control_plane_write = matches!(segments.first(), Some(&"auth"))
-        || (method == Method::POST && matches!(segments.as_slice(), ["orgs"]))
-        || (method == Method::POST && matches!(segments.as_slice(), ["orgs", _, "invite"]))
-        || (method == Method::DELETE && matches!(segments.as_slice(), ["orgs", _, "members", _]));
+    let control_plane_write = match *method {
+        Method::POST => matches!(
+            matched_path,
+            "/auth/signup"
+                | "/auth/login"
+                | "/auth/device/start"
+                | "/auth/device/poll"
+                | "/auth/device/approve"
+                | "/auth/api-keys"
+                | "/orgs"
+                | "/orgs/{name}/invite"
+        ),
+        Method::DELETE => matches!(
+            matched_path,
+            "/auth/api-keys/{id}"
+                | "/apps/{name}"
+                | "/orgs/{name}/members/{id}"
+                | "/internal/paas/orgs/{paas_org_id}/apps/{app_name}"
+        ),
+        Method::PUT => matches!(
+            matched_path,
+            "/internal/paas/orgs/{paas_org_id}"
+                | "/internal/paas/orgs/{paas_org_id}/entitlements"
+                | "/internal/paas/orgs/{paas_org_id}/members/{paas_user_id}"
+        ),
+        _ => false,
+    };
     !control_plane_write
 }
 
@@ -997,49 +959,60 @@ mod runtime_gate_tests {
 
         for (method, path) in [
             (Method::GET, "/apps"),
-            (Method::DELETE, "/apps/demo"),
+            (Method::DELETE, "/apps/{name}"),
             (Method::POST, "/auth/login"),
             (Method::POST, "/orgs"),
-            (Method::DELETE, "/orgs/acme/members/user-1"),
-            (Method::PUT, "/internal/paas/orgs/org-1/entitlements"),
-            (Method::DELETE, "/internal/paas/orgs/org-1/apps/demo"),
+            (Method::DELETE, "/orgs/{name}/members/{id}"),
+            (
+                Method::PUT,
+                "/internal/paas/orgs/{paas_org_id}/entitlements",
+            ),
+            (
+                Method::DELETE,
+                "/internal/paas/orgs/{paas_org_id}/apps/{app_name}",
+            ),
         ] {
             assert!(!is_workload_authority_mutation(&method, path));
         }
     }
 
     #[tokio::test]
+    async fn freeze_blocks_new_writes_without_a_route_inventory_entry() {
+        let state = crate::test_support::lazy_state();
+        state.set_deployment_dispatch_enabled(false);
+        state.mark_startup_ready();
+        for path in [
+            "/auth/future-workload-authority",
+            "/auth/api-keys/future-workload-authority",
+            "/orgs/acme/members/future-workload-authority",
+        ] {
+            let app = super::with_operational_gates(
+                &state,
+                Router::new().route(path, axum::routing::any(|| async { StatusCode::OK })),
+            )
+            .with_state(state.clone());
+            for method in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
+                let request = || {
+                    Request::builder()
+                        .method(method.clone())
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap()
+                };
+                state.set_deployment_dispatch_enabled(false);
+                let response = app.clone().oneshot(request()).await.unwrap();
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                state.set_deployment_dispatch_enabled(true);
+                let response = app.clone().oneshot(request()).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn workload_gate_classification_agrees_with_axum_dispatch() {
-        // Locks the gate/router alignment invariant to the production
-        // router built by build_router_inner, from two angles:
-        //
-        // 1. Exhaustive dispatch agreement: every annotated pattern below
-        //    is instantiated with every poison value (empty, dot segments,
-        //    %2F encodings) in every parameter, sent through the real
-        //    router via oneshot, and the response must carry the matched
-        //    route's own pattern (pinning that the matcher never decodes
-        //    %2F, resolves dot segments, or treats an interior empty
-        //    segment as a separator) with the gate classification equal to
-        //    the annotation. A trailing empty parameter produces a
-        //    trailing '/', which no route may match (pinning the absence
-        //    of trailing-slash tolerance); the gate's own trailing-slash
-        //    trim stays fail-closed because no handler serves those
-        //    shapes.
-        // 2. Enumerated raw variants are fed through the router with
-        //    explicit match/miss pins.
-        //
-        // Dispatch is observed through `echo_matched_path`, a middleware
-        // layered over the finished router: route-level layers run after
-        // routing, so axum's `MatchedPath` extension records the pattern
-        // that actually dispatched each request. A matcher semantics
-        // change (percent-decoding, %2F/empty as separators, dot
-        // resolution, trailing-slash tolerance) breaks the agreement and
-        // fails CI instead of silently breaking alignment. Adding a
-        // workload-authority route without annotating it here leaves the
-        // gate fail-closed (deny-by-default), never fail-open.
-        //
-        // HEAD is dispatched by axum's method router to the GET handler
-        // and always allowed by the gate, so GET annotations cover it.
+        // Parameter contents must not change which route's admission policy applies.
+        // The production matcher supplies identity; this case table is not authority.
         const MATCHED_PATH_HEADER: header::HeaderName =
             header::HeaderName::from_static("x-enclava-test-matched-path");
         const FALLBACK_SENTINEL: &str = "(fallback)";
@@ -1396,7 +1369,7 @@ mod runtime_gate_tests {
                     );
                     for (method_name, is_allow) in served.iter() {
                         let method = Method::from_bytes(method_name.as_bytes()).unwrap();
-                        let gate = is_workload_authority_mutation(&method, path);
+                        let gate = is_workload_authority_mutation(&method, &observed);
                         assert_eq!(
                             gate,
                             !*is_allow,
@@ -1490,7 +1463,7 @@ mod runtime_gate_tests {
                     )
                 });
             assert_eq!(
-                is_workload_authority_mutation(method, path),
+                is_workload_authority_mutation(method, &observed),
                 !*is_allow,
                 "{method} {path} dispatched to {pattern}: gate and annotation \
                  disagree"
@@ -1530,67 +1503,6 @@ mod runtime_gate_tests {
         }
     }
 
-    #[test]
-    fn workload_gate_classifies_raw_path_variants_fail_closed() {
-        // Raw variants of workload mutations (encoded slashes, doubled
-        // slashes, trailing slash, dot segments) must never fall through the
-        // gate's allow patterns. The router (matchit 0.8) matches the raw
-        // path with literal `/` separators only, so the gate must classify
-        // these same raw bytes — and must classify every one of them as a
-        // mutation.
-        for (method, path) in [
-            (Method::POST, "/apps%2Fdemo/deploy"),
-            (Method::POST, "/apps%2fdemo/deploy"),
-            (Method::POST, "//apps//demo//deploy"),
-            (Method::POST, "/apps/demo/deploy/"),
-            (Method::POST, "/apps/./demo/deploy"),
-            (Method::POST, "/apps/x/../demo/deploy"),
-            // A `%2F`/`..` poisoned path parameter on a route the router
-            // still dispatches to a mutation handler.
-            (Method::POST, "/apps/x%2F..%2F..%2Fauth%2Flogin/deploy"),
-            (Method::POST, "/apps/x%2f..%2f..%2fauth/deploy"),
-            (Method::DELETE, "/apps/demo/domains/.."),
-            (Method::DELETE, "/apps/demo/domains/%2e%2e"),
-            (Method::DELETE, "/apps/demo/domains/x%2F..%2F.."),
-            (Method::DELETE, "/apps/demo/config/x%2F..%2F..%2Fauth/meta"),
-            (Method::PUT, "/internal%2Fpaas/orgs/org-1/deployments"),
-            (Method::POST, "/auth%2Flogin"),
-            // Interior empty segment as a poisoned parameter: matchit
-            // dispatches this to the keyring handler (empty paas_org_id),
-            // so it must NOT collapse onto the org-upsert allow rule.
-            (Method::PUT, "/internal/paas/orgs//keyring"),
-        ] {
-            assert!(
-                is_workload_authority_mutation(&method, path),
-                "{method} {path} must be classified as a workload authority mutation"
-            );
-        }
-
-        // Allow-listed control-plane writes keep working, including when a
-        // still-literal segment carries an encoded character.
-        for (method, path) in [
-            (Method::POST, "/auth/login"),
-            (Method::PUT, "/internal/paas/orgs/org%2F1/entitlements"),
-            (Method::PUT, "/internal/paas/orgs/org-1/members/user%2F1"),
-            (Method::DELETE, "/internal/paas/orgs/org-1/apps/demo"),
-            // Interior empty segments inside allow patterns: matchit
-            // dispatches these to the allow-listed handlers (the empty
-            // segment is the parameter value), so they must stay allowed —
-            // an over-strict gate that rejects empty segments inside allow
-            // rules would false-block control-plane writes.
-            (Method::PUT, "/internal/paas/orgs//members/u"),
-            (Method::PUT, "/internal/paas/orgs//entitlements"),
-            (Method::DELETE, "/internal/paas/orgs//apps/demo"),
-            (Method::POST, "/orgs//invite"),
-            (Method::DELETE, "/orgs//members/user-1"),
-        ] {
-            assert!(
-                !is_workload_authority_mutation(&method, path),
-                "{method} {path} must not be classified as a workload authority mutation"
-            );
-        }
-    }
-
     #[tokio::test]
     async fn router_freeze_gate_blocks_encoded_and_dot_segment_variants() {
         // End-to-end through the real router middleware: while dispatch is
@@ -1606,6 +1518,7 @@ mod runtime_gate_tests {
 
         for (method, path) in [
             (Method::POST, "/apps/demo/deploy"),
+            (Method::POST, "/auth/%2e%2e/apps/demo/deploy"),
             (
                 Method::POST,
                 "/internal/paas/orgs/org-1/deployments/deployment-1/customer-config-released",
@@ -1702,21 +1615,6 @@ mod runtime_gate_tests {
                 "{method} {path} must not be blocked by the freeze gate"
             );
         }
-
-        // Raw first segment `auth`, so the gate's control-plane allow list
-        // matches it — but matchit has no such route, so the router must
-        // 404 it. Asserting the 404 (not just "not 503") pins the router
-        // agreement: if a future route table ever dispatches this shape to
-        // a mutation handler, this test fails and forces a gate update.
-        let response = app
-            .oneshot(
-                Request::post("/auth/%2e%2e/apps/demo/deploy")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

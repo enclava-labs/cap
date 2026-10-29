@@ -5,7 +5,6 @@ use indicatif::{ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha256};
 use std::{
     fs::OpenOptions,
-    io::IsTerminal,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -167,6 +166,9 @@ impl StoragePasswordInput {
         match &self.value {
             Some(value) => Ok(value.clone()),
             None => {
+                super::interactive::require_prompt(
+                    "pass --storage-password-file <PATH> to provide the storage password non-interactively",
+                )?;
                 // A pty with no stdin feeder blocks here forever (nohup
                 // script-class runs), so name the non-interactive path in
                 // whatever log the operator will eventually read.
@@ -186,6 +188,9 @@ impl StoragePasswordInput {
         match &self.value {
             Some(value) => Ok(value.clone()),
             None => {
+                super::interactive::require_prompt(
+                    "pass --storage-password-file <PATH> to provide the storage password non-interactively",
+                )?;
                 eprintln!(
                     "Reading the unlock password from the terminal; \
                      unattended runs must pass --storage-password-file <PATH>."
@@ -209,7 +214,7 @@ fn storage_password_prompt_available() -> bool {
     // Both terminals, mirroring secret_from_file_or_prompt's prompted path:
     // dialoguer renders password prompts on stderr, so a piped stderr cannot
     // host the prompt. Recorded-output runs (`2>&1 | tee`) use the file flags.
-    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
+    super::interactive::prompts_available()
 }
 
 fn deploy_should_unlock_before_config(
@@ -301,19 +306,17 @@ pub struct CreateArgs {
     pub signer_issuer: String,
 }
 
-/// Auto-unlock is only reachable via `enclava auto-unlock enable` after a password-mode
-/// claim has established the owner seed inside the TEE (the CLI then wraps that seed
-/// for attestation-gated KBS release). At `create` time no claim has happened, so there
-/// is no seed to wrap — `unlock.mode = "auto"` is always a category error. Fail fast
-/// with the workaround rather than letting enclava-init time out (~60s) fetching a KBS
-/// wrap-key that nothing provisions.
+/// Auto-unlock is hard-disabled platform-wide: the CLI no longer implements
+/// `auto-unlock enable`, the proxy refuses to arm the seal, and init no
+/// longer auto-releases seeds. `unlock.mode = "auto"` can never succeed, so
+/// fail fast instead of letting the deploy hit server-side rejection.
 fn validate_create_unlock_mode(mode: &str) -> Result<(), &'static str> {
     match mode {
         "auto" => Err(
-            "auto-unlock cannot be set at first deploy: the owner seed is \
-             established by a password-mode claim. Set `unlock.mode = \"password\"` for \
-             the first deploy, then run `enclava auto-unlock enable` to wrap the seed \
-             for attestation-gated release on restarts.",
+            "auto_unlock_disabled: auto-unlock cannot be created anymore. \
+             Set `unlock.mode = \"password\"` — password apps stay unlockable \
+             with `enclava unlock`, and `enclava auto-unlock disable` converts \
+             a legacy auto-unlock app.",
         ),
         _ => Ok(()),
     }
@@ -1678,6 +1681,11 @@ const LANDED_PICKUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 ///   deadline issues nothing), a landed answer is never dropped (a request
 ///   is only ever superseded while still pending), and the probe -- with
 ///   every request it holds -- is dropped when the wait returns.
+///   `GET /apps/{name}/deployments` projects the server's live overlay:
+///   a terminal runtime failure (e.g. a guest start error) marks the
+///   exact deployment's row `failed` with its bounded code long before
+///   the apply job's recorded verdict (cap#335), so one request is
+///   authority in both direct and hosted modes.
 pub(crate) struct DeploymentHistoryProbe {
     in_flight: VecDeque<HistoryRequest>,
     refresh_age: Duration,
@@ -2581,6 +2589,9 @@ pub struct StatusArgs {
     /// App name (defaults to enclava.toml app.name)
     #[arg(long)]
     pub app: Option<String>,
+    /// Print machine-readable JSON on stdout instead of the human report
+    #[arg(long)]
+    pub json: bool,
 }
 
 fn status_with_attested_tee_state(api_status: &str, tee_state: &str) -> String {
@@ -2590,6 +2601,46 @@ fn status_with_attested_tee_state(api_status: &str, tee_state: &str) -> String {
         "unclaimed" if api_status == "failed" => "creating".to_string(),
         _ => api_status.to_string(),
     }
+}
+
+/// Machine-readable status payload: the API status object plus the CLI-derived
+/// diagnostics, with a stable shape — every key is always present and absent or
+/// unverified values are `null` (never a value that reads as a verified result).
+fn status_json_payload(
+    status: &enclava_cli::api_types::AppStatus,
+    stable_ssh_endpoint: &StableSshEndpointState,
+    tee_acme_retry_after: Option<&str>,
+    missing_config_keys: Option<&[String]>,
+) -> Result<serde_json::Value, serde_json::Error> {
+    let mut out = serde_json::to_value(status)?;
+    out["stable_ssh_endpoint"] = match stable_ssh_endpoint {
+        StableSshEndpointState::Ready(endpoint) => {
+            serde_json::json!({"state": "ready", "endpoint": endpoint})
+        }
+        StableSshEndpointState::Missing => {
+            serde_json::json!({"state": "missing", "endpoint": null})
+        }
+        StableSshEndpointState::Invalid => {
+            serde_json::json!({"state": "invalid", "endpoint": null})
+        }
+        StableSshEndpointState::NotStableTemplate => {
+            serde_json::json!({"state": "not_stable_template", "endpoint": null})
+        }
+        StableSshEndpointState::Unknown => {
+            serde_json::json!({"state": "unknown", "endpoint": null})
+        }
+    };
+    out["tee_acme_retry_after"] = match tee_acme_retry_after {
+        Some(retry_after) => serde_json::json!(retry_after),
+        None => serde_json::Value::Null,
+    };
+    // `null` means the completeness check did not run (non-template app or a
+    // metadata lookup failed); only `[]` means verified complete.
+    out["missing_config_keys"] = match missing_config_keys {
+        Some(keys) => serde_json::json!(keys),
+        None => serde_json::Value::Null,
+    };
+    Ok(out)
 }
 
 pub async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -2603,7 +2654,7 @@ pub async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> 
     let stable_ssh_endpoint = app_metadata
         .as_ref()
         .map(stable_ssh_endpoint_state_from_app)
-        .unwrap_or(StableSshEndpointState::NotStableTemplate);
+        .unwrap_or(StableSshEndpointState::Unknown);
     let mut tee_acme_retry_after: Option<String> = None;
     if let Ok(endpoint) = api.get_unlock_endpoint(&app_name).await {
         let tee = TeeClient::new_for_ownership_with_resolve_ip(
@@ -2640,6 +2691,27 @@ pub async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> 
         }
     }
 
+    // Config completeness per platform metadata: a template deploy's
+    // customer-config phase is CLI-driven and does not resume on its own, so an
+    // interrupted deploy can leave the guest waiting on a required key while
+    // this status reads healthy. Compare the template's required customer keys
+    // against the platform's config metadata and name the recovery.
+    let missing_config_keys = match app_metadata.as_ref() {
+        Some(app) => template_missing_config_keys(&api, app, &app_name).await,
+        None => None,
+    };
+
+    if args.json {
+        let payload = status_json_payload(
+            &status,
+            &stable_ssh_endpoint,
+            tee_acme_retry_after.as_deref(),
+            missing_config_keys.as_deref(),
+        )?;
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        return Ok(());
+    }
+
     let status_colored = match status.status.as_str() {
         "running" | "ready" | "healthy" => status.status.green().to_string(),
         "creating" | "deploying" | "applying" | "pending" => status.status.yellow().to_string(),
@@ -2665,7 +2737,7 @@ pub async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> 
                 "Stable SSH endpoint metadata invalid; redeploy the template so PaaS reserves a stable SSH endpoint"
             );
         }
-        StableSshEndpointState::NotStableTemplate => {}
+        StableSshEndpointState::NotStableTemplate | StableSshEndpointState::Unknown => {}
     }
     if let Some(phase) = &status.pod_phase {
         println!("Pod:      {phase}");
@@ -2697,6 +2769,20 @@ pub async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> 
             println!("Evidence: {reason}");
         }
     }
+    if let Some(missing) = &missing_config_keys
+        && !missing.is_empty()
+    {
+        println!("Config:   {}", "INCOMPLETE (per platform metadata)".red());
+        println!("Missing:  {}", missing.join(", "));
+        println!(
+            "          the deploy's config delivery is client-driven and does not resume on its own;"
+        );
+        println!(
+            "          if no deploy is in progress, re-run it to finish delivery (also heals a"
+        );
+        println!("          key stored in the TEE whose platform-metadata sync failed)");
+    }
+
     if let Some(deployment) = &status.deployment {
         print_deployment_diagnostics(deployment);
     }
@@ -2840,6 +2926,67 @@ enum StableSshEndpointState {
     Ready(String),
     Missing,
     Invalid,
+    /// App metadata could not be read, so the endpoint state is unknown.
+    Unknown,
+}
+
+/// Required template config keys that the app's platform config metadata does
+/// not record as set. `None` when inapplicable or a lookup fails — this
+/// advisory check must never fail `status`. Note the comparison is against
+/// metadata, not an authoritative TEE key read: a key stored in the TEE whose
+/// metadata sync failed shows as missing here (the printed recovery heals
+/// that case too).
+async fn template_missing_config_keys(
+    api: &ApiClient,
+    app: &AppResponse,
+    app_name: &str,
+) -> Option<Vec<String>> {
+    let template_slug = app.template_slug.as_deref()?;
+    let templates = api.list_templates().await.ok()?;
+    let template = templates.iter().find(|entry| entry.slug == template_slug)?;
+    if !template_version_matches_registry(app.template_version.as_deref(), &template.version) {
+        return None;
+    }
+    let delivered = api.list_config_keys(app_name).await.ok()?;
+    // Customer-channel keys only (same cut as the template deploy's
+    // customer-vs-managed split): managed keys are delivered by a durable
+    // server-side event that retries on its own, so only customer keys can
+    // strand when the deploy client dies before writing them.
+    Some(missing_required_config_keys(
+        template
+            .config_keys
+            .iter()
+            .filter(|entry| {
+                entry.required && !template.paas_managed_config_keys.contains(&entry.key)
+            })
+            .map(|entry| entry.key.clone()),
+        delivered.keys.into_iter().map(|entry| entry.key),
+    ))
+}
+
+/// The advisory compares against the registry's CURRENT required keys, which
+/// are only in force for apps deployed on exactly that template version;
+/// historical requirements are not available, so other versions are skipped.
+fn template_version_matches_registry(
+    app_template_version: Option<&str>,
+    registry_version: &str,
+) -> bool {
+    app_template_version == Some(registry_version)
+}
+
+/// Sorted, deduplicated set difference of required minus delivered keys.
+fn missing_required_config_keys(
+    required: impl IntoIterator<Item = String>,
+    delivered: impl IntoIterator<Item = String>,
+) -> Vec<String> {
+    let delivered: std::collections::HashSet<String> = delivered.into_iter().collect();
+    let mut missing: Vec<String> = required
+        .into_iter()
+        .filter(|key| !delivered.contains(key))
+        .collect();
+    missing.sort();
+    missing.dedup();
+    missing
 }
 
 fn stable_ssh_endpoint_state_from_app(app: &AppResponse) -> StableSshEndpointState {
@@ -3462,6 +3609,9 @@ pub async fn rollback(args: RollbackArgs) -> Result<(), Box<dyn std::error::Erro
 
         // Default to the immediately previous deployment
         let previous = &deployments[1];
+        super::interactive::require_prompt(
+            "pass --to <deployment-id> to roll back without confirmation",
+        )?;
         let confirm = dialoguer::Confirm::new()
             .with_prompt(format!("Roll back to deployment {}?", &previous.id[..8]))
             .default(true)
@@ -3606,6 +3756,7 @@ pub async fn destroy(args: DestroyArgs) -> Result<(), Box<dyn std::error::Error>
     let (api, _paths, _cli_config) = build_api_client()?;
 
     if !args.force {
+        super::interactive::require_prompt("pass --force to destroy without confirmation")?;
         let confirm = dialoguer::Confirm::new()
             .with_prompt(format!(
                 "This will permanently destroy '{app_name}' and all its data. Continue?"

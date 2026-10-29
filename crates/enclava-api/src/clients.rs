@@ -8,10 +8,9 @@
 //! RFC1918, IMDS-style metadata addresses, IPv4-compatible/mapped IPv6
 //! spellings of all of the above, and configured cluster CIDRs. Because
 //! reqwest never consults a custom resolver for literal-IP hosts, the
-//! cosign/sigstore verification paths (whose stacks build their own
-//! transports) additionally pre-flight every registry-derived destination
-//! through `EgressGuard` (issue #224): https-only, registry allowlist,
-//! literal-IP blocklist, and a one-shot DNS resolution for names.
+//! OCI signature-verification requests additionally validate every
+//! registry-derived destination through `EgressGuard`: HTTPS, registry
+//! allowlist, literal-IP blocklist and checked DNS answers.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -166,9 +165,9 @@ fn parse_literal_ip(host: &str) -> Option<IpAddr> {
 /// routed through `build_guarded_client` (issue #224): reqwest never
 /// consults a custom DNS resolver for literal-IP hosts, so a literal such
 /// as `10.0.5.7` or `::ffff:169.254.169.254` reaches the socket directly.
-/// The sigstore/oci clients used by the cosign verification paths build
-/// their own reqwest transports internally, so every registry-derived URL
-/// they touch is validated here — https, allowlisted host, and literal IPs
+/// The oci-client transport used by the cosign verification paths builds
+/// its own reqwest transport internally, so every registry-derived URL
+/// it touches is validated here — https, allowlisted host, and literal IPs
 /// (and, for names, a one-shot DNS resolution) checked against
 /// `BlockedNetworks` — BEFORE any connection is attempted.
 pub async fn check_egress_destination(
@@ -306,21 +305,13 @@ impl RegistryClient {
     }
 }
 
-/// Shared egress policy for the cosign/sigstore verification paths (issue
-/// #224): those stacks build their own reqwest transports internally (no
-/// resolver/redirect injection point), so their destinations are validated
-/// through this pre-flight guard instead — https-only, registry allowlist,
-/// literal-IP blocklist, and a one-shot DNS resolution for names — before
-/// any connection is attempted.
+/// Destination checks for OCI clients whose internal resolver cannot be replaced.
+/// Every request also uses `proxy`, binding connections to checked DNS answers.
 #[derive(Debug, Clone)]
 pub struct EgressGuard {
     pub blocked: Arc<BlockedNetworks>,
     pub allowlist: AllowList,
-    /// Loopback CONNECT proxy (see `egress_proxy`) that the sigstore and
-    /// oci-client transports are routed through, so the guarded resolution
-    /// is the one the connection actually uses and every redirect hop /
-    /// bearer-token realm is re-validated (DNS-rebinding and redirect
-    /// bypasses from the cap#241 review).
+    /// CONNECT proxy keeps redirects and token realms on validated DNS answers.
     pub proxy: crate::egress_proxy::EgressProxy,
 }
 

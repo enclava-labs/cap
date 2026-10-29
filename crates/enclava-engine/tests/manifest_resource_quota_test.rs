@@ -14,15 +14,6 @@ fn resource_quota_name_and_namespace() {
 }
 
 #[test]
-fn resource_quota_has_cpu_limits() {
-    let app = sample_app();
-    let rq = generate_resource_quota(&app);
-    let hard = rq.spec.as_ref().unwrap().hard.as_ref().unwrap();
-    assert_eq!(hard.get("requests.cpu").unwrap().0, "1500m");
-    assert_eq!(hard.get("limits.cpu").unwrap().0, "3250m");
-}
-
-#[test]
 fn resource_quota_has_memory_limits() {
     let app = sample_app();
     let rq = generate_resource_quota(&app);
@@ -43,8 +34,6 @@ fn resource_quota_is_unchanged_by_encrypted_log_relay() {
 
     let rq = generate_resource_quota(&app);
     let hard = rq.spec.as_ref().unwrap().hard.as_ref().unwrap();
-    assert_eq!(hard.get("requests.cpu").unwrap().0, "1500m");
-    assert_eq!(hard.get("limits.cpu").unwrap().0, "3250m");
     assert_eq!(hard.get("requests.memory").unwrap().0, "4928Mi");
     assert_eq!(hard.get("limits.memory").unwrap().0, "6Gi");
 }

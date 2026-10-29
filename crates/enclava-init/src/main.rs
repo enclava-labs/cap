@@ -3,7 +3,7 @@ use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use enclava_init::chown::{self, ExecIdentity, IdentityKind};
@@ -14,7 +14,7 @@ use enclava_init::config::{
 use enclava_init::safe_diagnostics::SafeBootstrapDiagnostic;
 use enclava_init::secrets::{DerivedSeed, OwnerSeed, Password};
 use enclava_init::{
-    dev_no_luks_override, env_override, kbs_fetch, log_relay, luks, luks2_seal, seeds, socket,
+    dev_no_luks_override, env_override, log_relay, luks, luks2_seal, seeds, socket,
     tls_certificate, trustee_verify, unlock, writes,
 };
 use serde::Deserialize;
@@ -22,12 +22,8 @@ use serde::Deserialize;
 const DEFAULT_READY_FILE: &str = "/run/enclava/init-ready";
 const DEFAULT_ERROR_FILE: &str = "/run/enclava/init-error";
 const DEFAULT_ACME_COOLDOWN_FILE: &str = "/run/enclava/init-acme-cooldown";
-const DEFAULT_KBS_PROXY_HEALTH_WAIT_SECONDS: u64 = 300;
+const DEFAULT_AA_TOKEN_WAIT_SECONDS: u64 = 300;
 const DEFAULT_KBS_PROXY_HEALTH_POLL_SECONDS: u64 = 2;
-const KBS_PROXY_HEALTH_REQUEST_TIMEOUT_SECONDS: u64 = 5;
-const DEFAULT_KBS_FETCH_ATTEMPTS: u32 = 30;
-const DEFAULT_KBS_FETCH_RETRY_SLEEP_SECONDS: u64 = 2;
-const DEFAULT_KBS_FETCH_REQUEST_TIMEOUT_SECONDS: u64 = 10;
 const CADDY_RUNTIME_HANDOFF_PATH: &str = "/run/enclava/caddy-runtime";
 const PUBLIC_TLS_CERT_HANDOFF_PATH: &str = "/run/enclava/public-tls/certificates/tls.crt";
 const CADDY_RUNTIME_SYNC_INTERVAL_SECONDS: u64 = 5;
@@ -108,6 +104,14 @@ fn report_failure(error: &anyhow::Error) {
 
 fn run() -> Result<()> {
     let mut stats = init_stats::BootStats::begin();
+    let result = run_with_stats(&mut stats);
+    if result.is_err() {
+        let _ = stats.write(&init_stats::stats_path_for(&ready_file_path()));
+    }
+    result
+}
+
+fn run_with_stats(stats: &mut init_stats::BootStats) -> Result<()> {
     record_stage("loading config").ok();
     let cfg_path = std::env::var("ENCLAVA_INIT_CONFIG")
         .map(PathBuf::from)
@@ -150,10 +154,8 @@ fn run() -> Result<()> {
 
     record_stage("waiting for owner seed").ok();
     let phase = stats.elapsed_ms();
-    let owner = match cfg.mode {
-        Mode::Password => acquire_owner_seed_password(&cfg)?,
-        Mode::Autounlock => acquire_owner_seed_autounlock(&cfg)?,
-    };
+    // Legacy auto metadata must still accept owner-authorized manual handoff.
+    let owner = acquire_owner_seed_password(&cfg)?;
     stats.record_owner_seed(phase);
     clear_error_file(&error_file_path());
 
@@ -161,7 +163,7 @@ fn run() -> Result<()> {
     open_luks_volumes(
         &cfg,
         &owner,
-        &mut stats,
+        stats,
         &luks_rollout_policy(cc_init_data.as_deref())?,
     )?;
     record_stage("preparing mount ownership").ok();
@@ -1114,131 +1116,6 @@ fn unlock_socket_peer_gid() -> Option<u32> {
         .and_then(parse_positive_u32)
 }
 
-fn acquire_owner_seed_autounlock(cfg: &Config) -> Result<OwnerSeed> {
-    let url = cfg
-        .kbs_url
-        .as_deref()
-        .ok_or_else(|| anyhow!("autounlock mode requires kbs_url"))?;
-    let path = cfg
-        .kbs_resource_path
-        .as_deref()
-        .ok_or_else(|| anyhow!("autounlock mode requires kbs_resource_path"))?;
-    wait_for_kbs_proxy_health_if_needed(url).context("waiting for local KBS proxy health")?;
-    let mut client = kbs_fetch::KbsClient::new(url.into(), path.into());
-    client.timeout = kbs_fetch_request_timeout();
-    let wrap =
-        fetch_wrap_key_with_retries(&client).with_context(|| "fetching wrap key from KBS")?;
-    Ok(OwnerSeed(*wrap.as_bytes()))
-}
-
-fn fetch_wrap_key_with_retries(
-    client: &kbs_fetch::KbsClient,
-) -> Result<enclava_init::secrets::WrapKey> {
-    let attempts = kbs_fetch_attempts();
-    let sleep = kbs_fetch_retry_sleep_interval();
-
-    for attempt in 1..=attempts {
-        match client.fetch_wrap_key() {
-            Ok(wrap_key) => return Ok(wrap_key),
-            Err(err) => {
-                if attempt == attempts {
-                    return Err(err)
-                        .with_context(|| format!("KBS fetch failed after {attempts} attempt(s)"));
-                }
-                // Safe bounded retry metadata only: the raw KBS error text
-                // carries the complete request URL — its path/query may hold
-                // secret markers — so it must never reach ordinary logs.
-                tracing::warn!(
-                    attempt,
-                    attempts,
-                    retry_sleep_seconds = sleep.as_secs(),
-                    error = "kbs_fetch_failed",
-                    "KBS autounlock fetch failed; retrying"
-                );
-                std::thread::sleep(sleep);
-            }
-        }
-    }
-
-    Err(anyhow!("KBS fetch did not run"))
-}
-
-fn wait_for_kbs_proxy_health_if_needed(kbs_url: &str) -> Result<()> {
-    let wait_timeout = kbs_proxy_health_wait_timeout(kbs_url);
-    if wait_timeout.is_zero() {
-        return Ok(());
-    }
-    let poll = kbs_proxy_health_poll_interval();
-    let health_url = kbs_proxy_health_url(kbs_url);
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(
-            KBS_PROXY_HEALTH_REQUEST_TIMEOUT_SECONDS,
-        ))
-        .build()
-        .context("building KBS proxy health client")?;
-
-    tracing::info!(
-        wait_seconds = wait_timeout.as_secs(),
-        poll_seconds = poll.as_secs(),
-        "waiting for local KBS proxy before autounlock"
-    );
-
-    let started = Instant::now();
-    loop {
-        match client.get(&health_url).send() {
-            Ok(resp) if kbs_proxy_health_status_is_ready(resp.status().as_u16()) => {
-                tracing::info!(
-                    elapsed_seconds = started.elapsed().as_secs(),
-                    status = resp.status().as_u16(),
-                    "local KBS proxy ready"
-                );
-                return Ok(());
-            }
-            Ok(resp) => {
-                tracing::debug!(
-                    status = resp.status().as_u16(),
-                    "local KBS proxy health not ready"
-                );
-            }
-            Err(_) => {
-                // Bounded code only: reqwest error text embeds the full
-                // (supplied) health URL, whose query may carry secret
-                // markers.
-                tracing::debug!(
-                    error = "health_request_failed",
-                    "local KBS proxy health request failed"
-                );
-            }
-        }
-
-        let elapsed = started.elapsed();
-        if elapsed >= wait_timeout {
-            return Err(anyhow!(
-                "timed out after {}s waiting for {}",
-                wait_timeout.as_secs(),
-                health_url
-            ));
-        }
-        std::thread::sleep(poll.min(wait_timeout - elapsed));
-    }
-}
-
-fn kbs_proxy_health_wait_timeout(kbs_url: &str) -> Duration {
-    let explicit = std::env::var("ENCLAVA_INIT_KBS_PROXY_HEALTH_WAIT_SECONDS")
-        .ok()
-        .or_else(|| std::env::var("KBS_PROXY_HEALTH_WAIT_SECONDS").ok());
-    if let Some(value) = explicit {
-        return parse_positive_seconds(&value)
-            .map(Duration::from_secs)
-            .unwrap_or(Duration::ZERO);
-    }
-    if is_local_kbs_proxy_url(kbs_url) {
-        Duration::from_secs(DEFAULT_KBS_PROXY_HEALTH_WAIT_SECONDS)
-    } else {
-        Duration::ZERO
-    }
-}
-
 fn kbs_proxy_health_poll_interval() -> Duration {
     let explicit = std::env::var("ENCLAVA_INIT_KBS_PROXY_HEALTH_POLL_SECONDS")
         .ok()
@@ -1250,58 +1127,12 @@ fn kbs_proxy_health_poll_interval() -> Duration {
         .unwrap_or_else(|| Duration::from_secs(DEFAULT_KBS_PROXY_HEALTH_POLL_SECONDS))
 }
 
-fn kbs_fetch_attempts() -> u32 {
-    std::env::var("ENCLAVA_INIT_KBS_FETCH_RETRIES")
-        .ok()
-        .or_else(|| std::env::var("KBS_FETCH_RETRIES").ok())
-        .and_then(|value| value.parse::<u32>().ok())
-        .filter(|attempts| *attempts > 0)
-        .unwrap_or(DEFAULT_KBS_FETCH_ATTEMPTS)
-}
-
-fn kbs_fetch_retry_sleep_interval() -> Duration {
-    let seconds = std::env::var("ENCLAVA_INIT_KBS_FETCH_RETRY_SLEEP_SECONDS")
-        .ok()
-        .or_else(|| std::env::var("KBS_FETCH_RETRY_SLEEP_SECONDS").ok())
-        .as_deref()
-        .and_then(parse_positive_seconds)
-        .unwrap_or(DEFAULT_KBS_FETCH_RETRY_SLEEP_SECONDS);
-    Duration::from_secs(seconds)
-}
-
-fn kbs_fetch_request_timeout() -> Duration {
-    let seconds = std::env::var("ENCLAVA_INIT_KBS_FETCH_REQUEST_TIMEOUT_SECONDS")
-        .ok()
-        .or_else(|| std::env::var("KBS_FETCH_REQUEST_TIMEOUT_SECONDS").ok())
-        .as_deref()
-        .and_then(parse_positive_seconds)
-        .unwrap_or(DEFAULT_KBS_FETCH_REQUEST_TIMEOUT_SECONDS);
-    Duration::from_secs(seconds)
-}
-
 fn parse_positive_seconds(value: &str) -> Option<u64> {
     value.parse::<u64>().ok().filter(|seconds| *seconds > 0)
 }
 
 fn parse_positive_u32(value: &str) -> Option<u32> {
     value.parse::<u32>().ok().filter(|value| *value > 0)
-}
-
-fn kbs_proxy_health_url(kbs_url: &str) -> String {
-    if let Ok(value) = std::env::var("ENCLAVA_INIT_ATTESTATION_PROXY_HEALTH_URL")
-        .or_else(|_| std::env::var("ATTESTATION_PROXY_HEALTH_URL"))
-    {
-        if !value.trim().is_empty() {
-            return value;
-        }
-    }
-
-    let trimmed = kbs_url.trim_end_matches('/');
-    let base = trimmed
-        .strip_suffix("/cdh/resource")
-        .unwrap_or(trimmed)
-        .trim_end_matches('/');
-    format!("{base}/health")
 }
 
 /// Bounded readiness wait for a LOCAL attestation-agent token endpoint
@@ -1365,9 +1196,6 @@ fn wait_for_local_aa_token_endpoint(token_url: &str) {
     );
 }
 
-/// Wait budget for the local AA token endpoint: explicit env override, else
-/// the same 300s default the KBS-proxy wait uses (independent of the URL's
-/// port).
 fn aa_token_wait_timeout() -> Duration {
     let explicit = std::env::var("ENCLAVA_INIT_AA_TOKEN_WAIT_SECONDS")
         .ok()
@@ -1377,23 +1205,7 @@ fn aa_token_wait_timeout() -> Duration {
             .map(Duration::from_secs)
             .unwrap_or(Duration::ZERO);
     }
-    Duration::from_secs(DEFAULT_KBS_PROXY_HEALTH_WAIT_SECONDS)
-}
-
-fn is_local_kbs_proxy_url(kbs_url: &str) -> bool {
-    reqwest::Url::parse(kbs_url)
-        .ok()
-        .and_then(|url| {
-            Some(matches!(
-                (url.host_str()?, url.port_or_known_default()),
-                ("127.0.0.1" | "localhost", Some(8081))
-            ))
-        })
-        .unwrap_or_else(|| kbs_url.contains("127.0.0.1:8081") || kbs_url.contains("localhost:8081"))
-}
-
-fn kbs_proxy_health_status_is_ready(status: u16) -> bool {
-    status == 200 || status == 423
+    Duration::from_secs(DEFAULT_AA_TOKEN_WAIT_SECONDS)
 }
 
 fn open_luks_volumes(
@@ -1410,7 +1222,7 @@ fn open_luks_volumes(
     // hardening floor before touching any volume.
     luks2_seal::ensure_cryptsetup_floor()?;
     let state_phase = stats.elapsed_ms();
-    let state_opened = open_one_volume(
+    let state_result = open_one_volume(
         &cfg.state,
         owner,
         // The passphrase stays derived from the signed per-volume
@@ -1419,19 +1231,21 @@ fn open_luks_volumes(
         &cfg.state.hkdf_info,
         seeds::STATE_HEADER_MAC_INFO,
         luks_policy,
-    )
-    .with_context(|| format!("opening state volume {}", cfg.state.device))?;
-    stats.record_state_volume(state_phase, state_opened.formatted);
+        &mut stats.state_profile,
+    );
+    stats.record_state_volume(state_phase, stats.state_profile.format_completed());
+    state_result.with_context(|| format!("opening state volume {}", cfg.state.device))?;
     let tls_phase = stats.elapsed_ms();
-    let tls_opened = open_one_volume(
+    let tls_result = open_one_volume(
         &cfg.tls_state,
         owner,
         &cfg.tls_state.hkdf_info,
         seeds::TLS_STATE_HEADER_MAC_INFO,
         luks_policy,
-    )
-    .with_context(|| format!("opening tls-state volume {}", cfg.tls_state.device))?;
-    stats.record_tls_volume(tls_phase, tls_opened.formatted);
+        &mut stats.tls_profile,
+    );
+    stats.record_tls_volume(tls_phase, stats.tls_profile.format_completed());
+    tls_result.with_context(|| format!("opening tls-state volume {}", cfg.tls_state.device))?;
     stats.record_post_luks_memory();
     Ok(())
 }
@@ -1448,6 +1262,7 @@ fn open_one_volume(
     // the MAC key cannot be steered by config data.
     header_mac_info: &[u8],
     policy: &luks::LuksOpenPolicy,
+    profile: &mut enclava_init::volume_profile::VolumeProfile,
 ) -> Result<luks::LuksOpened> {
     // Distinct HKDF branches: the volume passphrase and the header MAC key
     // must never share material (cap#242).
@@ -1456,13 +1271,19 @@ fn open_one_volume(
         derive_volume_key(owner, header_mac_info)?,
     );
     let device = Path::new(&vol.device);
+    profile.device_bytes = std::fs::File::open(device)
+        .and_then(|mut file| std::io::Seek::seek(&mut file, std::io::SeekFrom::End(0)))
+        .unwrap_or(0);
     let opened = luks::format_if_unformatted_then_open_with_policy(
         device,
         &vol.mapping_name,
         &keys,
         policy,
+        profile,
     )?;
-    luks::mount(&opened.mapper_path, Path::new(&vol.mount_path))?;
+    profile.run(enclava_init::volume_profile::Stage::Mount, |_| {
+        luks::mount(&opened.mapper_path, Path::new(&vol.mount_path))
+    })?;
     tracing::info!(
         device = %vol.device,
         mapper = %opened.mapper_path.display(),
@@ -2051,8 +1872,7 @@ fn bind_log_spool_to_state(
     if !log_spool_capacity_sufficient(total_bytes) {
         anyhow::bail!(
             "log spool state filesystem has only {total_bytes} bytes total capacity; \
-             need at least {} (32Mi spool rotation plus temp and fs/platform headroom)",
-            LOG_SPOOL_MIN_STATE_BYTES
+             need at least {LOG_SPOOL_MIN_STATE_BYTES} (32Mi spool rotation plus temp and fs/platform headroom)"
         );
     }
     let source = format!("/proc/self/fd/{}", spool_dir.as_raw_fd());

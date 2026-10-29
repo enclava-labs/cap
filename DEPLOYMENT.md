@@ -299,6 +299,21 @@ at the configured name never satisfies platform-credential convergence.
 | `OUTBOUND_HTTP_BODY_LIMIT_BYTES` | code default | Body-size limit for guarded outbound HTTP responses. |
 | `CAP_PUBLIC_INTERNET_EGRESS_EXCLUDED_CIDRS` | unset | Public-internet egress CIDRs excluded from generated tenant egress policy. |
 
+The long-lived `enclava-init` sidecar requests `50m` CPU and is limited to
+`500m`; its memory request/limit remain `64Mi`/`512Mi`. The CPU limit is
+initialization headroom, not an increase to the workload's plan allowance or
+scheduler CPU request. Tenant quota totals include this limit and RuntimeClass
+overhead. Keep the signing service's pod resource rendering aligned. Existing
+pods are not resized in place.
+
+Image verification uses the upstream Sigstore verifier with the guarded OCI
+transport and the existing pinned trust root. Legacy `.sig` layers require a
+verified Rekor SET; DSSE image signatures require the cosign sign-v1 predicate,
+a certificate, and one log entry with a SET and Merkle proof. Identity policies
+require Fulcio CA trust. P-256 key-pin policies instead require the exact key
+and Rekor evidence; certificate identities enter the audit record only after
+independent CA validation.
+
 ## Release-Build Safety Gates
 
 Release builds refuse to start when dangerous development settings are enabled:

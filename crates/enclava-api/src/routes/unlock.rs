@@ -593,6 +593,10 @@ fn unlock_transition_conflict(message: &'static str) -> UnlockModeError {
     )
 }
 
+fn auto_unlock_disabled_error() -> UnlockModeError {
+    crate::routes::apps::auto_unlock_disabled_response()
+}
+
 async fn reject_replayed_transition_receipt(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     app_id: Uuid,
@@ -653,6 +657,11 @@ async fn commit_unlock_mode_transition(
     pool: &sqlx::PgPool,
     request: UnlockModeCommitRequest<'_>,
 ) -> Result<CommittedUnlockModeTransition, UnlockModeError> {
+    // Backstop under the deployment lane: even if admission above raced with
+    // another writer, an auto target can never reach the committed rows.
+    if request.requested == RequestedUnlockMode::Auto {
+        return Err(auto_unlock_disabled_error());
+    }
     let mut tx = pool.begin().await.map_err(|_| unlock_database_error())?;
 
     // Match every hosted authority writer's global lock order. The caller's
@@ -1238,6 +1247,12 @@ pub async fn update_unlock_mode(
             Json(serde_json::json!({"error": e})),
         )
     })?;
+    // Auto-unlock is hard-disabled: refuse any auto target before app reads,
+    // receipt verification, or attestation work. Auto->password transitions
+    // (legacy migration) remain fully functional.
+    if requested == RequestedUnlockMode::Auto {
+        return Err(auto_unlock_disabled_error());
+    }
 
     let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
         .bind(auth.org_id)
@@ -1630,9 +1645,10 @@ mod tests {
     use super::{
         BUILTIN_AMD_ARK_SHA256_PINS, ReceiptEnvelope, ReceiptPayloadView, RequestedUnlockMode,
         SignedReceiptResponse, TransitionQuoteError, TransitionReceiptAttestation,
-        TransitionSnpQuote, UnlockModeCommitRequest, commit_unlock_mode_transition,
-        snp_guest_policy_allows_debug, transition_receipt_is_fresh, validate_transition,
-        verify_transition_attestation, verify_transition_receipt, verify_transition_snp_quote,
+        TransitionSnpQuote, UnlockModeCommitRequest, auto_unlock_disabled_error,
+        commit_unlock_mode_transition, snp_guest_policy_allows_debug, transition_receipt_is_fresh,
+        validate_transition, verify_transition_attestation, verify_transition_receipt,
+        verify_transition_snp_quote,
     };
     use crate::models::{App, AppContainer, AppStatus, UnlockMode};
 
@@ -1792,7 +1808,7 @@ mod tests {
              )
              VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9,
-                'password'::unlock_enum, $10, $11, 'running'::app_status_enum
+                'auto'::unlock_enum, $10, $11, 'running'::app_status_enum
              )",
         )
         .bind(app_id)
@@ -2697,16 +2713,16 @@ mod tests {
         let receipt = signed_transition_receipt_for_app(
             app.id,
             "2026-07-17T10:00:00Z",
-            "password",
             "auto",
+            "password",
             &quote_hash,
             &signing_key,
         );
         let verified_receipt = verify_transition_receipt(
             &receipt,
             &app,
-            RequestedUnlockMode::Password,
             RequestedUnlockMode::Auto,
+            RequestedUnlockMode::Password,
         )
         .expect("verify test transition receipt");
         let attestation = transition_attestation_for_domain(
@@ -2755,7 +2771,7 @@ mod tests {
                 app_name: &app.name,
                 observed_authority: &authority,
                 source_deployment_id,
-                requested: RequestedUnlockMode::Auto,
+                requested: RequestedUnlockMode::Password,
                 receipt: &receipt,
                 transition_attestation: &attestation,
                 verified_receipt: &verified_receipt,
@@ -2787,7 +2803,7 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .expect("load rolled-back unlock mode");
-        assert_eq!(persisted_mode, "password");
+        assert_eq!(persisted_mode, "auto");
         let persisted_container: AppContainer =
             sqlx::query_as("SELECT * FROM app_containers WHERE app_id = $1 AND is_primary = true")
                 .bind(app.id)
@@ -2851,16 +2867,16 @@ mod tests {
         let receipt = signed_transition_receipt_for_app(
             app.id,
             "2026-07-17T10:30:00Z",
-            "password",
             "auto",
+            "password",
             &quote_hash,
             &signing_key,
         );
         let verified_receipt = verify_transition_receipt(
             &receipt,
             &app,
-            RequestedUnlockMode::Password,
             RequestedUnlockMode::Auto,
+            RequestedUnlockMode::Password,
         )
         .expect("verify deployment failure receipt");
         let attestation = transition_attestation_for_domain(
@@ -2893,7 +2909,7 @@ mod tests {
                 app_name: &app.name,
                 observed_authority: &authority,
                 source_deployment_id,
-                requested: RequestedUnlockMode::Auto,
+                requested: RequestedUnlockMode::Password,
                 receipt: &receipt,
                 transition_attestation: &attestation,
                 verified_receipt: &verified_receipt,
@@ -2925,7 +2941,7 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .expect("load mode after deployment failure");
-        assert_eq!(persisted_mode, "password");
+        assert_eq!(persisted_mode, "auto");
         let receipt_count: i64 =
             sqlx::query_scalar("SELECT count(*) FROM unlock_transition_receipts WHERE app_id = $1")
                 .bind(app.id)
@@ -2959,16 +2975,16 @@ mod tests {
         let receipt = signed_transition_receipt_for_app(
             app.id,
             "2026-07-17T10:40:00Z",
-            "password",
             "auto",
+            "password",
             &quote_hash,
             &signing_key,
         );
         let verified_receipt = verify_transition_receipt(
             &receipt,
             &app,
-            RequestedUnlockMode::Password,
             RequestedUnlockMode::Auto,
+            RequestedUnlockMode::Password,
         )
         .expect("verify durable-job failure receipt");
         let attestation = transition_attestation_for_domain(
@@ -3013,7 +3029,7 @@ mod tests {
                 app_name: &app.name,
                 observed_authority: &authority,
                 source_deployment_id,
-                requested: RequestedUnlockMode::Auto,
+                requested: RequestedUnlockMode::Password,
                 receipt: &receipt,
                 transition_attestation: &attestation,
                 verified_receipt: &verified_receipt,
@@ -3045,7 +3061,7 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .expect("load mode after durable-job failure");
-        assert_eq!(persisted_mode, "password");
+        assert_eq!(persisted_mode, "auto");
         let receipt_count: i64 =
             sqlx::query_scalar("SELECT count(*) FROM unlock_transition_receipts WHERE app_id = $1")
                 .bind(app.id)
@@ -3104,16 +3120,16 @@ mod tests {
         let receipt = signed_transition_receipt_for_app(
             app.id,
             "2026-07-17T10:45:00Z",
-            "password",
             "auto",
+            "password",
             &quote_hash,
             &signing_key,
         );
         let verified_receipt = verify_transition_receipt(
             &receipt,
             &app,
-            RequestedUnlockMode::Password,
             RequestedUnlockMode::Auto,
+            RequestedUnlockMode::Password,
         )
         .expect("verify artifact failure receipt");
         let attestation = transition_attestation_for_domain(
@@ -3137,7 +3153,7 @@ mod tests {
                 app_name: &app.name,
                 observed_authority: &authority,
                 source_deployment_id,
-                requested: RequestedUnlockMode::Auto,
+                requested: RequestedUnlockMode::Password,
                 receipt: &receipt,
                 transition_attestation: &attestation,
                 verified_receipt: &verified_receipt,
@@ -3175,7 +3191,7 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .expect("load mode after artifact failure");
-        assert_eq!(persisted_mode, "password");
+        assert_eq!(persisted_mode, "auto");
         let receipt_count: i64 =
             sqlx::query_scalar("SELECT count(*) FROM unlock_transition_receipts WHERE app_id = $1")
                 .bind(app.id)
@@ -3223,16 +3239,16 @@ mod tests {
         let receipt = signed_transition_receipt_for_app(
             app.id,
             "2026-07-17T11:00:00Z",
-            "password",
             "auto",
+            "password",
             &quote_hash,
             &signing_key,
         );
         let verified_receipt = verify_transition_receipt(
             &receipt,
             &app,
-            RequestedUnlockMode::Password,
             RequestedUnlockMode::Auto,
+            RequestedUnlockMode::Password,
         )
         .expect("verify duplicate test receipt");
         let attestation = transition_attestation_for_domain(
@@ -3253,7 +3269,7 @@ mod tests {
                 app_name: &app.name,
                 observed_authority: &authority,
                 source_deployment_id,
-                requested: RequestedUnlockMode::Auto,
+                requested: RequestedUnlockMode::Password,
                 receipt: &receipt,
                 transition_attestation: &attestation,
                 verified_receipt: &verified_receipt,
@@ -3283,7 +3299,7 @@ mod tests {
                 app_name: &app.name,
                 observed_authority: &authority,
                 source_deployment_id,
-                requested: RequestedUnlockMode::Auto,
+                requested: RequestedUnlockMode::Password,
                 receipt: &receipt,
                 transition_attestation: &attestation,
                 verified_receipt: &verified_receipt,
@@ -3328,7 +3344,7 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .expect("load committed unlock mode");
-        assert_eq!(persisted_mode, "auto");
+        assert_eq!(persisted_mode, "password");
         let receipt_count: i64 =
             sqlx::query_scalar("SELECT count(*) FROM unlock_transition_receipts WHERE app_id = $1")
                 .bind(app.id)
@@ -3379,16 +3395,16 @@ mod tests {
         let receipt = signed_transition_receipt_for_app(
             app.id,
             "2026-07-17T11:20:00Z",
-            "password",
             "auto",
+            "password",
             &quote_hash,
             &signing_key,
         );
         let verified_receipt = verify_transition_receipt(
             &receipt,
             &app,
-            RequestedUnlockMode::Password,
             RequestedUnlockMode::Auto,
+            RequestedUnlockMode::Password,
         )
         .expect("verify busy-fence test receipt");
         let attestation = transition_attestation_for_domain(
@@ -3438,7 +3454,7 @@ mod tests {
                 app_name: &app_name,
                 observed_authority: &authority,
                 source_deployment_id,
-                requested: RequestedUnlockMode::Auto,
+                requested: RequestedUnlockMode::Password,
                 receipt: &receipt,
                 transition_attestation: &attestation,
                 verified_receipt: &verified_receipt,
@@ -3486,7 +3502,7 @@ mod tests {
                 app_name: &app_name,
                 observed_authority: &authority,
                 source_deployment_id,
-                requested: RequestedUnlockMode::Auto,
+                requested: RequestedUnlockMode::Password,
                 receipt: &receipt,
                 transition_attestation: &attestation,
                 verified_receipt: &verified_receipt,
@@ -3512,5 +3528,106 @@ mod tests {
         .expect("released mutation lease admits the transition");
 
         delete_unlock_test_org(&pool, app.org_id).await;
+    }
+
+    #[tokio::test]
+    async fn commit_authority_rejects_auto_target_before_any_persistence() {
+        let pool = database_test_pool().await;
+        let UnlockTestFixture {
+            app,
+            user_id,
+            source_deployment_id,
+            authority,
+        } = insert_unlock_test_app(&pool).await;
+        let signing_key = SigningKey::from_bytes(&[25; 32]);
+        let quote_hash = "fa".repeat(32);
+        let receipt = signed_transition_receipt_for_app(
+            app.id,
+            "2026-07-17T11:30:00Z",
+            "password",
+            "auto",
+            &quote_hash,
+            &signing_key,
+        );
+        let verified_receipt = verify_transition_receipt(
+            &receipt,
+            &app,
+            RequestedUnlockMode::Password,
+            RequestedUnlockMode::Auto,
+        )
+        .expect("verify backstop test receipt");
+        let attestation = transition_attestation_for_domain(
+            app.tee_domain.as_deref().expect("test TEE domain"),
+            &signing_key,
+            &quote_hash,
+        );
+        let receipt_json = serde_json::to_value(&receipt).expect("serialize receipt");
+        let deploy_id = Uuid::new_v4();
+
+        let (status, body) = commit_unlock_mode_transition(
+            &pool,
+            UnlockModeCommitRequest {
+                org_id: app.org_id,
+                user_id,
+                app_name: &app.name,
+                observed_authority: &authority,
+                source_deployment_id,
+                requested: RequestedUnlockMode::Auto,
+                receipt: &receipt,
+                transition_attestation: &attestation,
+                verified_receipt: &verified_receipt,
+                receipt_json: &receipt_json,
+                deploy_id,
+                image_digest: None,
+                signed_workload_command: None,
+                signed_container_port: None,
+                signed_storage_paths: None,
+                signing_artifacts: None,
+                signed_policy_artifact: None,
+                descriptor_platform_binding: &EMPTY_PLATFORM_BINDING,
+                log_encryption: None,
+                api_signing_pubkey: "unused-without-signing-artifacts",
+                api_url: "https://api.example.test",
+                attestation_config: None,
+                signing_service_pubkey_hex: None,
+                signed_required: false,
+                fresh_volume_claims: enclava_engine::apply::orchestrator::FreshVolumeClaims::ALL,
+            },
+        )
+        .await
+        .expect_err("auto target must never commit");
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body.0["error"], "auto_unlock_disabled");
+
+        let deployment_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM deployments WHERE id = $1")
+                .bind(deploy_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count deployments after auto rejection");
+        assert_eq!(deployment_count, 0);
+        let receipt_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM unlock_transition_receipts WHERE app_id = $1")
+                .bind(app.id)
+                .fetch_one(&pool)
+                .await
+                .expect("count receipts after auto rejection");
+        assert_eq!(receipt_count, 0);
+        let persisted_mode: String =
+            sqlx::query_scalar("SELECT unlock_mode::text FROM apps WHERE id = $1")
+                .bind(app.id)
+                .fetch_one(&pool)
+                .await
+                .expect("load mode after auto rejection");
+        assert_eq!(persisted_mode, "auto");
+
+        delete_unlock_test_org(&pool, app.org_id).await;
+    }
+
+    #[test]
+    fn auto_unlock_disabled_rejection_is_forbidden_with_stable_code() {
+        let (status, body) = auto_unlock_disabled_error();
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body.0["error"], "auto_unlock_disabled");
     }
 }

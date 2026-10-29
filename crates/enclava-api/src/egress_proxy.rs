@@ -1,11 +1,11 @@
 //! Loopback CONNECT proxy that binds egress validation to the actual
 //! connection (issue #224 review follow-up).
 //!
-//! The sigstore and oci-client stacks build their own internal `reqwest`
-//! clients: `sigstore::cosign::ClientBuilder::build()` hardcodes
-//! `oci_client::client::Client::new(..)`, which exposes no DNS-resolver or
-//! redirect-policy injection point. A pre-flight check alone therefore
-//! leaves two gaps:
+//! The oci-client stack builds its own internal `reqwest` clients (the
+//! cosign verifier drives `oci_client::client::Client` directly since the
+//! sigstore-rust 0.15 migration), and `Client::try_from(ClientConfig)`
+//! exposes no DNS-resolver or redirect-policy injection point. A pre-flight
+//! check alone therefore leaves two gaps:
 //!
 //! 1. **DNS rebinding** — the pre-flight resolves the hostname, discards the
 //!    answers, and the transport's own resolver performs a second, unguarded
@@ -14,10 +14,10 @@
 //!    requests and point bearer-token challenges at new hosts that the
 //!    pre-flight never saw.
 //!
-//! Both `sigstore::registry::ClientConfig` and
-//! `oci_client::client::ClientConfig` DO expose `https_proxy`, and reqwest
-//! routes HTTPS requests through a proxy with CONNECT. Routing those
-//! transports through this loopback proxy closes both gaps at once: every
+//! Both the cosign verifier's `oci_client::client::ClientConfig` instances
+//! expose `https_proxy`, and reqwest
+//! routes HTTPS requests through a proxy with CONNECT. Routing that
+//! transport through this loopback proxy closes both gaps at once: every
 //! CONNECT target (initial registry host, each redirect hop, each token
 //! realm) is resolved HERE, every answer is checked against
 //! `BlockedNetworks`, and the proxy itself dials the validated address —

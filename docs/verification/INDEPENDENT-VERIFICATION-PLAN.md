@@ -760,8 +760,7 @@ In addition to phase-specific native/WASM, fixture, conformance, browser, and ad
 ```bash
 rustup run stable cargo fmt --all -- --check
 rustup run stable cargo clippy --workspace --all-targets -- -D warnings
-rustup run stable cargo test --workspace
-rustup run stable cargo test --doc
+rustup run stable cargo test --workspace -- --test-threads=1
 rustup run stable cargo audit --ignore RUSTSEC-2023-0071
 rustup run stable cargo deny check advisories sources
 rustup run stable cargo build --workspace

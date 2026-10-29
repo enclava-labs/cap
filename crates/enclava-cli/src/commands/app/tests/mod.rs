@@ -160,13 +160,14 @@ fn test_deployment_context() -> DeploymentContextResponse {
 }
 
 #[test]
-fn create_unlock_mode_validation_rejects_auto_with_workaround() {
-    // auto is a post-claim transition (via `auto-unlock enable`), never a first-deploy
-    // mode — there is no owner seed to wrap at create time.
+fn create_unlock_mode_validation_rejects_auto() {
+    // auto is hard-disabled: no enable path exists to turn a first-deploy
+    // auto app operational, so create-time validation refuses with the
+    // stable code.
     let err = validate_create_unlock_mode("auto").unwrap_err();
     assert!(
-        err.contains("auto-unlock enable"),
-        "error should name the workaround: {err}",
+        err.starts_with("auto_unlock_disabled"),
+        "refusal must carry the stable code: {err}",
     );
     assert!(validate_create_unlock_mode("password").is_ok());
 }
@@ -403,6 +404,48 @@ fn deploy_unlocks_existing_password_storage_before_config_push() {
 #[test]
 fn deploy_unlocks_existing_password_storage_even_without_config_push() {
     assert!(deploy_should_unlock_before_config(true, false, false));
+}
+
+#[test]
+fn template_version_matches_registry_requires_exact_deployed_version() {
+    assert!(template_version_matches_registry(Some("1.0.0"), "1.0.0"));
+    assert!(!template_version_matches_registry(Some("1.0.0"), "2.0.0"));
+    assert!(!template_version_matches_registry(None, "1.0.0"));
+}
+
+#[test]
+fn missing_required_config_keys_reports_only_undelivered_keys() {
+    assert_eq!(
+        missing_required_config_keys(
+            vec![
+                "DEBIAN_SSH_AUTHORIZED_KEYS".to_string(),
+                "FRP_SERVER_ADDR".to_string(),
+            ],
+            vec!["FRP_SERVER_ADDR".to_string()],
+        ),
+        vec!["DEBIAN_SSH_AUTHORIZED_KEYS".to_string()]
+    );
+    assert!(
+        missing_required_config_keys(
+            vec!["FRP_SERVER_ADDR".to_string()],
+            vec![
+                "DEBIAN_SSH_AUTHORIZED_KEYS".to_string(),
+                "FRP_SERVER_ADDR".to_string(),
+            ],
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn missing_required_config_keys_is_sorted_and_deduplicated() {
+    assert_eq!(
+        missing_required_config_keys(
+            vec!["B".to_string(), "A".to_string(), "B".to_string()],
+            std::iter::empty::<String>(),
+        ),
+        vec!["A".to_string(), "B".to_string()]
+    );
 }
 
 #[test]
@@ -1445,6 +1488,8 @@ pub(crate) async fn spawn_json_api_stub(
 /// The development JSON-only attestation path (debug builds only) lets a
 /// local TLS stub answer `attest_receipt_key` with `report_data` evidence
 /// computed from the request's nonce and leaf pin -- no AMD hardware needed.
+/// Callers must hold `crate::commands::env_lock()` (typically via
+/// `isolated_state_env`): this writes a shared environment variable.
 pub(crate) fn enable_dev_json_attestation() {
     unsafe {
         std::env::set_var("ENCLAVA_TEE_DEV_ALLOW_JSON_REPORT_DATA_ONLY", "1");
@@ -1497,10 +1542,6 @@ pub(crate) fn dev_json_attestation_body(request_target: &str) -> String {
     .to_string()
 }
 
-/// Serializes tests that point `ENCLAVA_STATE_DIR`, the dev-attestation env,
-//  or the process working directory at a fixture directory.
-static STATE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// An isolated CLI state directory: config.toml + credentials.toml pointing
 /// at a stub API, `ENCLAVA_STATE_DIR` set, and optionally the process CWD
 /// moved into the directory. Everything is restored on drop.
@@ -1545,7 +1586,7 @@ impl Drop for IsolatedStateEnv {
 /// `api_url`. `cwd_to_root` also moves the process CWD there (so
 /// `AppConfig::find_and_load` sees the directory's `enclava.toml`).
 pub(crate) fn isolated_state_env(api_url: &str, cwd_to_root: bool) -> IsolatedStateEnv {
-    let guard = STATE_ENV_LOCK.lock().unwrap();
+    let guard = crate::commands::env_lock();
     let dir = tempfile::tempdir().unwrap();
     let paths = CliPaths::from_root(dir.path().to_path_buf()).unwrap();
     paths.ensure_dirs().unwrap();
@@ -1591,7 +1632,7 @@ pub(crate) fn isolated_state_env(api_url: &str, cwd_to_root: bool) -> IsolatedSt
 mod terminal_diagnostics {
     use super::*;
     use std::net::SocketAddr;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::Mutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const SYNTHETIC_SECRET_MARKER: &str = "SECRET-MARKER-9a41e7";
@@ -1817,8 +1858,7 @@ mod terminal_diagnostics {
     /// held across synchronous set/build and clear windows, never across an
     /// await; clients read the env at build time, so later clears are inert.
     fn tls_env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+        crate::commands::env_lock()
     }
 
     fn local_tee_client(address: SocketAddr) -> TeeClient {
@@ -3659,5 +3699,79 @@ async fn bootstrap_endpoint_wait_attests_before_probing_the_claim_endpoint() {
     assert!(
         attestation < challenge,
         "attestation must precede the claim-endpoint probe: {recorded:?}"
+    );
+}
+
+#[test]
+fn status_json_payload_carries_diagnostics_with_stable_shape() {
+    let status = enclava_cli::api_types::AppStatus {
+        app_name: "demo".to_string(),
+        status: "running".to_string(),
+        pod_phase: None,
+        tee_status: Some("unlocked".to_string()),
+        unlock_status: Some("unlocked".to_string()),
+        domain: "demo.example".to_string(),
+        last_deployed: None,
+        tee_error: None,
+        observation: None,
+        deployment: None,
+    };
+
+    let missing = vec!["DEBIAN_SSH_AUTHORIZED_KEYS".to_string()];
+    let payload = status_json_payload(
+        &status,
+        &StableSshEndpointState::Ready("ssh://endpoint".to_string()),
+        Some("12s"),
+        Some(&missing),
+    )
+    .expect("serializes");
+    assert_eq!(payload["app_name"], "demo");
+    assert_eq!(payload["tee_status"], "unlocked");
+    assert_eq!(payload["stable_ssh_endpoint"]["state"], "ready");
+    assert_eq!(payload["stable_ssh_endpoint"]["endpoint"], "ssh://endpoint");
+    assert_eq!(payload["tee_acme_retry_after"], "12s");
+    assert_eq!(
+        payload["missing_config_keys"][0],
+        "DEBIAN_SSH_AUTHORIZED_KEYS"
+    );
+    assert!(payload["tee_error"].is_null(), "absent fields stay null");
+
+    // Every non-ready state keeps the endpoint key as explicit null, and an
+    // unverified completeness check must not read as verified-complete ([]).
+    for (state, name) in [
+        (StableSshEndpointState::Missing, "missing"),
+        (StableSshEndpointState::Invalid, "invalid"),
+        (
+            StableSshEndpointState::NotStableTemplate,
+            "not_stable_template",
+        ),
+        (StableSshEndpointState::Unknown, "unknown"),
+    ] {
+        let payload = status_json_payload(&status, &state, None, None).expect("serializes");
+        assert_eq!(payload["stable_ssh_endpoint"]["state"], name);
+        assert!(
+            payload["stable_ssh_endpoint"]
+                .get("endpoint")
+                .is_some_and(|value| value.is_null()),
+            "{name} keeps the endpoint key as null"
+        );
+        assert!(
+            payload["missing_config_keys"].is_null(),
+            "{name}: an unverified completeness check serializes as null"
+        );
+        assert!(payload["tee_acme_retry_after"].is_null());
+    }
+
+    let payload = status_json_payload(
+        &status,
+        &StableSshEndpointState::NotStableTemplate,
+        None,
+        Some(&[]),
+    )
+    .expect("serializes");
+    assert_eq!(
+        payload["missing_config_keys"],
+        serde_json::json!([]),
+        "[] means the check ran and found none missing"
     );
 }

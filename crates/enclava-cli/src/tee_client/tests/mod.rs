@@ -3,13 +3,12 @@ use super::{
 };
 use sev::parser::ByteParser;
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    crate::env_lock()
 }
 
 #[test]

@@ -1006,6 +1006,9 @@ async fn deploy_app_candidate(
     app_mutation: AppMutation,
     honor_customer_config_roll_hold: bool,
 ) -> Result<(StatusCode, Json<DeploymentResponse>), (StatusCode, Json<serde_json::Value>)> {
+    if app.unlock_mode == crate::models::UnlockMode::Auto {
+        return Err(crate::routes::apps::auto_unlock_disabled_response());
+    }
     if app_mutation != AppMutation::Insert
         && let Some(error) = runtime_reapply_status_error(app.status)
     {
@@ -2138,10 +2141,29 @@ pub async fn deployment_history(
         )
     })?;
 
+    // The recorded rows only learn a terminal runtime failure (e.g. a
+    // guest start error) when the apply job gives up; the live
+    // deployment-scoped overlay marks exactly that row `failed` with its
+    // bounded code here instead, so a waiting client observes the real
+    // terminal state from this same history endpoint (cap#335).
+    let observed =
+        crate::routes::status::observe_app_status_for_deployment(&state, &app, None).await;
+
     Ok(Json(
         deployments
             .into_iter()
-            .map(|d| DeploymentResponse::from_deployment(d, &app))
+            .map(|d| {
+                let runtime_failure = observed
+                    .runtime_failure_matches_deployment(d.id)
+                    .then(|| observed.runtime_failure_public_message())
+                    .flatten();
+                let mut response = DeploymentResponse::from_deployment(d, &app);
+                if let Some(runtime_failure) = runtime_failure {
+                    response.status = "failed".to_string();
+                    response.error_message = Some(runtime_failure);
+                }
+                response
+            })
             .collect(),
     ))
 }
@@ -2230,6 +2252,54 @@ mod tests {
             .fetch_one(pool)
             .await
             .expect("load setup test app")
+    }
+
+    #[tokio::test]
+    async fn stored_auto_deploys_are_rejected_before_validation_or_persistence() {
+        let pool = database_test_pool().await;
+        let mut app = insert_setup_test_app(&pool).await;
+        app.unlock_mode = crate::models::UnlockMode::Auto;
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.require_customer_signed_policy_artifact = false;
+
+        for blob in [None, Some("malformed-signed-input")] {
+            let auth = AuthContext {
+                user_id: Uuid::new_v4(),
+                org_id: app.org_id,
+                org_name: "auto-refusal-test".to_string(),
+                role: crate::models::Role::Owner,
+                api_key: None,
+                management_origin: crate::auth::middleware::ManagementOrigin::Public,
+            };
+            let body = serde_json::from_value(serde_json::json!({
+                "image": "not an image",
+                "customer_descriptor_blob": blob,
+                "org_keyring_blob": blob
+            }))
+            .expect("decode deploy request");
+            let error = deploy_app_candidate(
+                auth,
+                state.clone(),
+                app.clone(),
+                body,
+                AppMutation::None,
+                false,
+            )
+            .await
+            .expect_err("auto deployment must be refused before validating its inputs");
+            assert_eq!(error.0, StatusCode::FORBIDDEN);
+            assert_eq!(error.1.0["error"], "auto_unlock_disabled");
+        }
+
+        let deployments: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM deployments WHERE app_id = $1")
+                .bind(app.id)
+                .fetch_one(&pool)
+                .await
+                .expect("inspect rejected deployment side effects");
+        assert_eq!(deployments, 0);
+        delete_setup_test_org(&pool, app.org_id).await;
     }
 
     async fn insert_authority_rows(

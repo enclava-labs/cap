@@ -23,8 +23,7 @@ pub(crate) fn detect_dockerfile_port(path: &Path) -> Option<u16> {
 
 /// Default app name derived from the current project directory.
 fn interactive_session() -> bool {
-    use std::io::IsTerminal;
-    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
+    super::interactive::prompts_available()
 }
 
 pub(crate) fn default_app_name(cwd: &Path) -> String {

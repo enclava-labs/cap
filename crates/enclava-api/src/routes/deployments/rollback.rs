@@ -143,6 +143,11 @@ pub async fn rollback(
     if let Some(error) = super::runtime_reapply_status_error(app.status) {
         return Err(json_error(StatusCode::CONFLICT, error));
     }
+    // A stored-auto app must not roll back into an auto-unlock workload;
+    // refuse before queueing anything.
+    if app.unlock_mode == crate::models::UnlockMode::Auto {
+        return Err(crate::routes::apps::auto_unlock_disabled_response());
+    }
 
     let implicit_target = body.deployment_id.is_none();
     let prev: Deployment = if let Some(deployment_id) = body.deployment_id {

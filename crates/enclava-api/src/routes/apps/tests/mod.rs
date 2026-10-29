@@ -852,6 +852,25 @@ fn derive_identity_rejects_oversized_generated_namespace() {
     assert!(error.contains("namespace longer than 63 characters"));
 }
 
+#[test]
+fn derive_identity_refuses_auto_unlock_and_generates_no_bootstrap_key() {
+    // Shared create authority: public, hosted, and generic create-if-missing
+    // all derive identity here, so an explicit auto request must be refused
+    // with the stable code instead of generating a platform bootstrap key.
+    for mode in ["auto", "auto-unlock"] {
+        let error = derive_identity("org", uuid::Uuid::nil(), "app", mode, None).unwrap_err();
+        assert!(
+            error.starts_with("auto_unlock_disabled"),
+            "refusal must carry the stable code: {error}"
+        );
+    }
+    assert!(
+        derive_identity("org", uuid::Uuid::nil(), "app", "password", None)
+            .unwrap_err()
+            .contains("bootstrap_pubkey_hash required")
+    );
+}
+
 #[tokio::test]
 async fn list_apps_rejects_unscoped_api_key_before_database_access() {
     let result = list_apps(

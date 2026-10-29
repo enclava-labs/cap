@@ -2,7 +2,6 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::{Args, Subcommand};
 use dialoguer::{Confirm, Input, Password};
 use ed25519_dalek::{Signer, SigningKey};
-use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -69,7 +68,7 @@ pub struct ChangePasswordArgs {
 
 #[derive(Subcommand)]
 pub enum AutoUnlockCommand {
-    /// Enable automatic unlock (owner seed wrapped for KBS-attestation-gated release)
+    /// Removed: auto-unlock cannot be enabled anymore (refuses immediately)
     Enable {
         /// App name (defaults to enclava.toml app.name)
         #[arg(long)]
@@ -127,9 +126,8 @@ fn is_unimplemented_hosted(err: &ApiError) -> bool {
 }
 
 /// Capability preflight before any TEE mutation (the seal at
-/// `tee.enable_auto_unlock`/`tee.disable_auto_unlock` must never run before
-/// this passes — enclava-paas#189's half-enabled residue is exactly what this
-/// guards).
+/// `tee.disable_auto_unlock` must never run before this passes —
+/// enclava-paas#189's half-enabled residue is exactly what this guards).
 ///
 /// The probe carries an intentionally invalid mode, so it can never be a
 /// valid mutation: every handler lineage parses the mode string before
@@ -340,8 +338,8 @@ pub(crate) fn ensure_claim_session_now(
     password_from_file: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     ensure_claim_session_for(
-        std::io::IsTerminal::is_terminal(&std::io::stdin()),
-        std::io::IsTerminal::is_terminal(&std::io::stderr()),
+        super::interactive::stdin_interactive(),
+        super::interactive::stderr_interactive(),
         password_from_file,
     )
 }
@@ -375,8 +373,8 @@ pub(crate) fn prepare_recovery_mnemonic_sink(
         org,
         app,
         capture,
-        io::stdin().is_terminal(),
-        io::stderr().is_terminal(),
+        super::interactive::stdin_interactive(),
+        super::interactive::stderr_interactive(),
         password_from_file,
     )
 }
@@ -517,7 +515,7 @@ pub async fn recover(args: RecoverArgs) -> Result<(), Box<dyn std::error::Error>
         TeeClient::new_for_ownership_with_resolve_ip(&endpoint.tee_url, endpoint.tee_resolve_ip);
     let (_attestation, tee) = tee.attest_receipt_key().await?;
 
-    let is_tty = io::stdin().is_terminal();
+    let is_tty = super::interactive::stdin_interactive();
 
     // An explicit file must take priority even when local state is unreadable.
     let mnemonic = match load_recovery_mnemonic(
@@ -547,13 +545,13 @@ pub async fn recover(args: RecoverArgs) -> Result<(), Box<dyn std::error::Error>
         }
     };
 
-    let new_password = match args.new_password_file.as_ref() {
-        Some(path) => keys::read_secret_file(path, "new password")?,
-        None => Password::new()
-            .with_prompt("New unlock password")
-            .with_confirmation("Confirm password", "Passwords don't match")
-            .interact()?,
-    };
+    let new_password = secret_from_file_or_prompt(
+        args.new_password_file.as_deref(),
+        "new password",
+        "New unlock password",
+        Some(("Confirm password", "Passwords don't match")),
+        "--new-password-file",
+    )?;
 
     println!("Recovering {app_name}...");
     if let Err(err) = tee.recover(&mnemonic, &new_password).await {
@@ -652,8 +650,8 @@ pub(crate) fn secret_from_file_or_prompt(
         prompt,
         confirmation,
         flag,
-        io::stdin().is_terminal(),
-        io::stderr().is_terminal(),
+        super::interactive::stdin_interactive(),
+        super::interactive::stderr_interactive(),
     )
 }
 
@@ -721,87 +719,12 @@ pub async fn change_password(args: ChangePasswordArgs) -> Result<(), Box<dyn std
 
 pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
-        AutoUnlockCommand::Enable {
-            app,
-            image,
-            password_file,
-        } => {
-            let app_name = resolve_app_name(&app)?;
-            let (api, paths) = build_api_client()?;
-            ensure_unlock_mode_change_supported(&api, &app_name).await?;
-            let cli_config = config::load_config(&paths)?;
-            let creds = config::load_credentials(&paths)?;
-            let app_config = AppConfig::find_and_load()?;
-            let app_meta = api.get_app(&app_name).await?;
-            // Resolve the local password source before any remote mutation:
-            // blob signing bootstraps the org keyring/signing authority, and a
-            // missing or unreadable --password-file must not leave that
-            // half-done for a command that never ran.
-            let password = secret_from_file_or_prompt(
-                password_file.as_deref(),
-                "password",
-                "Unlock password (to authorize auto-unlock wrapping)",
-                None,
-                "--password-file",
-            )?;
-            println!("Signing auto-unlock redeploy descriptor for {app_name}...");
-            let signed_blobs =
-                super::app::build_signed_deploy_blobs(super::app::SignedDeployBlobParams {
-                    api: &api,
-                    paths: &paths,
-                    cli_config: &cli_config,
-                    creds: &creds,
-                    app: &app_meta,
-                    app_config: &app_config,
-                    image: &image,
-                    target_unlock_mode: Some("auto"),
-                    workload_security_profile: WorkloadSecurityProfile::Restricted,
-                })
-                .await?;
-            let endpoint = resolve_tee_endpoint(&api, &app_name).await?;
-            let tee = TeeClient::new_with_resolve_ip(&endpoint.tee_url, endpoint.tee_resolve_ip);
-            let (mut transition_attestation, tee) = tee.attest_receipt_key().await?;
-            // CRL collateral is transition-specific: fetch it here, not in
-            // the shared attestation path, so ordinary TEE operations keep
-            // working through a KDS outage.
-            tee.complete_transition_quote_crl(&mut transition_attestation)
-                .await?;
-
-            println!("Enabling auto-unlock for {app_name}...");
-            tee.enable_auto_unlock(&password).await?;
-            println!("KBS-gated seed wrap created inside the TEE.");
-
-            let transition_receipt = tee
-                .sign_unlock_mode_transition(
-                    &app_meta.id,
-                    &app_meta.unlock_mode,
-                    "auto",
-                    &transition_attestation,
-                )
-                .await?;
-            let transition = api
-                .update_unlock_mode(
-                    &app_name,
-                    &UpdateUnlockModeRequest {
-                        mode: "auto-unlock".to_string(),
-                        transition_receipt: Some(transition_receipt),
-                        transition_attestation: Some(transition_attestation),
-                        customer_descriptor_blob: Some(signed_blobs.customer_descriptor_blob),
-                        org_keyring_blob: Some(signed_blobs.org_keyring_blob),
-                        signed_policy_artifact: Some(signed_blobs.signed_policy_artifact),
-                    },
-                )
-                .await?;
-            match transition.deployment_id {
-                Some(id) => println!(
-                    "CAP unlock mode updated to {}. Redeploy started: {id}",
-                    transition.unlock_mode
-                ),
-                None => println!("CAP unlock mode already set to {}.", transition.unlock_mode),
-            }
-            println!("Auto-unlock enabled. Restarts no longer require a password.");
-            Ok(())
-        }
+        AutoUnlockCommand::Enable { .. } => Err(
+            "auto_unlock_disabled: auto-unlock enable is no longer available; \
+             apps use password unlock, and `enclava auto-unlock disable` converts \
+             a legacy auto-unlock app"
+                .into(),
+        ),
         AutoUnlockCommand::Disable {
             app,
             image,
@@ -912,6 +835,24 @@ mod tests {
             400,
             Some("not_implemented_hosted")
         )));
+    }
+
+    #[tokio::test]
+    async fn enable_subcommand_refuses_before_any_remote_call() {
+        // The refusal must not depend on a local enclava.toml, stored
+        // credentials, or network reachability: dummy args must fail with the
+        // stable code before any resolution step runs.
+        let error = auto_unlock(AutoUnlockCommand::Enable {
+            app: Some("never-resolved".to_string()),
+            image: "ghcr.io/acme/app@sha256:".to_string() + &"a".repeat(64),
+            password_file: None,
+        })
+        .await
+        .expect_err("enable must refuse");
+        assert!(
+            error.to_string().starts_with("auto_unlock_disabled"),
+            "refusal must carry the stable code: {error}"
+        );
     }
 
     #[test]
@@ -1364,9 +1305,10 @@ mod tests {
     async fn auto_unlock_preflight_runs_before_manifest_load_and_tee_seals() {
         use crate::commands::app::tests::{isolated_state_env, spawn_json_api_stub};
 
-        // A hosted placeholder answer (501) aborts the command before the
-        // enclava.toml load and before any TEE contact: with no manifest in
-        // the isolated CWD and no TEE stub at all, the run must fail with
+        // Enable refuses up front (see enable_subcommand_refuses_above); for
+        // Disable, a hosted placeholder answer (501) aborts the command before
+        // the enclava.toml load and before any TEE contact: with no manifest
+        // in the isolated CWD and no TEE stub at all, the run must fail with
         // the probe's answer, not a file or connection error.
         let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let api_address = spawn_json_api_stub(events.clone(), |path| {
@@ -1379,40 +1321,31 @@ mod tests {
         .await;
         let _env = isolated_state_env(&format!("http://{api_address}"), true);
 
-        for command in [
-            AutoUnlockCommand::Enable {
-                app: Some("shell".to_string()),
-                image: "img".to_string(),
-                password_file: None,
-            },
-            AutoUnlockCommand::Disable {
-                app: Some("shell".to_string()),
-                image: "img".to_string(),
-                password_file: None,
-            },
-        ] {
-            let error = auto_unlock(command)
-                .await
-                .expect_err("the hosted placeholder must abort the command")
-                .to_string();
-            assert!(
-                error.contains("not implemented on this platform"),
-                "unexpected error: {error}"
-            );
-        }
+        let error = auto_unlock(AutoUnlockCommand::Disable {
+            app: Some("shell".to_string()),
+            image: "img".to_string(),
+            password_file: None,
+        })
+        .await
+        .expect_err("the hosted placeholder must abort the command")
+        .to_string();
+        assert!(
+            error.contains("not implemented on this platform"),
+            "unexpected error: {error}"
+        );
 
         let recorded = events.lock().unwrap().clone();
         assert_eq!(
             recorded.len(),
-            2,
-            "each arm probes exactly once: {recorded:?}"
+            1,
+            "the command probes exactly once: {recorded:?}"
         );
         assert!(
             recorded.iter().all(
                 |request| request.starts_with("PUT /apps/shell/unlock/mode ")
                     && request.contains("__capability_probe__")
             ),
-            "both arms probe once and stop: no app lookup, no manifest, no TEE seal — {recorded:?}"
+            "the command probes once and stops: no app lookup, no manifest, no TEE seal — {recorded:?}"
         );
     }
 }

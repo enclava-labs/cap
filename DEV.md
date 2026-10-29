@@ -53,11 +53,11 @@ python3 -m pytest tests
 The Python checks require `pytest`; install it in your local virtualenv if
 `python3 -m pytest` is not available.
 
-CI additionally runs doctests and, after installing `cargo-audit` and
-`cargo-deny`, the Rust dependency gates:
+CI runs the Rust dependency gates after installing `cargo-audit` and
+`cargo-deny` (workspace doctests already run inside `cargo test --workspace`,
+so CI has no separate doctest step):
 
 ```bash
-cargo test --doc
 cargo audit --ignore RUSTSEC-2023-0071
 cargo deny check advisories sources
 ```
@@ -170,6 +170,8 @@ Test runtime behavior rather than Rust source spelling, function order, or file
 layout. Route and middleware invariants must exercise the real Axum router,
 including encoded and empty path segments. CI rejects direct Rust-source reads
 in tests; declarative artifact checks and `prod-strict` build gates remain.
+The deployment freeze admits writes only for explicit method/`MatchedPath`
+pairs; newly mounted routes remain blocked until their authority is reviewed.
 
 ## Runtime Contract Notes
 

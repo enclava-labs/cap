@@ -106,6 +106,59 @@ resume that recorded deadline verbatim across restarts and release worker
 slots after each 90-second observation slice. Password owner wait remains
 separately nonterminal.
 
+### Numeric volume profiling
+
+`/run/enclava/init-stats.json` retains its version-1 boot fields and adds
+`volume_profile_version: 1` and `volume_profiles.state` / `volume_profiles.tls`.
+Read it through the tenant's authenticated connection, not Kubernetes workload
+logs. Ordinary boot failures also attempt to publish the summary; process
+termination cannot guarantee a final record. Check `init_start_unix` before
+using a retained file as evidence for a particular boot.
+
+Each volume has `device_bytes`, `scanned_bytes`, `initialized_bytes`, and a
+fixed twelve-entry `stages` array. Its indices are:
+
+| Index | Stage | Nesting |
+| --- | --- | --- |
+| 0 | Header probe / existing-keyslot inspection | Top level |
+| 1 | Full-device blank scan | Top level; fresh devices only |
+| 2 | Cryptsetup CLI format | Top level; includes the CLI's internal integrity work |
+| 3 | Libcryptsetup fallback | Top level; only after CLI failure |
+| 4 | Libcryptsetup format | Inside fallback |
+| 5 | Fallback keyslot creation | Inside fallback |
+| 6 | Fallback integrity initialization | Inside fallback |
+| 7 | Fallback integrity final sync | Reserved, always 0: the final device sync runs inside the libcryptsetup wipe counted at index 6 |
+| 8 | Header validation and sealing | Top level |
+| 9 | Authenticated open | Top level |
+| 10 | Filesystem creation | Top level; fresh devices only |
+| 11 | Mount | Top level |
+
+Entries record `calls`, `failures`, `elapsed_us`, self and reaped-child
+user/system CPU microseconds, combined `input_blocks` / `output_blocks` from
+`getrusage`, and init-cgroup throttled periods/microseconds. These block
+counters are not application bytes or a count of physical Longhorn replica
+writes. Self CPU includes other init-process threads; child usage includes
+waited-for helpers. The profiler never resets counters or falls back to an
+ancestor cgroup.
+
+`counters_available` is a bitmask: 1 = self usage, 2 = child usage, 4 = cgroup
+throttling. Combined block deltas require both usage bits. A missing bit means
+unavailable, not observed zero; `calls=0` means the stage was not reached.
+Zero `device_bytes` means its best-effort size observation was unavailable.
+`initialized_bytes` counts explicit fallback writes only: zero does not prove
+that the CLI skipped integrity initialization. No paths, formatter output,
+error text, headers, keys or tenant data enter this numeric schema.
+Per-volume elapsed time is recorded on ordinary errors as well as success.
+`volume_formatted=1` means fresh formatting and header sealing completed, even
+if a later open, mkfs or mount failed. Zero never proves an untouched device:
+a failed formatting attempt can already have changed storage. These fields
+are diagnostics, never authorization to reformat or reuse a failed volume.
+
+Stage elapsed time excludes its own counter-sampling overhead. Nested stages
+are not additive with their parents; compare top-level sums with the existing
+per-volume duration and retain the residual. Profiling does not change volume
+format/open decisions, cryptographic parameters, readiness or error handling.
+
 ## Verification Chain
 
 When policy-read mode is enabled, `enclava-init` verifies:
@@ -121,6 +174,11 @@ Any mismatch fails startup before encrypted volumes are opened or seeds are
 released. The check consumes the same signed `cc_init_data` bytes as the
 ConfigMap transport cross-check.
 
+Attestation-agent token responses are capped at 512 KiB before typed JSON
+decoding, for both declared-length and streamed bodies. EAR tokens include
+signed policy claims; larger workload commands can exceed 64 KiB without
+exceeding the supported policy size.
+
 ## TLS State
 
 Tenant Caddy receives seed and certificate material from the TLS-state volume.
@@ -130,25 +188,37 @@ writes the returned certificate chain into the shared Caddy runtime directory.
 
 ## Volume Integrity
 
-Fresh LUKS2 volumes are formatted AES-256-XTS with `hmac(sha256)` integrity
-(dm-integrity), so ciphertext tampering turns into an I/O error at read time.
-Both format paths request it: `cryptsetup luksFormat --integrity hmac-sha256`
+Fresh LUKS2 volumes use 4096-byte sectors, AES-256-XTS and `hmac(sha256)`
+integrity (dm-integrity), so ciphertext tampering becomes a read-time I/O error.
+Both format paths request the same layout: the cryptsetup CLI
 and the libcryptsetup fallback. The fallback initializes tags through a
 temporary private, no-journal mapping, then closes it; normal opens retain
 journaled integrity. Both paths write the entire data area at first format.
 
-Volumes formatted before integrity support stay as they are: they are
-detected by their LUKS2 header and opened without reformatting.
+Both format paths use a fixed Argon2id keyslot budget: **4 passes, 262144 KiB
+(256 MiB), one lane**, with benchmarking disabled. The CLI uses
+`--pbkdf argon2id --pbkdf-force-iterations 4 --pbkdf-memory 262144 --pbkdf-parallel 1`;
+the library sets the same budget for format and keyslot creation with
+`CRYPT_PBKDF_NO_BENCHMARK`. CPU throttling therefore cannot change the chosen
+work factors or add per-volume calibration. Password-to-owner-seed derivation
+is unchanged. The 512-MiB init container limit must cover the KDF plus the
+remaining process and header material.
+
+This is a greenfield format cutover: only 4096-byte, HMAC-integrity headers
+are accepted. Older 512-byte and non-integrity layouts fail closed; there is
+no conversion or compatibility path. Existing nonblank devices are never
+automatically reformatted or deleted.
 
 Encryption makes the initial zeros non-sparse: reserve the full requested
 capacity on every Longhorn replica, not just the filesystem's used bytes.
 Use native Longhorn scheduling without logical overprovisioning and retain
 its free-space reserve. Header, journal and tag overhead also reduce usable
-capacity. With 512-byte sectors, the 32-byte tags alone add 6.25% overhead.
+capacity. With 4096-byte sectors, 32-byte tags alone add 0.78125% overhead.
 
 Before changing an environment's init pin, qualify its exact Kata guest
-kernel with `cryptsetup --integrity hmac-sha256` on a disposable block PVC,
-including close/reopen and data persistence. `CONFIG_DM_INTEGRITY=y`, or a
+kernel with the 4096-byte integrity layout on disposable block storage,
+including both format paths, ext4 persistence, authenticated close/reopen and
+corruption rejection. `CONFIG_DM_INTEGRITY=y`, or a
 loadable target plus its matching module, is required separately from
 dm-crypt. A healthy existing volume is not proof: it needs no new integrity
 target. Do not enable mandatory integrity in an unqualified environment.
@@ -167,10 +237,11 @@ never-ready volume.
 cargo test -p enclava-init --lib
 ```
 
-LUKS integration tests need root, `/dev/mapper` control, dm-crypt and
-dm-integrity kernel support, `cryptsetup`, `mkfs.ext4`/`e2fsck`, and a
-writable `/run/enclava`. They use disposable backing files and random
-per-test mapper names and close their mappings even on failure:
+Run LUKS integration tests in an isolated disposable VM: they need root,
+`/dev/mapper` control, loop devices, dm-crypt and dm-integrity kernel support,
+cryptsetup 2.8.1 or newer at `/usr/local/sbin/cryptsetup`, `mkfs.ext4`, and
+tmpfs-backed `/run/enclava-luks`. They create disposable backing files and
+test mapper names. Missing prerequisites cause skips, not storage validation:
 
 ```bash
 sudo cargo test -p enclava-init --features luks-integration
