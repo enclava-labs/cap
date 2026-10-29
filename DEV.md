@@ -177,6 +177,14 @@ pairs; newly mounted routes remain blocked until their authority is reviewed.
 All three app-create paths use `insert_app_if_owner_seed_fresh` so the INSERT
 and fresh waiver read cannot drift apart; a rejected insert aborts its transaction.
 
+New signed artifacts use `accept_signed_workload_artifacts` so persistence and
+the policy generation commit together. Rollback reuses immutable artifact
+bindings and schedules its policy generation with the new durable job.
+Startup KBS and edge convergence gate dispatch and readiness; DNS propagation
+gates ACME challenge readiness. Deploy-time password and config requests use
+the SPKI-pinned client returned by attestation. Prod-strict init binds every
+handoff and diagnostic path to its compiled default, not host environment values.
+
 ## Runtime Contract Notes
 
 - Workload images and platform sidecar images that CAP wraps must include

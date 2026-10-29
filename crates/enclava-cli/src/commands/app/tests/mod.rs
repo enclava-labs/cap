@@ -3775,3 +3775,317 @@ fn status_json_payload_carries_diagnostics_with_stable_shape() {
         "[] means the check ran and found none missing"
     );
 }
+
+// --- attested-channel deploy phases ------------------------------------------
+//
+// The deploy flow may only read /status and deliver passwords/config over the
+// SPKI-pinned client `attest_receipt_key` returns; the raw token/ownership
+// client is untrusted. With no TLS-bypass env, only the pinned client can
+// reach the stub TEE at all, so these tests fail if a phase skips attestation
+// (missing tee:attest) or mutates over the raw client (TLS leaf check fails).
+
+/// Isolated state with dev-JSON attestation enabled and any ambient
+/// TLS-bypass env scrubbed while the shared env lock is held.
+fn pinned_tee_env(api_url: &str) -> IsolatedStateEnv {
+    let env = isolated_state_env(api_url, false);
+    enable_dev_json_attestation();
+    unsafe {
+        std::env::remove_var("ENCLAVA_TEE_TLS_MODE");
+        std::env::remove_var("ENCLAVA_TEE_ACCEPT_INVALID_CERTS");
+    }
+    env
+}
+
+/// Attestation answers for the failure variants: a refused endpoint, or a
+/// valid-looking attestation bound to a domain the client never asked about
+/// (wrong identity).
+fn failing_attestation_response(path: &str, refused: bool) -> (u16, String) {
+    if refused {
+        return (500, "{}".to_string());
+    }
+    let mut body: serde_json::Value =
+        serde_json::from_str(&dev_json_attestation_body(path)).unwrap();
+    body["runtime_data_binding"]["domain"] = serde_json::json!("forged.example.test");
+    (200, body.to_string())
+}
+
+fn event_position(recorded: &[String], needle: &str) -> usize {
+    recorded
+        .iter()
+        .position(|event| event.contains(needle))
+        .unwrap_or_else(|| panic!("{needle} missing from {recorded:?}"))
+}
+
+#[tokio::test]
+async fn deploy_config_push_attests_before_writing_and_syncs_each_key() {
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let tee_events = events.clone();
+    let tee_address = spawn_local_tls_server(
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        move |path| {
+            if path.starts_with("/.well-known/confidential/attestation") {
+                tee_events.lock().unwrap().push("tee:attest".to_string());
+                (200, dev_json_attestation_body(path))
+            } else if path.starts_with("/.well-known/confidential/config/") {
+                tee_events.lock().unwrap().push(format!("tee:put {path}"));
+                (200, "{}".to_string())
+            } else {
+                (404, "{}".to_string())
+            }
+        },
+    )
+    .await;
+    let api_address = spawn_json_api_stub(events.clone(), move |path| {
+        if path == "/apps/shell/config-token" {
+            (
+                200,
+                serde_json::json!({
+                    "token": "config-jwt",
+                    "tee_url": format!("https://localhost:{}", tee_address.port()),
+                    "tee_resolve_ip": "127.0.0.1"
+                }),
+            )
+        } else if path == "/apps/shell/config/sync" {
+            (200, serde_json::json!({}))
+        } else {
+            (404, serde_json::json!({}))
+        }
+    })
+    .await;
+
+    let _env = pinned_tee_env(&format!("http://{api_address}"));
+    let api = ApiClient::new(&format!("http://{api_address}"), Some("test".to_string()));
+    let pairs = vec![
+        ("K1".to_string(), "v1".to_string()),
+        ("K2".to_string(), "v2".to_string()),
+    ];
+    push_deploy_config(
+        &api,
+        "unused.example",
+        "shell",
+        DeploymentWait::new("deploy-1"),
+        &pairs,
+        &ProgressBar::hidden(),
+    )
+    .await
+    .expect("config push over the attested channel");
+
+    let recorded = events.lock().unwrap().clone();
+    let attest = event_position(&recorded, "tee:attest");
+    let k1_put = event_position(&recorded, "tee:put /.well-known/confidential/config/K1");
+    let k1_sync = event_position(&recorded, "\"key_name\":\"K1\"");
+    let k2_put = event_position(&recorded, "tee:put /.well-known/confidential/config/K2");
+    let k2_sync = event_position(&recorded, "\"key_name\":\"K2\"");
+    assert!(
+        event_position(&recorded, "POST /apps/shell/config-token") < attest
+            && attest < k1_put
+            && k1_put < k1_sync
+            && k1_sync < k2_put
+            && k2_put < k2_sync,
+        "the token fetch and attestation must precede every TEE write, and each write precedes its sync: {recorded:?}"
+    );
+}
+
+#[tokio::test]
+async fn deploy_config_push_writes_nothing_when_attestation_fails() {
+    for refused in [true, false] {
+        let tee_requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tee_address = spawn_local_tls_server(tee_requests.clone(), move |path| {
+            if path.starts_with("/.well-known/confidential/attestation") {
+                failing_attestation_response(path, refused)
+            } else {
+                (200, "{}".to_string())
+            }
+        })
+        .await;
+        let api_requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let api_address = spawn_json_api_stub(api_requests.clone(), move |path| {
+            if path == "/apps/shell/config-token" {
+                (
+                    200,
+                    serde_json::json!({
+                        "token": "config-jwt",
+                        "tee_url": format!("https://localhost:{}", tee_address.port()),
+                        "tee_resolve_ip": "127.0.0.1"
+                    }),
+                )
+            } else {
+                (200, serde_json::json!({}))
+            }
+        })
+        .await;
+
+        let _env = pinned_tee_env(&format!("http://{api_address}"));
+        let api = ApiClient::new(&format!("http://{api_address}"), Some("test".to_string()));
+        let pairs = vec![("K".to_string(), "v".to_string())];
+        let result = push_deploy_config(
+            &api,
+            "unused.example",
+            "shell",
+            DeploymentWait::new("deploy-1"),
+            &pairs,
+            &ProgressBar::hidden(),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "failed attestation (refused={refused}) must fail the config push"
+        );
+        {
+            let requests = tee_requests.lock().unwrap();
+            assert!(
+                requests.len() == 1
+                    && requests[0].starts_with("GET /.well-known/confidential/attestation"),
+                "exactly the failed attestation may reach the TEE; no mutation (refused={refused}): {requests:?}"
+            );
+        }
+        assert!(
+            !api_requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request.contains("/config/sync")),
+            "no config sync may follow a failed attestation (refused={refused})"
+        );
+    }
+}
+
+#[tokio::test]
+async fn deploy_unlock_attests_before_status_read_and_password_unlock() {
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let tee_events = events.clone();
+    let unlocked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let tee_unlocked = unlocked.clone();
+    let tee_address = spawn_local_tls_server(
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        move |path| {
+            if path.starts_with("/.well-known/confidential/attestation") {
+                tee_events.lock().unwrap().push("tee:attest".to_string());
+                (200, dev_json_attestation_body(path))
+            } else if path.ends_with("/status") {
+                tee_events.lock().unwrap().push("tee:status".to_string());
+                let state = if tee_unlocked.load(std::sync::atomic::Ordering::SeqCst) {
+                    "unlocked"
+                } else {
+                    "locked"
+                };
+                (
+                    200,
+                    serde_json::json!({ "unlock_state": state }).to_string(),
+                )
+            } else if path.ends_with("/unlock") {
+                tee_unlocked.store(true, std::sync::atomic::Ordering::SeqCst);
+                tee_events.lock().unwrap().push("tee:unlock".to_string());
+                (200, "{}".to_string())
+            } else {
+                (404, "{}".to_string())
+            }
+        },
+    )
+    .await;
+    let api_address = spawn_json_api_stub(events.clone(), move |path| {
+        if path == "/apps/shell/unlock/endpoint" {
+            (
+                200,
+                serde_json::json!({
+                    "tee_url": format!("https://localhost:{}", tee_address.port()),
+                    "tee_resolve_ip": "127.0.0.1",
+                    "unlock_endpoint": format!("https://localhost:{}/unlock", tee_address.port()),
+                    "claim_endpoint": format!("https://localhost:{}/bootstrap/claim", tee_address.port()),
+                }),
+            )
+        } else {
+            (404, serde_json::json!({}))
+        }
+    })
+    .await;
+
+    let env = pinned_tee_env(&format!("http://{api_address}"));
+    let password_file = env.paths().root.join("storage-password");
+    std::fs::write(&password_file, "hunter2\n").unwrap();
+    let storage_password = StoragePasswordInput::from_file_option(Some(&password_file)).unwrap();
+    let api = ApiClient::new(&format!("http://{api_address}"), Some("test".to_string()));
+    ensure_password_storage_unlocked_for_config(
+        &api,
+        "shell",
+        DeploymentWait::new("deploy-1"),
+        &ProgressBar::hidden(),
+        &storage_password,
+    )
+    .await
+    .expect("unlock over the attested channel");
+
+    let recorded = events.lock().unwrap().clone();
+    let attest = event_position(&recorded, "tee:attest");
+    let status = event_position(&recorded, "tee:status");
+    let unlock = event_position(&recorded, "tee:unlock");
+    assert!(
+        event_position(&recorded, "GET /apps/shell/unlock/endpoint") < attest
+            && attest < status
+            && status < unlock,
+        "attestation must precede the status read and the password unlock: {recorded:?}"
+    );
+}
+
+#[tokio::test]
+async fn deploy_unlock_touches_nothing_when_attestation_fails() {
+    for refused in [true, false] {
+        let tee_requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tee_address = spawn_local_tls_server(tee_requests.clone(), move |path| {
+            if path.starts_with("/.well-known/confidential/attestation") {
+                failing_attestation_response(path, refused)
+            } else {
+                (200, "{}".to_string())
+            }
+        })
+        .await;
+        let api_address = spawn_json_api_stub(
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            move |path| {
+                if path == "/apps/shell/unlock/endpoint" {
+                    (
+                        200,
+                        serde_json::json!({
+                            "tee_url": format!("https://localhost:{}", tee_address.port()),
+                            "tee_resolve_ip": "127.0.0.1",
+                            "unlock_endpoint": format!("https://localhost:{}/unlock", tee_address.port()),
+                            "claim_endpoint": format!("https://localhost:{}/bootstrap/claim", tee_address.port()),
+                        }),
+                    )
+                } else {
+                    (404, serde_json::json!({}))
+                }
+            },
+        )
+        .await;
+
+        let env = pinned_tee_env(&format!("http://{api_address}"));
+        let password_file = env.paths().root.join("storage-password");
+        std::fs::write(&password_file, "hunter2\n").unwrap();
+        let storage_password =
+            StoragePasswordInput::from_file_option(Some(&password_file)).unwrap();
+        let api = ApiClient::new(&format!("http://{api_address}"), Some("test".to_string()));
+        let result = ensure_password_storage_unlocked_for_config(
+            &api,
+            "shell",
+            DeploymentWait::new("deploy-1"),
+            &ProgressBar::hidden(),
+            &storage_password,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "failed attestation (refused={refused}) must fail the unlock phase"
+        );
+        {
+            let requests = tee_requests.lock().unwrap();
+            assert!(
+                requests.len() == 1
+                    && requests[0].starts_with("GET /.well-known/confidential/attestation"),
+                "exactly the failed attestation may reach the TEE; no status read or unlock (refused={refused}): {requests:?}"
+            );
+        }
+    }
+}

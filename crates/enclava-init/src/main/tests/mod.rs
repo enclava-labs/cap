@@ -1357,21 +1357,45 @@ fn log_encryption_handoff_uses_single_cc_init_data_snapshot() {
 }
 
 #[test]
-fn init_surface_env_overrides_resolve_through_env_override() {
+fn init_surface_accessors_enforce_build_mode() {
     let _env_lock = FAILURE_ENV_LOCK.lock().unwrap();
     let dir = tempdir().unwrap();
-    for var in [
-        "ENCLAVA_INIT_READY_FILE",
-        "ENCLAVA_INIT_ERROR_FILE",
-        "ENCLAVA_INIT_STAGE_FILE",
-        "ENCLAVA_INIT_STARTED_DIR",
-        "ENCLAVA_INIT_ACME_COOLDOWN_FILE",
-        "ENCLAVA_INIT_TERMINATION_LOG",
+    for (var, resolve, default) in [
+        (
+            "ENCLAVA_INIT_READY_FILE",
+            ready_file_path as fn() -> PathBuf,
+            DEFAULT_READY_FILE,
+        ),
+        (
+            "ENCLAVA_INIT_ERROR_FILE",
+            error_file_path,
+            DEFAULT_ERROR_FILE,
+        ),
+        (
+            "ENCLAVA_INIT_STAGE_FILE",
+            stage_file_path,
+            DEFAULT_STAGE_FILE,
+        ),
+        (
+            "ENCLAVA_INIT_STARTED_DIR",
+            started_dir_path,
+            "/run/enclava/containers",
+        ),
+        (
+            "ENCLAVA_INIT_ACME_COOLDOWN_FILE",
+            acme_cooldown_file_path,
+            DEFAULT_ACME_COOLDOWN_FILE,
+        ),
+        (
+            "ENCLAVA_INIT_TERMINATION_LOG",
+            termination_log_path,
+            "/dev/termination-log",
+        ),
     ] {
         let previous = std::env::var_os(var);
         let custom = dir.path().join(var);
         unsafe { std::env::set_var(var, &custom) };
-        let resolved = init_surface_path(var, "/enclava-default");
+        let resolved = resolve();
         match previous {
             Some(value) => unsafe { std::env::set_var(var, value) },
             None => unsafe { std::env::remove_var(var) },
@@ -1379,7 +1403,7 @@ fn init_surface_env_overrides_resolve_through_env_override() {
         let expected = if cfg!(feature = "prod-strict") {
             // Prod-strict binds surfaces to compiled defaults only: the
             // host-controlled pod environment must not redirect them.
-            PathBuf::from("/enclava-default")
+            PathBuf::from(default)
         } else {
             custom
         };

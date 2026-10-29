@@ -272,6 +272,10 @@ fn started_dir_path() -> PathBuf {
     init_surface_path("ENCLAVA_INIT_STARTED_DIR", "/run/enclava/containers")
 }
 
+fn termination_log_path() -> PathBuf {
+    init_surface_path("ENCLAVA_INIT_TERMINATION_LOG", "/dev/termination-log")
+}
+
 /// Resolve the path of an init output surface (ready/error/stage/started/
 /// termination/cooldown files).
 ///
@@ -378,8 +382,7 @@ fn record_failure_file(safe_json: &str) {
     if let Err(err) = writes::atomic_write(&path, body.as_bytes(), 0o644) {
         eprintln!("enclava-init: failed to write init error file: {err}");
     }
-    let termination_path =
-        init_surface_path("ENCLAVA_INIT_TERMINATION_LOG", "/dev/termination-log");
+    let termination_path = termination_log_path();
     if let Err(err) = write_termination_log_in_place(&termination_path, body.as_bytes()) {
         eprintln!("enclava-init: failed to write termination log: {err}");
     }

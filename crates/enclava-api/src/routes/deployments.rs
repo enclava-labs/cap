@@ -1969,14 +1969,18 @@ async fn deploy_app_candidate(
     if let (Some(artifacts), Some(signed)) =
         (signing_artifacts.as_ref(), signed_policy_artifact.as_ref())
     {
-        crate::signing_service::persist_workload_artifacts(
-            &mut *tx, app.id, deploy_id, artifacts, signed,
+        crate::signing_service::accept_signed_workload_artifacts(
+            &mut tx, app.id, deploy_id, artifacts, signed,
         )
         .await
-        .map_err(signing_error_response)?;
-        crate::kbs::enqueue_signed_policy_reconciliation(&mut tx)
-            .await
-            .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+        .map_err(|error| match error {
+            crate::signing_service::SignedAcceptanceError::Artifact(error) => {
+                signing_error_response(error)
+            }
+            crate::signing_service::SignedAcceptanceError::Policy(_) => {
+                json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
+            }
+        })?;
     } else {
         // An unsigned generation makes a previously-current signed artifact
         // ineligible.  Persist revocation intent atomically with acceptance;

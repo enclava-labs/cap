@@ -1625,16 +1625,14 @@ pub async fn load_stored_customer_authority_in_tx(
     }))
 }
 
-pub async fn persist_workload_artifacts<'e, E>(
-    executor: E,
+// Keep raw insertion private so production acceptance always schedules reconciliation.
+async fn insert_workload_artifact_row(
+    executor: &mut sqlx::PgConnection,
     app_id: Uuid,
     deploy_id: Uuid,
     artifacts: &DeploymentSigningArtifacts,
     signed_policy_artifact: &SignedPolicyArtifact,
-) -> Result<(), SigningServiceError>
-where
-    E: Executor<'e, Database = Postgres>,
-{
+) -> Result<(), SigningServiceError> {
     let descriptor_payload = serde_json::to_value(&artifacts.descriptor)?;
     let org_keyring_payload = serde_json::to_value(&artifacts.org_keyring)?;
     let signed_policy_artifact = serde_json::to_value(signed_policy_artifact)?;
@@ -1660,6 +1658,51 @@ where
     .await?;
 
     Ok(())
+}
+
+/// Test fixtures that stage pre-existing artifact rows (never new
+/// acceptances) may insert the row directly.
+#[cfg(test)]
+pub(crate) async fn insert_workload_artifact_fixture(
+    executor: &mut sqlx::PgConnection,
+    app_id: Uuid,
+    deploy_id: Uuid,
+    artifacts: &DeploymentSigningArtifacts,
+    signed_policy_artifact: &SignedPolicyArtifact,
+) -> Result<(), SigningServiceError> {
+    insert_workload_artifact_row(
+        executor,
+        app_id,
+        deploy_id,
+        artifacts,
+        signed_policy_artifact,
+    )
+    .await
+}
+
+// Callers expose different errors for artifact validation and policy scheduling.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SignedAcceptanceError {
+    #[error(transparent)]
+    Artifact(SigningServiceError),
+    #[error(transparent)]
+    Policy(crate::kbs::KbsPolicyError),
+}
+
+/// Persist new signed artifacts and schedule reconciliation in the caller's transaction.
+pub(crate) async fn accept_signed_workload_artifacts(
+    tx: &mut Transaction<'_, Postgres>,
+    app_id: Uuid,
+    deploy_id: Uuid,
+    artifacts: &DeploymentSigningArtifacts,
+    signed_policy_artifact: &SignedPolicyArtifact,
+) -> Result<i64, SignedAcceptanceError> {
+    insert_workload_artifact_row(tx, app_id, deploy_id, artifacts, signed_policy_artifact)
+        .await
+        .map_err(SignedAcceptanceError::Artifact)?;
+    crate::kbs::enqueue_signed_policy_reconciliation(tx)
+        .await
+        .map_err(SignedAcceptanceError::Policy)
 }
 
 /// Test-support re-exports: canonical keyring bytes and keyring types for

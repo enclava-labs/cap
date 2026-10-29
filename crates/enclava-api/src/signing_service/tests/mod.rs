@@ -2038,3 +2038,134 @@ fn required_seal_policy_still_accepts_modern_render() {
     assert!(!binding.omit_luks2_header_seal_claim);
     assert!(!binding.omit_log_encryption_claim);
 }
+
+async fn insert_acceptance_test_deployment(pool: &sqlx::PgPool, descriptor: &DeploymentDescriptor) {
+    let suffix = descriptor.org_id.simple().to_string();
+    sqlx::query("INSERT INTO organizations (id, name, cust_slug) VALUES ($1, $2, $3)")
+        .bind(descriptor.org_id)
+        .bind(format!("acceptance-test-{suffix}"))
+        .bind(&suffix[..8])
+        .execute(pool)
+        .await
+        .expect("insert acceptance test organization");
+    sqlx::query(
+        "INSERT INTO apps (
+             id, org_id, name, namespace, instance_id, tenant_id,
+             service_account, bootstrap_owner_pubkey_hash,
+             tenant_instance_identity_hash, domain, tee_domain
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+    )
+    .bind(descriptor.app_id)
+    .bind(descriptor.org_id)
+    .bind(&descriptor.app_name)
+    .bind(&descriptor.namespace)
+    .bind(format!("instance-{suffix}"))
+    .bind(&descriptor.org_slug)
+    .bind(&descriptor.service_account)
+    .bind("11".repeat(32))
+    .bind("22".repeat(32))
+    .bind(&descriptor.app_domain)
+    .bind(&descriptor.tee_domain)
+    .execute(pool)
+    .await
+    .expect("insert acceptance test app");
+    // A historical terminal row needs no unrelated durable apply-job fixture.
+    sqlx::query(
+        "INSERT INTO deployments (
+             id, org_id, app_id, trigger, status, spec_snapshot, image_digest
+         ) VALUES ($1, $2, $3, 'api', 'failed', $4, $5)",
+    )
+    .bind(descriptor.deploy_id)
+    .bind(descriptor.org_id)
+    .bind(descriptor.app_id)
+    .bind(serde_json::json!({"image": &descriptor.image_ref}))
+    .bind(&descriptor.image_digest)
+    .execute(pool)
+    .await
+    .expect("insert acceptance test deployment");
+}
+
+fn acceptance_test_artifacts(
+    descriptor: &DeploymentDescriptor,
+) -> (DeploymentSigningArtifacts, SignedPolicyArtifact) {
+    let artifacts = signing_artifacts(descriptor.clone());
+    let signed = signed_policy_artifact(&artifacts, &SigningKey::from_bytes(&[0x77; 32]));
+    (artifacts, signed)
+}
+
+async fn accepted_counts(pool: &sqlx::PgPool, app_id: Uuid) -> (i64, i64) {
+    sqlx::query_as(
+        "SELECT (SELECT count(*) FROM workload_artifacts WHERE app_id = $1),
+                (SELECT desired_generation FROM kbs_signed_policy_reconciliation
+                  WHERE singleton)",
+    )
+    .bind(app_id)
+    .fetch_one(pool)
+    .await
+    .expect("count accepted artifacts and desired generation")
+}
+
+#[tokio::test]
+async fn signed_acceptance_commits_artifact_and_generation_together() {
+    let _singleton = crate::test_support::SIGNED_POLICY_SINGLETON_LOCK
+        .lock()
+        .await;
+    let (_cleanup, pool) =
+        crate::test_support::isolated_database_test_pool("cap340_accept_commit").await;
+    let descriptor = descriptor();
+    insert_acceptance_test_deployment(&pool, &descriptor).await;
+    let (artifacts, signed) = acceptance_test_artifacts(&descriptor);
+
+    let mut tx = pool.begin().await.expect("begin acceptance");
+    let generation = accept_signed_workload_artifacts(
+        &mut tx,
+        descriptor.app_id,
+        descriptor.deploy_id,
+        &artifacts,
+        &signed,
+    )
+    .await
+    .expect("accept signed artifacts");
+    assert_eq!(generation, 1, "fresh singleton starts at generation one");
+    tx.commit().await.expect("commit acceptance");
+
+    assert_eq!(
+        accepted_counts(&pool, descriptor.app_id).await,
+        (1, 1),
+        "artifact row and reconciliation generation must commit as one"
+    );
+
+    crate::test_support::drop_isolated_database("cap340_accept_commit", pool).await;
+}
+
+#[tokio::test]
+async fn signed_acceptance_rolls_back_artifact_and_generation_together() {
+    let _singleton = crate::test_support::SIGNED_POLICY_SINGLETON_LOCK
+        .lock()
+        .await;
+    let (_cleanup, pool) =
+        crate::test_support::isolated_database_test_pool("cap340_accept_rollback").await;
+    let descriptor = descriptor();
+    insert_acceptance_test_deployment(&pool, &descriptor).await;
+    let (artifacts, signed) = acceptance_test_artifacts(&descriptor);
+
+    let mut tx = pool.begin().await.expect("begin acceptance");
+    accept_signed_workload_artifacts(
+        &mut tx,
+        descriptor.app_id,
+        descriptor.deploy_id,
+        &artifacts,
+        &signed,
+    )
+    .await
+    .expect("accept signed artifacts");
+    tx.rollback().await.expect("abort acceptance");
+
+    assert_eq!(
+        accepted_counts(&pool, descriptor.app_id).await,
+        (0, 0),
+        "an aborted acceptance must leave neither the artifact row nor the bump"
+    );
+
+    crate::test_support::drop_isolated_database("cap340_accept_rollback", pool).await;
+}

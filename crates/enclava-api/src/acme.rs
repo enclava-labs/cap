@@ -369,19 +369,13 @@ async fn issue_dns01_certificate_attempt(
                 )
                 .await?;
             challenge_records.push(record);
-            if let Err(err) = timing
-                .measure(
-                    Phase::DnsVisibility,
-                    wait_for_txt_record(&record_name, &record_value, acme_config, timing),
-                )
-                .await
-            {
-                cleanup_challenges(http_client, dns_config, &challenge_records, timing).await;
-                return Err(err);
-            }
-            timing
-                .measure(Phase::AcmeChallengeReady, challenge.set_ready())
-                .await?;
+            await_propagation_then_ready(
+                wait_for_txt_record(&record_name, &record_value, acme_config, timing),
+                || async { challenge.set_ready().await },
+                || cleanup_challenges(http_client, dns_config, &challenge_records, timing),
+                timing,
+            )
+            .await?;
         }
     }
 
@@ -434,6 +428,29 @@ async fn wait_for_txt_record(
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
+}
+
+// Construct the CA operation only after DNS propagation succeeds.
+async fn await_propagation_then_ready<PropagateFut, ReadyFut, CleanupFut, E>(
+    propagate: PropagateFut,
+    ready: impl FnOnce() -> ReadyFut,
+    cleanup: impl FnOnce() -> CleanupFut,
+    timing: RequestTiming,
+) -> Result<(), AcmeError>
+where
+    PropagateFut: Future<Output = Result<(), AcmeError>>,
+    ReadyFut: Future<Output = Result<(), E>>,
+    CleanupFut: Future<Output = ()>,
+    E: Into<AcmeError>,
+{
+    if let Err(err) = timing.measure(Phase::DnsVisibility, propagate).await {
+        cleanup().await;
+        return Err(err);
+    }
+    timing
+        .measure(Phase::AcmeChallengeReady, ready())
+        .await
+        .map_err(Into::into)
 }
 
 async fn lookup_txt(
@@ -1539,5 +1556,69 @@ mod tests {
         );
         assert_eq!(diagnostic.code, IssuanceFailureCode::Failed);
         assert_eq!(diagnostic.retry_after, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ca_ready_signal_waits_for_dns_propagation_to_finish() {
+        let signaled = std::cell::Cell::new(false);
+        let result = tokio::time::timeout(
+            Duration::from_secs(60),
+            await_propagation_then_ready(
+                std::future::pending::<Result<(), AcmeError>>(),
+                || {
+                    signaled.set(true);
+                    std::future::ready(Ok::<(), AcmeError>(()))
+                },
+                || async {},
+                RequestTiming::new(),
+            ),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(!signaled.get());
+    }
+
+    #[tokio::test]
+    async fn propagation_failure_cleans_up_and_never_signals_ready() {
+        let signaled = std::cell::Cell::new(false);
+        let cleaned = std::cell::Cell::new(false);
+        let error = await_propagation_then_ready(
+            std::future::ready(Err(AcmeError::DnsPropagation {
+                record_name: "_acme-challenge.app.example.test".to_string(),
+            })),
+            || {
+                signaled.set(true);
+                std::future::ready(Ok::<(), AcmeError>(()))
+            },
+            || async { cleaned.set(true) },
+            RequestTiming::new(),
+        )
+        .await
+        .expect_err("propagation failure must propagate");
+        assert!(matches!(error, AcmeError::DnsPropagation { .. }));
+        assert!(cleaned.get());
+        assert!(!signaled.get());
+    }
+
+    #[tokio::test]
+    async fn successful_propagation_signals_ready_only_afterward() {
+        let propagated = std::cell::Cell::new(false);
+        let signaled = std::cell::Cell::new(false);
+        await_propagation_then_ready(
+            async {
+                propagated.set(true);
+                Ok(())
+            },
+            || {
+                assert!(propagated.get());
+                signaled.set(true);
+                std::future::ready(Ok::<(), AcmeError>(()))
+            },
+            || async { panic!("successful propagation must retain challenge records") },
+            RequestTiming::new(),
+        )
+        .await
+        .expect("propagation success must reach readiness");
+        assert!(signaled.get());
     }
 }

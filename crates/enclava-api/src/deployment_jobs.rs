@@ -5205,8 +5205,8 @@ pub(crate) mod tests {
             artifacts.descriptor_core_hash,
         )
         .await;
-        crate::signing_service::persist_workload_artifacts(
-            &mut *tx,
+        crate::signing_service::insert_workload_artifact_fixture(
+            &mut tx,
             payload.app.id,
             deployment_id,
             &artifacts,
@@ -8994,6 +8994,118 @@ pub(crate) mod tests {
             .execute(&pool)
             .await
             .expect("delete keyring revalidation fixture");
+    }
+
+    #[tokio::test]
+    async fn signed_rollback_commits_selection_and_policy_generation_atomically() {
+        for fail_reconciliation in [false, true] {
+            let (_cleanup, pool) =
+                crate::test_support::isolated_database_test_pool("cap_signed_rollback").await;
+            let (app, source_id, _lease, mut payload) = insert_job_fixture(&pool).await;
+            let mut state = crate::test_support::lazy_state();
+            state.db = pool.clone();
+            payload.api_signing_pubkey = crate::auth::jwt::public_key_base64(&state.signing_key);
+            payload.api_url = state.api_url.clone();
+            let (accepted_payload, authority) =
+                replace_job_with_valid_signed_binding(&pool, source_id, payload, &mut state).await;
+            let setup = claim_job(&pool, "setup_pending", "setting_up", Some(source_id))
+                .await
+                .expect("claim signed target setup")
+                .expect("signed target setup exists");
+            mark_setup_accepted(&pool, source_id, setup.lock_token)
+                .await
+                .expect("accept signed target setup");
+            let mut tx = pool.begin().await.expect("begin healthy target");
+            sqlx::query(
+                "UPDATE deployments SET status = 'healthy', completed_at = now() WHERE id = $1",
+            )
+            .bind(source_id)
+            .execute(&mut *tx)
+            .await
+            .expect("mark target healthy");
+            sqlx::query(
+                "UPDATE deployment_apply_jobs SET state = 'completed' WHERE deployment_id = $1",
+            )
+            .bind(source_id)
+            .execute(&mut *tx)
+            .await
+            .expect("complete target job");
+            sqlx::query("UPDATE apps SET status = 'running' WHERE id = $1")
+                .bind(app.id)
+                .execute(&mut *tx)
+                .await
+                .expect("mark app running");
+            tx.commit().await.expect("commit healthy target");
+            if fail_reconciliation {
+                sqlx::query("DELETE FROM kbs_signed_policy_reconciliation")
+                    .execute(&pool)
+                    .await
+                    .expect("remove generation singleton");
+            }
+
+            let result = crate::routes::deployments::rollback(
+                crate::auth::middleware::AuthContext {
+                    user_id: authority.user_id,
+                    org_id: app.org_id,
+                    org_name: "signed-rollback-test".to_string(),
+                    role: crate::models::Role::Owner,
+                    api_key: None,
+                    management_origin: crate::auth::middleware::ManagementOrigin::Public,
+                },
+                axum::extract::State(state),
+                axum::extract::Path(app.name),
+                axum::Json(crate::routes::deployments::RollbackRequest {
+                    deployment_id: Some(source_id),
+                }),
+            )
+            .await;
+            if fail_reconciliation {
+                assert_eq!(
+                    result.expect_err("policy failure must abort rollback").0,
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                );
+            } else {
+                let (status, axum::Json(accepted)) = result.expect("accept signed rollback");
+                assert_eq!(status, axum::http::StatusCode::CREATED);
+                let binding: (Uuid, Vec<u8>) = sqlx::query_as(
+                    "SELECT artifact_deployment_id, artifact_descriptor_core_hash
+                       FROM deployment_apply_jobs WHERE deployment_id = $1",
+                )
+                .bind(accepted.deployment_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read committed rollback binding");
+                assert_eq!(
+                    binding,
+                    (
+                        source_id,
+                        accepted_payload
+                            .artifact_descriptor_core_hash
+                            .unwrap()
+                            .to_vec()
+                    )
+                );
+            }
+            let persisted: (i64, i64, i64, Option<i64>) = sqlx::query_as(
+                "SELECT (SELECT count(*) FROM deployments WHERE app_id = $1),
+                        (SELECT count(*) FROM deployment_apply_jobs WHERE app_id = $1),
+                        (SELECT count(*) FROM workload_artifacts WHERE app_id = $1),
+                        (SELECT desired_generation FROM kbs_signed_policy_reconciliation WHERE singleton)",
+            )
+            .bind(app.id)
+            .fetch_one(&pool)
+            .await
+            .expect("read rollback transaction outcome");
+            assert_eq!(
+                persisted,
+                if fail_reconciliation {
+                    (1, 1, 1, None)
+                } else {
+                    (2, 2, 1, Some(1))
+                }
+            );
+            crate::test_support::drop_isolated_database("cap_signed_rollback", pool).await;
+        }
     }
 
     #[tokio::test]
