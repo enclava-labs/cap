@@ -126,10 +126,23 @@ and resource version, retains PVCs, and uses normal graceful termination.
 The CLI requires the signed deployment's attested launch identity both while
 waiting for bootstrap and on the client that submits the ownership claim.
 
+If a deploy or template rollout fails terminally at startup (for example a
+guest start error), the CLI reports the typed failure and exits promptly
+instead of timing out; run `enclava status --app <name>` for the recorded
+detail.
+
 Apps awaiting required confidential teardown retain their public routes even if
 every deployment has failed or a failed delete restored the app's prior status.
 Routes are removed after teardown completes; deleting a failed app does not
 bypass its storage or ownership checks.
+
+If an app delete errors after its namespace deletion begins, the app's
+namespace mutation fence stays armed instead of risking name reuse. The
+periodic fence reconciler releases it automatically once Kubernetes reports
+the namespace gone — no manual lease edits — while a live or still-Terminating
+namespace keeps it fenced. Other stranded `kubernetes_namespace` fences
+remain an operator path; see
+[runbooks/kubernetes-mutation-fence-recovery.md](runbooks/kubernetes-mutation-fence-recovery.md).
 
 ## Local Development
 
@@ -215,6 +228,9 @@ Security-relevant behavior is built into both the API and runtime path:
 - release builds reject debug bypass flags;
 - platform sidecars and workload images are expected to be digest-pinned;
 - workload images are verified against configured signer identity;
+- private tenant-image pulls require authentication inside the TEE; host
+  registry credentials alone do not authorize them. Never release a platform
+  registry token to a tenant guest;
 - deployment descriptors, org keyrings, generated policies, and signed policy
   artifacts are bound together before deploy;
 - `enclava-init` verifies the in-TEE trust chain before releasing app secrets or
