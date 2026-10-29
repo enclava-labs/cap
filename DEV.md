@@ -168,8 +168,10 @@ implementation.
 
 Test runtime behavior rather than Rust source spelling, function order, or file
 layout. Route and middleware invariants must exercise the real Axum router,
-including encoded and empty path segments. CI rejects direct Rust-source reads
-in tests; declarative artifact checks and `prod-strict` build gates remain.
+including encoded and empty path segments. CI conservatively rejects a Rust file
+that combines source-path literals with file-reading APIs; compiler `include!`
+arguments and module-path attributes are exempt. Declarative artifact checks and
+`prod-strict` build gates remain.
 The deployment freeze admits writes only for explicit method/`MatchedPath`
 pairs; newly mounted routes remain blocked until their authority is reviewed.
 All three app-create paths use `insert_app_if_owner_seed_fresh` so the INSERT
