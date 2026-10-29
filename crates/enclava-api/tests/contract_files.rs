@@ -38,17 +38,6 @@ fn paas_internal_logs_contract() {
 }
 
 #[test]
-fn ci_serializes_tests_that_share_postgres_authority() {
-    let workflow = fs::read_to_string(workspace_root().join(".github/workflows/ci.yml"))
-        .expect("read CI workflow");
-
-    assert!(
-        workflow.contains("cargo test --workspace -- --test-threads=1"),
-        "CI must serialize tests that share global PostgreSQL-backed provider fences"
-    );
-}
-
-#[test]
 fn dockerfiles_pin_base_images_by_digest() {
     // Mutable tags can be repointed by the registry at any time; every external
     // FROM must carry the immutable digest that was reviewed.

@@ -100,8 +100,11 @@ jobs:
 
       - name: Run tests
         # Database-backed tests share one PostgreSQL service and exercise
-        # intentionally global provider fences. Serialize them so independent
-        # fixtures cannot contend through that shared authority.
+        # intentionally global provider fences; enclava-cli, enclava-init,
+        # and enclava-wait-exec also mutate process-global env or init
+        # surface paths, so the whole suite stays serialized. Workspace
+        # doctests run inside this selection, so no separate cargo test
+        # --doc step is needed.
         run: cargo test --workspace -- --test-threads=1
         env:
           DATABASE_URL: postgresql://test:test@localhost:5432/test
@@ -125,9 +128,6 @@ jobs:
         # compiled defaults, mirroring enclava-init). Bin unit tests only:
         # the integration tests exercise the dev-build env-override behavior.
         run: cargo test --locked -p enclava-wait-exec --bins --features prod-strict -- --test-threads=1
-
-      - name: Run doctests
-        run: cargo test --doc
 
       - name: Run appraiser API conformance
         run: |

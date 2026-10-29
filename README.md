@@ -164,8 +164,13 @@ Common checks:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace -- --test-threads=1
-cargo test --doc
 ```
+
+The workspace test run already includes every package's doctests, so a
+separate `cargo test --doc` is redundant. The suite must stay serialized:
+API fixtures share global PostgreSQL provider fences, and enclava-cli,
+enclava-init, and enclava-wait-exec tests mutate process-global
+environment or init surface paths.
 
 Do not use `--all-features` as the default workspace test command. Some feature
 combinations intentionally fail, such as `prod-strict` with debug/test-only
