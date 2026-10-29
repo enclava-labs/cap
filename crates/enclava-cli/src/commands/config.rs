@@ -246,117 +246,241 @@ mod tests {
         assert_eq!(super::resolve_app_name(&app).unwrap(), "shell");
     }
 
-    #[test]
-    fn config_set_and_unset_print_next_boot_application_note() {
-        let source = include_str!("config.rs");
-        let set_start = source
-            .find("ConfigCommand::Set { vars, app } =>")
-            .expect("set command branch exists");
-        let get_start = source[set_start..]
-            .find("ConfigCommand::Get")
-            .expect("get command branch follows set")
-            + set_start;
-        let set_body = &source[set_start..get_start];
+    // Runtime coverage for the ordering contracts the removed source-text
+    // pins used to assert: attestation gates every TEE mutation, and the
+    // store-side meta delete is the refusal gate that must run before any
+    // TEE deletion (#304, review on #307). The development JSON attestation
+    // path lets a local TLS stub stand in for the TEE.
 
-        let tee_write = set_body
-            .find("config_set")
-            .expect("set writes values to the TEE");
-        let note = set_body
-            .find("CONFIG_APPLICATION_NOTE")
-            .expect("set names the next-boot application contract");
-        let sync = set_body
-            .find("sync_config_key")
-            .expect("set syncs key metadata after the TEE write");
+    fn app_response() -> serde_json::Value {
+        serde_json::json!({
+            "id": "11111111-2222-3333-4444-555555555555",
+            "name": "shell",
+            "namespace": "team",
+            "instance_id": "inst-1",
+            "domain": "shell.enclava.dev",
+            "status": "running",
+            "unlock_mode": "password",
+            "created_at": "2026-10-01T00:00:00Z"
+        })
+    }
+
+    #[tokio::test]
+    async fn config_set_and_unset_attest_before_mutating_and_gate_the_store_delete() {
+        use crate::commands::app::tests::{
+            dev_json_attestation_body, enable_dev_json_attestation, isolated_state_env,
+            spawn_json_api_stub, spawn_local_tls_server,
+        };
+
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tee_events = events.clone();
+        let tee_requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tee_address = spawn_local_tls_server(tee_requests, move |path| {
+            if path.starts_with("/.well-known/confidential/attestation") {
+                tee_events.lock().unwrap().push("tee:attest".to_string());
+                (200, dev_json_attestation_body(path))
+            } else if path.ends_with("/config/K") {
+                tee_events.lock().unwrap().push(format!("tee:write {path}"));
+                (200, "{}".to_string())
+            } else {
+                (404, "{}".to_string())
+            }
+        })
+        .await;
+        let api_events = events.clone();
+        let api_address = spawn_json_api_stub(events.clone(), move |path| {
+            let (status, body) = if path == "/apps/shell" {
+                (200, app_response())
+            } else if path == "/apps/shell/config-token" {
+                api_events
+                    .lock()
+                    .unwrap()
+                    .push("api:config-token".to_string());
+                (
+                    200,
+                    serde_json::json!({
+                        "token": "config-jwt",
+                        "tee_url": format!("https://localhost:{}", tee_address.port()),
+                        "tee_resolve_ip": "127.0.0.1"
+                    }),
+                )
+            } else if path == "/apps/shell/config/sync" {
+                api_events.lock().unwrap().push("api:sync".to_string());
+                (200, serde_json::json!({}))
+            } else if path == "/apps/shell/config/K/meta" {
+                api_events
+                    .lock()
+                    .unwrap()
+                    .push("api:meta-delete".to_string());
+                (204, serde_json::json!({}))
+            } else {
+                (404, serde_json::json!({}))
+            };
+            (status, body)
+        })
+        .await;
+
+        let _env = isolated_state_env(&format!("http://{api_address}"), false);
+        enable_dev_json_attestation();
+
+        super::run(super::ConfigCommand::Set {
+            vars: vec!["K=v".to_string()],
+            app: Some("shell".to_string()),
+        })
+        .await
+        .expect("config set against stubbed API+TEE");
+        super::run(super::ConfigCommand::Unset {
+            key: "K".to_string(),
+            app: Some("shell".to_string()),
+        })
+        .await
+        .expect("config unset against stubbed API+TEE");
+
+        let recorded = events.lock().unwrap().clone();
+        let position = |needle: &str| {
+            recorded
+                .iter()
+                .position(|event| event.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} missing from {recorded:?}"))
+        };
+        // set: config token -> attestation -> TEE write -> metadata sync.
+        let set_attest = position("tee:attest");
+        let set_write = position("tee:write /.well-known/confidential/config/K");
         assert!(
-            tee_write < note && note < sync,
-            "set prints the application note after the first TEE mutation and before the metadata sync can fail the command"
+            position("api:config-token") < set_attest
+                && set_attest < set_write
+                && set_write < position("api:sync"),
+            "config set must attest the TEE before writing values: {recorded:?}"
         );
-
-        let unset_start = source
-            .find("ConfigCommand::Unset { key, app } =>")
-            .expect("unset command branch exists");
-        let tests_start = source.find("#[cfg(test)]").expect("tests module exists");
-        let unset_body = &source[unset_start..tests_start];
-
-        let tee_delete = unset_body
-            .find("config_unset")
-            .expect("unset deletes the key from the TEE");
-        let unset_note = unset_body
-            .find("CONFIG_APPLICATION_NOTE")
-            .expect("unset names the next-boot application contract");
-        let meta_delete = unset_body
-            .find("delete_config_meta")
-            .expect("unset deletes key metadata before the TEE deletion");
+        // unset: app lookup -> store meta delete -> attestation -> TEE delete.
+        assert_eq!(
+            recorded[0], "GET /apps/shell ",
+            "the read-only capability lookup must precede every mutation: {recorded:?}"
+        );
+        let meta_delete = position("api:meta-delete");
+        let unset_lookup = recorded
+            .iter()
+            .rposition(|event| event.starts_with("GET /apps/shell"))
+            .expect("unset must look up the app first");
+        let unset_attest = recorded
+            .iter()
+            .rposition(|event| event == "tee:attest")
+            .expect("unset must attest");
+        let unset_delete = recorded
+            .iter()
+            .rposition(|event| event.contains("tee:write"))
+            .expect("unset must delete the TEE key");
         assert!(
-            meta_delete < tee_delete && tee_delete < unset_note,
-            "unset runs the store-side guard first, then the TEE deletion, then prints the \
-             application note — a refused unset must mutate nothing, and the note must not \
-             print while a step can still fail the command (#304)"
+            unset_lookup < meta_delete && meta_delete < unset_attest && unset_attest < unset_delete,
+            "config unset must run the store-side guard and attestation before the TEE delete: {recorded:?}"
         );
     }
 
-    #[test]
-    fn config_set_attests_before_writing_values() {
-        let source = include_str!("config.rs");
-        let set_start = source
-            .find("ConfigCommand::Set { vars, app } =>")
-            .expect("set command branch exists");
-        let get_start = source[set_start..]
-            .find("ConfigCommand::Get")
-            .expect("get command branch follows set")
-            + set_start;
-        let body = &source[set_start..get_start];
+    #[tokio::test]
+    async fn config_unset_refusal_mutates_nothing() {
+        use crate::commands::app::tests::{
+            isolated_state_env, spawn_json_api_stub, spawn_local_tls_server,
+        };
 
-        let attest = body
-            .find("attest_receipt_key")
-            .expect("config set must attest the TEE TLS leaf");
-        let config_set = body
-            .find("config_set")
-            .expect("config set must write values");
+        let tee_requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tee_address =
+            spawn_local_tls_server(tee_requests.clone(), |_| (200, "{}".to_string())).await;
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let api_address = spawn_json_api_stub(events.clone(), move |path| {
+            if path == "/apps/shell" {
+                (200, app_response())
+            } else if path == "/apps/shell/config/K/meta" {
+                // The store-side guard refuses (e.g. required-key guard or a
+                // permission denial): a definite client-side answer, so the
+                // command must stop without touching anything else.
+                (403, serde_json::json!({}))
+            } else if path == "/apps/shell/config-token" {
+                (
+                    200,
+                    serde_json::json!({
+                        "token": "config-jwt",
+                        "tee_url": format!("https://localhost:{}", tee_address.port()),
+                        "tee_resolve_ip": "127.0.0.1"
+                    }),
+                )
+            } else {
+                (404, serde_json::json!({}))
+            }
+        })
+        .await;
+
+        let _env = isolated_state_env(&format!("http://{api_address}"), false);
+
+        let result = super::run(super::ConfigCommand::Unset {
+            key: "K".to_string(),
+            app: Some("shell".to_string()),
+        })
+        .await;
+
+        assert!(result.is_err(), "a refused meta delete must fail the unset");
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            ["GET /apps/shell ", "DELETE /apps/shell/config/K/meta "],
+            "no config-token fetch may follow the refused guard"
+        );
         assert!(
-            attest < config_set,
-            "config set must verify attestation/SPKI binding before writing config"
+            tee_requests.lock().unwrap().is_empty(),
+            "a refused unset must mutate nothing: no TEE connection at all"
         );
     }
 
-    #[test]
-    fn config_unset_attests_before_deleting_value() {
-        let source = include_str!("config.rs");
-        let unset_start = source
-            .find("ConfigCommand::Unset { key, app } =>")
-            .expect("unset command branch exists");
-        let body = &source[unset_start..];
+    #[tokio::test]
+    async fn config_set_never_writes_to_an_unattested_tee() {
+        use crate::commands::app::tests::{
+            isolated_state_env, spawn_json_api_stub, spawn_local_tls_server,
+        };
 
-        let attest = body
-            .find("attest_receipt_key")
-            .expect("config unset must attest the TEE TLS leaf");
-        let config_unset = body
-            .find("config_unset")
-            .expect("config unset must delete value");
+        let tee_requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tee_address = spawn_local_tls_server(tee_requests.clone(), |path| {
+            if path.starts_with("/.well-known/confidential/attestation") {
+                // Attestation rejection: no write may reach this endpoint.
+                (500, "{}".to_string())
+            } else {
+                (200, "{}".to_string())
+            }
+        })
+        .await;
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let api_address = spawn_json_api_stub(events, move |path| {
+            if path == "/apps/shell" {
+                (200, app_response())
+            } else if path == "/apps/shell/config-token" {
+                (
+                    200,
+                    serde_json::json!({
+                        "token": "config-jwt",
+                        "tee_url": format!("https://localhost:{}", tee_address.port()),
+                        "tee_resolve_ip": "127.0.0.1"
+                    }),
+                )
+            } else {
+                (404, serde_json::json!({}))
+            }
+        })
+        .await;
+
+        let _env = isolated_state_env(&format!("http://{api_address}"), false);
+
+        let result = super::run(super::ConfigCommand::Set {
+            vars: vec!["K=v".to_string()],
+            app: Some("shell".to_string()),
+        })
+        .await;
+
+        assert!(result.is_err(), "failed attestation must abort the set");
         assert!(
-            attest < config_unset,
-            "config unset must verify attestation/SPKI binding before deleting config"
-        );
-    }
-
-    #[test]
-    fn config_unset_stores_meta_delete_before_any_tee_mutation() {
-        let source = include_str!("config.rs");
-        let unset_start = source
-            .find("ConfigCommand::Unset { key, app } =>")
-            .expect("unset command branch exists");
-        let body = &source[unset_start..];
-
-        let meta_delete = body
-            .find("delete_config_meta")
-            .expect("config unset must delete the store metadata");
-        let config_unset = body
-            .find("config_unset")
-            .expect("config unset must delete value");
-        assert!(
-            meta_delete < config_unset,
-            "config unset must run the store-side guard (delete_config_meta) before the TEE \
-             key is removed — a refused unset must mutate nothing (#304)"
+            tee_requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|request| request.starts_with("GET /.well-known/confidential/attestation")),
+            "only the attestation request may reach the TEE: {:?}",
+            tee_requests.lock().unwrap()
         );
     }
 }

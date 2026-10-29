@@ -166,6 +166,11 @@ When changing deploy behavior, check both sides of the contract:
 If a production bug is being fixed, add the failing test before changing the
 implementation.
 
+Test runtime behavior rather than Rust source spelling, function order, or file
+layout. Route and middleware invariants must exercise the real Axum router,
+including encoded and empty path segments. CI rejects direct Rust-source reads
+in tests; declarative artifact checks and `prod-strict` build gates remain.
+
 ## Runtime Contract Notes
 
 - Workload images and platform sidecar images that CAP wraps must include

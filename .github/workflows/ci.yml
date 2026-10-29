@@ -80,6 +80,15 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
+      - name: Reject Rust source-text tests
+        run: |
+          if git grep -nE '(include_str!|read_to_string).*([.]rs"|src/)' -- '*.rs'; then
+            echo "Test runtime behavior instead of reading Rust implementation source."
+            exit 1
+          else
+            test "$?" -eq 1
+          fi
+
       - name: Install native build dependencies
         run: |
           sudo apt-get update

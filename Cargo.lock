@@ -1493,7 +1493,6 @@ dependencies = [
  "jsonwebtoken",
  "k8s-openapi",
  "kube",
- "matchit",
  "nostr",
  "oci-client",
  "rand 0.8.6",

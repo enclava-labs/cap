@@ -1456,21 +1456,6 @@ mod tests {
     }
 
     #[test]
-    fn api_startup_installs_rustls_crypto_provider() {
-        let source = include_str!("main.rs");
-        let main_body = source
-            .split("#[tokio::main]")
-            .nth(1)
-            .and_then(|s| s.split("#[cfg(test)]").next())
-            .expect("main body");
-        let expected = concat!("install_default", "_rustls_crypto_provider();");
-        assert!(
-            main_body.contains(expected),
-            "API startup must install a rustls CryptoProvider before building ACME/HTTP clients"
-        );
-    }
-
-    #[test]
     fn deployment_dispatch_switch_is_strict_and_fail_closed() {
         assert!(!parse_fail_closed_switch("SWITCH", None).unwrap());
         assert!(!parse_fail_closed_switch("SWITCH", Some("false")).unwrap());
@@ -1540,36 +1525,6 @@ mod tests {
             &runtime_class,
         )
         .unwrap();
-    }
-
-    #[test]
-    fn kbs_and_edge_authority_converge_before_dispatch_and_readiness() {
-        let source = include_str!("main.rs");
-        let main_body = source
-            .split("#[tokio::main]")
-            .nth(1)
-            .and_then(|body| body.split("#[cfg(test)]").next())
-            .expect("main body");
-        let kbs = main_body
-            .find("reconcile_signed_policy_at_startup")
-            .expect("startup KBS reconciliation");
-        let edge = main_body
-            .find("reconcile_all_haproxy_routes_at_startup")
-            .expect("startup edge reconciliation");
-        let local_disable = main_body
-            .find("CAP_DISABLE_EDGE_RECONCILIATION")
-            .expect("explicit local-only edge disable");
-        let dispatch = main_body
-            .find("spawn_deployment_dispatcher")
-            .expect("deployment dispatcher");
-        let ready = main_body
-            .find("mark_startup_ready")
-            .expect("readiness gate");
-        assert!(
-            !main_body[..edge].contains("config.required"),
-            "configured KBS management must never bypass the startup barrier"
-        );
-        assert!(kbs < edge && local_disable < edge && edge < dispatch && dispatch < ready);
     }
 
     #[test]

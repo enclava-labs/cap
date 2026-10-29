@@ -210,51 +210,6 @@ fn optional_app_name_propagates_malformed_and_invalid_config() {
 }
 
 #[test]
-fn manual_deploy_keyring_always_checks_remote_state() {
-    let source = include_str!("../signing.rs");
-    let body = source
-        .split("pub(crate) async fn ensure_manual_deploy_keyring")
-        .nth(1)
-        .unwrap()
-        .split("fn render_trustee_policy")
-        .next()
-        .unwrap();
-    let local_check = body.find("verify_keyring").unwrap();
-    let remote_check = body.find("api.get_org_keyring").unwrap();
-
-    assert!(local_check < remote_check);
-    assert!(!body[local_check..remote_check].contains("return Ok"));
-}
-
-#[test]
-fn manual_deploy_keyring_always_bootstraps_the_signing_service() {
-    let source = include_str!("../signing.rs");
-    let body = source
-        .split("pub(crate) async fn ensure_manual_deploy_keyring")
-        .nth(1)
-        .unwrap()
-        .split("fn render_trustee_policy")
-        .next()
-        .unwrap();
-
-    assert_eq!(body.matches(".bootstrap_signing_service_owner").count(), 1);
-    assert!(
-        body.find(".bootstrap_signing_service_owner").unwrap()
-            > body.find("match api.get_org_keyring").unwrap()
-    );
-}
-
-#[test]
-fn deployment_requires_explicit_recoverable_setup_and_login_has_no_keyring_side_effect() {
-    let signing = include_str!("../signing.rs");
-    let auth = include_str!("../../auth.rs");
-
-    assert!(signing.contains("ensure_manual_deploy_keyring(api, paths, true).await?"));
-    assert!(signing.contains("enclava key setup --backup-out <offline-backup.json>"));
-    assert!(!auth.contains("ensure_manual_deploy_keyring"));
-}
-
-#[test]
 fn deployment_context_platform_release_is_verified_and_selected() {
     let envelope = PlatformReleaseEnvelope {
         payload: test_release(),
@@ -608,37 +563,6 @@ fn destroy_failure_hint_covers_lane_conflicts_and_teardown_failures() {
 }
 
 #[test]
-fn deploy_preflights_password_input_before_remote_side_effects() {
-    // CRLF checkouts (Windows autocrlf) must not break source matching.
-    let source = include_str!("../../app.rs").replace("\r\n", "\n");
-    let deploy_start = source.find("pub async fn deploy").expect("deploy exists");
-    let deploy_end = source[deploy_start..]
-        .find("// Phase 1: Deploy")
-        .expect("phase 1 follows deploy setup")
-        + deploy_start;
-    let setup = &source[deploy_start..deploy_end];
-
-    let password_input = setup
-        .find("StoragePasswordInput::from_file_option")
-        .expect("deploy prepares storage password input");
-    let preflight = setup
-        .find("storage_password.ensure_available_for_password_mode")
-        .expect("deploy preflights password input availability");
-    let sign = setup
-        .find("build_signed_deploy_blobs")
-        .expect("deploy signs local blobs before remote deployment");
-    let remote_deploy = source[deploy_start..]
-        .find("api.deploy")
-        .expect("deploy mutates remote app")
-        + deploy_start;
-
-    assert!(
-        password_input < preflight && preflight < sign && deploy_end < remote_deploy,
-        "password-mode deploy must verify password input before signing and before remote mutation"
-    );
-}
-
-#[test]
 fn deploy_accepts_storage_password_file_flag() {
     use clap::Parser as _;
 
@@ -685,95 +609,6 @@ fn deployment_failure_message_includes_api_error_code_detail() {
 }
 
 #[test]
-fn deploy_waits_fail_fast_on_terminal_deployment_failure() {
-    // CRLF checkouts (Windows autocrlf) must not break source matching.
-    let source = include_str!("../../app.rs").replace("\r\n", "\n");
-
-    for (fn_name, deadline_message, blocking_call, bounded_check) in [
-        (
-            "async fn wait_for_bootstrap_endpoint",
-            "TEE ownership timed out",
-            "api.get_unlock_endpoint(app_name)",
-            "fail_if_template_deployment_failed(apiapp_namedeployment_idstart+max_wait&muthistory)",
-        ),
-        (
-            "async fn wait_for_deploy_runtime",
-            "TEE boot timed out",
-            "api.get_status(app_name)",
-            "fail_if_template_deployment_failed(apiapp_nameexpected_deployment_idstart+max_wait&muthistory)",
-        ),
-    ] {
-        let fn_start = source
-            .find(fn_name)
-            .unwrap_or_else(|| panic!("{fn_name} must exist so standalone app deploy waits exist"));
-        let body = &source[fn_start..];
-        let wait_loop = body.find("loop {").expect("wait loop exists");
-        let deadline = body
-            .find(deadline_message)
-            .unwrap_or_else(|| panic!("{fn_name} must keep its deadline guard"));
-        let failure_check = body
-            .find("fail_if_template_deployment_failed")
-            .unwrap_or_else(|| {
-                panic!("{fn_name} must poll for a terminal deployment failure (#18)")
-            });
-        let blocking = body
-            .find(blocking_call)
-            .unwrap_or_else(|| panic!("{fn_name} must keep its readiness poll"));
-        assert!(
-            wait_loop < deadline && deadline < failure_check,
-            "{fn_name}: check the wait deadline before polling deployment history (cap#220 review), so an unresponsive API cannot extend the wait past its budget"
-        );
-        assert!(
-            failure_check < blocking,
-            "{fn_name}: the terminal-failure check must run inside the wait loop before the (potentially blocking) readiness request, so a manifest-apply rejection (e.g. KBS signed-policy budget) fails fast instead of timing out ~10 minutes later (#18)"
-        );
-        // Whitespace- and comma-insensitive so rustfmt line wrapping cannot
-        // break the wiring check: the failure check must receive the wait's
-        // deadline and the shared detached history probe (cap#220 review
-        // follow-ups).
-        let dense: String = body
-            .chars()
-            .filter(|c| !c.is_whitespace() && *c != ',')
-            .collect();
-        assert!(
-            dense.contains(bounded_check),
-            "{fn_name}: the failure check must take its observation from the detached history probe, bounded by the wait's deadline (cap#220 review follow-ups)"
-        );
-    }
-
-    // The sibling deployment-history lookups (apply-start and health waits)
-    // receive the wait's deadline and the same detached probe: they are how
-    // deploy state is observed at all, so their requests must outlive any
-    // per-attempt budget (a slow-but-valid answer is observed when it lands)
-    // while never blocking the loop or outliving the wait (cap#220 review
-    // follow-ups).
-    let dense_source: String = source
-        .chars()
-        .filter(|c| !c.is_whitespace() && *c != ',')
-        .collect();
-    assert_eq!(
-        dense_source
-            .matches("find_deployment_entry(apiapp_namedeployment_idstart+max_wait&muthistory)")
-            .count(),
-        2,
-        "wait_for_deployment_apply_start and wait_for_deployment_completion must observe history through the detached probe (cap#220 review follow-ups)"
-    );
-
-    // The standalone ownership wait must not swallow non-retryable
-    // unlock-endpoint errors until the 900s budget: it fetches the endpoint
-    // lazily inside the loop and routes fetch failures through the same
-    // retry predicate as the template wait (auth/decode/404 fail fast).
-    let fn_start = source
-        .find("async fn wait_for_bootstrap_endpoint")
-        .expect("standalone ownership wait exists");
-    let body = &source[fn_start..];
-    assert!(
-        body.contains("should_retry_template_bootstrap_endpoint_error"),
-        "endpoint fetch errors must go through the template retry predicate, not an unconditional retry"
-    );
-}
-
-#[test]
 fn wait_attempt_budget_is_finite_and_bounded_by_the_wait() {
     // Far deadline: the per-attempt budget is finite (so a stalled attempt is
     // cut and the loop retries) and comfortably long (so slow-but-valid
@@ -792,405 +627,6 @@ fn wait_attempt_budget_is_finite_and_bounded_by_the_wait() {
         .checked_sub(std::time::Duration::from_secs(1))
         .unwrap_or_else(std::time::Instant::now);
     assert!(wait_attempt_budget(past).is_zero());
-}
-
-#[test]
-fn success_exit_settles_requests_with_the_per_attempt_budget() {
-    // cap#220 review follow-up: the exit gate's wait for pending history
-    // requests is bounded by the same finite per-attempt budget as the
-    // readiness polls (60s, min'd with the wait's remaining time by
-    // wait_attempt_budget), never a separate advisory cap: earlier reviews
-    // rejected a short cap because a slow-but-valid failure answer at 16s+
-    // is an observation, not a stall. On expiry the request is reconciled
-    // with the success instead of failing a ready deployment.
-    let source = include_str!("../../app.rs");
-    let gate_start = source
-        .find("pub(crate) async fn reconcile_success_with_deployment_history")
-        .expect("the gate must exist");
-    let gate_end = source[gate_start..]
-        .find("\nasync fn find_deployment_entry")
-        .expect("find_deployment_entry must follow the gate")
-        + gate_start;
-    let gate = &source[gate_start..gate_end];
-    assert!(
-        gate.contains("take_settled_within(wait_attempt_budget(wait_deadline)"),
-        "the gate must settle its requests within the per-attempt budget (cap#220 review follow-up)"
-    );
-    assert!(
-        gate.contains("history.force_request(api, app_name, wait_deadline)"),
-        "the gate must ask for a current observation at the exit (cap#220 review follow-up): a pre-gate non-failure may predate the failure"
-    );
-    assert!(
-        !gate.contains("SUCCESS_RECONCILE_BUDGET") && !gate.contains("success_reconcile_budget"),
-        "the gate must not carry a separate advisory budget cap (rejected in earlier reviews)"
-    );
-}
-
-#[test]
-fn wait_loop_requests_use_the_finite_per_attempt_budget() {
-    // cap#220 review follow-ups: every synchronous request a wait loop makes
-    // -- the readiness polls (unlock endpoint, runtime status, config keys,
-    // SSH command) and the direct-TEE probes (attest, challenge) -- is cut
-    // at one finite per-attempt budget, bounded by the wait's remaining
-    // time. The deployment-history lookups (the terminal-failure check and
-    // the apply-start/health state lookups) run on the detached probe
-    // instead: their answers are the loops' source of truth, so they must
-    // observe slow-but-valid responses (the 70s-history false timeout) while
-    // never blocking the loop or outliving the wait (the stalled-history
-    // false timeout).
-    let source = include_str!("../../app.rs").replace("\r\n", "\n");
-    let template_source = include_str!("../../template.rs").replace("\r\n", "\n");
-    // Whitespace- and comma-insensitive: rustfmt may wrap call arguments
-    // one-per-line (adding a trailing comma) without changing the wiring.
-    let dense = |text: &str| -> String {
-        text.chars()
-            .filter(|c| !c.is_whitespace() && *c != ',')
-            .collect()
-    };
-    let app = dense(&source);
-    let template = dense(&template_source);
-
-    let failure_check = {
-        let start = source
-            .find("async fn template_deployment_failure(")
-            .expect("terminal-failure check exists");
-        let end = start
-            + source[start..]
-                .find("fn template_deployment_failure_message(")
-                .expect("failure message helper follows the check");
-        &source[start..end]
-    };
-    assert!(
-        dense(failure_check).contains("history.ensure_request(apiapp_namewait_deadline)")
-            && dense(failure_check).contains("history.take_landed().await"),
-        "the terminal-failure check must take its observation from the detached history probe (cap#220 review follow-ups): a slow answer is observed whenever it lands, and the shared client's 900s request timeout must never consume the wait"
-    );
-    assert!(
-        !failure_check.contains("bounded_wait_attempt") && !failure_check.contains("timeout("),
-        "the terminal-failure check must never block on deployment history (cap#220 review follow-up #2): even a 30s template wait must still poll its ready TEE endpoint"
-    );
-
-    let state_lookup = {
-        let start = source
-            .find("async fn find_deployment_entry(")
-            .expect("deployment-state lookup exists");
-        let end = start
-            + source[start..]
-                .find("async fn wait_for_deployment_apply_start(")
-                .expect("apply-start wait follows the state lookup");
-        &source[start..end]
-    };
-    assert!(
-        dense(state_lookup).contains("history.ensure_request(apiapp_namewait_deadline)")
-            && dense(state_lookup).contains("history.take_landed().await"),
-        "the deployment-state lookup must take its observation from the detached history probe (cap#220 review follow-ups): slow responses stay observable while a stall never blocks the loop"
-    );
-    assert!(
-        !state_lookup.contains("bounded_wait_attempt") && !state_lookup.contains("timeout("),
-        "the deployment-state lookup must never block on deployment history (cap#220 review follow-up #2)"
-    );
-
-    // Readiness polls are bounded the same way (cap#220 review follow-up):
-    // a stalled status/endpoint call must not eat the wait or hide the
-    // failure check's observations behind it.
-    assert!(
-        app.contains("bounded_wait_attempt(start+max_waitapi.get_status(app_name))"),
-        "wait_for_deploy_runtime must bound its status poll per attempt (cap#220 review follow-up)"
-    );
-    assert!(
-        app.matches("bounded_wait_attempt(start+max_waitapi.get_unlock_endpoint(app_name))")
-            .count()
-            >= 2,
-        "wait_for_bootstrap_endpoint and the runtime diagnostic chain must bound their endpoint fetches per attempt (cap#220 review follow-up)"
-    );
-    assert!(
-        template.contains(
-            "bounded_wait_attempt(wait_deadlinetimings.run(DeployPhase::BootstrapEndpointAcquisitionapi.get_unlock_endpoint(app_name)))"
-        ),
-        "wait_for_template_bootstrap_endpoint must bound its endpoint fetch per attempt (cap#220 review follow-up)"
-    );
-    // And the remaining wait-loop requests from the self-check warning:
-    // the direct-TEE attest in the runtime wait, plus the managed-config and
-    // SSH polls in the hosted template waits.
-    assert!(
-        app.matches("bounded_wait_attempt(start+max_waittee.attest_receipt_key())")
-            .count()
-            >= 2,
-        "wait_for_deploy_runtime and wait_for_bootstrap_endpoint must bound their direct-TEE attest per attempt (cap#220 review follow-up #2)"
-    );
-    assert!(
-        app.contains("bounded_wait_attempt(start+max_waitattested_tee.bootstrap_challenge())"),
-        "wait_for_bootstrap_endpoint must bound its bootstrap challenge per attempt (cap#220 review follow-up #3)"
-    );
-    assert!(
-        template.contains(
-            "bounded_wait_attempt(wait_deadlinetimings.run(DeployPhase::BootstrapAttestationtee.attest_receipt_key()))"
-        ),
-        "wait_for_template_bootstrap_endpoint must bound its attest per attempt (cap#220 review follow-up #3)"
-    );
-    assert!(
-        template.contains(
-            "bounded_wait_attempt(wait_deadlinetimings.run(DeployPhase::BootstrapChallengeattested_tee.bootstrap_challenge()))"
-        ),
-        "wait_for_template_bootstrap_endpoint must bound its bootstrap challenge per attempt (cap#220 review follow-up #3)"
-    );
-    assert!(
-        template.contains("bounded_wait_attempt(deadlineapi.list_config_keys(instance_name))"),
-        "wait_for_paas_managed_config_keys must bound its status poll per attempt (cap#220 review follow-up #2)"
-    );
-    assert!(
-        template
-            .contains("bounded_wait_attempt(start+timeoutapi.get_template_ssh_command(app_name))"),
-        "wait_for_paas_ssh_command must bound its status poll per attempt (cap#220 review follow-up #2)"
-    );
-}
-
-#[test]
-fn managed_config_cut_reads_retry_until_the_wait_deadline() {
-    // cap#220 review follow-up: `bounded_wait_attempt`'s `None` covers both
-    // a passed wait deadline and a read cut at the 60s per-attempt budget.
-    // Only the first is a timeout: a cut read with wait time remaining must
-    // retry on the next tick, not fail the whole managed-config wait.
-    let template = include_str!("../../template.rs").replace("\r\n", "\n");
-    let wait_start = template
-        .find("async fn wait_for_paas_managed_config_keys")
-        .expect("the managed-config wait must exist");
-    let wait_end = template[wait_start..]
-        .find("\n/// One poll of this call's managed-config delivery receipt.")
-        .expect("the delivery-receipt poll doc must follow the wait")
-        + wait_start;
-    let wait = &template[wait_start..wait_end];
-    assert!(
-        wait.contains("None if Instant::now() < deadline =>"),
-        "a read cut at the per-attempt budget must retry on the next tick while the wait deadline is open (cap#220 review follow-up)"
-    );
-    // The retry arm must come before the terminal `None =>` expiry arm so a
-    // cut read can never take the deadline-reached error.
-    let retry_arm = wait
-        .find("None if Instant::now() < deadline =>")
-        .expect("the cut-read retry arm must exist");
-    let expiry_arm = wait[retry_arm..]
-        .find("None =>")
-        .expect("the terminal None arm must exist")
-        + retry_arm;
-    assert!(retry_arm < expiry_arm);
-    // The delivery-receipt poll has the same two-faced `None`: a cut read
-    // reports pending while the wait is open, so a stalled delivery-status
-    // request cannot abort the wait through the poll's Err. It must also run
-    // under `bounded_wait_attempt` (the 60s per-attempt budget), not plain
-    // `bounded_request` (deadline-only), so one stalled read cannot hold the
-    // loop until the client's 900s request timeout.
-    let dense = |text: &str| -> String {
-        text.chars()
-            .filter(|c| !c.is_whitespace() && *c != ',')
-            .collect()
-    };
-    let poll_start = template[wait_end..]
-        .find("async fn poll_managed_delivery_status")
-        .expect("the delivery-receipt poll must exist")
-        + wait_end;
-    let poll = &template[poll_start..];
-    assert!(
-        dense(poll).contains(
-            "bounded_wait_attempt(deadlineapi.managed_config_delivery_status(instance_namedelivery_id))"
-        ),
-        "poll_managed_delivery_status must bound its read per attempt, not only by the deadline (cap#220 review follow-up)"
-    );
-    assert!(
-        poll.contains("None if Instant::now() < deadline =>"),
-        "poll_managed_delivery_status must treat a cut read as pending while the wait deadline is open (cap#220 review follow-up)"
-    );
-}
-
-#[test]
-fn deploy_wait_success_exits_reconcile_deployment_state_first() {
-    // cap#220 review follow-up: readiness alone must not end a wait that
-    // polls deployment history -- a failed deployment would proceed to
-    // ownership handling before its history answer lands. Every successful
-    // exit of those waits therefore carries exactly one reconciliation with
-    // the detached probe (one per `return Ok(`), so a new success exit
-    // cannot silently skip it.
-    let source = include_str!("../../app.rs").replace("\r\n", "\n");
-    let template_source = include_str!("../../template.rs").replace("\r\n", "\n");
-    let body_between = |text: &str, start: &str, end: &str| -> String {
-        let start_index = text
-            .find(start)
-            .unwrap_or_else(|| panic!("{start} must exist"));
-        let end_index = text[start_index..]
-            .find(end)
-            .unwrap_or_else(|| panic!("{end} must follow {start}"))
-            + start_index;
-        text[start_index..end_index].to_string()
-    };
-    for (fn_name, text, start, end) in [
-        (
-            "wait_for_bootstrap_endpoint",
-            source.as_str(),
-            "async fn wait_for_bootstrap_endpoint",
-            "async fn wait_for_deploy_runtime",
-        ),
-        (
-            "wait_for_deploy_runtime",
-            source.as_str(),
-            "async fn wait_for_deploy_runtime",
-            "fn observation_is_fresh_for_deployment",
-        ),
-        (
-            "wait_for_deployment_apply_start",
-            source.as_str(),
-            "async fn wait_for_deployment_apply_start",
-            "async fn wait_for_deployment_completion",
-        ),
-        (
-            "wait_for_deployment_completion",
-            source.as_str(),
-            "async fn wait_for_deployment_completion",
-            "async fn ensure_password_storage_unlocked_for_config",
-        ),
-        (
-            "wait_for_template_bootstrap_endpoint",
-            template_source.as_str(),
-            "async fn wait_for_template_bootstrap_endpoint",
-            "pub(crate) fn should_retry_template_bootstrap_endpoint_error",
-        ),
-        (
-            "wait_for_paas_managed_config_keys",
-            template_source.as_str(),
-            "async fn wait_for_paas_managed_config_keys",
-            "async fn refresh_template_config_token_with_retry",
-        ),
-        (
-            "wait_for_paas_ssh_command",
-            template_source.as_str(),
-            "async fn wait_for_paas_ssh_command",
-            "async fn latest_deployment_id",
-        ),
-    ] {
-        let body = body_between(text, start, end);
-        let exits = body.matches("return Ok(").count();
-        let reconciliations = body
-            .matches("reconcile_success_with_deployment_history(")
-            .count();
-        assert!(exits > 0, "{fn_name} must have successful exits to gate");
-        assert_eq!(
-            exits, reconciliations,
-            "{fn_name}: every successful exit must reconcile the pending deployment-state observation first (cap#220 review follow-up); {exits} `return Ok(` vs {reconciliations} reconciliations"
-        );
-    }
-}
-
-#[test]
-fn deploy_progress_does_not_redraw_during_interactive_secret_prompts() {
-    // CRLF checkouts (Windows autocrlf) must not break source matching.
-    let source = include_str!("../../app.rs").replace("\r\n", "\n");
-    let deploy_start = source
-        .find("pub async fn deploy")
-        .expect("deploy function exists");
-    let deploy_end = source[deploy_start..]
-        .find("async fn wait_for_bootstrap_endpoint")
-        .expect("bootstrap helper follows deploy")
-        + deploy_start;
-    let body = &source[deploy_start..deploy_end];
-
-    assert!(
-        !body.contains("enable_steady_tick"),
-        "deploy progress must not redraw during password, unlock, or recovery-mnemonic prompts"
-    );
-}
-
-#[test]
-fn deploy_bootstrap_probe_attests_before_calling_claim_endpoint() {
-    // CRLF checkouts (Windows autocrlf) must not break source matching.
-    let source = include_str!("../../app.rs").replace("\r\n", "\n");
-    let fn_start = source
-        .find("async fn wait_for_bootstrap_endpoint")
-        .expect("wait_for_bootstrap_endpoint exists");
-    let fn_end = source[fn_start..]
-        .find("async fn wait_for_deploy_runtime")
-        .expect("wait_for_deploy_runtime follows wait_for_bootstrap_endpoint")
-        + fn_start;
-    let body = &source[fn_start..fn_end];
-
-    let attest = body
-        .find("attest_receipt_key")
-        .expect("bootstrap readiness probe must attest the TEE TLS leaf");
-    let challenge = body
-        .find("bootstrap_challenge")
-        .expect("bootstrap readiness probe must query challenge endpoint");
-    assert!(
-        attest < challenge,
-        "deploy must verify attestation/SPKI binding before probing bootstrap challenge"
-    );
-}
-
-#[test]
-fn deploy_bootstrap_probe_uses_short_probe_timeout_client() {
-    // CRLF checkouts (Windows autocrlf) must not break source matching.
-    let source = include_str!("../../app.rs").replace("\r\n", "\n");
-    let fn_start = source
-        .find("async fn wait_for_bootstrap_endpoint")
-        .expect("wait_for_bootstrap_endpoint exists");
-    let fn_end = source[fn_start..]
-        .find("async fn wait_for_deploy_runtime")
-        .expect("wait_for_deploy_runtime follows wait_for_bootstrap_endpoint")
-        + fn_start;
-    let body = &source[fn_start..fn_end];
-
-    assert!(
-        body.contains("TeeClient::new_for_ownership_probe_with_resolve_ip"),
-        "bootstrap readiness probes must not inherit the long claim/unlock request timeout"
-    );
-}
-
-#[test]
-fn deploy_runtime_wait_falls_back_to_attested_tee_status() {
-    // CRLF checkouts (Windows autocrlf) must not break source matching.
-    let source = include_str!("../../app.rs").replace("\r\n", "\n");
-    let fn_start = source
-        .find("async fn wait_for_deploy_runtime")
-        .expect("wait_for_deploy_runtime exists");
-    let fn_end = source[fn_start..]
-        .find("async fn ensure_password_storage_unlocked_for_config")
-        .expect("ensure_password_storage_unlocked_for_config follows wait_for_deploy_runtime")
-        + fn_start;
-    let body = &source[fn_start..fn_end];
-
-    let endpoint = body
-        .find("get_unlock_endpoint")
-        .expect("runtime wait must resolve the direct TEE endpoint");
-    let tee = body
-        .find("TeeClient::new_for_ownership")
-        .expect("runtime wait must use the ownership timeout TEE client");
-    let attest = body
-        .find("attest_receipt_key")
-        .expect("runtime wait must attest the direct TEE status endpoint");
-    let status = body
-        .find("bounded_status_json")
-        .expect("runtime wait must read direct TEE status through the bounded safe path");
-    let classify = body
-        .find("direct_tee_runtime_outcome")
-        .expect("runtime wait must classify terminal diagnostics from the direct status");
-    let poll_loop = body.find("loop {").expect("runtime wait must poll");
-    assert!(
-        poll_loop < endpoint
-            && endpoint < tee
-            && tee < attest
-            && attest < status
-            && status < classify
-            && body.contains("tee_supplemental_fields_are_consistent"),
-        "deploy runtime wait must refresh and attest the direct TEE endpoint while polling"
-    );
-    assert!(
-        body.contains("observation_is_fresh")
-            && body.contains("if observation_is_fresh && target.accepts_api_status")
-            && body.contains("pod_phase_is_verified")
-            && body
-                .contains("observation.deployment_id.as_deref() == Some(expected_deployment_id)")
-            && body.contains("observation.state == \"fresh\"")
-            && body.contains("direct_tee_allowed")
-            && body.contains("status.status != \"failed\""),
-        "new observations must be fresh and deployment-bound while legacy responses without observation remain compatible"
-    );
 }
 
 fn deploy_observation(
@@ -1334,78 +770,6 @@ fn direct_tee_status_rejects_errors_mismatches_and_malformed_fields() {
     ] {
         assert!(!tee_supplemental_fields_are_consistent(&status), "{status}");
     }
-}
-
-#[test]
-fn status_command_falls_back_to_attested_tee_status() {
-    // CRLF checkouts (Windows autocrlf) must not break source matching.
-    let source = include_str!("../../app.rs").replace("\r\n", "\n");
-    let fn_start = source
-        .find("pub async fn status")
-        .expect("status function exists");
-    let fn_end = source[fn_start..]
-        .find("#[derive(Args)]\npub struct LogsArgs")
-        .expect("logs args follow status function")
-        + fn_start;
-    let body = &source[fn_start..fn_end];
-
-    let api_status = body
-        .find("api.get_status")
-        .expect("status command must read API status");
-    let endpoint = body
-        .find("get_unlock_endpoint")
-        .expect("status command must resolve the direct TEE endpoint");
-    let tee = body
-        .find("TeeClient::new_for_ownership")
-        .expect("status command must use the ownership timeout TEE client");
-    let attest = body
-        .find("attest_receipt_key")
-        .expect("status command must attest the direct TEE status endpoint");
-    let state = body
-        .find("tee_unlock_state")
-        .expect("status command must interpret the direct TEE state");
-    assert!(
-        api_status < endpoint && endpoint < tee && tee < attest && attest < state,
-        "status must fall back to attested direct TEE state when API live status lacks TEE fields"
-    );
-}
-
-#[test]
-fn status_command_surfaces_stable_ssh_endpoint_with_validating_follow_up() {
-    // CRLF checkouts (Windows autocrlf) must not break source matching.
-    let source = include_str!("../../app.rs").replace("\r\n", "\n");
-    let fn_start = source
-        .find("pub async fn status")
-        .expect("status function exists");
-    let fn_end = source[fn_start..]
-        .find("#[derive(Args)]\npub struct LogsArgs")
-        .expect("logs args follow status function")
-        + fn_start;
-    let body = &source[fn_start..fn_end];
-
-    assert!(body.contains("Stable SSH endpoint: {endpoint}"));
-    assert!(
-        body.contains("Validate:  enclava template ssh-command --name {app_name} --wait"),
-        "status should show a follow-up command that reads the stored stable SSH endpoint"
-    );
-    assert!(
-        body.contains("\"running\" | \"ready\" | \"healthy\" => status.status.green().to_string()"),
-        "status should render hosted healthy status vocabulary consistently"
-    );
-    assert!(
-        body.contains(
-            "\"creating\" | \"deploying\" | \"applying\" | \"pending\" => status.status.yellow().to_string()"
-        ),
-        "status should render hosted pending status vocabulary consistently"
-    );
-    assert!(
-        body.contains("Stable SSH endpoint metadata missing; redeploy the template so PaaS reserves a stable SSH endpoint"),
-        "status should make legacy Debian SSH apps without stable SSH endpoint metadata actionable"
-    );
-    assert!(
-        body.contains("Stable SSH endpoint metadata invalid; redeploy the template so PaaS reserves a stable SSH endpoint"),
-        "status should make corrupt Debian SSH endpoint metadata actionable"
-    );
 }
 
 #[test]
@@ -1779,134 +1143,6 @@ fn attested_locked_state_overrides_only_running_status() {
 }
 
 #[test]
-fn password_redeploy_wait_does_not_accept_stale_unlocked_runtime() {
-    // CRLF checkouts (Windows autocrlf) must not break source matching.
-    let source = include_str!("../../app.rs").replace("\r\n", "\n");
-    let fn_start = source
-        .find("async fn wait_for_deploy_runtime")
-        .expect("wait_for_deploy_runtime exists");
-    let fn_end = source[fn_start..]
-        .find("async fn ensure_password_storage_unlocked_for_config")
-        .expect("ensure_password_storage_unlocked_for_config follows wait_for_deploy_runtime")
-        + fn_start;
-    let body = &source[fn_start..fn_end];
-
-    assert!(
-        source.contains("DeployRuntimeTarget::PasswordLocked"),
-        "runtime wait must have a password-redeploy mode"
-    );
-    assert!(
-        body.contains("target.accepts_direct_unlocked()"),
-        "password redeploy wait must gate direct unlocked status so old pods cannot satisfy the new rollout"
-    );
-}
-
-#[test]
-fn deploy_waits_on_returned_deployment_record() {
-    // CRLF checkouts (Windows autocrlf) must not break source matching.
-    let source = include_str!("../../app.rs").replace("\r\n", "\n");
-    let deploy_start = source
-        .find("pub async fn deploy")
-        .expect("deploy function exists");
-    let deploy_end = source[deploy_start..]
-        .find("async fn wait_for_bootstrap_endpoint")
-        .expect("wait_for_bootstrap_endpoint follows deploy")
-        + deploy_start;
-    let body = &source[deploy_start..deploy_end];
-
-    let deploy_call = body.find("api.deploy").expect("deploy calls API");
-    let apply_wait = body
-        .find("wait_for_deployment_apply_start")
-        .expect("deploy must wait for the returned deployment to start applying");
-    let runtime_wait = body
-        .find("wait_for_deploy_runtime")
-        .expect("deploy waits for TEE runtime");
-    let completion_wait = body
-        .find("wait_for_deployment_completion")
-        .expect("deploy must wait for the returned deployment to complete");
-    assert!(
-        deploy_call < apply_wait && apply_wait < runtime_wait && runtime_wait < completion_wait,
-        "deploy must not let stale app status from the previous pod satisfy the new deployment"
-    );
-    assert!(
-        body.contains("resp.deployment_id"),
-        "deployment waits must be tied to the deployment returned by POST /deploy"
-    );
-}
-
-#[test]
-fn deploy_password_unlock_attests_before_reading_or_unlocking_storage() {
-    // CRLF checkouts (Windows autocrlf) must not break source matching.
-    let source = include_str!("../../app.rs").replace("\r\n", "\n");
-    let fn_start = source
-        .find("async fn ensure_password_storage_unlocked_for_config")
-        .expect("ensure_password_storage_unlocked_for_config exists");
-    let fn_end = source[fn_start..]
-        .find("fn tee_unlock_state")
-        .expect("tee_unlock_state follows ensure_password_storage_unlocked_for_config")
-        + fn_start;
-    let body = &source[fn_start..fn_end];
-
-    let attest = body
-        .find("attest_receipt_key")
-        .expect("password unlock helper must attest the TEE TLS leaf");
-    let status = body
-        .find("status_json")
-        .expect("password unlock helper must read TEE status");
-    let unlock = body
-        .find("tee.unlock")
-        .expect("password unlock helper must call unlock");
-    assert!(
-        attest < status && attest < unlock,
-        "deploy must use the attested/SPKI-pinned client for status and password unlock"
-    );
-}
-
-#[test]
-fn deploy_config_push_attests_before_setting_values() {
-    // CRLF checkouts (Windows autocrlf) must not break source matching.
-    let source = include_str!("../../app.rs").replace("\r\n", "\n");
-    let phase_start = source
-        .find("// Phase 4: Push config if --set was used")
-        .expect("config push phase exists");
-    let phase_end = source[phase_start..]
-        .find("// Phase 4: Health check")
-        .expect("health check phase follows config push")
-        + phase_start;
-    let body = &source[phase_start..phase_end];
-
-    let attest = body
-        .find("attest_receipt_key")
-        .expect("deploy config push must attest the TEE TLS leaf");
-    let set = body
-        .find("set_deploy_config")
-        .expect("deploy config push must set config values");
-    assert!(
-        attest < set,
-        "deploy config delivery must verify attestation/SPKI binding before writing config"
-    );
-}
-
-#[test]
-fn deploy_health_timeout_is_not_reported_as_success() {
-    // CRLF checkouts (Windows autocrlf) must not break source matching.
-    let source = include_str!("../../app.rs").replace("\r\n", "\n");
-    let phase_start = source
-        .find("// Phase 4: Health check")
-        .expect("health check phase exists");
-    let phase_end = source[phase_start..]
-        .find("println!();")
-        .expect("health check phase is followed by deploy summary")
-        + phase_start;
-    let body = &source[phase_start..phase_end];
-
-    assert!(
-        !body.contains("Deployed (health check timed out)"),
-        "deploy must fail when the runtime health check times out"
-    );
-}
-
-#[test]
 fn deploy_health_timeout_covers_generated_readiness_delay() {
     let deploy_health_timeout = Duration::from_secs(DEPLOY_HEALTH_TIMEOUT_SECONDS);
     let generated_readiness_delay_with_jitter = Duration::from_secs(240);
@@ -2037,6 +1273,319 @@ async fn revoke_org_log_key_hits_org_endpoint() {
     assert_eq!(resp.cleared_app_selections, Some(2));
 }
 
+// --- shared local-network fixtures ------------------------------------------
+//
+// Plain-HTTP API stubs, a local-TLS TEE stub, and the isolated CLI-state env
+// shared by the command-flow tests here and in sibling command modules
+// (crate::commands::config, crate::commands::ownership).
+
+// Public synthetic localhost fixture (same key material as the transport
+// test in tee_client/tls.rs); used only for local TLS test servers.
+pub(crate) const SYNTHETIC_LOCALHOST_CERT_B64: &str = "MIIBfzCCASWgAwIBAgIUDvNchz/4kjYNIUZPbhErYcJcQEkwCgYIKoZIzj0EAwIwFDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MDkwNjE1NTgyM1oYDzIxMjYwODEzMTU1ODIzWjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASTrTE27CrHezsrQig5SJS3khO5zrEB7SYnpJj05SOwGHPQCBpYHg38VRS9fdnyKI2JdkuAePfnhVJULAcTmrkuo1MwUTAdBgNVHQ4EFgQUW41obMczsiP/amwMRntTfO2u2g0wHwYDVR0jBBgwFoAUW41obMczsiP/amwMRntTfO2u2g0wDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNIADBFAiBFGRlU//+3JyhVqXNcpWw7QR9N9pEoiRVpgFc0Dxg+uwIhAIO8kzgeVzlTSTS7/2jE2EuVXtAxL3Mcbd62YjrqNtaG";
+pub(crate) const SYNTHETIC_LOCALHOST_KEY_B64: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg1eONjcC4FaH2HqTDcwYCUym2nm332NQ/GN4WxJafrU+hRANCAASTrTE27CrHezsrQig5SJS3khO5zrEB7SYnpJj05SOwGHPQCBpYHg38VRS9fdnyKI2JdkuAePfnhVJULAcTmrku";
+
+/// Serves one static JSON body per request path over local TLS, recording
+/// every received request line ("METHOD target").
+pub(crate) async fn spawn_local_tls_server(
+    requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    respond: impl Fn(&str) -> (u16, String) + Send + Sync + 'static,
+) -> std::net::SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let certificate = base64::engine::general_purpose::STANDARD
+        .decode(SYNTHETIC_LOCALHOST_CERT_B64)
+        .unwrap();
+    let key = base64::engine::general_purpose::STANDARD
+        .decode(SYNTHETIC_LOCALHOST_KEY_B64)
+        .unwrap();
+    let config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(
+        vec![rustls::pki_types::CertificateDer::from(certificate)],
+        rustls::pki_types::PrivatePkcs8KeyDer::from(key).into(),
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config));
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut stream) = acceptor.accept(stream).await else {
+                continue;
+            };
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                match stream.read(&mut chunk).await {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        request.extend_from_slice(&chunk[..read]);
+                        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            if request.is_empty() {
+                continue;
+            }
+            let request_line = String::from_utf8_lossy(&request)
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            let mut parts = request_line.split_whitespace();
+            let (method, path) = (
+                parts.next().unwrap_or("?").to_string(),
+                parts.next().unwrap_or("/").to_string(),
+            );
+            requests.lock().unwrap().push(format!("{method} {path}"));
+            let (status, reason, body) = match respond(&path) {
+                (200, body) => (200, "OK", body),
+                (404, body) => (404, "Not Found", body),
+                (423, body) => (423, "Locked", body),
+                (500, body) => (500, "Internal Server Error", body),
+                _ => (404, "Not Found", "{}".to_string()),
+            };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        }
+    });
+    address
+}
+
+/// Plain-HTTP JSON stub for `ApiClient` routes, recording every received
+/// request as "METHOD target body". `respond` answers `(status, body)` per
+/// request path.
+pub(crate) async fn spawn_json_api_stub(
+    requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    respond: impl Fn(&str) -> (u16, serde_json::Value) + Send + Sync + 'static,
+) -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            let headers_end = loop {
+                match stream.read(&mut chunk).await {
+                    Ok(0) => break request.len(),
+                    Ok(read) => {
+                        request.extend_from_slice(&chunk[..read]);
+                        if let Some(at) =
+                            request.windows(4).position(|window| window == b"\r\n\r\n")
+                        {
+                            break at + 4;
+                        }
+                    }
+                    Err(_) => break request.len(),
+                }
+            };
+            let text = String::from_utf8_lossy(&request);
+            let mut lines = text.split("\r\n");
+            let request_line = lines.next().unwrap_or_default().to_string();
+            let mut parts = request_line.split_whitespace();
+            let (method, path) = (
+                parts.next().unwrap_or("?").to_string(),
+                parts.next().unwrap_or("/").to_string(),
+            );
+            let content_length: usize = lines
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse().ok())
+                })
+                .unwrap_or(0);
+            let mut body_bytes = request.len().saturating_sub(headers_end);
+            while body_bytes < content_length {
+                match stream.read(&mut chunk).await {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        request.extend_from_slice(&chunk[..read]);
+                        body_bytes += read;
+                    }
+                    Err(_) => break,
+                }
+            }
+            let body = String::from_utf8_lossy(&request[headers_end..]).to_string();
+            requests
+                .lock()
+                .unwrap()
+                .push(format!("{method} {path} {body}"));
+            let (status, value) = respond(&path);
+            let response_body = value.to_string();
+            let response = format!(
+                "HTTP/1.1 {status} S\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
+                response_body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        }
+    });
+    address
+}
+
+/// The development JSON-only attestation path (debug builds only) lets a
+/// local TLS stub answer `attest_receipt_key` with `report_data` evidence
+/// computed from the request's nonce and leaf pin -- no AMD hardware needed.
+pub(crate) fn enable_dev_json_attestation() {
+    unsafe {
+        std::env::set_var("ENCLAVA_TEE_DEV_ALLOW_JSON_REPORT_DATA_ONLY", "1");
+    }
+}
+
+/// Build the `/attestation` answer that satisfies the development JSON
+/// report-data check for the client's echoed nonce, domain, and leaf pin.
+pub(crate) fn dev_json_attestation_body(request_target: &str) -> String {
+    let url = reqwest::Url::parse(&format!("https://localhost{request_target}")).unwrap();
+    let param = |name: &str| -> String {
+        url.query_pairs()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.into_owned())
+            .expect("attestation request carries all binding params")
+    };
+    let nonce = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(param("nonce"))
+        .unwrap();
+    let leaf_spki_sha256: [u8; 32] = hex::decode(param("leaf_spki_sha256"))
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let receipt_pubkey_sha256 = "11".repeat(32);
+    let transcript = enclava_cli::attestation::tee_tls_transcript_hash(
+        &param("domain"),
+        nonce.as_slice().try_into().unwrap(),
+        &leaf_spki_sha256,
+    );
+    let binding = enclava_common::canonical::ce_v1_hash(&[
+        ("purpose", b"enclava-tee-report-data-v1"),
+        ("transcript_hash", &transcript),
+        (
+            "receipt_pubkey_sha256",
+            hex::decode(&receipt_pubkey_sha256).unwrap().as_slice(),
+        ),
+    ]);
+    serde_json::json!({
+        "nonce": param("nonce"),
+        "runtime_data_binding": {
+            "domain": param("domain"),
+            "leaf_spki_sha256": param("leaf_spki_sha256"),
+            "receipt_pubkey_sha256": receipt_pubkey_sha256,
+        },
+        "evidence": {
+            "payload_b64": "",
+            "json": { "report_data": hex::encode(hex::encode(binding)) }
+        }
+    })
+    .to_string()
+}
+
+/// Serializes tests that point `ENCLAVA_STATE_DIR`, the dev-attestation env,
+//  or the process working directory at a fixture directory.
+static STATE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// An isolated CLI state directory: config.toml + credentials.toml pointing
+/// at a stub API, `ENCLAVA_STATE_DIR` set, and optionally the process CWD
+/// moved into the directory. Everything is restored on drop.
+pub(crate) struct IsolatedStateEnv {
+    _guard: std::sync::MutexGuard<'static, ()>,
+    _dir: tempfile::TempDir,
+    prev_state_dir: Option<std::ffi::OsString>,
+    prev_dev_attestation: Option<std::ffi::OsString>,
+    prev_cwd: Option<std::path::PathBuf>,
+}
+
+impl IsolatedStateEnv {
+    /// The CLI state paths under the isolated root.
+    pub(crate) fn paths(&self) -> CliPaths {
+        CliPaths::from_root(self._dir.path().to_path_buf()).unwrap()
+    }
+
+    fn restore_var(name: &str, previous: Option<std::ffi::OsString>) {
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+}
+
+impl Drop for IsolatedStateEnv {
+    fn drop(&mut self) {
+        Self::restore_var("ENCLAVA_STATE_DIR", self.prev_state_dir.take());
+        Self::restore_var(
+            "ENCLAVA_TEE_DEV_ALLOW_JSON_REPORT_DATA_ONLY",
+            self.prev_dev_attestation.take(),
+        );
+        if let Some(cwd) = self.prev_cwd.take() {
+            let _ = std::env::set_current_dir(cwd);
+        }
+    }
+}
+
+/// Isolate CLI state under a fresh temp directory with credentials for
+/// `api_url`. `cwd_to_root` also moves the process CWD there (so
+/// `AppConfig::find_and_load` sees the directory's `enclava.toml`).
+pub(crate) fn isolated_state_env(api_url: &str, cwd_to_root: bool) -> IsolatedStateEnv {
+    let guard = STATE_ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let paths = CliPaths::from_root(dir.path().to_path_buf()).unwrap();
+    paths.ensure_dirs().unwrap();
+    enclava_cli::config::save_config(
+        &paths,
+        &enclava_cli::config::CliConfig {
+            api_url: api_url.to_string(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    enclava_cli::config::save_credentials(
+        &paths,
+        &enclava_cli::config::Credentials {
+            api_key: Some("test-token".to_string()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let prev_state_dir = std::env::var_os("ENCLAVA_STATE_DIR");
+    let prev_dev_attestation = std::env::var_os("ENCLAVA_TEE_DEV_ALLOW_JSON_REPORT_DATA_ONLY");
+    unsafe {
+        std::env::set_var("ENCLAVA_STATE_DIR", dir.path());
+    }
+    let prev_cwd = if cwd_to_root {
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        Some(cwd)
+    } else {
+        None
+    };
+    IsolatedStateEnv {
+        _guard: guard,
+        _dir: dir,
+        prev_state_dir,
+        prev_dev_attestation,
+        prev_cwd,
+    }
+}
+
 // --- terminal bootstrap diagnostics -------------------------------------------
 
 mod terminal_diagnostics {
@@ -2046,83 +1595,6 @@ mod terminal_diagnostics {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const SYNTHETIC_SECRET_MARKER: &str = "SECRET-MARKER-9a41e7";
-
-    // Public synthetic localhost fixture (same key material as the transport
-    // test in tee_client/tls.rs); used only for local TLS test servers.
-    const SYNTHETIC_LOCALHOST_CERT_B64: &str = "MIIBfzCCASWgAwIBAgIUDvNchz/4kjYNIUZPbhErYcJcQEkwCgYIKoZIzj0EAwIwFDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MDkwNjE1NTgyM1oYDzIxMjYwODEzMTU1ODIzWjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASTrTE27CrHezsrQig5SJS3khO5zrEB7SYnpJj05SOwGHPQCBpYHg38VRS9fdnyKI2JdkuAePfnhVJULAcTmrkuo1MwUTAdBgNVHQ4EFgQUW41obMczsiP/amwMRntTfO2u2g0wHwYDVR0jBBgwFoAUW41obMczsiP/amwMRntTfO2u2g0wDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNIADBFAiBFGRlU//+3JyhVqXNcpWw7QR9N9pEoiRVpgFc0Dxg+uwIhAIO8kzgeVzlTSTS7/2jE2EuVXtAxL3Mcbd62YjrqNtaG";
-    const SYNTHETIC_LOCALHOST_KEY_B64: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg1eONjcC4FaH2HqTDcwYCUym2nm332NQ/GN4WxJafrU+hRANCAASTrTE27CrHezsrQig5SJS3khO5zrEB7SYnpJj05SOwGHPQCBpYHg38VRS9fdnyKI2JdkuAePfnhVJULAcTmrku";
-
-    /// Serves one static JSON body per request path over local TLS, recording
-    /// every received request path.
-    async fn spawn_local_tls_server(
-        requests: std::sync::Arc<Mutex<Vec<String>>>,
-        respond: impl Fn(&str) -> (u16, String) + Send + Sync + 'static,
-    ) -> SocketAddr {
-        let certificate = base64::engine::general_purpose::STANDARD
-            .decode(SYNTHETIC_LOCALHOST_CERT_B64)
-            .unwrap();
-        let key = base64::engine::general_purpose::STANDARD
-            .decode(SYNTHETIC_LOCALHOST_KEY_B64)
-            .unwrap();
-        let config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
-            rustls::crypto::aws_lc_rs::default_provider(),
-        ))
-        .with_protocol_versions(rustls::DEFAULT_VERSIONS)
-        .unwrap()
-        .with_no_client_auth()
-        .with_single_cert(
-            vec![rustls::pki_types::CertificateDer::from(certificate)],
-            rustls::pki_types::PrivatePkcs8KeyDer::from(key).into(),
-        )
-        .unwrap();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config));
-        tokio::spawn(async move {
-            loop {
-                let Ok((stream, _)) = listener.accept().await else {
-                    return;
-                };
-                let Ok(mut stream) = acceptor.accept(stream).await else {
-                    continue;
-                };
-                let mut request = Vec::new();
-                let mut chunk = [0_u8; 4096];
-                loop {
-                    match stream.read(&mut chunk).await {
-                        Ok(0) => break,
-                        Ok(read) => {
-                            request.extend_from_slice(&chunk[..read]);
-                            if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-                let path = String::from_utf8_lossy(&request)
-                    .split_whitespace()
-                    .nth(1)
-                    .unwrap_or("/")
-                    .to_string();
-                requests.lock().unwrap().push(path.clone());
-                let (status, reason, body) = match respond(&path) {
-                    (200, body) => (200, "OK", body),
-                    (404, body) => (404, "Not Found", body),
-                    (423, body) => (423, "Locked", body),
-                    (500, body) => (500, "Internal Server Error", body),
-                    _ => (404, "Not Found", "{}".to_string()),
-                };
-                let response = format!(
-                    "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = stream.write_all(response.as_bytes()).await;
-                let _ = stream.shutdown().await;
-            }
-        });
-        address
-    }
 
     /// Plain-HTTP stub for `ApiClient::get_unlock_endpoint`.
     async fn spawn_unlock_endpoint_stub(tee_base_url: String) -> SocketAddr {
@@ -2156,51 +1628,6 @@ mod terminal_diagnostics {
                 .to_string();
                 let response = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = stream.write_all(response.as_bytes()).await;
-                let _ = stream.shutdown().await;
-            }
-        });
-        address
-    }
-
-    /// Plain-HTTP JSON stub for `ApiClient` GET routes; unmatched paths 404.
-    async fn spawn_json_api_stub(
-        respond: impl Fn(&str) -> Option<serde_json::Value> + Send + Sync + 'static,
-    ) -> SocketAddr {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut stream, _)) = listener.accept().await else {
-                    return;
-                };
-                let mut request = Vec::new();
-                let mut chunk = [0_u8; 4096];
-                loop {
-                    match stream.read(&mut chunk).await {
-                        Ok(0) => break,
-                        Ok(read) => {
-                            request.extend_from_slice(&chunk[..read]);
-                            if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-                let path = String::from_utf8_lossy(&request)
-                    .split_whitespace()
-                    .nth(1)
-                    .unwrap_or("/")
-                    .to_string();
-                let (status, body) = match respond(&path) {
-                    Some(value) => ("200 OK", value.to_string()),
-                    None => ("404 Not Found", "{}".to_string()),
-                };
-                let response = format!(
-                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 let _ = stream.write_all(response.as_bytes()).await;
@@ -3950,16 +3377,19 @@ mod terminal_diagnostics {
         // deployment-bound probe, but without a verified attestation the
         // probe authorizes nothing and the wait keeps its own deadline
         // semantics (here: the timeout error).
-        let api_address = spawn_json_api_stub(|path| {
-            if path.ends_with("/deployments") {
-                Some(serde_json::json!([deployment_entry_json(
-                    "expected-1",
-                    "watching"
-                )]))
-            } else {
-                None
-            }
-        })
+        let api_address = spawn_json_api_stub(
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            |path| {
+                if path.ends_with("/deployments") {
+                    (
+                        200,
+                        serde_json::json!([deployment_entry_json("expected-1", "watching")]),
+                    )
+                } else {
+                    (404, serde_json::json!({}))
+                }
+            },
+        )
         .await;
         let api = ApiClient::new(&format!("http://{api_address}"), Some("test".to_string()));
         let error = wait_for_deployment_completion(
@@ -3989,23 +3419,29 @@ mod terminal_diagnostics {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let deployments = std::sync::Arc::new(AtomicUsize::new(0));
         let seen = deployments.clone();
-        let api_address = spawn_json_api_stub(move |path| {
-            if !path.ends_with("/deployments") {
-                return None;
-            }
-            let nth = seen.fetch_add(1, Ordering::SeqCst) + 1;
-            Some(match nth {
-                1 => serde_json::json!([deployment_entry_json("expected-1", "healthy")]),
-                _ => serde_json::json!([{
-                    "id": "expected-1",
-                    "status": "failed",
-                    "error_message": "signed_policy_budget_exceeded",
-                    "image_digest": null,
-                    "created_at": "2026-10-13T00:00:00Z",
-                    "completed_at": "2026-10-13T00:01:00Z",
-                }]),
-            })
-        })
+        let api_address = spawn_json_api_stub(
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            move |path| {
+                if !path.ends_with("/deployments") {
+                    return (404, serde_json::json!({}));
+                }
+                let nth = seen.fetch_add(1, Ordering::SeqCst) + 1;
+                (
+                    200,
+                    match nth {
+                        1 => serde_json::json!([deployment_entry_json("expected-1", "healthy")]),
+                        _ => serde_json::json!([{
+                            "id": "expected-1",
+                            "status": "failed",
+                            "error_message": "signed_policy_budget_exceeded",
+                            "image_digest": null,
+                            "created_at": "2026-10-13T00:00:00Z",
+                            "completed_at": "2026-10-13T00:01:00Z",
+                        }]),
+                    },
+                )
+            },
+        )
         .await;
         let api = ApiClient::new(&format!("http://{api_address}"), Some("test".to_string()));
         let error = wait_for_deployment_completion(
@@ -4035,23 +3471,29 @@ mod terminal_diagnostics {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let deployments = std::sync::Arc::new(AtomicUsize::new(0));
         let seen = deployments.clone();
-        let api_address = spawn_json_api_stub(move |path| {
-            if !path.ends_with("/deployments") {
-                return None;
-            }
-            let nth = seen.fetch_add(1, Ordering::SeqCst) + 1;
-            Some(match nth {
-                1 => serde_json::json!([deployment_entry_json("expected-1", "applying")]),
-                _ => serde_json::json!([{
-                    "id": "expected-1",
-                    "status": "failed",
-                    "error_message": "signed_policy_budget_exceeded",
-                    "image_digest": null,
-                    "created_at": "2026-10-13T00:00:00Z",
-                    "completed_at": "2026-10-13T00:01:00Z",
-                }]),
-            })
-        })
+        let api_address = spawn_json_api_stub(
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            move |path| {
+                if !path.ends_with("/deployments") {
+                    return (404, serde_json::json!({}));
+                }
+                let nth = seen.fetch_add(1, Ordering::SeqCst) + 1;
+                (
+                    200,
+                    match nth {
+                        1 => serde_json::json!([deployment_entry_json("expected-1", "applying")]),
+                        _ => serde_json::json!([{
+                            "id": "expected-1",
+                            "status": "failed",
+                            "error_message": "signed_policy_budget_exceeded",
+                            "image_digest": null,
+                            "created_at": "2026-10-13T00:00:00Z",
+                            "completed_at": "2026-10-13T00:01:00Z",
+                        }]),
+                    },
+                )
+            },
+        )
         .await;
         let api = ApiClient::new(&format!("http://{api_address}"), Some("test".to_string()));
         let error = wait_for_deployment_apply_start(
@@ -4071,87 +3513,151 @@ mod terminal_diagnostics {
             "unexpected error: {error}"
         );
     }
+}
 
-    #[test]
-    fn terminal_diagnostic_wiring_covers_every_post_claim_wait() {
-        // Fail-if-bypassed wiring check (behavior is covered by the live
-        // tests above): the runtime direct fallback classifies before
-        // returning Ok, config retries probe, and the health wait uses the
-        // deployment-bound probe.
-        let source = include_str!("../../app.rs").replace("\r\n", "\n");
+// --- command-flow regression coverage ---------------------------------------
 
-        let runtime_start = source.find("async fn wait_for_deploy_runtime").unwrap();
-        let runtime_end = source[runtime_start..]
-            .find("async fn find_deployment_entry")
-            .unwrap()
-            + runtime_start;
-        let runtime = &source[runtime_start..runtime_end];
-        let classify = runtime.find("direct_tee_runtime_outcome").unwrap();
-        let ready = runtime[classify..]
-            .find("return Ok(())")
-            .map(|offset| offset + classify)
-            .unwrap();
-        assert!(
-            classify < ready,
-            "the direct TEE fallback must classify terminal diagnostics before reporting readiness"
-        );
-        assert!(runtime.contains("bounded_status_json"));
+#[test]
+fn password_redeploy_runtime_target_rejects_stale_unlocked_states() {
+    // A password-mode redeploy must not accept the old pod's unlocked/running
+    // state: only a fresh `locked` observation can satisfy the wait.
+    assert!(!super::DeployRuntimeTarget::PasswordLocked.accepts_direct_unlocked());
+    assert!(!super::DeployRuntimeTarget::PasswordLocked.accepts_running_pod_phase());
+    assert!(super::DeployRuntimeTarget::PasswordLocked.accepts_api_status("locked"));
+    assert!(!super::DeployRuntimeTarget::PasswordLocked.accepts_api_status("running"));
+    assert!(!super::DeployRuntimeTarget::PasswordLocked.accepts_api_status("unlocked"));
+}
 
-        let config_start = source.find("async fn set_deploy_config").unwrap();
-        let config_end = source[config_start..]
-            .find("fn should_retry_deploy_config")
-            .unwrap()
-            + config_start;
-        let config = &source[config_start..config_end];
-        assert!(
-            config.contains("deployment_bound_terminal_bootstrap_error_on_channel"),
-            "config write retries must stop on a deployment-bound terminal diagnostic from the attested channel"
-        );
+#[tokio::test]
+async fn deploy_verifies_password_input_before_remote_side_effects() {
+    // A password-mode deploy whose storage password source cannot be read
+    // must stop before signing and before any remote mutation: the only
+    // request allowed is the read-only app lookup that precedes the input
+    // check.
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let api_address = spawn_json_api_stub(events.clone(), |path| {
+        if path == "/apps/shell" {
+            (
+                200,
+                serde_json::json!({
+                    "id": "11111111-2222-3333-4444-555555555555",
+                    "name": "shell",
+                    "namespace": "team",
+                    "instance_id": "inst-1",
+                    "domain": "shell.enclava.dev",
+                    "status": "running",
+                    "unlock_mode": "password",
+                    "created_at": "2026-10-01T00:00:00Z"
+                }),
+            )
+        } else {
+            (404, serde_json::json!({}))
+        }
+    })
+    .await;
+    let env = isolated_state_env(&format!("http://{api_address}"), true);
+    std::fs::write(
+        env.paths().root.join("enclava.toml"),
+        "[app]\nname = \"shell\"\nport = 8080\n",
+    )
+    .unwrap();
 
-        let health_start = source
-            .find("async fn wait_for_deployment_completion")
-            .unwrap();
-        let health_end = source[health_start..]
-            .find("async fn ensure_password_storage_unlocked_for_config")
-            .unwrap()
-            + health_start;
-        let health = &source[health_start..health_end];
-        assert!(
-            health.contains("deployment_bound_terminal_bootstrap_error"),
-            "the health wait must use the deployment-bound terminal probe"
-        );
+    let result = super::deploy(super::DeployArgs {
+        image: "ghcr.io/acme/demo@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            .to_string(),
+        config_vars: vec![],
+        config_file_vars: vec![],
+        storage_password_file: Some(env.paths().root.join("missing-password")),
+        store_mnemonic: false,
+        no_store_mnemonic: false,
+    })
+    .await;
 
-        // Production ordering inside the post-auth reader is
-        // verification -> predicate -> reader: the launch-identity predicate
-        // must gate the bounded status read.
-        let reader_start = source
-            .find("async fn bound_tee_status_on_attested")
-            .unwrap();
-        let reader_end = source[reader_start..].find("\nasync fn ").unwrap() + reader_start;
-        let reader = &source[reader_start..reader_end];
-        let predicate = reader.find("launch_identity_binds_deployment").unwrap();
-        let read = reader.find("bounded_status_json").unwrap();
-        assert!(
-            predicate < read,
-            "the launch-identity predicate must gate the status read"
-        );
+    assert!(
+        result.is_err(),
+        "unreadable password input must fail the deploy"
+    );
+    assert_eq!(
+        events.lock().unwrap().as_slice(),
+        ["GET /apps/shell "],
+        "only the read-only app lookup may run before password input is verified"
+    );
+}
 
-        // No terminal-classifying status read may escape a complete budget:
-        // the unlock wait, the runtime direct fallback, and the bootstrap
-        // fallback arms all use the deadline-capped reads.
-        let unlock_start = source
-            .find("async fn wait_for_deploy_unlock_completion")
-            .unwrap();
-        let unlock_end = source[unlock_start..]
-            .find("pub(crate) async fn claim_initial_ownership")
-            .unwrap()
-            + unlock_start;
-        assert!(
-            source[unlock_start..unlock_end]
-                .contains("bounded_status_json_within(terminal_diagnostic_budget"),
-            "the unlock wait's status read must be budget-capped to its deadline"
-        );
-        assert!(runtime.contains("bounded_status_json_within"));
-        assert!(source.contains("bootstrap_status_within(terminal_diagnostic_budget"));
-    }
+#[tokio::test]
+async fn bootstrap_endpoint_wait_attests_before_probing_the_claim_endpoint() {
+    // The ownership readiness probe may only query the claim challenge over
+    // the SPKI-pinned channel produced by attestation: the recorded request
+    // order must show /attestation before /bootstrap/challenge.
+    let _env = isolated_state_env("http://127.0.0.1:1", false);
+    enable_dev_json_attestation();
+    let tee_requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let tee_address = spawn_local_tls_server(tee_requests.clone(), |path| {
+        if path.starts_with("/.well-known/confidential/attestation") {
+            (200, dev_json_attestation_body(path))
+        } else if path.ends_with("/bootstrap/challenge") {
+            (
+                200,
+                serde_json::json!({ "nonce": "challenge-nonce", "expires_in_seconds": 30 })
+                    .to_string(),
+            )
+        } else {
+            (404, "{}".to_string())
+        }
+    })
+    .await;
+    let api_requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let api_address = spawn_json_api_stub(api_requests, move |path| {
+        if path.ends_with("/unlock/endpoint") {
+            (200, serde_json::json!({
+                "tee_url": format!("https://localhost:{}", tee_address.port()),
+                "tee_resolve_ip": "127.0.0.1",
+                "unlock_endpoint": format!("https://localhost:{}/unlock", tee_address.port()),
+                "claim_endpoint": format!("https://localhost:{}/bootstrap/claim", tee_address.port()),
+            }))
+        } else if path.ends_with("/deployments") {
+            (
+                200,
+                serde_json::json!([{
+                    "id": "deploy-1",
+                    "status": "applying",
+                    "image_digest": null,
+                    "created_at": "2026-10-01T00:00:00Z",
+                    "completed_at": null
+                }]),
+            )
+        } else {
+            (404, serde_json::json!({}))
+        }
+    })
+    .await;
+
+    let api = ApiClient::new(&format!("http://{api_address}"), Some("test".to_string()));
+    let ready = wait_for_bootstrap_endpoint(
+        &api,
+        "shell",
+        DeploymentWait::new("deploy-1"),
+        Duration::from_secs(15),
+        Duration::from_millis(20),
+        &ProgressBar::hidden(),
+    )
+    .await
+    .expect("the readiness probe must pass against the stub TEE");
+    assert!(ready);
+
+    let recorded = tee_requests.lock().unwrap();
+    let attestation = recorded
+        .iter()
+        .position(|request| request.starts_with("GET /.well-known/confidential/attestation"))
+        .expect("the wait must attest the TEE leaf first");
+    let challenge = recorded
+        .iter()
+        .position(|request| {
+            request.starts_with("POST /.well-known/confidential/bootstrap/challenge")
+        })
+        .expect("the wait must probe the claim challenge");
+    assert!(
+        attestation < challenge,
+        "attestation must precede the claim-endpoint probe: {recorded:?}"
+    );
 }

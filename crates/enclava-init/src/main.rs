@@ -71,10 +71,9 @@ fn main() -> ExitCode {
             report_failure(&e);
             // Prod-strict fails fast: an indefinitely-alive failed sidecar
             // masks the failure from orchestration (no restart, no backoff).
-            // Dev builds keep the diagnostics-readable stay-alive.
-            // NOTE: the exact condition string below is load-bearing —
-            // lib.rs::prod_strict_gates_host_mutable_env_overrides pins it.
-            if stay_alive_enabled() && !cfg!(feature = "prod-strict") {
+            // Dev builds keep the diagnostics-readable stay-alive; the
+            // predicate compiles the bypass out of prod-strict builds.
+            if stay_alive_after_failure_enabled() {
                 tracing::error!(
                     "enclava-init failed; keeping sidecar alive so diagnostics remain readable"
                 );
@@ -224,6 +223,13 @@ fn stay_alive_enabled() -> bool {
     std::env::var("ENCLAVA_INIT_STAY_ALIVE")
         .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
         .unwrap_or(false)
+}
+
+/// Whether a failed bootstrap keeps the sidecar alive for diagnostics.
+/// Prod-strict compiles this to false: a failed init must exit so
+/// orchestration sees the failure instead of a mounter that stays up.
+fn stay_alive_after_failure_enabled() -> bool {
+    stay_alive_enabled() && !cfg!(feature = "prod-strict")
 }
 
 fn start_log_relay_if_configured() -> Result<Option<std::thread::JoinHandle<()>>> {

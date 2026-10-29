@@ -823,18 +823,6 @@ mod tests {
                 assert_eq!(seq(lines[0]), seq(lines[1]));
             }
         }
-        let source = include_str!("acme.rs");
-        let wait = source
-            .split("async fn wait_for_txt_record")
-            .nth(1)
-            .unwrap()
-            .split("async fn lookup_txt")
-            .next()
-            .unwrap();
-        assert!(!wait.contains("expected ="));
-        assert!(!wait.contains("observed ="));
-        assert!(!wait.contains("error ="));
-        assert!(wait.contains("value == expected_value"));
     }
 
     #[tokio::test]
@@ -947,47 +935,6 @@ mod tests {
         assert!(result.is_err());
         assert!(dropped.get());
         assert_eq!(calls.get(), 1);
-    }
-    #[test]
-    fn dns01_challenge_is_marked_ready_after_propagation_wait() {
-        let source = include_str!("acme.rs");
-        let wait_pos = source.find("wait_for_txt_record").expect("TXT self-check");
-        let ready_pos = source
-            .find("challenge.set_ready()")
-            .expect("set_ready call");
-
-        assert!(
-            wait_pos < ready_pos,
-            "ACME DNS-01 must verify TXT propagation before challenge.set_ready()"
-        );
-    }
-
-    #[test]
-    fn dns01_txt_lookup_prefers_external_resolver() {
-        let source = include_str!("acme.rs");
-        let lookup = source
-            .split("async fn lookup_txt_external")
-            .nth(1)
-            .expect("lookup_txt_external function");
-
-        assert!(
-            lookup.contains("ResolverConfig::udp_and_tcp(&CLOUDFLARE)"),
-            "ACME DNS-01 TXT self-check should use an external recursive resolver"
-        );
-    }
-
-    #[test]
-    fn dns01_txt_lookup_falls_back_when_external_dns_is_blocked() {
-        let source = include_str!("acme.rs");
-        let fallback = source
-            .split("async fn lookup_txt_system")
-            .nth(1)
-            .expect("lookup_txt_system function");
-
-        assert!(
-            fallback.contains("builder_tokio()"),
-            "ACME DNS-01 TXT self-check must fall back to a fresh system resolver when pod egress to external DNS is blocked"
-        );
     }
 
     const SYNTHETIC_PROVIDER_SECRET: &str = "SYNTHETIC-PROVIDER-SECRET-7f3a91c2";

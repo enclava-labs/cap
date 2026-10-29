@@ -3658,7 +3658,7 @@ pub async fn destroy(args: DestroyArgs) -> Result<(), Box<dyn std::error::Error>
 
 #[cfg(test)]
 #[path = "app/tests/mod.rs"]
-mod tests;
+pub(crate) mod tests;
 
 /// Operator guidance for a failed destroy, keyed on the stable API code (or
 /// the in-band cause text hosted deferrals carry). Pure so the prose mapping

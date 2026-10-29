@@ -853,7 +853,10 @@ pub(crate) async fn build_signed_deploy_blobs(
 
 #[cfg(test)]
 mod bootstrap_tests {
-    use super::confirmed_bootstrap_state;
+    use super::*;
+    use enclava_cli::keyring::{Role, sign_keyring, single_member_keyring};
+    use enclava_cli::keys;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn accepts_only_policy_service_bootstrap_success_states() {
@@ -861,5 +864,176 @@ mod bootstrap_tests {
         assert!(confirmed_bootstrap_state("already-bootstrapped"));
         assert!(!confirmed_bootstrap_state("ready"));
         assert!(!confirmed_bootstrap_state("failed"));
+    }
+
+    const TEST_USER_ID: Uuid = Uuid::from_u128(0x11111111_1111_1111_1111_111111111111);
+    const TEST_ORG_ID: Uuid = Uuid::from_u128(0x22222222_2222_3333_4444_555555555555);
+    const TEST_SEED: [u8; 32] = [7u8; 32];
+
+    fn test_owner() -> keys::UserSigningKey {
+        keys::derive_org_owner_key(TEST_USER_ID, TEST_ORG_ID, &TEST_SEED).unwrap()
+    }
+
+    fn keyring_response() -> serde_json::Value {
+        let owner = test_owner();
+        let keyring = single_member_keyring(TEST_ORG_ID, 1, &owner, Role::Owner, Utc::now());
+        let envelope = serde_json::to_value(sign_keyring(&owner, keyring)).unwrap();
+        serde_json::json!({
+            "org_id": TEST_ORG_ID.to_string(),
+            "version": 1,
+            "keyring_payload": envelope["keyring"].clone(),
+            "signature": envelope["signature"].clone(),
+            "signing_pubkey": hex::encode(owner.public.to_bytes()),
+            "fingerprint": hex::encode(owner.public.to_bytes()),
+        })
+    }
+
+    fn bootstrap_state(status: u16) -> serde_json::Value {
+        serde_json::json!({
+            "org_id": TEST_ORG_ID.to_string(),
+            "state": if status == 200 { "bootstrapped" } else { "unavailable" },
+            "owner_pubkey_fingerprint": hex::encode(test_owner().public.to_bytes()),
+        })
+    }
+
+    /// API stub serving the whole ensure_manual_deploy_keyring surface;
+    /// `bootstrap_status` controls the signing-service bootstrap answer.
+    async fn spawn_keyring_api(
+        events: Arc<Mutex<Vec<String>>>,
+        bootstrap_status: u16,
+    ) -> std::net::SocketAddr {
+        let keyring = keyring_response();
+        crate::commands::app::tests::spawn_json_api_stub(events, move |path| {
+            if path == "/users/me" {
+                (
+                    200,
+                    serde_json::json!({
+                        "user_id": TEST_USER_ID.to_string(),
+                        "display_name": "tester",
+                        "active_org": {
+                            "id": TEST_ORG_ID.to_string(),
+                            "name": "team",
+                            "display_name": null,
+                            "role": "owner",
+                            "is_personal": false
+                        },
+                        "orgs": []
+                    }),
+                )
+            } else if path == "/users/me/public-keys" {
+                (
+                    200,
+                    serde_json::json!({
+                        "id": "key-1",
+                        "public_key": hex::encode(test_owner().public.to_bytes())
+                    }),
+                )
+            } else if path == "/orgs/team/keyring" {
+                (200, keyring.clone())
+            } else if path == "/orgs/team/keyring/bootstrap-signing-service" {
+                (bootstrap_status, bootstrap_state(bootstrap_status))
+            } else {
+                (404, serde_json::json!({}))
+            }
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn manual_deploy_keyring_checks_remote_state_then_bootstraps_the_service() {
+        use crate::commands::app::tests::isolated_state_env;
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let api_address = spawn_keyring_api(events.clone(), 200).await;
+        let env = isolated_state_env(&format!("http://{api_address}"), false);
+        keys::store_seed_at(&env.paths().recovery_seed, &TEST_SEED, false).unwrap();
+        let api = ApiClient::new(&format!("http://{api_address}"), Some("t".to_string()));
+
+        let (org_id, org_name, owner_key) = ensure_manual_deploy_keyring(&api, &env.paths(), true)
+            .await
+            .expect("keyring bootstrap against the stub API");
+        assert_eq!(org_id, TEST_ORG_ID);
+        assert_eq!(org_name, "team");
+        assert_eq!(owner_key.public.to_bytes(), test_owner().public.to_bytes());
+
+        // The remote keyring check must come before the signing-service
+        // bootstrap and must run even with a warm local cache: a second call
+        // re-fetches the remote keyring instead of trusting the stored one.
+        ensure_manual_deploy_keyring(&api, &env.paths(), true)
+            .await
+            .expect("a second call still checks remote state");
+        let recorded = events.lock().unwrap().clone();
+        let remote_checks = recorded
+            .iter()
+            .filter(|request| request.starts_with("GET /orgs/team/keyring "))
+            .count();
+        assert_eq!(
+            remote_checks, 2,
+            "every call must check remote state: {recorded:?}"
+        );
+        let first_remote = recorded
+            .iter()
+            .position(|request| request.starts_with("GET /orgs/team/keyring "))
+            .unwrap();
+        let first_bootstrap = recorded
+            .iter()
+            .position(|request| {
+                request.starts_with("POST /orgs/team/keyring/bootstrap-signing-service")
+            })
+            .expect("the signing service must be bootstrapped");
+        assert!(
+            first_remote < first_bootstrap,
+            "the remote keyring check must precede the signing-service bootstrap: {recorded:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_deploy_keyring_503_signing_service_is_required_only_for_deployment() {
+        use crate::commands::app::tests::isolated_state_env;
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let api_address = spawn_keyring_api(events.clone(), 503).await;
+        let env = isolated_state_env(&format!("http://{api_address}"), false);
+        keys::store_seed_at(&env.paths().recovery_seed, &TEST_SEED, false).unwrap();
+        let api = ApiClient::new(&format!("http://{api_address}"), Some("t".to_string()));
+
+        ensure_manual_deploy_keyring(&api, &env.paths(), false)
+            .await
+            .expect("a tolerated 503 still yields the deploy keyring");
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request
+                    .starts_with("POST /orgs/team/keyring/bootstrap-signing-service")),
+            "the signing service is always attempted before tolerance is decided"
+        );
+        ensure_manual_deploy_keyring(&api, &env.paths(), true)
+            .await
+            .expect_err("deployment requires the signing service");
+    }
+
+    #[tokio::test]
+    async fn manual_deploy_keyring_requires_an_existing_recovery_seed() {
+        use crate::commands::app::tests::isolated_state_env;
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let api_address = spawn_keyring_api(events.clone(), 200).await;
+        let env = isolated_state_env(&format!("http://{api_address}"), false);
+        let api = ApiClient::new(&format!("http://{api_address}"), Some("t".to_string()));
+
+        let error = ensure_manual_deploy_keyring(&api, &env.paths(), true)
+            .await
+            .expect_err("deployment must require a recoverable signing seed");
+        assert!(
+            error.to_string().contains("enclava key setup"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            ["GET /users/me "],
+            "nothing but the org lookup may run without a seed"
+        );
     }
 }

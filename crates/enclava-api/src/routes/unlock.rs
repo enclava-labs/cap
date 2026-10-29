@@ -2143,30 +2143,6 @@ mod tests {
     }
 
     #[test]
-    fn unlock_mode_hash_validation_uses_local_artifact_delivery_mode() {
-        let source = include_str!("unlock.rs");
-        let fn_start = source
-            .find("pub async fn update_unlock_mode")
-            .expect("update_unlock_mode exists");
-        let fn_end = source[fn_start..]
-            .find("let receipt_json")
-            .expect("receipt persistence follows signing validation")
-            + fn_start;
-        let body = &source[fn_start..fn_end];
-
-        let select = body
-            .find("select_local_signed_artifact_delivery")
-            .expect("unlock-mode signing validation must use local artifact delivery mode");
-        let compute = body
-            .find("validate_and_pin_cc_init_data_render")
-            .expect("unlock-mode signing validation validates the cc_init_data render");
-        assert!(
-            select < compute,
-            "unlock-mode redeploy hash validation must match normal deploy's signed-artifact delivery mode"
-        );
-    }
-
-    #[test]
     fn verifies_unlock_mode_transition_receipt_signature_and_payload() {
         let signing_key = SigningKey::from_bytes(&[7; 32]);
         let quote_hash = "ab".repeat(32);

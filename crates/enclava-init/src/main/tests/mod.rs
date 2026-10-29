@@ -1489,19 +1489,69 @@ fn log_encryption_handoff_uses_single_cc_init_data_snapshot() {
 }
 
 #[test]
-fn password_unlock_socket_is_reached_before_waiting_on_workload_namespaces() {
-    let source = include_str!("../../main.rs");
-    let owner_seed_stage = source
-        .find("record_stage(\"waiting for owner seed\")")
-        .expect("owner seed stage marker");
-    let workload_wait_stage = source
-        .find("record_stage(\"waiting for workload containers\")")
-        .expect("workload wait stage marker");
+fn init_surface_env_overrides_resolve_through_env_override() {
+    let _env_lock = FAILURE_ENV_LOCK.lock().unwrap();
+    let dir = tempdir().unwrap();
+    for var in [
+        "ENCLAVA_INIT_READY_FILE",
+        "ENCLAVA_INIT_ERROR_FILE",
+        "ENCLAVA_INIT_STAGE_FILE",
+        "ENCLAVA_INIT_STARTED_DIR",
+        "ENCLAVA_INIT_ACME_COOLDOWN_FILE",
+        "ENCLAVA_INIT_TERMINATION_LOG",
+    ] {
+        let previous = std::env::var_os(var);
+        let custom = dir.path().join(var);
+        unsafe { std::env::set_var(var, &custom) };
+        let resolved = init_surface_path(var, "/enclava-default");
+        match previous {
+            Some(value) => unsafe { std::env::set_var(var, value) },
+            None => unsafe { std::env::remove_var(var) },
+        }
+        let expected = if cfg!(feature = "prod-strict") {
+            // Prod-strict binds surfaces to compiled defaults only: the
+            // host-controlled pod environment must not redirect them.
+            PathBuf::from("/enclava-default")
+        } else {
+            custom
+        };
+        assert_eq!(
+            resolved,
+            expected,
+            "{var} resolution under {} builds",
+            if cfg!(feature = "prod-strict") {
+                "prod-strict"
+            } else {
+                "dev"
+            }
+        );
+    }
+}
 
+#[test]
+#[cfg(feature = "prod-strict")]
+fn prod_strict_failure_exit_never_stays_alive() {
     assert!(
-        owner_seed_stage < workload_wait_stage,
-        "enclava-init must accept claim/unlock before waiting on workload sentinels"
+        !stay_alive_after_failure_enabled(),
+        "prod-strict must fail fast so orchestration observes failed boots"
     );
+}
+
+#[test]
+#[cfg(not(feature = "prod-strict"))]
+fn dev_failure_exit_stays_alive_only_when_enabled() {
+    let _env_lock = FAILURE_ENV_LOCK.lock().unwrap();
+    let previous = std::env::var_os("ENCLAVA_INIT_STAY_ALIVE");
+    unsafe { std::env::set_var("ENCLAVA_INIT_STAY_ALIVE", "1") };
+    let enabled = stay_alive_after_failure_enabled();
+    unsafe { std::env::set_var("ENCLAVA_INIT_STAY_ALIVE", "0") };
+    let disabled = stay_alive_after_failure_enabled();
+    match previous {
+        Some(value) => unsafe { std::env::set_var("ENCLAVA_INIT_STAY_ALIVE", value) },
+        None => unsafe { std::env::remove_var("ENCLAVA_INIT_STAY_ALIVE") },
+    }
+    assert!(enabled, "dev builds honor ENCLAVA_INIT_STAY_ALIVE");
+    assert!(!disabled);
 }
 
 #[test]

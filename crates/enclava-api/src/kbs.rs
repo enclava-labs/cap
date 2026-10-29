@@ -3186,30 +3186,6 @@ mod tests {
     use chrono::Utc;
 
     #[test]
-    fn startup_fence_busy_spin_logs_disambiguation() {
-        // The Busy spin answers readiness with 503 the whole time; without a
-        // logged arm an operator cannot distinguish "recovering lease" from
-        // "hung reconcile" (as it looked during a real roll's ~9-minute reclaim).
-        let source = include_str!("kbs.rs");
-        assert!(
-            source.contains("error_code = \"kbs_policy_fence_busy\""),
-            "the startup kbs_policy fence Busy arm must keep its disambiguating log line"
-        );
-        assert!(
-            source.contains("fence_busy_logged = true"),
-            "the Busy arm must flip its flag so the WARN fires once, not per retry"
-        );
-        assert!(
-            source.contains("still waiting on the kbs_policy fence"),
-            "retries must demote to DEBUG instead of flooding WARN every 2s"
-        );
-        assert!(
-            source.contains("cleared the kbs_policy fence"),
-            "the WARN's window must be closed with an elapsed-time line an operator can correlate"
-        );
-    }
-
-    #[test]
     fn reconciliation_error_display_redacts_upstream_detail() {
         let db = KbsPolicyReconciliationError::from(KbsPolicyError::Db(sqlx::Error::Protocol(
             "tenant-sensitive database detail".to_string(),
