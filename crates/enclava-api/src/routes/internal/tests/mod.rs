@@ -1097,6 +1097,19 @@ async fn idempotency_receipt_reports_what_a_same_key_retry_would_do() {
     assert_eq!(live["operation_id"], serde_json::json!(operation_id));
     let retry_after = live["retry_after"].as_i64().expect("live lease retry hint");
     assert!((1..=IDEMPOTENCY_DEFAULT_LEASE_SECONDS).contains(&retry_after));
+    let (status, Json(body)) = begin_idempotent_request_with_recovery(
+        &state,
+        &key,
+        "POST",
+        &path,
+        &hash,
+        IdempotencyRecovery::RetrySafe,
+    )
+    .await
+    .err()
+    .expect("a same-key retry under a live lease is deferred");
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"], "idempotency_request_in_progress");
     drop(first);
     expire_idempotency_lease(&pool, &key).await;
 
@@ -1131,6 +1144,96 @@ async fn idempotency_receipt_reports_what_a_same_key_retry_would_do() {
 
     let (status, _) = receipt("  ").await.expect_err("blank key is rejected");
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn idempotency_receipt_matches_the_retry_decision_for_legacy_and_released_rows() {
+    let pool = database_test_pool().await;
+    let state = idempotency_test_state(pool.clone());
+    let hash = Sha256::digest(b"receipt-shape-request").to_vec();
+    // (label, has reservation token, lease offset seconds, known_not_applied,
+    // updated_at offset seconds, expected receipt state)
+    let shapes = [
+        ("legacy-recent", false, None, false, -60, "in_progress"),
+        (
+            "legacy-stale",
+            false,
+            None,
+            false,
+            -(IDEMPOTENCY_LEGACY_STALE_SECONDS + 60),
+            "abandoned",
+        ),
+        (
+            "leased-without-deadline",
+            true,
+            None,
+            false,
+            -60,
+            "in_progress",
+        ),
+        ("released-live", true, Some(30), true, -1, "in_progress"),
+        ("released-expired", true, Some(-30), true, -60, "abandoned"),
+    ];
+    for (label, has_token, lease_offset, known_not_applied, updated_offset, expected) in shapes {
+        let suffix = Uuid::new_v4().simple().to_string();
+        let key = format!("receipt-{label}-{suffix}");
+        let path = format!("/internal/test/receipt-shape/{suffix}");
+        sqlx::query(
+            "INSERT INTO cap_internal_idempotency (
+                 idempotency_key, method, path, request_hash, reservation_token,
+                 operation_id, lease_expires_at, recovery_kind, known_not_applied,
+                 updated_at
+             )
+             VALUES (
+                 $1, 'POST', $2, $3, $4, $5,
+                 clock_timestamp() + $6 * interval '1 second',
+                 CASE WHEN $4::uuid IS NULL THEN NULL ELSE 'retry_safe' END,
+                 $7,
+                 clock_timestamp() + $8 * interval '1 second'
+             )",
+        )
+        .bind(&key)
+        .bind(&path)
+        .bind(&hash)
+        .bind(has_token.then(Uuid::new_v4))
+        .bind(has_token.then(Uuid::new_v4))
+        .bind(lease_offset.map(|seconds| seconds as f64))
+        .bind(known_not_applied)
+        .bind(updated_offset as f64)
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("insert {label} idempotency row: {error}"));
+
+        let Json(receipt) = get_paas_idempotency_receipt(
+            internal_test_auth(),
+            State(state.clone()),
+            Query(IdempotencyReceiptQuery { key: key.clone() }),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("read {label} receipt"));
+        assert_eq!(receipt["state"], expected, "{label} receipt state");
+
+        let retry = begin_idempotent_request_with_recovery(
+            &state,
+            &key,
+            "POST",
+            &path,
+            &hash,
+            IdempotencyRecovery::RetrySafe,
+        )
+        .await;
+        let deferred = matches!(
+            &retry,
+            Err((status, Json(body)))
+                if *status == StatusCode::CONFLICT
+                    && body["error"] == "idempotency_request_in_progress"
+        );
+        assert_eq!(
+            deferred,
+            expected == "in_progress",
+            "{label}: receipt state must predict whether a same-key retry is deferred"
+        );
+    }
 }
 
 #[tokio::test]
