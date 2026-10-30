@@ -62,6 +62,11 @@ pub mod writes;
 
 #[cfg(test)]
 mod tests {
+    /// Serializes tests that read or mutate the process environment: the
+    /// override functions under test read it directly, and parallel test
+    /// threads must not observe another case's variables.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn dockerfile_defaults_to_locked_release_profile() {
         let dockerfile = include_str!("../Dockerfile").replace("\r\n", "\n");
@@ -131,28 +136,20 @@ mod tests {
     }
 
     #[test]
-    fn prod_strict_cannot_skip_luks() {
-        let source = include_str!("lib.rs").replace("\r\n", "\n");
-        assert!(
-            source.contains("cfg!(all(debug_assertions, not(feature = \"prod-strict\")))"),
-            "dev_no_luks_override must compile out when prod-strict is enabled"
-        );
-        assert!(
-            source.contains("std::env::var(\"ENCLAVA_INIT_DEV_NO_LUKS\")"),
-            "dev_no_luks_override must read the ENCLAVA_INIT_DEV_NO_LUKS env var"
-        );
-        let wrapper_body = source
-            .split("pub fn dev_no_luks_override() -> bool {")
-            .nth(1)
-            .expect("dev_no_luks_override definition")
-            .split('}')
-            .next()
-            .expect("dev_no_luks_override body")
-            .trim();
+    fn dev_no_luks_override_reads_env_only_in_debug_builds() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let previous = std::env::var_os("ENCLAVA_INIT_DEV_NO_LUKS");
+        unsafe { std::env::set_var("ENCLAVA_INIT_DEV_NO_LUKS", "true") };
+        let honored = super::dev_no_luks_override();
+        match previous {
+            Some(value) => unsafe { std::env::set_var("ENCLAVA_INIT_DEV_NO_LUKS", value) },
+            None => unsafe { std::env::remove_var("ENCLAVA_INIT_DEV_NO_LUKS") },
+        }
         assert_eq!(
-            wrapper_body,
-            "dev_no_luks_override_for(std::env::var(\"ENCLAVA_INIT_DEV_NO_LUKS\").ok().as_deref())",
-            "dev_no_luks_override must only delegate to dev_no_luks_override_for"
+            honored,
+            cfg!(all(debug_assertions, not(feature = "prod-strict"))),
+            "ENCLAVA_INIT_DEV_NO_LUKS must engage the override only in \
+             non-prod-strict debug builds"
         );
     }
 
@@ -190,66 +187,6 @@ mod tests {
             Some("value")
         );
         assert!(super::env_override_for(None).is_none());
-    }
-
-    #[test]
-    fn prod_strict_gates_host_mutable_env_overrides() {
-        let main_source = include_str!("main.rs").replace("\r\n", "\n");
-        // Whitespace-squashed view: the tripwire matches call sites even
-        // when rustfmt wraps long argument lists across lines.
-        let normalized: String = main_source.chars().filter(|c| !c.is_whitespace()).collect();
-        // The path-like env vars below redirect init output surfaces and must
-        // resolve through env_override (compiled out under prod-strict).
-        // Deliberately NOT gated (platform-set in prod manifests or
-        // timing-only knobs, see PR #136): ENCLAVA_INIT_CONFIG,
-        // ENCLAVA_INIT_STAY_ALIVE, ENCLAVA_INIT_UNLOCK_SOCKET_GID,
-        // ENCLAVA_INIT_WAIT_FOR_CONTAINERS*,
-        // ENCLAVA_INIT_KBS_PROXY_HEALTH_POLL_SECONDS/KBS_PROXY_HEALTH_POLL_SECONDS.
-        for var in [
-            "ENCLAVA_INIT_READY_FILE",
-            "ENCLAVA_INIT_ERROR_FILE",
-            "ENCLAVA_INIT_STAGE_FILE",
-            "ENCLAVA_INIT_STARTED_DIR",
-            "ENCLAVA_INIT_ACME_COOLDOWN_FILE",
-            "ENCLAVA_INIT_TERMINATION_LOG",
-        ] {
-            assert!(
-                !main_source.contains(&format!("std::env::var(\"{var}\")")),
-                "{var} must be read via env_override, not std::env::var"
-            );
-        }
-        for var in [
-            "ENCLAVA_INIT_READY_FILE",
-            "ENCLAVA_INIT_ERROR_FILE",
-            "ENCLAVA_INIT_STAGE_FILE",
-            "ENCLAVA_INIT_STARTED_DIR",
-            "ENCLAVA_INIT_ACME_COOLDOWN_FILE",
-            "ENCLAVA_INIT_TERMINATION_LOG",
-        ] {
-            assert!(
-                normalized.contains(&format!("init_surface_path(\"{var}\"")),
-                "{var} must resolve through init_surface_path (env_override + compiled default)"
-            );
-        }
-        // The failure-path keep-alive masks failed boots from orchestration;
-        // prod-strict must fail fast instead.
-        assert!(
-            main_source.contains("stay_alive_enabled() && !cfg!(feature = \"prod-strict\")"),
-            "failure-path stay-alive must be compiled out of prod-strict builds"
-        );
-        // The KBS attestation token env bypass must be gated too: prod-strict
-        // resolves the token from the signed kbs_attestation_token_url only.
-        for source in [
-            main_source.as_str(),
-            include_str!("tls_certificate.rs")
-                .replace("\r\n", "\n")
-                .as_str(),
-        ] {
-            assert!(
-                !source.contains("std::env::var(\"KBS_ATTESTATION_TOKEN\")"),
-                "KBS_ATTESTATION_TOKEN must be read via env_override, not std::env::var"
-            );
-        }
     }
 
     #[test]

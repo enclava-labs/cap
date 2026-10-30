@@ -224,8 +224,12 @@ async fn freeze_workload_authority_mutations(
     request: Request,
     next: Next,
 ) -> Response {
+    let matched_path = request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map_or("", |path| path.as_str());
     if state.deployment_dispatch_is_enabled()
-        || !is_workload_authority_mutation(request.method(), request.uri().path())
+        || !is_workload_authority_mutation(request.method(), matched_path)
     {
         return next.run(request).await;
     }
@@ -241,85 +245,41 @@ async fn freeze_workload_authority_mutations(
         .into_response()
 }
 
-/// Classify whether a request is a tenant workload-authority mutation that
-/// the deployment freeze gate must block while dispatch is disabled.
-///
-/// Invariant: this function must classify the raw segments the router will
-/// match — the only deliberate divergence is the leading/trailing slash
-/// trim described below, which is fail-closed. Axum 0.8 dispatches through
-/// matchit 0.8.x, which matches the raw
-/// (still percent-encoded) URI path, splits parameters on a literal `/`
-/// only, and never decodes `%2F` or resolves `.`/`..` segments (there is no
-/// `NormalizePath` layer in `build_router_inner`). The gate therefore also
-/// splits on literal `/` and compares raw segments: `%2F` inside a segment
-/// is NOT a separator here, because it is not one to the router either.
-///
-/// The invariant is enforced by
-/// `workload_gate_classification_agrees_with_matchit_dispatch`, which
-/// mirrors this file's route table into a `matchit::Router` pinned to the
-/// locked version and asserts gate classification ↔ dispatch agreement on
-/// every pattern instantiated with poisoned parameter values (empty, dot
-/// segments, %2F encodings), plus explicit match/miss pins for the raw
-/// variants below: a matchit update that changes raw-path semantics
-/// (decoding %2F, resolving dot segments, tolerating trailing slashes)
-/// fails that test instead of silently breaking alignment. Because a
-/// patch-level matchit release can change matching behavior, the pin must
-/// be bumped deliberately — re-verify the semantics on ANY matchit bump,
-/// not only majors.
-///
-/// A path that matches no allow pattern below is a mutation (deny-by-default),
-/// so raw variants such as `/apps%2Fdemo/deploy`, `//apps//demo//deploy`,
-/// `/apps/demo/deploy/`, or `/apps/./demo/deploy` are all blocked: the
-/// router would not serve them as allow-listed control-plane writes.
-///
-/// Interior empty segments (`//`) are preserved, because matchit treats an
-/// empty path parameter as a value: `PUT /internal/paas/orgs//keyring` is
-/// dispatched to the keyring handler with an empty `paas_org_id`, so the
-/// gate must see the five-segment shape (mutation), not a collapsed
-/// four-segment shape that would hit the org-upsert allow rule. Only the
-/// leading/trailing slashes are trimmed; that divergence from matchit is
-/// fail-closed (a trailing slash can only make a path look like a shorter
-/// allow pattern that matchit would not route, or leave it deny-by-default).
-///
-/// Do NOT "normalize" by percent-decoding or resolving dot segments before
-/// matching: that rewrites the path into shapes the router never selected,
-/// and can only move requests from the blocked set into the allowed set
-/// (fail-open). For example, decoding `/apps/x%2F..%2F..%2Fauth%2Flogin/deploy`
-/// — which the router dispatches to the deploy handler — would make it look
-/// like an `auth`-prefixed control-plane write and let it through the gate.
-fn is_workload_authority_mutation(method: &Method, path: &str) -> bool {
+/// Only explicitly allowed method/route pairs bypass the deployment freeze.
+/// Axum's matched pattern prevents new static routes, encoded parameters, or
+/// renamed routes from inheriting a raw-path prefix exemption.
+fn is_workload_authority_mutation(method: &Method, matched_path: &str) -> bool {
     if matches!(method, &Method::GET | &Method::HEAD | &Method::OPTIONS) {
         return false;
     }
 
-    // Split on literal '/' with interior empty segments preserved (see the
-    // invariant comment above): an empty segment is a parameter value to
-    // matchit, not a separator to collapse.
-    let segments = path.trim_matches('/').split('/').collect::<Vec<_>>();
-
-    if method == Method::DELETE
-        && matches!(
-            segments.as_slice(),
-            ["apps", _] | ["internal", "paas", "orgs", _, "apps", _]
-        )
-    {
-        return false;
-    }
-
-    if matches!(segments.as_slice(), ["internal", "paas", ..]) {
-        return !(method == Method::PUT
-            && matches!(
-                segments.as_slice(),
-                ["internal", "paas", "orgs", _]
-                    | ["internal", "paas", "orgs", _, "entitlements"]
-                    | ["internal", "paas", "orgs", _, "members", _]
-            ));
-    }
-
-    let control_plane_write = matches!(segments.first(), Some(&"auth"))
-        || (method == Method::POST && matches!(segments.as_slice(), ["orgs"]))
-        || (method == Method::POST && matches!(segments.as_slice(), ["orgs", _, "invite"]))
-        || (method == Method::DELETE && matches!(segments.as_slice(), ["orgs", _, "members", _]));
+    let control_plane_write = match *method {
+        Method::POST => matches!(
+            matched_path,
+            "/auth/signup"
+                | "/auth/login"
+                | "/auth/device/start"
+                | "/auth/device/poll"
+                | "/auth/device/approve"
+                | "/auth/api-keys"
+                | "/orgs"
+                | "/orgs/{name}/invite"
+        ),
+        Method::DELETE => matches!(
+            matched_path,
+            "/auth/api-keys/{id}"
+                | "/apps/{name}"
+                | "/orgs/{name}/members/{id}"
+                | "/internal/paas/orgs/{paas_org_id}/apps/{app_name}"
+        ),
+        Method::PUT => matches!(
+            matched_path,
+            "/internal/paas/orgs/{paas_org_id}"
+                | "/internal/paas/orgs/{paas_org_id}/entitlements"
+                | "/internal/paas/orgs/{paas_org_id}/members/{paas_user_id}"
+        ),
+        _ => false,
+    };
     !control_plane_write
 }
 
@@ -845,9 +805,12 @@ mod runtime_gate_tests {
         test_router,
     };
     use axum::{
+        Router,
         body::Body,
         extract::ConnectInfo,
-        http::{Method, Request, StatusCode, header},
+        http::{HeaderValue, Method, Request, StatusCode, header},
+        middleware::{self, Next},
+        response::Response,
     };
     use http_body_util::BodyExt;
     use std::net::SocketAddr;
@@ -996,50 +959,83 @@ mod runtime_gate_tests {
 
         for (method, path) in [
             (Method::GET, "/apps"),
-            (Method::DELETE, "/apps/demo"),
+            (Method::DELETE, "/apps/{name}"),
             (Method::POST, "/auth/login"),
             (Method::POST, "/orgs"),
-            (Method::DELETE, "/orgs/acme/members/user-1"),
-            (Method::PUT, "/internal/paas/orgs/org-1/entitlements"),
-            (Method::DELETE, "/internal/paas/orgs/org-1/apps/demo"),
+            (Method::DELETE, "/orgs/{name}/members/{id}"),
+            (
+                Method::PUT,
+                "/internal/paas/orgs/{paas_org_id}/entitlements",
+            ),
+            (
+                Method::DELETE,
+                "/internal/paas/orgs/{paas_org_id}/apps/{app_name}",
+            ),
         ] {
             assert!(!is_workload_authority_mutation(&method, path));
         }
     }
 
-    #[test]
-    fn workload_gate_classification_agrees_with_matchit_dispatch() {
-        // Locks the gate/router alignment invariant to the exact matchit
-        // in the lockfile, from four angles:
-        //
-        // 1. Mirror freshness: the annotated pattern set below must equal
-        //    the route declarations in this file (scanned from the source
-        //    at compile time), including each route's served methods, so
-        //    adding a route or a method on an existing route without
-        //    updating the table fails here instead of drifting silently.
-        // 2. Single matcher: Cargo.lock must contain exactly one matchit
-        //    package, pinned via the `=0.8.4` dev-dependency. If axum and
-        //    this mirror ever resolve to different matchit copies, the
-        //    mirror would test the wrong crate — fail instead.
-        // 3. Exhaustive dispatch agreement: every pattern is instantiated
-        //    with every poison value (empty, dot segments, %2F encodings)
-        //    in every parameter, and the mirror must dispatch it to the
-        //    same pattern (pinning that matchit never decodes %2F,
-        //    resolves dot segments, or treats an interior empty segment as
-        //    a separator) with the gate classification equal to the
-        //    annotation. A trailing empty parameter produces a trailing
-        //    '/', which matchit must NOT match (pinning the absence of
-        //    trailing-slash tolerance); the gate's own trailing-slash
-        //    trim stays fail-closed because no handler serves those
-        //    shapes.
-        // 4. Enumerated raw variants from the tests below are fed through
-        //    the mirror with explicit match/miss pins.
-        //
-        // A matcher semantics change (percent-decoding, %2F/empty as
-        // separators, dot resolution, trailing-slash tolerance) breaks 3
-        // or 4 and fails CI instead of silently breaking alignment.
-        // HEAD is dispatched by axum's method router to the GET handler
-        // and always allowed by the gate, so GET annotations cover it.
+    #[tokio::test]
+    async fn freeze_blocks_new_writes_without_a_route_inventory_entry() {
+        let state = crate::test_support::lazy_state();
+        state.set_deployment_dispatch_enabled(false);
+        state.mark_startup_ready();
+        for path in [
+            "/auth/future-workload-authority",
+            "/auth/api-keys/future-workload-authority",
+            "/orgs/acme/members/future-workload-authority",
+        ] {
+            let app = super::with_operational_gates(
+                &state,
+                Router::new().route(path, axum::routing::any(|| async { StatusCode::OK })),
+            )
+            .with_state(state.clone());
+            for method in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
+                let request = || {
+                    Request::builder()
+                        .method(method.clone())
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap()
+                };
+                state.set_deployment_dispatch_enabled(false);
+                let response = app.clone().oneshot(request()).await.unwrap();
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                state.set_deployment_dispatch_enabled(true);
+                let response = app.clone().oneshot(request()).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn workload_gate_classification_agrees_with_axum_dispatch() {
+        // Parameter contents must not change which route's admission policy applies.
+        // The production matcher supplies identity; this case table is not authority.
+        const MATCHED_PATH_HEADER: header::HeaderName =
+            header::HeaderName::from_static("x-enclava-test-matched-path");
+        const FALLBACK_SENTINEL: &str = "(fallback)";
+
+        async fn echo_matched_path(
+            matched: Option<axum::extract::MatchedPath>,
+            request: Request<Body>,
+            next: Next,
+        ) -> Response {
+            let mut response = next.run(request).await;
+            response.headers_mut().insert(
+                MATCHED_PATH_HEADER,
+                HeaderValue::from_str(
+                    matched
+                        .as_ref()
+                        .map(|path| path.as_str())
+                        .unwrap_or(FALLBACK_SENTINEL),
+                )
+                .expect("route patterns are valid header values"),
+            );
+            response
+        }
+
         const ALLOW: bool = true;
         const MUTATION: bool = false;
         let route_table: &[(&str, &[(&str, bool)])] = &[
@@ -1261,232 +1257,37 @@ mod runtime_gate_tests {
             ),
         ];
 
-        // (1) The route declarations of this file, scanned at compile
-        // time, must match the annotated table exactly — both the set
-        // of paths and, per path, the set of served methods (a path
-        // may be declared twice with different methods or chained via
-        // `.get(...).post(...)`). Adding a route or adding/changing a
-        // method on an existing route fails here instead of drifting
-        // silently. Only the router-construction section is scanned —
-        // everything from the test module onward (including this
-        // scanner's own source) is excluded.
-        let source = include_str!("lib.rs");
-        let source = &source[..source
-            .find("mod runtime_gate_tests")
-            .expect("test module must exist; the route scanner depends on its position")];
-        const METHOD_VERBS: [&str; 5] = ["get", "post", "put", "patch", "delete"];
-        // Builder calls that may appear inside a route handler
-        // expression without serving a method.
-        const NON_METHOD_CALLS: [&str; 6] = [
-            "layer",
-            "route_layer",
-            "with_state",
-            "handle_error",
-            "fallback",
-            "fallback_service",
-        ];
+        // PaasManaged so the internal PaaS routes are mounted; dispatch
+        // stays enabled so every annotated route is reachable (the freeze
+        // gate itself is exercised end-to-end by the other tests in this
+        // module). The echo layer sits outside the operational gates, so
+        // even a gate short-circuit still reports the matched pattern.
+        let mut state = crate::test_support::lazy_state();
+        state.management_mode = crate::state::CapManagementMode::PaasManaged;
+        let app = build_router_inner(state, false).layer(middleware::from_fn(echo_matched_path));
 
-        // Blank string-literal bodies and comments with spaces (byte
-        // positions preserved) so structural scans see only code.
-        fn blank_noncode(src: &str) -> Vec<u8> {
-            let b = src.as_bytes();
-            let mut out = b.to_vec();
-            let mut i = 0;
-            let mut in_string = false;
-            while i < b.len() {
-                let c = b[i];
-                if in_string {
-                    out[i] = b' ';
-                    if c == b'\\' && i + 1 < b.len() {
-                        out[i + 1] = b' ';
-                        i += 2;
-                        continue;
-                    }
-                    if c == b'"' {
-                        in_string = false;
-                    }
-                    i += 1;
-                } else {
-                    match c {
-                        b'"' => {
-                            in_string = true;
-                            out[i] = b' ';
-                            i += 1;
-                        }
-                        b'/' if i + 1 < b.len() && b[i + 1] == b'/' => {
-                            while i < b.len() && b[i] != b'\n' {
-                                out[i] = b' ';
-                                i += 1;
-                            }
-                        }
-                        b'/' if i + 1 < b.len() && b[i + 1] == b'*' => {
-                            out[i] = b' ';
-                            out[i + 1] = b' ';
-                            i += 2;
-                            while i < b.len() {
-                                if b[i] == b'*' && i + 1 < b.len() && b[i + 1] == b'/' {
-                                    out[i] = b' ';
-                                    out[i + 1] = b' ';
-                                    i += 2;
-                                    break;
-                                }
-                                out[i] = b' ';
-                                i += 1;
-                            }
-                        }
-                        _ => i += 1,
-                    }
-                }
-            }
-            out
-        }
-
-        let blanked = blank_noncode(source);
-        let code = std::str::from_utf8(&blanked).expect("blanking preserves UTF-8 validity");
-        // (path, method verb) pairs, one per served method
-        let mut declared: Vec<(&str, &str)> = Vec::new();
-        let mut search_from = 0usize;
-        while let Some(rel) = code[search_from..].find(".route(") {
-            let pos = search_from + rel;
-            // The .route(...) call is bounded by its matching paren —
-            // never anything beyond it — so later code cannot be
-            // misattributed to this route.
-            let open = pos + ".route(".len() - 1;
-            let mut depth = 0usize;
-            let mut close = None;
-            for (i, c) in code[open..].char_indices() {
-                match c {
-                    '(' => depth += 1,
-                    ')' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            close = Some(open + i);
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            let close = close.expect("unbalanced .route( call");
-            search_from = close + 1;
-            let call = &code[pos..=close];
-            // route paths are plain literals without escapes; look the
-            // literal up in the original source (the blanked copy has
-            // no quotes left)
-            let src_call = &source[pos..=close];
-            let q1 = src_call
-                .find('"')
-                .expect("route path must be a string literal");
-            let q2 = src_call[q1 + 1..]
-                .find('"')
-                .expect("route path literal must close")
-                + q1
-                + 1;
-            let path = &src_call[q1 + 1..q2];
-            let comma = call[q2 + 1..]
-                .find(',')
-                .expect("route must have a handler argument")
-                + q2
-                + 1;
-            let handler = &call[comma + 1..call.len() - 1];
-            // Leading verb: `axum::routing::get(handler)` or `get(handler)`
-            let trimmed = handler.trim_start();
-            let paren = trimmed.find('(').expect("handler must be a call");
-            let ident_path = trimmed[..paren].trim_end();
-            let leading = ident_path.rsplit("::").next().unwrap();
-            assert!(
-                METHOD_VERBS.contains(&leading),
-                "route {path}: unrecognized handler {ident_path:?}; the freshness \
-                 scanner only understands verb calls (get/post/put/patch/delete, \
-                 optionally module-qualified) — restructure the route or teach \
-                 the scanner about it"
-            );
-            declared.push((path, leading));
-            // Every dotted call chained on the handler must be a known
-            // method verb or a known non-method builder. Anything else
-            // (`.on(MethodFilter, ...)`, `.any(...)`, `.merge(...)`,
-            // `get_service`-style forms, ...) may serve a method this
-            // table cannot see — fail instead of tracking it wrongly.
-            let mut scan = 0usize;
-            while let Some(dot) = handler[scan..].find('.') {
-                let at = scan + dot;
-                scan = at + 1;
-                let after = &handler[at + 1..];
-                let name_len = after
-                    .find(|c: char| !(c.is_ascii_alphabetic() || c == '_'))
-                    .unwrap_or(after.len());
-                if name_len == 0 || !handler[at + 1 + name_len..].starts_with('(') {
-                    continue; // not a call
-                }
-                let name = &after[..name_len];
-                if METHOD_VERBS.contains(&name) {
-                    declared.push((path, name));
-                } else if !NON_METHOD_CALLS.contains(&name) {
-                    panic!(
-                        "route {path}: chained call .{name}( is not a known method \
-                         verb or non-method builder; it may serve a method the \
-                         mirrored table cannot track — restructure the route or \
-                         teach the scanner about it"
-                    );
-                }
-            }
-        }
-        let mut declared_map: std::collections::BTreeMap<&str, std::collections::BTreeSet<String>> =
-            std::collections::BTreeMap::new();
-        for (path, verb) in declared {
-            declared_map
-                .entry(path)
-                .or_default()
-                .insert(verb.to_uppercase());
-        }
-        let mut table_map: std::collections::BTreeMap<&str, std::collections::BTreeSet<String>> =
-            std::collections::BTreeMap::new();
-        for (path, served) in route_table {
-            table_map
-                .entry(path)
-                .or_default()
-                .extend(served.iter().map(|(m, _)| m.to_string()));
-        }
-        assert_eq!(
-            declared_map, table_map,
-            "route table mirror (paths AND per-path method sets) drifted from the \
-             route declarations in this file"
-        );
-
-        // (2) Exactly one matchit in the lockfile, and it is the pinned
-        // version this test compiles against.
-        let lock = include_str!("../../../Cargo.lock");
-        let mut lock_lines = lock.lines().filter(|l| l.starts_with("name = \"matchit\""));
-        let name_line = lock_lines
-            .next()
-            .expect("Cargo.lock must contain a matchit package");
-        assert!(
-            lock_lines.next().is_none(),
-            "Cargo.lock contains more than one matchit package: the mirror would \
-             test a different matcher than the router"
-        );
-        let _ = name_line;
-        let pin_index = lock.find("name = \"matchit\"").unwrap();
-        let version_line = lock[pin_index..]
-            .lines()
-            .find(|l| l.starts_with("version = "))
-            .expect("matchit package must have a version");
-        const PINNED_MATCHIT: &str = "0.8.4";
-        assert_eq!(
-            version_line,
-            format!("version = \"{PINNED_MATCHIT}\""),
-            "the matchit dev-dependency pin (=0.8.4) and Cargo.lock disagree; \
-             re-verify matcher semantics (see the classifier invariant comment) \
-             when bumping matchit — any bump, not only majors"
-        );
-
-        // Inserting must succeed: conflicting patterns would mean the
-        // table itself is malformed.
-        let mut mirror = matchit::Router::new();
-        for (index, (pattern, _)) in route_table.iter().enumerate() {
-            mirror
-                .insert(*pattern, index)
-                .unwrap_or_else(|e| panic!("mirror insert failed for {pattern}: {e}"));
+        // The pattern axum dispatched this request to, or `None` when no
+        // route matched (the sentinel the echo layer emits for fallback).
+        async fn dispatched_pattern(app: &Router, method: Method, path: &str) -> Option<String> {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let observed = response
+                .headers()
+                .get(MATCHED_PATH_HEADER)
+                .expect("echo layer must report dispatch outcome")
+                .to_str()
+                .expect("matched pattern is ASCII")
+                .to_string();
+            (observed != FALLBACK_SENTINEL).then_some(observed)
         }
 
         // Replace every {param} in a pattern with the given raw value.
@@ -1529,7 +1330,6 @@ mod runtime_gate_tests {
             pattern.matches('{').count()
         }
 
-        // (3) Exhaustive per-pattern poison instantiation.
         let poison_values = [
             "demo",
             "org-1",
@@ -1542,59 +1342,63 @@ mod runtime_gate_tests {
             "x%2F..%2F..%2Fauth%2Flogin",
             "org%2F1",
         ];
-        let patterns_needing_non_get = route_table
-            .iter()
-            .filter(|(_, served)| served.iter().any(|(m, _)| *m != "GET"))
-            .count();
-        let mut non_get_covered = std::collections::HashSet::new();
-        for (index, (pattern, served)) in route_table.iter().enumerate() {
-            for value in poison_values {
-                let path = instantiate(pattern, value);
-                // A trailing empty parameter yields a trailing '/', which
-                // no pattern contains: matchit must not match it. All
-                // other instantiations must dispatch to their own pattern
-                // — pinning that %2F, dots, and interior empties are
-                // ordinary parameter bytes to the matcher.
-                let trailing_empty = value.is_empty() && pattern.ends_with('}');
-                match mirror.at(&path) {
-                    Ok(matched) => {
-                        assert!(
-                            !trailing_empty,
-                            "{path}: matchit must not match a trailing '/' \
-                             (no pattern serves it; pattern {pattern})"
-                        );
+
+        // Assert one instantiated path: the router must dispatch it to the
+        // pattern it was built from — except a trailing empty parameter,
+        // which yields a trailing '/' no route may match — and the gate
+        // classification of every method the pattern serves must equal the
+        // annotation.
+        async fn assert_dispatch_agrees(
+            app: &Router,
+            pattern: &str,
+            served: &[(&str, bool)],
+            path: &str,
+            expect_miss: bool,
+        ) {
+            let method = Method::from_bytes(served[0].0.as_bytes()).unwrap();
+            match dispatched_pattern(app, method, path).await {
+                Some(observed) => {
+                    assert!(
+                        !expect_miss,
+                        "{path}: the router must not match a trailing '/' \
+                         (no route serves it; pattern {pattern})"
+                    );
+                    assert_eq!(
+                        observed, pattern,
+                        "{path} instantiated from {pattern} dispatched to {observed}"
+                    );
+                    for (method_name, is_allow) in served.iter() {
+                        let method = Method::from_bytes(method_name.as_bytes()).unwrap();
+                        let gate = is_workload_authority_mutation(&method, &observed);
                         assert_eq!(
-                            *matched.value, index,
-                            "{path} instantiated from {pattern} dispatched to {}",
-                            route_table[*matched.value].0
-                        );
-                        for (method_name, is_allow) in served.iter() {
-                            let method = Method::from_bytes(method_name.as_bytes()).unwrap();
-                            let gate = is_workload_authority_mutation(&method, &path);
-                            assert_eq!(
-                                gate,
-                                !*is_allow,
-                                "{method} {path} (from {pattern}): gate says {}, \
-                                 annotation says {}",
-                                if gate { "mutation" } else { "allowed" },
-                                if *is_allow { "allow" } else { "mutation" },
-                            );
-                            if method != Method::GET {
-                                non_get_covered.insert(index);
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        assert!(
-                            trailing_empty,
-                            "{path} instantiated from {pattern} must dispatch"
+                            gate,
+                            !*is_allow,
+                            "{method} {path} (from {pattern}): gate says {}, \
+                             annotation says {}",
+                            if gate { "mutation" } else { "allowed" },
+                            if *is_allow { "allow" } else { "mutation" },
                         );
                     }
+                }
+                None => {
+                    assert!(
+                        expect_miss,
+                        "{path} instantiated from {pattern} must dispatch"
+                    );
                 }
             }
         }
 
-        // (3b) Mixed parameters: poison each parameter position on every
+        // (1) Exhaustive per-pattern poison instantiation.
+        for (pattern, served) in route_table.iter() {
+            for value in poison_values {
+                let path = instantiate(pattern, value);
+                let trailing_empty = value.is_empty() && pattern.ends_with('}');
+                assert_dispatch_agrees(&app, pattern, served, &path, trailing_empty).await;
+            }
+        }
+
+        // (1b) Mixed parameters: poison each parameter position on every
         // multi-parameter pattern while the others stay ordinary. A
         // poisoned segment beside plain segments (for example a poisoned
         // `{paas_org_id}` next to an ordinary `{deployment_id}` on the
@@ -1602,7 +1406,7 @@ mod runtime_gate_tests {
         // pattern with the same gate classification — uniform-poison runs
         // alone would miss a matcher or gate that only misbehaves on mixed
         // input.
-        for (index, (pattern, served)) in route_table.iter().enumerate() {
+        for (pattern, served) in route_table.iter() {
             if parameter_count(pattern) < 2 {
                 continue;
             }
@@ -1612,50 +1416,12 @@ mod runtime_gate_tests {
                     let trailing_empty = poison.is_empty()
                         && poison_at == parameter_count(pattern) - 1
                         && pattern.ends_with('}');
-                    match mirror.at(&path) {
-                        Ok(matched) => {
-                            assert!(
-                                !trailing_empty,
-                                "{path}: matchit must not match a trailing '/' \
-                                 (no pattern serves it; pattern {pattern})"
-                            );
-                            assert_eq!(
-                                *matched.value, index,
-                                "{path} (param {poison_at} of {pattern} = {poison:?}) \
-                                 dispatched to {}",
-                                route_table[*matched.value].0
-                            );
-                            for (method_name, is_allow) in served.iter() {
-                                let method = Method::from_bytes(method_name.as_bytes()).unwrap();
-                                let gate = is_workload_authority_mutation(&method, &path);
-                                assert_eq!(
-                                    gate,
-                                    !*is_allow,
-                                    "{method} {path} (from {pattern}): gate says {}, \
-                                     annotation says {}",
-                                    if gate { "mutation" } else { "allowed" },
-                                    if *is_allow { "allow" } else { "mutation" },
-                                );
-                            }
-                        }
-                        Err(_) => {
-                            assert!(
-                                trailing_empty,
-                                "{path} instantiated from {pattern} must dispatch"
-                            );
-                        }
-                    }
+                    assert_dispatch_agrees(&app, pattern, served, &path, trailing_empty).await;
                 }
             }
         }
-        assert_eq!(
-            non_get_covered.len(),
-            patterns_needing_non_get,
-            "every pattern with a non-GET method must be asserted against \
-             the mirror with at least one non-GET method"
-        );
 
-        // (4) Enumerated raw variants: explicit dispatch pins for the
+        // (2) Enumerated raw variants: explicit dispatch pins for the
         // shapes the other tests reason about.
         let dispatch_pins: &[(Method, &str)] = &[
             // Interior empty segment is a parameter value: dispatched to
@@ -1676,24 +1442,28 @@ mod runtime_gate_tests {
             (Method::DELETE, "/orgs//members/user-1"),
         ];
         for (method, path) in dispatch_pins {
-            let matched = mirror.at(path).unwrap_or_else(|_| {
-                panic!(
-                    "{method} {path} must dispatch under \
-                                          current matchit semantics"
-                )
-            });
-            let (pattern, served) = route_table[*matched.value];
+            let observed = dispatched_pattern(&app, method.clone(), path)
+                .await
+                .unwrap_or_else(|| {
+                    panic!("{method} {path} must dispatch under current router semantics")
+                });
+            let (pattern, served) = route_table
+                .iter()
+                .find(|(p, _)| *p == observed)
+                .unwrap_or_else(|| {
+                    panic!("{method} {path} dispatched to unannotated route {observed}")
+                });
             let (_, is_allow) = served
                 .iter()
                 .find(|(m, _)| *m == method.as_str())
                 .unwrap_or_else(|| {
                     panic!(
-                        "{method} {path} dispatched to {pattern} \
-                                          which does not serve that method"
+                        "{method} {path} dispatched to {pattern} which does \
+                         not serve that method"
                     )
                 });
             assert_eq!(
-                is_workload_authority_mutation(method, path),
+                is_workload_authority_mutation(method, &observed),
                 !*is_allow,
                 "{method} {path} dispatched to {pattern}: gate and annotation \
                  disagree"
@@ -1712,72 +1482,23 @@ mod runtime_gate_tests {
             "/auth%2Flogin",
         ];
         for path in miss_pins {
-            assert!(
-                mirror.at(path).is_err(),
-                "{path} must NOT dispatch under current matchit semantics \
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "{path} must NOT dispatch under current router semantics \
                  (raw bytes are not decoded, dot segments are not resolved, \
                  trailing slashes and leading empties do not match)"
-            );
-        }
-    }
-
-    #[test]
-    fn workload_gate_classifies_raw_path_variants_fail_closed() {
-        // Raw variants of workload mutations (encoded slashes, doubled
-        // slashes, trailing slash, dot segments) must never fall through the
-        // gate's allow patterns. The router (matchit 0.8) matches the raw
-        // path with literal `/` separators only, so the gate must classify
-        // these same raw bytes — and must classify every one of them as a
-        // mutation.
-        for (method, path) in [
-            (Method::POST, "/apps%2Fdemo/deploy"),
-            (Method::POST, "/apps%2fdemo/deploy"),
-            (Method::POST, "//apps//demo//deploy"),
-            (Method::POST, "/apps/demo/deploy/"),
-            (Method::POST, "/apps/./demo/deploy"),
-            (Method::POST, "/apps/x/../demo/deploy"),
-            // A `%2F`/`..` poisoned path parameter on a route the router
-            // still dispatches to a mutation handler.
-            (Method::POST, "/apps/x%2F..%2F..%2Fauth%2Flogin/deploy"),
-            (Method::POST, "/apps/x%2f..%2f..%2fauth/deploy"),
-            (Method::DELETE, "/apps/demo/domains/.."),
-            (Method::DELETE, "/apps/demo/domains/%2e%2e"),
-            (Method::DELETE, "/apps/demo/domains/x%2F..%2F.."),
-            (Method::DELETE, "/apps/demo/config/x%2F..%2F..%2Fauth/meta"),
-            (Method::PUT, "/internal%2Fpaas/orgs/org-1/deployments"),
-            (Method::POST, "/auth%2Flogin"),
-            // Interior empty segment as a poisoned parameter: matchit
-            // dispatches this to the keyring handler (empty paas_org_id),
-            // so it must NOT collapse onto the org-upsert allow rule.
-            (Method::PUT, "/internal/paas/orgs//keyring"),
-        ] {
-            assert!(
-                is_workload_authority_mutation(&method, path),
-                "{method} {path} must be classified as a workload authority mutation"
-            );
-        }
-
-        // Allow-listed control-plane writes keep working, including when a
-        // still-literal segment carries an encoded character.
-        for (method, path) in [
-            (Method::POST, "/auth/login"),
-            (Method::PUT, "/internal/paas/orgs/org%2F1/entitlements"),
-            (Method::PUT, "/internal/paas/orgs/org-1/members/user%2F1"),
-            (Method::DELETE, "/internal/paas/orgs/org-1/apps/demo"),
-            // Interior empty segments inside allow patterns: matchit
-            // dispatches these to the allow-listed handlers (the empty
-            // segment is the parameter value), so they must stay allowed —
-            // an over-strict gate that rejects empty segments inside allow
-            // rules would false-block control-plane writes.
-            (Method::PUT, "/internal/paas/orgs//members/u"),
-            (Method::PUT, "/internal/paas/orgs//entitlements"),
-            (Method::DELETE, "/internal/paas/orgs//apps/demo"),
-            (Method::POST, "/orgs//invite"),
-            (Method::DELETE, "/orgs//members/user-1"),
-        ] {
-            assert!(
-                !is_workload_authority_mutation(&method, path),
-                "{method} {path} must not be classified as a workload authority mutation"
             );
         }
     }
@@ -1797,6 +1518,7 @@ mod runtime_gate_tests {
 
         for (method, path) in [
             (Method::POST, "/apps/demo/deploy"),
+            (Method::POST, "/auth/%2e%2e/apps/demo/deploy"),
             (
                 Method::POST,
                 "/internal/paas/orgs/org-1/deployments/deployment-1/customer-config-released",
@@ -1893,21 +1615,6 @@ mod runtime_gate_tests {
                 "{method} {path} must not be blocked by the freeze gate"
             );
         }
-
-        // Raw first segment `auth`, so the gate's control-plane allow list
-        // matches it — but matchit has no such route, so the router must
-        // 404 it. Asserting the 404 (not just "not 503") pins the router
-        // agreement: if a future route table ever dispatches this shape to
-        // a mutation handler, this test fails and forces a gate update.
-        let response = app
-            .oneshot(
-                Request::post("/auth/%2e%2e/apps/demo/deploy")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

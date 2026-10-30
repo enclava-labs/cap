@@ -1736,7 +1736,7 @@ async fn deploy_app_candidate(
             }
         }
         AppMutation::Insert => {
-            sqlx::query(APP_INSERT_SQL)
+            let insert = sqlx::query(APP_INSERT_SQL)
                 .bind(app.id)
                 .bind(app.org_id)
                 .bind(&app.name)
@@ -1761,43 +1761,24 @@ async fn deploy_app_candidate(
                 .bind(&app.egress_mode)
                 .bind(app.created_at)
                 .bind(app.updated_at)
-                .bind(crate::kbs::owner_binding_key_for(&app.namespace, &app.name))
-                .execute(&mut *tx)
-                .await
-                .map_err(|error| {
-                    if error.to_string().contains("duplicate key")
-                        || error.to_string().contains("unique")
-                    {
-                        json_error(StatusCode::CONFLICT, "app name already taken in this org")
-                    } else {
-                        json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
-                    }
-                })?;
-            // The waiver guard runs before this transaction, and under READ
-            // COMMITTED the insert's NOT EXISTS is evaluated on its statement
-            // snapshot — an abandoned destroy committing while the insert
-            // waits out the old row's unique constraint is invisible to both.
-            // Two guards close it: zero rows inserted means the NOT EXISTS
-            // filtered the create (a waiver existed at statement time — the
-            // recheck alone must not decide this, because the waiver can be
-            // cleared between the filtered insert and the lookup, e.g. by a
-            // teardown retry completing, and proceeding would fail the
-            // dependent inserts on the missing app row); the recheck then
-            // takes a fresh statement snapshot in this transaction and sees
-            // every waiver committed while the insert was blocked.
-            let insert_result =
-                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM apps WHERE id = $1")
-                    .bind(app.id)
-                    .fetch_one(&mut *tx)
-                    .await
-                    .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
-            if insert_result == 0 {
-                return Err(json_error(StatusCode::CONFLICT, "stale_owner_seed"));
-            }
-            if crate::kbs::owner_seed_waiver_recorded_in_tx(&mut tx, &app.namespace, &app.name)
-                .await
-                .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?
-            {
+                .bind(crate::kbs::owner_binding_key_for(&app.namespace, &app.name));
+            let insert_result = crate::routes::apps::insert_app_if_owner_seed_fresh(
+                &mut tx,
+                insert,
+                &app.namespace,
+                &app.name,
+            )
+            .await
+            .map_err(|error| {
+                if error.to_string().contains("duplicate key")
+                    || error.to_string().contains("unique")
+                {
+                    json_error(StatusCode::CONFLICT, "app name already taken in this org")
+                } else {
+                    json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
+                }
+            })?;
+            if !insert_result {
                 return Err(json_error(StatusCode::CONFLICT, "stale_owner_seed"));
             }
             insert_transaction_audit(
@@ -1988,14 +1969,18 @@ async fn deploy_app_candidate(
     if let (Some(artifacts), Some(signed)) =
         (signing_artifacts.as_ref(), signed_policy_artifact.as_ref())
     {
-        crate::signing_service::persist_workload_artifacts(
-            &mut *tx, app.id, deploy_id, artifacts, signed,
+        crate::signing_service::accept_signed_workload_artifacts(
+            &mut tx, app.id, deploy_id, artifacts, signed,
         )
         .await
-        .map_err(signing_error_response)?;
-        crate::kbs::enqueue_signed_policy_reconciliation(&mut tx)
-            .await
-            .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+        .map_err(|error| match error {
+            crate::signing_service::SignedAcceptanceError::Artifact(error) => {
+                signing_error_response(error)
+            }
+            crate::signing_service::SignedAcceptanceError::Policy(_) => {
+                json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
+            }
+        })?;
     } else {
         // An unsigned generation makes a previously-current signed artifact
         // ineligible.  Persist revocation intent atomically with acceptance;
@@ -2388,22 +2373,9 @@ mod tests {
             .expect("delete setup test organization");
     }
 
-    #[tokio::test]
-    async fn generic_app_insert_statement_accepts_every_bound_column() {
-        let pool = database_test_pool().await;
-        let mut app = insert_setup_test_app(&pool).await;
-        // Execute the exact AppMutation::Insert statement with the handler's
-        // bind order: an added column without its SELECT placeholder makes
-        // PostgreSQL reject every generic create before execution (Codex P1
-        // against 8fdebfd), and sqlx only checks bind counts at runtime.
-        app.id = Uuid::new_v4();
-        app.name = format!("insert-{}", Uuid::new_v4().simple());
-        app.namespace = format!("cap-{}", app.name);
-        app.instance_id = format!("instance-{}", app.name);
-        app.service_account = format!("{}-sa", app.name);
-        app.domain = format!("{}.enclava.dev", app.name);
-        app.tee_domain = Some(format!("{}.tee.enclava.dev", app.name));
-        app.custom_domain = None;
+    fn app_insert_query(
+        app: &App,
+    ) -> sqlx::query::Query<'_, sqlx::Postgres, sqlx::postgres::PgArguments> {
         sqlx::query(APP_INSERT_SQL)
             .bind(app.id)
             .bind(app.org_id)
@@ -2430,6 +2402,25 @@ mod tests {
             .bind(app.created_at)
             .bind(app.updated_at)
             .bind(crate::kbs::owner_binding_key_for(&app.namespace, &app.name))
+    }
+
+    #[tokio::test]
+    async fn generic_app_insert_statement_accepts_every_bound_column() {
+        let pool = database_test_pool().await;
+        let mut app = insert_setup_test_app(&pool).await;
+        // Execute the exact AppMutation::Insert statement with the handler's
+        // bind order: an added column without its SELECT placeholder makes
+        // PostgreSQL reject every generic create before execution (Codex P1
+        // against 8fdebfd), and sqlx only checks bind counts at runtime.
+        app.id = Uuid::new_v4();
+        app.name = format!("insert-{}", Uuid::new_v4().simple());
+        app.namespace = format!("cap-{}", app.name);
+        app.instance_id = format!("instance-{}", app.name);
+        app.service_account = format!("{}-sa", app.name);
+        app.domain = format!("{}.enclava.dev", app.name);
+        app.tee_domain = Some(format!("{}.tee.enclava.dev", app.name));
+        app.custom_domain = None;
+        app_insert_query(&app)
             .execute(&pool)
             .await
             .expect("the generic app insert must accept its full column and bind shape");
@@ -2440,6 +2431,119 @@ mod tests {
             .expect("read inserted generic app");
         assert_eq!(inserted, 1, "the generic app insert must commit its row");
         delete_setup_test_org(&pool, app.org_id).await;
+    }
+
+    #[tokio::test]
+    async fn app_insert_rechecks_waiver_committed_while_waiting_on_name() {
+        let (_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_seed_insert_race").await;
+        let mut app = insert_setup_test_app(&pool).await;
+        let old_id = app.id;
+        let org_id = app.org_id;
+        let name = app.name.clone();
+        let binding = crate::kbs::owner_binding_key_for(&app.namespace, &name);
+        app.id = Uuid::new_v4();
+
+        let mut destroy = pool.begin().await.unwrap();
+        let destroy_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *destroy)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM apps WHERE id = $1")
+            .bind(old_id)
+            .execute(&mut *destroy)
+            .await
+            .unwrap();
+
+        let (send_pid, receive_pid) = tokio::sync::oneshot::channel();
+        let create_pool = pool.clone();
+        let create = tokio::spawn(async move {
+            let mut tx = create_pool.begin().await.unwrap();
+            let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+            send_pid.send(pid).unwrap();
+            let accepted = crate::routes::apps::insert_app_if_owner_seed_fresh(
+                &mut tx,
+                app_insert_query(&app),
+                &app.namespace,
+                &app.name,
+            )
+            .await
+            .unwrap();
+            if accepted {
+                tx.commit().await.unwrap();
+            } else {
+                tx.rollback().await.unwrap();
+            }
+            (accepted, app)
+        });
+        let create_pid = receive_pid.await.unwrap();
+        wait_for_backend_lock(&pool, create_pid).await;
+        let blocked_by_destroy: bool = sqlx::query_scalar("SELECT $1 = ANY(pg_blocking_pids($2))")
+            .bind(destroy_pid)
+            .bind(create_pid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(blocked_by_destroy);
+        sqlx::query(
+            "INSERT INTO kbs_owner_seed_waivers (binding_key, app_id, org_name, app_name)
+             SELECT $1, $2, name, $3 FROM organizations WHERE id = $4",
+        )
+        .bind(&binding)
+        .bind(old_id)
+        .bind(&name)
+        .bind(org_id)
+        .execute(&mut *destroy)
+        .await
+        .unwrap();
+        destroy.commit().await.unwrap();
+        let (accepted, app) = tokio::time::timeout(std::time::Duration::from_secs(5), create)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !accepted,
+            "the fresh snapshot must reject the destroy's waiver"
+        );
+        let replacements: i64 = sqlx::query_scalar("SELECT count(*) FROM apps WHERE org_id = $1")
+            .bind(org_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(replacements, 0);
+
+        let mut retry = pool.begin().await.unwrap();
+        assert!(
+            !crate::routes::apps::insert_app_if_owner_seed_fresh(
+                &mut retry,
+                app_insert_query(&app),
+                &app.namespace,
+                &app.name,
+            )
+            .await
+            .unwrap()
+        );
+        retry.rollback().await.unwrap();
+        sqlx::query("DELETE FROM kbs_owner_seed_waivers WHERE binding_key = $1")
+            .bind(&binding)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut cleared = pool.begin().await.unwrap();
+        assert!(
+            crate::routes::apps::insert_app_if_owner_seed_fresh(
+                &mut cleared,
+                app_insert_query(&app),
+                &app.namespace,
+                &app.name,
+            )
+            .await
+            .unwrap()
+        );
+        cleared.commit().await.unwrap();
     }
 
     fn valid_log_encryption_config() -> LogEncryptionConfig {

@@ -1074,8 +1074,8 @@ async fn commit_unlock_mode_transition(
     if let (Some(artifacts), Some(signed)) =
         (request.signing_artifacts, request.signed_policy_artifact)
     {
-        crate::signing_service::persist_workload_artifacts(
-            &mut *tx,
+        crate::signing_service::accept_signed_workload_artifacts(
+            &mut tx,
             locked_app.id,
             request.deploy_id,
             artifacts,
@@ -1083,9 +1083,6 @@ async fn commit_unlock_mode_transition(
         )
         .await
         .map_err(|_| unlock_database_error())?;
-        crate::kbs::enqueue_signed_policy_reconciliation(&mut tx)
-            .await
-            .map_err(|_| unlock_database_error())?;
     } else {
         crate::kbs::enqueue_signed_policy_revocation_if_active(&mut tx)
             .await

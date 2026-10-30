@@ -641,41 +641,15 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
     }
 
     // Phase 4: Push config if --set was used
-    if !config_pairs.is_empty() {
-        pb.set_position(4);
-        pb.set_message(counted_progress("Customer config", 0, config_pairs.len()));
-
-        let token_resp = api.get_config_token(&app_name).await?;
-        let tee = token_resp
-            .tee_url
-            .as_deref()
-            .map(|tee_url| {
-                TeeClient::from_config_url_with_resolve_ip(tee_url, token_resp.tee_resolve_ip)
-            })
-            .unwrap_or_else(|| {
-                TeeClient::new_with_resolve_ip(&resp.app_domain, token_resp.tee_resolve_ip)
-            });
-        let (_attestation, tee) = tee.attest_receipt_key().await?;
-
-        for (index, (key, value)) in config_pairs.iter().enumerate() {
-            set_deploy_config(
-                &api,
-                &tee,
-                &app_name,
-                DeploymentWait::trusted(&resp.deployment_id, Some(&trusted_deployment)),
-                key,
-                value,
-                &token_resp.token,
-            )
-            .await?;
-            api.sync_config_key(&app_name, key, false).await?;
-            pb.set_message(counted_progress(
-                "Customer config",
-                index + 1,
-                config_pairs.len(),
-            ));
-        }
-    }
+    push_deploy_config(
+        &api,
+        &resp.app_domain,
+        &app_name,
+        DeploymentWait::trusted(&resp.deployment_id, Some(&trusted_deployment)),
+        &config_pairs,
+        &pb,
+    )
+    .await?;
 
     // Phase 4: Health check
     pb.set_position(5);
@@ -705,6 +679,54 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
         println!("  Config: {} key(s) set", config_pairs.len());
     }
 
+    Ok(())
+}
+
+/// Deploy-time config delivery: fetch the config token, attest the TEE, then
+/// push every `--set` pair over the SPKI-pinned channel `attest_receipt_key`
+/// returns. The raw token/ownership client is never used for mutations.
+async fn push_deploy_config(
+    api: &ApiClient,
+    app_domain: &str,
+    app_name: &str,
+    deployment: DeploymentWait<'_>,
+    config_pairs: &[(String, String)],
+    pb: &ProgressBar,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if config_pairs.is_empty() {
+        return Ok(());
+    }
+    pb.set_position(4);
+    pb.set_message(counted_progress("Customer config", 0, config_pairs.len()));
+
+    let token_resp = api.get_config_token(app_name).await?;
+    let tee = token_resp
+        .tee_url
+        .as_deref()
+        .map(|tee_url| {
+            TeeClient::from_config_url_with_resolve_ip(tee_url, token_resp.tee_resolve_ip)
+        })
+        .unwrap_or_else(|| TeeClient::new_with_resolve_ip(app_domain, token_resp.tee_resolve_ip));
+    let (_attestation, tee) = tee.attest_receipt_key().await?;
+
+    for (index, (key, value)) in config_pairs.iter().enumerate() {
+        set_deploy_config(
+            api,
+            &tee,
+            app_name,
+            deployment,
+            key,
+            value,
+            &token_resp.token,
+        )
+        .await?;
+        api.sync_config_key(app_name, key, false).await?;
+        pb.set_message(counted_progress(
+            "Customer config",
+            index + 1,
+            config_pairs.len(),
+        ));
+    }
     Ok(())
 }
 
@@ -3809,7 +3831,7 @@ pub async fn destroy(args: DestroyArgs) -> Result<(), Box<dyn std::error::Error>
 
 #[cfg(test)]
 #[path = "app/tests/mod.rs"]
-mod tests;
+pub(crate) mod tests;
 
 /// Operator guidance for a failed destroy, keyed on the stable API code (or
 /// the in-band cause text hosted deferrals carry). Pure so the prose mapping

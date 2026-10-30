@@ -11,3 +11,13 @@ pub mod platform_release;
 pub mod policy_artifact;
 pub mod registry;
 pub mod tee_client;
+
+/// Serializes tests that mutate process-global state (environment variables
+/// or the working directory). Every env/CWD-mutating test in this crate takes
+/// this one lock; `commands` compiles into the `enclava` binary so its tests
+/// run in a separate process and share `commands::env_lock` there.
+#[cfg(test)]
+pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap()
+}

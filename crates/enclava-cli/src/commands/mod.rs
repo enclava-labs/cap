@@ -155,6 +155,16 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+/// Serializes tests that mutate process-global state (environment variables
+/// or the working directory). The `commands` tree compiles only into the
+/// `enclava` binary, so its tests run in their own process and share this
+/// one lock; the library's tests use `enclava_cli::env_lock` in theirs.
+#[cfg(test)]
+pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

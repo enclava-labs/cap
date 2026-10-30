@@ -1,3 +1,4 @@
+use anyhow::Context as _;
 use axum::Extension;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::DecodePrivateKey;
@@ -685,13 +686,42 @@ fn load_trustee_attestation_verify_bearer_token(
     Ok(token)
 }
 
-fn install_default_rustls_crypto_provider() {
+// rustls cannot infer a provider when both ring and aws-lc-rs are enabled.
+fn bootstrap_runtime_crypto_provider() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
+// Both authority barriers must complete before dispatch or readiness opens.
+async fn run_startup_convergence<K, E, D, R>(
+    kbs_reconcile: K,
+    edge_reconcile: Option<E>,
+    spawn_dispatcher: Option<D>,
+    mark_ready: R,
+) -> anyhow::Result<()>
+where
+    K: Future<Output = anyhow::Result<()>>,
+    E: Future<Output = anyhow::Result<()>>,
+    D: FnOnce(),
+    R: FnOnce(),
+{
+    kbs_reconcile
+        .await
+        .context("KBS policy reconciliation failed")?;
+    if let Some(edge_reconcile) = edge_reconcile {
+        edge_reconcile
+            .await
+            .context("HAProxy route reconciliation failed")?;
+    }
+    if let Some(spawn_dispatcher) = spawn_dispatcher {
+        spawn_dispatcher();
+    }
+    mark_ready();
+    Ok(())
 }
 
 #[tokio::main]
 async fn main() {
-    install_default_rustls_crypto_provider();
+    bootstrap_runtime_crypto_provider();
 
     tracing_subscriber::registry()
         .with(
@@ -1075,31 +1105,41 @@ async fn main() {
             "workload admission closed: pull secret cleanup did not converge; background retry scheduled"
         );
     }
-    if let Err(error) = enclava_api::kbs::reconcile_signed_policy_at_startup(&state).await {
-        eprintln!("startup refused: KBS policy reconciliation failed: {error}");
-        std::process::exit(1);
-    }
     if edge_reconciliation_disabled {
         tracing::warn!("tenant HAProxy reconciliation disabled for local development");
-    } else {
-        if let Err(error) = enclava_api::edge::reconcile_all_haproxy_routes_at_startup(&state).await
-        {
-            eprintln!("startup refused: HAProxy route reconciliation failed: {error}");
-            std::process::exit(1);
-        }
-        enclava_api::edge::spawn_haproxy_reconciler(state.clone());
     }
-    enclava_api::kbs::spawn_signed_policy_reconciler(state.clone());
-    enclava_api::routes::auth::spawn_device_login_reaper(state.db.clone());
-    enclava_api::auth::nostr::spawn_nip98_replay_cache_reaper(state.db.clone());
     // The pull-secret cleanup sweep already ran before router construction;
     // `dispatch_admission` encodes its result together with the operator's
     // CAP_DEPLOYMENT_DISPATCH_ENABLED intent. The deployment dispatcher is
     // spawned only when the operator enabled dispatch (review finding on
     // #243) — and only once, in lockstep with opening workload admission.
-    if deployment_dispatch_enabled && dispatch_admission {
-        enclava_api::deployment_jobs::spawn_deployment_dispatcher(state.clone());
-    } else if !deployment_dispatch_enabled {
+    if let Err(error) = run_startup_convergence(
+        async {
+            enclava_api::kbs::reconcile_signed_policy_at_startup(&state)
+                .await
+                .map_err(anyhow::Error::from)
+        },
+        (!edge_reconciliation_disabled).then_some(async {
+            enclava_api::edge::reconcile_all_haproxy_routes_at_startup(&state)
+                .await
+                .map_err(anyhow::Error::from)
+        }),
+        (deployment_dispatch_enabled && dispatch_admission)
+            .then_some(|| enclava_api::deployment_jobs::spawn_deployment_dispatcher(state.clone())),
+        || state.mark_startup_ready(),
+    )
+    .await
+    {
+        eprintln!("startup refused: {error:#}");
+        std::process::exit(1);
+    }
+    if !edge_reconciliation_disabled {
+        enclava_api::edge::spawn_haproxy_reconciler(state.clone());
+    }
+    enclava_api::kbs::spawn_signed_policy_reconciler(state.clone());
+    enclava_api::routes::auth::spawn_device_login_reaper(state.db.clone());
+    enclava_api::auth::nostr::spawn_nip98_replay_cache_reaper(state.db.clone());
+    if !deployment_dispatch_enabled {
         tracing::info!(
             "workload mutation and durable deployment dispatch are disabled \
              (CAP_DEPLOYMENT_DISPATCH_ENABLED=false)"
@@ -1116,7 +1156,6 @@ async fn main() {
         deployment_dispatch_enabled,
         dispatch_admission,
     );
-    state.mark_startup_ready();
     tracing::info!("startup reconciliation complete; API is ready");
 
     server
@@ -1456,21 +1495,6 @@ mod tests {
     }
 
     #[test]
-    fn api_startup_installs_rustls_crypto_provider() {
-        let source = include_str!("main.rs");
-        let main_body = source
-            .split("#[tokio::main]")
-            .nth(1)
-            .and_then(|s| s.split("#[cfg(test)]").next())
-            .expect("main body");
-        let expected = concat!("install_default", "_rustls_crypto_provider();");
-        assert!(
-            main_body.contains(expected),
-            "API startup must install a rustls CryptoProvider before building ACME/HTTP clients"
-        );
-    }
-
-    #[test]
     fn deployment_dispatch_switch_is_strict_and_fail_closed() {
         assert!(!parse_fail_closed_switch("SWITCH", None).unwrap());
         assert!(!parse_fail_closed_switch("SWITCH", Some("false")).unwrap());
@@ -1489,6 +1513,199 @@ mod tests {
         validate_edge_reconciliation_mode(true, false).unwrap();
         validate_edge_reconciliation_mode(false, true).unwrap();
         assert!(validate_edge_reconciliation_mode(true, true).is_err());
+    }
+
+    #[test]
+    fn startup_convergence_blocks_dispatch_and_readiness_while_kbs_pending() {
+        use futures::FutureExt as _;
+
+        let events = std::cell::RefCell::new(Vec::new());
+        let pending = run_startup_convergence(
+            std::future::pending(),
+            Some(async {
+                events.borrow_mut().push("edge");
+                Ok(())
+            }),
+            Some(|| events.borrow_mut().push("dispatch")),
+            || events.borrow_mut().push("ready"),
+        );
+        assert!(
+            pending.now_or_never().is_none(),
+            "a still-running KBS reconcile must hold dispatch and readiness"
+        );
+        assert_eq!(*events.borrow(), Vec::<&'static str>::new());
+    }
+
+    #[test]
+    fn startup_convergence_blocks_dispatch_and_readiness_while_edge_pending() {
+        use futures::FutureExt as _;
+
+        let events = std::cell::RefCell::new(Vec::new());
+        let pending = run_startup_convergence(
+            async {
+                events.borrow_mut().push("kbs");
+                Ok(())
+            },
+            Some(std::future::pending()),
+            Some(|| events.borrow_mut().push("dispatch")),
+            || events.borrow_mut().push("ready"),
+        );
+        assert!(
+            pending.now_or_never().is_none(),
+            "a still-running edge reconcile must hold dispatch and readiness"
+        );
+        assert_eq!(
+            *events.borrow(),
+            vec!["kbs"],
+            "dispatch/readiness must not run while the edge reconcile pends"
+        );
+    }
+
+    #[test]
+    fn startup_convergence_fails_before_dispatch_and_readiness_on_kbs_error() {
+        use futures::FutureExt as _;
+
+        let events = std::cell::RefCell::new(Vec::new());
+        let _ = run_startup_convergence(
+            async {
+                events.borrow_mut().push("kbs");
+                anyhow::bail!("kbs fence lost")
+            },
+            Some(async {
+                events.borrow_mut().push("edge");
+                Ok(())
+            }),
+            Some(|| events.borrow_mut().push("dispatch")),
+            || events.borrow_mut().push("ready"),
+        )
+        .now_or_never()
+        .expect("a failed reconcile resolves immediately")
+        .expect_err("a failed KBS reconcile must abort startup convergence");
+        assert_eq!(
+            *events.borrow(),
+            vec!["kbs"],
+            "edge/dispatch/readiness must not run after the KBS reconcile fails"
+        );
+    }
+
+    #[test]
+    fn startup_convergence_fails_before_dispatch_and_readiness_on_edge_error() {
+        use futures::FutureExt as _;
+
+        let events = std::cell::RefCell::new(Vec::new());
+        let _ = run_startup_convergence(
+            async {
+                events.borrow_mut().push("kbs");
+                Ok(())
+            },
+            Some(async {
+                events.borrow_mut().push("edge");
+                anyhow::bail!("edge rollout timed out")
+            }),
+            Some(|| events.borrow_mut().push("dispatch")),
+            || events.borrow_mut().push("ready"),
+        )
+        .now_or_never()
+        .expect("a failed reconcile resolves immediately")
+        .expect_err("a failed edge reconcile must abort startup convergence");
+        assert_eq!(
+            *events.borrow(),
+            vec!["kbs", "edge"],
+            "dispatch/readiness must not run after the edge reconcile fails"
+        );
+    }
+
+    #[test]
+    fn startup_convergence_dispatches_then_opens_readiness_once_converged() {
+        use futures::FutureExt as _;
+
+        let events = std::cell::RefCell::new(Vec::new());
+        run_startup_convergence(
+            async {
+                events.borrow_mut().push("kbs");
+                Ok(())
+            },
+            Some(async {
+                events.borrow_mut().push("edge");
+                Ok(())
+            }),
+            Some(|| events.borrow_mut().push("dispatch")),
+            || events.borrow_mut().push("ready"),
+        )
+        .now_or_never()
+        .expect("converged reconciles resolve immediately")
+        .expect("converged reconciles must not fail startup");
+        assert_eq!(*events.borrow(), vec!["kbs", "edge", "dispatch", "ready"]);
+    }
+
+    #[test]
+    fn startup_convergence_respects_disabled_edge_and_dispatch() {
+        use futures::FutureExt as _;
+
+        // Dispatch disabled (CAP_DEPLOYMENT_DISPATCH_ENABLED=false): startup
+        // still converges and opens readiness without a dispatcher.
+        let events = std::cell::RefCell::new(Vec::new());
+        run_startup_convergence(
+            async {
+                events.borrow_mut().push("kbs");
+                Ok(())
+            },
+            Some(async {
+                events.borrow_mut().push("edge");
+                Ok(())
+            }),
+            None::<fn()>,
+            || events.borrow_mut().push("ready"),
+        )
+        .now_or_never()
+        .expect("converged reconciles resolve immediately")
+        .expect("disabled dispatch must not fail startup");
+        assert_eq!(*events.borrow(), vec!["kbs", "edge", "ready"]);
+
+        // Edge disabled (CAP_DISABLE_EDGE_RECONCILIATION, only valid with
+        // dispatch off — the pairing is proven by
+        // edge_reconciliation_can_only_be_disabled_without_dispatch): no edge
+        // reconcile runs at all.
+        let events = std::cell::RefCell::new(Vec::new());
+        run_startup_convergence(
+            async {
+                events.borrow_mut().push("kbs");
+                Ok(())
+            },
+            None::<std::future::Ready<anyhow::Result<()>>>,
+            None::<fn()>,
+            || events.borrow_mut().push("ready"),
+        )
+        .now_or_never()
+        .expect("converged reconciles resolve immediately")
+        .expect("disabled edge must not fail startup");
+        assert_eq!(*events.borrow(), vec!["kbs", "ready"]);
+    }
+
+    // A fresh process prevents other TLS tests from masking a missing install.
+    #[test]
+    fn tls_provider_bootstrap_smoke_child() {
+        if std::env::var_os("CAP_TLS_BOOTSTRAP_SMOKE_CHILD").is_none() {
+            return;
+        }
+        bootstrap_runtime_crypto_provider();
+        let _ = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+    }
+
+    #[test]
+    fn tls_provider_bootstrap_installs_provider_in_a_fresh_process() {
+        let status = std::process::Command::new(std::env::current_exe().expect("test binary path"))
+            .arg("tests::tls_provider_bootstrap_smoke_child")
+            .arg("--exact")
+            .env("CAP_TLS_BOOTSTRAP_SMOKE_CHILD", "1")
+            .status()
+            .expect("failed to spawn TLS bootstrap smoke child");
+        assert!(
+            status.success(),
+            "fresh-process TLS bootstrap failed: {status}"
+        );
     }
 
     #[test]
@@ -1540,36 +1757,6 @@ mod tests {
             &runtime_class,
         )
         .unwrap();
-    }
-
-    #[test]
-    fn kbs_and_edge_authority_converge_before_dispatch_and_readiness() {
-        let source = include_str!("main.rs");
-        let main_body = source
-            .split("#[tokio::main]")
-            .nth(1)
-            .and_then(|body| body.split("#[cfg(test)]").next())
-            .expect("main body");
-        let kbs = main_body
-            .find("reconcile_signed_policy_at_startup")
-            .expect("startup KBS reconciliation");
-        let edge = main_body
-            .find("reconcile_all_haproxy_routes_at_startup")
-            .expect("startup edge reconciliation");
-        let local_disable = main_body
-            .find("CAP_DISABLE_EDGE_RECONCILIATION")
-            .expect("explicit local-only edge disable");
-        let dispatch = main_body
-            .find("spawn_deployment_dispatcher")
-            .expect("deployment dispatcher");
-        let ready = main_body
-            .find("mark_startup_ready")
-            .expect("readiness gate");
-        assert!(
-            !main_body[..edge].contains("config.required"),
-            "configured KBS management must never bypass the startup barrier"
-        );
-        assert!(kbs < edge && local_disable < edge && edge < dispatch && dispatch < ready);
     }
 
     #[test]

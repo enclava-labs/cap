@@ -91,6 +91,23 @@ fn env_override_for(raw: Option<OsString>) -> Option<OsString> {
     raw
 }
 
+/// Path of the init-started sentinel directory. Prod-strict binds this to
+/// the compiled default only ([`env_override`] returns `None`), so a
+/// tampered host environment cannot redirect the readiness handshake.
+fn started_dir_path() -> PathBuf {
+    env_override("ENCLAVA_STARTED_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_STARTED_DIR))
+}
+
+/// Path of the init-ready file this wrapper waits on. Same prod-strict
+/// binding rule as [`started_dir_path`].
+fn ready_file_path() -> PathBuf {
+    env_override("ENCLAVA_INIT_READY_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_READY_FILE))
+}
+
 fn main() {
     if let Err(err) = run(env::args_os().skip(1).collect()) {
         eprintln!("enclava-wait-exec: {err}");
@@ -102,12 +119,8 @@ fn run(argv: Vec<OsString>) -> Result<(), String> {
     let name = env::var("ENCLAVA_CONTAINER_NAME").unwrap_or_else(|_| "unknown".to_string());
     validate_sentinel_name(&name)?;
 
-    let started_dir = env_override("ENCLAVA_STARTED_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_STARTED_DIR));
-    let ready_file = env_override("ENCLAVA_INIT_READY_FILE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_READY_FILE));
+    let started_dir = started_dir_path();
+    let ready_file = ready_file_path();
 
     signal_started(&started_dir, &name)?;
     wait_until_ready(&ready_file);
@@ -1672,42 +1685,72 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(feature = "prod-strict"))]
-    fn prod_strict_pins_readiness_paths_to_compiled_defaults() {
-        // This test verifies that prod-strict builds don't read certain env vars directly.
-        // It runs in dev builds but checks the source for patterns that should not exist
-        // in prod-strict.
-        //
-        // Note: The log encryption key checks are intentionally omitted here because
-        // encrypted_log_config_from_raw_env is already gated with #[cfg(not(feature = "prod-strict"))],
-        // so the env::var calls exist in the source but are compiled out in prod-strict.
-        let source = include_str!("main.rs").replace("\r\n", "\n");
-        for var in ["ENCLAVA_INIT_READY_FILE", "ENCLAVA_STARTED_DIR"] {
-            assert!(
-                !source.contains(&format!("env::var_os(\"{var}\")")),
-                "{var} must not be read via env::var_os"
-            );
-            assert!(
-                source.contains(&format!("env_override(\"{var}\")")),
-                "{var} must resolve through env_override"
-            );
+    fn readiness_paths_bind_to_env_only_in_dev_builds() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "enclava-wait-exec-paths-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let planted_started = dir.join("planted-started");
+        let planted_ready = dir.join("planted-ready");
+        for (var, planted) in [
+            ("ENCLAVA_STARTED_DIR", &planted_started),
+            ("ENCLAVA_INIT_READY_FILE", &planted_ready),
+        ] {
+            unsafe { env::set_var(var, planted) };
+        }
+        let (started, ready) = (started_dir_path(), ready_file_path());
+        unsafe {
+            env::remove_var("ENCLAVA_STARTED_DIR");
+            env::remove_var("ENCLAVA_INIT_READY_FILE");
+        }
+        if cfg!(feature = "prod-strict") {
+            assert_eq!(started, PathBuf::from(DEFAULT_STARTED_DIR));
+            assert_eq!(ready, PathBuf::from(DEFAULT_READY_FILE));
+        } else {
+            assert_eq!(started, planted_started);
+            assert_eq!(ready, planted_ready);
         }
     }
 
     #[test]
     #[cfg(feature = "prod-strict")]
-    fn prod_strict_uses_handoff_for_log_encryption() {
-        // Verify prod-strict reads log encryption from handoff file, not env.
-        let source = include_str!("main.rs").replace("\r\n", "\n");
-        assert!(
-            source.contains("LOG_ENCRYPTION_HANDOFF_FILE"),
-            "prod-strict must read log encryption from handoff file"
-        );
-        // Note: We don't check that encrypted_log_config_from_raw_env is absent because
-        // it's gated with #[cfg(not(feature = "prod-strict"))] in the source, which is correct.
-        // The function exists in dev builds but is compiled out in prod-strict.
+    fn prod_strict_ignores_host_log_encryption_env_without_handoff() {
+        // Prod-strict takes the encrypted-log recipient exclusively from the
+        // trusted handoff init writes onto the decrypted state volume. Host
+        // env carrying attacker key material must never engage encrypted
+        // logging: with no handoff on the state volume the resolver returns
+        // disabled, proving the raw-env path is not consulted.
+        let _guard = ENV_LOCK.lock().unwrap();
+        let keypair = enclava_common::log_encryption::generate_log_keypair();
+        unsafe {
+            env::set_var("ENCLAVA_LOG_ENCRYPTION_KEY_ID", "attacker-key");
+            env::set_var(
+                "ENCLAVA_LOG_ENCRYPTION_PUBLIC_KEY_BASE64URL",
+                &keypair.public_key_base64url,
+            );
+            env::set_var(
+                "ENCLAVA_LOG_ENCRYPTION_PUBLIC_KEY_SHA256",
+                &keypair.public_key_sha256,
+            );
+        }
+        let config = encrypted_log_config_from_env("web");
+        unsafe {
+            env::remove_var("ENCLAVA_LOG_ENCRYPTION_KEY_ID");
+            env::remove_var("ENCLAVA_LOG_ENCRYPTION_PUBLIC_KEY_BASE64URL");
+            env::remove_var("ENCLAVA_LOG_ENCRYPTION_PUBLIC_KEY_SHA256");
+        }
+        // /state/app/log-encryption.json must not exist on the test host.
+        assert!(config.unwrap().is_none());
     }
 
+    /// Serializes tests that mutate process env (Rust runs tests on parallel
+    /// threads; set_var/remove_var on shared env would otherwise race).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     #[cfg(feature = "prod-strict")]
     fn unique_handoff_path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -1720,11 +1763,6 @@ mod tests {
                 .as_nanos()
         ))
     }
-
-    /// Serializes tests that mutate process env (Rust runs tests on parallel
-    /// threads; set_var/remove_var on shared env would otherwise race).
-    #[cfg(feature = "prod-strict")]
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     #[cfg(feature = "prod-strict")]

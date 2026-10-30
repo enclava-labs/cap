@@ -1263,4 +1263,89 @@ mod tests {
             );
         }
     }
+
+    // Runtime coverage for the probe contract the removed source-text pins
+    // used to assert: the capability preflight carries an intentionally
+    // invalid mode (never a valid mutation), runs before the manifest load
+    // and before any TEE seal, and propagates every answer but the
+    // side-effect-free 400 (enclava-paas#189).
+
+    #[tokio::test]
+    async fn unlock_mode_probe_accepts_only_the_side_effect_free_400() {
+        use crate::commands::app::tests::{isolated_state_env, spawn_json_api_stub};
+
+        for (status, ok) in [(400u16, true), (501, false), (403, false), (200, false)] {
+            let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let api_address =
+                spawn_json_api_stub(events.clone(), move |_| (status, serde_json::json!({}))).await;
+            let _env = isolated_state_env(&format!("http://{api_address}"), false);
+            let api = ApiClient::new(&format!("http://{api_address}"), Some("t".to_string()));
+
+            let result = ensure_unlock_mode_change_supported(&api, "shell").await;
+            assert_eq!(result.is_ok(), ok, "status {status}: {result:?}");
+
+            let recorded = events.lock().unwrap().clone();
+            assert_eq!(recorded.len(), 1, "exactly one probe request: {recorded:?}");
+            assert!(
+                recorded[0].starts_with("PUT /apps/shell/unlock/mode "),
+                "the probe must hit the unlock-mode route: {recorded:?}"
+            );
+            assert!(
+                recorded[0].contains("__capability_probe__"),
+                "the probe must carry an invalid mode so it can never be a valid mutation: {recorded:?}"
+            );
+            assert!(
+                !recorded[0].contains("\"transition_receipt\":"),
+                "the probe must not carry a transition receipt: {recorded:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_unlock_preflight_runs_before_manifest_load_and_tee_seals() {
+        use crate::commands::app::tests::{isolated_state_env, spawn_json_api_stub};
+
+        // Enable refuses up front (see enable_subcommand_refuses_above); for
+        // Disable, a hosted placeholder answer (501) aborts the command before
+        // the enclava.toml load and before any TEE contact: with no manifest
+        // in the isolated CWD and no TEE stub at all, the run must fail with
+        // the probe's answer, not a file or connection error.
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let api_address = spawn_json_api_stub(events.clone(), |path| {
+            if path == "/apps/shell/unlock/mode" {
+                (501, serde_json::json!({ "code": "not_implemented_hosted" }))
+            } else {
+                (404, serde_json::json!({}))
+            }
+        })
+        .await;
+        let _env = isolated_state_env(&format!("http://{api_address}"), true);
+
+        let error = auto_unlock(AutoUnlockCommand::Disable {
+            app: Some("shell".to_string()),
+            image: "img".to_string(),
+            password_file: None,
+        })
+        .await
+        .expect_err("the hosted placeholder must abort the command")
+        .to_string();
+        assert!(
+            error.contains("not implemented on this platform"),
+            "unexpected error: {error}"
+        );
+
+        let recorded = events.lock().unwrap().clone();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "the command probes exactly once: {recorded:?}"
+        );
+        assert!(
+            recorded.iter().all(
+                |request| request.starts_with("PUT /apps/shell/unlock/mode ")
+                    && request.contains("__capability_probe__")
+            ),
+            "the command probes once and stops: no app lookup, no manifest, no TEE seal — {recorded:?}"
+        );
+    }
 }

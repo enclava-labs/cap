@@ -80,6 +80,11 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
+      - name: Reject Rust source-text tests
+        run: |
+          python3 scripts/check-no-rust-source-tests.py --self-test
+          python3 scripts/check-no-rust-source-tests.py
+
       - name: Install native build dependencies
         run: |
           sudo apt-get update

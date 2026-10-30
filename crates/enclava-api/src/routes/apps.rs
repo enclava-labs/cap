@@ -1185,6 +1185,19 @@ pub(crate) fn stale_owner_seed_response() -> (StatusCode, Json<serde_json::Value
     )
 }
 
+/// A false result requires rolling back the transaction, including its inserted row.
+pub(crate) async fn insert_app_if_owner_seed_fresh(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    insert: sqlx::query::Query<'_, sqlx::Postgres, sqlx::postgres::PgArguments>,
+    namespace: &str,
+    name: &str,
+) -> Result<bool, sqlx::Error> {
+    let inserted = insert.execute(&mut **tx).await?;
+    // A unique-index wait can outlive the INSERT's READ COMMITTED snapshot.
+    Ok(inserted.rows_affected() != 0
+        && !crate::kbs::owner_seed_waiver_recorded_in_tx(tx, namespace, name).await?)
+}
+
 pub(crate) async fn refuse_stale_owner_seed(
     state: &AppState,
     namespace: &str,
@@ -1246,7 +1259,7 @@ pub async fn create_app(
     )
     .await?;
 
-    let result = sqlx::query(
+    let insert = sqlx::query(
         "INSERT INTO apps (id, org_id, name, namespace, instance_id, tenant_id,
         service_account, bootstrap_owner_pubkey_hash, tenant_instance_identity_hash,
          unlock_mode, domain, tee_domain,
@@ -1283,7 +1296,13 @@ pub async fn create_app(
         &app_candidate.namespace,
         &app_candidate.name,
     ))
-    .execute(&mut *tx)
+    ;
+    let result = insert_app_if_owner_seed_fresh(
+        &mut tx,
+        insert,
+        &app_candidate.namespace,
+        &app_candidate.name,
+    )
     .await;
 
     let insert_result = match result {
@@ -1298,27 +1317,7 @@ pub async fn create_app(
             return Err(internal_server_error());
         }
     };
-    // The waiver check in `prepare_app_candidate` runs before this
-    // transaction, so an abandoned destroy committing between the check and
-    // this insert could slip a recreate past the tombstone: the insert waits
-    // out the old row's unique constraint, but under READ COMMITTED the NOT
-    // EXISTS above was evaluated on the statement snapshot taken before the
-    // destroy committed, so it cannot see a waiver that landed while the
-    // insert was blocked. Two guards close it: zero rows inserted means the
-    // waiver predated the statement; the recheck below takes a fresh
-    // statement snapshot after the insert completes and sees any waiver the
-    // destroy committed in between.
-    if insert_result.rows_affected() == 0 {
-        return Err(stale_owner_seed_response());
-    }
-    if crate::kbs::owner_seed_waiver_recorded_in_tx(
-        &mut tx,
-        &app_candidate.namespace,
-        &app_candidate.name,
-    )
-    .await
-    .map_err(|_| internal_server_error())?
-    {
+    if !insert_result {
         return Err(stale_owner_seed_response());
     }
 

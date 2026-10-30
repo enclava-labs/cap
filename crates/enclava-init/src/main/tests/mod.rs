@@ -1357,6 +1357,106 @@ fn log_encryption_handoff_uses_single_cc_init_data_snapshot() {
 }
 
 #[test]
+fn init_surface_accessors_enforce_build_mode() {
+    let _env_lock = FAILURE_ENV_LOCK.lock().unwrap();
+    let dir = tempdir().unwrap();
+    for (var, resolve, default) in [
+        (
+            "ENCLAVA_INIT_READY_FILE",
+            ready_file_path as fn() -> PathBuf,
+            DEFAULT_READY_FILE,
+        ),
+        (
+            "ENCLAVA_INIT_ERROR_FILE",
+            error_file_path,
+            DEFAULT_ERROR_FILE,
+        ),
+        (
+            "ENCLAVA_INIT_STAGE_FILE",
+            stage_file_path,
+            DEFAULT_STAGE_FILE,
+        ),
+        (
+            "ENCLAVA_INIT_STARTED_DIR",
+            started_dir_path,
+            "/run/enclava/containers",
+        ),
+        (
+            "ENCLAVA_INIT_ACME_COOLDOWN_FILE",
+            acme_cooldown_file_path,
+            DEFAULT_ACME_COOLDOWN_FILE,
+        ),
+        (
+            "ENCLAVA_INIT_TERMINATION_LOG",
+            termination_log_path,
+            "/dev/termination-log",
+        ),
+    ] {
+        let previous = std::env::var_os(var);
+        let custom = dir.path().join(var);
+        unsafe { std::env::set_var(var, &custom) };
+        let resolved = resolve();
+        match previous {
+            Some(value) => unsafe { std::env::set_var(var, value) },
+            None => unsafe { std::env::remove_var(var) },
+        }
+        let expected = if cfg!(feature = "prod-strict") {
+            // Prod-strict binds surfaces to compiled defaults only: the
+            // host-controlled pod environment must not redirect them.
+            PathBuf::from(default)
+        } else {
+            custom
+        };
+        assert_eq!(
+            resolved,
+            expected,
+            "{var} resolution under {} builds",
+            if cfg!(feature = "prod-strict") {
+                "prod-strict"
+            } else {
+                "dev"
+            }
+        );
+    }
+}
+
+#[test]
+#[cfg(feature = "prod-strict")]
+fn prod_strict_failure_exit_never_stays_alive() {
+    // A host-set keep-alive must be ignored under prod-strict: set a truthy
+    // value so the assertion exercises the gate instead of passing vacuously.
+    let _env_lock = FAILURE_ENV_LOCK.lock().unwrap();
+    let previous = std::env::var_os("ENCLAVA_INIT_STAY_ALIVE");
+    unsafe { std::env::set_var("ENCLAVA_INIT_STAY_ALIVE", "1") };
+    let enabled = stay_alive_after_failure_enabled();
+    match previous {
+        Some(value) => unsafe { std::env::set_var("ENCLAVA_INIT_STAY_ALIVE", value) },
+        None => unsafe { std::env::remove_var("ENCLAVA_INIT_STAY_ALIVE") },
+    }
+    assert!(
+        !enabled,
+        "prod-strict must fail fast so orchestration observes failed boots"
+    );
+}
+
+#[test]
+#[cfg(not(feature = "prod-strict"))]
+fn dev_failure_exit_stays_alive_only_when_enabled() {
+    let _env_lock = FAILURE_ENV_LOCK.lock().unwrap();
+    let previous = std::env::var_os("ENCLAVA_INIT_STAY_ALIVE");
+    unsafe { std::env::set_var("ENCLAVA_INIT_STAY_ALIVE", "1") };
+    let enabled = stay_alive_after_failure_enabled();
+    unsafe { std::env::set_var("ENCLAVA_INIT_STAY_ALIVE", "0") };
+    let disabled = stay_alive_after_failure_enabled();
+    match previous {
+        Some(value) => unsafe { std::env::set_var("ENCLAVA_INIT_STAY_ALIVE", value) },
+        None => unsafe { std::env::remove_var("ENCLAVA_INIT_STAY_ALIVE") },
+    }
+    assert!(enabled, "dev builds honor ENCLAVA_INIT_STAY_ALIVE");
+    assert!(!disabled);
+}
+
+#[test]
 fn workload_pid_fallback_finds_wait_exec_process_by_container_name() {
     let dir = tempdir().unwrap();
     let proc_dir = dir.path().join("123");

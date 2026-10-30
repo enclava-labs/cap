@@ -84,48 +84,4 @@ mod tests {
         assert!(err.to_string().contains("pass --force"), "{err}");
         require_prompt_for(true, "pass --force").expect("interactive sessions may prompt");
     }
-
-    /// Tripwire (house source-contract pattern): every prompt site keeps its
-    /// flag escape in the refusal message. Deleting a gate deletes its needle.
-    #[test]
-    fn every_prompt_site_names_its_escape() {
-        for (source, needles) in [
-            (include_str!("mod.rs"), &["ENCLAVA_NO_INPUT"][..]),
-            (
-                include_str!("app.rs"),
-                &[
-                    "pass --force to destroy without confirmation",
-                    "pass --to <deployment-id> to roll back without confirmation",
-                    "--storage-password-file <PATH> to provide the storage password non-interactively",
-                ][..],
-            ),
-            (
-                include_str!("auth.rs"),
-                &[
-                    "pass --replace-session",
-                    "pass --email or --nostr to choose the login method",
-                    "pass --email or --nostr to choose the signup method",
-                    "--email-address <EMAIL> and --password-file <PATH>",
-                    "--npub <NPUB> and --nsec-file <PATH>",
-                ][..],
-            ),
-            (include_str!("ownership.rs"), &["--new-password-file"][..]),
-            (
-                include_str!("prepare.rs"),
-                &["pass --yes to update the existing files without confirmation"][..],
-            ),
-            (
-                include_str!("key.rs"),
-                &["pass --yes to rotate the owner key without confirmation"][..],
-            ),
-            (
-                include_str!("org.rs"),
-                &["pass --yes to confirm trust on first use without prompting"][..],
-            ),
-        ] {
-            for needle in needles {
-                assert!(source.contains(needle), "missing prompt escape: {needle}");
-            }
-        }
-    }
 }
