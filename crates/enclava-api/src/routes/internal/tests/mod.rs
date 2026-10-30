@@ -1059,6 +1059,81 @@ async fn abandoned_lease_reclaims_once_and_replays_the_committed_response() {
 }
 
 #[tokio::test]
+async fn idempotency_receipt_reports_what_a_same_key_retry_would_do() {
+    let pool = database_test_pool().await;
+    let state = idempotency_test_state(pool.clone());
+    let suffix = Uuid::new_v4().simple().to_string();
+    let key = format!("receipt-{suffix}");
+    let path = format!("/internal/test/receipt/{suffix}");
+    let hash = Sha256::digest(b"receipt-request").to_vec();
+    let receipt = |key: &str| {
+        get_paas_idempotency_receipt(
+            internal_test_auth(),
+            State(state.clone()),
+            Query(IdempotencyReceiptQuery {
+                key: key.to_string(),
+            }),
+        )
+    };
+
+    let Json(absent) = receipt(&key).await.expect("read absent receipt");
+    assert_eq!(absent["state"], "absent");
+
+    let first = expect_idempotency_execution(
+        begin_idempotent_request_with_recovery(
+            &state,
+            &key,
+            "POST",
+            &path,
+            &hash,
+            IdempotencyRecovery::RetrySafe,
+        )
+        .await
+        .expect("reserve first attempt"),
+    );
+    let operation_id = first.operation_id();
+    let Json(live) = receipt(&key).await.expect("read live receipt");
+    assert_eq!(live["state"], "in_progress");
+    assert_eq!(live["operation_id"], serde_json::json!(operation_id));
+    let retry_after = live["retry_after"].as_i64().expect("live lease retry hint");
+    assert!((1..=IDEMPOTENCY_DEFAULT_LEASE_SECONDS).contains(&retry_after));
+    drop(first);
+    expire_idempotency_lease(&pool, &key).await;
+
+    let Json(abandoned) = receipt(&key).await.expect("read abandoned receipt");
+    assert_eq!(abandoned["state"], "abandoned");
+    assert_eq!(abandoned["response_status"], serde_json::Value::Null);
+    assert_eq!(abandoned["retry_after"], serde_json::Value::Null);
+
+    let reclaimed = expect_idempotency_execution(
+        begin_idempotent_request_with_recovery(
+            &state,
+            &key,
+            "POST",
+            &path,
+            &hash,
+            IdempotencyRecovery::RetrySafe,
+        )
+        .await
+        .expect("reclaim abandoned attempt"),
+    );
+    let response = serde_json::json!({"result": "committed"});
+    finish_idempotent_request(reclaimed, StatusCode::CREATED, &response)
+        .await
+        .expect("complete reclaimed attempt");
+    let Json(completed) = receipt(&key).await.expect("read completed receipt");
+    assert_eq!(completed["state"], "completed");
+    assert_eq!(completed["method"], "POST");
+    assert_eq!(completed["path"], path);
+    assert_eq!(completed["operation_id"], serde_json::json!(operation_id));
+    assert_eq!(completed["response_status"], 201);
+    assert_eq!(completed["response_body"], response);
+
+    let (status, _) = receipt("  ").await.expect_err("blank key is rejected");
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn live_lease_does_not_starve_a_single_connection_pool() {
     let migration_pool = database_test_pool().await;
     let database_url = std::env::var("DATABASE_URL")

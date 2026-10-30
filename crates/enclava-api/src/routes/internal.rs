@@ -356,6 +356,103 @@ pub async fn paas_deployment_context(
     Json(deployment_context_response(&state))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct IdempotencyReceiptQuery {
+    key: String,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct IdempotencyReceiptRow {
+    method: String,
+    path: String,
+    response_status: Option<i32>,
+    response_body: Option<serde_json::Value>,
+    reservation_token: Option<Uuid>,
+    operation_id: Option<Uuid>,
+    lease_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    known_not_applied: bool,
+    completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+    database_now: chrono::DateTime<chrono::Utc>,
+}
+
+/// Lets PaaS settle a mutation whose CAP answer it never observed from this
+/// ledger instead of guessing. `in_progress` and `abandoned` mirror the
+/// live-lease and reclaimable arms of `begin_idempotent_request_with_recovery_and_binding`,
+/// so a same-key retry behaves exactly as the reported state says.
+pub async fn get_paas_idempotency_receipt(
+    _auth: InternalAuth,
+    State(state): State<AppState>,
+    Query(query): Query<IdempotencyReceiptQuery>,
+) -> Result<Json<serde_json::Value>, InternalRouteError> {
+    let key = query.key.trim();
+    if key.is_empty() || key.len() > 200 {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "idempotency key is required",
+        ));
+    }
+    let row: Option<IdempotencyReceiptRow> = sqlx::query_as(
+        "SELECT method, path, response_status, response_body, reservation_token,
+                operation_id, lease_expires_at, known_not_applied, completed_at,
+                updated_at, clock_timestamp() AS database_now
+           FROM cap_internal_idempotency
+          WHERE idempotency_key = $1",
+    )
+    .bind(key)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|_| db_error())?;
+    let Some(row) = row else {
+        return Ok(Json(serde_json::json!({
+            "idempotency_key": key,
+            "state": "absent",
+            "method": null,
+            "path": null,
+            "operation_id": null,
+            "response_status": null,
+            "response_body": null,
+            "retry_after": null,
+        })));
+    };
+    let lease_expired = row
+        .lease_expires_at
+        .is_some_and(|lease_expires_at| lease_expires_at <= row.database_now);
+    let reclaimable = (row.known_not_applied && lease_expired)
+        || match row.reservation_token {
+            None => {
+                row.updated_at
+                    <= row.database_now
+                        - chrono::Duration::seconds(IDEMPOTENCY_LEGACY_STALE_SECONDS)
+            }
+            Some(_) => lease_expired,
+        };
+    let (receipt_state, retry_after) = if row.completed_at.is_some() {
+        ("completed", None)
+    } else if reclaimable {
+        ("abandoned", None)
+    } else {
+        (
+            "in_progress",
+            row.lease_expires_at.map(|lease_expires_at| {
+                (lease_expires_at - row.database_now)
+                    .num_seconds()
+                    .clamp(1, IDEMPOTENCY_RETRY_HINT_MAX_SECONDS)
+            }),
+        )
+    };
+    Ok(Json(serde_json::json!({
+        "idempotency_key": key,
+        "state": receipt_state,
+        "method": row.method,
+        "path": row.path,
+        "operation_id": row.operation_id,
+        "response_status": row.response_status,
+        "response_body": row.response_body,
+        "retry_after": retry_after,
+    })))
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UpsertPaaSOrgRequest {
     pub name: String,
