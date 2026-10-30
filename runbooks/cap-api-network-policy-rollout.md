@@ -377,22 +377,17 @@ and both must hit 429s.
 
 Use the registered cluster-status route (`/internal/paas/status`; there is no
 `/internal/paas/health` — an unregistered path 404s at the router and never
-reaches the `InternalAuth` extractor):
+reaches the `InternalAuth` extractor). A caller that bypasses the mTLS proxy
+cannot know `CAP_INTERNAL_TRUSTED_PROXY_SECRET`, so every direct request must
+be refused even with a valid token and an allowed SAN:
 
 ```sh
-# from an enclava-paas pod, direct to the ClusterIP (not via ingress):
-curl -s -w '\n%{http_code}\n' \
-  http://enclava-api.enclava-platform.svc.cluster.local/internal/paas/status \
-  -H 'Authorization: Bearer <internal service token>' \
-  -H 'x-enclava-internal-client-san: <allowed SAN>'
-# Expect 200 with a JSON body (extractor accepted token + SAN).
-
-# Denied case — an SAN not in CAP_INTERNAL_ALLOWED_CLIENT_SANS must be 401:
+# from an enclava-paas pod, direct to the ClusterIP (not via the proxy):
 curl -s -o /dev/null -w '%{http_code}\n' \
   http://enclava-api.enclava-platform.svc.cluster.local/internal/paas/status \
   -H 'Authorization: Bearer <internal service token>' \
-  -H 'x-enclava-internal-client-san: not-allowed.example'
-# Expect 401.
+  -H 'x-enclava-internal-client-san: <allowed SAN>'
+# Expect 401 (forged SAN without the proxy secret).
 
 # Denied case — missing token must be 401:
 curl -s -o /dev/null -w '%{http_code}\n' \
@@ -401,11 +396,11 @@ curl -s -o /dev/null -w '%{http_code}\n' \
 # Expect 401.
 ```
 
-Confirm a pod in the namespace WITHOUT the `app.kubernetes.io/name=enclava-paas`
-label is refused (NetworkPolicy drop). If the mTLS handshake terminates at a
-proxy in front of the PaaS rather than at the PaaS client itself, set
-`CAP_INTERNAL_TRUSTED_PROXY_SECRET` so SAN assertions are pinned to the
-verified proxy.
+Through the mTLS proxy with the PaaS client certificate, the same route must
+return 200 with a JSON body. Confirm a pod in the namespace WITHOUT the
+`app.kubernetes.io/name=enclava-paas` label is refused (NetworkPolicy drop).
+`CAP_MANAGEMENT_MODE=paas_managed` refuses to start without
+`CAP_INTERNAL_TRUSTED_PROXY_SECRET`.
 
 ## 5. Rate-limit budget is per replica
 

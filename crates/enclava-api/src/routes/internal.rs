@@ -321,17 +321,15 @@ impl FromRequestParts<AppState> for InternalAuth {
             return Err(InternalAuthError::InvalidToken);
         }
 
-        if config.requires_trusted_proxy() {
-            let proxy_secret = parts
-                .headers
-                .get("x-enclava-internal-proxy-secret")
-                .and_then(|value| value.to_str().ok())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or(InternalAuthError::MissingTrustedProxy)?;
-            if !config.accepts_trusted_proxy_secret(proxy_secret) {
-                return Err(InternalAuthError::InvalidTrustedProxy);
-            }
+        let proxy_secret = parts
+            .headers
+            .get("x-enclava-internal-proxy-secret")
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or(InternalAuthError::MissingTrustedProxy)?;
+        if !config.accepts_trusted_proxy_secret(proxy_secret) {
+            return Err(InternalAuthError::InvalidTrustedProxy);
         }
 
         let client_san = parts
