@@ -39,6 +39,8 @@ IDs, Turin) are rejected instead of widening trust on one side.
 ## AMD KDS
 
 `Kds { base_url, ca_bundle_path, max_attempts }` configures the fallback.
+Without a CA bundle, KDS TLS trusts Mozilla's roots compiled in from
+`webpki-root-certs`, not the image's CA store. Redirects are never followed.
 429 and 5xx responses are retried on a jittered 2/5/10/20/30 s schedule, and
 `Retry-After` is honored up to 120 s. CAP makes one attempt because the
 teardown lane has its own deadline; PaaS makes eight.

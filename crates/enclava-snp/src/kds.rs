@@ -174,16 +174,24 @@ fn builtin_ca_der_chain(generation: sev::Generation) -> Result<(Vec<u8>, Vec<u8>
 }
 
 fn http_client(ca_bundle_path: Option<&Path>) -> Result<reqwest::Client, AttestError> {
-    let mut builder = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(30));
-    if let Some(path) = ca_bundle_path {
+    let roots = match ca_bundle_path {
         // Public CA material only, scoped to this client and re-read for rotation.
-        let roots =
-            read_ca_bundle(path).ok_or(AttestError::Attestation("invalid KDS CA bundle"))?;
-        builder = builder.tls_certs_only(roots);
-    }
-    builder.build().map_err(|error| map_reqwest_error(&error))
+        Some(path) => {
+            read_ca_bundle(path).ok_or(AttestError::Attestation("invalid KDS CA bundle"))?
+        }
+        // Mozilla roots bundled at build time: KDS trust must not depend on
+        // whether the image ships a CA store (the PaaS image does not).
+        None => webpki_root_certs::TLS_SERVER_ROOT_CERTS
+            .iter()
+            .filter_map(|der| reqwest::Certificate::from_der(der).ok())
+            .collect(),
+    };
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(30))
+        .tls_certs_only(roots)
+        .build()
+        .map_err(|error| map_reqwest_error(&error))
 }
 
 fn read_ca_bundle(path: &Path) -> Option<Vec<reqwest::Certificate>> {
