@@ -113,8 +113,8 @@ pub struct TransitionSnpQuote {
 
 /// SHA-256 pins of the AMD ARK roots compiled into the `sev` crate the
 /// platform CLI uses to anchor SNP chains (Milan, Genoa, Turin): the shared
-/// anchor set lives in [`crate::tee_attestation`].
-use crate::tee_attestation::{BUILTIN_AMD_ARK_SHA256_PINS, snp_guest_policy_allows_debug};
+/// anchor set lives in [`enclava_snp`].
+use enclava_snp::{BUILTIN_AMD_ARK_SHA256_PINS, snp_guest_policy_allows_debug};
 
 /// Maximum accepted size of a single submitted AMD certificate DER. Real
 /// ARK/ASK/VCEK certificates are under 2 KiB; anything larger is rejected

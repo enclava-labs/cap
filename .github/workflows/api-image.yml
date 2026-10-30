@@ -24,6 +24,7 @@ on:
       - "crates/enclava-cli/**"
       - "crates/enclava-common/**"
       - "crates/enclava-engine/**"
+      - "crates/enclava-snp/**"
       - "crates/enclava-verifier/**"
   pull_request:
     paths:
@@ -46,6 +47,7 @@ on:
       - "crates/enclava-cli/**"
       - "crates/enclava-common/**"
       - "crates/enclava-engine/**"
+      - "crates/enclava-snp/**"
       - "crates/enclava-verifier/**"
   workflow_dispatch:
     inputs:
