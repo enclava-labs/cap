@@ -1250,7 +1250,9 @@ pub(crate) async fn refuse_stale_owner_seed(
 /// target column list, SELECT placeholder list, and [`bind_app_insert`]'s bind
 /// order must stay aligned: an added column without its SELECT placeholder
 /// makes PostgreSQL reject every such insert before execution, and sqlx only
-/// checks the bind count at runtime.
+/// checks the bind count at runtime. Timestamps come from the database clock:
+/// incarnation fences compare `apps.created_at` with idempotency-ledger
+/// timestamps written by the same database.
 pub(crate) const APP_INSERT_SQL: &str = "INSERT INTO apps (
     id, org_id, name, namespace, instance_id, tenant_id, service_account,
     bootstrap_owner_pubkey_hash, tenant_instance_identity_hash, unlock_mode,
@@ -1261,10 +1263,10 @@ pub(crate) const APP_INSERT_SQL: &str = "INSERT INTO apps (
  )
  SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10::unlock_enum,
     $11, $12, $13, $14::app_status_enum, $15, $16, $17, $18,
-    $19, $20, $21, $22, $23, $24
+    $19, $20, $21, $22, now(), now()
  WHERE NOT EXISTS (
      SELECT 1 FROM kbs_owner_seed_waivers
-      WHERE binding_key = $25
+      WHERE binding_key = $23
  )";
 
 /// Bind an [`App`] row onto [`APP_INSERT_SQL`] in placeholder order.
@@ -1294,8 +1296,6 @@ pub(crate) fn bind_app_insert<'a>(
         .bind(app.source_repository.as_deref())
         .bind(&app.egress_allowlist)
         .bind(&app.egress_mode)
-        .bind(app.created_at)
-        .bind(app.updated_at)
         .bind(crate::kbs::owner_binding_key_for(&app.namespace, &app.name))
 }
 
