@@ -1,4 +1,4 @@
-//! Binds SNP-attested TEE channels (`enclava-snp`) to the app's stored launch identities.
+//! Loads the launch identities a tenant TEE may attest to, and binds SNP-attested channels (`enclava-snp`) to them.
 //! CRL freshness follows the CLI policy: required for unlock transitions, not ordinary attested operations.
 
 use std::{
@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use enclava_common::descriptor::{DeploymentDescriptor, FirmwareMeasurement};
+use enclava_common::descriptor::{DeploymentDescriptor, LaunchIdentity};
 use enclava_snp::AttestError;
 
 /// Coarse, content-free failure class (see [`AttestError`]).
@@ -45,44 +45,37 @@ fn rejected(reason: &'static str) -> TeeAttestError {
     TeeAttestError::Attest(AttestError::Attestation(reason))
 }
 
-/// Expected launch identity for one admissible live deployment, derived from
-/// the signed deployment descriptor persisted at deploy time.
-#[derive(Debug)]
-pub(crate) struct TeardownIdentity {
-    pub expected_cc_init_data_hash: [u8; 32],
-    pub expected_firmware_measurement: FirmwareMeasurement,
-}
-
 #[derive(Debug, sqlx::FromRow)]
-struct TeardownArtifactRow {
+struct AdmittedArtifactRow {
     deploy_id: uuid::Uuid,
     descriptor_payload: serde_json::Value,
 }
 
-/// Load the deployment identities the live TEE may legitimately attest to.
+/// Load the launch identities the app's live TEE may legitimately attest to.
+/// Empty when no workload is admitted.
 ///
 /// Authority is exactly the app's required KBS policy authority (kbs.rs): the
 /// artifact of the latest admitted operation (a rollback's older source
 /// artifact included), the prior healthy workload while a replacement is
 /// unconfirmed, and every possibly-serving generation of a deleting app.
 /// Held, withdrawn, removed-signer and artifact-less operations contribute
-/// nothing, so a token is never minted for an identity KBS would not admit.
-pub(crate) async fn load_teardown_identities(
+/// nothing, so nothing is sent to a TEE KBS would not admit.
+pub(crate) async fn load_admissible_launch_identities(
     pool: &sqlx::PgPool,
     app: &crate::models::App,
-) -> Result<Vec<TeardownIdentity>, TeeAttestError> {
+) -> Result<Vec<LaunchIdentity>, TeeAttestError> {
     let artifacts = crate::kbs::load_required_app_artifacts(pool, app.id)
         .await
         .map_err(|_| TeeAttestError::Storage)?;
     if artifacts.is_empty() {
-        return Err(rejected("no admitted workload authority"));
+        return Ok(Vec::new());
     }
     let core_hashes = artifacts
         .iter()
         .map(|artifact| hex::decode(&artifact.metadata.descriptor_core_hash))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| TeeAttestError::Storage)?;
-    let rows = sqlx::query_as::<_, TeardownArtifactRow>(
+    let rows = sqlx::query_as::<_, AdmittedArtifactRow>(
         "SELECT deploy_id, descriptor_payload
            FROM workload_artifacts
           WHERE app_id = $1 AND descriptor_core_hash = ANY($2)",
@@ -101,35 +94,19 @@ pub(crate) async fn load_teardown_identities(
         let descriptor: DeploymentDescriptor =
             serde_json::from_value(row.descriptor_payload).map_err(|_| TeeAttestError::Storage)?;
         // The stored artifact is already signature- and hash-validated at
-        // deploy; these comparisons bind it to THIS delete's app row so a
-        // cataloguing anomaly cannot attest another app's TEE into scope.
+        // deploy; these comparisons bind it to THIS app row so a cataloguing
+        // anomaly cannot attest another app's TEE into scope.
         if descriptor.app_id != app.id
             || descriptor.org_id != app.org_id
             || descriptor.deploy_id != row.deploy_id
         {
             return Err(rejected(
-                "stored deployment identity does not match the deleting app",
+                "stored deployment identity does not match the app",
             ));
         }
-        identities.push(TeardownIdentity {
-            expected_cc_init_data_hash: descriptor.expected_cc_init_data_hash,
-            expected_firmware_measurement: descriptor.expected_firmware_measurement,
-        });
+        identities.push(descriptor.launch_identity());
     }
     Ok(identities)
-}
-
-fn report_is_bound_to_deployment(
-    host_data: &[u8; 32],
-    measurement: &[u8; 48],
-    identities: &[TeardownIdentity],
-) -> bool {
-    identities.iter().any(|identity| {
-        *host_data == identity.expected_cc_init_data_hash
-            && identity
-                .expected_firmware_measurement
-                .matches_report(measurement)
-    })
 }
 
 /// Attest the TEE endpoint and return an SPKI-pinned HTTP client for it.
@@ -143,14 +120,9 @@ fn report_is_bound_to_deployment(
 pub(crate) async fn attest_teardown_channel(
     domain: &str,
     resolve_ip: Option<IpAddr>,
-    identities: &[TeardownIdentity],
+    identities: &[LaunchIdentity],
     kds_base_url: Option<&str>,
 ) -> Result<reqwest::Client, TeeAttestError> {
-    if identities.is_empty() {
-        return Err(rejected(
-            "no signed deployment identity to bind TEE evidence",
-        ));
-    }
     let url = format!("https://{domain}");
     let timeout = Duration::from_secs(30);
     // One KDS attempt: retry backoff must not outlast the teardown deadline.
@@ -160,18 +132,13 @@ pub(crate) async fn attest_teardown_channel(
         max_attempts: 1,
     };
     let (attested, resolve_ip) =
-        match enclava_snp::attest_tee(&url, resolve_ip, timeout, &kds).await {
+        match enclava_snp::attest_tee(&url, resolve_ip, timeout, &kds, identities).await {
             Err(AttestError::TcpConnect) if resolve_ip.is_some() => (
-                enclava_snp::attest_tee(&url, None, timeout, &kds).await?,
+                enclava_snp::attest_tee(&url, None, timeout, &kds, identities).await?,
                 None,
             ),
             result => (result?, resolve_ip),
         };
-    if !report_is_bound_to_deployment(&attested.host_data, &attested.measurement, identities) {
-        return Err(rejected(
-            "SNP launch identity does not bind a live deployment",
-        ));
-    }
     let mut builder = reqwest::Client::builder()
         .https_only(true)
         .no_proxy()
@@ -185,51 +152,4 @@ pub(crate) async fn attest_teardown_channel(
     builder
         .build()
         .map_err(|_| TeeAttestError::Attest(AttestError::Transport))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const HOST_DATA: [u8; 32] = [7; 32];
-    const MEASUREMENT: [u8; 48] = [9; 48];
-
-    fn identity(host_data: [u8; 32], measurement: FirmwareMeasurement) -> TeardownIdentity {
-        TeardownIdentity {
-            expected_cc_init_data_hash: host_data,
-            expected_firmware_measurement: measurement,
-        }
-    }
-
-    #[test]
-    fn launch_identity_must_match_a_live_deployment_host_data_and_firmware() {
-        let bound = identity(HOST_DATA, FirmwareMeasurement::Full(MEASUREMENT));
-        assert!(report_is_bound_to_deployment(
-            &HOST_DATA,
-            &MEASUREMENT,
-            &[bound]
-        ));
-
-        // A valid TEE launch whose HOST_DATA matches no admissible deployment
-        // (wrong app, or a superseded deployment outside the live set).
-        let foreign = identity([0xAA; 32], FirmwareMeasurement::Full(MEASUREMENT));
-        assert!(!report_is_bound_to_deployment(
-            &HOST_DATA,
-            &MEASUREMENT,
-            &[foreign]
-        ));
-
-        // A different measured firmware must not receive a teardown token.
-        let other_firmware = identity(HOST_DATA, FirmwareMeasurement::Full([0xAB; 48]));
-        assert!(!report_is_bound_to_deployment(
-            &HOST_DATA,
-            &MEASUREMENT,
-            &[other_firmware]
-        ));
-        assert!(!report_is_bound_to_deployment(
-            &HOST_DATA,
-            &MEASUREMENT,
-            &[]
-        ));
-    }
 }

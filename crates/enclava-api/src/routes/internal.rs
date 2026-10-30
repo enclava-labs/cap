@@ -8130,6 +8130,10 @@ mod tests {
         assert_eq!(duplicate["token"], first["token"]);
         assert_eq!(duplicate["issued_at"], first["issued_at"]);
         assert_eq!(duplicate["expires_at"], first["expires_at"]);
+        // PaaS attests only TEEs launched under one of these identities. This
+        // fixture admits no workload, so there is nothing to attest against.
+        assert_eq!(first["launch_identities"], serde_json::json!([]));
+        assert_eq!(duplicate["launch_identities"], first["launch_identities"]);
 
         insert_config_token_test_app(&pool, org_id, &org_name, app_b, &app_name_b, "b").await;
         sqlx::query("DELETE FROM deployments WHERE id = $1")

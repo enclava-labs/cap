@@ -21,6 +21,7 @@ use base64::{
     Engine as _,
     engine::general_purpose::{STANDARD as B64_STANDARD, URL_SAFE_NO_PAD},
 };
+use enclava_common::descriptor::LaunchIdentity;
 use rand::{RngCore, rngs::OsRng};
 use sha2::{Digest, Sha256};
 use x509_cert::der::Decode;
@@ -117,7 +118,8 @@ fn map_reqwest_error(error: &reqwest::Error) -> AttestError {
     }
 }
 
-/// A TEE endpoint whose TLS key is bound to verified SNP evidence.
+/// A TEE endpoint whose TLS key is bound to verified SNP evidence from an
+/// admissible launch.
 #[derive(Debug)]
 pub struct AttestedTee {
     /// Lowercase host the evidence binds, and the port that served it.
@@ -125,14 +127,12 @@ pub struct AttestedTee {
     pub port: u16,
     /// Client config that only accepts the attested TLS leaf key.
     pub tls_config: rustls::ClientConfig,
-    /// Authenticated launch identity; callers decide which ones are admissible.
-    pub host_data: [u8; 32],
-    pub measurement: [u8; 48],
     /// The guest attestation agent reported it could not obtain a KBS token.
     pub aa_token_error: bool,
 }
 
-/// Attest the TEE serving `url` (an `https` URL; only host and port are used).
+/// Attest the TEE serving `url` (an `https` URL; only host and port are used)
+/// and require its launch to be one of `admissible`.
 ///
 /// `resolve_ip` pins the host to an address, e.g. an in-cluster Gateway.
 pub async fn attest_tee(
@@ -140,7 +140,15 @@ pub async fn attest_tee(
     resolve_ip: Option<IpAddr>,
     timeout: Duration,
     kds: &Kds<'_>,
+    admissible: &[LaunchIdentity],
 ) -> Result<AttestedTee, AttestError> {
+    // Any genuine SNP guest produces valid evidence; only the launch identity
+    // tells the expected deployment apart, so never attest without one.
+    if admissible.is_empty() {
+        return Err(AttestError::Attestation(
+            "no signed deployment identity to bind TEE evidence",
+        ));
+    }
     let session_id = ATTESTATION_SESSION.fetch_add(1, Ordering::Relaxed);
     let (host, port) = tee_endpoint(url)?;
     let resolve = resolve_ip.map(|ip| SocketAddr::new(ip, port));
@@ -196,11 +204,12 @@ pub async fn attest_tee(
     let evidence_bytes = B64_STANDARD
         .decode(attestation.evidence.payload_b64.as_bytes())
         .map_err(|_| AttestError::Attestation("evidence payload is not base64"))?;
-    let (host_data, measurement) = AttestationTiming::new(session_id, "evidence_verify")
+    AttestationTiming::new(session_id, "evidence_verify")
         .measure(verify_snp_evidence(
             &attestation.evidence,
             &evidence_bytes,
             &expected_report_data,
+            admissible,
             kds,
             session_id,
         ))
@@ -209,8 +218,6 @@ pub async fn attest_tee(
         host,
         port,
         tls_config,
-        host_data,
-        measurement,
         aa_token_error: attestation.claims_meta.reports_aa_token_failure(),
     })
 }
@@ -349,14 +356,15 @@ fn parse_hex32(value: &str) -> Result<[u8; 32], AttestError> {
 
 /// Extract the raw report, authenticate it against a pinned-ARK chain
 /// (evidence-embedded when it anchors to a builtin AMD root, otherwise AMD
-/// KDS) and return the authenticated launch identity.
+/// KDS) and require its launch identity to be admissible.
 async fn verify_snp_evidence(
     evidence: &AttestationEvidence,
     evidence_bytes: &[u8],
     expected_report_data: &[u8; 64],
+    admissible: &[LaunchIdentity],
     kds: &Kds<'_>,
     session_id: u64,
-) -> Result<([u8; 32], [u8; 48]), AttestError> {
+) -> Result<(), AttestError> {
     let parsed_evidence;
     let evidence_json = match evidence.json.as_ref() {
         Some(json) => json,
@@ -386,7 +394,17 @@ async fn verify_snp_evidence(
                 .await?
         }
     };
-    verify_snp_report(&report_bytes, &chain, expected_report_data, unix_now()?)
+    let (host_data, measurement) =
+        verify_snp_report(&report_bytes, &chain, expected_report_data, unix_now()?)?;
+    if !admissible
+        .iter()
+        .any(|identity| identity.matches_report(&host_data, &measurement))
+    {
+        return Err(AttestError::Attestation(
+            "SNP launch identity does not bind a live deployment",
+        ));
+    }
+    Ok(())
 }
 
 /// The full gate stack: pinned ARK anchor, ARK/ASK/VCEK signatures, the
@@ -535,20 +553,67 @@ mod tests {
     };
 
     #[tokio::test]
-    async fn pinned_evidence_chain_verifies_and_returns_launch_identity() {
+    async fn pinned_evidence_chain_verifies_an_admissible_launch() {
         let _quiet = quiet_subscriber();
         let fixture = prove_it_live();
-        let report = fixture.parsed();
-        let identity = verify_snp_evidence(
+        verify_snp_evidence(
             &evidence(fixture.evidence()),
             b"",
-            &report.report_data,
+            &fixture.parsed().report_data,
+            &[fixture.launch_identity()],
             &UNREACHABLE_KDS,
             1,
         )
         .await
         .expect("live Genoa evidence must verify offline");
-        assert_eq!(identity, (report.host_data, report.measurement));
+    }
+
+    #[tokio::test]
+    async fn verified_evidence_from_an_unlisted_launch_is_rejected() {
+        let _quiet = quiet_subscriber();
+        let fixture = prove_it_live();
+        let genuine = fixture.launch_identity();
+        // A genuine SNP guest launched for another deployment, or the right
+        // deployment under different firmware.
+        let other_deployment = LaunchIdentity {
+            expected_cc_init_data_hash: [0xaa; 32],
+            ..genuine.clone()
+        };
+        let other_firmware = LaunchIdentity {
+            expected_firmware_measurement: [0xab; 48].into(),
+            ..genuine
+        };
+        let error = verify_snp_evidence(
+            &evidence(fixture.evidence()),
+            b"",
+            &fixture.parsed().report_data,
+            &[other_deployment, other_firmware],
+            &UNREACHABLE_KDS,
+            1,
+        )
+        .await
+        .expect_err("valid evidence for an unlisted launch must be rejected");
+        assert_eq!(
+            error.reason(),
+            "SNP launch identity does not bind a live deployment"
+        );
+    }
+
+    #[tokio::test]
+    async fn attest_tee_without_admissible_identity_fails_before_connecting() {
+        let error = attest_tee(
+            "https://127.0.0.1:9",
+            None,
+            Duration::from_secs(5),
+            &UNREACHABLE_KDS,
+            &[],
+        )
+        .await
+        .expect_err("attestation without an expected launch must fail closed");
+        assert_eq!(
+            error.reason(),
+            "no signed deployment identity to bind TEE evidence"
+        );
     }
 
     /// CoCo guest components send the report as sev's structured JSON.
@@ -568,6 +633,7 @@ mod tests {
             &evidence(json),
             b"",
             &fixture.parsed().report_data,
+            &[fixture.launch_identity()],
             &UNREACHABLE_KDS,
             1,
         )
@@ -583,6 +649,7 @@ mod tests {
             &evidence(fixture.evidence()),
             b"",
             &[0x42; 64],
+            &[fixture.launch_identity()],
             &UNREACHABLE_KDS,
             1,
         )
@@ -683,10 +750,16 @@ mod tests {
             max_attempts: 1,
         };
         let report = fixture.parsed();
-        let identity = verify_snp_evidence(&evidence(json), b"", &report.report_data, &kds, 1)
-            .await
-            .expect("the KDS VCEK must chain to the builtin Genoa roots");
-        assert_eq!(identity, (report.host_data, report.measurement));
+        verify_snp_evidence(
+            &evidence(json),
+            b"",
+            &report.report_data,
+            &[fixture.launch_identity()],
+            &kds,
+            1,
+        )
+        .await
+        .expect("the KDS VCEK must chain to the builtin Genoa roots");
         assert_eq!(requests.load(Ordering::Relaxed), 1);
         server.abort();
     }
@@ -800,6 +873,7 @@ mod tests {
             Some(socket.ip()),
             Duration::from_secs(5),
             &UNREACHABLE_KDS,
+            &[prove_it_live().launch_identity()],
         )
         .await
         .expect_err("mock evidence without a raw SNP report must fail closed");

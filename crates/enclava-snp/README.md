@@ -7,16 +7,23 @@ learning, SPKI pinning, AMD KDS) and the collateral policy below.
 
 ## Handshake
 
+`attest_tee` takes the admissible launch identities (`LaunchIdentity`, from
+`enclava-common`) and refuses to start without at least one. Any genuine SNP
+guest produces valid evidence; only HOST_DATA (the cc_init_data hash) and the
+firmware measurement tell the expected deployment apart. Callers pass the
+app's KBS policy authority: CAP loads it for teardown, and PaaS receives it in
+CAP's internal config-token response.
+
 1. A TLS handshake learns the TEE's per-boot leaf. Nothing is trusted yet.
 2. Every later request goes over a client pinned to that leaf's SPKI SHA-256.
 3. `GET /.well-known/confidential/attestation?nonce=…&domain=…&leaf_spki_sha256=…`.
    The body is capped at 256 KiB; the nonce, domain and leaf echoes must match.
 4. The report's `report_data` must equal the `enclava-tee-report-data-v1`
    binding of domain, nonce, leaf SPKI and receipt-key hash.
-5. The report and chain pass the policy below. `attest_tee` returns the pinned
-   TLS config with the authenticated `host_data` and `measurement`; callers
-   decide which launch identities are admissible (CAP requires one of the
-   app's admitted deployments).
+5. The report and chain pass the policy below.
+6. The report's HOST_DATA and measurement must match one admissible identity.
+   A legacy descriptor pins only the first 32 measurement bytes. `attest_tee`
+   then returns the pinned TLS config.
 
 ## Collateral policy
 

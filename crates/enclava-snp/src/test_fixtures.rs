@@ -65,6 +65,14 @@ impl ProveItLive {
     pub(crate) fn parsed(&self) -> enclava_verifier::SnpReport<'_> {
         enclava_verifier::parse_snp_report(&self.report).expect("fixture report parses")
     }
+
+    pub(crate) fn launch_identity(&self) -> enclava_common::descriptor::LaunchIdentity {
+        let report = self.parsed();
+        enclava_common::descriptor::LaunchIdentity {
+            expected_cc_init_data_hash: report.host_data,
+            expected_firmware_measurement: report.measurement.into(),
+        }
+    }
 }
 
 /// Timing events share process-global callsites: a first registration on a

@@ -131,6 +131,16 @@ pub struct GenericConfigTokenResponse {
     pub expires_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// The PaaS-internal config-token response: the token plus the launch
+/// identities a TEE serving the deployment's app may attest to. PaaS delivers
+/// managed config only into a TEE that attests one of them.
+#[derive(Debug, Serialize)]
+pub struct PaasConfigTokenResponse {
+    #[serde(flatten)]
+    pub token: GenericConfigTokenResponse,
+    pub launch_identities: Vec<enclava_common::descriptor::LaunchIdentity>,
+}
+
 impl GenericDeploymentResponse {
     pub(super) fn from_deployment(deployment: Deployment, app: &App) -> Self {
         let app_domain = app
@@ -467,7 +477,8 @@ pub async fn generic_config_token(
     State(state): State<AppState>,
     Path(deployment_id): Path<Uuid>,
 ) -> Result<Json<GenericConfigTokenResponse>, (StatusCode, Json<serde_json::Value>)> {
-    generic_config_token_inner(auth, state, deployment_id, None).await
+    let (token, _app) = generic_config_token_inner(auth, state, deployment_id, None).await?;
+    Ok(Json(token))
 }
 
 pub(crate) async fn generic_config_token_for_issuance(
@@ -475,8 +486,28 @@ pub(crate) async fn generic_config_token_for_issuance(
     state: AppState,
     deployment_id: Uuid,
     issuance: crate::auth::jwt::ConfigTokenIssuance,
-) -> Result<Json<GenericConfigTokenResponse>, (StatusCode, Json<serde_json::Value>)> {
-    generic_config_token_inner(auth, state, deployment_id, Some(issuance)).await
+) -> Result<Json<PaasConfigTokenResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let db = state.db.clone();
+    let (token, app) =
+        generic_config_token_inner(auth, state, deployment_id, Some(issuance)).await?;
+    let launch_identities = crate::tee_attestation::load_admissible_launch_identities(&db, &app)
+        .await
+        .map_err(|error| {
+            tracing::warn!(
+                %deployment_id,
+                category = error.category(),
+                reason = error.reason(),
+                "launch identities unavailable for config token"
+            );
+            json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "launch identity unavailable",
+            )
+        })?;
+    Ok(Json(PaasConfigTokenResponse {
+        token,
+        launch_identities,
+    }))
 }
 
 async fn generic_config_token_inner(
@@ -484,7 +515,7 @@ async fn generic_config_token_inner(
     state: AppState,
     deployment_id: Uuid,
     issuance: Option<crate::auth::jwt::ConfigTokenIssuance>,
-) -> Result<Json<GenericConfigTokenResponse>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<(GenericConfigTokenResponse, App), (StatusCode, Json<serde_json::Value>)> {
     scopes::require_admin(&auth)?;
     scopes::require_scope(&auth, "config:write")?;
 
@@ -511,15 +542,18 @@ async fn generic_config_token_inner(
         }
     };
 
-    Ok(Json(GenericConfigTokenResponse {
-        deployment_id,
-        token: token.token,
-        tee_url: token.tee_url,
-        tee_resolve_ip: token.tee_resolve_ip,
-        expires_in_seconds: token.expires_in_seconds,
-        issued_at: token.issued_at,
-        expires_at: token.expires_at,
-    }))
+    Ok((
+        GenericConfigTokenResponse {
+            deployment_id,
+            token: token.token,
+            tee_url: token.tee_url,
+            tee_resolve_ip: token.tee_resolve_ip,
+            expires_in_seconds: token.expires_in_seconds,
+            issued_at: token.issued_at,
+            expires_at: token.expires_at,
+        },
+        app,
+    ))
 }
 
 async fn fetch_app_by_name(

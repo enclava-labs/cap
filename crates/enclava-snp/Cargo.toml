@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 base64 = { workspace = true }
+enclava-common = { path = "../enclava-common", default-features = false, features = ["descriptor"] }
 enclava-verifier = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
@@ -25,7 +26,6 @@ sev = { version = "7.1.0", default-features = false, features = ["snp", "serde"]
 
 [dev-dependencies]
 axum = { workspace = true }
-enclava-common = { workspace = true }
 futures = { workspace = true }
 rcgen = "0.14"
 tempfile = "3"

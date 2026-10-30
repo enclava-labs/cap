@@ -180,6 +180,36 @@ pub struct DeploymentDescriptor {
     pub expected_kbs_policy_hash: [u8; 32],
 }
 
+/// What a TEE launched for one deployment attests to: SNP HOST_DATA (the
+/// cc_init_data hash) and the firmware measurement, as signed in its
+/// descriptor. Serialized with the descriptor's own field names and encodings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchIdentity {
+    #[serde(with = "hex_bytes32")]
+    pub expected_cc_init_data_hash: [u8; 32],
+    #[serde(with = "hex_measurement")]
+    pub expected_firmware_measurement: FirmwareMeasurement,
+}
+
+impl LaunchIdentity {
+    pub fn matches_report(&self, host_data: &[u8; 32], measurement: &[u8; 48]) -> bool {
+        *host_data == self.expected_cc_init_data_hash
+            && self
+                .expected_firmware_measurement
+                .matches_report(measurement)
+    }
+}
+
+impl DeploymentDescriptor {
+    pub fn launch_identity(&self) -> LaunchIdentity {
+        LaunchIdentity {
+            expected_cc_init_data_hash: self.expected_cc_init_data_hash,
+            expected_firmware_measurement: self.expected_firmware_measurement.clone(),
+        }
+    }
+}
+
 mod hex_bytes32 {
     use serde::{Deserialize, Deserializer, Serializer};
 
@@ -433,4 +463,54 @@ pub fn descriptor_core_canonical_bytes(d: &DeploymentDescriptor) -> Vec<u8> {
 pub fn descriptor_core_hash(d: &DeploymentDescriptor) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     Sha256::digest(descriptor_core_canonical_bytes(d)).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FirmwareMeasurement, LaunchIdentity};
+
+    #[test]
+    fn launch_identity_requires_host_data_and_firmware_to_match() {
+        let identity = LaunchIdentity {
+            expected_cc_init_data_hash: [7; 32],
+            expected_firmware_measurement: FirmwareMeasurement::Full([9; 48]),
+        };
+        assert!(identity.matches_report(&[7; 32], &[9; 48]));
+        // Another deployment's init-data, or the same one under other firmware.
+        assert!(!identity.matches_report(&[0xaa; 32], &[9; 48]));
+        assert!(!identity.matches_report(&[7; 32], &[0xab; 48]));
+
+        // Legacy descriptors pin only the first 32 measurement bytes.
+        let legacy = LaunchIdentity {
+            expected_firmware_measurement: FirmwareMeasurement::Legacy([9; 32]),
+            ..identity
+        };
+        let mut measurement = [9u8; 48];
+        measurement[47] = 0;
+        assert!(legacy.matches_report(&[7; 32], &measurement));
+        measurement[0] = 0;
+        assert!(!legacy.matches_report(&[7; 32], &measurement));
+    }
+
+    #[test]
+    fn launch_identity_wire_format_is_the_descriptors_hex_fields() {
+        let wire = serde_json::json!({
+            "expected_cc_init_data_hash": "07".repeat(32),
+            "expected_firmware_measurement": "09".repeat(48),
+        });
+        let identity: LaunchIdentity = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(identity.expected_cc_init_data_hash, [7; 32]);
+        assert_eq!(
+            identity.expected_firmware_measurement,
+            FirmwareMeasurement::Full([9; 48])
+        );
+        assert_eq!(serde_json::to_value(&identity).unwrap(), wire);
+
+        let mut short_hash = wire.clone();
+        short_hash["expected_cc_init_data_hash"] = serde_json::json!("07".repeat(31));
+        assert!(serde_json::from_value::<LaunchIdentity>(short_hash).is_err());
+        let mut odd_measurement = wire;
+        odd_measurement["expected_firmware_measurement"] = serde_json::json!("09".repeat(40));
+        assert!(serde_json::from_value::<LaunchIdentity>(odd_measurement).is_err());
+    }
 }
