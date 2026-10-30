@@ -41,3 +41,6 @@ prod-strict = []
 
 [build-dependencies]
 serde_json = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

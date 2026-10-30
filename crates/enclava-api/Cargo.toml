@@ -56,6 +56,7 @@ oci-client = { workspace = true }
 hickory-resolver = { workspace = true }
 k8s-openapi = { workspace = true }
 enclava-verifier = { workspace = true }
+enclava-snp = { workspace = true }
 kube = { workspace = true }
 instant-acme = "0.8"
 rustls = { workspace = true }
@@ -64,13 +65,6 @@ http-body-util = "0.1"
 httpdate = "1"
 bytes = "1"
 tokio-rustls = { workspace = true }
-# Evidence-authenticated TEE channel (cap#206): SNP report parsing for the
-# KDS VCEK fallback, builtin ARK/ASK roots, and structured report
-# extraction. AMD chain/signature verification itself runs on
-# enclava-verifier primitives. `openssl` matches enclava-cli's sev features
-# so the vendored OpenSSL build unifies, and doubles as the test-only
-# anchor sync guard this manifest previously carried under dev-deps.
-sev = { version = "7.1.0", default-features = false, features = ["snp", "openssl", "serde"] }
 
 [features]
 prod-strict = ["enclava-engine/prod-strict", "enclava-common/prod-strict"]
@@ -79,6 +73,10 @@ prod-strict = ["enclava-engine/prod-strict", "enclava-common/prod-strict"]
 axum-test = "20"
 tower = { version = "0.5", features = ["util"] }
 rcgen = "0.14"
+# Anchor sync guard: the API's builtin ARK pins (enclava-snp) must stay the
+# roots the CLI gets from sev. `openssl` matches enclava-cli's sev features so
+# the vendored OpenSSL build unifies.
+sev = { version = "7.1.0", default-features = false, features = ["snp", "openssl"] }
 # start_paused for the pull-secret cleanup tests: the delete conflict backoff
 # (~60 s budget) and the finalizer poll (30 s) run in simulated time.
 tokio = { version = "1", features = ["full", "test-util"] }

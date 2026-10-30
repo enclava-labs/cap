@@ -7,6 +7,7 @@ members = [
     "crates/enclava-appraiser",
     "crates/enclava-cli",
     "crates/enclava-init",
+    "crates/enclava-snp",
     "crates/enclava-verifier",
     "crates/enclava-verifier-wasm",
     "crates/enclava-wait-exec",
@@ -85,3 +86,4 @@ pkcs1 = { version = "0.7", features = ["std"] }
 enclava-common = { path = "crates/enclava-common" }
 enclava-verifier = { path = "crates/enclava-verifier" }
 enclava-engine = { path = "crates/enclava-engine" }
+enclava-snp = { path = "crates/enclava-snp" }

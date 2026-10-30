@@ -218,6 +218,16 @@ Release builds also require:
 | `TRUSTEE_POLICY_READ_AVAILABLE=true` | Enables the supported signed-policy and in-TEE verification path. |
 | `ENCLAVA_PLATFORM_RELEASE_PROFILE` | Required API runtime profile: `dev`, `preprod`, or `production`. Must match the `API_URL` origin. |
 
+`CAP_MANAGEMENT_MODE=paas_managed` also requires the following. Startup is
+refused without them, and `/internal/paas/*` answers 503 if a running config
+lacks any of them:
+
+| Variable | Purpose |
+| --- | --- |
+| `CAP_INTERNAL_SERVICE_TOKEN` | Bearer token PaaS presents on `/internal/paas/*`. `CAP_INTERNAL_SERVICE_TOKEN_NEXT` is also accepted during rotation. |
+| `CAP_INTERNAL_ALLOWED_CLIENT_SANS` | Comma-separated client certificate SANs the mTLS proxy may assert in `x-enclava-internal-client-san`. |
+| `CAP_INTERNAL_TRUSTED_PROXY_SECRET` | Secret the mTLS proxy injects as `x-enclava-internal-proxy-secret`. Without it, anyone holding the bearer token could assert an allowed SAN. |
+
 For production deploys with policy-read mode enabled:
 
 | Variable | Purpose |

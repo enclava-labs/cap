@@ -1448,6 +1448,7 @@ dependencies = [
  "ed25519-dalek",
  "enclava-common",
  "enclava-engine",
+ "enclava-snp",
  "enclava-verifier",
  "futures",
  "hex",
@@ -1631,6 +1632,33 @@ dependencies = [
  "uuid",
  "webpki-roots 1.0.10",
  "zeroize",
+]
+
+[[package]]
+name = "enclava-snp"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "enclava-common",
+ "enclava-verifier",
+ "futures",
+ "hex",
+ "rand 0.8.6",
+ "rcgen",
+ "reqwest 0.13.2",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sev",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "tracing-subscriber",
+ "webpki-root-certs",
+ "x509-cert",
 ]
 
 [[package]]

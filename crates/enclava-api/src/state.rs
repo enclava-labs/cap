@@ -59,7 +59,8 @@ impl FromStr for CapManagementMode {
 ///
 /// Tokens are stored as SHA-256 digests so they are not carried around in
 /// state after startup. The SAN list is supplied by a trusted TLS-terminating
-/// proxy after client certificate verification.
+/// proxy after client certificate verification; the proxy secret is what
+/// makes that SAN header trustworthy, so a config without it is unusable.
 #[derive(Clone)]
 pub struct InternalAuthConfig {
     token_sha256: Arc<[[u8; 32]]>,
@@ -68,10 +69,6 @@ pub struct InternalAuthConfig {
 }
 
 impl InternalAuthConfig {
-    pub fn from_plaintext_tokens(tokens: &[&str], allowed_client_sans: &[&str]) -> Self {
-        Self::from_plaintext_tokens_with_proxy_secret(tokens, allowed_client_sans, None)
-    }
-
     pub fn from_plaintext_tokens_with_proxy_secret(
         tokens: &[&str],
         allowed_client_sans: &[&str],
@@ -123,20 +120,18 @@ impl InternalAuthConfig {
         self.allowed_client_sans.iter().any(|san| san == client_san)
     }
 
-    pub fn requires_trusted_proxy(&self) -> bool {
-        self.trusted_proxy_secret_sha256.is_some()
-    }
-
     pub fn accepts_trusted_proxy_secret(&self, secret: &str) -> bool {
         let Some(expected) = self.trusted_proxy_secret_sha256.as_ref() else {
-            return true;
+            return false;
         };
         let candidate = hash_token(secret.as_bytes());
         expected.ct_eq(&candidate).into()
     }
 
     pub fn is_usable(&self) -> bool {
-        !self.token_sha256.is_empty() && !self.allowed_client_sans.is_empty()
+        !self.token_sha256.is_empty()
+            && !self.allowed_client_sans.is_empty()
+            && self.trusted_proxy_secret_sha256.is_some()
     }
 }
 
@@ -363,17 +358,26 @@ mod tests {
     use sqlx::postgres::PgPoolOptions;
 
     #[test]
-    fn internal_auth_can_require_trusted_proxy_secret() {
+    fn internal_auth_requires_trusted_proxy_secret() {
         let config = InternalAuthConfig::from_plaintext_token_strings(
             vec!["token".to_string()],
             vec!["spiffe://local/enclava-paas".to_string()],
             Some("proxy-secret".to_string()),
         );
-
-        assert!(config.requires_trusted_proxy());
+        assert!(config.is_usable());
         assert!(config.accepts_trusted_proxy_secret("proxy-secret"));
         assert!(!config.accepts_trusted_proxy_secret("wrong-secret"));
-        assert!(config.is_usable());
+
+        // Without the proxy secret any bearer-token holder could assert an
+        // allowed SAN itself, so the config must fail closed.
+        let unproxied = InternalAuthConfig::from_plaintext_token_strings(
+            vec!["token".to_string()],
+            vec!["spiffe://local/enclava-paas".to_string()],
+            None,
+        );
+        assert!(!unproxied.is_usable());
+        assert!(!unproxied.accepts_trusted_proxy_secret(""));
+        assert!(!unproxied.accepts_trusted_proxy_secret("proxy-secret"));
     }
 
     #[tokio::test]

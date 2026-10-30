@@ -321,17 +321,15 @@ impl FromRequestParts<AppState> for InternalAuth {
             return Err(InternalAuthError::InvalidToken);
         }
 
-        if config.requires_trusted_proxy() {
-            let proxy_secret = parts
-                .headers
-                .get("x-enclava-internal-proxy-secret")
-                .and_then(|value| value.to_str().ok())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or(InternalAuthError::MissingTrustedProxy)?;
-            if !config.accepts_trusted_proxy_secret(proxy_secret) {
-                return Err(InternalAuthError::InvalidTrustedProxy);
-            }
+        let proxy_secret = parts
+            .headers
+            .get("x-enclava-internal-proxy-secret")
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or(InternalAuthError::MissingTrustedProxy)?;
+        if !config.accepts_trusted_proxy_secret(proxy_secret) {
+            return Err(InternalAuthError::InvalidTrustedProxy);
         }
 
         let client_san = parts
@@ -8132,6 +8130,10 @@ mod tests {
         assert_eq!(duplicate["token"], first["token"]);
         assert_eq!(duplicate["issued_at"], first["issued_at"]);
         assert_eq!(duplicate["expires_at"], first["expires_at"]);
+        // PaaS attests only TEEs launched under one of these identities. This
+        // fixture admits no workload, so there is nothing to attest against.
+        assert_eq!(first["launch_identities"], serde_json::json!([]));
+        assert_eq!(duplicate["launch_identities"], first["launch_identities"]);
 
         insert_config_token_test_app(&pool, org_id, &org_name, app_b, &app_name_b, "b").await;
         sqlx::query("DELETE FROM deployments WHERE id = $1")

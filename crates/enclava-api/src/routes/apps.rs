@@ -455,7 +455,7 @@ async fn request_workload_teardown(
         relaxed
     } else {
         let identities =
-            match crate::tee_attestation::load_teardown_identities(&state.db, app).await {
+            match crate::tee_attestation::load_admissible_launch_identities(&state.db, app).await {
                 Ok(identities) => identities,
                 Err(error) => {
                     tracing::warn!(

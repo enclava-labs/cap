@@ -20,6 +20,8 @@ codex-security-review.md
 *.env
 .env.*
 *.pem
+# Public AMD root certificates pinned by enclava-snp.
+!/crates/enclava-snp/certs/*.pem
 *.key
 private-age-key*
 *.sops.yaml

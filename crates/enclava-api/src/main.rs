@@ -726,7 +726,7 @@ async fn main() {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "enclava_api=debug,tower_http=debug".into()),
+                .unwrap_or_else(|_| "enclava_api=debug,enclava_snp=debug,tower_http=debug".into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
@@ -1002,7 +1002,7 @@ async fn main() {
             .is_some_and(|config| config.is_usable())
     {
         panic!(
-            "CAP_MANAGEMENT_MODE=paas_managed requires usable CAP_INTERNAL_SERVICE_TOKEN and CAP_INTERNAL_ALLOWED_CLIENT_SANS"
+            "CAP_MANAGEMENT_MODE=paas_managed requires CAP_INTERNAL_SERVICE_TOKEN, CAP_INTERNAL_ALLOWED_CLIENT_SANS and CAP_INTERNAL_TRUSTED_PROXY_SECRET"
         );
     }
     if management_mode == CapManagementMode::Standalone && internal_auth.is_some() {

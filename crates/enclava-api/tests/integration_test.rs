@@ -228,9 +228,10 @@ async fn setup_test_state_with_mode(management_mode: CapManagementMode) -> (AppS
         require_customer_signed_policy_artifact: false,
         deployment_apply_permits: Arc::new(tokio::sync::Semaphore::new(1)),
         side_effect_admission,
-        internal_auth: Some(InternalAuthConfig::from_plaintext_tokens(
+        internal_auth: Some(InternalAuthConfig::from_plaintext_tokens_with_proxy_secret(
             &["cap-internal-current", "cap-internal-next"],
             &["spiffe://paas.example.test/enclava-paas"],
+            Some("cap-internal-proxy-secret"),
         )),
     };
 
@@ -251,6 +252,10 @@ fn add_internal_headers(
 ) -> axum_test::TestRequest {
     request
         .add_header("authorization", "Bearer cap-internal-current")
+        .add_header(
+            "x-enclava-internal-proxy-secret",
+            "cap-internal-proxy-secret",
+        )
         .add_header(
             "x-enclava-internal-client-san",
             "spiffe://paas.example.test/enclava-paas",
@@ -1319,6 +1324,30 @@ async fn paas_internal_org_member_and_entitlement_sync_are_idempotent() {
         .await;
     missing_san.assert_status(StatusCode::UNAUTHORIZED);
 
+    // A direct caller holding the bearer token cannot assert the SAN itself:
+    // only the mTLS proxy knows the secret it injects.
+    for proxy_secret in [None, Some("forged-proxy-secret")] {
+        let mut forged = server
+            .put(&format!("/internal/paas/orgs/{paas_org_id}"))
+            .add_header("authorization", "Bearer cap-internal-current")
+            .add_header(
+                "x-enclava-internal-client-san",
+                "spiffe://paas.example.test/enclava-paas",
+            )
+            .add_header("idempotency-key", format!("org-forged-san-{suffix}"));
+        if let Some(secret) = proxy_secret {
+            forged = forged.add_header("x-enclava-internal-proxy-secret", secret);
+        }
+        forged
+            .json(&serde_json::json!({
+                "name": org_name,
+                "display_name": "PaaS Managed",
+                "status": "active",
+            }))
+            .await
+            .assert_status(StatusCode::UNAUTHORIZED);
+    }
+
     let create_org = add_internal_headers(
         server.put(&format!("/internal/paas/orgs/{paas_org_id}")),
         &format!("org-create-{suffix}"),
@@ -1433,6 +1462,30 @@ async fn paas_internal_org_member_and_entitlement_sync_are_idempotent() {
     assert_eq!(entitlement.0, 3);
     assert!(entitlement.1);
     assert_eq!(entitlement.2["max_apps"], 2);
+}
+
+#[tokio::test]
+async fn paas_managed_internal_routes_fail_closed_without_proxy_secret_config() {
+    let (mut state, _pool) = setup_paas_managed_test_state().await;
+    state.internal_auth = Some(InternalAuthConfig::from_plaintext_token_strings(
+        vec!["cap-internal-current".to_string()],
+        vec!["spiffe://paas.example.test/enclava-paas".to_string()],
+        None,
+    ));
+    let app = test_router(state);
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+
+    add_internal_headers(
+        server.put("/internal/paas/orgs/unproxied-config-check"),
+        "unproxied-config-check",
+    )
+    .json(&serde_json::json!({
+        "name": "unproxied-config-check",
+        "display_name": "Unproxied Config Check",
+        "status": "active",
+    }))
+    .await
+    .assert_status(StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[tokio::test]
