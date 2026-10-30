@@ -3468,227 +3468,144 @@ pub async fn create_paas_app(
     };
 
     let result: Result<IdempotencyResponse, InternalRouteError> = async {
-    let (cap_org_id, org_name, org_slug) = mapped_cap_org(&state, &paas_org_id).await?;
-    let limits = require_deploy_entitlement(&state, cap_org_id).await?;
-    let max_apps = limits
-        .get("max_apps")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| {
+        let (cap_org_id, org_name, org_slug) = mapped_cap_org(&state, &paas_org_id).await?;
+        let limits = require_deploy_entitlement(&state, cap_org_id).await?;
+        let max_apps = limits
+            .get("max_apps")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| {
+                json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "invalid entitlement limits",
+                )
+            })?;
+        let app_id = idempotency.operation_id();
+        let app_host =
+            enclava_common::hostnames::app_hostname(&body.name, &org_slug, &state.platform_domain)
+                .map_err(|error| {
+                    json_error(
+                        StatusCode::BAD_REQUEST,
+                        format!("invalid app hostname: {error}"),
+                    )
+                })?;
+        let tee_host = enclava_common::hostnames::tee_hostname(
+            &body.name,
+            &org_slug,
+            &state.tee_domain_suffix,
+        )
+        .map_err(|error| {
             json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "invalid entitlement limits",
+                StatusCode::BAD_REQUEST,
+                format!("invalid tee hostname: {error}"),
             )
         })?;
-    let app_id = idempotency.operation_id();
-    let app_host =
-        enclava_common::hostnames::app_hostname(&body.name, &org_slug, &state.platform_domain)
-            .map_err(|error| {
-                json_error(
-                    StatusCode::BAD_REQUEST,
-                    format!("invalid app hostname: {error}"),
-                )
-            })?;
-    let tee_host =
-        enclava_common::hostnames::tee_hostname(&body.name, &org_slug, &state.tee_domain_suffix)
-            .map_err(|error| {
-                json_error(
-                    StatusCode::BAD_REQUEST,
-                    format!("invalid tee hostname: {error}"),
-                )
-            })?;
-    let signer_set_at =
-        if body.signer_identity_subject.is_some() || body.signer_identity_issuer.is_some() {
-            Some(chrono::Utc::now())
-        } else {
-            None
-        };
-    let egress_allowlist = crate::routes::apps::validate_egress_allowlist(&body.egress_allowlist)
-        .map_err(|error| json_error(StatusCode::BAD_REQUEST, error))?;
-    let egress_mode = crate::routes::apps::validate_egress_mode(&body.egress_mode)
-        .map_err(|error| json_error(StatusCode::BAD_REQUEST, error))?;
+        let egress_allowlist =
+            crate::routes::apps::validate_egress_allowlist(&body.egress_allowlist)
+                .map_err(|error| json_error(StatusCode::BAD_REQUEST, error))?;
+        let egress_mode = crate::routes::apps::validate_egress_mode(&body.egress_mode)
+            .map_err(|error| json_error(StatusCode::BAD_REQUEST, error))?;
 
-    // Effective resource row: hosted defaults overlaid with any caller
-    // overrides. Computed before adoption so replayed create requests compare
-    // against what this call would actually persist.
-    let mut resources = crate::models::AppResources {
-        app_id,
-        cpu_limit: "1".to_string(),
-        memory_limit: "1Gi".to_string(),
-        app_data_size: "5Gi".to_string(),
-        tls_data_size: "2Gi".to_string(),
-    };
-    if let Some(overrides) = body.resources.as_ref() {
-        if let Some(cpu) = overrides.cpu.as_ref() {
-            resources.cpu_limit = cpu.clone();
-        }
-        if let Some(memory) = overrides.memory.as_ref() {
-            resources.memory_limit = memory.clone();
-        }
-        if let Some(storage) = overrides.storage.as_ref() {
-            resources.app_data_size = storage.clone();
-        }
-        if let Some(tls_storage) = overrides.tls_storage.as_ref() {
-            resources.tls_data_size = tls_storage.clone();
-        }
-    }
+        // Effective resource row: hosted defaults overlaid with any caller
+        // overrides. Computed before adoption so replayed create requests compare
+        // against what this call would actually persist.
+        let resources = crate::routes::apps::hosted_app_resources(app_id, body.resources.as_ref());
 
-    if idempotency.reclaimed() {
-        let expected = InternalCreateAppIdentity {
-            app_id,
-            org_id: cap_org_id,
-            org_name: &org_name,
-            body: &body,
-            egress_allowlist: &egress_allowlist,
-            egress_mode: egress_mode.as_str(),
-            app_host: &app_host,
-            tee_host: &tee_host,
-            resources: &resources,
-        };
-        if let Some(response) = adopt_exact_internal_app(&state, &expected).await? {
-            return Ok((StatusCode::CREATED, response));
+        if idempotency.reclaimed() {
+            let expected = InternalCreateAppIdentity {
+                app_id,
+                org_id: cap_org_id,
+                org_name: &org_name,
+                body: &body,
+                egress_allowlist: &egress_allowlist,
+                egress_mode: egress_mode.as_str(),
+                app_host: &app_host,
+                tee_host: &tee_host,
+                resources: &resources,
+            };
+            if let Some(response) = adopt_exact_internal_app(&state, &expected).await? {
+                return Ok((StatusCode::CREATED, response));
+            }
         }
-    }
 
-    let conflicting_name: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM apps WHERE org_id = $1 AND name = $2 AND id <> $3)",
-    )
-    .bind(cap_org_id)
-    .bind(&body.name)
-    .bind(app_id)
-    .fetch_one(&state.db)
-    .await
-    .map_err(|_| db_error())?;
-    if conflicting_name {
-        return Err(idempotency_resource_conflict_error());
-    }
-
-    let app_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM apps WHERE org_id = $1")
+        let conflicting_name: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM apps WHERE org_id = $1 AND name = $2 AND id <> $3)",
+        )
         .bind(cap_org_id)
+        .bind(&body.name)
+        .bind(app_id)
         .fetch_one(&state.db)
         .await
         .map_err(|_| db_error())?;
-    if app_count >= max_apps as i64 {
-        return Err(json_error(StatusCode::FORBIDDEN, "entitlement_app_limit"));
-    }
-
-    let (tenant_id, instance_id, namespace, service_account, pubkey_hash, identity_hash) =
-        crate::routes::apps::derive_identity(
-            &org_name,
-            app_id,
-            &body.name,
-            &body.unlock_mode,
-            body.bootstrap_pubkey_hash.as_deref(),
-        )
-        .map_err(|error| {
-            if error == crate::routes::apps::AUTO_UNLOCK_DISABLED_REJECTION {
-                crate::routes::apps::auto_unlock_disabled_response()
-            } else {
-                json_error(StatusCode::BAD_REQUEST, error)
-            }
-        })?;
-    // Same-name recreate guard as the public create path: the hosted create
-    // derives its own identity instead of going through prepare_app_candidate,
-    // so the check runs here explicitly and the 409 passes through as-is.
-    crate::routes::apps::refuse_stale_owner_seed(&state, &namespace, &body.name).await?;
-
-    let mut tx = state.db.begin().await.map_err(|_| db_error())?;
-    crate::entitlements::lock_org_entitlement_lane(&mut tx, cap_org_id)
-        .await
-        .map_err(|_| db_error())?;
-    crate::deploy::lock_app_deployment_lane(&mut tx, app_id)
-        .await
-        .map_err(|_| db_error())?;
-    crate::routes::deployments::enforce_authoritative_entitlement(
-        &mut tx,
-        cap_org_id,
-        &resources,
-        true,
-        // Hosted app creation provisions fresh volumes for these sizes.
-        enclava_engine::apply::orchestrator::FreshVolumeClaims::ALL,
-    )
-    .await?;
-
-    let insert = sqlx::query(
-        "INSERT INTO apps (
-            id, org_id, name, namespace, instance_id, tenant_id, service_account,
-            bootstrap_owner_pubkey_hash, tenant_instance_identity_hash,
-            unlock_mode, domain, tee_domain,
-            signer_identity_subject, signer_identity_issuer, signer_identity_set_at,
-            egress_allowlist, egress_mode
-         )
-         SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10::unlock_enum, $11, $12, $13, $14, $15, $16, $17
-         WHERE NOT EXISTS (
-             SELECT 1 FROM kbs_owner_seed_waivers
-              WHERE binding_key = $18
-         )",
-    )
-    .bind(app_id)
-    .bind(cap_org_id)
-    .bind(&body.name)
-    .bind(&namespace)
-    .bind(&instance_id)
-    .bind(&tenant_id)
-    .bind(&service_account)
-    .bind(&pubkey_hash)
-    .bind(&identity_hash)
-    .bind(&body.unlock_mode)
-    .bind(&app_host)
-    .bind(&tee_host)
-    .bind(body.signer_identity_subject.as_deref())
-    .bind(body.signer_identity_issuer.as_deref())
-    .bind(signer_set_at)
-    .bind(sqlx::types::Json(egress_allowlist.clone()))
-    .bind(egress_mode.as_str())
-    .bind(crate::kbs::owner_binding_key_for(&namespace, &body.name))
-    ;
-    let inserted = crate::routes::apps::insert_app_if_owner_seed_fresh(
-        &mut tx,
-        insert,
-        &namespace,
-        &body.name,
-    )
-    .await
-    .map_err(|error| {
-        if error.to_string().contains("duplicate key") || error.to_string().contains("unique") {
-            json_error(StatusCode::CONFLICT, "app name already taken in this org")
-        } else {
-            db_error()
+        if conflicting_name {
+            return Err(idempotency_resource_conflict_error());
         }
-    })?;
-    if !inserted {
-        return Err(json_error(StatusCode::CONFLICT, "stale_owner_seed"));
-    }
-    sqlx::query(
-        "INSERT INTO app_resources (
-             app_id, cpu_limit, memory_limit, app_data_size, tls_data_size
-         ) VALUES ($1, $2, $3, $4, $5)",
-    )
-    .bind(resources.app_id)
-    .bind(&resources.cpu_limit)
-    .bind(&resources.memory_limit)
-    .bind(&resources.app_data_size)
-    .bind(&resources.tls_data_size)
-    .execute(&mut *tx)
-    .await
-    .map_err(|_| db_error())?;
-    tx.commit().await.map_err(|_| db_error())?;
 
-    let response = serde_json::json!({
-        "cap_org_id": cap_org_id,
-        "cap_app_id": app_id,
-        "name": body.name,
-        "namespace": namespace,
-        "instance_id": instance_id,
-        "service_account": service_account,
-        "bootstrap_owner_pubkey_hash": pubkey_hash,
-        "tenant_instance_identity_hash": identity_hash,
-        "status": "creating",
-        "domain": app_host,
-        "tee_domain": tee_host,
-        "signer_identity_subject": body.signer_identity_subject,
-        "signer_identity_issuer": body.signer_identity_issuer,
-    });
-    Ok((StatusCode::CREATED, response))
+        let app_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM apps WHERE org_id = $1")
+            .bind(cap_org_id)
+            .fetch_one(&state.db)
+            .await
+            .map_err(|_| db_error())?;
+        if app_count >= max_apps as i64 {
+            return Err(json_error(StatusCode::FORBIDDEN, "entitlement_app_limit"));
+        }
+
+        // The hosted request carries no source-provider fields; the shared
+        // candidate builder re-runs the request validations (same bodies) and
+        // derives the row every create path persists.
+        let create = crate::routes::apps::CreateAppRequest {
+            name: body.name.clone(),
+            unlock_mode: body.unlock_mode.clone(),
+            bootstrap_pubkey_hash: body.bootstrap_pubkey_hash.clone(),
+            signer_identity_subject: body.signer_identity_subject.clone(),
+            signer_identity_issuer: body.signer_identity_issuer.clone(),
+            source_provider: None,
+            source_repository: None,
+            egress_allowlist: body.egress_allowlist.clone(),
+            egress_mode: body.egress_mode.clone(),
+        };
+        let app = crate::routes::apps::build_app_candidate(
+            &state, app_id, cap_org_id, &org_name, &org_slug, &create,
+        )
+        .await?;
+
+        let mut tx = state.db.begin().await.map_err(|_| db_error())?;
+        crate::routes::apps::create_app_inner(
+            &mut tx,
+            crate::routes::apps::CreateAppActor::PaasInternal,
+            crate::routes::apps::CreateAppInput {
+                app: &app,
+                resource_overrides: body.resources.as_ref(),
+            },
+        )
+        .await
+        .map_err(|error| match error {
+            crate::routes::apps::CreateAppError::Response(response) => response,
+            crate::routes::apps::CreateAppError::NameTaken => {
+                json_error(StatusCode::CONFLICT, "app name already taken in this org")
+            }
+            crate::routes::apps::CreateAppError::StaleOwnerSeed => {
+                json_error(StatusCode::CONFLICT, "stale_owner_seed")
+            }
+            crate::routes::apps::CreateAppError::Db => db_error(),
+        })?;
+        tx.commit().await.map_err(|_| db_error())?;
+
+        let response = serde_json::json!({
+            "cap_org_id": cap_org_id,
+            "cap_app_id": app_id,
+            "name": body.name,
+            "namespace": app.namespace,
+            "instance_id": app.instance_id,
+            "service_account": app.service_account,
+            "bootstrap_owner_pubkey_hash": app.bootstrap_owner_pubkey_hash,
+            "tenant_instance_identity_hash": app.tenant_instance_identity_hash,
+            "status": "creating",
+            "domain": app_host,
+            "tee_domain": tee_host,
+            "signer_identity_subject": body.signer_identity_subject,
+            "signer_identity_issuer": body.signer_identity_issuer,
+        });
+        Ok((StatusCode::CREATED, response))
     }
     .await;
     let (status, response) = complete_idempotent_result(idempotency, result).await?;
@@ -3702,32 +3619,19 @@ pub async fn list_paas_apps(
 ) -> Result<Json<InternalListResponse>, (StatusCode, Json<serde_json::Value>)> {
     validate_external_id(&paas_org_id, "paas_org_id")?;
     let (cap_org_id, _org_name, _org_slug) = mapped_cap_org(&state, &paas_org_id).await?;
-    let rows: Vec<(Uuid, String, String, String, Option<String>)> = sqlx::query_as(
-        r#"
-        SELECT id,
-               name,
-               status::text,
-               domain,
-               tee_domain
-          FROM apps
-         WHERE org_id = $1
-         ORDER BY created_at DESC, id
-        "#,
-    )
-    .bind(cap_org_id)
-    .fetch_all(&state.db)
-    .await
-    .map_err(|_| db_error())?;
+    let rows = crate::db::paas::list_paas_org_apps_pool(&state.db, cap_org_id)
+        .await
+        .map_err(|_| db_error())?;
     Ok(Json(InternalListResponse {
         items: rows
             .into_iter()
-            .map(|(id, name, status, domain, tee_domain)| {
+            .map(|row| {
                 serde_json::json!({
-                    "cap_app_id": id,
-                    "name": name,
-                    "status": status,
-                    "domain": domain,
-                    "tee_domain": tee_domain,
+                    "cap_app_id": row.id,
+                    "name": row.name,
+                    "status": row.status,
+                    "domain": row.domain,
+                    "tee_domain": row.tee_domain,
                 })
             })
             .collect(),
@@ -3943,210 +3847,16 @@ pub async fn put_paas_app_desired_state(
 
     let result: Result<IdempotencyResponse, InternalRouteError> = async {
         let (cap_org_id, _, _) = mapped_cap_org(&state, &paas_org_id).await?;
-        let (app_id, namespace, current_status): (Uuid, String, crate::models::AppStatus) =
-            sqlx::query_as(
-            "SELECT id, namespace, status
-               FROM apps
-              WHERE org_id = $1
-                AND name = $2
-                AND status <> 'deleting'::app_status_enum",
-        )
-        .bind(cap_org_id)
-        .bind(&app_name)
-        .fetch_optional(&state.db)
-        .await
-        .map_err(|_| db_error())?
-        .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "application not found"))?;
-        if current_status == crate::models::AppStatus::Failed {
-            return Err(json_error(
-                StatusCode::CONFLICT,
-                "failed applications require a successful redeployment before changing desired state",
-            ));
-        }
         let desired_state = body.desired_state.as_str();
-        let resource =
-            crate::mutation_leases::ResourceFence::new("kubernetes_namespace", &namespace);
-        let mut mutation = match crate::mutation_leases::claim(
+        crate::deploy::set_app_desired_state(
             &state,
-            app_id,
-            "app_desired_state",
+            &engine,
+            cap_org_id,
+            &app_name,
+            desired_state,
             operation_id,
-            false,
-            vec![resource.clone()],
         )
-        .await
-        {
-            Ok(mutation) => mutation,
-            // Lane etiquette: this fifth Busy arm carries the same lease hints
-            // as the HTTP-facing ones so the contract is uniform.
-            Err(crate::mutation_leases::MutationLeaseError::Busy) => {
-                return Err(crate::routes::apps::app_mutation_busy_error(
-                    &state.db,
-                    app_id,
-                    std::slice::from_ref(&resource),
-                )
-                .await);
-            }
-            Err(_) => {
-                return Err(json_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "desired_state_retryable",
-                ));
-            }
-        };
-        let mut tx = state.db.begin().await.map_err(|_| db_error())?;
-        crate::deploy::lock_app_deployment_lane(&mut tx, app_id)
-            .await
-            .map_err(|_| db_error())?;
-        let claimed_status: crate::models::AppStatus =
-            sqlx::query_scalar("SELECT status FROM apps WHERE id = $1")
-                .bind(app_id)
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(|_| db_error())?;
-        if claimed_status == crate::models::AppStatus::Failed {
-            mutation
-                .finish_in_tx(&mut tx)
-                .await
-                .map_err(|_| db_error())?;
-            tx.commit().await.map_err(|_| db_error())?;
-            return Err(json_error(
-                StatusCode::CONFLICT,
-                "failed applications require a successful redeployment before changing desired state",
-            ));
-        }
-        let deployment_in_progress = body.desired_state == InternalAppDesiredState::Stopped
-            && sqlx::query_scalar(
-                "SELECT EXISTS(
-                     SELECT 1
-                       FROM deployment_apply_jobs
-                      WHERE app_id = $1
-                        AND state IN (
-                            'setup_pending', 'setting_up',
-                            'cleanup_pending', 'cleaning_up',
-                            'pending', 'running'
-                        )
-                 )",
-            )
-            .bind(app_id)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|_| db_error())?;
-        if deployment_in_progress {
-            mutation
-                .finish_in_tx(&mut tx)
-                .await
-                .map_err(|_| db_error())?;
-            tx.commit().await.map_err(|_| db_error())?;
-            return Err(json_error(
-                StatusCode::CONFLICT,
-                "current deployment generation is still in progress",
-            ));
-        }
-        // Release the deployment lane and the pooled connection before the
-        // bounded Kubernetes convergence wait (#95). Concurrent app mutations
-        // stay fenced out by the heartbeated mutation lease (they fail busy
-        // on claim), and the StatefulSet patch itself is generation-checked,
-        // so a deploy that slips in cannot be overwritten by a stale patch.
-        tx.commit().await.map_err(|_| db_error())?;
-        let generation = mutation.resource_generation(&resource).ok_or_else(|| {
-            json_error(StatusCode::SERVICE_UNAVAILABLE, "desired_state_retryable")
-        })?;
-        let generation = enclava_engine::apply::generation::MutationGeneration::new(generation)
-            .map_err(|_| json_error(StatusCode::SERVICE_UNAVAILABLE, "desired_state_retryable"))?;
-        let replicas = match body.desired_state {
-            InternalAppDesiredState::Running => 1,
-            InternalAppDesiredState::Stopped => 0,
-        };
-        let convergence = mutation
-            .guard_provider(
-                enclava_engine::apply::cleanup::set_statefulset_desired_replicas(
-                    &engine,
-                    &namespace,
-                    &app_name,
-                    replicas,
-                    std::time::Duration::from_secs(300),
-                    generation,
-                ),
-            )
-            .await
-            .map_err(|_| json_error(StatusCode::SERVICE_UNAVAILABLE, "desired_state_retryable"))?;
-        if let Err(error) = convergence {
-            tracing::warn!(
-                cap_app_id = %app_id,
-                outcome = error.public_code(),
-                "application desired-state convergence failed"
-            );
-            // Codex P2: a replicas/desired-state write whose accepted
-            // response lost CAP creation evidence must durably mark the
-            // app — this path has no deployment job, so without the marker
-            // a later failed apply's sweep would treat the stripped object
-            // as foreign and clear cleanup evidence over it.
-            if matches!(
-                error,
-                enclava_engine::apply::engine::ApplyError::CreationEvidenceLost { .. }
-            ) && !crate::deployment_failure_cleanup::persist_creation_evidence_loss(
-                &state.db,
-                app_id,
-            )
-            .await
-            {
-                // The marker is the only durable signal for later sweeps;
-                // surface its loss distinctly instead of silently
-                // continuing (the request already failed).
-                tracing::error!(
-                    cap_app_id = %app_id,
-                    "creation-evidence-loss marker could not be persisted; later sweeps will not know unmarked targets may be CAP-created"
-                );
-            }
-            // The failure path deliberately does NOT re-take the lane: the
-            // lease is dropped and stays owned through its reclaim
-            // quarantine, which is the documented safe outcome after an
-            // uncertain provider response.
-            return Err(json_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "desired_state_retryable",
-            ));
-        }
-
-        // Re-take the lane and publish the terminal status in a fresh short
-        // transaction. finish_in_tx requires the caller to hold the app
-        // advisory lane (see its doc comment) and re-asserts lease ownership
-        // (token and generation) before this status write can commit. A
-        // `failed` status published while the lane was released (for example
-        // a deployment worker terminalizing an in-flight job) must not be
-        // overwritten by the desired state, so the UPDATE guards it too.
-        let mut tx = state.db.begin().await.map_err(|_| db_error())?;
-        crate::deploy::lock_app_deployment_lane(&mut tx, app_id)
-            .await
-            .map_err(|_| db_error())?;
-        let updated = sqlx::query(
-            "UPDATE apps
-                SET status = $2::app_status_enum,
-                    updated_at = now()
-              WHERE id = $1
-                AND org_id = $3
-                AND namespace = $4
-                AND status NOT IN ('deleting'::app_status_enum, 'failed'::app_status_enum)",
-        )
-        .bind(app_id)
-        .bind(desired_state)
-        .bind(cap_org_id)
-        .bind(&namespace)
-        .execute(&mut *tx)
-        .await
-        .map_err(|_| db_error())?;
-        if updated.rows_affected() != 1 {
-            return Err(json_error(
-                StatusCode::CONFLICT,
-                "application authority changed",
-            ));
-        }
-        mutation
-            .finish_in_tx(&mut tx)
-            .await
-            .map_err(|_| db_error())?;
-        tx.commit().await.map_err(|_| db_error())?;
+        .await?;
         Ok((
             StatusCode::OK,
             serde_json::json!({
@@ -4343,31 +4053,18 @@ pub async fn list_paas_members(
 ) -> Result<Json<InternalListResponse>, (StatusCode, Json<serde_json::Value>)> {
     validate_external_id(&paas_org_id, "paas_org_id")?;
     let (cap_org_id, _org_name, _org_slug) = mapped_cap_org(&state, &paas_org_id).await?;
-    let rows: Vec<(Uuid, String, String, bool)> = sqlx::query_as(
-        r#"
-        SELECT u.id,
-               u.display_name,
-               m.role::text,
-               m.removed_at IS NULL AS active
-          FROM memberships m
-          JOIN users u ON u.id = m.user_id
-         WHERE m.org_id = $1
-         ORDER BY u.display_name, u.id
-        "#,
-    )
-    .bind(cap_org_id)
-    .fetch_all(&state.db)
-    .await
-    .map_err(|_| db_error())?;
+    let rows = crate::db::paas::list_paas_org_members_pool(&state.db, cap_org_id)
+        .await
+        .map_err(|_| db_error())?;
     Ok(Json(InternalListResponse {
         items: rows
             .into_iter()
-            .map(|(cap_user_id, display_name, role, active)| {
+            .map(|row| {
                 serde_json::json!({
-                    "cap_user_id": cap_user_id,
-                    "display_name": display_name,
-                    "role": role,
-                    "active": active,
+                    "cap_user_id": row.user_id,
+                    "display_name": row.display_name,
+                    "role": row.role,
+                    "active": row.active,
                 })
             })
             .collect(),
@@ -4381,63 +4078,29 @@ pub async fn list_paas_deployments(
 ) -> Result<Json<InternalListResponse>, (StatusCode, Json<serde_json::Value>)> {
     validate_external_id(&paas_org_id, "paas_org_id")?;
     let (cap_org_id, _org_name, _org_slug) = mapped_cap_org(&state, &paas_org_id).await?;
-    type PaasDeploymentRow = (
-        Uuid,
-        Uuid,
-        String,
-        String,
-        serde_json::Value,
-        Option<String>,
-        Option<String>,
-    );
-    let rows: Vec<PaasDeploymentRow> = sqlx::query_as(
-        r#"
-        SELECT d.id,
-               d.app_id,
-               a.name,
-               d.status::text,
-               d.spec_snapshot,
-               d.image_digest,
-               d.error_message
-          FROM deployments d
-          JOIN apps a ON a.id = d.app_id
-         WHERE d.org_id = $1
-         ORDER BY d.created_at DESC, d.id
-        "#,
-    )
-    .bind(cap_org_id)
-    .fetch_all(&state.db)
-    .await
-    .map_err(|_| db_error())?;
+    let rows = crate::db::paas::list_paas_org_deployments_pool(&state.db, cap_org_id)
+        .await
+        .map_err(|_| db_error())?;
     Ok(Json(InternalListResponse {
         items: rows
             .into_iter()
-            .map(
-                |(
-                    cap_deployment_id,
-                    cap_app_id,
-                    app_name,
-                    status,
-                    spec,
-                    image_digest,
-                    error_message,
-                )| {
-                    let image = spec
-                        .get("image")
-                        .and_then(|value| value.as_str())
-                        .map(str::to_string);
-                    serde_json::json!({
-                        "cap_deployment_id": cap_deployment_id,
-                        "cap_app_id": cap_app_id,
-                        "app_name": app_name,
-                        "status": status,
-                        "image": image,
-                        "spec": spec,
-                        "image_digest": image_digest,
-                        "error_message": public_deployment_error_message(error_message.as_deref()),
-                    })
-                },
-            )
+            .map(|row| {
+                let image = row
+                    .spec_snapshot
+                    .get("image")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string);
+                serde_json::json!({
+                    "cap_deployment_id": row.deployment_id,
+                    "cap_app_id": row.app_id,
+                    "app_name": row.app_name,
+                    "status": row.status,
+                    "image": image,
+                    "spec": row.spec_snapshot,
+                    "image_digest": row.image_digest,
+                    "error_message": public_deployment_error_message(row.error_message.as_deref()),
+                })
+            })
             .collect(),
     }))
 }
@@ -4515,86 +4178,28 @@ pub async fn list_paas_status(
 ) -> Result<Json<InternalListResponse>, (StatusCode, Json<serde_json::Value>)> {
     validate_external_id(&paas_org_id, "paas_org_id")?;
     let (cap_org_id, _org_name, _org_slug) = mapped_cap_org(&state, &paas_org_id).await?;
-    type PaasStatusRow = (
-        Uuid,
-        String,
-        String,
-        String,
-        String,
-        Option<String>,
-        Option<Uuid>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    );
-    let rows: Vec<PaasStatusRow> = sqlx::query_as(
-        r#"
-        SELECT a.id,
-               a.name,
-               a.namespace,
-               a.status::text,
-               a.domain,
-               a.tee_domain,
-               latest.id,
-               latest.status,
-               latest.image_digest,
-               latest.error_message
-          FROM apps a
-          LEFT JOIN LATERAL (
-              SELECT d.id,
-                     d.status::text AS status,
-                     d.image_digest,
-                     d.error_message
-                FROM deployments d
-                LEFT JOIN deployment_apply_jobs apply_job
-                  ON apply_job.deployment_id = d.id
-               WHERE d.app_id = a.id
-               ORDER BY (apply_job.generation IS NOT NULL) DESC,
-                        apply_job.generation DESC NULLS LAST,
-                        d.created_at DESC,
-                        d.id DESC
-               LIMIT 1
-          ) latest ON TRUE
-         WHERE a.org_id = $1
-         ORDER BY a.created_at DESC, a.id
-        "#,
-    )
-    .bind(cap_org_id)
-    .fetch_all(&state.db)
-    .await
-    .map_err(|_| db_error())?;
-    let items = stream::iter(rows.into_iter().map(
-        |(
-            cap_app_id,
-            app_name,
-            namespace,
-            app_status,
-            domain,
-            tee_domain,
-            cap_deployment_id,
-            deployment_status,
-            image_digest,
-            error_message,
-        )| {
-            let state = state.clone();
-            async move {
-                observed_internal_status_item(
-                    &state,
-                    cap_app_id,
-                    app_name,
-                    namespace,
-                    app_status,
-                    domain,
-                    tee_domain,
-                    cap_deployment_id,
-                    deployment_status,
-                    image_digest,
-                    error_message,
-                )
-                .await
-            }
-        },
-    ))
+    let rows = crate::db::paas::list_paas_org_status_pool(&state.db, cap_org_id)
+        .await
+        .map_err(|_| db_error())?;
+    let items = stream::iter(rows.into_iter().map(|row| {
+        let state = state.clone();
+        async move {
+            observed_internal_status_item(
+                &state,
+                row.app_id,
+                row.app_name,
+                row.namespace,
+                row.app_status,
+                row.domain,
+                row.tee_domain,
+                row.deployment_id,
+                row.deployment_status,
+                row.image_digest,
+                row.error_message,
+            )
+            .await
+        }
+    }))
     .buffered(STATUS_OBSERVATION_CONCURRENCY)
     .collect()
     .await;
@@ -4605,112 +4210,46 @@ pub async fn list_paas_cluster_status(
     _auth: InternalAuth,
     State(state): State<AppState>,
 ) -> Result<Json<InternalListResponse>, (StatusCode, Json<serde_json::Value>)> {
-    type PaasClusterStatusRow = (
-        String,
-        Uuid,
-        String,
-        Option<String>,
-        Uuid,
-        String,
-        String,
-        String,
-        String,
-        Option<String>,
-        Option<Uuid>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    );
-    let rows: Vec<PaasClusterStatusRow> = sqlx::query_as(
-        r#"
-        SELECT m.paas_external_id,
-               o.id,
-               o.name,
-               o.display_name,
-               a.id,
-               a.name,
-               a.namespace,
-               a.status::text,
-               a.domain,
-               a.tee_domain,
-               latest.id,
-               latest.status,
-               latest.image_digest,
-               latest.error_message
-          FROM apps a
-          JOIN organizations o ON o.id = a.org_id
-          JOIN paas_external_mappings m
-            ON m.org_id = o.id
-           AND m.resource_type = 'organization'
-          LEFT JOIN LATERAL (
-              SELECT d.id,
-                     d.status::text AS status,
-                     d.image_digest,
-                     d.error_message
-                FROM deployments d
-                LEFT JOIN deployment_apply_jobs apply_job
-                  ON apply_job.deployment_id = d.id
-               WHERE d.app_id = a.id
-               ORDER BY (apply_job.generation IS NOT NULL) DESC,
-                        apply_job.generation DESC NULLS LAST,
-                        d.created_at DESC,
-                        d.id DESC
-               LIMIT 1
-          ) latest ON TRUE
-         ORDER BY a.created_at DESC, a.id
-        "#,
-    )
-    .fetch_all(&state.db)
-    .await
-    .map_err(|_| db_error())?;
+    let rows = crate::db::paas::list_paas_cluster_status_pool(&state.db)
+        .await
+        .map_err(|_| db_error())?;
 
-    let items = stream::iter(rows.into_iter().map(
-        |(
-            paas_org_id,
-            cap_org_id,
-            cap_org_name,
-            cap_org_display_name,
-            cap_app_id,
-            app_name,
-            namespace,
-            app_status,
-            domain,
-            tee_domain,
-            cap_deployment_id,
-            deployment_status,
-            image_digest,
-            error_message,
-        )| {
-            let state = state.clone();
-            async move {
-                let mut item = observed_internal_status_item(
-                    &state,
-                    cap_app_id,
-                    app_name,
-                    namespace,
-                    app_status,
-                    domain,
-                    tee_domain,
-                    cap_deployment_id,
-                    deployment_status,
-                    image_digest,
-                    error_message,
-                )
-                .await;
-                let object = item
-                    .as_object_mut()
-                    .expect("internal status item is always an object");
-                object.insert("paas_org_id".to_string(), serde_json::json!(paas_org_id));
-                object.insert("cap_org_id".to_string(), serde_json::json!(cap_org_id));
-                object.insert("cap_org_name".to_string(), serde_json::json!(cap_org_name));
-                object.insert(
-                    "cap_org_display_name".to_string(),
-                    serde_json::json!(cap_org_display_name),
-                );
-                item
-            }
-        },
-    ))
+    let items = stream::iter(rows.into_iter().map(|row| {
+        let state = state.clone();
+        async move {
+            let mut item = observed_internal_status_item(
+                &state,
+                row.app_id,
+                row.app_name,
+                row.namespace,
+                row.app_status,
+                row.domain,
+                row.tee_domain,
+                row.deployment_id,
+                row.deployment_status,
+                row.image_digest,
+                row.error_message,
+            )
+            .await;
+            let object = item
+                .as_object_mut()
+                .expect("internal status item is always an object");
+            object.insert(
+                "paas_org_id".to_string(),
+                serde_json::json!(row.paas_org_id),
+            );
+            object.insert("cap_org_id".to_string(), serde_json::json!(row.cap_org_id));
+            object.insert(
+                "cap_org_name".to_string(),
+                serde_json::json!(row.cap_org_name),
+            );
+            object.insert(
+                "cap_org_display_name".to_string(),
+                serde_json::json!(row.cap_org_display_name),
+            );
+            item
+        }
+    }))
     .buffered(STATUS_OBSERVATION_CONCURRENCY)
     .collect()
     .await;

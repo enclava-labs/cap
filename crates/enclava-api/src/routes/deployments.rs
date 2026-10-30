@@ -912,29 +912,6 @@ async fn build_accepted_apply_payload(
     ))
 }
 
-/// The app-insert statement behind generic `app.create_if_missing` creates
-/// (AppMutation::Insert). Its target column list, SELECT placeholder list,
-/// and the caller's bind order must stay aligned: an added column without
-/// its SELECT placeholder makes PostgreSQL reject every such insert before
-/// execution (Codex P1 against 8fdebfd), and sqlx only checks the bind
-/// count at runtime. The statement is shared with the regression that
-/// executes it against real PostgreSQL.
-const APP_INSERT_SQL: &str = "INSERT INTO apps (
-    id, org_id, name, namespace, instance_id, tenant_id, service_account,
-    bootstrap_owner_pubkey_hash, tenant_instance_identity_hash, unlock_mode,
-    domain, tee_domain, custom_domain, status, signer_identity_subject,
-    signer_identity_issuer, signer_identity_set_at, signer_rotation_generation,
-    source_provider,
-    source_repository, egress_allowlist, egress_mode, created_at, updated_at
- )
- SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10::unlock_enum,
-    $11, $12, $13, $14::app_status_enum, $15, $16, $17, $18,
-    $19, $20, $21, $22, $23, $24
- WHERE NOT EXISTS (
-     SELECT 1 FROM kbs_owner_seed_waivers
-      WHERE binding_key = $25
- )";
-
 async fn insert_transaction_audit(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     org_id: Uuid,
@@ -1736,32 +1713,7 @@ async fn deploy_app_candidate(
             }
         }
         AppMutation::Insert => {
-            let insert = sqlx::query(APP_INSERT_SQL)
-                .bind(app.id)
-                .bind(app.org_id)
-                .bind(&app.name)
-                .bind(&app.namespace)
-                .bind(&app.instance_id)
-                .bind(&app.tenant_id)
-                .bind(&app.service_account)
-                .bind(&app.bootstrap_owner_pubkey_hash)
-                .bind(&app.tenant_instance_identity_hash)
-                .bind(app.unlock_mode)
-                .bind(&app.domain)
-                .bind(app.tee_domain.as_deref())
-                .bind(app.custom_domain.as_deref())
-                .bind(app.status)
-                .bind(app.signer_identity_subject.as_deref())
-                .bind(app.signer_identity_issuer.as_deref())
-                .bind(app.signer_identity_set_at)
-                .bind(app.signer_rotation_generation)
-                .bind(app.source_provider.as_deref())
-                .bind(app.source_repository.as_deref())
-                .bind(&app.egress_allowlist)
-                .bind(&app.egress_mode)
-                .bind(app.created_at)
-                .bind(app.updated_at)
-                .bind(crate::kbs::owner_binding_key_for(&app.namespace, &app.name));
+            let insert = crate::routes::apps::bind_app_insert(&app);
             let insert_result = crate::routes::apps::insert_app_if_owner_seed_fresh(
                 &mut tx,
                 insert,
@@ -2376,32 +2328,7 @@ mod tests {
     fn app_insert_query(
         app: &App,
     ) -> sqlx::query::Query<'_, sqlx::Postgres, sqlx::postgres::PgArguments> {
-        sqlx::query(APP_INSERT_SQL)
-            .bind(app.id)
-            .bind(app.org_id)
-            .bind(&app.name)
-            .bind(&app.namespace)
-            .bind(&app.instance_id)
-            .bind(&app.tenant_id)
-            .bind(&app.service_account)
-            .bind(&app.bootstrap_owner_pubkey_hash)
-            .bind(&app.tenant_instance_identity_hash)
-            .bind(app.unlock_mode)
-            .bind(&app.domain)
-            .bind(app.tee_domain.as_deref())
-            .bind(app.custom_domain.as_deref())
-            .bind(app.status)
-            .bind(app.signer_identity_subject.as_deref())
-            .bind(app.signer_identity_issuer.as_deref())
-            .bind(app.signer_identity_set_at)
-            .bind(app.signer_rotation_generation)
-            .bind(app.source_provider.as_deref())
-            .bind(app.source_repository.as_deref())
-            .bind(&app.egress_allowlist)
-            .bind(&app.egress_mode)
-            .bind(app.created_at)
-            .bind(app.updated_at)
-            .bind(crate::kbs::owner_binding_key_for(&app.namespace, &app.name))
+        crate::routes::apps::bind_app_insert(app)
     }
 
     #[tokio::test]

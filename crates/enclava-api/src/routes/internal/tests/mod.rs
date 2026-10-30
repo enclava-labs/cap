@@ -8725,6 +8725,179 @@ async fn keyring_unrelated_five_xx_stays_fail_closed() {
     crate::test_support::drop_isolated_database("cap_keyring_pending_unrelated", pool).await;
 }
 
+/// The public create route and the hosted internal create must persist
+/// the same app and resource rows for the same request: the shared write
+/// core leaves only caller-derived fields (identity columns from the
+/// deterministic PaaS app id, timestamps, and per-path org/name) to
+/// legitimately differ.
+#[tokio::test]
+async fn public_and_hosted_creates_persist_identical_app_rows() {
+    let (_db_cleanup, pool) =
+        crate::test_support::isolated_database_test_pool("cap_create_parity").await;
+
+    // The PaaS org carries the hosted management/entitlement rows its
+    // pre-checks read; the public org is a plain core-class org.
+    let paas_org_id = format!("paas-create-parity-{}", Uuid::new_v4().simple());
+    let cap_org_id = Uuid::new_v4();
+    let org_name = format!("parity{}", &cap_org_id.simple().to_string()[..8]);
+    insert_mapped_org(&pool, cap_org_id, &org_name, &paas_org_id).await;
+    sqlx::query(
+        "INSERT INTO organization_management (org_id, mode, paas_org_id, status)
+             VALUES ($1, 'paas_managed', $2, 'active')",
+    )
+    .bind(cap_org_id)
+    .bind(&paas_org_id)
+    .execute(&pool)
+    .await
+    .expect("mark parity org PaaS-managed");
+    sqlx::query(
+        "INSERT INTO organization_entitlements
+                 (org_id, version, deploy_allowed, limits)
+             VALUES ($1, 1, true, $2)",
+    )
+    .bind(cap_org_id)
+    .bind(serde_json::json!({
+        "name": "create-parity-test",
+        "max_apps": 10,
+        "max_cpu": "10",
+        "max_memory": "10Gi",
+        "max_storage": "100Gi"
+    }))
+    .execute(&pool)
+    .await
+    .expect("insert parity entitlement");
+
+    let public_org_id = Uuid::new_v4();
+    let public_org_name = format!("paritypub{}", &public_org_id.simple().to_string()[..8]);
+    crate::db::orgs::insert_org_pool(&pool, public_org_id, &public_org_name, None, false)
+        .await
+        .expect("insert public parity organization");
+    let public_user_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Parity Admin')")
+        .bind(public_user_id)
+        .execute(&pool)
+        .await
+        .expect("insert public parity user");
+    sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'admin')")
+        .bind(public_user_id)
+        .bind(public_org_id)
+        .execute(&pool)
+        .await
+        .expect("insert public parity membership");
+
+    let state = idempotency_test_state(pool.clone());
+    let pubkey_hash = "b".repeat(64);
+    let signer_subject = "https://github.com/acme/app/.github/workflows/build.yml@refs/heads/main";
+    let signer_issuer = "https://token.actions.githubusercontent.com";
+
+    let (paas_status, Json(paas_response)) = create_paas_app(
+        InternalAuth {
+            client_san: "spiffe://paas.example.test/enclava-paas".to_string(),
+        },
+        State(state.clone()),
+        Path(paas_org_id),
+        idempotency_headers(&format!("create-parity-{}", Uuid::new_v4())),
+        Json(InternalCreateAppRequest {
+            name: "parity-app".to_string(),
+            unlock_mode: "password".to_string(),
+            bootstrap_pubkey_hash: Some(pubkey_hash.clone()),
+            signer_identity_subject: Some(signer_subject.to_string()),
+            signer_identity_issuer: Some(signer_issuer.to_string()),
+            egress_allowlist: Vec::new(),
+            egress_mode: "restricted".to_string(),
+            resources: None,
+        }),
+    )
+    .await
+    .expect("hosted create should succeed");
+    assert_eq!(paas_status, StatusCode::CREATED);
+
+    let public_auth = AuthContext {
+        user_id: public_user_id,
+        org_id: public_org_id,
+        org_name: public_org_name,
+        role: Role::Admin,
+        api_key: None,
+        management_origin: ManagementOrigin::Public,
+    };
+    let (public_status, Json(public_response)) = crate::routes::apps::create_app(
+        public_auth,
+        State(state),
+        Json(crate::routes::apps::CreateAppRequest {
+            name: "parity-app".to_string(),
+            unlock_mode: "password".to_string(),
+            bootstrap_pubkey_hash: Some(pubkey_hash.clone()),
+            signer_identity_subject: Some(signer_subject.to_string()),
+            signer_identity_issuer: Some(signer_issuer.to_string()),
+            source_provider: None,
+            source_repository: None,
+            egress_allowlist: Vec::new(),
+            egress_mode: "restricted".to_string(),
+        }),
+    )
+    .await
+    .expect("public create should succeed");
+    assert_eq!(public_status, StatusCode::CREATED);
+    let paas_app_id: Uuid = paas_response["cap_app_id"]
+        .as_str()
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .expect("hosted create reports its app id");
+
+    let mut paas_app: serde_json::Value =
+        sqlx::query_scalar("SELECT row_to_json(a) FROM apps a WHERE id = $1")
+            .bind(paas_app_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read hosted app row");
+    let mut public_app: serde_json::Value =
+        sqlx::query_scalar("SELECT row_to_json(a) FROM apps a WHERE id = $1")
+            .bind(public_response.id)
+            .fetch_one(&pool)
+            .await
+            .expect("read public app row");
+
+    // Columns that legitimately differ between the two paths: identity
+    // columns derived from the app id or the org/name, and timestamps.
+    for key in [
+        "id",
+        "org_id",
+        "tenant_id",
+        "namespace",
+        "instance_id",
+        "service_account",
+        "domain",
+        "tee_domain",
+        "tenant_instance_identity_hash",
+        "signer_identity_set_at",
+        "created_at",
+        "updated_at",
+    ] {
+        paas_app.as_object_mut().unwrap().remove(key);
+        public_app.as_object_mut().unwrap().remove(key);
+    }
+    assert_eq!(paas_app, public_app);
+
+    let paas_resources: serde_json::Value =
+        sqlx::query_scalar("SELECT row_to_json(r) FROM app_resources r WHERE app_id = $1")
+            .bind(paas_app_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read hosted app resources");
+    let public_resources: serde_json::Value =
+        sqlx::query_scalar("SELECT row_to_json(r) FROM app_resources r WHERE app_id = $1")
+            .bind(public_response.id)
+            .fetch_one(&pool)
+            .await
+            .expect("read public app resources");
+    let strip_app_id = |mut row: serde_json::Value| {
+        row.as_object_mut().unwrap().remove("app_id");
+        row
+    };
+    assert_eq!(strip_app_id(paas_resources), strip_app_id(public_resources));
+
+    crate::test_support::drop_isolated_database("cap_create_parity", pool).await;
+}
+
 mod confidentiality_tests {
     use super::{project_internal_deployment_error, validated_proof_origin};
 

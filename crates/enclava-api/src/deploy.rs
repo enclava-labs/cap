@@ -16124,6 +16124,258 @@ pub async fn set_app_status(pool: &PgPool, app_id: Uuid, status: &str) -> Result
     Ok(())
 }
 
+fn desired_state_json_error(
+    status: axum::http::StatusCode,
+    error: &'static str,
+) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    (status, axum::Json(serde_json::json!({"error": error})))
+}
+
+fn desired_state_db_error() -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    desired_state_json_error(
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        "database error",
+    )
+}
+
+fn desired_state_retryable_error() -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    desired_state_json_error(
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        "desired_state_retryable",
+    )
+}
+
+/// Drive one app's desired running/stopped state: claim the mutation lease,
+/// patch the workload StatefulSet's replicas under its mutation generation,
+/// and publish the terminal app status. The internal PaaS route owns
+/// authentication, validation, idempotency, and the response body; it
+/// forwards here with the caller's `operation_id` as the lease authority.
+///
+/// `desired_state` is the persisted app status ("running" or "stopped"); the
+/// replica count is derived from it. The provider wait runs WITHOUT the app
+/// advisory lane (a bounded convergence must not block other mutations): the
+/// heartbeated mutation lease keeps fencing concurrent mutations, and the
+/// generation-checked patch cannot be overwritten by a stale deploy.
+pub(crate) async fn set_app_desired_state(
+    state: &crate::state::AppState,
+    engine: &ApplyEngine,
+    cap_org_id: Uuid,
+    app_name: &str,
+    desired_state: &str,
+    operation_id: Uuid,
+) -> Result<(), (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
+    use axum::http::StatusCode;
+
+    let (app_id, namespace, current_status): (Uuid, String, AppStatus) = sqlx::query_as(
+        "SELECT id, namespace, status
+           FROM apps
+          WHERE org_id = $1
+            AND name = $2
+            AND status <> 'deleting'::app_status_enum",
+    )
+    .bind(cap_org_id)
+    .bind(app_name)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|_| desired_state_db_error())?
+    .ok_or_else(|| desired_state_json_error(StatusCode::NOT_FOUND, "application not found"))?;
+    if current_status == AppStatus::Failed {
+        return Err(desired_state_json_error(
+            StatusCode::CONFLICT,
+            "failed applications require a successful redeployment before changing desired state",
+        ));
+    }
+    let resource = crate::mutation_leases::ResourceFence::new("kubernetes_namespace", &namespace);
+    let mut mutation = match crate::mutation_leases::claim(
+        state,
+        app_id,
+        "app_desired_state",
+        operation_id,
+        false,
+        vec![resource.clone()],
+    )
+    .await
+    {
+        Ok(mutation) => mutation,
+        // Lane etiquette: this fifth Busy arm carries the same lease hints
+        // as the HTTP-facing ones so the contract is uniform.
+        Err(crate::mutation_leases::MutationLeaseError::Busy) => {
+            return Err(crate::routes::apps::app_mutation_busy_error(
+                &state.db,
+                app_id,
+                std::slice::from_ref(&resource),
+            )
+            .await);
+        }
+        Err(_) => {
+            return Err(desired_state_retryable_error());
+        }
+    };
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|_| desired_state_db_error())?;
+    lock_app_deployment_lane(&mut tx, app_id)
+        .await
+        .map_err(|_| desired_state_db_error())?;
+    let claimed_status: AppStatus = sqlx::query_scalar("SELECT status FROM apps WHERE id = $1")
+        .bind(app_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| desired_state_db_error())?;
+    if claimed_status == AppStatus::Failed {
+        mutation
+            .finish_in_tx(&mut tx)
+            .await
+            .map_err(|_| desired_state_db_error())?;
+        tx.commit().await.map_err(|_| desired_state_db_error())?;
+        return Err(desired_state_json_error(
+            StatusCode::CONFLICT,
+            "failed applications require a successful redeployment before changing desired state",
+        ));
+    }
+    let deployment_in_progress = desired_state == "stopped"
+        && sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(
+                 SELECT 1
+                   FROM deployment_apply_jobs
+                  WHERE app_id = $1
+                    AND state IN (
+                        'setup_pending', 'setting_up',
+                        'cleanup_pending', 'cleaning_up',
+                        'pending', 'running'
+                    )
+             )",
+        )
+        .bind(app_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| desired_state_db_error())?;
+    if deployment_in_progress {
+        mutation
+            .finish_in_tx(&mut tx)
+            .await
+            .map_err(|_| desired_state_db_error())?;
+        tx.commit().await.map_err(|_| desired_state_db_error())?;
+        return Err(desired_state_json_error(
+            StatusCode::CONFLICT,
+            "current deployment generation is still in progress",
+        ));
+    }
+    // Release the deployment lane and the pooled connection before the
+    // bounded Kubernetes convergence wait (#95). Concurrent app mutations
+    // stay fenced out by the heartbeated mutation lease (they fail busy
+    // on claim), and the StatefulSet patch itself is generation-checked,
+    // so a deploy that slips in cannot be overwritten by a stale patch.
+    tx.commit().await.map_err(|_| desired_state_db_error())?;
+    let generation = mutation
+        .resource_generation(&resource)
+        .ok_or_else(desired_state_retryable_error)?;
+    let generation =
+        MutationGeneration::new(generation).map_err(|_| desired_state_retryable_error())?;
+    let replicas = match desired_state {
+        "running" => 1,
+        "stopped" => 0,
+        _ => {
+            return Err(desired_state_json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid desired_state",
+            ));
+        }
+    };
+    let convergence = mutation
+        .guard_provider(
+            enclava_engine::apply::cleanup::set_statefulset_desired_replicas(
+                engine,
+                &namespace,
+                app_name,
+                replicas,
+                std::time::Duration::from_secs(300),
+                generation,
+            ),
+        )
+        .await
+        .map_err(|_| desired_state_retryable_error())?;
+    if let Err(error) = convergence {
+        tracing::warn!(
+            cap_app_id = %app_id,
+            outcome = error.public_code(),
+            "application desired-state convergence failed"
+        );
+        // Codex P2: a replicas/desired-state write whose accepted
+        // response lost CAP creation evidence must durably mark the
+        // app — this path has no deployment job, so without the marker
+        // a later failed apply's sweep would treat the stripped object
+        // as foreign and clear cleanup evidence over it.
+        if matches!(
+            error,
+            enclava_engine::apply::engine::ApplyError::CreationEvidenceLost { .. }
+        ) && !crate::deployment_failure_cleanup::persist_creation_evidence_loss(
+            &state.db, app_id,
+        )
+        .await
+        {
+            // The marker is the only durable signal for later sweeps;
+            // surface its loss distinctly instead of silently
+            // continuing (the request already failed).
+            tracing::error!(
+                cap_app_id = %app_id,
+                "creation-evidence-loss marker could not be persisted; later sweeps will not know unmarked targets may be CAP-created"
+            );
+        }
+        // The failure path deliberately does NOT re-take the lane: the
+        // lease is dropped and stays owned through its reclaim
+        // quarantine, which is the documented safe outcome after an
+        // uncertain provider response.
+        return Err(desired_state_retryable_error());
+    }
+
+    // Re-take the lane and publish the terminal status in a fresh short
+    // transaction. finish_in_tx requires the caller to hold the app
+    // advisory lane (see its doc comment) and re-asserts lease ownership
+    // (token and generation) before this status write can commit. A
+    // `failed` status published while the lane was released (for example
+    // a deployment worker terminalizing an in-flight job) must not be
+    // overwritten by the desired state, so the UPDATE guards it too.
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|_| desired_state_db_error())?;
+    lock_app_deployment_lane(&mut tx, app_id)
+        .await
+        .map_err(|_| desired_state_db_error())?;
+    let updated = sqlx::query(
+        "UPDATE apps
+            SET status = $2::app_status_enum,
+                updated_at = now()
+          WHERE id = $1
+            AND org_id = $3
+            AND namespace = $4
+            AND status NOT IN ('deleting'::app_status_enum, 'failed'::app_status_enum)",
+    )
+    .bind(app_id)
+    .bind(desired_state)
+    .bind(cap_org_id)
+    .bind(&namespace)
+    .execute(&mut *tx)
+    .await
+    .map_err(|_| desired_state_db_error())?;
+    if updated.rows_affected() != 1 {
+        return Err(desired_state_json_error(
+            StatusCode::CONFLICT,
+            "application authority changed",
+        ));
+    }
+    mutation
+        .finish_in_tx(&mut tx)
+        .await
+        .map_err(|_| desired_state_db_error())?;
+    tx.commit().await.map_err(|_| desired_state_db_error())?;
+    Ok(())
+}
+
 /// Whether a domain-triggered tenant-ingress restart may proceed.
 ///
 /// `NotDeployed`: the workload StatefulSet does not exist yet, so there is

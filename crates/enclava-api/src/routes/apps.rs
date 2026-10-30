@@ -1024,13 +1024,15 @@ pub(crate) async fn prepare_app_candidate(
             Json(serde_json::json!({"error": error})),
         )
     })?;
-    let egress_allowlist = validate_egress_allowlist(&body.egress_allowlist).map_err(|error| {
+    // Request-shape validation runs up front for error ordering; the shared
+    // candidate builder re-validates when it assembles the row.
+    validate_egress_allowlist(&body.egress_allowlist).map_err(|error| {
         (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": error})),
         )
     })?;
-    let egress_mode = validate_egress_mode(&body.egress_mode).map_err(|error| {
+    validate_egress_mode(&body.egress_mode).map_err(|error| {
         (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": error})),
@@ -1079,10 +1081,45 @@ pub(crate) async fn prepare_app_candidate(
         ));
     }
 
-    let app_id = Uuid::new_v4();
+    build_app_candidate(
+        state,
+        Uuid::new_v4(),
+        auth.org_id,
+        &auth.org_name,
+        &org.cust_slug,
+        body,
+    )
+    .await
+}
+
+/// Assemble the app row a create would insert, without mutating persistent
+/// state. Shared by every app-create write path: the public
+/// [`prepare_app_candidate`] performs its entitlement and app-count
+/// pre-checks first, while the hosted internal create derives its own
+/// deterministic id and performs its PaaS-specific pre-checks.
+pub(crate) async fn build_app_candidate(
+    state: &AppState,
+    app_id: Uuid,
+    org_id: Uuid,
+    org_name: &str,
+    org_slug: &str,
+    body: &CreateAppRequest,
+) -> Result<App, (StatusCode, Json<serde_json::Value>)> {
+    let egress_allowlist = validate_egress_allowlist(&body.egress_allowlist).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": error})),
+        )
+    })?;
+    let egress_mode = validate_egress_mode(&body.egress_mode).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": error})),
+        )
+    })?;
     let (tenant_id, instance_id, namespace, service_account, pubkey_hash, identity_hash) =
         derive_identity(
-            &auth.org_name,
+            org_name,
             app_id,
             &body.name,
             &body.unlock_mode,
@@ -1105,7 +1142,7 @@ pub(crate) async fn prepare_app_candidate(
     // teardown.
     refuse_stale_owner_seed(state, &namespace, &body.name).await?;
     let app_host =
-        enclava_common::hostnames::app_hostname(&body.name, &org.cust_slug, &state.platform_domain)
+        enclava_common::hostnames::app_hostname(&body.name, org_slug, &state.platform_domain)
             .map_err(|error| {
                 (
                     StatusCode::BAD_REQUEST,
@@ -1114,19 +1151,16 @@ pub(crate) async fn prepare_app_candidate(
                     })),
                 )
             })?;
-    let tee_host = enclava_common::hostnames::tee_hostname(
-        &body.name,
-        &org.cust_slug,
-        &state.tee_domain_suffix,
-    )
-    .map_err(|error| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": format!("invalid tee hostname: {error}")
-            })),
-        )
-    })?;
+    let tee_host =
+        enclava_common::hostnames::tee_hostname(&body.name, org_slug, &state.tee_domain_suffix)
+            .map_err(|error| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!("invalid tee hostname: {error}")
+                    })),
+                )
+            })?;
     let unlock_mode = match body.unlock_mode.as_str() {
         "password" => crate::models::UnlockMode::Password,
         _ => unreachable!("derive_identity validates unlock_mode"),
@@ -1135,7 +1169,7 @@ pub(crate) async fn prepare_app_candidate(
 
     Ok(App {
         id: app_id,
-        org_id: auth.org_id,
+        org_id,
         name: body.name.clone(),
         namespace,
         instance_id,
@@ -1211,114 +1245,187 @@ pub(crate) async fn refuse_stale_owner_seed(
     }
     Ok(())
 }
+/// The app-insert statement shared by every app-create write path (public
+/// create, hosted internal create, and generic `app.create_if_missing`). Its
+/// target column list, SELECT placeholder list, and [`bind_app_insert`]'s bind
+/// order must stay aligned: an added column without its SELECT placeholder
+/// makes PostgreSQL reject every such insert before execution, and sqlx only
+/// checks the bind count at runtime.
+pub(crate) const APP_INSERT_SQL: &str = "INSERT INTO apps (
+    id, org_id, name, namespace, instance_id, tenant_id, service_account,
+    bootstrap_owner_pubkey_hash, tenant_instance_identity_hash, unlock_mode,
+    domain, tee_domain, custom_domain, status, signer_identity_subject,
+    signer_identity_issuer, signer_identity_set_at, signer_rotation_generation,
+    source_provider,
+    source_repository, egress_allowlist, egress_mode, created_at, updated_at
+ )
+ SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10::unlock_enum,
+    $11, $12, $13, $14::app_status_enum, $15, $16, $17, $18,
+    $19, $20, $21, $22, $23, $24
+ WHERE NOT EXISTS (
+     SELECT 1 FROM kbs_owner_seed_waivers
+      WHERE binding_key = $25
+ )";
 
-pub async fn create_app(
-    auth: AuthContext,
-    State(state): State<AppState>,
-    Json(body): Json<CreateAppRequest>,
-) -> Result<(StatusCode, Json<AppResponse>), (StatusCode, Json<serde_json::Value>)> {
-    scopes::require_app_write(&auth)?;
-    ensure_management_write_allowed(&state, &auth).await?;
+/// Bind an [`App`] row onto [`APP_INSERT_SQL`] in placeholder order.
+pub(crate) fn bind_app_insert<'a>(
+    app: &'a App,
+) -> sqlx::query::Query<'a, sqlx::Postgres, sqlx::postgres::PgArguments> {
+    sqlx::query(APP_INSERT_SQL)
+        .bind(app.id)
+        .bind(app.org_id)
+        .bind(&app.name)
+        .bind(&app.namespace)
+        .bind(&app.instance_id)
+        .bind(&app.tenant_id)
+        .bind(&app.service_account)
+        .bind(&app.bootstrap_owner_pubkey_hash)
+        .bind(&app.tenant_instance_identity_hash)
+        .bind(app.unlock_mode)
+        .bind(&app.domain)
+        .bind(app.tee_domain.as_deref())
+        .bind(app.custom_domain.as_deref())
+        .bind(app.status)
+        .bind(app.signer_identity_subject.as_deref())
+        .bind(app.signer_identity_issuer.as_deref())
+        .bind(app.signer_identity_set_at)
+        .bind(app.signer_rotation_generation)
+        .bind(app.source_provider.as_deref())
+        .bind(app.source_repository.as_deref())
+        .bind(&app.egress_allowlist)
+        .bind(&app.egress_mode)
+        .bind(app.created_at)
+        .bind(app.updated_at)
+        .bind(crate::kbs::owner_binding_key_for(&app.namespace, &app.name))
+}
 
-    let app_candidate = prepare_app_candidate(&state, &auth, &body).await?;
-    let app_id = app_candidate.id;
-    let resources = crate::models::AppResources {
+/// Effective `app_resources` row for a create: the hosted defaults overlaid
+/// with caller-supplied per-field overrides. Absent fields keep the default;
+/// only the internal hosted create supplies overrides.
+pub(crate) fn hosted_app_resources(
+    app_id: Uuid,
+    overrides: Option<&crate::routes::deployments::DeployResources>,
+) -> crate::models::AppResources {
+    let mut resources = crate::models::AppResources {
         app_id,
         cpu_limit: "1".to_string(),
         memory_limit: "1Gi".to_string(),
         app_data_size: "5Gi".to_string(),
         tls_data_size: "2Gi".to_string(),
     };
+    if let Some(overrides) = overrides {
+        if let Some(cpu) = overrides.cpu.as_ref() {
+            resources.cpu_limit = cpu.clone();
+        }
+        if let Some(memory) = overrides.memory.as_ref() {
+            resources.memory_limit = memory.clone();
+        }
+        if let Some(storage) = overrides.storage.as_ref() {
+            resources.app_data_size = storage.clone();
+        }
+        if let Some(tls_storage) = overrides.tls_storage.as_ref() {
+            resources.tls_data_size = tls_storage.clone();
+        }
+    }
+    resources
+}
 
-    let mut tx = state
-        .db
-        .begin()
+/// Who is creating the app. The write core runs identical for every caller
+/// except the member-only in-transaction role re-check and `app.create`
+/// audit row; the internal hosted create performs neither (its caller has
+/// no user).
+pub(crate) enum CreateAppActor {
+    Member { org_id: Uuid, user_id: Uuid },
+    PaasInternal,
+}
+
+/// Inputs to [`create_app_inner`]. `app` is the fully-derived candidate row;
+/// `resource_overrides` carries hosted per-field resource overrides (`None`
+/// on the public route).
+pub(crate) struct CreateAppInput<'a> {
+    pub app: &'a App,
+    pub resource_overrides: Option<&'a crate::routes::deployments::DeployResources>,
+}
+
+/// Failure of the shared create write core, before caller-specific error
+/// shaping: each caller maps `Response` verbatim and maps the rest to its
+/// own error bodies.
+pub(crate) enum CreateAppError {
+    /// A ready-made HTTP error (authz re-check, authoritative entitlement).
+    Response((StatusCode, Json<serde_json::Value>)),
+    /// The apps insert failed on a name/id uniqueness violation.
+    NameTaken,
+    /// The post-insert owner-seed waiver recheck found the insert guarded out.
+    StaleOwnerSeed,
+    /// Any other database failure; each caller emits its own body.
+    Db,
+}
+
+fn public_create_app_error(error: CreateAppError) -> (StatusCode, Json<serde_json::Value>) {
+    match error {
+        CreateAppError::Response(response) => response,
+        CreateAppError::NameTaken => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "app name already taken in this org"})),
+        ),
+        CreateAppError::StaleOwnerSeed => stale_owner_seed_response(),
+        CreateAppError::Db => internal_server_error(),
+    }
+}
+
+/// Shared transactional write core of app creation, in the global lock
+/// order: org entitlement lane -> (member callers: role re-check) -> app
+/// deployment lane -> authoritative entitlement -> guarded apps insert ->
+/// app_resources insert -> (member callers: `app.create` audit). The caller
+/// owns the transaction so its commit can join additional writes; on error
+/// it must roll the transaction back.
+pub(crate) async fn create_app_inner(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    actor: CreateAppActor,
+    input: CreateAppInput<'_>,
+) -> Result<(), CreateAppError> {
+    let app = input.app;
+    let resources = hosted_app_resources(app.id, input.resource_overrides);
+
+    crate::entitlements::lock_org_entitlement_lane(tx, app.org_id)
         .await
-        .map_err(|_| internal_server_error())?;
-    crate::entitlements::lock_org_entitlement_lane(&mut tx, auth.org_id)
+        .map_err(|_| CreateAppError::Db)?;
+    if let CreateAppActor::Member { org_id, user_id } = actor {
+        let current_role =
+            crate::auth::scopes::lock_and_read_active_membership_role_in_tx(tx, org_id, user_id)
+                .await
+                .map_err(CreateAppError::Response)?;
+        crate::auth::scopes::require_admin_role(current_role).map_err(CreateAppError::Response)?;
+    }
+    crate::deploy::lock_app_deployment_lane(tx, app.id)
         .await
-        .map_err(|_| internal_server_error())?;
-    let current_role = crate::auth::scopes::lock_and_read_active_membership_role_in_tx(
-        &mut tx,
-        auth.org_id,
-        auth.user_id,
-    )
-    .await?;
-    crate::auth::scopes::require_admin_role(current_role)?;
-    crate::deploy::lock_app_deployment_lane(&mut tx, app_id)
-        .await
-        .map_err(|_| internal_server_error())?;
+        .map_err(|_| CreateAppError::Db)?;
     crate::routes::deployments::enforce_authoritative_entitlement(
-        &mut tx,
-        auth.org_id,
+        tx,
+        app.org_id,
         &resources,
         true,
         // App creation provisions fresh volumes for these sizes; enforce the
         // 32 MiB LUKS2 floor synchronously (defaults 5Gi/2Gi always pass).
         enclava_engine::apply::orchestrator::FreshVolumeClaims::ALL,
     )
-    .await?;
+    .await
+    .map_err(CreateAppError::Response)?;
 
-    let insert = sqlx::query(
-        "INSERT INTO apps (id, org_id, name, namespace, instance_id, tenant_id,
-        service_account, bootstrap_owner_pubkey_hash, tenant_instance_identity_hash,
-         unlock_mode, domain, tee_domain,
-         signer_identity_subject, signer_identity_issuer, signer_identity_set_at,
-         signer_rotation_generation,
-         source_provider, source_repository, egress_allowlist, egress_mode)
-          SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10::unlock_enum, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20
-          WHERE NOT EXISTS (
-              SELECT 1 FROM kbs_owner_seed_waivers
-               WHERE binding_key = $21
-          )",
-    )
-    .bind(app_id)
-    .bind(app_candidate.org_id)
-    .bind(&app_candidate.name)
-    .bind(&app_candidate.namespace)
-    .bind(&app_candidate.instance_id)
-    .bind(&app_candidate.tenant_id)
-    .bind(&app_candidate.service_account)
-    .bind(&app_candidate.bootstrap_owner_pubkey_hash)
-    .bind(&app_candidate.tenant_instance_identity_hash)
-    .bind(app_candidate.unlock_mode)
-    .bind(&app_candidate.domain)
-    .bind(app_candidate.tee_domain.as_deref())
-    .bind(app_candidate.signer_identity_subject.as_deref())
-    .bind(app_candidate.signer_identity_issuer.as_deref())
-    .bind(app_candidate.signer_identity_set_at)
-    .bind(app_candidate.signer_rotation_generation)
-    .bind(app_candidate.source_provider.as_deref())
-    .bind(app_candidate.source_repository.as_deref())
-    .bind(&app_candidate.egress_allowlist)
-    .bind(&app_candidate.egress_mode)
-    .bind(crate::kbs::owner_binding_key_for(
-        &app_candidate.namespace,
-        &app_candidate.name,
-    ))
-    ;
-    let result = insert_app_if_owner_seed_fresh(
-        &mut tx,
-        insert,
-        &app_candidate.namespace,
-        &app_candidate.name,
-    )
-    .await;
-
-    let insert_result = match result {
-        Ok(executed) => executed,
-        Err(e) => {
-            if e.to_string().contains("duplicate key") || e.to_string().contains("unique") {
-                return Err((
-                    StatusCode::CONFLICT,
-                    Json(serde_json::json!({"error": "app name already taken in this org"})),
-                ));
-            }
-            return Err(internal_server_error());
-        }
-    };
-    if !insert_result {
-        return Err(stale_owner_seed_response());
+    let inserted =
+        insert_app_if_owner_seed_fresh(tx, bind_app_insert(app), &app.namespace, &app.name)
+            .await
+            .map_err(|error| {
+                if error.to_string().contains("duplicate key")
+                    || error.to_string().contains("unique")
+                {
+                    CreateAppError::NameTaken
+                } else {
+                    CreateAppError::Db
+                }
+            })?;
+    if !inserted {
+        return Err(CreateAppError::StaleOwnerSeed);
     }
 
     sqlx::query(
@@ -1331,27 +1438,61 @@ pub async fn create_app(
     .bind(&resources.memory_limit)
     .bind(&resources.app_data_size)
     .bind(&resources.tls_data_size)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await
-    .map_err(|_| internal_server_error())?;
+    .map_err(|_| CreateAppError::Db)?;
 
-    sqlx::query(
-        "INSERT INTO audit_log (org_id, app_id, user_id, action, detail)
-         VALUES ($1, $2, $3, 'app.create', $4)",
+    if let CreateAppActor::Member { org_id, user_id } = actor {
+        sqlx::query(
+            "INSERT INTO audit_log (org_id, app_id, user_id, action, detail)
+             VALUES ($1, $2, $3, 'app.create', $4)",
+        )
+        .bind(org_id)
+        .bind(app.id)
+        .bind(user_id)
+        .bind(serde_json::json!({
+            "name": &app.name,
+            "unlock_mode": &app.unlock_mode,
+            "egress_allowlist": &app.egress_allowlist.0,
+            "egress_mode": &app.egress_mode
+        }))
+        .execute(&mut **tx)
+        .await
+        .map_err(|_| CreateAppError::Db)?;
+    }
+
+    Ok(())
+}
+
+pub async fn create_app(
+    auth: AuthContext,
+    State(state): State<AppState>,
+    Json(body): Json<CreateAppRequest>,
+) -> Result<(StatusCode, Json<AppResponse>), (StatusCode, Json<serde_json::Value>)> {
+    scopes::require_app_write(&auth)?;
+    ensure_management_write_allowed(&state, &auth).await?;
+
+    let app_candidate = prepare_app_candidate(&state, &auth, &body).await?;
+    let app_id = app_candidate.id;
+
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|_| internal_server_error())?;
+    create_app_inner(
+        &mut tx,
+        CreateAppActor::Member {
+            org_id: auth.org_id,
+            user_id: auth.user_id,
+        },
+        CreateAppInput {
+            app: &app_candidate,
+            resource_overrides: None,
+        },
     )
-    .bind(auth.org_id)
-    .bind(app_id)
-    .bind(auth.user_id)
-    .bind(serde_json::json!({
-        "name": &body.name,
-        "unlock_mode": &body.unlock_mode,
-        "egress_allowlist": &app_candidate.egress_allowlist.0,
-        "egress_mode": &app_candidate.egress_mode
-    }))
-    .execute(&mut *tx)
     .await
-    .map_err(|_| internal_server_error())?;
-
+    .map_err(public_create_app_error)?;
     tx.commit().await.map_err(|_| internal_server_error())?;
 
     let dns_fences = vec![
