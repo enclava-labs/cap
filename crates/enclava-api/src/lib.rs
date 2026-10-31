@@ -294,6 +294,10 @@ fn internal_routes() -> Router<AppState> {
             axum::routing::get(routes::internal::paas_deployment_context),
         )
         .route(
+            "/internal/paas/idempotency-receipts",
+            axum::routing::get(routes::internal::get_paas_idempotency_receipt),
+        )
+        .route(
             "/internal/paas/orgs/{paas_org_id}",
             axum::routing::put(routes::internal::upsert_paas_org),
         )
@@ -1118,6 +1122,7 @@ mod runtime_gate_tests {
                 "/internal/paas/platform/deployment-context",
                 &[("GET", ALLOW)],
             ),
+            ("/internal/paas/idempotency-receipts", &[("GET", ALLOW)]),
             ("/internal/paas/orgs/{paas_org_id}", &[("PUT", ALLOW)]),
             (
                 "/internal/paas/orgs/{paas_org_id}/members/{paas_user_id}",
