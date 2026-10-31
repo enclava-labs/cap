@@ -366,7 +366,6 @@ struct IdempotencyReceiptRow {
     method: String,
     path: String,
     response_status: Option<i32>,
-    response_body: Option<serde_json::Value>,
     reservation_token: Option<Uuid>,
     operation_id: Option<Uuid>,
     lease_expires_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -377,9 +376,15 @@ struct IdempotencyReceiptRow {
 }
 
 /// Lets PaaS settle a mutation whose CAP answer it never observed from this
-/// ledger instead of guessing. `in_progress` and `abandoned` mirror the
-/// live-lease and reclaimable arms of `begin_idempotent_request_with_recovery_and_binding`,
-/// so a same-key retry behaves exactly as the reported state says.
+/// ledger instead of guessing. `in_progress` and `abandoned` follow the
+/// live-lease and reclaimable arms of
+/// `begin_idempotent_request_with_recovery_and_binding`: an `abandoned` key is
+/// no longer leased, and a same-key retry settles it under the route's
+/// recovery policy (re-execute or adopt, or close it as
+/// `idempotency_recovery_required` for fail-closed mutations). The receipt is
+/// metadata only: the stored response body stays behind the original
+/// actor-bound request, and completed config-token receipts never carry a
+/// result because the bearer is never stored.
 pub async fn get_paas_idempotency_receipt(
     _auth: InternalAuth,
     State(state): State<AppState>,
@@ -393,7 +398,7 @@ pub async fn get_paas_idempotency_receipt(
         ));
     }
     let row: Option<IdempotencyReceiptRow> = sqlx::query_as(
-        "SELECT method, path, response_status, response_body, reservation_token,
+        "SELECT method, path, response_status, reservation_token,
                 operation_id, lease_expires_at, known_not_applied, completed_at,
                 updated_at, clock_timestamp() AS database_now
            FROM cap_internal_idempotency
@@ -411,7 +416,6 @@ pub async fn get_paas_idempotency_receipt(
             "path": null,
             "operation_id": null,
             "response_status": null,
-            "response_body": null,
             "retry_after": null,
         })));
     };
@@ -448,7 +452,6 @@ pub async fn get_paas_idempotency_receipt(
         "path": row.path,
         "operation_id": row.operation_id,
         "response_status": row.response_status,
-        "response_body": row.response_body,
         "retry_after": retry_after,
     })))
 }

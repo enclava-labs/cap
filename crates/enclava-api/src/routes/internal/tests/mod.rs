@@ -1140,7 +1140,10 @@ async fn idempotency_receipt_reports_what_a_same_key_retry_would_do() {
     assert_eq!(completed["path"], path);
     assert_eq!(completed["operation_id"], serde_json::json!(operation_id));
     assert_eq!(completed["response_status"], 201);
-    assert_eq!(completed["response_body"], response);
+    assert!(
+        completed.get("response_body").is_none(),
+        "the receipt is metadata only; the stored body stays behind the original request"
+    );
 
     let (status, _) = receipt("  ").await.expect_err("blank key is rejected");
     assert_eq!(status, StatusCode::BAD_REQUEST);
