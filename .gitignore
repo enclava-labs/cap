@@ -15,6 +15,9 @@
 .remember/
 docs/superpowers/
 codex-security-review.md
+*.log
+pr-body*.md
+/wts/
 
 # Secrets / keys
 *.env
