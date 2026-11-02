@@ -116,19 +116,21 @@ async fn issue_config_token_route_inner(
             Json(serde_json::json!({"error": "tee domain not configured"})),
         )
     })?;
-    let tee_resolve_ip = match crate::edge::resolve_gateway_address(&app.name, &app.namespace).await
-    {
-        Ok(resolve_ip) => resolve_ip,
-        Err(error) => {
-            tracing::warn!(
-                app = %app.name,
-                namespace = %app.namespace,
-                error = %error,
-                "could not resolve tenant Gateway address for config-token response"
-            );
-            None
-        }
-    };
+    let tee_resolve_ip =
+        match crate::edge::resolve_gateway_address(&state.kube_client, &app.name, &app.namespace)
+            .await
+        {
+            Ok(resolve_ip) => resolve_ip,
+            Err(error) => {
+                tracing::warn!(
+                    app = %app.name,
+                    namespace = %app.namespace,
+                    error = %error,
+                    "could not resolve tenant Gateway address for config-token response"
+                );
+                None
+            }
+        };
 
     let database_now: chrono::DateTime<chrono::Utc> =
         sqlx::query_scalar("SELECT clock_timestamp()")

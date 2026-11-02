@@ -295,7 +295,7 @@ async fn tenant_tee_logs_client(
 ) -> Result<(reqwest::Client, String), RouteError> {
     let resolution = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        resolve_internal_tee_socket(app_name, namespace),
+        resolve_internal_tee_socket(&state.kube_client, app_name, namespace),
     )
     .await
     .unwrap_or_else(|_| Err("internal tenant TEE lookup timed out".to_string()));
@@ -336,10 +336,11 @@ async fn tenant_tee_logs_client(
 /// routes it through its per-app rate-limited warn limiter with
 /// `stage="resolve_socket"`).
 pub(crate) async fn resolve_internal_tee_socket(
+    client: &kube::Client,
     app_name: &str,
     namespace: &str,
 ) -> Result<SocketAddr, String> {
-    let target = match crate::edge::resolve_backend_target(app_name, namespace, 443).await {
+    let target = match crate::edge::resolve_backend_target(client, app_name, namespace, 443).await {
         Ok(target) => target,
         Err(err) => {
             return Err(format!(
@@ -370,12 +371,13 @@ fn parse_socket_addr(target: &str) -> Option<SocketAddr> {
 /// diagnostics contract forbids at warn level).
 pub(crate) async fn resolve_tenant_gateway_ip(
     app_id: uuid::Uuid,
+    client: &kube::Client,
     app_name: &str,
     namespace: &str,
 ) -> Option<IpAddr> {
     match tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        crate::edge::resolve_gateway_address(app_name, namespace),
+        crate::edge::resolve_gateway_address(client, app_name, namespace),
     )
     .await
     {
@@ -412,11 +414,12 @@ pub(crate) async fn resolve_tenant_gateway_ip(
 /// caller's shared public client on every failure mode.
 pub(crate) async fn resolved_tenant_tee_client(
     app_id: uuid::Uuid,
+    client: &kube::Client,
     app_name: &str,
     namespace: &str,
     confidential_domain: &str,
 ) -> Option<reqwest::Client> {
-    let address = resolve_tenant_gateway_ip(app_id, app_name, namespace).await?;
+    let address = resolve_tenant_gateway_ip(app_id, client, app_name, namespace).await?;
     match build_resolved_tenant_tee_http_client(confidential_domain, SocketAddr::new(address, 443))
     {
         Ok(client) => Some(client),

@@ -778,12 +778,13 @@ async fn reconcile_legacy_rego_policy_with_client(
 pub async fn reconcile_policy(
     db: &PgPool,
     config: Option<&KbsPolicyConfig>,
+    shared_client: &kube::Client,
 ) -> Result<(), KbsPolicyError> {
     let Some(config) = config else {
         return Err(KbsPolicyError::NotConfigured);
     };
 
-    let client = reconcile_kube_client().await?;
+    let client = reconcile_kube_client(shared_client);
     if signed_policy_mode_active(db).await? {
         tracing::info!(
             namespace = %config.namespace,
@@ -1783,6 +1784,7 @@ pub async fn reconcile_signed_policy_artifacts(
     db: &PgPool,
     config: Option<&KbsPolicyConfig>,
     extra_artifact: Option<&crate::signing_service::SignedPolicyArtifact>,
+    shared_client: &kube::Client,
 ) -> Result<(), KbsPolicyError> {
     let Some(config) = config else {
         return Err(KbsPolicyError::NotConfigured);
@@ -1791,7 +1793,7 @@ pub async fn reconcile_signed_policy_artifacts(
     let mut tx = db.begin().await?;
     enqueue_signed_policy_reconciliation(&mut tx).await?;
     tx.commit().await?;
-    reconcile_pending_signed_policy_artifacts_inner(db, config, extra_artifact).await
+    reconcile_pending_signed_policy_artifacts_inner(db, config, extra_artifact, shared_client).await
 }
 
 /// Converge every currently pending desired generation.  This is safe to call
@@ -1800,11 +1802,12 @@ pub async fn reconcile_signed_policy_artifacts(
 pub async fn reconcile_pending_signed_policy_artifacts(
     db: &PgPool,
     config: Option<&KbsPolicyConfig>,
+    shared_client: &kube::Client,
 ) -> Result<(), KbsPolicyError> {
     let Some(config) = config else {
         return Err(KbsPolicyError::NotConfigured);
     };
-    reconcile_pending_signed_policy_artifacts_inner(db, config, None).await
+    reconcile_pending_signed_policy_artifacts_inner(db, config, None, shared_client).await
 }
 
 pub async fn reconcile_signed_policy_once(
@@ -1824,6 +1827,7 @@ pub async fn reconcile_signed_policy_once(
         .guard_provider(reconcile_pending_signed_policy_artifacts(
             &state.db,
             state.kbs_policy.as_ref(),
+            &state.kube_client,
         ))
         .await??;
     lease.finish().await?;
@@ -1935,8 +1939,9 @@ async fn reconcile_pending_signed_policy_artifacts_inner(
     db: &PgPool,
     config: &KbsPolicyConfig,
     expected_artifact: Option<&crate::signing_service::SignedPolicyArtifact>,
+    shared_client: &kube::Client,
 ) -> Result<(), KbsPolicyError> {
-    let client = reconcile_kube_client().await?;
+    let client = reconcile_kube_client(shared_client);
     reconcile_pending_signed_policy_artifacts_with_client(db, config, expected_artifact, client)
         .await
 }
@@ -1946,14 +1951,12 @@ tokio::task_local! {
     pub(crate) static TEST_KUBE_CLIENT: kube::Client;
 }
 
-async fn reconcile_kube_client() -> Result<kube::Client, KbsPolicyError> {
+fn reconcile_kube_client(shared_client: &kube::Client) -> kube::Client {
     #[cfg(test)]
     if let Ok(client) = TEST_KUBE_CLIENT.try_with(Clone::clone) {
-        return Ok(client);
+        return client;
     }
-    kube::Client::try_default()
-        .await
-        .map_err(KbsPolicyError::Kube)
+    shared_client.clone()
 }
 
 async fn reconcile_pending_signed_policy_artifacts_with_client(
@@ -3187,6 +3190,14 @@ mod tests {
     use super::*;
     use crate::test_support::KbsPolicyProvider;
     use chrono::Utc;
+
+    async fn reconcile_policy(
+        db: &PgPool,
+        config: Option<&KbsPolicyConfig>,
+    ) -> Result<(), KbsPolicyError> {
+        let client = TEST_KUBE_CLIENT.with(Clone::clone);
+        super::reconcile_policy(db, config, &client).await
+    }
 
     #[test]
     fn reconciliation_error_display_redacts_upstream_detail() {

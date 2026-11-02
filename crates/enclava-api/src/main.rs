@@ -3,6 +3,7 @@ use axum::Extension;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::DecodePrivateKey;
 use enclava_common::image::ImageRef;
+use enclava_engine::apply::{engine::ApplyEngine, types::ApplyConfig};
 use enclava_engine::types::{AttestationConfig, CaddyTlsMode};
 use rand::rngs::OsRng;
 use std::sync::Arc;
@@ -1032,8 +1033,12 @@ async fn main() {
     // cluster must not make startup probes restart us before /livez exists.
     // The shared atomic is opened only after the initial sweep converges.
     let mut dispatch_admission = false;
+    let kube_client = kube::Client::try_default()
+        .await
+        .expect("failed to configure the Kubernetes client");
     let state = AppState {
         db: pool,
+        kube_client: kube_client.clone(),
         management_mode,
         deployment_dispatch_enabled: Arc::new(std::sync::atomic::AtomicBool::new(
             dispatch_admission,
@@ -1069,11 +1074,10 @@ async fn main() {
     };
 
     let desired_state_engine = if management_mode == CapManagementMode::PaasManaged {
-        Some(Arc::new(
-            enclava_engine::apply::engine::ApplyEngine::try_default()
-                .await
-                .expect("failed to configure Kubernetes client for PaaS desired-state routes"),
-        ))
+        Some(Arc::new(ApplyEngine::new(
+            kube_client.clone(),
+            ApplyConfig::default(),
+        )))
     } else {
         None
     };
@@ -1114,7 +1118,11 @@ async fn main() {
     };
 
     let pull_secret_sweep_converged =
-        enclava_api::deploy::cleanup_stale_tenant_image_pull_secrets_at_startup(&state.db).await;
+        enclava_api::deploy::cleanup_stale_tenant_image_pull_secrets_at_startup(
+            &state.db,
+            &state.kube_client,
+        )
+        .await;
     dispatch_admission = deployment_dispatch_enabled && pull_secret_sweep_converged;
     if dispatch_admission {
         state.set_deployment_dispatch_enabled(true);
@@ -1227,8 +1235,11 @@ fn spawn_pull_secret_sweep_reconciler(
         let mut dispatcher_spawned = dispatch_admission;
         loop {
             tokio::time::sleep(backoff).await;
-            if enclava_api::deploy::cleanup_stale_tenant_image_pull_secrets_at_startup(&state.db)
-                .await
+            if enclava_api::deploy::cleanup_stale_tenant_image_pull_secrets_at_startup(
+                &state.db,
+                &state.kube_client,
+            )
+            .await
             {
                 if deployment_dispatch_enabled && !dispatcher_spawned {
                     // Dispatcher first, admission second: whenever a workload

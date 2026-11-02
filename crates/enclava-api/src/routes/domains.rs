@@ -81,14 +81,15 @@ async fn ensure_custom_domain_haproxy_route(
                 )
             },
         )?;
-    let app_target = crate::edge::resolve_backend_target(&app.name, &app.namespace, 443)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("resolve backend: {e}")})),
-            )
-        })?;
+    let app_target =
+        crate::edge::resolve_backend_target(&state.kube_client, &app.name, &app.namespace, 443)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("resolve backend: {e}")})),
+                )
+            })?;
     let route = crate::edge::SniRoute::new(domain, &app_backend, &app_target).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -96,6 +97,7 @@ async fn ensure_custom_domain_haproxy_route(
         )
     })?;
     crate::edge::ensure_haproxy_routes(
+        &state.kube_client,
         &state.db,
         &crate::edge::EdgeRouteConfig::from_env(),
         Some(edge_config_generation),
@@ -395,11 +397,10 @@ pub async fn verify_challenge(
         .await
         .map_err(|_| internal_error())?;
     let engine = if app.custom_domain.as_deref() != Some(domain.as_str()) {
-        Some(
-            enclava_engine::apply::engine::ApplyEngine::try_default()
-                .await
-                .map_err(|_| internal_error())?,
-        )
+        Some(enclava_engine::apply::engine::ApplyEngine::new(
+            state.kube_client.clone(),
+            enclava_engine::apply::types::ApplyConfig::default(),
+        ))
     } else {
         None
     };
@@ -580,6 +581,7 @@ pub async fn verify_challenge(
     };
     let ingress_ready = match mutation
         .guard_provider(crate::deploy::reapply_tenant_ingress(
+            &state.kube_client,
             &state.db,
             &next_app,
             state.attestation.as_ref(),
@@ -688,6 +690,7 @@ pub async fn verify_challenge(
             .map_err(dns_error_response)?;
         if mutation
             .guard_provider(crate::edge::remove_haproxy_routes(
+                &state.kube_client,
                 &state.db,
                 &crate::edge::EdgeRouteConfig::from_env(),
                 Some(edge_config_generation),
@@ -843,6 +846,7 @@ pub async fn remove_custom_domain(
     let edge_config = crate::edge::EdgeRouteConfig::from_env();
     if mutation
         .guard_provider(crate::edge::remove_haproxy_routes(
+            &state.kube_client,
             &state.db,
             &edge_config,
             Some(edge_config_generation),

@@ -21,7 +21,7 @@ use crate::deploy::{
 };
 use crate::models::{App, AppStatus, DeployStatus};
 use crate::state::AppState;
-use enclava_engine::apply::engine::ApplyEngine;
+use enclava_engine::apply::{engine::ApplyEngine, types::ApplyConfig};
 use enclava_engine::types::{AttestationConfig, LogEncryptionConfig};
 
 pub const DEPLOYMENT_SETUP_STATE: &str = "setup_state";
@@ -1797,6 +1797,7 @@ pub fn spawn_deployment_dispatcher(state: AppState, shutdown: tokio_util::sync::
             // gone; fail closed on any uncertainty.
             match crate::mutation_leases::release_retained_deployment_namespace_fences(
                 &retained_state.db,
+                &retained_state.kube_client,
             )
             .await
             {
@@ -2867,9 +2868,7 @@ async fn apply_claimed_job(
             observing_since,
             rollout_timeout,
         }) => {
-            let engine = ApplyEngine::try_default()
-                .await
-                .map_err(|error| DeploymentJobError::Apply(error.into()))?;
+            let engine = ApplyEngine::new(state.kube_client.clone(), ApplyConfig::default());
             // The budget was computed once before this generation's first
             // provider apply and persisted with the watching marker; resume
             // with the recorded value, never a fresh computation over
@@ -2893,9 +2892,7 @@ async fn apply_claimed_job(
     // Preflight before queueing on the semaphore, then repeat after capacity is
     // granted. The latest org keyring can change while this future waits.
     validate_apply_artifacts(state, job, payload, &primary_image_digest).await?;
-    let engine = ApplyEngine::try_default()
-        .await
-        .map_err(|error| classify_preflight_lookup_error(error.into()))?;
+    let engine = ApplyEngine::new(state.kube_client.clone(), ApplyConfig::default());
 
     let Some((apply_permit, mut mutation, authority_lane, validated, fresh_volume_claims)) =
         acquire_apply_permit_and_revalidate(state, job, payload, &engine).await?
@@ -2938,6 +2935,7 @@ async fn apply_claimed_job(
                 provenance_oci_material: validated.provenance_oci_material,
                 log_encryption: payload.log_encryption.clone(),
             },
+            &state.kube_client,
             &mutation,
         ))
         .await?;
@@ -3639,6 +3637,7 @@ async fn reconcile_pending_kbs_with_mutation(
         .guard_provider(crate::kbs::reconcile_pending_signed_policy_artifacts(
             &state.db,
             state.kbs_policy.as_ref(),
+            &state.kube_client,
         ))
         .await??;
     Ok(())
@@ -3663,6 +3662,7 @@ async fn reconcile_pending_kbs_for_apply(
         .guard_provider(crate::kbs::reconcile_pending_signed_policy_artifacts(
             &state.db,
             state.kbs_policy.as_ref(),
+            &state.kube_client,
         ))
         .await??;
     lease.finish().await?;

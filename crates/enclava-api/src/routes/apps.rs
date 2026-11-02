@@ -444,6 +444,7 @@ async fn request_workload_teardown(
         // ships, the fallback is the first place to look.
         if let Some(client) = crate::routes::logs::resolved_tenant_tee_client(
             app.id,
+            &state.kube_client,
             &app.name,
             &app.namespace,
             domain,
@@ -472,8 +473,13 @@ async fn request_workload_teardown(
                     ));
                 }
             };
-        let gateway_ip =
-            crate::routes::logs::resolve_tenant_gateway_ip(app.id, &app.name, &app.namespace).await;
+        let gateway_ip = crate::routes::logs::resolve_tenant_gateway_ip(
+            app.id,
+            &state.kube_client,
+            &app.name,
+            &app.namespace,
+        )
+        .await;
         match crate::tee_attestation::attest_teardown_channel(
             domain,
             gateway_ip,
@@ -2135,6 +2141,7 @@ pub(crate) async fn delete_app_before(
                 .guard_provider(crate::kbs::reconcile_pending_signed_policy_artifacts(
                     &state.db,
                     state.kbs_policy.as_ref(),
+                    &state.kube_client,
                 ))
                 .await
                 .map_err(|_| internal_server_error())?
@@ -2154,19 +2161,17 @@ pub(crate) async fn delete_app_before(
                     let already_published = matches!(
                         error,
                         crate::kbs::KbsPolicyError::SignedPolicyBudgetExceeded { .. }
-                    ) && match (
-                        state.kbs_policy.as_ref(),
-                        kube::Client::try_default().await,
-                    ) {
-                        (Some(config), Ok(client)) => crate::kbs::teardown_unit_already_published(
+                    ) && if let Some(config) = state.kbs_policy.as_ref() {
+                        crate::kbs::teardown_unit_already_published(
                             &state.db,
                             config,
-                            client,
+                            state.kube_client.clone(),
                             deleting_app.id,
                         )
                         .await
-                        .unwrap_or(false),
-                        _ => false,
+                        .unwrap_or(false)
+                    } else {
+                        false
                     };
                     if already_published {
                         tracing::warn!(
@@ -2365,6 +2370,7 @@ pub(crate) async fn delete_app_before(
             .guard_provider(crate::kbs::reconcile_pending_signed_policy_artifacts(
                 &state.db,
                 state.kbs_policy.as_ref(),
+                &state.kube_client,
             ))
             .await
             .map_err(|_| internal_server_error())?
@@ -2432,6 +2438,7 @@ pub(crate) async fn delete_app_before(
     routes_to_remove.dedup();
     delete_mutation
         .guard_provider(crate::edge::remove_haproxy_routes(
+            &state.kube_client,
             &state.db,
             &crate::edge::EdgeRouteConfig::from_env(),
             Some(edge_config_generation),
@@ -2531,9 +2538,7 @@ pub(crate) async fn delete_app_before(
     let kubernetes_mutation_generation =
         enclava_engine::apply::generation::MutationGeneration::new(kubernetes_mutation_generation)
             .map_err(|_| internal_server_error())?;
-    let kubernetes_client = kube::Client::try_default()
-        .await
-        .map_err(|error| app_delete_failure(deleting_app.id, AppDeleteFailure::Namespace, error))?;
+    let kubernetes_client = state.kube_client.clone();
     let kubernetes_namespaces: kube::Api<k8s_openapi::api::core::v1::Namespace> =
         kube::Api::all(kubernetes_client);
     delete_mutation
@@ -2589,6 +2594,7 @@ pub(crate) async fn delete_app_before(
         .guard_provider(crate::kbs::reconcile_policy(
             &state.db,
             state.kbs_policy.as_ref(),
+            &state.kube_client,
         ))
         .await
         .map_err(|_| internal_server_error())?
@@ -2674,6 +2680,7 @@ pub(crate) async fn delete_app_before(
         && let Err(_error) = crate::kbs::reconcile_pending_signed_policy_artifacts(
             &state.db,
             state.kbs_policy.as_ref(),
+            &state.kube_client,
         )
         .await
     {
@@ -3070,6 +3077,7 @@ pub(crate) async fn reconcile_signer_publication(
         .guard_provider(crate::kbs::reconcile_policy(
             &state.db,
             state.kbs_policy.as_ref(),
+            &state.kube_client,
         ))
         .await
     {

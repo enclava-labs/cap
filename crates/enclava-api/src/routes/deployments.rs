@@ -168,6 +168,7 @@ pub(crate) async fn enforce_authoritative_entitlement(
 /// claim keeps the floor (a refusal, never a destructive recovery), and
 /// lookup errors abort the request rather than granting the waiver.
 pub(crate) async fn fresh_volume_claims(
+    client: &kube::Client,
     app: &App,
     resources: &AppResources,
 ) -> Result<enclava_engine::apply::orchestrator::FreshVolumeClaims, crate::deploy::DeployError> {
@@ -178,7 +179,10 @@ pub(crate) async fn fresh_volume_claims(
     if !claims_to_check.app_data && !claims_to_check.tls_data {
         return Ok(enclava_engine::apply::orchestrator::FreshVolumeClaims::NONE);
     }
-    let engine = enclava_engine::apply::engine::ApplyEngine::try_default().await?;
+    let engine = enclava_engine::apply::engine::ApplyEngine::new(
+        client.clone(),
+        enclava_engine::apply::types::ApplyConfig::default(),
+    );
     enclava_engine::apply::orchestrator::inspect_fresh_volume_claims(
         &engine,
         &app.namespace,
@@ -1500,7 +1504,7 @@ async fn deploy_app_candidate(
     let fresh_volume_claims = if app_mutation == AppMutation::Insert {
         enclava_engine::apply::orchestrator::FreshVolumeClaims::ALL
     } else {
-        fresh_volume_claims(&app, &candidate_resources)
+        fresh_volume_claims(&state.kube_client, &app, &candidate_resources)
             .await
             .map_err(|_| {
                 json_error(
@@ -1564,43 +1568,30 @@ async fn deploy_app_candidate(
             .as_deref()
             .is_some_and(|domain| !domain.trim().is_empty())
     {
-        match enclava_engine::apply::engine::ApplyEngine::try_default().await {
-            Ok(engine) => {
-                // Bounded: the probe runs under the acceptance transaction
-                // and the organization lanes, so a slow Kubernetes API must
-                // not pin them (and a pooled connection) for kube-client's
-                // full request timeout. Timeout fails closed like an
-                // in-flight rollout.
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(10),
-                    crate::deploy::workload_rollout_settled(&engine, &app.namespace, &app.name),
-                )
-                .await
-                {
-                    Ok(Ok(settled)) => cluster_workload_settled = settled,
-                    Ok(Err(error)) => {
-                        tracing::warn!(
-                            app_id = %app.id,
-                            error = %error,
-                            "could not verify live rollout settling; failing the roll hold closed"
-                        );
-                        cluster_workload_settled = Some(false);
-                    }
-                    Err(elapsed) => {
-                        tracing::warn!(
-                            app_id = %app.id,
-                            error = %elapsed,
-                            "live rollout settling probe timed out; failing the roll hold closed"
-                        );
-                        cluster_workload_settled = Some(false);
-                    }
-                }
-            }
-            Err(error) => {
+        let engine = enclava_engine::apply::engine::ApplyEngine::new(
+            state.kube_client.clone(),
+            enclava_engine::apply::types::ApplyConfig::default(),
+        );
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            crate::deploy::workload_rollout_settled(&engine, &app.namespace, &app.name),
+        )
+        .await
+        {
+            Ok(Ok(settled)) => cluster_workload_settled = settled,
+            Ok(Err(error)) => {
                 tracing::warn!(
                     app_id = %app.id,
                     error = %error,
-                    "no Kubernetes client for the rollout settling probe; failing the roll hold closed"
+                    "could not verify live rollout settling; failing the roll hold closed"
+                );
+                cluster_workload_settled = Some(false);
+            }
+            Err(elapsed) => {
+                tracing::warn!(
+                    app_id = %app.id,
+                    error = %elapsed,
+                    "live rollout settling probe timed out; failing the roll hold closed"
                 );
                 cluster_workload_settled = Some(false);
             }

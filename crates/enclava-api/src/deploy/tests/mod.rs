@@ -1,4 +1,3 @@
-
 mod creation_ledger_regressions {
     use super::*;
     include!("creation_ledger_regressions.rs");
@@ -8350,9 +8349,12 @@ async fn empty_fleet_publishes_rollout_authority_before_inventory() {
         std::env::set_var("TENANT_IMAGE_PULL_SCOPE_GENERATION", "8");
         std::env::set_var("TENANT_IMAGE_PULL_CREDENTIAL_GENERATION", "4");
     }
-    // A missing local kubeconfig may fail the sweep; publication must
-    // already have happened regardless of any subsequent inventory/work.
-    let _ = cleanup_stale_tenant_image_pull_secrets(&pool).await;
+    // The authority is published before any inventory or Kubernetes work.
+    let client = kube::Client::try_from(kube::Config::new(
+        "http://127.0.0.1:9".parse().expect("static test url"),
+    ))
+    .expect("test kube client");
+    let _ = cleanup_stale_tenant_image_pull_secrets(&pool, &client).await;
     unsafe {
         std::env::remove_var("TENANT_IMAGE_PULL_SCOPE_GENERATION");
         std::env::remove_var("TENANT_IMAGE_PULL_CREDENTIAL_GENERATION");

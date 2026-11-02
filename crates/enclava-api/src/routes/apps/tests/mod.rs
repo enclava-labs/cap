@@ -662,7 +662,11 @@ async fn deletion_retry_preserves_teardown_requirement_before_policy_revocation(
     crate::kbs::TEST_KUBE_CLIENT
         .scope(
             kbs_policy_kube_client(provider.clone()),
-            crate::kbs::reconcile_pending_signed_policy_artifacts(&pool, state.kbs_policy.as_ref()),
+            crate::kbs::reconcile_pending_signed_policy_artifacts(
+                &pool,
+                state.kbs_policy.as_ref(),
+                &state.kube_client,
+            ),
         )
         .await
         .expect("publish the running workload's authority");

@@ -11,7 +11,7 @@ use enclava_engine::apply::{
     orchestrator::{MANIFEST_HASH_ANNOTATION, manifest_hash},
     resources::{apply_namespaced_resource, apply_standard_resources_with_service_account},
     statefulset::apply_statefulset,
-    types::{DeployPhase, DeployStatus as EngineDeployStatus},
+    types::{ApplyConfig, DeployPhase, DeployStatus as EngineDeployStatus},
     watch::watch_rollout,
 };
 use enclava_engine::manifest::generate_all_manifests;
@@ -3784,7 +3784,10 @@ async fn publish_missing_namespace_pull_secret_lease(
 /// the dispatcher would re-apply workloads and re-attach secrets while a
 /// stale platform token is still exposed. The per-deploy cleanup in
 /// [`apply_all_with_tenant_image_pull_secret`] remains the hard gate.
-pub async fn cleanup_stale_tenant_image_pull_secrets_at_startup(pool: &PgPool) -> bool {
+pub async fn cleanup_stale_tenant_image_pull_secrets_at_startup(
+    pool: &PgPool,
+    client: &kube::Client,
+) -> bool {
     // No whole-sweep timeout (Codex review on #243, P1 follow-up): every
     // namespace's reconciliation is individually bounded by
     // `sweep_namespace_with_budget`, so the sweep always terminates — a
@@ -3793,7 +3796,7 @@ pub async fn cleanup_stale_tenant_image_pull_secrets_at_startup(pool: &PgPool) -
     // the sweep at an arbitrary namespace and make every retry restart from
     // the first one, deterministically starving the tail namespaces on
     // clusters whose healthy traversal exceeds the budget.
-    match cleanup_stale_tenant_image_pull_secrets(pool).await {
+    match cleanup_stale_tenant_image_pull_secrets(pool, client).await {
         Ok(true) => true,
         Ok(false) => {
             tracing::error!(
@@ -3900,7 +3903,10 @@ async fn namespace_absent(
     )
 }
 
-async fn cleanup_stale_tenant_image_pull_secrets(pool: &PgPool) -> Result<bool, DeployError> {
+async fn cleanup_stale_tenant_image_pull_secrets(
+    pool: &PgPool,
+    client: &kube::Client,
+) -> Result<bool, DeployError> {
     let settings = PullSecretSettings::from_env();
     let config = tenant_image_pull_secret_config_from_env();
 
@@ -4014,7 +4020,7 @@ async fn cleanup_stale_tenant_image_pull_secrets(pool: &PgPool) -> Result<bool, 
             .push((service_account, images));
     }
 
-    let engine = ApplyEngine::try_default().await?;
+    let engine = ApplyEngine::new(client.clone(), ApplyConfig::default());
     // A failed write leaves the platform token exposed in the namespace — the
     // sweep must report that as not-converged, not "sweep complete" (review
     // finding): the caller keeps workload admission closed on it and retries.
@@ -6892,7 +6898,9 @@ pub async fn ingress_restart_verdict(
 /// the restart only re-opens already-initialized volumes.
 ///
 /// Returns `DeployError::NotDeployed` when the app has no live StatefulSet yet.
+#[allow(clippy::too_many_arguments)]
 pub async fn reapply_tenant_ingress(
+    client: &kube::Client,
     pool: &PgPool,
     app: &App,
     attestation_config: Option<&AttestationConfig>,
@@ -6921,9 +6929,8 @@ pub async fn reapply_tenant_ingress(
     let cm = enclava_engine::manifest::ingress::generate_ingress_configmap(&app_spec);
 
     let ledger = crate::deployment_failure_cleanup::load_creation_ledger(pool, app.id).await?;
-    let engine = ApplyEngine::try_default()
-        .await?
-        .with_creation_ledger(ledger);
+    let engine =
+        ApplyEngine::new(client.clone(), ApplyConfig::default()).with_creation_ledger(ledger);
     // Domain-only reapply: the pod restart re-opens existing volumes, so the
     // base rollout budget applies — the fresh-initialization allowance is
     // reserved for renders that provision a new claim.
@@ -7294,6 +7301,7 @@ async fn record_workload_spec_published(
 /// Apply manifests and return durable rollout-observation context.
 pub async fn apply_deployment_manifests(
     request: ApplyDeploymentManifestsRequest,
+    client: &kube::Client,
     mutation: &crate::mutation_leases::AppMutationLease,
 ) -> Result<Option<DeploymentRollout>, DeployError> {
     let ApplyDeploymentManifestsRequest {
@@ -7396,6 +7404,7 @@ pub async fn apply_deployment_manifests(
             crate::kbs::reconcile_pending_signed_policy_artifacts(
                 &pool,
                 kbs_policy_config.as_ref(),
+                client,
             )
             .await?;
         } else {
@@ -7408,7 +7417,7 @@ pub async fn apply_deployment_manifests(
     } else {
         crate::kbs::ensure_owner_binding(&pool, kbs_policy_config.as_ref(), &app_spec).await?;
         crate::kbs::ensure_tls_binding(&pool, kbs_policy_config.as_ref(), &app_spec).await?;
-        crate::kbs::reconcile_policy(&pool, kbs_policy_config.as_ref()).await?;
+        crate::kbs::reconcile_policy(&pool, kbs_policy_config.as_ref(), client).await?;
     }
 
     let generation = MutationGeneration::new(kubernetes_mutation_generation)?;
@@ -7453,9 +7462,11 @@ pub async fn apply_deployment_manifests(
     // (`crate::deployment_failure_cleanup`) so publication and removal can
     // never diverge.
     let app_target =
-        crate::edge::resolve_backend_target(&app_spec.name, &app_spec.namespace, 443).await?;
+        crate::edge::resolve_backend_target(client, &app_spec.name, &app_spec.namespace, 443)
+            .await?;
     let tee_target =
-        crate::edge::resolve_backend_target(&app_spec.name, &app_spec.namespace, 8081).await?;
+        crate::edge::resolve_backend_target(client, &app_spec.name, &app_spec.namespace, 8081)
+            .await?;
     let mut routes = Vec::with_capacity(3);
     for (tag, host) in crate::deploy::app_route_hosts(&app) {
         let backend = crate::edge::backend_name_for(&org_slug, &app_spec.name, tag)?;
@@ -7465,8 +7476,14 @@ pub async fn apply_deployment_manifests(
         };
         routes.push(crate::edge::SniRoute::new(&host, &backend, target)?);
     }
-    crate::edge::ensure_haproxy_routes(&pool, &edge_config, Some(edge_config_generation), &routes)
-        .await?;
+    crate::edge::ensure_haproxy_routes(
+        client,
+        &pool,
+        &edge_config,
+        Some(edge_config_generation),
+        &routes,
+    )
+    .await?;
 
     Ok(Some(DeploymentRollout {
         app,
