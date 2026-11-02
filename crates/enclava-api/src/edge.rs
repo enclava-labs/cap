@@ -244,8 +244,8 @@ pub async fn reconcile_all_haproxy_routes_at_startup(
     }
 }
 
-pub fn spawn_haproxy_reconciler(state: AppState) {
-    tokio::spawn(async move {
+pub fn spawn_haproxy_reconciler(state: AppState, shutdown: tokio_util::sync::CancellationToken) {
+    crate::reconciler::spawn_reconciler("haproxy-reconciler", shutdown, async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             match haproxy_routes_need_reconciliation(&state).await {

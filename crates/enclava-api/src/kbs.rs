@@ -1901,11 +1901,14 @@ pub async fn reconcile_signed_policy_at_startup(
 /// Recover a committed desired generation after process or provider failure.
 /// The resource-only lease is shared with app apply/delete paths, so this loop
 /// also works after the final app row and its artifacts have cascaded away.
-pub fn spawn_signed_policy_reconciler(state: crate::state::AppState) {
+pub fn spawn_signed_policy_reconciler(
+    state: crate::state::AppState,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
     if state.kbs_policy.is_none() {
         return;
     }
-    tokio::spawn(async move {
+    crate::reconciler::spawn_reconciler("signed-policy-reconciler", shutdown, async move {
         loop {
             match reconcile_signed_policy_once(&state).await {
                 Ok(()) => {}

@@ -347,8 +347,8 @@ pub async fn purge_expired_device_login_sessions(db: &PgPool) -> Result<u64, sql
 
 /// Hourly reaper for expired device-login sessions (see
 /// `purge_expired_device_login_sessions`).
-pub fn spawn_device_login_reaper(db: PgPool) {
-    tokio::spawn(async move {
+pub fn spawn_device_login_reaper(db: PgPool, shutdown: tokio_util::sync::CancellationToken) {
+    crate::reconciler::spawn_reconciler("device-login-reaper", shutdown, async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {

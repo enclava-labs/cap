@@ -1087,13 +1087,31 @@ async fn main() {
         .await
         .expect("failed to bind");
     tracing::info!("startup liveness listening on {}", bind_addr);
-    let server = tokio::spawn(async move {
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .await
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let signal_shutdown = shutdown.clone();
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("failed to install SIGTERM handler");
+    tokio::spawn(async move {
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                result.expect("failed to listen for Ctrl-C");
+            }
+            _ = terminate.recv() => {}
+        }
+        tracing::info!("shutdown signal received; stopping background tasks");
+        signal_shutdown.cancel();
     });
+    let server = {
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown.clone().cancelled_owned())
+            .await
+        })
+    };
 
     let pull_secret_sweep_converged =
         enclava_api::deploy::cleanup_stale_tenant_image_pull_secrets_at_startup(&state.db).await;
@@ -1124,8 +1142,12 @@ async fn main() {
                 .await
                 .map_err(anyhow::Error::from)
         }),
-        (deployment_dispatch_enabled && dispatch_admission)
-            .then_some(|| enclava_api::deployment_jobs::spawn_deployment_dispatcher(state.clone())),
+        (deployment_dispatch_enabled && dispatch_admission).then_some(|| {
+            enclava_api::deployment_jobs::spawn_deployment_dispatcher(
+                state.clone(),
+                shutdown.clone(),
+            )
+        }),
         || state.mark_startup_ready(),
     )
     .await
@@ -1134,11 +1156,11 @@ async fn main() {
         std::process::exit(1);
     }
     if !edge_reconciliation_disabled {
-        enclava_api::edge::spawn_haproxy_reconciler(state.clone());
+        enclava_api::edge::spawn_haproxy_reconciler(state.clone(), shutdown.clone());
     }
-    enclava_api::kbs::spawn_signed_policy_reconciler(state.clone());
-    enclava_api::routes::auth::spawn_device_login_reaper(state.db.clone());
-    enclava_api::auth::nostr::spawn_nip98_replay_cache_reaper(state.db.clone());
+    enclava_api::kbs::spawn_signed_policy_reconciler(state.clone(), shutdown.clone());
+    enclava_api::routes::auth::spawn_device_login_reaper(state.db.clone(), shutdown.clone());
+    enclava_api::auth::nostr::spawn_nip98_replay_cache_reaper(state.db.clone(), shutdown.clone());
     if !deployment_dispatch_enabled {
         tracing::info!(
             "workload mutation and durable deployment dispatch are disabled \
@@ -1155,6 +1177,7 @@ async fn main() {
         state.clone(),
         deployment_dispatch_enabled,
         dispatch_admission,
+        shutdown.clone(),
     );
     tracing::info!("startup reconciliation complete; API is ready");
 
@@ -1195,8 +1218,9 @@ fn spawn_pull_secret_sweep_reconciler(
     state: AppState,
     deployment_dispatch_enabled: bool,
     dispatch_admission: bool,
+    shutdown: tokio_util::sync::CancellationToken,
 ) {
-    tokio::spawn(async move {
+    enclava_api::reconciler::spawn_reconciler("pull-secret-sweep", shutdown.clone(), async move {
         let mut backoff = std::time::Duration::from_secs(2);
         // The startup sweep already converged: the dispatcher is running and
         // admission is open.
@@ -1209,7 +1233,10 @@ fn spawn_pull_secret_sweep_reconciler(
                 if deployment_dispatch_enabled && !dispatcher_spawned {
                     // Dispatcher first, admission second: whenever a workload
                     // mutation is admitted, the dispatcher is already running.
-                    enclava_api::deployment_jobs::spawn_deployment_dispatcher(state.clone());
+                    enclava_api::deployment_jobs::spawn_deployment_dispatcher(
+                        state.clone(),
+                        shutdown.clone(),
+                    );
                     state.set_deployment_dispatch_enabled(true);
                     dispatcher_spawned = true;
                     tracing::info!(

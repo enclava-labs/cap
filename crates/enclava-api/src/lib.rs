@@ -16,6 +16,7 @@ pub mod models;
 pub mod mutation_leases;
 pub mod platform_release;
 pub mod ratelimit;
+pub mod reconciler;
 pub mod registry;
 pub mod routes;
 pub mod signing_service;

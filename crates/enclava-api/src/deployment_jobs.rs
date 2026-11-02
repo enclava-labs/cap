@@ -1752,9 +1752,9 @@ async fn release_cleanup_for_retry_in_tx(
 /// Start the durable dispatcher after migrations and runtime configuration
 /// have loaded.  Every API replica may run this loop; `FOR UPDATE SKIP LOCKED`
 /// and lease tokens ensure that only one owns a job at a time.
-pub fn spawn_deployment_dispatcher(state: AppState) {
+pub fn spawn_deployment_dispatcher(state: AppState, shutdown: tokio_util::sync::CancellationToken) {
     let repair_state = state.clone();
-    tokio::spawn(async move {
+    crate::reconciler::spawn_reconciler("orphan-lease-repair", shutdown.clone(), async move {
         loop {
             match crate::mutation_leases::reconcile_orphaned_deployment_apply_leases(
                 &repair_state.db,
@@ -1790,7 +1790,7 @@ pub fn spawn_deployment_dispatcher(state: AppState) {
     // held up by slow/unreachable API servers, so it runs on its own task:
     // orphaned-apply repair must never wait behind a stalled namespace GET.
     let retained_state = state.clone();
-    tokio::spawn(async move {
+    crate::reconciler::spawn_reconciler("retained-fence-release", shutdown.clone(), async move {
         loop {
             // Retained-namespace fences from incomplete failed-apply teardowns
             // are released only after reconciliation observes the namespace
@@ -1817,7 +1817,7 @@ pub fn spawn_deployment_dispatcher(state: AppState) {
     let configured_apply_workers =
         apply_worker_limit(state.deployment_apply_permits.available_permits());
     let apply_worker_slots = Arc::new(tokio::sync::Semaphore::new(configured_apply_workers));
-    tokio::spawn(async move {
+    crate::reconciler::spawn_reconciler("deployment-dispatcher", shutdown.clone(), async move {
         loop {
             let mut found_work = false;
 
