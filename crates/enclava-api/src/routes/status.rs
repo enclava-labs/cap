@@ -288,19 +288,25 @@ pub(crate) async fn observe_app_status_fields_for_deployment(
     expected_deployment_id: Option<Uuid>,
 ) -> ObservedAppStatus {
     let (kubernetes, tee) = tokio::join!(
-        probe_kubernetes(namespace, app_name, expected_deployment_id),
+        probe_kubernetes(
+            &state.kube_client,
+            namespace,
+            app_name,
+            expected_deployment_id
+        ),
         probe_tee(state, app_id, namespace, app_name, domain, tee_domain)
     );
     classify_live_observation_for_deployment(kubernetes, tee, Utc::now(), expected_deployment_id)
 }
 
 async fn probe_kubernetes(
+    client: &kube::Client,
     namespace: &str,
     app_name: &str,
     expected_deployment_id: Option<Uuid>,
 ) -> KubernetesEvidence {
     bounded_kubernetes_probe(
-        probe_kubernetes_unbounded(namespace, app_name, expected_deployment_id),
+        probe_kubernetes_unbounded(client, namespace, app_name, expected_deployment_id),
         KUBERNETES_STATUS_PROBE_TIMEOUT,
     )
     .await
@@ -316,14 +322,12 @@ where
 }
 
 async fn probe_kubernetes_unbounded(
+    client: &kube::Client,
     namespace: &str,
     app_name: &str,
     expected_deployment_id: Option<Uuid>,
 ) -> KubernetesEvidence {
-    let Ok(client) = kube::Client::try_default().await else {
-        return KubernetesEvidence::Unavailable;
-    };
-    let pods: Api<Pod> = Api::namespaced(client, namespace);
+    let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
     let Ok(list) = pods
         .list(&ListParams::default().labels(&pod_label_selector(app_name)))
         .await
@@ -603,21 +607,26 @@ async fn probe_tee_unbounded(
         // Socket-resolution failures are emitted through the probe warning
         // limiter below (stage `resolve_socket`), sharing the per-app
         // rate limit instead of an untagged per-request warn (#219 review).
-        let socket =
-            match crate::routes::logs::resolve_internal_tee_socket(app_name, namespace).await {
-                Ok(socket) => socket,
-                Err(detail) => {
-                    warn_tee_probe_failure(
-                        state,
-                        app_id,
-                        app_name,
-                        namespace,
-                        "resolve_socket",
-                        &detail,
-                    );
-                    return TeeEvidence::Unavailable;
-                }
-            };
+        let socket = match crate::routes::logs::resolve_internal_tee_socket(
+            &state.kube_client,
+            app_name,
+            namespace,
+        )
+        .await
+        {
+            Ok(socket) => socket,
+            Err(detail) => {
+                warn_tee_probe_failure(
+                    state,
+                    app_id,
+                    app_name,
+                    namespace,
+                    "resolve_socket",
+                    &detail,
+                );
+                return TeeEvidence::Unavailable;
+            }
+        };
         let client =
             match crate::routes::logs::build_resolved_tenant_tee_http_client(domain, socket) {
                 Ok(client) => client,

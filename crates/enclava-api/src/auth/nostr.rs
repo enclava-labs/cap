@@ -286,10 +286,13 @@ async fn reap_nip98_replay_cache_batch(
 /// Periodically purge expired replay-cache rows so the table stays bounded
 /// (worst-case accumulation between purges: retention + one tick interval,
 /// see the `NIP98_REPLAY_CACHE_*` constants above).
-pub fn spawn_nip98_replay_cache_reaper(pool: PgPool) {
+pub fn spawn_nip98_replay_cache_reaper(
+    pool: PgPool,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
     use tokio::time::{MissedTickBehavior, interval};
 
-    tokio::spawn(async move {
+    crate::reconciler::spawn_reconciler("nip98-replay-cache-reaper", shutdown, async move {
         // First tick fires immediately, which also cleans up any backlog
         // left by a previous instance.
         let mut interval = interval(NIP98_REPLAY_CACHE_REAP_INTERVAL);

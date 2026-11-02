@@ -366,18 +366,7 @@ pub(crate) async fn sweep_published_objects_from_adopted_namespace(
     // deployment_apply_jobs behind a CHECK that cannot hold this one).
     evidence_loss_unresolved: bool,
 ) -> usize {
-    let client = match kube::Client::try_default().await {
-        Ok(client) => client,
-        Err(error) => {
-            tracing::warn!(
-                app_id = %app.id,
-                namespace = %app.namespace,
-                error = %error,
-                "adopted-namespace sweep cannot reach Kubernetes; leaving published objects for reconciliation"
-            );
-            return usize::MAX;
-        }
-    };
+    let client = state.kube_client.clone();
     let sweep_deadline = tokio::time::Instant::now() + SWEEP_DEADLINE;
     // The legacy temporal bound (devin 🔴 round-6): rows published before
     // the `apply_started_at` column existed (manifest_hash set,
@@ -1845,6 +1834,7 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
         Ok(ledger) => {
             match mutation
                 .guard_provider(classify_failed_generation_namespace(
+                    &state.kube_client,
                     app,
                     &namespace_generations,
                     provenance_incomplete,
@@ -2038,6 +2028,7 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
             } else {
                 match mutation
                     .guard_provider(delete_owned_namespace(
+                        &state.kube_client,
                         app,
                         &namespace_generations,
                         provenance_incomplete,
@@ -2434,6 +2425,7 @@ async fn remove_failed_generation_edge_routes(
     }
 
     if let Err(error) = crate::edge::remove_haproxy_routes(
+        &state.kube_client,
         &state.db,
         &crate::edge::EdgeRouteConfig::from_env(),
         Some(edge_config_generation),
@@ -2615,25 +2607,13 @@ pub(crate) fn classify_initial_namespace_get(
 /// classification cannot retain the namespace fence (no delete could have
 /// been issued yet).
 async fn classify_failed_generation_namespace(
+    client: &kube::Client,
     app: &App,
     generations: &[MutationGeneration],
     provenance_incomplete: bool,
     creation_ledger: &enclava_engine::apply::creation_ledger::CreationLedgerBuffer,
 ) -> InitialNamespaceOwnership {
-    let client = match kube::Client::try_default().await {
-        Ok(client) => client,
-        Err(error) => {
-            tracing::warn!(
-                app_id = %app.id,
-                namespace = %app.namespace,
-                error = %error,
-                "failed-apply cleanup cannot reach Kubernetes; skipping namespace deletion"
-            );
-            // No delete was issued through this path.
-            return InitialNamespaceOwnership::Uninspectable;
-        }
-    };
-    let api: kube::Api<k8s_openapi::api::core::v1::Namespace> = kube::Api::all(client);
+    let api: kube::Api<k8s_openapi::api::core::v1::Namespace> = kube::Api::all(client.clone());
     // Bound the probe: a stalled API server must not hold the failed
     // mutation's shared fences for the client's ~295 s read timeout on
     // this pre-teardown GET (it is outside both the sweep deadline and
@@ -2662,13 +2642,14 @@ async fn classify_failed_generation_namespace(
 /// object that no longer classifies as ours also completes — the newer
 /// deployment now owns it.
 ///
-/// Failures BEFORE the delete could have been accepted (client creation,
-/// transport rejection) return `ReleaseNormally` via [`NamespaceTeardown::ConfirmedAbsent`]
+/// Failures BEFORE the delete could have been accepted (transport rejection)
+/// return `ReleaseNormally` via [`NamespaceTeardown::ConfirmedAbsent`]
 /// semantics handled by the caller only when absence is proven; here they
 /// map to a distinct pre-acceptance outcome so the caller need not retain
 /// the fence for a delete that was never issued. Failures after issuance
 /// (or ambiguous ones) are `DeleteIncomplete` and retain the fence.
 async fn delete_owned_namespace(
+    client: &kube::Client,
     app: &App,
     generations: &[MutationGeneration],
     provenance_incomplete: bool,
@@ -2676,22 +2657,7 @@ async fn delete_owned_namespace(
     owned_resource_version: String,
     creation_ledger: &enclava_engine::apply::creation_ledger::CreationLedgerBuffer,
 ) -> NamespaceTeardown {
-    let client = match kube::Client::try_default().await {
-        Ok(client) => client,
-        Err(error) => {
-            tracing::warn!(
-                app_id = %app.id,
-                namespace = %app.namespace,
-                error = %error,
-                "failed-apply cleanup cannot reach Kubernetes before issuing the namespace delete; no delete was sent"
-            );
-            // Pre-acceptance: no DELETE reached the API server, so there
-            // is nothing in flight to converge — but the namespace IS
-            // still live, so this is not confirmed absence either.
-            return NamespaceTeardown::DeleteNotIssued;
-        }
-    };
-    let api: kube::Api<k8s_openapi::api::core::v1::Namespace> = kube::Api::all(client);
+    let api: kube::Api<k8s_openapi::api::core::v1::Namespace> = kube::Api::all(client.clone());
 
     let pinned_uid = owned_uid;
     let mut pinned_resource_version = owned_resource_version;

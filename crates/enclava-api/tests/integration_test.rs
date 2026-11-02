@@ -174,6 +174,10 @@ async fn setup_test_state_with_mode(management_mode: CapManagementMode) -> (AppS
     let side_effect_admission = enclava_api::state::side_effect_admission_for_pool(&pool);
     let state = AppState {
         db: pool.clone(),
+        kube_client: kube::Client::try_from(kube::Config::new(
+            "http://127.0.0.1:9".parse().expect("static test url"),
+        ))
+        .expect("test kube client"),
         management_mode,
         deployment_dispatch_enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         startup_ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),

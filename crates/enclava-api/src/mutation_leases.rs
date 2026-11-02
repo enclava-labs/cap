@@ -1234,23 +1234,13 @@ pub async fn reconcile_orphaned_deployment_apply_leases(
 /// the CAS makes the release exactly-once and harmless to race.
 pub async fn release_retained_deployment_namespace_fences(
     pool: &PgPool,
+    client: &kube::Client,
 ) -> Result<u64, MutationLeaseError> {
     let retained = select_expired_retained_namespace_fences(pool).await?;
     if retained.is_empty() {
         return Ok(0);
     }
-    let client = match kube::Client::try_default().await {
-        Ok(client) => client,
-        Err(error) => {
-            // No Kubernetes authority to observe: retain every fence.
-            tracing::warn!(
-                error = %error,
-                "retained-namespace fence reconciliation cannot reach Kubernetes; retaining fences"
-            );
-            return Ok(0);
-        }
-    };
-    release_retained_deployment_namespace_fences_with(pool, client).await
+    release_retained_deployment_namespace_fences_with(pool, client.clone()).await
 }
 
 /// Expired retained namespace fences to probe this pass. `ORDER BY

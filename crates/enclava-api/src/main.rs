@@ -3,6 +3,7 @@ use axum::Extension;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::DecodePrivateKey;
 use enclava_common::image::ImageRef;
+use enclava_engine::apply::{engine::ApplyEngine, types::ApplyConfig};
 use enclava_engine::types::{AttestationConfig, CaddyTlsMode};
 use rand::rngs::OsRng;
 use std::sync::Arc;
@@ -52,6 +53,16 @@ fn validate_edge_reconciliation_mode(
         );
     }
     Ok(())
+}
+
+fn kubernetes_required(
+    management_mode: CapManagementMode,
+    deployment_dispatch_enabled: bool,
+    edge_reconciliation_disabled: bool,
+) -> bool {
+    management_mode == CapManagementMode::PaasManaged
+        || deployment_dispatch_enabled
+        || !edge_reconciliation_disabled
 }
 
 fn env_nonempty(name: &str) -> Option<String> {
@@ -719,6 +730,10 @@ where
     Ok(())
 }
 
+// Below Kubernetes' default 30 s grace period so a SIGTERM'd pod still exits
+// by itself before the kubelet escalates to SIGKILL.
+const SHUTDOWN_DRAIN: std::time::Duration = std::time::Duration::from_secs(20);
+
 #[tokio::main]
 async fn main() {
     bootstrap_runtime_crypto_provider();
@@ -1032,8 +1047,32 @@ async fn main() {
     // cluster must not make startup probes restart us before /livez exists.
     // The shared atomic is opened only after the initial sweep converges.
     let mut dispatch_admission = false;
+    let kube_client = match kube::Client::try_default().await {
+        Ok(client) => client,
+        Err(error)
+            if kubernetes_required(
+                management_mode,
+                deployment_dispatch_enabled,
+                edge_reconciliation_disabled,
+            ) =>
+        {
+            panic!("failed to configure the Kubernetes client: {error:?}");
+        }
+        Err(error) => {
+            // Kubernetes is optional in this configuration: every kube call
+            // fails per request with an error naming the missing cluster.
+            tracing::warn!("Kubernetes client not configured: {error}");
+            kube::Client::try_from(kube::Config::new(
+                "http://kubernetes-not-configured.invalid"
+                    .parse()
+                    .expect("static url"),
+            ))
+            .expect("failed to build unconfigured Kubernetes client")
+        }
+    };
     let state = AppState {
         db: pool,
+        kube_client: kube_client.clone(),
         management_mode,
         deployment_dispatch_enabled: Arc::new(std::sync::atomic::AtomicBool::new(
             dispatch_admission,
@@ -1069,11 +1108,10 @@ async fn main() {
     };
 
     let desired_state_engine = if management_mode == CapManagementMode::PaasManaged {
-        Some(Arc::new(
-            enclava_engine::apply::engine::ApplyEngine::try_default()
-                .await
-                .expect("failed to configure Kubernetes client for PaaS desired-state routes"),
-        ))
+        Some(Arc::new(ApplyEngine::new(
+            kube_client.clone(),
+            ApplyConfig::default(),
+        )))
     } else {
         None
     };
@@ -1087,16 +1125,43 @@ async fn main() {
         .await
         .expect("failed to bind");
     tracing::info!("startup liveness listening on {}", bind_addr);
-    let server = tokio::spawn(async move {
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .await
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let signal_shutdown = shutdown.clone();
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("failed to install SIGTERM handler");
+    tokio::spawn(async move {
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                result.expect("failed to listen for Ctrl-C");
+            }
+            _ = terminate.recv() => {}
+        }
+        tracing::info!("shutdown signal received; stopping background tasks");
+        signal_shutdown.cancel();
+        // Bound the drain: follow streams and startup convergence otherwise
+        // block exit until Kubernetes kills the pod.
+        tokio::time::sleep(SHUTDOWN_DRAIN).await;
+        tracing::warn!("graceful shutdown drain expired; forcing exit");
+        std::process::exit(0);
     });
+    let server = {
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown.clone().cancelled_owned())
+            .await
+        })
+    };
 
     let pull_secret_sweep_converged =
-        enclava_api::deploy::cleanup_stale_tenant_image_pull_secrets_at_startup(&state.db).await;
+        enclava_api::deploy::cleanup_stale_tenant_image_pull_secrets_at_startup(
+            &state.db,
+            &state.kube_client,
+        )
+        .await;
     dispatch_admission = deployment_dispatch_enabled && pull_secret_sweep_converged;
     if dispatch_admission {
         state.set_deployment_dispatch_enabled(true);
@@ -1124,8 +1189,12 @@ async fn main() {
                 .await
                 .map_err(anyhow::Error::from)
         }),
-        (deployment_dispatch_enabled && dispatch_admission)
-            .then_some(|| enclava_api::deployment_jobs::spawn_deployment_dispatcher(state.clone())),
+        (deployment_dispatch_enabled && dispatch_admission).then_some(|| {
+            enclava_api::deployment_jobs::spawn_deployment_dispatcher(
+                state.clone(),
+                shutdown.clone(),
+            )
+        }),
         || state.mark_startup_ready(),
     )
     .await
@@ -1134,11 +1203,11 @@ async fn main() {
         std::process::exit(1);
     }
     if !edge_reconciliation_disabled {
-        enclava_api::edge::spawn_haproxy_reconciler(state.clone());
+        enclava_api::edge::spawn_haproxy_reconciler(state.clone(), shutdown.clone());
     }
-    enclava_api::kbs::spawn_signed_policy_reconciler(state.clone());
-    enclava_api::routes::auth::spawn_device_login_reaper(state.db.clone());
-    enclava_api::auth::nostr::spawn_nip98_replay_cache_reaper(state.db.clone());
+    enclava_api::kbs::spawn_signed_policy_reconciler(state.clone(), shutdown.clone());
+    enclava_api::routes::auth::spawn_device_login_reaper(state.db.clone(), shutdown.clone());
+    enclava_api::auth::nostr::spawn_nip98_replay_cache_reaper(state.db.clone(), shutdown.clone());
     if !deployment_dispatch_enabled {
         tracing::info!(
             "workload mutation and durable deployment dispatch are disabled \
@@ -1155,6 +1224,7 @@ async fn main() {
         state.clone(),
         deployment_dispatch_enabled,
         dispatch_admission,
+        shutdown.clone(),
     );
     tracing::info!("startup reconciliation complete; API is ready");
 
@@ -1195,21 +1265,28 @@ fn spawn_pull_secret_sweep_reconciler(
     state: AppState,
     deployment_dispatch_enabled: bool,
     dispatch_admission: bool,
+    shutdown: tokio_util::sync::CancellationToken,
 ) {
-    tokio::spawn(async move {
+    enclava_api::reconciler::spawn_reconciler("pull-secret-sweep", shutdown.clone(), async move {
         let mut backoff = std::time::Duration::from_secs(2);
         // The startup sweep already converged: the dispatcher is running and
         // admission is open.
         let mut dispatcher_spawned = dispatch_admission;
         loop {
             tokio::time::sleep(backoff).await;
-            if enclava_api::deploy::cleanup_stale_tenant_image_pull_secrets_at_startup(&state.db)
-                .await
+            if enclava_api::deploy::cleanup_stale_tenant_image_pull_secrets_at_startup(
+                &state.db,
+                &state.kube_client,
+            )
+            .await
             {
                 if deployment_dispatch_enabled && !dispatcher_spawned {
                     // Dispatcher first, admission second: whenever a workload
                     // mutation is admitted, the dispatcher is already running.
-                    enclava_api::deployment_jobs::spawn_deployment_dispatcher(state.clone());
+                    enclava_api::deployment_jobs::spawn_deployment_dispatcher(
+                        state.clone(),
+                        shutdown.clone(),
+                    );
                     state.set_deployment_dispatch_enabled(true);
                     dispatcher_spawned = true;
                     tracing::info!(
@@ -1245,6 +1322,31 @@ fn spawn_pull_secret_sweep_reconciler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kubernetes_is_optional_only_in_compose_mode() {
+        assert!(kubernetes_required(
+            CapManagementMode::PaasManaged,
+            false,
+            true
+        ));
+        assert!(kubernetes_required(
+            CapManagementMode::Standalone,
+            true,
+            true
+        ));
+        assert!(kubernetes_required(
+            CapManagementMode::Standalone,
+            false,
+            false
+        ));
+        // Compose: standalone, no dispatch, edge reconciliation disabled.
+        assert!(!kubernetes_required(
+            CapManagementMode::Standalone,
+            false,
+            true
+        ));
+    }
 
     #[test]
     fn sweep_retry_backoff_is_bounded() {

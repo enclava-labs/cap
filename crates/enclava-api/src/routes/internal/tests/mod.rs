@@ -4392,6 +4392,9 @@ async fn app_delete_retry_finishes_after_namespace_removal() {
         .with_test_writer()
         .init();
     let (mut state, auth, app_name, app_id) = app_delete_fixture().await;
+    state.kube_client = kube::Client::try_default()
+        .await
+        .expect("fixture kubeconfig");
     // The missing KBS config fails after both namespace teardown and soft deletes.
     state.kbs_policy = None;
     state.dns = Some(crate::dns::DnsConfig {
@@ -4648,6 +4651,9 @@ async fn app_delete_retry_finishes_after_teardown_completion_marker() {
         .with_test_writer()
         .init();
     let (mut state, auth, app_name, app_id) = app_delete_fixture().await;
+    state.kube_client = kube::Client::try_default()
+        .await
+        .expect("fixture kubeconfig");
     // A running app holds confidential state: teardown is required and the
     // pre-delete decision must survive the deleting transition. The
     // fixture's .test tee domain fails teardown resolution instantly
@@ -4921,6 +4927,9 @@ async fn abandoned_destroy_records_waiver_and_blocks_recreate() {
         .with_test_writer()
         .init();
     let (mut state, auth, app_name, app_id) = app_delete_fixture().await;
+    state.kube_client = kube::Client::try_default()
+        .await
+        .expect("fixture kubeconfig");
     sqlx::query("UPDATE apps SET status = 'running' WHERE id = $1")
         .bind(app_id)
         .execute(&state.db)

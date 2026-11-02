@@ -146,12 +146,13 @@ impl SniRoute {
 
 /// Insert two SNI routes (app + TEE) for an app under a single advisory lock.
 pub async fn ensure_haproxy_routes(
+    client: &Client,
     pool: &PgPool,
     config: &EdgeRouteConfig,
     mutation_generation: Option<i64>,
     routes: &[SniRoute],
 ) -> Result<(), EdgeRouteError> {
-    mutate_haproxy_config(pool, config, mutation_generation, |current| {
+    mutate_haproxy_config(client, pool, config, mutation_generation, |current| {
         let mut out = current.to_string();
         for r in routes {
             out = render_route_into(&out, r);
@@ -167,12 +168,13 @@ pub async fn ensure_haproxy_routes(
 }
 
 pub async fn remove_haproxy_routes(
+    client: &Client,
     pool: &PgPool,
     config: &EdgeRouteConfig,
     mutation_generation: Option<i64>,
     routes: &[(String, String)],
 ) -> Result<(), EdgeRouteError> {
-    let changed = mutate_haproxy_config(pool, config, mutation_generation, |current| {
+    let changed = mutate_haproxy_config(client, pool, config, mutation_generation, |current| {
         let mut out = current.to_string();
         for (backend, host) in routes {
             out = remove_route_from(&out, backend, host);
@@ -215,7 +217,7 @@ async fn reconcile_all_haproxy_routes_for_generation(
     state: &AppState,
     generation: i64,
 ) -> Result<(), EdgeRouteError> {
-    let client = Client::try_default().await?;
+    let client = state.kube_client.clone();
     let config = EdgeRouteConfig::from_env();
     let routes = load_desired_haproxy_routes(&state.db, client.clone()).await?;
     // This full rebuild owns the global fence and reloads authoritative state
@@ -244,8 +246,8 @@ pub async fn reconcile_all_haproxy_routes_at_startup(
     }
 }
 
-pub fn spawn_haproxy_reconciler(state: AppState) {
-    tokio::spawn(async move {
+pub fn spawn_haproxy_reconciler(state: AppState, shutdown: tokio_util::sync::CancellationToken) {
+    crate::reconciler::spawn_reconciler("haproxy-reconciler", shutdown, async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             match haproxy_routes_need_reconciliation(&state).await {
@@ -270,7 +272,7 @@ pub fn spawn_haproxy_reconciler(state: AppState) {
 }
 
 async fn haproxy_routes_need_reconciliation(state: &AppState) -> Result<bool, EdgeRouteError> {
-    let client = Client::try_default().await?;
+    let client = state.kube_client.clone();
     let config = EdgeRouteConfig::from_env();
     let routes = load_desired_haproxy_routes(&state.db, client.clone()).await?;
     let cm_api: Api<ConfigMap> = Api::namespaced(client.clone(), &config.namespace);
@@ -409,6 +411,7 @@ async fn load_desired_edge_apps(pool: &PgPool) -> Result<Vec<DesiredEdgeApp>, sq
 }
 
 async fn mutate_haproxy_config<F>(
+    client: &Client,
     _pool: &PgPool,
     config: &EdgeRouteConfig,
     mutation_generation: Option<i64>,
@@ -420,8 +423,8 @@ where
     // Runtime callers already own the durable global edge_config generation.
     // Do not hold a second PostgreSQL connection across Kubernetes I/O: with a
     // two-connection pool that would starve both job and mutation heartbeats.
-    let client = Client::try_default().await?;
-    mutate_haproxy_config_with_client(_pool, client, config, mutation_generation, mutate).await
+    mutate_haproxy_config_with_client(_pool, client.clone(), config, mutation_generation, mutate)
+        .await
 }
 
 async fn mutate_haproxy_config_with_client<F>(
@@ -803,12 +806,12 @@ impl BackendTag {
 /// port. Inputs are validated DNS labels; the namespace and app come from
 /// trusted DB rows but we still validate as defense in depth.
 pub async fn resolve_backend_target(
+    client: &Client,
     app_name: &str,
     namespace: &str,
     port: u16,
 ) -> Result<String, EdgeRouteError> {
-    let client = Client::try_default().await?;
-    let service_api: Api<Service> = Api::namespaced(client, namespace);
+    let service_api: Api<Service> = Api::namespaced(client.clone(), namespace);
     let service = service_api.get(app_name).await?;
     let cluster_ip = service
         .spec
@@ -855,13 +858,14 @@ fn gateway_api_resource() -> ApiResource {
 /// This is intended for internal platform callers such as PaaS workers that
 /// must preserve the tenant TEE Host/SNI while avoiding public edge hairpinning.
 pub async fn resolve_gateway_address(
+    client: &Client,
     app_name: &str,
     namespace: &str,
 ) -> Result<Option<IpAddr>, EdgeRouteError> {
     validate_app_name_legacy(app_name)
         .map_err(|_| EdgeRouteError::InvalidAppName(format!("invalid app name: {app_name}")))?;
-    let client = Client::try_default().await?;
-    let api: Api<DynamicObject> = Api::namespaced_with(client, namespace, &gateway_api_resource());
+    let api: Api<DynamicObject> =
+        Api::namespaced_with(client.clone(), namespace, &gateway_api_resource());
     let gateway_name = format!("tenant-gateway-{app_name}");
     let gateway = match api.get(&gateway_name).await {
         Ok(gateway) => gateway,

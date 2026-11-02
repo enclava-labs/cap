@@ -320,14 +320,15 @@ pub async fn rollback(
     // at/above-floor sizes): a proven-initialized sub-floor claim keeps
     // operating; a missing/terminating/unproven one is a fresh format and
     // must meet the floor.
-    let fresh_volume_claims = super::fresh_volume_claims(&app, &target_resources)
-        .await
-        .map_err(|_| {
-            json_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "volume provisioning state could not be verified; retry the rollback",
-            )
-        })?;
+    let fresh_volume_claims =
+        super::fresh_volume_claims(&state.kube_client, &app, &target_resources)
+            .await
+            .map_err(|_| {
+                json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "volume provisioning state could not be verified; retry the rollback",
+                )
+            })?;
 
     let mut tx = state.db.begin().await.map_err(|_| {
         (

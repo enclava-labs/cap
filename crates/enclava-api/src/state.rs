@@ -223,6 +223,7 @@ impl TeeProbeFailureCache {
 #[derive(Clone)]
 pub struct AppState {
     pub db: PgPool,
+    pub kube_client: kube::Client,
     /// Instance-level management ownership mode.
     pub management_mode: CapManagementMode,
     /// Live workload admission gate. Starts closed whenever the operator

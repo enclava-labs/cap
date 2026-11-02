@@ -16,6 +16,7 @@ pub mod models;
 pub mod mutation_leases;
 pub mod platform_release;
 pub mod ratelimit;
+pub mod reconciler;
 pub mod registry;
 pub mod routes;
 pub mod signing_service;
@@ -1872,6 +1873,10 @@ pub(crate) mod test_support {
         let side_effect_admission = crate::state::side_effect_admission_for_pool(&pool);
         AppState {
             db: pool,
+            kube_client: kube::Client::try_from(kube::Config::new(
+                "http://127.0.0.1:9".parse().expect("static test url"),
+            ))
+            .expect("test kube client"),
             management_mode: crate::state::CapManagementMode::Standalone,
             deployment_dispatch_enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             startup_ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),

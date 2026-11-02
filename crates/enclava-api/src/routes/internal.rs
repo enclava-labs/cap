@@ -4066,6 +4066,7 @@ pub async fn get_paas_proof_bundle(
         .ok_or_else(|| json_error(StatusCode::BAD_REQUEST, "origin_not_allowed"))?;
     let client = crate::routes::logs::resolved_tenant_tee_client(
         app_id,
+        &state.kube_client,
         &app_name,
         &artifacts.descriptor.namespace,
         &domain,

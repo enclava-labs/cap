@@ -1,0 +1,6903 @@
+use super::*;
+use crate::auth::api_key::ValidatedApiKey;
+use crate::test_support::{
+    KbsPolicyProvider, drop_isolated_database, isolated_database_test_pool, kbs_policy_kube_client,
+};
+use chrono::{TimeZone, Utc};
+use ed25519_dalek::{Signer, SigningKey};
+use rand::rngs::OsRng;
+use std::sync::Arc;
+
+#[tokio::test]
+async fn create_org_rejects_non_dns_safe_names_before_database_access() {
+    let state = crate::test_support::lazy_state();
+    let auth = crate::test_support::auth_context(Role::Owner, &[]);
+    for bad_name in ["Acme", "acme corp", "acme_", "-acme", "acme-", ""] {
+        let err = create_org(
+            auth.clone(),
+            State(state.clone()),
+            Json(CreateOrgRequest {
+                name: bad_name.to_string(),
+                display_name: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST, "name {bad_name:?}");
+    }
+}
+
+#[tokio::test]
+async fn create_org_refuses_public_signups_on_paas_managed_instances() {
+    let mut state = crate::test_support::lazy_state();
+    state.management_mode = crate::state::CapManagementMode::PaasManaged;
+    let auth = crate::test_support::auth_context(Role::Owner, &[]);
+    let err = create_org(
+        auth,
+        State(state),
+        Json(CreateOrgRequest {
+            name: "acme".to_string(),
+            display_name: None,
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.0, StatusCode::FORBIDDEN);
+}
+
+#[test]
+fn signing_readiness_requires_both_authorities_to_agree() {
+    let owner = [0x11; 32];
+    let other = [0x22; 32];
+    assert_eq!(signing_readiness_state(None, None), "not_configured");
+    assert_eq!(signing_readiness_state(Some(&owner), Some(&owner)), "ready");
+    assert_eq!(
+        signing_readiness_state(Some(&owner), Some(&other)),
+        "drifted"
+    );
+    assert_eq!(
+        signing_readiness_state(Some(&owner), None),
+        "recovery_required"
+    );
+    assert_eq!(
+        signing_readiness_state(None, Some(&owner)),
+        "recovery_required"
+    );
+}
+
+#[test]
+fn owner_fingerprint_is_a_digest_not_the_public_key() {
+    let owner = [0x11; 32];
+    let public_key = hex::encode(owner);
+    let fingerprint = owner_key_fingerprint(&public_key).expect("valid owner key");
+    assert_ne!(fingerprint, public_key);
+    assert_eq!(fingerprint, hex::encode(Sha256::digest(owner)));
+    assert_eq!(owner_key_fingerprint("not-hex"), None);
+}
+
+#[test]
+fn owner_rotation_preserves_every_member_except_owner_public_key() {
+    let org_id = Uuid::new_v4();
+    let owner_id = Uuid::new_v4();
+    let deployer_id = Uuid::new_v4();
+    let added_at = Utc.with_ymd_and_hms(2026, 8, 12, 0, 0, 0).unwrap();
+    let current_owner = [0x11; 32];
+    let replacement_owner = [0x22; 32];
+    let current = SignedOrgKeyring {
+        org_id,
+        version: 1,
+        members: vec![
+            SignedOrgKeyringMember {
+                user_id: owner_id,
+                pubkey: current_owner,
+                role: SignedOrgKeyringRole::Owner,
+                added_at,
+            },
+            SignedOrgKeyringMember {
+                user_id: deployer_id,
+                pubkey: [0x33; 32],
+                role: SignedOrgKeyringRole::Deployer,
+                added_at,
+            },
+        ],
+        updated_at: added_at,
+    };
+    let replacement = SignedOrgKeyring {
+        org_id,
+        version: 2,
+        members: vec![
+            SignedOrgKeyringMember {
+                user_id: owner_id,
+                pubkey: replacement_owner,
+                role: SignedOrgKeyringRole::Owner,
+                added_at,
+            },
+            SignedOrgKeyringMember {
+                user_id: deployer_id,
+                pubkey: [0x33; 32],
+                role: SignedOrgKeyringRole::Deployer,
+                added_at,
+            },
+        ],
+        updated_at: added_at,
+    };
+
+    assert!(
+        validate_rotated_members(&current, &replacement, &current_owner, &replacement_owner)
+            .is_ok()
+    );
+
+    let mut tampered = replacement;
+    tampered.members[1].role = SignedOrgKeyringRole::Admin;
+    assert_eq!(
+        validate_rotated_members(&current, &tampered, &current_owner, &replacement_owner),
+        Err("owner rotation must preserve non-owner keyring members")
+    );
+}
+
+async fn database_test_pool() -> sqlx::PgPool {
+    let database_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
+    let pool = sqlx::PgPool::connect(&database_url)
+        .await
+        .expect("connect keyring regression database");
+    crate::db::pool::run_migrations(&pool)
+        .await
+        .expect("migrate keyring regression database");
+    pool
+}
+
+async fn named_database_test_pool(application_name: &str) -> sqlx::PgPool {
+    let database_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
+    let options = database_url
+        .parse::<sqlx::postgres::PgConnectOptions>()
+        .expect("parse keyring regression database URL")
+        .application_name(application_name);
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(4)
+        .connect_with(options)
+        .await
+        .expect("connect named keyring regression pool")
+}
+
+async fn wait_for_named_lock_waiter(pool: &sqlx::PgPool, application_name: &str) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS (
+                         SELECT 1
+                           FROM pg_stat_activity
+                          WHERE datname = current_database()
+                            AND application_name = $1
+                            AND wait_event_type = 'Lock'
+                     )",
+            )
+            .bind(application_name)
+            .fetch_one(pool)
+            .await
+            .expect("inspect named keyring writer lock state");
+            if waiting {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("keyring writer did not block on membership authority removal");
+}
+
+fn signed_keyring_request(
+    org_id: Uuid,
+    user_id: Uuid,
+    key: &SigningKey,
+    version: i64,
+    second: u32,
+) -> PutOrgKeyringRequest {
+    let added_at = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let updated_at = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, second).unwrap();
+    let member = SignedOrgKeyringMember {
+        user_id,
+        pubkey: key.verifying_key().to_bytes(),
+        role: SignedOrgKeyringRole::Owner,
+        added_at,
+    };
+    let keyring = SignedOrgKeyring {
+        org_id,
+        version: version as u64,
+        members: vec![member],
+        updated_at,
+    };
+    let signature = key.sign(&canonical_keyring_bytes(&keyring));
+    let pubkey = hex::encode(key.verifying_key().to_bytes());
+    PutOrgKeyringRequest {
+        version,
+        keyring_payload: serde_json::json!({
+            "org_id": org_id,
+            "version": version,
+            "members": [{
+                "user_id": user_id,
+                "pubkey": pubkey,
+                "role": "owner",
+                "added_at": added_at,
+            }],
+            "updated_at": updated_at,
+        }),
+        signature: hex::encode(signature.to_bytes()),
+        signing_pubkey: pubkey,
+    }
+}
+
+fn auth_context(api_key: Option<ValidatedApiKey>) -> AuthContext {
+    AuthContext {
+        user_id: Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
+        org_id: Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap(),
+        org_name: "personal".to_string(),
+        role: Role::Owner,
+        api_key,
+        management_origin: crate::auth::middleware::ManagementOrigin::Public,
+    }
+}
+
+/// In-process stand-in for the platform signing service's owner authority
+/// surface (`GET /orgs/{id}/owner`, `POST /rotate-owner`), carrying the
+/// state receipt-aware rotations depend on: the current owner, its
+/// upstream version, when it last changed, and how many rotate-owner
+/// RPCs have been accepted. Rotate calls signed by anyone other than the
+/// current owner are rejected, mirroring the real service's authority
+/// check, so a stale owner snapshot that re-sends an already-completed
+/// rotation surfaces as a rejected RPC instead of silently rotating
+/// twice.
+struct MockSigningServiceOwner {
+    owner: [u8; 32],
+    changed_at: DateTime<Utc>,
+    version: i64,
+    rotate_calls: usize,
+}
+
+/// Spawn the mock owner-authority service and return its base URL plus
+/// the shared state handle tests mutate and assert on.
+async fn spawn_mock_signing_service_owner(
+    org_id: Uuid,
+    initial: MockSigningServiceOwner,
+) -> (String, Arc<std::sync::Mutex<MockSigningServiceOwner>>) {
+    let owner = Arc::new(std::sync::Mutex::new(initial));
+    let status_owner = owner.clone();
+    let rotate_owner = owner.clone();
+    let app = axum::Router::new()
+        .route(
+            &format!("/orgs/{org_id}/owner"),
+            axum::routing::get(move || async move {
+                let state = status_owner.lock().expect("mock owner lock");
+                axum::Json(serde_json::json!({
+                    "org_id": org_id,
+                    "state": "ready",
+                    "version": state.version,
+                    "owner_pubkey_hex": hex::encode(state.owner),
+                    "last_changed_at": state.changed_at,
+                }))
+            }),
+        )
+        .route(
+            "/rotate-owner",
+            axum::routing::post(
+                move |axum::Json(req): axum::Json<serde_json::Value>| async move {
+                    let mut state = rotate_owner.lock().expect("mock owner lock");
+                    let signer = req["signing_pubkey_b64"]
+                        .as_str()
+                        .and_then(|raw| B64.decode(raw).ok())
+                        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok());
+                    if signer != Some(state.owner) {
+                        return (
+                            StatusCode::CONFLICT,
+                            axum::Json(serde_json::json!({
+                                "error": "rotation signer does not match the current owner"
+                            })),
+                        );
+                    }
+                    let replacement: [u8; 32] = B64
+                        .decode(req["replacement_owner_pubkey_b64"].as_str().unwrap_or(""))
+                        .expect("mock replacement owner decodes")
+                        .try_into()
+                        .expect("mock replacement owner is 32 bytes");
+                    state.owner = replacement;
+                    state.changed_at = Utc::now();
+                    state.version += 1;
+                    state.rotate_calls += 1;
+                    (
+                        StatusCode::OK,
+                        axum::Json(serde_json::json!({
+                            "org_id": req["org_id"].clone(),
+                            "version": state.version,
+                            "owner_pubkey_fingerprint": hex::encode(replacement),
+                            "rotated_at": state.changed_at,
+                        })),
+                    )
+                },
+            ),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock signing service");
+    let address = listener.local_addr().expect("mock signing service address");
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve mock signing service");
+    });
+    (format!("http://{address}/"), owner)
+}
+
+/// Minimal in-process stand-in for the platform signing service's owner
+/// authority surface: `GET /orgs/{id}/owner` and `POST /rotate-owner`.
+async fn mock_signing_service_owner_api(org_id: Uuid, initial_owner: [u8; 32]) -> String {
+    spawn_mock_signing_service_owner(
+        org_id,
+        MockSigningServiceOwner {
+            owner: initial_owner,
+            changed_at: Utc::now(),
+            version: 1,
+            rotate_calls: 0,
+        },
+    )
+    .await
+    .0
+}
+
+/// The normalized typed-JSON keyring encoding both put_keyring and owner
+/// rotation must store and digest: the `SignedOrgKeyring` struct
+/// re-serialized, dropping unsigned extra fields. Mirrors what
+/// `rotation_request` builds so tests can compute the exact digests the
+/// handlers record.
+fn normalized_keyring_bytes(
+    org_id: Uuid,
+    user_id: Uuid,
+    owner: [u8; 32],
+    version: i64,
+    second: u32,
+) -> Vec<u8> {
+    let keyring = SignedOrgKeyring {
+        org_id,
+        version: version as u64,
+        members: vec![SignedOrgKeyringMember {
+            user_id,
+            pubkey: owner,
+            role: SignedOrgKeyringRole::Owner,
+            added_at: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+        }],
+        updated_at: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, second).unwrap(),
+    };
+    serde_json::to_vec(&serde_json::to_value(&keyring).expect("serialize keyring value"))
+        .expect("serialize normalized keyring bytes")
+}
+
+async fn keyring_enqueue_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    crate::test_support::SIGNED_POLICY_SINGLETON_LOCK
+        .lock()
+        .await
+}
+
+fn test_kbs_policy_config() -> crate::kbs::KbsPolicyConfig {
+    crate::kbs::KbsPolicyConfig {
+        namespace: "kbs-test".to_string(),
+        configmap_name: "resource-policy".to_string(),
+        policy_key: "policy.rego".to_string(),
+        deployment_name: "trustee".to_string(),
+        required: true,
+        signed_policy_retention: 6,
+        signed_policy_max_bytes: 900 * 1024,
+    }
+}
+
+#[tokio::test]
+async fn put_keyring_reports_success_only_after_kbs_publication() {
+    let _singleton = keyring_enqueue_guard().await;
+    let (_db_cleanup, pool) = isolated_database_test_pool("cap130_keyring_enqueue_put").await;
+    let org_id = Uuid::new_v4();
+    let user_id = Uuid::new_v4();
+    let suffix = org_id.simple().to_string();
+    let org_name = format!("keyring-enqueue-{suffix}");
+    crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+        .await
+        .expect("insert keyring enqueue org");
+    sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Keyring Enqueuer')")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("insert keyring enqueue user");
+    sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+        .bind(user_id)
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("insert keyring enqueue membership");
+    let key = SigningKey::generate(&mut OsRng);
+    sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2)")
+        .bind(user_id)
+        .bind(key.verifying_key().to_bytes().to_vec())
+        .execute(&pool)
+        .await
+        .expect("insert keyring enqueue signing key");
+
+    // Active signed mode, seeded at a nonzero desired generation: the
+    // keyring insert must owe exactly one selector bump through
+    // migration 0061's trigger (never a direct desired_generation bump),
+    // and the route must not report success until the owed generation is
+    // live in the KBS.
+    sqlx::query(
+        "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 5,
+                    selector_bumps_owed = 0,
+                    configmap_generation = 0,
+                    applied_generation = 0,
+                    configmap_policy_sha256 = NULL,
+                    applied_policy_sha256 = NULL,
+                    configmap_resource_version = NULL
+              WHERE singleton",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed signed-policy generation");
+
+    let mut state = crate::test_support::lazy_state();
+    state.db = pool.clone();
+    let auth = AuthContext {
+        user_id,
+        org_id,
+        org_name: org_name.clone(),
+        role: Role::Owner,
+        api_key: None,
+        management_origin: crate::auth::middleware::ManagementOrigin::Public,
+    };
+
+    // Active signed mode without KBS configuration fails closed; the
+    // committed mutation stays durable exactly once.
+    let misconfigured = put_keyring(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(signed_keyring_request(org_id, user_id, &key, 1, 1)),
+    )
+    .await
+    .expect_err("active signed mode without KBS configuration must fail closed");
+    assert_eq!(misconfigured.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        misconfigured.1.0["error"],
+        "keyring committed; KBS policy reconciliation pending"
+    );
+    assert_eq!(
+        misconfigured.1.0["code"],
+        "keyring_policy_reconciliation_pending"
+    );
+
+    // Configure the KBS against a failing provider: publication cannot
+    // be confirmed, so the route still must not report success.
+    state.kbs_policy = Some(test_kbs_policy_config());
+    let provider = std::sync::Arc::new(tokio::sync::Mutex::new(KbsPolicyProvider::new(false)));
+    crate::kbs::TEST_KUBE_CLIENT
+        .scope(kbs_policy_kube_client(provider.clone()), async {
+            let blocked = put_keyring(
+                auth.clone(),
+                State(state.clone()),
+                Path(org_name.clone()),
+                Json(signed_keyring_request(org_id, user_id, &key, 1, 1)),
+            )
+            .await
+            .expect_err("blocked publication must not report success");
+            assert_eq!(blocked.0, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(blocked.1.0["code"], "keyring_policy_reconciliation_pending");
+            let authority: (i64, i64, i64, i64) = sqlx::query_as(
+                "SELECT
+                 (SELECT count(*) FROM org_keyrings WHERE org_id = $1),
+                 (SELECT count(*) FROM audit_log
+                   WHERE org_id = $1 AND action = 'org.keyring.put'),
+                 (SELECT desired_generation FROM kbs_signed_policy_reconciliation
+                   WHERE singleton),
+                 (SELECT selector_bumps_owed FROM kbs_signed_policy_reconciliation
+                   WHERE singleton)",
+            )
+            .bind(org_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read durable keyring authority after blocked publication");
+            assert_eq!(
+                authority,
+                (1, 1, 5, 1),
+                "the committed keyring, audit row, and owed selector bump must remain exactly once"
+            );
+
+            // Healthy provider: exact replay retries publication without another
+            // keyring version or audit row, and succeeds only once the filtered
+            // policy set is live.
+            {
+                let mut provider = provider.lock().await;
+                provider.healthy = true;
+            }
+            // Failed provider calls retain their fence until its reclaim deadline.
+            sqlx::query(
+                "UPDATE external_resource_mutation_leases
+                SET locked_until = clock_timestamp() - interval '2 seconds',
+                    reclaim_after = clock_timestamp() - interval '1 second'
+              WHERE resource_scope = 'kbs_policy' AND resource_key = 'global'",
+            )
+            .execute(&pool)
+            .await
+            .expect("expire failed publication fence");
+            let published = put_keyring(
+                auth.clone(),
+                State(state.clone()),
+                Path(org_name.clone()),
+                Json(signed_keyring_request(org_id, user_id, &key, 1, 1)),
+            )
+            .await
+            .expect("replay must succeed once publication is confirmed");
+            assert_eq!(published.1.0.version, 1);
+            {
+                let provider = provider.lock().await;
+                assert_eq!(
+                    provider.published_generation(),
+                    Some(6),
+                    "the owed generation must be live before success is reported"
+                );
+                assert_eq!(provider.configmap_replaces, 1);
+            }
+            let reconciled: (i64, i64, i64, i64) = sqlx::query_as(
+                "SELECT
+                 (SELECT count(*) FROM org_keyrings WHERE org_id = $1),
+                 (SELECT count(*) FROM audit_log
+                   WHERE org_id = $1 AND action = 'org.keyring.put'),
+                 (SELECT desired_generation FROM kbs_signed_policy_reconciliation
+                   WHERE singleton),
+                 (SELECT selector_bumps_owed FROM kbs_signed_policy_reconciliation
+                   WHERE singleton)",
+            )
+            .bind(org_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read durable keyring authority after publication");
+            assert_eq!(
+                reconciled,
+                (1, 1, 6, 0),
+                "the debt must be consumed exactly once, never re-owed by replay"
+            );
+            let applied: i64 = sqlx::query_scalar(
+                "SELECT applied_generation FROM kbs_signed_policy_reconciliation
+              WHERE singleton",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read applied generation after publication");
+            assert_eq!(applied, 6, "publication must be observed before success");
+
+            // Once current, replay stays idempotent: no re-publication churn.
+            let replayed = put_keyring(
+                auth.clone(),
+                State(state.clone()),
+                Path(org_name.clone()),
+                Json(signed_keyring_request(org_id, user_id, &key, 1, 1)),
+            )
+            .await
+            .expect("idempotent replay succeeds while publication is current");
+            assert_eq!(replayed.1.0.version, 1);
+            {
+                let provider = provider.lock().await;
+                assert_eq!(
+                    provider.configmap_replaces, 1,
+                    "a current publication must not be replaced again"
+                );
+            }
+        })
+        .await;
+    sqlx::query("DELETE FROM audit_log WHERE org_id = $1")
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("delete keyring enqueue audit rows");
+    sqlx::query("DELETE FROM organizations WHERE id = $1")
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("delete keyring enqueue org");
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("delete keyring enqueue user");
+    drop_isolated_database("cap130_keyring_enqueue_put", pool).await;
+}
+
+async fn keyring_put_authority(pool: &sqlx::PgPool, org_id: Uuid) -> (i64, i64, i64, i64) {
+    sqlx::query_as(
+        "SELECT
+                 (SELECT count(*) FROM org_keyrings WHERE org_id = $1),
+                 (SELECT count(*) FROM audit_log
+                   WHERE org_id = $1 AND action = 'org.keyring.put'),
+                 (SELECT desired_generation FROM kbs_signed_policy_reconciliation
+                   WHERE singleton),
+                 (SELECT selector_bumps_owed FROM kbs_signed_policy_reconciliation
+                   WHERE singleton)",
+    )
+    .bind(org_id)
+    .fetch_one(pool)
+    .await
+    .expect("read keyring put authority counters")
+}
+
+#[tokio::test]
+async fn put_keyring_second_owner_replays_current_envelope_without_owning_signer_registration() {
+    let _singleton = keyring_enqueue_guard().await;
+    let (_db_cleanup, pool) = isolated_database_test_pool("cap178_second_owner_replay").await;
+    let org_id = Uuid::new_v4();
+    let alice_id = Uuid::new_v4();
+    let bob_id = Uuid::new_v4();
+    let suffix = org_id.simple().to_string();
+    let org_name = format!("keyring-second-owner-{suffix}");
+    crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+        .await
+        .expect("insert second-owner replay org");
+    for (user_id, display_name) in [(alice_id, "Alice"), (bob_id, "Bob")] {
+        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, $2)")
+            .bind(user_id)
+            .bind(display_name)
+            .execute(&pool)
+            .await
+            .expect("insert second-owner replay user");
+        sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+            .bind(user_id)
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("insert second-owner replay membership");
+    }
+    let alice_key = SigningKey::generate(&mut OsRng);
+    sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2)")
+        .bind(alice_id)
+        .bind(alice_key.verifying_key().to_bytes().to_vec())
+        .execute(&pool)
+        .await
+        .expect("insert Alice's signing key registration");
+
+    sqlx::query(
+        "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 5,
+                    selector_bumps_owed = 0,
+                    configmap_generation = 0,
+                    applied_generation = 0,
+                    configmap_policy_sha256 = NULL,
+                    applied_policy_sha256 = NULL,
+                    configmap_resource_version = NULL
+              WHERE singleton",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed signed-policy generation");
+
+    let mut state = crate::test_support::lazy_state();
+    state.db = pool.clone();
+    state.kbs_policy = Some(test_kbs_policy_config());
+    let auth_for = |user_id| AuthContext {
+        user_id,
+        org_id,
+        org_name: org_name.clone(),
+        role: Role::Owner,
+        api_key: None,
+        management_origin: crate::auth::middleware::ManagementOrigin::Public,
+    };
+    let alice_auth = auth_for(alice_id);
+    let bob_auth = auth_for(bob_id);
+
+    let provider = std::sync::Arc::new(tokio::sync::Mutex::new(KbsPolicyProvider::new(false)));
+    crate::kbs::TEST_KUBE_CLIENT
+        .scope(kbs_policy_kube_client(provider.clone()), async {
+            let alice_envelope = || signed_keyring_request(org_id, alice_id, &alice_key, 1, 1);
+
+            let pending = put_keyring(
+                alice_auth.clone(),
+                State(state.clone()),
+                Path(org_name.clone()),
+                Json(alice_envelope()),
+            )
+            .await
+            .expect_err("unavailable KBS must leave Alice's write pending");
+            assert_eq!(pending.0, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(pending.1.0["code"], "keyring_policy_reconciliation_pending");
+            assert_eq!(
+                keyring_put_authority(&pool, org_id).await,
+                (1, 1, 5, 1),
+                "Alice's write must commit the keyring, audit row, and owed selector bump once"
+            );
+
+            sqlx::query(
+                "UPDATE external_resource_mutation_leases
+                SET locked_until = clock_timestamp() - interval '2 seconds',
+                    reclaim_after = clock_timestamp() - interval '1 second'
+              WHERE resource_scope = 'kbs_policy' AND resource_key = 'global'",
+            )
+            .execute(&pool)
+            .await
+            .expect("expire failed publication fence");
+            let bob_pending = put_keyring(
+                bob_auth.clone(),
+                State(state.clone()),
+                Path(org_name.clone()),
+                Json(alice_envelope()),
+            )
+            .await
+            .expect_err("second-owner replay must stay pending while KBS is unavailable");
+            assert_eq!(bob_pending.0, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                bob_pending.1.0["code"],
+                "keyring_policy_reconciliation_pending"
+            );
+            assert_eq!(
+                keyring_put_authority(&pool, org_id).await,
+                (1, 1, 5, 1),
+                "the second-owner replay must not write another keyring or audit row"
+            );
+
+            {
+                let mut provider = provider.lock().await;
+                provider.healthy = true;
+            }
+            sqlx::query(
+                "UPDATE external_resource_mutation_leases
+                SET locked_until = clock_timestamp() - interval '2 seconds',
+                    reclaim_after = clock_timestamp() - interval '1 second'
+              WHERE resource_scope = 'kbs_policy' AND resource_key = 'global'",
+            )
+            .execute(&pool)
+            .await
+            .expect("expire failed publication fence");
+            let published = put_keyring(
+                bob_auth.clone(),
+                State(state.clone()),
+                Path(org_name.clone()),
+                Json(alice_envelope()),
+            )
+            .await
+            .expect("second-owner replay must confirm publication");
+            assert_eq!(published.1.0.version, 1);
+            {
+                let provider = provider.lock().await;
+                assert_eq!(
+                    provider.published_generation(),
+                    Some(6),
+                    "the owed generation must be live before success is reported"
+                );
+            }
+            assert_eq!(
+                keyring_put_authority(&pool, org_id).await,
+                (1, 1, 6, 0),
+                "the healthy second-owner replay must consume the debt without a new write"
+            );
+
+            let denied = put_keyring(
+                bob_auth.clone(),
+                State(state.clone()),
+                Path(org_name.clone()),
+                Json(signed_keyring_request(org_id, alice_id, &alice_key, 2, 2)),
+            )
+            .await
+            .expect_err("fresh successor must require a caller-owned registration");
+            assert_eq!(denied.0, StatusCode::BAD_REQUEST);
+            assert_eq!(
+                keyring_put_authority(&pool, org_id).await,
+                (1, 1, 6, 0),
+                "the denied successor must not write anything"
+            );
+        })
+        .await;
+    sqlx::query("DELETE FROM audit_log WHERE org_id = $1")
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("delete second-owner replay audit rows");
+    sqlx::query("DELETE FROM organizations WHERE id = $1")
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("delete second-owner replay org");
+    sqlx::query("DELETE FROM users WHERE id = ANY($1)")
+        .bind(vec![alice_id, bob_id])
+        .execute(&pool)
+        .await
+        .expect("delete second-owner replay users");
+    drop_isolated_database("cap178_second_owner_replay", pool).await;
+}
+
+/// 0061 quarantines by deleting every keyring row, then commits and drops
+/// its ACCESS EXCLUSIVE lock before 0085 runs. An active owner can insert
+/// a replacement v1 in that gap (the unrestricted first-version path).
+/// 0085's backfill used to require the org to still have no keyring row —
+/// the quarantine state the replacement no longer has — so the recovery
+/// marker was never created and `fence_quarantined_keyring_recovery`
+/// never compared the replacement to the displaced signer.
+#[tokio::test]
+async fn migration_0085_backfill_fences_owner_replaced_quarantine() {
+    check_migration_0085_quarantine(false).await;
+}
+
+#[tokio::test]
+async fn migration_0085_existing_markers_fence_owner_replaced_quarantine() {
+    check_migration_0085_quarantine(true).await;
+}
+
+async fn check_migration_0085_quarantine(existing_markers: bool) {
+    let _singleton = keyring_enqueue_guard().await;
+    let (_db_cleanup, pool) = isolated_database_test_pool("cap187_replaced_quarantine").await;
+    let captured_org = Uuid::new_v4();
+    let survivor_org = Uuid::new_v4();
+    let alice_id = Uuid::new_v4();
+    let bob_id = Uuid::new_v4();
+    let carol_id = Uuid::new_v4();
+    let captured_name = format!("keyring-replaced-q-{}", captured_org.simple());
+    let survivor_name = format!("keyring-survivor-{}", survivor_org.simple());
+    crate::db::orgs::insert_org_pool(&pool, captured_org, &captured_name, None, false)
+        .await
+        .expect("insert captured org");
+    crate::db::orgs::insert_org_pool(&pool, survivor_org, &survivor_name, None, false)
+        .await
+        .expect("insert survivor org");
+    for (user_id, display_name) in [(alice_id, "Alice"), (bob_id, "Bob"), (carol_id, "Carol")] {
+        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, $2)")
+            .bind(user_id)
+            .bind(display_name)
+            .execute(&pool)
+            .await
+            .expect("insert user");
+    }
+    for (user_id, org_id) in [
+        (alice_id, captured_org),
+        (bob_id, captured_org),
+        (carol_id, survivor_org),
+    ] {
+        sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+            .bind(user_id)
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("insert membership");
+    }
+    let alice_key = SigningKey::generate(&mut OsRng);
+    let bob_key = SigningKey::generate(&mut OsRng);
+    let carol_key = SigningKey::generate(&mut OsRng);
+    let alice_signing_key_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2) RETURNING id",
+    )
+    .bind(alice_id)
+    .bind(alice_key.verifying_key().to_bytes().to_vec())
+    .fetch_one(&pool)
+    .await
+    .expect("insert alice signing key");
+    let bob_signing_key_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2) RETURNING id",
+    )
+    .bind(bob_id)
+    .bind(bob_key.verifying_key().to_bytes().to_vec())
+    .fetch_one(&pool)
+    .await
+    .expect("insert bob signing key");
+    let carol_signing_key_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2) RETURNING id",
+    )
+    .bind(carol_id)
+    .bind(carol_key.verifying_key().to_bytes().to_vec())
+    .fetch_one(&pool)
+    .await
+    .expect("insert carol signing key");
+    let well_formed = br#"{"members":[]}"#.to_vec();
+    let signature = vec![0u8; 64];
+    // 0061 archives every version of a quarantined org, including v1,
+    // then deletes them. The window replacement re-inserts v1.
+    sqlx::query(
+        "INSERT INTO org_keyring_repairs
+                 (org_id, version, keyring_payload, signature, signing_key_id, created_at)
+             VALUES ($1, 1, $2, $3, $4, now()),
+                    ($1, 3, $2, $3, $4, now())",
+    )
+    .bind(captured_org)
+    .bind(&well_formed)
+    .bind(&signature)
+    .bind(alice_signing_key_id)
+    .execute(&pool)
+    .await
+    .expect("archive quarantined versions");
+    sqlx::query(
+        "INSERT INTO org_keyrings
+                 (org_id, version, keyring_payload, signature, signing_key_id)
+             VALUES ($1, 1, $2, $3, $4)",
+    )
+    .bind(captured_org)
+    .bind(&well_formed)
+    .bind(&signature)
+    .bind(bob_signing_key_id)
+    .execute(&pool)
+    .await
+    .expect("insert window replacement");
+    // Control: a clean current version survived 0061 (not archived) while
+    // a malformed historical row was archived. That org must keep its
+    // keyring and must not receive a recovery marker.
+    sqlx::query(
+        "INSERT INTO org_keyring_repairs
+                 (org_id, version, keyring_payload, signature, signing_key_id, created_at)
+             VALUES ($1, 1, $2, $3, $4, now())",
+    )
+    .bind(survivor_org)
+    .bind(&well_formed)
+    .bind(&signature)
+    .bind(carol_signing_key_id)
+    .execute(&pool)
+    .await
+    .expect("archive survivor historical row");
+    sqlx::query(
+        "INSERT INTO org_keyrings
+                 (org_id, version, keyring_payload, signature, signing_key_id)
+             VALUES ($1, 2, $2, $3, $4)",
+    )
+    .bind(survivor_org)
+    .bind(&well_formed)
+    .bind(&signature)
+    .bind(carol_signing_key_id)
+    .execute(&pool)
+    .await
+    .expect("insert surviving clean keyring");
+    // The old writer can append a version that 0061 never archived after
+    // inserting the colliding v1. That unarchived row must not be treated
+    // as a clean survivor: every live generation of the colliding org is
+    // quarantined.
+    let appended_org = Uuid::new_v4();
+    let appended_name = format!("keyring-appended-q-{}", appended_org.simple());
+    crate::db::orgs::insert_org_pool(&pool, appended_org, &appended_name, None, false)
+        .await
+        .expect("insert appended org");
+    sqlx::query(
+        "INSERT INTO org_keyring_repairs
+                 (org_id, version, keyring_payload, signature, signing_key_id, created_at)
+             VALUES ($1, 1, $2, $3, $4, now()),
+                    ($1, 3, $2, $3, $4, now())",
+    )
+    .bind(appended_org)
+    .bind(&well_formed)
+    .bind(&signature)
+    .bind(alice_signing_key_id)
+    .execute(&pool)
+    .await
+    .expect("archive appended-org versions");
+    sqlx::query(
+        "INSERT INTO org_keyrings
+                 (org_id, version, keyring_payload, signature, signing_key_id)
+             VALUES ($1, 1, $2, $3, $4),
+                    ($1, 2, $2, $3, $4)",
+    )
+    .bind(appended_org)
+    .bind(&well_formed)
+    .bind(&signature)
+    .bind(bob_signing_key_id)
+    .execute(&pool)
+    .await
+    .expect("insert colliding v1 and unarchived v2");
+
+    // Canonical 0061 has no marker table; divergent 0061 leaves markers
+    // but no INSERT trigger. Exercise both rollout histories.
+    sqlx::raw_sql(
+        "DROP TRIGGER IF EXISTS org_keyrings_fence_quarantine_recovery ON org_keyrings;
+             DROP FUNCTION IF EXISTS org_keyrings_reject_unfenced_quarantine_recovery();",
+    )
+    .execute(&pool)
+    .await
+    .expect("restore pre-0085 insert behavior");
+    let recovered_org = Uuid::new_v4();
+    if existing_markers {
+        sqlx::query(
+            "INSERT INTO org_keyring_shape_recoveries (org_id, quarantined_latest_version)
+                 VALUES ($1, 3), ($2, 3)",
+        )
+        .bind(captured_org)
+        .bind(appended_org)
+        .execute(&pool)
+        .await
+        .expect("restore divergent 0061 markers");
+        // Older successor handlers could clear the marker after an
+        // unfenced v1. Marker absence cannot authorize a colliding row.
+        crate::db::orgs::insert_org_pool(
+            &pool,
+            recovered_org,
+            &format!("keyring-recovered-{}", recovered_org.simple()),
+            None,
+            false,
+        )
+        .await
+        .expect("insert recovered org");
+        sqlx::query(
+            "INSERT INTO org_keyring_repairs
+                     (org_id, version, keyring_payload, signature, signing_key_id, created_at)
+                 SELECT $1, version, keyring_payload, signature, signing_key_id, created_at
+                   FROM org_keyring_repairs WHERE org_id = $2",
+        )
+        .bind(recovered_org)
+        .bind(captured_org)
+        .execute(&pool)
+        .await
+        .expect("copy recovered org archive");
+        sqlx::query(
+            "INSERT INTO org_keyrings
+                     (org_id, version, keyring_payload, signature, signing_key_id)
+                 VALUES ($1, 1, $2, $3, $4), ($1, 2, $2, $3, $4)",
+        )
+        .bind(recovered_org)
+        .bind(&well_formed)
+        .bind(&signature)
+        .bind(bob_signing_key_id)
+        .execute(&pool)
+        .await
+        .expect("insert capture whose successor cleared the marker");
+    } else {
+        sqlx::query("DROP TABLE org_keyring_shape_recoveries")
+            .execute(&pool)
+            .await
+            .expect("restore canonical 0061 schema");
+    }
+    sqlx::raw_sql(include_str!(
+        "../../../../migrations/0085_org_keyring_shape_recoveries.sql"
+    ))
+    .execute(&pool)
+    .await
+    .expect("replay production 0085 migration");
+    if existing_markers {
+        let captured_rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM org_keyrings WHERE org_id = $1")
+                .bind(recovered_org)
+                .fetch_one(&pool)
+                .await
+                .expect("count marker-free captured rows");
+        assert_eq!(captured_rows, 0);
+        let marker: i64 = sqlx::query_scalar(
+            "SELECT quarantined_latest_version FROM org_keyring_shape_recoveries WHERE org_id = $1",
+        )
+        .bind(recovered_org)
+        .fetch_one(&pool)
+        .await
+        .expect("restore marker consumed by an unfenced successor");
+        assert_eq!(marker, 3);
+    }
+
+    let captured_rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM org_keyrings WHERE org_id = $1")
+            .bind(captured_org)
+            .fetch_one(&pool)
+            .await
+            .expect("count captured keyrings");
+    assert_eq!(
+        captured_rows, 0,
+        "0085 must remove the unfenced window replacement so the first-version fence can run"
+    );
+    let marker: Option<i64> = sqlx::query_scalar(
+        "SELECT quarantined_latest_version FROM org_keyring_shape_recoveries WHERE org_id = $1",
+    )
+    .bind(captured_org)
+    .fetch_optional(&pool)
+    .await
+    .expect("read captured recovery marker");
+    assert_eq!(
+        marker,
+        Some(3),
+        "0085 must record the quarantined latest version even though a replacement keyring existed"
+    );
+    let archived: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM org_keyring_repairs WHERE org_id = $1")
+            .bind(captured_org)
+            .fetch_one(&pool)
+            .await
+            .expect("count archived provenance");
+    assert_eq!(
+        archived, 2,
+        "the repair archive is the displaced-signer provenance"
+    );
+    let survivor_version: i64 =
+        sqlx::query_scalar("SELECT version FROM org_keyrings WHERE org_id = $1")
+            .bind(survivor_org)
+            .fetch_one(&pool)
+            .await
+            .expect("read surviving keyring");
+    assert_eq!(
+        survivor_version, 2,
+        "a clean survivor must not be quarantined"
+    );
+    let survivor_marker: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM org_keyring_shape_recoveries WHERE org_id = $1")
+            .bind(survivor_org)
+            .fetch_one(&pool)
+            .await
+            .expect("count survivor marker");
+    assert_eq!(
+        survivor_marker, 0,
+        "a clean survivor must not get a recovery marker"
+    );
+    let appended_rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM org_keyrings WHERE org_id = $1")
+            .bind(appended_org)
+            .fetch_one(&pool)
+            .await
+            .expect("count appended keyrings");
+    assert_eq!(
+        appended_rows, 0,
+        "an unarchived version appended after a colliding v1 must be quarantined with it"
+    );
+    let appended_marker: Option<i64> = sqlx::query_scalar(
+        "SELECT quarantined_latest_version FROM org_keyring_shape_recoveries WHERE org_id = $1",
+    )
+    .bind(appended_org)
+    .fetch_optional(&pool)
+    .await
+    .expect("read appended recovery marker");
+    assert_eq!(
+        appended_marker,
+        Some(3),
+        "the appended window capture must still record the archived latest version"
+    );
+
+    let mut state = crate::test_support::lazy_state();
+    state.db = pool.clone();
+    let auth_for = |user_id, org_id, org_name: &str| AuthContext {
+        user_id,
+        org_id,
+        org_name: org_name.to_string(),
+        role: Role::Owner,
+        api_key: None,
+        management_origin: crate::auth::middleware::ManagementOrigin::Public,
+    };
+    let hijack = put_keyring(
+        auth_for(bob_id, captured_org, &captured_name),
+        State(state.clone()),
+        Path(captured_name.clone()),
+        Json(signed_keyring_request(captured_org, bob_id, &bob_key, 1, 1)),
+    )
+    .await
+    .expect_err("the capturer must not restore quarantined authority");
+    assert_eq!(hijack.0, StatusCode::CONFLICT);
+    assert_eq!(
+        hijack.1.0["error"],
+        "quarantined keyring recovery signer does not match the quarantined signing owner"
+    );
+    let recovered = put_keyring(
+        auth_for(alice_id, captured_org, &captured_name),
+        State(state),
+        Path(captured_name),
+        Json(signed_keyring_request(
+            captured_org,
+            alice_id,
+            &alice_key,
+            1,
+            1,
+        )),
+    )
+    .await
+    .expect("the displaced signer must restore authority through the fence");
+    assert_eq!(recovered.0, StatusCode::OK);
+    let marker_after: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM org_keyring_shape_recoveries WHERE org_id = $1")
+            .bind(captured_org)
+            .fetch_one(&pool)
+            .await
+            .expect("read marker after recovery");
+    assert_eq!(
+        marker_after, 0,
+        "the fenced recovery must consume the marker"
+    );
+
+    drop_isolated_database("cap187_replaced_quarantine", pool).await;
+}
+
+#[tokio::test]
+async fn put_keyring_quarantine_recovery_requires_live_service_owner() {
+    let _singleton = keyring_enqueue_guard().await;
+    let (_db_cleanup, pool) = isolated_database_test_pool("cap187_quarantine_recovery").await;
+    let org_id = Uuid::new_v4();
+    let alice_id = Uuid::new_v4();
+    let bob_id = Uuid::new_v4();
+    let suffix = org_id.simple().to_string();
+    let org_name = format!("keyring-quarantine-{suffix}");
+    crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+        .await
+        .expect("insert quarantine recovery org");
+    for (user_id, display_name) in [(alice_id, "Alice"), (bob_id, "Bob")] {
+        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, $2)")
+            .bind(user_id)
+            .bind(display_name)
+            .execute(&pool)
+            .await
+            .expect("insert quarantine recovery user");
+        sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+            .bind(user_id)
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("insert quarantine recovery membership");
+    }
+    let alice_key = SigningKey::generate(&mut OsRng);
+    let bob_key = SigningKey::generate(&mut OsRng);
+    for (user_id, key) in [(alice_id, &alice_key), (bob_id, &bob_key)] {
+        sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2)")
+            .bind(user_id)
+            .bind(key.verifying_key().to_bytes().to_vec())
+            .execute(&pool)
+            .await
+            .expect("insert quarantine recovery signing key");
+    }
+    // Migration 0061 quarantined this org's CURRENT keyring: every row is
+    // gone while the signing service's owner registration stays live, and
+    // the recovery marker stands in for the dropped authority.
+    sqlx::query(
+        "INSERT INTO org_keyring_shape_recoveries (org_id, quarantined_latest_version)
+             VALUES ($1, 3)",
+    )
+    .bind(org_id)
+    .execute(&pool)
+    .await
+    .expect("insert quarantine recovery marker");
+
+    let mock_url =
+        mock_signing_service_owner_api(org_id, alice_key.verifying_key().to_bytes()).await;
+    let mut state = crate::test_support::lazy_state();
+    state.db = pool.clone();
+    state.signing_service = Some(
+        crate::signing_service::SigningServiceClient::new(mock_url, None)
+            .expect("mock signing service client"),
+    );
+    let auth_for = |user_id| AuthContext {
+        user_id,
+        org_id,
+        org_name: org_name.clone(),
+        role: Role::Owner,
+        api_key: None,
+        management_origin: crate::auth::middleware::ManagementOrigin::Public,
+    };
+
+    let denied = put_keyring(
+        auth_for(bob_id),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(signed_keyring_request(org_id, bob_id, &bob_key, 1, 1)),
+    )
+    .await
+    .expect_err("a recovery signer that is not the live service owner must be refused");
+    assert_eq!(denied.0, StatusCode::CONFLICT);
+    assert_eq!(
+        denied.1.0["error"],
+        "quarantined keyring recovery signer does not match the live signing-service owner"
+    );
+    assert_eq!(
+        keyring_put_authority(&pool, org_id).await,
+        (0, 0, 0, 0),
+        "the refused recovery must not write keyring, audit, or generation state"
+    );
+    let marker: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM org_keyring_shape_recoveries WHERE org_id = $1")
+            .bind(org_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read recovery marker");
+    assert_eq!(marker, 1, "a refused recovery must keep its marker");
+
+    let recovered = put_keyring(
+        auth_for(alice_id),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(signed_keyring_request(org_id, alice_id, &alice_key, 1, 1)),
+    )
+    .await
+    .expect("the live signing-service owner must be able to restore authority");
+    assert_eq!(recovered.0, StatusCode::OK);
+    assert_eq!(
+        keyring_put_authority(&pool, org_id).await,
+        (1, 1, 0, 0),
+        "the accepted recovery must commit exactly one keyring and audit row"
+    );
+    let marker: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM org_keyring_shape_recoveries WHERE org_id = $1")
+            .bind(org_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read recovery marker");
+    assert_eq!(marker, 0, "the committed recovery must consume its marker");
+}
+
+#[tokio::test]
+async fn put_keyring_quarantine_recovery_without_signing_service_owner_recovers() {
+    let _singleton = keyring_enqueue_guard().await;
+    let (_db_cleanup, pool) = isolated_database_test_pool("cap187_quarantine_no_service").await;
+    let org_id = Uuid::new_v4();
+    let alice_id = Uuid::new_v4();
+    let bob_id = Uuid::new_v4();
+    let suffix = org_id.simple().to_string();
+    let org_name = format!("keyring-quarantine-nosvc-{suffix}");
+    crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+        .await
+        .expect("insert quarantine recovery org");
+    for (user_id, display_name) in [(alice_id, "Alice"), (bob_id, "Bob")] {
+        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, $2)")
+            .bind(user_id)
+            .bind(display_name)
+            .execute(&pool)
+            .await
+            .expect("insert quarantine recovery user");
+        sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+            .bind(user_id)
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("insert quarantine recovery membership");
+    }
+    let alice_key = SigningKey::generate(&mut OsRng);
+    let bob_key = SigningKey::generate(&mut OsRng);
+    let alice_signing_key_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2) RETURNING id",
+    )
+    .bind(alice_id)
+    .bind(alice_key.verifying_key().to_bytes().to_vec())
+    .fetch_one(&pool)
+    .await
+    .expect("insert quarantine recovery signing key");
+    sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2)")
+        .bind(bob_id)
+        .bind(bob_key.verifying_key().to_bytes().to_vec())
+        .execute(&pool)
+        .await
+        .expect("insert quarantine recovery signing key");
+    sqlx::query(
+        "INSERT INTO org_keyring_shape_recoveries (org_id, quarantined_latest_version)
+             VALUES ($1, 3)",
+    )
+    .bind(org_id)
+    .execute(&pool)
+    .await
+    .expect("insert quarantine recovery marker");
+    // Migration 0061 archives every dropped row in org_keyring_repairs
+    // and migration 0085 writes the marker from that archive, so the
+    // displaced signer of the
+    // quarantined latest version is durable provenance even on an
+    // install without the platform signing service.
+    sqlx::query(
+        "INSERT INTO org_keyring_repairs
+                 (org_id, version, keyring_payload, signature, signing_key_id, created_at)
+             VALUES ($1, 3, $2, $3, $4, now())",
+    )
+    .bind(org_id)
+    .bind(b"{\"members\":[]}".to_vec())
+    .bind(vec![0u8; 64])
+    .bind(alice_signing_key_id)
+    .execute(&pool)
+    .await
+    .expect("insert quarantined keyring provenance");
+
+    let mut state = crate::test_support::lazy_state();
+    state.db = pool.clone();
+    // signing_service stays None: an install without the platform signing
+    // service has no live owner recovery could bind to.
+    let auth_for = |user_id| AuthContext {
+        user_id,
+        org_id,
+        org_name: org_name.clone(),
+        role: Role::Owner,
+        api_key: None,
+        management_origin: crate::auth::middleware::ManagementOrigin::Public,
+    };
+
+    // Fail-closed parity with fence_successor_keyring_version: recorded
+    // owner-rotation history without a configured service means upstream
+    // authority existed but cannot be read now.
+    sqlx::query(
+        "INSERT INTO org_rotation_intents (org_id, directive_sha256, keyring_sha256)
+             VALUES ($1, $2, $3)",
+    )
+    .bind(org_id)
+    .bind(vec![0x11u8; 32])
+    .bind(vec![0x22u8; 32])
+    .execute(&pool)
+    .await
+    .expect("insert rotation history");
+    let refused = put_keyring(
+        auth_for(alice_id),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(signed_keyring_request(org_id, alice_id, &alice_key, 1, 1)),
+    )
+    .await
+    .expect_err("rotation history without a configured service must refuse recovery");
+    assert_eq!(refused.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        keyring_put_authority(&pool, org_id).await,
+        (0, 0, 0, 0),
+        "the refused recovery must not write keyring, audit, or generation state"
+    );
+
+    sqlx::query("DELETE FROM org_rotation_intents WHERE org_id = $1")
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("clear rotation history");
+    // The recovery is bound to the displaced signing owner: a different
+    // active owner must not replace the quarantined keyring without that
+    // owner's signature.
+    let hijack = put_keyring(
+            auth_for(bob_id),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(signed_keyring_request(org_id, bob_id, &bob_key, 1, 1)),
+        )
+        .await
+        .expect_err(
+            "a different owner must not replace the quarantined keyring without the displaced owner's signature",
+        );
+    assert_eq!(hijack.0, StatusCode::CONFLICT);
+    assert_eq!(
+        hijack.1.0["error"],
+        "quarantined keyring recovery signer does not match the quarantined signing owner"
+    );
+    assert_eq!(
+        keyring_put_authority(&pool, org_id).await,
+        (0, 0, 0, 0),
+        "the refused recovery must not write keyring, audit, or generation state"
+    );
+
+    let recovered = put_keyring(
+            auth_for(alice_id),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(signed_keyring_request(org_id, alice_id, &alice_key, 1, 1)),
+        )
+        .await
+        .expect(
+            "the displaced signing owner must still be able to restore quarantined authority on a service-less install",
+        );
+    assert_eq!(recovered.0, StatusCode::OK);
+    assert_eq!(
+        keyring_put_authority(&pool, org_id).await,
+        (1, 1, 0, 0),
+        "the accepted recovery must commit exactly one keyring and audit row"
+    );
+    let marker: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM org_keyring_shape_recoveries WHERE org_id = $1")
+            .bind(org_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read recovery marker");
+    assert_eq!(marker, 0, "the committed recovery must consume its marker");
+}
+
+#[tokio::test]
+async fn put_keyring_quarantine_recovery_without_provenance_fails_closed() {
+    let _singleton = keyring_enqueue_guard().await;
+    let (_db_cleanup, pool) = isolated_database_test_pool("cap187_quarantine_no_provenance").await;
+    let org_id = Uuid::new_v4();
+    let alice_id = Uuid::new_v4();
+    let suffix = org_id.simple().to_string();
+    let org_name = format!("keyring-quarantine-noprovenance-{suffix}");
+    crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+        .await
+        .expect("insert quarantine recovery org");
+    sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, $2)")
+        .bind(alice_id)
+        .bind("Alice")
+        .execute(&pool)
+        .await
+        .expect("insert quarantine recovery user");
+    sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+        .bind(alice_id)
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("insert quarantine recovery membership");
+    let alice_key = SigningKey::generate(&mut OsRng);
+    sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2)")
+        .bind(alice_id)
+        .bind(alice_key.verifying_key().to_bytes().to_vec())
+        .execute(&pool)
+        .await
+        .expect("insert quarantine recovery signing key");
+    // A marker without readable org_keyring_repairs provenance cannot
+    // happen through the 0061/0085 repair (0061 archives every dropped
+    // row and 0085 writes the marker from that archive in the same
+    // migration run); when the displaced signer is
+    // unreadable anyway, the recovery fails closed instead of accepting
+    // any active owner's key.
+    sqlx::query(
+        "INSERT INTO org_keyring_shape_recoveries (org_id, quarantined_latest_version)
+             VALUES ($1, 3)",
+    )
+    .bind(org_id)
+    .execute(&pool)
+    .await
+    .expect("insert quarantine recovery marker");
+
+    let mut state = crate::test_support::lazy_state();
+    state.db = pool.clone();
+    // signing_service stays None: an install without the platform signing
+    // service has no live owner recovery could bind to.
+    let auth = AuthContext {
+        user_id: alice_id,
+        org_id,
+        org_name: org_name.clone(),
+        role: Role::Owner,
+        api_key: None,
+        management_origin: crate::auth::middleware::ManagementOrigin::Public,
+    };
+
+    let refused = put_keyring(
+        auth,
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(signed_keyring_request(org_id, alice_id, &alice_key, 1, 1)),
+    )
+    .await
+    .expect_err("recovery without readable provenance must fail closed");
+    assert_eq!(refused.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        refused.1.0["error"],
+        "quarantined keyring recovery provenance is unavailable"
+    );
+    assert_eq!(
+        keyring_put_authority(&pool, org_id).await,
+        (0, 0, 0, 0),
+        "the refused recovery must not write keyring, audit, or generation state"
+    );
+    let marker: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM org_keyring_shape_recoveries WHERE org_id = $1")
+            .bind(org_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read recovery marker");
+    assert_eq!(marker, 1, "a refused recovery must keep its marker");
+}
+
+#[tokio::test]
+async fn put_keyring_replay_answers_with_stored_envelope_not_submitted_echo() {
+    let _singleton = keyring_enqueue_guard().await;
+    let (_db_cleanup, pool) = isolated_database_test_pool("cap187_replay_envelope").await;
+    let org_id = Uuid::new_v4();
+    let user_id = Uuid::new_v4();
+    let suffix = org_id.simple().to_string();
+    let org_name = format!("keyring-replay-envelope-{suffix}");
+    crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+        .await
+        .expect("insert replay envelope org");
+    sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Replay Owner')")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("insert replay envelope user");
+    sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+        .bind(user_id)
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("insert replay envelope membership");
+    let key = SigningKey::generate(&mut OsRng);
+    sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2)")
+        .bind(user_id)
+        .bind(key.verifying_key().to_bytes().to_vec())
+        .execute(&pool)
+        .await
+        .expect("insert replay envelope signing key");
+
+    sqlx::query(
+        "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 5,
+                    selector_bumps_owed = 0,
+                    configmap_generation = 0,
+                    applied_generation = 0,
+                    configmap_policy_sha256 = NULL,
+                    applied_policy_sha256 = NULL,
+                    configmap_resource_version = NULL
+              WHERE singleton",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed signed-policy generation");
+
+    let mut state = crate::test_support::lazy_state();
+    state.db = pool.clone();
+    state.kbs_policy = Some(test_kbs_policy_config());
+    let auth = AuthContext {
+        user_id,
+        org_id,
+        org_name: org_name.clone(),
+        role: Role::Owner,
+        api_key: None,
+        management_origin: crate::auth::middleware::ManagementOrigin::Public,
+    };
+
+    fn with_memo(mut request: PutOrgKeyringRequest, memo: &str) -> PutOrgKeyringRequest {
+        let serde_json::Value::Object(map) = &mut request.keyring_payload else {
+            panic!("signed keyring payload must be an object");
+        };
+        map.insert(
+            "memo".to_string(),
+            serde_json::Value::String(memo.to_string()),
+        );
+        request
+    }
+
+    let provider = std::sync::Arc::new(tokio::sync::Mutex::new(KbsPolicyProvider::new(true)));
+    crate::kbs::TEST_KUBE_CLIENT
+            .scope(kbs_policy_kube_client(provider), async {
+                let stored = put_keyring(
+                    auth.clone(),
+                    State(state.clone()),
+                    Path(org_name.clone()),
+                    Json(with_memo(
+                        signed_keyring_request(org_id, user_id, &key, 1, 1),
+                        "old",
+                    )),
+                )
+                .await
+                .expect("initial keyring put must succeed");
+                assert_eq!(stored.0, StatusCode::OK);
+                assert_eq!(
+                    keyring_put_authority(&pool, org_id).await,
+                    (1, 1, 6, 0),
+                    "the initial put must commit one keyring and audit row and consume the owed selector bump"
+                );
+
+                let mut replay = with_memo(
+                    signed_keyring_request(org_id, user_id, &key, 1, 1),
+                    "new",
+                );
+                replay.signature = replay.signature.to_uppercase();
+                replay.signing_pubkey = replay.signing_pubkey.to_uppercase();
+                let Some(member_pubkey) = replay
+                    .keyring_payload
+                    .get_mut("members")
+                    .and_then(serde_json::Value::as_array_mut)
+                    .and_then(|members| members.first_mut())
+                    .and_then(|member| member.get_mut("pubkey"))
+                else {
+                    panic!("signed keyring payload must carry a member pubkey");
+                };
+                *member_pubkey = serde_json::Value::String(
+                    member_pubkey
+                        .as_str()
+                        .expect("member pubkey is a string")
+                        .to_uppercase(),
+                );
+                let replayed = put_keyring(
+                    auth.clone(),
+                    State(state.clone()),
+                    Path(org_name.clone()),
+                    Json(replay),
+                )
+                .await
+                .expect("semantic replay must succeed");
+                assert_eq!(replayed.0, StatusCode::OK);
+                assert_eq!(
+                    keyring_put_authority(&pool, org_id).await,
+                    (1, 1, 6, 0),
+                    "the accepted replay must not write another keyring, audit row, or selector bump"
+                );
+
+                let fetched = get_keyring(auth.clone(), State(state.clone()), Path(org_name.clone()))
+                    .await
+                    .expect("get keyring after replay");
+                assert!(
+                    fetched.0.keyring_payload.get("memo").is_none(),
+                    "the stored payload is the normalized first submission — unsigned extras are dropped"
+                );
+                assert_eq!(
+                    serde_json::to_value(&replayed.1.0).unwrap(),
+                    serde_json::to_value(&fetched.0).unwrap(),
+                    "the replay response must equal GET's stored envelope"
+                );
+
+                let conflict = put_keyring(
+                    auth.clone(),
+                    State(state.clone()),
+                    Path(org_name.clone()),
+                    Json(with_memo(
+                        signed_keyring_request(org_id, user_id, &key, 1, 2),
+                        "new",
+                    )),
+                )
+                .await
+                .expect_err("different signed content at the same version must conflict");
+                assert_eq!(conflict.0, StatusCode::CONFLICT);
+                assert_eq!(
+                    keyring_put_authority(&pool, org_id).await,
+                    (1, 1, 6, 0),
+                    "the conflicting replay must not write anything"
+                );
+            })
+            .await;
+    drop_isolated_database("cap187_replay_envelope", pool).await;
+}
+
+/// Review follow-up: a `\u0000` escape in an unknown field passes
+/// SignedOrgKeyring deserialization (unknown fields ignored) and would be
+/// persisted verbatim, but jsonb cannot represent it -- the INSERT would
+/// surface as a database error (500) once migration 0061's CHECK exists.
+/// The handler must reject it as a 400 before any signature work, and
+/// must never leave a row behind.
+#[tokio::test]
+async fn put_keyring_rejects_jsonb_unrepresentable_payload() {
+    let mut request = signed_keyring_request(
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        &SigningKey::from_bytes(&[7u8; 32]),
+        1,
+        0,
+    );
+    if let serde_json::Value::Object(map) = &mut request.keyring_payload {
+        map.insert(
+            "memo".to_string(),
+            serde_json::Value::String("bad \u{0} nul".to_string()),
+        );
+    } else {
+        panic!("signed_keyring_request payload must be an object");
+    }
+    let err = reject_jsonb_unrepresentable_payload(&request.keyring_payload)
+        .expect_err("NUL escape in an extra field must be rejected");
+    assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    // Nested positions must be caught too, and clean payloads pass.
+    let mut nested = serde_json::json!({"outer": ["fine", "x\u{0}y"]});
+    if let serde_json::Value::Object(map) = &mut nested {
+        map.insert(
+            "org_id".into(),
+            serde_json::Value::String(Uuid::new_v4().to_string()),
+        );
+    }
+    assert!(reject_jsonb_unrepresentable_payload(&nested).is_err());
+    // A NUL inside an object KEY must be caught too (self-review C1):
+    // serde_json parses it, serde_json::to_vec round-trips it verbatim,
+    // and jsonb rejects it just like a NUL in a value.
+    let mut nul_key = serde_json::Map::new();
+    nul_key.insert(
+        "a\u{0}b".to_string(),
+        serde_json::Value::String("value is fine".to_string()),
+    );
+    assert!(reject_jsonb_unrepresentable_payload(&serde_json::Value::Object(nul_key)).is_err());
+    assert!(
+        reject_jsonb_unrepresentable_payload(&serde_json::json!({
+            "org_id": Uuid::new_v4(),
+            "members": [],
+            "memo": "no nul here"
+        }))
+        .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn rotate_owner_reports_success_only_after_kbs_publication() {
+    let _singleton = keyring_enqueue_guard().await;
+    let (_db_cleanup, pool) = isolated_database_test_pool("cap130_keyring_enqueue_rotate").await;
+    let org_id = Uuid::new_v4();
+    let user_id = Uuid::new_v4();
+    let suffix = org_id.simple().to_string();
+    let org_name = format!("keyring-rotate-enqueue-{suffix}");
+    crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+        .await
+        .expect("insert rotate enqueue org");
+    sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Rotate Enqueuer')")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("insert rotate enqueue user");
+    sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+        .bind(user_id)
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("insert rotate enqueue membership");
+    let key = SigningKey::generate(&mut OsRng);
+    let replacement_key = SigningKey::generate(&mut OsRng);
+    // Both the current and the replacement owner keys must be registered
+    // for the rotating user: the handler resolves signing_key_id from
+    // user_signing_keys inside the lane-locked transaction.
+    sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2), ($1, $3)")
+        .bind(user_id)
+        .bind(key.verifying_key().to_bytes().to_vec())
+        .bind(replacement_key.verifying_key().to_bytes().to_vec())
+        .execute(&pool)
+        .await
+        .expect("insert rotate enqueue signing keys");
+
+    // Active signed mode: every committed keyring insert (the v1 put
+    // and the rotation v2) must owe exactly one selector bump through
+    // migration 0061's trigger, and the route must not report success
+    // until the owed generation is live in the KBS.
+    sqlx::query(
+        "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 5,
+                    selector_bumps_owed = 0,
+                    configmap_generation = 0,
+                    applied_generation = 0,
+                    configmap_policy_sha256 = NULL,
+                    applied_policy_sha256 = NULL,
+                    configmap_resource_version = NULL
+              WHERE singleton",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed signed-policy generation");
+
+    let mut state = crate::test_support::lazy_state();
+    state.db = pool.clone();
+    state.kbs_policy = Some(test_kbs_policy_config());
+    let provider = std::sync::Arc::new(tokio::sync::Mutex::new(KbsPolicyProvider::new(true)));
+    crate::kbs::TEST_KUBE_CLIENT
+        .scope(kbs_policy_kube_client(provider.clone()), async {
+            let auth = AuthContext {
+                user_id,
+                org_id,
+                org_name: org_name.clone(),
+                role: Role::Owner,
+                api_key: None,
+                management_origin: crate::auth::middleware::ManagementOrigin::Public,
+            };
+
+            // Publish v1 as the current owner; its owed selector bump must be
+            // published before the route reports success.
+            let _ = put_keyring(
+                auth.clone(),
+                State(state.clone()),
+                Path(org_name.clone()),
+                Json(signed_keyring_request(org_id, user_id, &key, 1, 1)),
+            )
+            .await
+            .expect("seed keyring v1");
+            let (desired, owed, applied): (i64, i64, i64) = sqlx::query_as(
+                "SELECT desired_generation, selector_bumps_owed, applied_generation
+               FROM kbs_signed_policy_reconciliation
+              WHERE singleton",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read reconciliation state after v1 publication");
+            assert_eq!((desired, owed, applied), (6, 0, 6));
+
+            // The signing service owner already matches the replacement key, so
+            // the handler takes the no-remote-rotation branch and commits the
+            // keyring v2 insert (and its trigger-owed selector bump) locally.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind signing service mock");
+            let address = listener.local_addr().expect("mock signing service address");
+            let replacement_hex = hex::encode(replacement_key.verifying_key().to_bytes());
+            let org_id_for_mock = org_id;
+            let owner_status_response =
+                std::sync::Arc::new(std::sync::Mutex::new(serde_json::json!({
+                    "org_id": org_id_for_mock,
+                    "state": "ready",
+                    "version": 2,
+                    "owner_pubkey_hex": replacement_hex.clone(),
+                    "last_changed_at": null,
+                })));
+            let rotate_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let status_for_mock = owner_status_response.clone();
+            let rotate_calls_for_mock = rotate_calls.clone();
+            let mock = tokio::spawn(async move {
+                use axum::{
+                    Json,
+                    routing::{get, post},
+                };
+                let app = axum::Router::new()
+                    .route(
+                        "/orgs/{org_id}/owner",
+                        get(move || {
+                            let body = status_for_mock
+                                .lock()
+                                .expect("owner status mock lock")
+                                .clone();
+                            async move { Json(body) }
+                        }),
+                    )
+                    .route(
+                        "/rotate-owner",
+                        post(move || {
+                            let calls = rotate_calls_for_mock.clone();
+                            let rotated_org_id = org_id_for_mock;
+                            let fingerprint = replacement_hex.clone();
+                            async move {
+                                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                Json(serde_json::json!({
+                                    "org_id": rotated_org_id,
+                                    "version": 2,
+                                    "owner_pubkey_fingerprint": fingerprint,
+                                    "rotated_at": "2026-01-01T00:00:00Z",
+                                }))
+                            }
+                        }),
+                    );
+                axum::serve(listener, app).await.expect("serve mock");
+            });
+            state.signing_service = Some(
+                crate::signing_service::SigningServiceClient::new(
+                    format!("http://{address}"),
+                    None,
+                )
+                .expect("mock signing service client"),
+            );
+
+            let added_at = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+            let updated_at = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 30).unwrap();
+            let replacement_pubkey = replacement_key.verifying_key().to_bytes();
+            let keyring = SignedOrgKeyring {
+                org_id,
+                version: 2,
+                members: vec![SignedOrgKeyringMember {
+                    user_id,
+                    pubkey: replacement_pubkey,
+                    role: SignedOrgKeyringRole::Owner,
+                    added_at,
+                }],
+                updated_at,
+            };
+            let keyring_payload = serde_json::json!({
+                "org_id": org_id,
+                "version": 2,
+                "members": [{
+                    "user_id": user_id,
+                    "pubkey": hex::encode(replacement_pubkey),
+                    "role": "owner",
+                    "added_at": added_at,
+                }],
+                "updated_at": updated_at,
+            });
+            let keyring_signature = replacement_key.sign(&canonical_keyring_bytes(&keyring));
+            let signed_at = Utc::now();
+            let reason = "owner key compromised";
+            let directive = owner_rotation_directive_bytes(
+                org_id,
+                &key.verifying_key().to_bytes(),
+                &replacement_pubkey,
+                signed_at,
+                reason,
+            );
+            let rotation_signature = key.sign(&directive);
+            let rotation_request = RotateOrgOwnerRequest {
+                version: 2,
+                keyring_payload: keyring_payload.clone(),
+                signature: hex::encode(keyring_signature.to_bytes()),
+                replacement_signing_pubkey: hex::encode(replacement_pubkey),
+                current_signing_pubkey: hex::encode(key.verifying_key().to_bytes()),
+                signed_at,
+                reason: reason.to_string(),
+                rotation_signature: hex::encode(rotation_signature.to_bytes()),
+            };
+            let rotated = rotate_org_owner(
+                auth.clone(),
+                State(state.clone()),
+                Path(org_name.clone()),
+                Json(rotation_request.clone()),
+            )
+            .await
+            .expect("owner rotation must confirm KBS publication");
+
+            // The rotation consumed the v2 insert's owed selector bump exactly
+            // once and never bumped desired_generation directly.
+            let (desired, owed, applied): (i64, i64, i64) = sqlx::query_as(
+                "SELECT desired_generation, selector_bumps_owed, applied_generation
+               FROM kbs_signed_policy_reconciliation
+              WHERE singleton",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read reconciliation state after rotation");
+            assert_eq!(
+                (desired, owed, applied),
+                (7, 0, 7),
+                "the v1 and v2 selector bumps must be consumed exactly once each"
+            );
+            let latest_version: i64 =
+                sqlx::query_scalar("SELECT max(version) FROM org_keyrings WHERE org_id = $1")
+                    .bind(org_id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("read latest keyring version");
+            assert_eq!(latest_version, 2);
+            assert_eq!(rotated.0.state, "ready");
+            {
+                let provider = provider.lock().await;
+                assert_eq!(
+                    provider.published_generation(),
+                    Some(7),
+                    "the rotated generation must be live before success is reported"
+                );
+            }
+
+            // The v1 predecessor row can be pruned by migration 0061's repair
+            // pass while the committed v2 rotation stays intact.  Replaying the
+            // identical request after that prune must still confirm the
+            // rotation, not fail with "previous keyring authority is
+            // unavailable".
+            sqlx::query("DELETE FROM org_keyrings WHERE org_id = $1 AND version = 1")
+                .bind(org_id)
+                .execute(&pool)
+                .await
+                .expect("prune predecessor keyring row");
+            let replayed = rotate_org_owner(
+                auth.clone(),
+                State(state.clone()),
+                Path(org_name.clone()),
+                Json(rotation_request.clone()),
+            )
+            .await
+            .expect("replay after predecessor prune must confirm the rotation");
+            assert_eq!(replayed.0.state, "ready");
+            assert_eq!(replayed.0.keyring_version, 2);
+            let versions_after_replay: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM org_keyrings WHERE org_id = $1")
+                    .bind(org_id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("count keyring rows after replay");
+            assert_eq!(
+                versions_after_replay, 1,
+                "replay must not insert a duplicate row"
+            );
+
+            *owner_status_response
+                .lock()
+                .expect("owner status mock lock") = serde_json::json!({
+                "org_id": org_id,
+                "state": "ready",
+                "version": 2,
+                "owner_pubkey_hex": hex::encode(key.verifying_key().to_bytes()),
+                "last_changed_at": null,
+            });
+            let drifted = rotate_org_owner(
+                auth.clone(),
+                State(state.clone()),
+                Path(org_name.clone()),
+                Json(rotation_request.clone()),
+            )
+            .await
+            .expect_err("pruned replay must fail when the service reports a different owner");
+            assert_eq!(drifted.0, StatusCode::BAD_GATEWAY);
+            assert_eq!(drifted.1.0["error"], "signing_authority_status_invalid");
+
+            *owner_status_response
+                .lock()
+                .expect("owner status mock lock") = serde_json::json!({
+                "org_id": org_id,
+                "state": "pending",
+                "version": 2,
+                "owner_pubkey_hex": hex::encode(replacement_key.verifying_key().to_bytes()),
+                "last_changed_at": null,
+            });
+            let not_ready = rotate_org_owner(
+                auth.clone(),
+                State(state.clone()),
+                Path(org_name.clone()),
+                Json(rotation_request.clone()),
+            )
+            .await
+            .expect_err("pruned replay must fail when the service is not ready");
+            assert_eq!(not_ready.0, StatusCode::BAD_GATEWAY);
+            assert_eq!(not_ready.1.0["error"], "signing_authority_status_invalid");
+
+            let dead = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind dead signing service address");
+            let dead_address = dead.local_addr().expect("dead signing service address");
+            drop(dead);
+            state.signing_service = Some(
+                crate::signing_service::SigningServiceClient::new(
+                    format!("http://{dead_address}"),
+                    None,
+                )
+                .expect("dead signing service client"),
+            );
+            let unavailable = rotate_org_owner(
+                auth.clone(),
+                State(state.clone()),
+                Path(org_name.clone()),
+                Json(rotation_request.clone()),
+            )
+            .await
+            .expect_err("pruned replay must fail when the signing service is unreachable");
+            assert_eq!(unavailable.0, StatusCode::BAD_GATEWAY);
+            assert_eq!(unavailable.1.0["error"], "signing_service_unavailable");
+
+            // Replay still requires KBS reconciliation: with the signing
+            // service healthy again but publication blocked, the replay must
+            // defer instead of reporting success.
+            state.signing_service = Some(
+                crate::signing_service::SigningServiceClient::new(
+                    format!("http://{address}"),
+                    None,
+                )
+                .expect("mock signing service client"),
+            );
+            *owner_status_response
+                .lock()
+                .expect("owner status mock lock") = serde_json::json!({
+                "org_id": org_id,
+                "state": "ready",
+                "version": 2,
+                "owner_pubkey_hex": hex::encode(replacement_key.verifying_key().to_bytes()),
+                "last_changed_at": null,
+            });
+            {
+                let mut provider = provider.lock().await;
+                provider.healthy = false;
+            }
+            let pending = rotate_org_owner(
+                auth.clone(),
+                State(state.clone()),
+                Path(org_name.clone()),
+                Json(rotation_request.clone()),
+            )
+            .await
+            .expect_err("replay must not report success while publication is blocked");
+            assert_eq!(pending.0, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(pending.1.0["code"], "keyring_policy_reconciliation_pending");
+            let (desired, owed, applied): (i64, i64, i64) = sqlx::query_as(
+                "SELECT desired_generation, selector_bumps_owed, applied_generation
+               FROM kbs_signed_policy_reconciliation
+              WHERE singleton",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read reconciliation state after blocked replay");
+            assert_eq!(
+                (desired, owed, applied),
+                (7, 0, 7),
+                "a blocked replay must not churn the durable rotation state"
+            );
+            {
+                let mut provider = provider.lock().await;
+                provider.healthy = true;
+            }
+            sqlx::query(
+                "UPDATE external_resource_mutation_leases
+                SET locked_until = clock_timestamp() - interval '2 seconds',
+                    reclaim_after = clock_timestamp() - interval '1 second'
+              WHERE resource_scope = 'kbs_policy' AND resource_key = 'global'",
+            )
+            .execute(&pool)
+            .await
+            .expect("expire failed publication fence");
+            let recovered = rotate_org_owner(
+                auth.clone(),
+                State(state.clone()),
+                Path(org_name.clone()),
+                Json(rotation_request.clone()),
+            )
+            .await
+            .expect("replay must confirm the rotation once publication recovers");
+            assert_eq!(recovered.0.state, "ready");
+            assert_eq!(recovered.0.keyring_version, 2);
+
+            assert_eq!(
+                rotate_calls.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "pruned replays must never re-drive the signing service rotation"
+            );
+            let rotate_audit_rows: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM audit_log
+              WHERE org_id = $1 AND action = 'org.keyring.owner.rotate'",
+            )
+            .bind(org_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count owner-rotation audit rows after replays");
+            assert_eq!(rotate_audit_rows, 1);
+            let versions_after_failures: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM org_keyrings WHERE org_id = $1")
+                    .bind(org_id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("count keyring rows after failed replays");
+            assert_eq!(versions_after_failures, 1);
+
+            mock.abort();
+        })
+        .await;
+    sqlx::query("DELETE FROM audit_log WHERE org_id = $1")
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("delete rotate enqueue audit rows");
+    sqlx::query("DELETE FROM organizations WHERE id = $1")
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("delete rotate enqueue org");
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("delete rotate enqueue user");
+    drop_isolated_database("cap130_keyring_enqueue_rotate", pool).await;
+}
+
+#[tokio::test]
+async fn put_keyring_replay_ignores_unsigned_extra_payload_fields() {
+    // PR #187 review: a client (e.g. the CLI's owner-recovery retry)
+    // fetches a committed keyring, rebuilds it through the typed
+    // envelope -- dropping unsigned extra JSON fields like "memo" --
+    // and PUTs the same version back. The replay must be idempotent:
+    // the signature is over the canonical keyring bytes, so comparing
+    // those instead of raw payload bytes accepts the semantically
+    // identical payload while still rejecting genuinely different
+    // content. Unsigned-only mode keeps KBS publication out of scope.
+    let (_db_cleanup, pool) = isolated_database_test_pool("cap187_keyring_replay_extra").await;
+    let org_id = Uuid::new_v4();
+    let user_id = Uuid::new_v4();
+    let suffix = org_id.simple().to_string();
+    let org_name = format!("keyring-replay-{suffix}");
+    crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+        .await
+        .expect("insert keyring replay org");
+    sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Keyring Replayer')")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("insert keyring replay user");
+    sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+        .bind(user_id)
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("insert keyring replay membership");
+    let key = SigningKey::generate(&mut OsRng);
+    sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2)")
+        .bind(user_id)
+        .bind(key.verifying_key().to_bytes().to_vec())
+        .execute(&pool)
+        .await
+        .expect("insert keyring replay signing key");
+
+    let mut state = crate::test_support::lazy_state();
+    state.db = pool.clone();
+    let auth = AuthContext {
+        user_id,
+        org_id,
+        org_name: org_name.clone(),
+        role: Role::Owner,
+        api_key: None,
+        management_origin: crate::auth::middleware::ManagementOrigin::Public,
+    };
+
+    // Initial put carries an unsigned extra field the typed keyring
+    // does not know about.
+    let mut request = signed_keyring_request(org_id, user_id, &key, 1, 1);
+    request
+        .keyring_payload
+        .as_object_mut()
+        .expect("keyring payload is an object")
+        .insert("memo".to_string(), serde_json::json!("rotation"));
+    let created = put_keyring(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(request),
+    )
+    .await
+    .expect("initial put with an extra field must succeed");
+    assert_eq!(created.1.version, 1);
+
+    // The CLI-style replay drops the extra field before resubmitting
+    // the same version: semantically identical, so idempotent.
+    let stripped = signed_keyring_request(org_id, user_id, &key, 1, 1);
+    let replayed = put_keyring(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(stripped),
+    )
+    .await
+    .expect("typed rebuild replay of the same version must be idempotent");
+    assert_eq!(replayed.1.version, 1);
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM org_keyrings WHERE org_id = $1")
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count keyring rows after replay");
+    assert_eq!(rows, 1, "the replay must not insert a duplicate row");
+
+    // Genuinely different content at the same version still conflicts:
+    // a different updated_at changes the canonical bytes, and this
+    // payload carries its own valid signature over those bytes.
+    let conflicting = signed_keyring_request(org_id, user_id, &key, 1, 2);
+    let rejected = put_keyring(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(conflicting),
+    )
+    .await
+    .expect_err("same-version replay with different canonical content must conflict");
+    assert_eq!(rejected.0, StatusCode::CONFLICT);
+
+    drop_isolated_database("cap187_keyring_replay_extra", pool).await;
+}
+
+/// Single-connection pool into an isolated fixture database: the receipt
+/// checkpoint must never need a second pool connection while a lane
+/// transaction holds the first (pool-exhaustion deadlock). The short
+/// acquire timeout turns that bug into a fast error instead of a hang.
+async fn isolated_single_connection_pool(name: &str) -> sqlx::PgPool {
+    let base_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
+    let options = base_url
+        .parse::<sqlx::postgres::PgConnectOptions>()
+        .expect("parse isolated database URL")
+        .database(&format!("{name}_{}", std::process::id()));
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_secs(10))
+        .connect_with(options)
+        .await
+        .expect("connect single-connection isolated pool")
+}
+
+/// Seed a committed presentation row exactly as the pre-lane intent
+/// insert would have recorded it, for presentations that happened
+/// before the test began.
+async fn seed_rotation_presentation(
+    pool: &sqlx::PgPool,
+    org_id: Uuid,
+    directive_sha256: &[u8],
+    keyring_sha256: &[u8],
+    presented_at: DateTime<Utc>,
+) {
+    sqlx::query(
+        "INSERT INTO org_rotation_intents
+                 (org_id, directive_sha256, keyring_sha256, created_at)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT ON CONSTRAINT org_rotation_intents_pkey DO NOTHING",
+    )
+    .bind(org_id)
+    .bind(directive_sha256)
+    .bind(keyring_sha256)
+    .bind(presented_at)
+    .execute(pool)
+    .await
+    .expect("seed committed intent row");
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rotation_request(
+    org_id: Uuid,
+    user_id: Uuid,
+    current: &SigningKey,
+    replacement: &SigningKey,
+    version: i64,
+    second: u32,
+    signed_at: DateTime<Utc>,
+    reason: &str,
+) -> RotateOrgOwnerRequest {
+    let added_at = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let updated_at = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, second).unwrap();
+    let keyring = SignedOrgKeyring {
+        org_id,
+        version: version as u64,
+        members: vec![SignedOrgKeyringMember {
+            user_id,
+            pubkey: replacement.verifying_key().to_bytes(),
+            role: SignedOrgKeyringRole::Owner,
+            added_at,
+        }],
+        updated_at,
+    };
+    let signature = replacement.sign(&canonical_keyring_bytes(&keyring));
+    let directive = owner_rotation_directive_bytes(
+        org_id,
+        &current.verifying_key().to_bytes(),
+        &replacement.verifying_key().to_bytes(),
+        signed_at,
+        reason,
+    );
+    RotateOrgOwnerRequest {
+        version,
+        keyring_payload: serde_json::json!({
+            "org_id": org_id,
+            "version": version,
+            "members": [{
+                "user_id": user_id,
+                "pubkey": hex::encode(replacement.verifying_key().to_bytes()),
+                "role": "owner",
+                "added_at": added_at,
+            }],
+            "updated_at": updated_at,
+        }),
+        signature: hex::encode(signature.to_bytes()),
+        replacement_signing_pubkey: hex::encode(replacement.verifying_key().to_bytes()),
+        current_signing_pubkey: hex::encode(current.verifying_key().to_bytes()),
+        signed_at,
+        reason: reason.to_string(),
+        rotation_signature: hex::encode(current.sign(&directive).to_bytes()),
+    }
+}
+
+#[tokio::test]
+async fn owner_rotation_directive_is_fresh_bound_and_single_use() {
+    let pool = database_test_pool().await;
+    let org_id = Uuid::new_v4();
+    let user_id = Uuid::new_v4();
+    let suffix = org_id.simple().to_string();
+    let org_name = format!("keyring-directive-replay-{suffix}");
+    crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+        .await
+        .expect("insert directive replay org");
+    sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Directive Owner')")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("insert directive owner user");
+    sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+        .bind(user_id)
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("insert directive owner membership");
+    let current_key = SigningKey::generate(&mut OsRng);
+    let replacement_key = SigningKey::generate(&mut OsRng);
+    sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2), ($1, $3)")
+        .bind(user_id)
+        .bind(current_key.verifying_key().to_bytes().to_vec())
+        .bind(replacement_key.verifying_key().to_bytes().to_vec())
+        .execute(&pool)
+        .await
+        .expect("insert directive owner signing keys");
+
+    let mut state = crate::test_support::lazy_state();
+    state.db = pool.clone();
+    state.signing_service = Some(
+        crate::signing_service::SigningServiceClient::new(
+            mock_signing_service_owner_api(org_id, current_key.verifying_key().to_bytes()).await,
+            None,
+        )
+        .expect("build mock signing service client"),
+    );
+    let auth = AuthContext {
+        user_id,
+        org_id,
+        org_name: org_name.clone(),
+        role: Role::Owner,
+        api_key: None,
+        management_origin: crate::auth::middleware::ManagementOrigin::Public,
+    };
+    let _ = put_keyring(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(signed_keyring_request(org_id, user_id, &current_key, 1, 1)),
+    )
+    .await
+    .expect("publish v1 keyring");
+
+    // A directive whose signed_at predates the current keyring version
+    // (while still inside the TTL window) must be rejected even though
+    // the signature itself is perfectly valid.
+    let stale = rotation_request(
+        org_id,
+        user_id,
+        &current_key,
+        &replacement_key,
+        2,
+        2,
+        Utc::now() - chrono::Duration::minutes(10),
+        "regression",
+    );
+    let rejected = rotate_org_owner(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(stale),
+    )
+    .await
+    .expect_err("stale rotation directive must be rejected");
+    assert_eq!(rejected.0, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        rejected.1.0["error"],
+        "owner rotation directive predates the current keyring version"
+    );
+
+    // A directive dated unreasonably far in the future is rejected: on
+    // the insert-new-version path there is no skew allowance, because
+    // signed_at is attacker-chosen at signing time and a future-dated
+    // directive could otherwise compare as newer than a keyring version
+    // that already existed when it was captured.
+    let future = rotation_request(
+        org_id,
+        user_id,
+        &current_key,
+        &replacement_key,
+        2,
+        2,
+        Utc::now() + chrono::Duration::minutes(30),
+        "regression",
+    );
+    let rejected = rotate_org_owner(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(future),
+    )
+    .await
+    .expect_err("future-dated rotation directive must be rejected");
+    assert_eq!(rejected.0, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        rejected.1.0["error"],
+        "owner rotation directive signed_at is in the future"
+    );
+
+    // The issue's core replay: a directive signed while the current
+    // keyring version was already in force (so it clears the
+    // predates-version check) but submitted only after the max-age
+    // window has elapsed. Signature still valid, pair still valid,
+    // never consumed -- the TTL must reject it on first use.
+    let aged = rotation_request(
+        org_id,
+        user_id,
+        &current_key,
+        &replacement_key,
+        2,
+        2,
+        Utc::now() - chrono::Duration::minutes(30),
+        "regression",
+    );
+    let rejected = rotate_org_owner(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(aged),
+    )
+    .await
+    .expect_err("aged rotation directive must be rejected on first use");
+    assert_eq!(rejected.0, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        rejected.1.0["error"],
+        "owner rotation directive signed_at is too old"
+    );
+
+    // A fresh directive rotates normally...
+    let first_signed_at = Utc::now();
+    let forward = rotation_request(
+        org_id,
+        user_id,
+        &current_key,
+        &replacement_key,
+        2,
+        2,
+        first_signed_at,
+        "regression",
+    );
+    let _ = rotate_org_owner(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(forward.clone()),
+    )
+    .await
+    .expect("fresh directive rotates the owner");
+    // ...and an exact retry of the same, already-applied request stays
+    // idempotent (same version, byte-identical payload, signatures, and
+    // directive).
+    let _ = rotate_org_owner(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(forward),
+    )
+    .await
+    .expect("exact retry of an applied rotation is idempotent");
+
+    // A DIFFERENT valid directive (fresh signed_at) presented against the
+    // already-applied version is indistinguishable from an original
+    // request whose response was lost: main's idempotency contract
+    // accepts it (the stored version content, signatures, and pinned
+    // owner all match) and nothing is mutated. It is NOT recorded in the
+    // ledger, so it can never authorize a later new-version rotation.
+    let different = rotation_request(
+        org_id,
+        user_id,
+        &current_key,
+        &replacement_key,
+        2,
+        2,
+        Utc::now(),
+        "regression-second-signature",
+    );
+    let _ = rotate_org_owner(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(different),
+    )
+    .await
+    .expect("different valid directive on the applied path is an idempotent no-op");
+
+    // Rotate back so the original pair is valid again: the pinned owner
+    // is once more the key that signed the first directive.
+    let _ = rotate_org_owner(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(rotation_request(
+            org_id,
+            user_id,
+            &replacement_key,
+            &current_key,
+            3,
+            3,
+            Utc::now(),
+            "regression-back",
+        )),
+    )
+    .await
+    .expect("rotate owner back to the original key");
+
+    // Replaying the captured first directive now targets a fresh keyring
+    // version (v4) with a still-valid signature and a still-valid pair.
+    // The predates-current-version bound rejects it here; the TTL and the
+    // consume-once ledger additionally reject in-window and clock-skew
+    // replays (a directive whose signed_at is older than every rollback
+    // version can never grant authority again).
+    let replay = rotation_request(
+        org_id,
+        user_id,
+        &current_key,
+        &replacement_key,
+        4,
+        4,
+        first_signed_at,
+        "regression",
+    );
+    let rejected = rotate_org_owner(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(replay),
+    )
+    .await
+    .expect_err("replayed rotation directive must be rejected");
+    assert_eq!(rejected.0, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        rejected.1.0["error"],
+        "owner rotation directive predates the current keyring version"
+    );
+
+    let directive_rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM org_rotation_directives WHERE org_id = $1")
+            .bind(org_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count consumed rotation directives");
+    assert_eq!(directive_rows, 2, "only the two applied directives consume");
+
+    sqlx::query("DELETE FROM audit_log WHERE org_id = $1")
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("delete directive replay audit rows");
+    sqlx::query("DELETE FROM organizations WHERE id = $1")
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("delete directive replay org");
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("delete directive replay user");
+}
+
+// Unsigned fields must not change recovery identity or break legacy replay.
+#[tokio::test]
+async fn owner_rotation_intent_digest_uses_registration_normalized_encoding() {
+    let pool = database_test_pool().await;
+    let org_id = Uuid::new_v4();
+    let user_id = Uuid::new_v4();
+    let suffix = org_id.simple().to_string();
+    let org_name = format!("keyring-intent-encoding-{suffix}");
+    crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+        .await
+        .expect("insert intent encoding org");
+    sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Intent Encoding Owner')")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("insert intent encoding user");
+    sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+        .bind(user_id)
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("insert intent encoding membership");
+    let current_key = SigningKey::generate(&mut OsRng);
+    let replacement_key = SigningKey::generate(&mut OsRng);
+    sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2), ($1, $3)")
+        .bind(user_id)
+        .bind(current_key.verifying_key().to_bytes().to_vec())
+        .bind(replacement_key.verifying_key().to_bytes().to_vec())
+        .execute(&pool)
+        .await
+        .expect("insert intent encoding signing keys");
+
+    let mut state = crate::test_support::lazy_state();
+    state.db = pool.clone();
+    state.signing_service = Some(
+        crate::signing_service::SigningServiceClient::new(
+            mock_signing_service_owner_api(org_id, current_key.verifying_key().to_bytes()).await,
+            None,
+        )
+        .expect("build mock signing service client"),
+    );
+    let auth = AuthContext {
+        user_id,
+        org_id,
+        org_name: org_name.clone(),
+        role: Role::Owner,
+        api_key: None,
+        management_origin: crate::auth::middleware::ManagementOrigin::Public,
+    };
+    let _ = put_keyring(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(signed_keyring_request(org_id, user_id, &current_key, 1, 1)),
+    )
+    .await
+    .expect("publish v1 keyring");
+
+    // Rotation request whose raw JSON carries an unsigned extra field:
+    // the typed parse ignores it, but the durable intent digest and the
+    // stored keyring bytes must be computed over the normalized typed
+    // serialization, exactly like registration after #182.
+    let mut request = rotation_request(
+        org_id,
+        user_id,
+        &current_key,
+        &replacement_key,
+        2,
+        2,
+        Utc::now(),
+        "intent-encoding",
+    );
+    request.keyring_payload["future_extension"] = serde_json::json!("unsigned-extra");
+    let normalized_bytes = serde_json::to_vec(
+        &serde_json::to_value(&SignedOrgKeyring {
+            org_id,
+            version: 2,
+            members: vec![SignedOrgKeyringMember {
+                user_id,
+                pubkey: replacement_key.verifying_key().to_bytes(),
+                role: SignedOrgKeyringRole::Owner,
+                added_at: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+            }],
+            updated_at: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 2).unwrap(),
+        })
+        .expect("serialize normalized keyring"),
+    )
+    .expect("serialize normalized keyring bytes");
+    let _response = rotate_org_owner(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(request),
+    )
+    .await
+    .expect("normalized rotation succeeds");
+
+    // The stored keyring version is the normalized encoding, not the
+    // raw request bytes carrying the extra field.
+    let stored: Vec<u8> = sqlx::query_scalar(
+        "SELECT keyring_payload FROM org_keyrings WHERE org_id = $1 AND version = 2",
+    )
+    .bind(org_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load stored rotated keyring");
+    assert_eq!(stored, normalized_bytes, "stored bytes must be normalized");
+
+    // The intent row's keyring digest is sha256 of the same normalized
+    // bytes registration would store, not sha256 of the raw request.
+    let expected_digest: Vec<u8> = Sha256::digest(&normalized_bytes).to_vec();
+    let intent_digest: Vec<u8> =
+        sqlx::query_scalar("SELECT keyring_sha256 FROM org_rotation_intents WHERE org_id = $1")
+            .bind(org_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load recorded intent digest");
+    assert_eq!(
+        intent_digest, expected_digest,
+        "intent digest must match the registration encoding"
+    );
+
+    // Legacy replay compatibility: rewrite the stored v2 row to the raw
+    // pre-#182 encoding (extra field re-added) and retry the exact
+    // rotation -- it must still be recognized as an already-applied
+    // rotation and succeed idempotently at any directive age.
+    let mut legacy_value: serde_json::Value =
+        serde_json::from_slice(&normalized_bytes).expect("parse normalized bytes");
+    legacy_value["future_extension"] = serde_json::json!("unsigned-extra");
+    let legacy_raw = serde_json::to_vec(&legacy_value).expect("serialize legacy raw bytes");
+    sqlx::query("UPDATE org_keyrings SET keyring_payload = $1 WHERE org_id = $2 AND version = 2")
+        .bind(&legacy_raw)
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("rewrite stored row to legacy encoding");
+    let mut retry = rotation_request(
+        org_id,
+        user_id,
+        &current_key,
+        &replacement_key,
+        2,
+        2,
+        Utc::now() - chrono::Duration::hours(1),
+        "intent-encoding",
+    );
+    retry.keyring_payload["future_extension"] = serde_json::json!("unsigned-extra");
+    let _response = rotate_org_owner(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(retry),
+    )
+    .await
+    .expect("legacy-encoded replay must stay idempotent");
+
+    // Equivalent valid representations of the same typed keyring -- a
+    // millisecond-precision timestamp and an uppercase-hex pubkey --
+    // carry identical signed content: replay equality compares the
+    // canonical typed encoding, not the stored text.
+    let mut equivalent: serde_json::Value =
+        serde_json::from_slice(&legacy_raw).expect("parse legacy bytes");
+    equivalent["updated_at"] = serde_json::json!("2026-01-01T00:00:02.000Z");
+    equivalent["members"][0]["pubkey"] =
+        serde_json::json!(hex::encode(replacement_key.verifying_key().to_bytes()).to_uppercase());
+    let equivalent_raw = serde_json::to_vec(&equivalent).expect("serialize equivalent bytes");
+    sqlx::query("UPDATE org_keyrings SET keyring_payload = $1 WHERE org_id = $2 AND version = 2")
+        .bind(&equivalent_raw)
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("rewrite stored row to an equivalent representation");
+    let mut equivalent_retry = rotation_request(
+        org_id,
+        user_id,
+        &current_key,
+        &replacement_key,
+        2,
+        2,
+        Utc::now() - chrono::Duration::hours(1),
+        "intent-encoding",
+    );
+    equivalent_retry.keyring_payload["future_extension"] = serde_json::json!("unsigned-extra");
+    let _response = rotate_org_owner(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(equivalent_retry),
+    )
+    .await
+    .expect("equivalent valid representations must stay replay-equal");
+
+    // The upload path shares the same normalization: a put_keyring
+    // carrying an unsigned extra field stores the normalized typed
+    // bytes and replays idempotently.
+    let upload = || {
+        let mut request = signed_keyring_request(org_id, user_id, &replacement_key, 3, 3);
+        request.keyring_payload["future_extension"] = serde_json::json!("unsigned-extra");
+        request
+    };
+    let _ = put_keyring(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(upload()),
+    )
+    .await
+    .expect("upload v3 with an unsigned extra field");
+    let stored_v3: Vec<u8> = sqlx::query_scalar(
+        "SELECT keyring_payload FROM org_keyrings WHERE org_id = $1 AND version = 3",
+    )
+    .bind(org_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load stored uploaded v3 keyring");
+    assert_eq!(
+        stored_v3,
+        normalized_keyring_bytes(
+            org_id,
+            user_id,
+            replacement_key.verifying_key().to_bytes(),
+            3,
+            3
+        ),
+        "upload must store the normalized typed encoding"
+    );
+    let _ = put_keyring(auth, State(state), Path(org_name), Json(upload()))
+        .await
+        .expect("exact upload replay stays idempotent");
+}
+
+#[tokio::test]
+async fn owner_rotation_intent_quota_preserves_exact_replays() {
+    let pool = database_test_pool().await;
+    let org_id = Uuid::new_v4();
+    let user_id = Uuid::new_v4();
+    let suffix = org_id.simple().to_string();
+    let org_name = format!("keyring-intent-precheck-{suffix}");
+    crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+        .await
+        .expect("insert intent precheck org");
+    sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Intent Precheck Owner')")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("insert intent precheck user");
+    sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+        .bind(user_id)
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("insert intent precheck membership");
+    let current_key = SigningKey::generate(&mut OsRng);
+    let replacement_key = SigningKey::generate(&mut OsRng);
+    sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2), ($1, $3)")
+        .bind(user_id)
+        .bind(current_key.verifying_key().to_bytes().to_vec())
+        .bind(replacement_key.verifying_key().to_bytes().to_vec())
+        .execute(&pool)
+        .await
+        .expect("insert intent precheck signing keys");
+
+    let mut state = crate::test_support::lazy_state();
+    state.db = pool.clone();
+    state.signing_service = Some(
+        crate::signing_service::SigningServiceClient::new(
+            mock_signing_service_owner_api(org_id, current_key.verifying_key().to_bytes()).await,
+            None,
+        )
+        .expect("build mock signing service client"),
+    );
+    let auth = AuthContext {
+        user_id,
+        org_id,
+        org_name: org_name.clone(),
+        role: Role::Owner,
+        api_key: None,
+        management_origin: crate::auth::middleware::ManagementOrigin::Public,
+    };
+    let _ = put_keyring(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(signed_keyring_request(org_id, user_id, &current_key, 1, 1)),
+    )
+    .await
+    .expect("publish v1 keyring");
+
+    // A fresh, valid directive still records its intent and succeeds.
+    let valid_signed_at = Utc::now();
+    let valid = rotation_request(
+        org_id,
+        user_id,
+        &current_key,
+        &replacement_key,
+        2,
+        2,
+        valid_signed_at,
+        "precheck-valid",
+    );
+    let _response = rotate_org_owner(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(valid),
+    )
+    .await
+    .expect("fresh valid rotation succeeds");
+    let intents: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM org_rotation_intents WHERE org_id = $1")
+            .bind(org_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count intent rows after valid rotation");
+    assert_eq!(
+        intents, 1,
+        "the valid presentation still records its intent"
+    );
+
+    // The rate cap: a burst of distinct directive presentations beyond
+    // the per-hour cap is throttled with 429 BEFORE any row is added,
+    // while an exact replay of an already-recorded presentation stays
+    // exempt (it would not grow the table).
+    for i in 0..MAX_INTENTS_PER_HOUR - 1 {
+        sqlx::query(
+            "INSERT INTO org_rotation_intents
+                     (org_id, directive_sha256, keyring_sha256)
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT ON CONSTRAINT org_rotation_intents_pkey DO NOTHING",
+        )
+        .bind(org_id)
+        .bind([i as u8; 32])
+        .bind([0u8; 32])
+        .execute(&pool)
+        .await
+        .expect("seed synthetic intent rows for the rate cap");
+    }
+    let churn = rotation_request(
+        org_id,
+        user_id,
+        &current_key,
+        &replacement_key,
+        3,
+        3,
+        Utc::now(),
+        "precheck-churn",
+    );
+    let throttled = rotate_org_owner(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(churn),
+    )
+    .await
+    .expect_err("the rate cap throttles further distinct presentations");
+    assert_eq!(throttled.0, StatusCode::TOO_MANY_REQUESTS);
+    let intents: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM org_rotation_intents WHERE org_id = $1")
+            .bind(org_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count intent rows after throttling");
+    assert_eq!(
+        intents, MAX_INTENTS_PER_HOUR,
+        "the throttled presentation added no intent row"
+    );
+
+    // An exact replay of the already-recorded valid presentation is
+    // exempt from the cap: it would not grow the table, so it proceeds
+    // past the insert (and is then judged idempotently at the lane).
+    let replay = rotation_request(
+        org_id,
+        user_id,
+        &current_key,
+        &replacement_key,
+        2,
+        2,
+        valid_signed_at,
+        "precheck-valid",
+    );
+    let replayed = rotate_org_owner(auth, State(state), Path(org_name), Json(replay))
+        .await
+        .expect("an exact replay of a recorded presentation is never rate-limited");
+    assert_eq!(replayed.keyring_version, 2);
+}
+
+// PR #185 review (Codex P2 "acquire the per-org intent lock before
+// checking the quota"): the first fix wrapped the advisory lock in an
+// unreferenced `WITH org_lock AS (...)` CTE, which PostgreSQL never
+// evaluates, so concurrent distinct directives still raced the count.
+// The recording step must hold a real per-org lock across the
+// count/insert, and the count must observe a post-lock snapshot.
+#[tokio::test]
+async fn owner_rotation_intent_quota_lock_serializes_concurrent_writers() {
+    let pool = database_test_pool().await;
+    let org_id = Uuid::new_v4();
+    let user_id = Uuid::new_v4();
+    let suffix = org_id.simple().to_string();
+    let org_name = format!("keyring-intent-quota-{suffix}");
+    crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+        .await
+        .expect("insert intent quota org");
+    sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Intent Quota Owner')")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("insert intent quota user");
+    sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+        .bind(user_id)
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("insert intent quota membership");
+    let current_key = SigningKey::generate(&mut OsRng);
+    let replacement_key = SigningKey::generate(&mut OsRng);
+    sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2), ($1, $3)")
+        .bind(user_id)
+        .bind(current_key.verifying_key().to_bytes().to_vec())
+        .bind(replacement_key.verifying_key().to_bytes().to_vec())
+        .execute(&pool)
+        .await
+        .expect("insert intent quota signing keys");
+
+    let mut state = crate::test_support::lazy_state();
+    state.db = pool.clone();
+    state.signing_service = Some(
+        crate::signing_service::SigningServiceClient::new(
+            mock_signing_service_owner_api(org_id, current_key.verifying_key().to_bytes()).await,
+            None,
+        )
+        .expect("build mock signing service client"),
+    );
+    let auth = AuthContext {
+        user_id,
+        org_id,
+        org_name: org_name.clone(),
+        role: Role::Owner,
+        api_key: None,
+        management_origin: crate::auth::middleware::ManagementOrigin::Public,
+    };
+
+    // Hold the per-org rotation-intent lock, exactly as the recording
+    // step does, so the writer must queue behind this transaction.
+    let mut intent_blocker = pool.begin().await.expect("begin intent blocker");
+    sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
+        .bind(ORG_ROTATION_INTENT_LANE_DOMAIN)
+        .bind(crate::signing_service::org_signing_advisory_key(org_id))
+        .execute(&mut *intent_blocker)
+        .await
+        .expect("hold rotation intent lock");
+
+    let application = format!("keyring-intent-quota-writer-{suffix}");
+    let mut writer_state = crate::test_support::lazy_state();
+    writer_state.db = named_database_test_pool(&application).await;
+    writer_state.signing_service = state.signing_service.clone();
+    let writer = tokio::spawn(rotate_org_owner(
+        auth.clone(),
+        State(writer_state),
+        Path(org_name.clone()),
+        Json(rotation_request(
+            org_id,
+            user_id,
+            &current_key,
+            &replacement_key,
+            2,
+            2,
+            Utc::now(),
+            "quota-lock",
+        )),
+    ));
+    // The writer must actually queue on the intent lock: with the lock
+    // skipped (the unused-CTE bug) it would record its row immediately
+    // and this wait would time out and panic.
+    wait_for_named_lock_waiter(&pool, &application).await;
+    let queued: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM org_rotation_intents WHERE org_id = $1")
+            .bind(org_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count intent rows while the writer queues");
+    assert_eq!(
+        queued, 0,
+        "no intent row may be recorded before the lock is granted"
+    );
+
+    // Fill the hourly quota inside the lock-holding transaction, then
+    // commit: the rows become visible and the lock is released in one
+    // step. The writer's count runs after the grant, so it must observe
+    // this post-lock snapshot and throttle instead of inserting.
+    for i in 0..MAX_INTENTS_PER_HOUR {
+        sqlx::query(
+            "INSERT INTO org_rotation_intents
+                     (org_id, directive_sha256, keyring_sha256)
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT ON CONSTRAINT org_rotation_intents_pkey DO NOTHING",
+        )
+        .bind(org_id)
+        .bind([i as u8; 32])
+        .bind([0u8; 32])
+        .execute(&mut *intent_blocker)
+        .await
+        .expect("seed synthetic intent rows for the rate cap");
+    }
+    intent_blocker
+        .commit()
+        .await
+        .expect("commit quota rows and release the intent lock");
+
+    let throttled = writer
+        .await
+        .expect("join queued intent writer")
+        .expect_err("a fresh presentation must be throttled once the quota is full");
+    assert_eq!(throttled.0, StatusCode::TOO_MANY_REQUESTS);
+    let rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM org_rotation_intents WHERE org_id = $1")
+            .bind(org_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count intent rows after throttling");
+    assert_eq!(
+        rows, MAX_INTENTS_PER_HOUR,
+        "the throttled writer added no intent row"
+    );
+}
+
+#[tokio::test]
+async fn owner_rotation_rejects_future_dated_directive_despite_version_recency() {
+    // A +300s clock-skew allowance
+    // made the version-recency bound bypassable. signed_at is chosen by
+    // the signer, not the server: a directive captured at 12:00 with
+    // signed_at = 12:04 compares as newer than a v2 uploaded at 12:01
+    // and still passes the future-skew check when submitted at 12:05,
+    // even though it predates v2. On the insert-new-version path
+    // signed_at must not be in the future at all (measured after the
+    // signing-authority lane is acquired).
+    let pool = database_test_pool().await;
+    let org_id = Uuid::new_v4();
+    let user_id = Uuid::new_v4();
+    let suffix = org_id.simple().to_string();
+    let org_name = format!("keyring-future-dated-{suffix}");
+    crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+        .await
+        .expect("insert future-dated org");
+    sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Future Dated Owner')")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("insert future-dated user");
+    sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+        .bind(user_id)
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("insert future-dated membership");
+    let current_key = SigningKey::generate(&mut OsRng);
+    let replacement_key = SigningKey::generate(&mut OsRng);
+    sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2), ($1, $3)")
+        .bind(user_id)
+        .bind(current_key.verifying_key().to_bytes().to_vec())
+        .bind(replacement_key.verifying_key().to_bytes().to_vec())
+        .execute(&pool)
+        .await
+        .expect("insert future-dated signing keys");
+
+    let mut state = crate::test_support::lazy_state();
+    state.db = pool.clone();
+    state.signing_service = Some(
+        crate::signing_service::SigningServiceClient::new(
+            mock_signing_service_owner_api(org_id, current_key.verifying_key().to_bytes()).await,
+            None,
+        )
+        .expect("build mock signing service client"),
+    );
+    let auth = AuthContext {
+        user_id,
+        org_id,
+        org_name: org_name.clone(),
+        role: Role::Owner,
+        api_key: None,
+        management_origin: crate::auth::middleware::ManagementOrigin::Public,
+    };
+    let _ = put_keyring(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(signed_keyring_request(org_id, user_id, &current_key, 1, 1)),
+    )
+    .await
+    .expect("publish v1 keyring");
+
+    // The directive is captured now but claims to be signed four
+    // minutes in the future -- inside the old +300s skew allowance.
+    let directive_signed_at = Utc::now() + chrono::Duration::minutes(4);
+    // A v2 upload lands while the directive's claimed timestamp is
+    // still in the future.
+    let _ = put_keyring(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(signed_keyring_request(org_id, user_id, &current_key, 2, 2)),
+    )
+    .await
+    .expect("publish v2 keyring");
+    // Submit the directive for v3 while its claimed signed_at is still
+    // four minutes in the future -- squarely inside the old +300s skew
+    // allowance. Under the old code it would sail through every check:
+    // inside the skew allowance, inside the TTL, and newer than v2's
+    // created_at, despite having been captured before v2 existed. The
+    // no-skew bound rejects it: signed_at is still in the future
+    // measured against the lane clock at submission.
+    let replay = rotation_request(
+        org_id,
+        user_id,
+        &current_key,
+        &replacement_key,
+        3,
+        3,
+        directive_signed_at,
+        "future-dated",
+    );
+    let rejected = rotate_org_owner(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(replay),
+    )
+    .await
+    .expect_err("directive submitted before its claimed signed_at must be rejected");
+    assert_eq!(rejected.0, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        rejected.1.0["error"],
+        "owner rotation directive signed_at is in the future"
+    );
+
+    sqlx::query("DELETE FROM audit_log WHERE org_id = $1")
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("delete future-dated audit rows");
+    sqlx::query("DELETE FROM organizations WHERE id = $1")
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("delete future-dated org");
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("delete future-dated user");
+}
+
+#[tokio::test]
+async fn owner_rotation_consumed_directive_conflict_is_rejected() {
+    // Coverage (grok-4.7 self-check of the PR #185 follow-up): the
+    // rows_affected == 0 branch of the ledger insert is the only
+    // backstop for an already-consumed directive whose signed_at still
+    // clears the time bounds (the #188 scenario once the directive has
+    // been used). Seed the digest directly, keep signed_at inside the
+    // window and not before the current version's created_at, and
+    // expect 409 "already used" rather than any time-bound rejection.
+    let pool = database_test_pool().await;
+    let org_id = Uuid::new_v4();
+    let user_id = Uuid::new_v4();
+    let suffix = org_id.simple().to_string();
+    let org_name = format!("keyring-consumed-conflict-{suffix}");
+    crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+        .await
+        .expect("insert consumed-conflict org");
+    sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Consumed Conflict Owner')")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("insert consumed-conflict user");
+    sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+        .bind(user_id)
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("insert consumed-conflict membership");
+    let current_key = SigningKey::generate(&mut OsRng);
+    let replacement_key = SigningKey::generate(&mut OsRng);
+    sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2), ($1, $3)")
+        .bind(user_id)
+        .bind(current_key.verifying_key().to_bytes().to_vec())
+        .bind(replacement_key.verifying_key().to_bytes().to_vec())
+        .execute(&pool)
+        .await
+        .expect("insert consumed-conflict signing keys");
+
+    let mut state = crate::test_support::lazy_state();
+    state.db = pool.clone();
+    state.signing_service = Some(
+        crate::signing_service::SigningServiceClient::new(
+            mock_signing_service_owner_api(org_id, current_key.verifying_key().to_bytes()).await,
+            None,
+        )
+        .expect("build mock signing service client"),
+    );
+    let auth = AuthContext {
+        user_id,
+        org_id,
+        org_name: org_name.clone(),
+        role: Role::Owner,
+        api_key: None,
+        management_origin: crate::auth::middleware::ManagementOrigin::Public,
+    };
+    let _ = put_keyring(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(signed_keyring_request(org_id, user_id, &current_key, 1, 1)),
+    )
+    .await
+    .expect("publish v1 keyring");
+
+    // A directive that is otherwise perfectly valid on the
+    // insert-new-version path: fresh, not future-dated, not before
+    // v1's created_at -- but its digest was already consumed.
+    let signed_at = Utc::now();
+    let request = rotation_request(
+        org_id,
+        user_id,
+        &current_key,
+        &replacement_key,
+        2,
+        2,
+        signed_at,
+        "consumed-conflict",
+    );
+    let directive = owner_rotation_directive_bytes(
+        org_id,
+        &current_key.verifying_key().to_bytes(),
+        &replacement_key.verifying_key().to_bytes(),
+        signed_at,
+        "consumed-conflict",
+    );
+    sqlx::query("INSERT INTO org_rotation_directives (org_id, directive_sha256) VALUES ($1, $2)")
+        .bind(org_id)
+        .bind(Sha256::digest(&directive).as_slice())
+        .execute(&pool)
+        .await
+        .expect("pre-consume directive digest");
+
+    let rejected = rotate_org_owner(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(request),
+    )
+    .await
+    .expect_err("already-consumed directive must be rejected");
+    assert_eq!(rejected.0, StatusCode::CONFLICT);
+    assert_eq!(
+        rejected.1.0["error"],
+        "owner rotation directive was already used"
+    );
+
+    sqlx::query("DELETE FROM audit_log WHERE org_id = $1")
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("delete consumed-conflict audit rows");
+    sqlx::query("DELETE FROM organizations WHERE id = $1")
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("delete consumed-conflict org");
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("delete consumed-conflict user");
+}
+
+#[tokio::test]
+async fn owner_rotation_version_bound_floors_legacy_rows_at_migration_watermark() {
+    // A keyring version committed before the migration can retain a
+    // transaction-start created_at that can predate its real
+    // insertion by the full signing-authority lane wait. Without the
+    // migration-0065 watermark floor, a directive signed while the
+    // legacy upload sat queued on the lane compares as "newer than
+    // the version" and is accepted during the post-rollout first-use
+    // window even though it predates the version's real insertion.
+    // Model the legacy row exactly: v1's stored created_at is moved
+    // into the past (what a transaction-start default recorded),
+    // while the watermark stays at migration time. The directive is
+    // signed "now" -- after v1's stored timestamp, inside the
+    // first-use window, never consumed -- and must be rejected by
+    // the watermark floor rather than compared against the stale
+    // legacy timestamp.
+    // The org_keyrings_created_at_watermark row is shared global state
+    // that this test backdates; pinning it inside an isolated database
+    // keeps the shared fixture's floor intact for concurrently running
+    // tests.
+    let (_db_cleanup, pool) =
+        crate::test_support::isolated_database_test_pool("cap185_watermark_floor").await;
+    let org_id = Uuid::new_v4();
+    let user_id = Uuid::new_v4();
+    let suffix = org_id.simple().to_string();
+    let org_name = format!("keyring-legacy-watermark-{suffix}");
+    crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+        .await
+        .expect("insert legacy watermark org");
+    sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Legacy Watermark Owner')")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("insert legacy watermark user");
+    sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+        .bind(user_id)
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("insert legacy watermark membership");
+    let current_key = SigningKey::generate(&mut OsRng);
+    let replacement_key = SigningKey::generate(&mut OsRng);
+    sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2), ($1, $3)")
+        .bind(user_id)
+        .bind(current_key.verifying_key().to_bytes().to_vec())
+        .bind(replacement_key.verifying_key().to_bytes().to_vec())
+        .execute(&pool)
+        .await
+        .expect("insert legacy watermark signing keys");
+
+    let mut state = crate::test_support::lazy_state();
+    state.db = pool.clone();
+    state.signing_service = Some(
+        crate::signing_service::SigningServiceClient::new(
+            mock_signing_service_owner_api(org_id, current_key.verifying_key().to_bytes()).await,
+            None,
+        )
+        .expect("build mock signing service client"),
+    );
+    let auth = AuthContext {
+        user_id,
+        org_id,
+        org_name: org_name.clone(),
+        role: Role::Owner,
+        api_key: None,
+        management_origin: crate::auth::middleware::ManagementOrigin::Public,
+    };
+    let _ = put_keyring(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(signed_keyring_request(org_id, user_id, &current_key, 1, 1)),
+    )
+    .await
+    .expect("publish v1 keyring");
+
+    // Legacy semantics: the stored created_at predates the row's real
+    // insertion (transaction-start clock). Pin the watermark explicitly
+    // (as it would be minutes after rollout) so the scenario does not
+    // depend on when this test database was migrated.
+    sqlx::query("UPDATE org_keyrings SET created_at = $2 WHERE org_id = $1 AND version = 1")
+        .bind(org_id)
+        .bind(Utc::now() - chrono::Duration::minutes(10))
+        .execute(&pool)
+        .await
+        .expect("backdate v1 to legacy transaction-start timestamp");
+    sqlx::query("UPDATE org_keyrings_created_at_watermark SET watermarked_at = $1")
+        .bind(Utc::now() - chrono::Duration::minutes(6))
+        .execute(&pool)
+        .await
+        .expect("pin watermark to rollout time");
+
+    // A directive signed 8 minutes ago: after v1's stored legacy
+    // timestamp (now-10m), inside the first-use window, never consumed
+    // -- but before the watermark (now-6m), hence before the version's
+    // earliest provable insertion semantics. Against the stale stored
+    // value it would pass; against the watermark floor it must fail.
+    let rejected = rotate_org_owner(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(rotation_request(
+            org_id,
+            user_id,
+            &current_key,
+            &replacement_key,
+            2,
+            2,
+            Utc::now() - chrono::Duration::minutes(8),
+            "legacy-watermark",
+        )),
+    )
+    .await
+    .expect_err("directive signed inside a legacy created_at lag must be rejected");
+    assert_eq!(rejected.0, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        rejected.1.0["error"],
+        "owner rotation directive predates the current keyring version"
+    );
+
+    // Control: once the org has a post-watermark version (uploaded
+    // after migration 0063, created_at = clock_timestamp()), a
+    // directive signed after that insertion rotates normally -- the
+    // floor does not wedge forward rotations.
+    let _ = put_keyring(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(signed_keyring_request(org_id, user_id, &current_key, 2, 2)),
+    )
+    .await
+    .expect("publish v2 keyring under post-migration semantics");
+    let _ = rotate_org_owner(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(rotation_request(
+            org_id,
+            user_id,
+            &current_key,
+            &replacement_key,
+            3,
+            3,
+            Utc::now(),
+            "legacy-watermark-forward",
+        )),
+    )
+    .await
+    .expect("post-watermark directive rotates normally");
+
+    crate::test_support::drop_isolated_database("cap185_watermark_floor", pool).await;
+}
+
+#[tokio::test]
+async fn owner_rotation_expired_recovery_requires_matching_upstream_receipt() {
+    // Presentation order differs from execution order. Unrelated intents must not
+    // block the exact receipt; a changed upstream snapshot must reject it.
+    let (_db_cleanup, pool) =
+        crate::test_support::isolated_database_test_pool("cap185_receipt_recovery").await;
+    let org_id = Uuid::new_v4();
+    let user_id = Uuid::new_v4();
+    let suffix = org_id.simple().to_string();
+    let org_name = format!("keyring-receipt-recovery-{suffix}");
+    crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+        .await
+        .expect("insert receipt recovery org");
+    sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Receipt Recovery Owner')")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("insert receipt recovery user");
+    sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+        .bind(user_id)
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("insert receipt recovery membership");
+    let current_key = SigningKey::generate(&mut OsRng);
+    let replacement_key = SigningKey::generate(&mut OsRng);
+    sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2), ($1, $3)")
+        .bind(user_id)
+        .bind(current_key.verifying_key().to_bytes().to_vec())
+        .bind(replacement_key.verifying_key().to_bytes().to_vec())
+        .execute(&pool)
+        .await
+        .expect("insert receipt recovery signing keys");
+
+    // D2 presented first but executed after D1 failed under the lane.
+    // Presentation order must not let D1 borrow D2's upstream change.
+    let drift_at = Utc::now() - chrono::Duration::minutes(19);
+    let presented_d2_at = drift_at - chrono::Duration::minutes(1);
+    let presented_d1_at = drift_at - chrono::Duration::seconds(30);
+
+    let (mock_url, mock) = spawn_mock_signing_service_owner(
+        org_id,
+        MockSigningServiceOwner {
+            owner: replacement_key.verifying_key().to_bytes(),
+            changed_at: drift_at,
+            version: 2,
+            rotate_calls: 0,
+        },
+    )
+    .await;
+    let mut state = crate::test_support::lazy_state();
+    state.db = pool.clone();
+    state.signing_service = Some(
+        crate::signing_service::SigningServiceClient::new(mock_url, None)
+            .expect("build mock signing service client"),
+    );
+    let auth = AuthContext {
+        user_id,
+        org_id,
+        org_name: org_name.clone(),
+        role: Role::Owner,
+        api_key: None,
+        management_origin: crate::auth::middleware::ManagementOrigin::Public,
+    };
+    let _ = put_keyring(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(signed_keyring_request(org_id, user_id, &current_key, 1, 1)),
+    )
+    .await
+    .expect("publish v1 keyring");
+    // Backdate v1 and the migration watermark so the 20-minute-old
+    // directives below pass the version-recency floor and only the
+    // first-use max-age window is exceeded. This mutates the shared
+    // org_keyrings_created_at_watermark row, which is why this test
+    // runs against an isolated database.
+    sqlx::query("UPDATE org_keyrings SET created_at = $2 WHERE org_id = $1 AND version = 1")
+        .bind(org_id)
+        .bind(Utc::now() - chrono::Duration::minutes(30))
+        .execute(&pool)
+        .await
+        .expect("backdate v1 creation");
+    sqlx::query("UPDATE org_keyrings_created_at_watermark SET watermarked_at = $1")
+        .bind(Utc::now() - chrono::Duration::minutes(30))
+        .execute(&pool)
+        .await
+        .expect("backdate created_at watermark");
+
+    let recovery_signed_at = presented_d2_at - chrono::Duration::seconds(1);
+    let d1_signed_at = presented_d1_at - chrono::Duration::seconds(1);
+    let recovery = rotation_request(
+        org_id,
+        user_id,
+        &current_key,
+        &replacement_key,
+        2,
+        2,
+        recovery_signed_at,
+        "receipt-recovery",
+    );
+    let recovery_directive = Sha256::digest(owner_rotation_directive_bytes(
+        org_id,
+        &current_key.verifying_key().to_bytes(),
+        &replacement_key.verifying_key().to_bytes(),
+        recovery_signed_at,
+        "receipt-recovery",
+    ))
+    .to_vec();
+    // Both D1 and D2 rotate the same member set, so their keyring
+    // digests are identical; only the directives differ.
+    let shared_keyring_digest = Sha256::digest(normalized_keyring_bytes(
+        org_id,
+        user_id,
+        replacement_key.verifying_key().to_bytes(),
+        2,
+        2,
+    ))
+    .to_vec();
+    let d1 = rotation_request(
+        org_id,
+        user_id,
+        &current_key,
+        &replacement_key,
+        2,
+        2,
+        d1_signed_at,
+        "receipt-recovery-lost-first",
+    );
+    let d1_directive = Sha256::digest(owner_rotation_directive_bytes(
+        org_id,
+        &current_key.verifying_key().to_bytes(),
+        &replacement_key.verifying_key().to_bytes(),
+        d1_signed_at,
+        "receipt-recovery-lost-first",
+    ))
+    .to_vec();
+
+    // Only D2's successful upstream execution produced a receipt.
+    seed_rotation_presentation(
+        &pool,
+        org_id,
+        &d1_directive,
+        &shared_keyring_digest,
+        presented_d1_at,
+    )
+    .await;
+    seed_rotation_presentation(
+        &pool,
+        org_id,
+        &recovery_directive,
+        &shared_keyring_digest,
+        presented_d2_at,
+    )
+    .await;
+    sqlx::query(
+            "INSERT INTO org_rotation_upstream_receipts
+                 (org_id, directive_sha256, keyring_sha256, upstream_owner_version, upstream_rotated_at)
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(org_id)
+        .bind(&recovery_directive)
+        .bind(&shared_keyring_digest)
+        .bind(2_i64)
+        .bind(drift_at)
+        .execute(&pool)
+        .await
+        .expect("seed upstream receipt for the lost attempt");
+
+    // A different directive over the same owner pair, presented now --
+    // long past the drift: it has no receipt, and a presentation record
+    // cannot borrow another directive's receipt. Its own presentation
+    // lands in org_rotation_intents before the check runs, so it also
+    // stands for every unactioned presentation recorded after the
+    // drift: none of them may block the valid receipt recovery below.
+    let imposter = rotation_request(
+        org_id,
+        user_id,
+        &current_key,
+        &replacement_key,
+        2,
+        2,
+        Utc::now() - chrono::Duration::minutes(20),
+        "receipt-recovery-imposter",
+    );
+    let rejected = rotate_org_owner(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(imposter),
+    )
+    .await
+    .expect_err("a different directive cannot borrow the upstream receipt");
+    assert_eq!(rejected.0, StatusCode::BAD_REQUEST);
+
+    // D1 was presented while fresh, but never completed upstream.
+    let rejected_d1 = rotate_org_owner(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(d1),
+    )
+    .await
+    .expect_err("an unactioned directive cannot borrow another request's upstream change");
+    assert_eq!(rejected_d1.0, StatusCode::BAD_REQUEST);
+
+    // The live signing service must still hold the exact rotation the
+    // receipt records. A higher upstream version means the service
+    // rotated again since the receipt: the older receipt must not
+    // authorize recovery against the newer owner state.
+    mock.lock().expect("mock owner lock").version = 3;
+    let _ = rotate_org_owner(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(recovery.clone()),
+    )
+    .await
+    .expect_err("a receipt older than the live upstream owner must be rejected");
+    // Likewise a last_changed_at that no longer matches the receipt's
+    // upstream_rotated_at (the owner state moved on without a version
+    // the receipt knows about) must fail closed.
+    {
+        let mut service = mock.lock().expect("mock owner lock");
+        service.version = 2;
+        service.changed_at = drift_at + chrono::Duration::minutes(5);
+    }
+    let _ = rotate_org_owner(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(recovery.clone()),
+    )
+    .await
+    .expect_err("receipt rotated_at must match the live owner last_changed_at");
+    let still_v1: i64 =
+        sqlx::query_scalar("SELECT max(version) FROM org_keyrings WHERE org_id = $1")
+            .bind(org_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load latest version after rejected recoveries");
+    assert_eq!(
+        still_v1, 1,
+        "no rejected recovery may mint a keyring version"
+    );
+
+    // The exact expired retry with the matching receipt: recovery
+    // completes without any new upstream rotation -- the receipt is
+    // the proof the remote already rotated.
+    mock.lock().expect("mock owner lock").changed_at = drift_at;
+    let recovered = rotate_org_owner(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(recovery),
+    )
+    .await
+    .expect("expired retry with a matching receipt recovers the lost rotation");
+    assert_eq!(recovered.keyring_version, 2);
+    assert_eq!(
+        recovered.owner_fingerprint,
+        hex::encode(Sha256::digest(replacement_key.verifying_key().to_bytes()))
+    );
+    assert_eq!(
+        mock.lock().expect("mock owner lock").rotate_calls,
+        0,
+        "receipt recovery must not repeat the upstream rotation"
+    );
+    let stored_version: i64 = sqlx::query_scalar(
+        "SELECT version FROM org_keyrings WHERE org_id = $1 ORDER BY version DESC LIMIT 1",
+    )
+    .bind(org_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read back latest version");
+    assert_eq!(stored_version, 2);
+
+    crate::test_support::drop_isolated_database("cap185_receipt_recovery", pool).await;
+}
+
+#[tokio::test]
+async fn owner_rotation_receipt_survives_failed_final_commit_and_replays_once() {
+    // The receipt must survive a failed final transaction without another RPC.
+    // One pool connection exposes any nested-acquisition deadlock.
+    let (_db_cleanup, pool) =
+        crate::test_support::isolated_database_test_pool("cap185_receipt_checkpoint").await;
+    let org_id = Uuid::new_v4();
+    let user_id = Uuid::new_v4();
+    let suffix = org_id.simple().to_string();
+    let org_name = format!("keyring-receipt-checkpoint-{suffix}");
+    crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+        .await
+        .expect("insert receipt checkpoint org");
+    sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Receipt Checkpoint Owner')")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("insert receipt checkpoint user");
+    sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+        .bind(user_id)
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("insert receipt checkpoint membership");
+    let current_key = SigningKey::generate(&mut OsRng);
+    let replacement_key = SigningKey::generate(&mut OsRng);
+    let third_key = SigningKey::generate(&mut OsRng);
+    sqlx::query(
+        "INSERT INTO user_signing_keys (user_id, pubkey)
+             VALUES ($1, $2), ($1, $3), ($1, $4)",
+    )
+    .bind(user_id)
+    .bind(current_key.verifying_key().to_bytes().to_vec())
+    .bind(replacement_key.verifying_key().to_bytes().to_vec())
+    .bind(third_key.verifying_key().to_bytes().to_vec())
+    .execute(&pool)
+    .await
+    .expect("insert receipt checkpoint signing keys");
+
+    // Scoped failure injection: while the switch row exists, inserts
+    // into org_keyrings for this org raise, aborting only the final CAP
+    // transaction. The receipt table is untouched, so the checkpoint
+    // commit survives.
+    sqlx::query("CREATE TABLE cap185_receipt_fail_switch (org_id uuid PRIMARY KEY)")
+        .execute(&pool)
+        .await
+        .expect("create final-commit failure switch");
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION cap185_fail_keyring_insert() RETURNS trigger
+             LANGUAGE plpgsql AS $$
+             BEGIN
+                 IF EXISTS (SELECT 1 FROM cap185_receipt_fail_switch WHERE org_id = NEW.org_id) THEN
+                     RAISE EXCEPTION 'induced final keyring insert failure';
+                 END IF;
+                 RETURN NEW;
+             END $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("create final-commit failure function");
+    sqlx::query(
+        "CREATE TRIGGER cap185_fail_keyring_insert_trigger
+             BEFORE INSERT ON org_keyrings
+             FOR EACH ROW EXECUTE FUNCTION cap185_fail_keyring_insert()",
+    )
+    .execute(&pool)
+    .await
+    .expect("create final-commit failure trigger");
+
+    let (mock_url, mock) = spawn_mock_signing_service_owner(
+        org_id,
+        MockSigningServiceOwner {
+            owner: current_key.verifying_key().to_bytes(),
+            changed_at: Utc::now(),
+            version: 1,
+            rotate_calls: 0,
+        },
+    )
+    .await;
+    let unrouted_url = format!("{mock_url}unrouted/");
+    let mut state = crate::test_support::lazy_state();
+    state.db = isolated_single_connection_pool("cap185_receipt_checkpoint").await;
+    state.signing_service = Some(
+        crate::signing_service::SigningServiceClient::new(mock_url, None)
+            .expect("build mock signing service client"),
+    );
+    let auth = AuthContext {
+        user_id,
+        org_id,
+        org_name: org_name.clone(),
+        role: Role::Owner,
+        api_key: None,
+        management_origin: crate::auth::middleware::ManagementOrigin::Public,
+    };
+    let _ = put_keyring(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(signed_keyring_request(org_id, user_id, &current_key, 1, 1)),
+    )
+    .await
+    .expect("publish v1 keyring");
+
+    let test_started_at = Utc::now();
+
+    // Fresh rotation v2: exactly one upstream RPC, and the receipt it
+    // produced binds the directive and normalized keyring digests to
+    // the upstream version the rotation reported.
+    let v2_signed_at = Utc::now();
+    let v2_request = rotation_request(
+        org_id,
+        user_id,
+        &current_key,
+        &replacement_key,
+        2,
+        2,
+        v2_signed_at,
+        "receipt-checkpoint",
+    );
+    let rotated = rotate_org_owner(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(v2_request),
+    )
+    .await
+    .expect("fresh rotation performs the upstream rotation");
+    assert_eq!(rotated.keyring_version, 2);
+    assert_eq!(mock.lock().expect("mock owner lock").rotate_calls, 1);
+    let v2_directive = Sha256::digest(owner_rotation_directive_bytes(
+        org_id,
+        &current_key.verifying_key().to_bytes(),
+        &replacement_key.verifying_key().to_bytes(),
+        v2_signed_at,
+        "receipt-checkpoint",
+    ));
+    let v2_keyring = Sha256::digest(normalized_keyring_bytes(
+        org_id,
+        user_id,
+        replacement_key.verifying_key().to_bytes(),
+        2,
+        2,
+    ));
+    let v2_receipt: (Vec<u8>, Vec<u8>, i64, DateTime<Utc>) = sqlx::query_as(
+        "SELECT directive_sha256, keyring_sha256, upstream_owner_version, upstream_rotated_at
+               FROM org_rotation_upstream_receipts
+              WHERE org_id = $1 AND upstream_owner_version = 2",
+    )
+    .bind(org_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load v2 upstream receipt");
+    assert_eq!(v2_receipt.0, v2_directive.as_slice().to_vec());
+    assert_eq!(v2_receipt.1, v2_keyring.as_slice().to_vec());
+    assert_eq!(v2_receipt.2, 2, "the receipt records the upstream version");
+    assert!(
+        v2_receipt.3 >= test_started_at,
+        "upstream_rotated_at is the RPC time, not the directive time"
+    );
+
+    // Force the FINAL CAP transaction of the next rotation to fail
+    // after its upstream rotation succeeded: only the receipt survives.
+    sqlx::query("INSERT INTO cap185_receipt_fail_switch (org_id) VALUES ($1)")
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("arm final-commit failure");
+    let v3_signed_at = Utc::now();
+    let v3_request = rotation_request(
+        org_id,
+        user_id,
+        &replacement_key,
+        &third_key,
+        3,
+        3,
+        v3_signed_at,
+        "receipt-checkpoint-failure",
+    );
+    let failed = rotate_org_owner(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(v3_request.clone()),
+    )
+    .await;
+    assert!(
+        failed.is_err(),
+        "forced final persistence failure must surface as an error"
+    );
+    assert_eq!(
+        mock.lock().expect("mock owner lock").rotate_calls,
+        2,
+        "the upstream rotation happened exactly once before the failed commit"
+    );
+    let v3_directive = Sha256::digest(owner_rotation_directive_bytes(
+        org_id,
+        &replacement_key.verifying_key().to_bytes(),
+        &third_key.verifying_key().to_bytes(),
+        v3_signed_at,
+        "receipt-checkpoint-failure",
+    ));
+    let v3_keyring = Sha256::digest(normalized_keyring_bytes(
+        org_id,
+        user_id,
+        third_key.verifying_key().to_bytes(),
+        3,
+        3,
+    ));
+    let v3_receipts: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM org_rotation_upstream_receipts
+              WHERE org_id = $1 AND directive_sha256 = $2 AND keyring_sha256 = $3
+                AND upstream_owner_version = 3",
+    )
+    .bind(org_id)
+    .bind(v3_directive.as_slice())
+    .bind(v3_keyring.as_slice())
+    .fetch_one(&pool)
+    .await
+    .expect("count v3 upstream receipts");
+    assert_eq!(
+        v3_receipts, 1,
+        "the failed final commit must leave the receipt durable"
+    );
+    let checkpoint_state: (i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM org_keyrings WHERE org_id = $1),
+                    (SELECT count(*) FROM audit_log
+                      WHERE org_id = $1 AND action = 'org.keyring.owner.rotate'),
+                    (SELECT count(*) FROM org_rotation_directives WHERE org_id = $1)",
+    )
+    .bind(org_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count CAP-side rows after the failed final commit");
+    assert_eq!(
+        checkpoint_state,
+        (2, 1, 1),
+        "only the receipt checkpoint persists: no v3 keyring, audit, or directive consumption"
+    );
+
+    sqlx::query("DELETE FROM cap185_receipt_fail_switch WHERE org_id = $1")
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("disarm final-commit failure");
+
+    // The failed rotation already moved the service from B to C, so B
+    // must not claim its successor even when authority becomes unreadable.
+    let stale_put = put_keyring(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(signed_keyring_request(
+            org_id,
+            user_id,
+            &replacement_key,
+            3,
+            3,
+        )),
+    )
+    .await
+    .expect_err("the old pinned owner must not claim the successor version");
+    assert_eq!(stale_put.0, StatusCode::CONFLICT);
+
+    // Missing client: this org has recorded rotation history, so the
+    // absence of configuration cannot stand in for the live authority.
+    let mut no_client_state = state.clone();
+    no_client_state.signing_service = None;
+    let unconfigured = put_keyring(
+        auth.clone(),
+        State(no_client_state),
+        Path(org_name.clone()),
+        Json(signed_keyring_request(
+            org_id,
+            user_id,
+            &replacement_key,
+            3,
+            3,
+        )),
+    )
+    .await
+    .expect_err("rotation history requires restored service configuration");
+    assert_eq!(unconfigured.0, StatusCode::SERVICE_UNAVAILABLE);
+
+    // Unreadable authority: the same mock listener under a prefix it
+    // does not route answers every request with a deterministic 404.
+    let mut unrouted_state = state.clone();
+    unrouted_state.signing_service = Some(
+        crate::signing_service::SigningServiceClient::new(unrouted_url, None)
+            .expect("build unrouted signing service client"),
+    );
+    let unreachable = put_keyring(
+        auth.clone(),
+        State(unrouted_state),
+        Path(org_name.clone()),
+        Json(signed_keyring_request(
+            org_id,
+            user_id,
+            &replacement_key,
+            3,
+            3,
+        )),
+    )
+    .await
+    .expect_err("an unreadable authority must fail closed");
+    assert_eq!(unreachable.0, StatusCode::BAD_GATEWAY);
+    assert_eq!(unreachable.1.0["error"], "signing_service_unavailable");
+
+    let fenced_v3_rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM org_keyrings WHERE org_id = $1 AND version = 3")
+            .bind(org_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count v3 keyrings after the fenced puts");
+    assert_eq!(
+        fenced_v3_rows, 0,
+        "every fenced put must reject before inserting a v3 row"
+    );
+
+    // Exact retry: the receipt proves the upstream rotation already
+    // happened, so CAP completes without calling the remote again.
+    let replayed = rotate_org_owner(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(v3_request),
+    )
+    .await
+    .expect("retry after the failed final commit replays the receipt");
+    assert_eq!(replayed.keyring_version, 3);
+    assert_eq!(
+        mock.lock().expect("mock owner lock").rotate_calls,
+        2,
+        "the retry must not repeat the upstream rotation"
+    );
+    let replayed_state: (i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM org_keyrings WHERE org_id = $1),
+                    (SELECT count(*) FROM audit_log
+                      WHERE org_id = $1 AND action = 'org.keyring.owner.rotate'),
+                    (SELECT count(*) FROM org_rotation_directives WHERE org_id = $1)",
+    )
+    .bind(org_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count CAP-side rows after the receipt replay");
+    assert_eq!(
+        replayed_state,
+        (3, 2, 2),
+        "exactly one v3 keyring, audit row, and directive consumption"
+    );
+    let receipt_rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM org_rotation_upstream_receipts WHERE org_id = $1")
+            .bind(org_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count upstream receipts after replay");
+    assert_eq!(
+        receipt_rows, 2,
+        "the retry reuses the existing receipt instead of recording a second one"
+    );
+
+    crate::test_support::drop_isolated_database("cap185_receipt_checkpoint", pool).await;
+}
+
+#[tokio::test]
+async fn owner_rotation_receipt_bound_recovery_by_remaining_owner() {
+    // Phase 1 committed the receipt and moved the service to the
+    // replacement owner, then the final CAP commit failed and the
+    // initiating owner was demoted. A demoted actor must never
+    // finalize; a remaining owner must recover the exact
+    // receipt-bound request without another upstream RPC; unrelated
+    // or mutated requests must stay denied.
+    let (_db_cleanup, pool) =
+        crate::test_support::isolated_database_test_pool("cap185_receipt_handoff").await;
+    let org_id = Uuid::new_v4();
+    let initiator_id = Uuid::new_v4();
+    let remaining_owner_id = Uuid::new_v4();
+    let suffix = org_id.simple().to_string();
+    let org_name = format!("keyring-receipt-handoff-{suffix}");
+    crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+        .await
+        .expect("insert receipt handoff org");
+    for (member_id, display_name) in [
+        (initiator_id, "Receipt Handoff Initiator"),
+        (remaining_owner_id, "Receipt Handoff Remaining Owner"),
+    ] {
+        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, $2)")
+            .bind(member_id)
+            .bind(display_name)
+            .execute(&pool)
+            .await
+            .expect("insert receipt handoff user");
+        sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+            .bind(member_id)
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("insert receipt handoff membership");
+    }
+    let current_key = SigningKey::generate(&mut OsRng);
+    let replacement_key = SigningKey::generate(&mut OsRng);
+    let third_key = SigningKey::generate(&mut OsRng);
+    // Only the initiator holds key registrations: the remaining owner
+    // authorizes purely through role and the receipt, never through
+    // key ownership.
+    sqlx::query(
+        "INSERT INTO user_signing_keys (user_id, pubkey)
+             VALUES ($1, $2), ($1, $3), ($1, $4)",
+    )
+    .bind(initiator_id)
+    .bind(current_key.verifying_key().to_bytes().to_vec())
+    .bind(replacement_key.verifying_key().to_bytes().to_vec())
+    .bind(third_key.verifying_key().to_bytes().to_vec())
+    .execute(&pool)
+    .await
+    .expect("insert receipt handoff signing keys");
+
+    // Scoped failure injection: while the switch row exists, inserts
+    // into org_keyrings for this org raise, aborting only the final
+    // CAP transaction; the receipt table is untouched.
+    sqlx::query("CREATE TABLE cap185_handoff_fail_switch (org_id uuid PRIMARY KEY)")
+        .execute(&pool)
+        .await
+        .expect("create handoff failure switch");
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION cap185_handoff_fail_insert() RETURNS trigger
+             LANGUAGE plpgsql AS $$
+             BEGIN
+                 IF EXISTS (SELECT 1 FROM cap185_handoff_fail_switch WHERE org_id = NEW.org_id) THEN
+                     RAISE EXCEPTION 'induced final keyring insert failure';
+                 END IF;
+                 RETURN NEW;
+             END $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("create handoff failure function");
+    sqlx::query(
+        "CREATE TRIGGER cap185_handoff_fail_insert_trigger
+             BEFORE INSERT ON org_keyrings
+             FOR EACH ROW EXECUTE FUNCTION cap185_handoff_fail_insert()",
+    )
+    .execute(&pool)
+    .await
+    .expect("create handoff failure trigger");
+
+    let (mock_url, mock) = spawn_mock_signing_service_owner(
+        org_id,
+        MockSigningServiceOwner {
+            owner: current_key.verifying_key().to_bytes(),
+            changed_at: Utc::now(),
+            version: 1,
+            rotate_calls: 0,
+        },
+    )
+    .await;
+    let mut state = crate::test_support::lazy_state();
+    state.db = isolated_single_connection_pool("cap185_receipt_handoff").await;
+    state.signing_service = Some(
+        crate::signing_service::SigningServiceClient::new(mock_url, None)
+            .expect("build mock signing service client"),
+    );
+    let initiator_auth = AuthContext {
+        user_id: initiator_id,
+        org_id,
+        org_name: org_name.clone(),
+        role: Role::Owner,
+        api_key: None,
+        management_origin: crate::auth::middleware::ManagementOrigin::Public,
+    };
+    let remaining_auth = AuthContext {
+        user_id: remaining_owner_id,
+        org_id,
+        org_name: org_name.clone(),
+        role: Role::Owner,
+        api_key: None,
+        management_origin: crate::auth::middleware::ManagementOrigin::Public,
+    };
+    let _ = put_keyring(
+        initiator_auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(signed_keyring_request(
+            org_id,
+            initiator_id,
+            &current_key,
+            1,
+            1,
+        )),
+    )
+    .await
+    .expect("publish v1 keyring");
+
+    // The initiating owner's rotation executes the upstream RPC and
+    // commits the receipt, then the final CAP commit is forced to
+    // fail.
+    sqlx::query("INSERT INTO cap185_handoff_fail_switch (org_id) VALUES ($1)")
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("arm final-commit failure");
+    let v2_signed_at = Utc::now();
+    let v2_request = rotation_request(
+        org_id,
+        initiator_id,
+        &current_key,
+        &replacement_key,
+        2,
+        2,
+        v2_signed_at,
+        "handoff",
+    );
+    let failed = rotate_org_owner(
+        initiator_auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(v2_request.clone()),
+    )
+    .await;
+    assert!(
+        failed.is_err(),
+        "forced final persistence failure must surface as an error"
+    );
+    assert_eq!(
+        mock.lock().expect("mock owner lock").rotate_calls,
+        1,
+        "the upstream rotation happened exactly once before the failed commit"
+    );
+    let checkpoint: (i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM org_keyrings WHERE org_id = $1),
+                    (SELECT count(*) FROM org_rotation_directives WHERE org_id = $1),
+                    (SELECT count(*) FROM audit_log
+                      WHERE org_id = $1 AND action = 'org.keyring.owner.rotate')",
+    )
+    .bind(org_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count CAP-side rows after the failed final commit");
+    assert_eq!(
+        checkpoint,
+        (1, 0, 0),
+        "only the receipt survived the failed final commit"
+    );
+
+    sqlx::query("UPDATE memberships SET role = 'admin' WHERE user_id = $1 AND org_id = $2")
+        .bind(initiator_id)
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("demote the initiating owner");
+
+    let demoted_error = rotate_org_owner(
+        initiator_auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(v2_request.clone()),
+    )
+    .await
+    .expect_err("a demoted actor must never finalize a rotation");
+    assert_eq!(demoted_error.0, StatusCode::FORBIDDEN);
+
+    // Mutated keyring content under the same directive: the receipt
+    // binds the exact keyring digest, so the mutation forfeits the
+    // recovery.
+    let mutated = rotation_request(
+        org_id,
+        initiator_id,
+        &current_key,
+        &replacement_key,
+        2,
+        3,
+        v2_signed_at,
+        "handoff",
+    );
+    let mutated_error = rotate_org_owner(
+        remaining_auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(mutated),
+    )
+    .await
+    .expect_err("a mutated request must not inherit the receipt");
+    assert_eq!(mutated_error.0, StatusCode::BAD_REQUEST);
+
+    // Unrelated directive with the initiator's key: no receipt exists
+    // for it, so the remaining owner cannot borrow the registration.
+    let unrelated = rotation_request(
+        org_id,
+        initiator_id,
+        &current_key,
+        &replacement_key,
+        2,
+        2,
+        v2_signed_at,
+        "handoff-unrelated",
+    );
+    let unrelated_error = rotate_org_owner(
+        remaining_auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(unrelated),
+    )
+    .await
+    .expect_err("an unrelated directive must not inherit the receipt");
+    assert_eq!(unrelated_error.0, StatusCode::BAD_REQUEST);
+
+    sqlx::query("DELETE FROM cap185_handoff_fail_switch WHERE org_id = $1")
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("disarm the final-commit failure");
+
+    let recovered = rotate_org_owner(
+        remaining_auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(v2_request),
+    )
+    .await
+    .expect("a remaining owner recovers the exact receipt-bound request");
+    assert_eq!(recovered.keyring_version, 2);
+    assert_eq!(
+        recovered.owner_fingerprint,
+        hex::encode(Sha256::digest(replacement_key.verifying_key().to_bytes()))
+    );
+    assert_eq!(
+        mock.lock().expect("mock owner lock").rotate_calls,
+        1,
+        "the recovery must not repeat the upstream rotation"
+    );
+    let recovered_state: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM org_keyrings WHERE org_id = $1),
+                    (SELECT count(*) FROM org_rotation_directives WHERE org_id = $1)",
+    )
+    .bind(org_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count CAP-side rows after the receipt recovery");
+    assert_eq!(
+        recovered_state,
+        (2, 1),
+        "exactly one v2 keyring and one directive consumption"
+    );
+    let finalized_by: Uuid = sqlx::query_scalar(
+        "SELECT user_id FROM audit_log
+              WHERE org_id = $1 AND action = 'org.keyring.owner.rotate'",
+    )
+    .bind(org_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load the rotation audit row");
+    assert_eq!(
+        finalized_by, remaining_owner_id,
+        "the remaining owner, not the demoted initiator, finalized the rotation"
+    );
+
+    // A fresh rotation by the remaining owner with a key registered
+    // only to the initiator keeps the caller-bound registration
+    // requirement: no receipt can authorize it.
+    let fresh = rotation_request(
+        org_id,
+        initiator_id,
+        &replacement_key,
+        &third_key,
+        3,
+        3,
+        Utc::now(),
+        "handoff-fresh",
+    );
+    let fresh_error = rotate_org_owner(
+        remaining_auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(fresh),
+    )
+    .await
+    .expect_err("fresh rotations keep the caller-bound registration requirement");
+    assert_eq!(fresh_error.0, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        mock.lock().expect("mock owner lock").rotate_calls,
+        1,
+        "the denied fresh rotation must not reach the upstream service"
+    );
+
+    // Deterministic lane-gap regression: the receipt INSERT runs after
+    // phase-one authorization but before its commit. Demote the caller in
+    // that same transaction. Phase 2 re-authorizes unconditionally, so
+    // the demoted caller must not write the successor keyring; the
+    // durable receipt remains for a still-active owner to recover.
+    sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2)")
+        .bind(remaining_owner_id)
+        .bind(third_key.verifying_key().to_bytes().to_vec())
+        .execute(&pool)
+        .await
+        .expect("register successor for remaining owner");
+    sqlx::query(
+        "CREATE FUNCTION cap185_demote_after_receipt() RETURNS trigger
+             LANGUAGE plpgsql AS $$
+             BEGIN
+                 UPDATE memberships SET role = 'admin'
+                  WHERE org_id = NEW.org_id AND user_id = TG_ARGV[0]::uuid;
+                 RETURN NEW;
+             END $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("create receipt interleave trigger");
+    let trigger_sql = format!(
+        "CREATE TRIGGER cap185_demote_after_receipt_trigger
+             AFTER INSERT ON org_rotation_upstream_receipts
+             FOR EACH ROW EXECUTE FUNCTION cap185_demote_after_receipt('{remaining_owner_id}')"
+    );
+    sqlx::query(&trigger_sql)
+        .execute(&pool)
+        .await
+        .expect("install receipt interleave trigger");
+    let gap_request = rotation_request(
+        org_id,
+        initiator_id,
+        &replacement_key,
+        &third_key,
+        3,
+        3,
+        Utc::now(),
+        "membership-changes-after-upstream",
+    );
+    let gap_error = rotate_org_owner(
+        remaining_auth,
+        State(state),
+        Path(org_name),
+        Json(gap_request),
+    )
+    .await
+    .expect_err("a caller demoted before phase 2 must not write the successor keyring");
+    assert_eq!(gap_error.0, StatusCode::FORBIDDEN);
+    let role_after: String =
+        sqlx::query_scalar("SELECT role::text FROM memberships WHERE org_id = $1 AND user_id = $2")
+            .bind(org_id)
+            .bind(remaining_owner_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read role after receipt");
+    assert_eq!(role_after, "admin");
+    assert_eq!(mock.lock().expect("mock owner lock").rotate_calls, 2);
+    let gap_keyrings: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM org_keyrings WHERE org_id = $1 AND version = 3")
+            .bind(org_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count successor keyring after demotion");
+    assert_eq!(
+        gap_keyrings, 0,
+        "demoted caller must not write the successor keyring"
+    );
+    let gap_receipts: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM org_rotation_upstream_receipts WHERE org_id = $1")
+            .bind(org_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count recoverable receipts after demotion");
+    assert_eq!(
+        gap_receipts, 2,
+        "the upstream change remains recoverable by a still-active owner"
+    );
+    crate::test_support::drop_isolated_database("cap185_receipt_handoff", pool).await;
+}
+
+#[tokio::test]
+async fn owner_rotation_version_ceiling_rejects_successor_and_preserves_replay() {
+    // derive_rotation_path must not compute latest+1 unchecked: at
+    // the bigint ceiling no successor version exists. A proposal
+    // below the ceiling must get the normal stale-version conflict
+    // (the unchecked add would panic in debug and wrap in release),
+    // and the exact existing-version replay at the ceiling must keep
+    // working.
+    let (_db_cleanup, pool) =
+        crate::test_support::isolated_database_test_pool("cap185_version_ceiling").await;
+    let org_id = Uuid::new_v4();
+    let user_id = Uuid::new_v4();
+    let suffix = org_id.simple().to_string();
+    let org_name = format!("keyring-version-ceiling-{suffix}");
+    crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+        .await
+        .expect("insert version ceiling org");
+    sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Version Ceiling Owner')")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("insert version ceiling user");
+    sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+        .bind(user_id)
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("insert version ceiling membership");
+    let current_key = SigningKey::generate(&mut OsRng);
+    let replacement_key = SigningKey::generate(&mut OsRng);
+    sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2), ($1, $3)")
+        .bind(user_id)
+        .bind(current_key.verifying_key().to_bytes().to_vec())
+        .bind(replacement_key.verifying_key().to_bytes().to_vec())
+        .execute(&pool)
+        .await
+        .expect("insert version ceiling signing keys");
+
+    // Seed the latest keyring at the bigint ceiling exactly as the
+    // committed writers store it: normalized payload bytes signed by
+    // the replacement key.
+    let replay = rotation_request(
+        org_id,
+        user_id,
+        &current_key,
+        &replacement_key,
+        i64::MAX,
+        9,
+        Utc::now(),
+        "ceiling-replay",
+    );
+    let replacement_key_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM user_signing_keys
+              WHERE user_id = $1 AND pubkey = $2 AND revoked_at IS NULL",
+    )
+    .bind(user_id)
+    .bind(replacement_key.verifying_key().to_bytes().to_vec())
+    .fetch_one(&pool)
+    .await
+    .expect("load replacement key registration");
+    sqlx::query(
+        "INSERT INTO org_keyrings
+                 (org_id, version, keyring_payload, signature, signing_key_id)
+             VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(org_id)
+    .bind(i64::MAX)
+    .bind(normalized_keyring_bytes(
+        org_id,
+        user_id,
+        replacement_key.verifying_key().to_bytes(),
+        i64::MAX,
+        9,
+    ))
+    .bind(hex::decode(&replay.signature).expect("decode replay signature"))
+    .bind(replacement_key_id)
+    .execute(&pool)
+    .await
+    .expect("insert keyring at the bigint version ceiling");
+
+    let (mock_url, mock) = spawn_mock_signing_service_owner(
+        org_id,
+        MockSigningServiceOwner {
+            owner: replacement_key.verifying_key().to_bytes(),
+            changed_at: Utc::now(),
+            version: 1,
+            rotate_calls: 0,
+        },
+    )
+    .await;
+    let mut state = crate::test_support::lazy_state();
+    state.db = isolated_single_connection_pool("cap185_version_ceiling").await;
+    state.signing_service = Some(
+        crate::signing_service::SigningServiceClient::new(mock_url, None)
+            .expect("build mock signing service client"),
+    );
+    let auth = AuthContext {
+        user_id,
+        org_id,
+        org_name: org_name.clone(),
+        role: Role::Owner,
+        api_key: None,
+        management_origin: crate::auth::middleware::ManagementOrigin::Public,
+    };
+
+    let below_ceiling = rotation_request(
+        org_id,
+        user_id,
+        &current_key,
+        &replacement_key,
+        i64::MAX - 1,
+        8,
+        Utc::now(),
+        "ceiling-stale",
+    );
+    let stale_error = rotate_org_owner(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(below_ceiling),
+    )
+    .await
+    .expect_err("a version below the committed ceiling is stale");
+    assert_eq!(stale_error.0, StatusCode::CONFLICT);
+
+    let recovered = rotate_org_owner(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(replay),
+    )
+    .await
+    .expect("exact existing-version replay at the ceiling succeeds");
+    assert_eq!(recovered.keyring_version, i64::MAX);
+    assert_eq!(
+        mock.lock().expect("mock owner lock").rotate_calls,
+        0,
+        "neither the stale proposal nor the ceiling replay rotates upstream"
+    );
+
+    crate::test_support::drop_isolated_database("cap185_version_ceiling", pool).await;
+}
+
+#[tokio::test]
+async fn owner_rotation_lane_waiter_rereads_owner_before_remote_rotation() {
+    // Both requests queue while the upstream owner is still the original key.
+    // A pre-lane snapshot would send the duplicate RPC with the revoked signer.
+    let pool = database_test_pool().await;
+    let org_id = Uuid::new_v4();
+    let user_id = Uuid::new_v4();
+    let suffix = org_id.simple().to_string();
+    let org_name = format!("keyring-lane-waiter-{suffix}");
+    crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+        .await
+        .expect("insert lane waiter org");
+    sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Lane Waiter Owner')")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("insert lane waiter user");
+    sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+        .bind(user_id)
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("insert lane waiter membership");
+    let current_key = SigningKey::generate(&mut OsRng);
+    let replacement_key = SigningKey::generate(&mut OsRng);
+    sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2), ($1, $3)")
+        .bind(user_id)
+        .bind(current_key.verifying_key().to_bytes().to_vec())
+        .bind(replacement_key.verifying_key().to_bytes().to_vec())
+        .execute(&pool)
+        .await
+        .expect("insert lane waiter signing keys");
+
+    let (mock_url, mock) = spawn_mock_signing_service_owner(
+        org_id,
+        MockSigningServiceOwner {
+            owner: current_key.verifying_key().to_bytes(),
+            changed_at: Utc::now(),
+            version: 1,
+            rotate_calls: 0,
+        },
+    )
+    .await;
+    let mut state = crate::test_support::lazy_state();
+    state.db = pool.clone();
+    state.signing_service = Some(
+        crate::signing_service::SigningServiceClient::new(mock_url, None)
+            .expect("build mock signing service client"),
+    );
+    let auth = AuthContext {
+        user_id,
+        org_id,
+        org_name: org_name.clone(),
+        role: Role::Owner,
+        api_key: None,
+        management_origin: crate::auth::middleware::ManagementOrigin::Public,
+    };
+    let _ = put_keyring(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(signed_keyring_request(org_id, user_id, &current_key, 1, 1)),
+    )
+    .await
+    .expect("publish v1 keyring");
+
+    // Hold the org's signing-authority lane so both rotation requests
+    // queue behind this transaction in a known order.
+    let mut lane_blocker = pool.begin().await.expect("begin lane blocker");
+    sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
+        .bind(crate::signing_service::ORG_SIGNING_AUTHORITY_LANE_DOMAIN)
+        .bind(crate::signing_service::org_signing_advisory_key(org_id))
+        .execute(&mut *lane_blocker)
+        .await
+        .expect("hold signing authority lane");
+
+    let winner_application = format!("keyring-lane-waiter-winner-{suffix}");
+    let mut winner_state = crate::test_support::lazy_state();
+    winner_state.db = named_database_test_pool(&winner_application).await;
+    winner_state.signing_service = state.signing_service.clone();
+    let winner_request = rotation_request(
+        org_id,
+        user_id,
+        &current_key,
+        &replacement_key,
+        2,
+        2,
+        Utc::now(),
+        "lane-waiter",
+    );
+    let winner = tokio::spawn(rotate_org_owner(
+        auth.clone(),
+        State(winner_state),
+        Path(org_name.clone()),
+        Json(winner_request.clone()),
+    ));
+    wait_for_named_lock_waiter(&pool, &winner_application).await;
+
+    // A byte-identical duplicate of the same rotation, queued strictly
+    // behind the winner. Whichever of the two lands the insert, the
+    // other must observe the winner's committed upstream state (owner,
+    // receipt) instead of its pre-lane snapshot.
+    let waiter_application = format!("keyring-lane-waiter-retry-{suffix}");
+    let mut waiter_state = crate::test_support::lazy_state();
+    waiter_state.db = named_database_test_pool(&waiter_application).await;
+    waiter_state.signing_service = state.signing_service.clone();
+    let waiter = tokio::spawn(rotate_org_owner(
+        auth.clone(),
+        State(waiter_state),
+        Path(org_name.clone()),
+        Json(winner_request),
+    ));
+    wait_for_named_lock_waiter(&pool, &waiter_application).await;
+
+    lane_blocker
+        .rollback()
+        .await
+        .expect("release signing authority lane");
+    let _ = winner
+        .await
+        .expect("join winner rotation")
+        .expect("winner rotation commits");
+    let _ = waiter
+        .await
+        .expect("join queued duplicate rotation")
+        .expect("queued duplicate completes idempotently without a second upstream rotation");
+
+    assert_eq!(
+        mock.lock().expect("mock owner lock").rotate_calls,
+        1,
+        "exactly one upstream rotation serves both requests"
+    );
+    let outcome: (i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM org_keyrings WHERE org_id = $1),
+                    (SELECT count(*) FROM audit_log
+                      WHERE org_id = $1 AND action = 'org.keyring.owner.rotate'),
+                    (SELECT count(*) FROM org_rotation_directives WHERE org_id = $1)",
+    )
+    .bind(org_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count lane waiter rotation rows");
+    assert_eq!(
+        outcome,
+        (2, 1, 1),
+        "one v2 keyring, one audit row, and one directive consumption"
+    );
+
+    sqlx::query("DELETE FROM audit_log WHERE org_id = $1")
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("delete lane waiter audit rows");
+    sqlx::query("DELETE FROM organizations WHERE id = $1")
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("delete lane waiter org");
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("delete lane waiter user");
+}
+
+#[tokio::test]
+async fn owner_rotation_expired_exact_retry_stays_idempotent() {
+    // The signed_at max-age is a first-use
+    // bound. If a rotation commits but its response is lost, a caller
+    // retrying the byte-identical request after the 15-minute window
+    // must still get the documented idempotent success: the consume-once
+    // ledger proves the exact directive authorized the completed
+    // rotation. The mock signing service starts with the replacement
+    // owner already pinned, standing in for the committed first attempt.
+    let pool = database_test_pool().await;
+    let org_id = Uuid::new_v4();
+    let user_id = Uuid::new_v4();
+    let suffix = org_id.simple().to_string();
+    let org_name = format!("keyring-expired-retry-{suffix}");
+    crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+        .await
+        .expect("insert expired retry org");
+    sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Expired Retry Owner')")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("insert expired retry user");
+    sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+        .bind(user_id)
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("insert expired retry membership");
+    let current_key = SigningKey::generate(&mut OsRng);
+    let replacement_key = SigningKey::generate(&mut OsRng);
+    sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2), ($1, $3)")
+        .bind(user_id)
+        .bind(current_key.verifying_key().to_bytes().to_vec())
+        .bind(replacement_key.verifying_key().to_bytes().to_vec())
+        .execute(&pool)
+        .await
+        .expect("insert expired retry signing keys");
+
+    let mut state = crate::test_support::lazy_state();
+    state.db = pool.clone();
+    state.signing_service = Some(
+        crate::signing_service::SigningServiceClient::new(
+            mock_signing_service_owner_api(org_id, replacement_key.verifying_key().to_bytes())
+                .await,
+            None,
+        )
+        .expect("build mock signing service client"),
+    );
+    let auth = AuthContext {
+        user_id,
+        org_id,
+        org_name: org_name.clone(),
+        role: Role::Owner,
+        api_key: None,
+        management_origin: crate::auth::middleware::ManagementOrigin::Public,
+    };
+    let _ = put_keyring(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(signed_keyring_request(org_id, user_id, &current_key, 1, 1)),
+    )
+    .await
+    .expect("publish v1 keyring");
+
+    // The "committed first attempt": v2 exists with the replacement
+    // owner pinned. No org_rotation_directives row exists, standing in
+    // for a rotation performed before the ledger deployment (or a
+    // crash-recovered commit) -- the retry must still be idempotent.
+    let applied_signed_at = Utc::now() - chrono::Duration::minutes(30);
+    let applied = rotation_request(
+        org_id,
+        user_id,
+        &current_key,
+        &replacement_key,
+        2,
+        2,
+        applied_signed_at,
+        "expired-retry",
+    );
+    sqlx::query(
+        "INSERT INTO org_keyrings (org_id, version, keyring_payload, signature, signing_key_id)
+             VALUES ($1, 2, $2, $3,
+                     (SELECT id FROM user_signing_keys
+                       WHERE user_id = $4 AND pubkey = $5 AND revoked_at IS NULL))",
+    )
+    .bind(org_id)
+    .bind(serde_json::to_vec(&applied.keyring_payload).expect("serialize applied payload"))
+    .bind(hex::decode(&applied.signature).expect("decode applied signature"))
+    .bind(user_id)
+    .bind(replacement_key.verifying_key().to_bytes().to_vec())
+    .execute(&pool)
+    .await
+    .expect("insert committed v2 keyring row");
+
+    // Byte-identical retry past the max-age window: idempotent success.
+    let retried = rotate_org_owner(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(applied),
+    )
+    .await
+    .expect("expired exact retry of an applied rotation is idempotent");
+    assert_eq!(retried.keyring_version, 2);
+    assert_eq!(
+        retried.owner_fingerprint,
+        hex::encode(Sha256::digest(replacement_key.verifying_key().to_bytes()))
+    );
+
+    // A never-applied directive older than the window is still rejected:
+    // the max-age bound holds on first use. The pinned owner is now the
+    // replacement key, so the would-be v3 rotation is signed by it.
+    let stale = rotation_request(
+        org_id,
+        user_id,
+        &replacement_key,
+        &current_key,
+        3,
+        3,
+        Utc::now() - chrono::Duration::minutes(30),
+        "expired-first-use",
+    );
+    let rejected = rotate_org_owner(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(stale),
+    )
+    .await
+    .expect_err("expired first-use directive must still be rejected");
+    assert_eq!(rejected.0, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        rejected.1.0["error"],
+        "owner rotation directive signed_at is too old"
+    );
+
+    sqlx::query("DELETE FROM audit_log WHERE org_id = $1")
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("delete expired retry audit rows");
+    sqlx::query("DELETE FROM organizations WHERE id = $1")
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("delete expired retry org");
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("delete expired retry user");
+}
+
+#[tokio::test]
+async fn owner_rotation_version_bound_uses_actual_keyring_insertion_time() {
+    // org_keyrings.created_at must witness
+    // the moment a version row is actually inserted, not the start of the
+    // inserting transaction. A keyring upload that queues on the shared
+    // signing-authority lane pins now() == transaction_timestamp() at
+    // BEGIN; a directive captured after BEGIN but before the queued
+    // version lands would then compare as "newer than the version" and be
+    // accepted, defeating the pre-creation replay bound. Migration 0063
+    // switches the default to clock_timestamp() and this test fails
+    // against the old transaction-start semantics.
+    let pool = database_test_pool().await;
+    let org_id = Uuid::new_v4();
+    let user_id = Uuid::new_v4();
+    let suffix = org_id.simple().to_string();
+    let org_name = format!("keyring-lane-lag-{suffix}");
+    crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+        .await
+        .expect("insert lane lag org");
+    sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Lane Lag Owner')")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("insert lane lag user");
+    sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+        .bind(user_id)
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("insert lane lag membership");
+    let current_key = SigningKey::generate(&mut OsRng);
+    let replacement_key = SigningKey::generate(&mut OsRng);
+    sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2), ($1, $3)")
+        .bind(user_id)
+        .bind(current_key.verifying_key().to_bytes().to_vec())
+        .bind(replacement_key.verifying_key().to_bytes().to_vec())
+        .execute(&pool)
+        .await
+        .expect("insert lane lag signing keys");
+
+    let mut state = crate::test_support::lazy_state();
+    state.db = pool.clone();
+    state.signing_service = Some(
+        crate::signing_service::SigningServiceClient::new(
+            mock_signing_service_owner_api(org_id, current_key.verifying_key().to_bytes()).await,
+            None,
+        )
+        .expect("build mock signing service client"),
+    );
+    let auth = AuthContext {
+        user_id,
+        org_id,
+        org_name: org_name.clone(),
+        role: Role::Owner,
+        api_key: None,
+        management_origin: crate::auth::middleware::ManagementOrigin::Public,
+    };
+    let _ = put_keyring(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(signed_keyring_request(org_id, user_id, &current_key, 1, 1)),
+    )
+    .await
+    .expect("publish v1 keyring");
+
+    // Hold the org's signing-authority lane so a v2 upload queues behind
+    // this transaction, exactly like any concurrent signing-authority
+    // writer would.
+    let mut lane_blocker = pool.begin().await.expect("begin lane blocker");
+    sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
+        .bind(crate::signing_service::ORG_SIGNING_AUTHORITY_LANE_DOMAIN)
+        .bind(crate::signing_service::org_signing_advisory_key(org_id))
+        .execute(&mut *lane_blocker)
+        .await
+        .expect("hold signing authority lane");
+
+    let writer_application = format!("keyring-lane-lag-writer-{suffix}");
+    let mut writer_state = crate::test_support::lazy_state();
+    writer_state.db = named_database_test_pool(&writer_application).await;
+    writer_state.signing_service = state.signing_service.clone();
+    let writer = tokio::spawn(put_keyring(
+        auth.clone(),
+        State(writer_state),
+        Path(org_name.clone()),
+        Json(signed_keyring_request(org_id, user_id, &current_key, 2, 2)),
+    ));
+    wait_for_named_lock_waiter(&pool, &writer_application).await;
+
+    // The upload transaction has begun and is queued on the lane. Capture
+    // the directive timestamp now: after the writer's BEGIN, before the
+    // v2 row can possibly be inserted. Under the old now() default this
+    // predates v2's created_at and the directive is accepted as "newer".
+    let directive_signed_at = Utc::now();
+    lane_blocker
+        .rollback()
+        .await
+        .expect("release signing authority lane");
+    let _ = writer
+        .await
+        .expect("join queued keyring upload")
+        .expect("queued v2 keyring upload commits");
+
+    // The stored witness must be the true insertion time: strictly after
+    // the directive captured while the upload was still queued.
+    let v2_created_at: DateTime<Utc> =
+        sqlx::query_scalar("SELECT created_at FROM org_keyrings WHERE org_id = $1 AND version = 2")
+            .bind(org_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read v2 insertion witness");
+    assert!(
+        v2_created_at > directive_signed_at,
+        "v2 created_at must be the actual insertion time (clock_timestamp), \
+             not the queued transaction's start time"
+    );
+
+    // The directive predates v2's actual creation and must be rejected on
+    // the insert-new-version path (v3) even though it is inside the TTL
+    // window, freshly signed, and never consumed.
+    let replay = rotation_request(
+        org_id,
+        user_id,
+        &current_key,
+        &replacement_key,
+        3,
+        3,
+        directive_signed_at,
+        "lane-lag",
+    );
+    let rejected = rotate_org_owner(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(replay),
+    )
+    .await
+    .expect_err("directive captured during lane lag must be rejected");
+    assert_eq!(rejected.0, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        rejected.1.0["error"],
+        "owner rotation directive predates the current keyring version"
+    );
+
+    sqlx::query("DELETE FROM audit_log WHERE org_id = $1")
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("delete lane lag audit rows");
+    sqlx::query("DELETE FROM organizations WHERE id = $1")
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("delete lane lag org");
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("delete lane lag user");
+}
+
+#[test]
+fn list_orgs_session_includes_all_user_orgs() {
+    let auth = auth_context(None);
+
+    assert_eq!(list_orgs_api_key_org_filter(&auth), None);
+}
+
+#[test]
+fn list_orgs_api_key_is_limited_to_bound_org() {
+    let org_id = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+    let auth = auth_context(Some(ValidatedApiKey {
+        id: Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap(),
+        org_id,
+        created_by: Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
+        scopes: vec!["apps:read".to_string()],
+    }));
+
+    assert_eq!(list_orgs_api_key_org_filter(&auth), Some(org_id));
+}
+#[tokio::test]
+async fn keyring_acceptance_waits_for_membership_removal_and_rejects() {
+    let pool = database_test_pool().await;
+    let org_id = Uuid::new_v4();
+    let user_id = Uuid::new_v4();
+    let remover_id = Uuid::new_v4();
+    let suffix = org_id.simple().to_string();
+    let org_name = format!("keyring-removal-{suffix}");
+    crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+        .await
+        .expect("insert keyring removal org");
+    sqlx::query(
+        "INSERT INTO users (id, display_name)
+             VALUES ($1, 'Removed Owner'), ($2, 'Remaining Owner')",
+    )
+    .bind(user_id)
+    .bind(remover_id)
+    .execute(&pool)
+    .await
+    .expect("insert keyring removal owners");
+    sqlx::query(
+        "INSERT INTO memberships (user_id, org_id, role)
+             VALUES ($1, $3, 'owner'), ($2, $3, 'owner')",
+    )
+    .bind(user_id)
+    .bind(remover_id)
+    .bind(org_id)
+    .execute(&pool)
+    .await
+    .expect("insert keyring removal memberships");
+    let key = SigningKey::generate(&mut OsRng);
+    sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2)")
+        .bind(user_id)
+        .bind(key.verifying_key().to_bytes().to_vec())
+        .execute(&pool)
+        .await
+        .expect("insert keyring removal signing key");
+
+    let removal_application = format!("member-removal-{suffix}");
+    let keyring_application = format!("keyring-after-removal-{suffix}");
+    let mut removal_state = crate::test_support::lazy_state();
+    removal_state.db = named_database_test_pool(&removal_application).await;
+    let mut keyring_state = crate::test_support::lazy_state();
+    keyring_state.db = named_database_test_pool(&keyring_application).await;
+    let keyring_auth = AuthContext {
+        user_id,
+        org_id,
+        org_name: org_name.clone(),
+        role: Role::Owner,
+        api_key: None,
+        management_origin: crate::auth::middleware::ManagementOrigin::Public,
+    };
+    let remover_auth = AuthContext {
+        user_id: remover_id,
+        org_id,
+        org_name: org_name.clone(),
+        role: Role::Owner,
+        api_key: None,
+        management_origin: crate::auth::middleware::ManagementOrigin::Public,
+    };
+
+    let mut row_blocker = pool.begin().await.expect("begin membership row blocker");
+    sqlx::query(
+        "SELECT 1 FROM memberships
+              WHERE org_id = $1 AND user_id = $2
+              FOR UPDATE",
+    )
+    .bind(org_id)
+    .bind(user_id)
+    .fetch_one(&mut *row_blocker)
+    .await
+    .expect("block target membership row");
+
+    let removal_org_name = org_name.clone();
+    let removal = tokio::spawn(remove_member(
+        remover_auth,
+        State(removal_state),
+        Path((removal_org_name, user_id)),
+    ));
+    wait_for_named_lock_waiter(&pool, &removal_application).await;
+
+    let writer = tokio::spawn(put_keyring(
+        keyring_auth,
+        State(keyring_state),
+        Path(org_name),
+        Json(signed_keyring_request(org_id, user_id, &key, 1, 1)),
+    ));
+    wait_for_named_lock_waiter(&pool, &keyring_application).await;
+    row_blocker
+        .rollback()
+        .await
+        .expect("release target membership row");
+    assert_eq!(
+        removal
+            .await
+            .expect("join public membership removal")
+            .expect("public membership removal succeeds"),
+        StatusCode::NO_CONTENT
+    );
+
+    let rejected = writer
+        .await
+        .expect("join blocked keyring writer")
+        .expect_err("removed owner cannot publish a keyring");
+    assert_eq!(rejected.0, StatusCode::FORBIDDEN);
+    assert_eq!(
+        rejected.1.0["error"],
+        "active organization membership required"
+    );
+    let authority_rows: (i64, i64) = sqlx::query_as(
+        "SELECT
+                 (SELECT count(*) FROM org_keyrings WHERE org_id = $1),
+                 (SELECT count(*) FROM audit_log
+                   WHERE org_id = $1 AND action = 'org.keyring.put')",
+    )
+    .bind(org_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count rejected keyring authority rows");
+    assert_eq!(authority_rows, (0, 0));
+}
+
+#[tokio::test]
+async fn put_keyring_response_returns_normalized_deployable_keyring() {
+    let pool = database_test_pool().await;
+    let org_id = Uuid::new_v4();
+    let user_id = Uuid::new_v4();
+    let suffix = org_id.simple().to_string();
+    let org_name = format!("keyring-normalize-{suffix}");
+    crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+        .await
+        .expect("insert keyring normalization org");
+    sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Keyring Owner')")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("insert keyring normalization owner");
+    sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+        .bind(user_id)
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("insert keyring normalization membership");
+    let key = SigningKey::generate(&mut OsRng);
+    sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2)")
+        .bind(user_id)
+        .bind(key.verifying_key().to_bytes().to_vec())
+        .execute(&pool)
+        .await
+        .expect("insert keyring normalization signing key");
+
+    let mut request = signed_keyring_request(org_id, user_id, &key, 1, 1);
+    // An otherwise-valid extra field: the typed parse ignores it, but the
+    // 200 response must echo the normalized stored form, not the raw
+    // request JSON, so the response is immediately deployable as an
+    // org_keyring_blob under the strict envelope parser (#128 P2).
+    request.keyring_payload["future_extension"] = serde_json::json!("must-not-echo");
+
+    let mut state = crate::test_support::lazy_state();
+    state.db = pool.clone();
+    let auth = AuthContext {
+        user_id,
+        org_id,
+        org_name: org_name.clone(),
+        role: Role::Owner,
+        api_key: None,
+        management_origin: crate::auth::middleware::ManagementOrigin::Public,
+    };
+
+    let (status, put_response) = put_keyring(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(request),
+    )
+    .await
+    .expect("publish keyring carrying an extra field");
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        put_response
+            .keyring_payload
+            .get("future_extension")
+            .is_none(),
+        "PUT response must not echo unknown request fields verbatim"
+    );
+
+    let stored_payload: Vec<u8> = sqlx::query_scalar(
+        "SELECT keyring_payload FROM org_keyrings WHERE org_id = $1 AND version = 1",
+    )
+    .bind(org_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load stored normalized keyring payload");
+    let stored: serde_json::Value =
+        serde_json::from_slice(&stored_payload).expect("decode stored keyring payload");
+    assert_eq!(
+        put_response.keyring_payload, stored,
+        "PUT response payload must match the stored normalized bytes"
+    );
+
+    let get_response = get_keyring(auth.clone(), State(state.clone()), Path(org_name.clone()))
+        .await
+        .expect("GET keyring after PUT");
+    assert_eq!(
+        put_response.keyring_payload, get_response.keyring_payload,
+        "PUT and GET responses must serve the identical normalized keyring"
+    );
+
+    let mut legacy = signed_keyring_request(org_id, user_id, &key, 2, 2);
+    // Seed the verbatim payload written before normalization.
+    legacy.keyring_payload["future_extension"] = serde_json::json!("legacy-extra");
+    sqlx::query(
+        "INSERT INTO org_keyrings
+                 (org_id, version, keyring_payload, signature, signing_key_id)
+             VALUES ($1, 2, $2, $3,
+                     (SELECT id FROM user_signing_keys WHERE user_id = $4 AND pubkey = $5))",
+    )
+    .bind(org_id)
+    .bind(serde_json::to_vec(&legacy.keyring_payload).expect("encode legacy payload"))
+    .bind(hex::decode(&legacy.signature).expect("decode legacy signature"))
+    .bind(user_id)
+    .bind(key.verifying_key().to_bytes().to_vec())
+    .execute(&pool)
+    .await
+    .expect("persist a keyring with the pre-normalization writer");
+    let (status, _) = put_keyring(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(legacy),
+    )
+    .await
+    .expect("normalization must preserve replay of an existing keyring");
+    assert_eq!(status, StatusCode::OK);
+
+    let legacy_get = get_keyring(auth, State(state), Path(org_name))
+        .await
+        .expect("GET keyring after legacy replay");
+    assert_eq!(legacy_get.version, 2);
+    assert!(
+        legacy_get.keyring_payload.get("future_extension").is_none(),
+        "GET must normalize legacy rows so org_keyring_blob wrapping stays deployable"
+    );
+}
+
+#[tokio::test]
+async fn keyring_rotation_preserves_pinned_owner_and_one_immutable_v2_winner() {
+    // Holds the singleton lock: this test's committed put_keyring calls
+    // bump the shared signed-policy generation whenever it is nonzero,
+    // which would corrupt concurrent tests asserting exact values.
+    let _singleton = keyring_enqueue_guard().await;
+    let pool = database_test_pool().await;
+    // Run as an unsigned install: this test asserts keyring authority,
+    // not KBS publication, and the shared database's singleton row must
+    // stay out of active signed mode for the whole flow.
+    sqlx::query(
+        "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 0,
+                    selector_bumps_owed = 0,
+                    configmap_generation = 0,
+                    applied_generation = 0,
+                    configmap_policy_sha256 = NULL,
+                    applied_policy_sha256 = NULL,
+                    configmap_resource_version = NULL
+              WHERE singleton",
+    )
+    .execute(&pool)
+    .await
+    .expect("reset shared signed-policy singleton to unsigned mode");
+    let org_id = Uuid::new_v4();
+    let user_id = Uuid::new_v4();
+    let attacker_user_id = Uuid::new_v4();
+    let suffix = org_id.simple().to_string();
+    let org_name = format!("keyring-race-{suffix}");
+    crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+        .await
+        .expect("insert keyring race org");
+    sqlx::query(
+        "INSERT INTO users (id, display_name)
+             VALUES ($1, 'Keyring Owner'), ($2, 'Unpinned Owner')",
+    )
+    .bind(user_id)
+    .bind(attacker_user_id)
+    .execute(&pool)
+    .await
+    .expect("insert keyring owners");
+    sqlx::query(
+        "INSERT INTO memberships (user_id, org_id, role)
+             VALUES ($1, $3, 'owner'), ($2, $3, 'owner')",
+    )
+    .bind(user_id)
+    .bind(attacker_user_id)
+    .bind(org_id)
+    .execute(&pool)
+    .await
+    .expect("insert owner memberships");
+    let key = SigningKey::generate(&mut OsRng);
+    let attacker_key = SigningKey::generate(&mut OsRng);
+    sqlx::query(
+        "INSERT INTO user_signing_keys (user_id, pubkey)
+             VALUES ($1, $3), ($2, $4)",
+    )
+    .bind(user_id)
+    .bind(attacker_user_id)
+    .bind(key.verifying_key().to_bytes().to_vec())
+    .bind(attacker_key.verifying_key().to_bytes().to_vec())
+    .execute(&pool)
+    .await
+    .expect("insert owner signing keys");
+
+    let mut state = crate::test_support::lazy_state();
+    state.db = pool.clone();
+    let auth = AuthContext {
+        user_id,
+        org_id,
+        org_name: org_name.clone(),
+        role: Role::Owner,
+        api_key: None,
+        management_origin: crate::auth::middleware::ManagementOrigin::Public,
+    };
+    let _ = put_keyring(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(signed_keyring_request(org_id, user_id, &key, 1, 1)),
+    )
+    .await
+    .expect("insert v1 keyring");
+
+    let attacker_auth = AuthContext {
+        user_id: attacker_user_id,
+        org_id,
+        org_name: org_name.clone(),
+        role: Role::Owner,
+        api_key: None,
+        management_origin: crate::auth::middleware::ManagementOrigin::Public,
+    };
+    let takeover = put_keyring(
+        attacker_auth,
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(signed_keyring_request(
+            org_id,
+            attacker_user_id,
+            &attacker_key,
+            2,
+            2,
+        )),
+    )
+    .await
+    .expect_err("an unpinned CAP owner cannot self-authorize keyring v2");
+    assert_eq!(takeover.0, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        takeover.1.0["error"],
+        "keyring signing owner does not match the current pinned owner"
+    );
+    let post_takeover_counts: (i64, i64) = sqlx::query_as(
+        "SELECT
+                 (SELECT count(*) FROM org_keyrings WHERE org_id = $1),
+                 (SELECT count(*) FROM audit_log
+                   WHERE org_id = $1 AND action = 'org.keyring.put')",
+    )
+    .bind(org_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count rows after rejected owner takeover");
+    assert_eq!(
+        post_takeover_counts,
+        (1, 1),
+        "rejected owner takeover must not mutate keyring or audit authority"
+    );
+
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(3));
+    let spawn_writer = |request: PutOrgKeyringRequest| {
+        let barrier = barrier.clone();
+        let auth = auth.clone();
+        let state = state.clone();
+        let org_name = org_name.clone();
+        tokio::spawn(async move {
+            barrier.wait().await;
+            put_keyring(auth, State(state), Path(org_name), Json(request)).await
+        })
+    };
+    let writer_a = spawn_writer(signed_keyring_request(org_id, user_id, &key, 2, 2));
+    let writer_b = spawn_writer(signed_keyring_request(org_id, user_id, &key, 2, 3));
+    barrier.wait().await;
+    let results = [
+        writer_a.await.expect("join keyring writer A"),
+        writer_b.await.expect("join keyring writer B"),
+    ];
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    let conflicts: Vec<_> = results
+        .iter()
+        .filter_map(|result| result.as_ref().err())
+        .collect();
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0].0, StatusCode::CONFLICT);
+    assert_eq!(
+        conflicts[0].1.0["error"],
+        "keyring version already exists with different content"
+    );
+
+    let versions: Vec<(i64, Vec<u8>)> = sqlx::query_as(
+        "SELECT version, keyring_payload FROM org_keyrings
+             WHERE org_id = $1 ORDER BY version",
+    )
+    .bind(org_id)
+    .fetch_all(&pool)
+    .await
+    .expect("load immutable keyring versions");
+    assert_eq!(versions.len(), 2);
+    assert_eq!(versions[0].0, 1);
+    assert_eq!(versions[1].0, 2);
+    let v2_payload: serde_json::Value =
+        serde_json::from_slice(&versions[1].1).expect("decode winning v2 payload");
+    assert!(
+        matches!(v2_payload["updated_at"].as_str(), Some(value) if value.ends_with("02Z") || value.ends_with("03Z"))
+    );
+    let winning_second = if v2_payload["updated_at"]
+        .as_str()
+        .is_some_and(|value| value.ends_with("02Z"))
+    {
+        2
+    } else {
+        3
+    };
+    let _ = put_keyring(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(signed_keyring_request(
+            org_id,
+            user_id,
+            &key,
+            2,
+            winning_second,
+        )),
+    )
+    .await
+    .expect("exact same-owner v2 replay is idempotent");
+    let latest_signing_pubkey: Vec<u8> = sqlx::query_scalar(
+        "SELECT usk.pubkey
+               FROM org_keyrings ok
+               JOIN user_signing_keys usk ON usk.id = ok.signing_key_id
+              WHERE ok.org_id = $1
+              ORDER BY ok.version DESC
+              LIMIT 1",
+    )
+    .bind(org_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load pinned v2 signing owner");
+    assert_eq!(latest_signing_pubkey, key.verifying_key().to_bytes());
+    let audit_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_log
+             WHERE org_id = $1 AND action = 'org.keyring.put'",
+    )
+    .bind(org_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count mandatory keyring audit rows");
+    assert_eq!(
+        audit_count, 2,
+        "only v1 and the single winning same-owner v2 are audited"
+    );
+
+    sqlx::query("DELETE FROM audit_log WHERE org_id = $1")
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("delete keyring race audit rows");
+    sqlx::query("DELETE FROM organizations WHERE id = $1")
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("delete keyring race org");
+    sqlx::query("DELETE FROM users WHERE id IN ($1, $2)")
+        .bind(user_id)
+        .bind(attacker_user_id)
+        .execute(&pool)
+        .await
+        .expect("delete keyring race users");
+}
+
+fn membership_test_auth(user_id: Uuid, org_id: Uuid, org_name: &str, role: Role) -> AuthContext {
+    AuthContext {
+        user_id,
+        org_id,
+        org_name: org_name.to_string(),
+        role,
+        api_key: None,
+        management_origin: crate::auth::middleware::ManagementOrigin::Public,
+    }
+}
+
+/// Regression (PR #185 review, Devin "maximum keyring version overflows
+/// rotation"): with the latest keyring version at the i64 ceiling,
+/// derive_rotation_path's successor arithmetic must not overflow; a
+/// request below the ceiling returns the stale-version conflict
+/// instead of panicking (the stale comparison evaluates the successor
+/// check, which is where the overflow hit).
+#[tokio::test]
+async fn owner_rotation_rejects_stale_version_at_i64_ceiling_without_overflow() {
+    let pool = database_test_pool().await;
+    let org_id = Uuid::new_v4();
+    let user_id = Uuid::new_v4();
+    let suffix = org_id.simple().to_string();
+    let org_name = format!("rotate-ceiling-{suffix}");
+    crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+        .await
+        .expect("insert ceiling org");
+    sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Ceiling Owner')")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("insert ceiling user");
+    sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+        .bind(user_id)
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("insert ceiling membership");
+    let current_key = SigningKey::generate(&mut OsRng);
+    let replacement_key = SigningKey::generate(&mut OsRng);
+    let signing_key_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2) RETURNING id",
+    )
+    .bind(user_id)
+    .bind(current_key.verifying_key().to_bytes().to_vec())
+    .fetch_one(&pool)
+    .await
+    .expect("insert ceiling signing key");
+    // A keyring version already at the i64 ceiling.
+    sqlx::query(
+            "INSERT INTO org_keyrings (org_id, version, keyring_payload, signature, signing_key_id)
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(org_id)
+        .bind(i64::MAX)
+        .bind(br#"{"org_id":"00000000-0000-0000-0000-000000000000","version":9223372036854775807,"members":[],"updated_at":"2026-01-01T00:00:00Z"}"#.to_vec())
+        .bind(vec![0u8; 64])
+        .bind(signing_key_id)
+        .execute(&pool)
+        .await
+        .expect("insert ceiling keyring version");
+
+    let mut state = crate::test_support::lazy_state();
+    state.db = pool.clone();
+    let (base_url, _service) = spawn_mock_signing_service_owner(
+        org_id,
+        MockSigningServiceOwner {
+            owner: current_key.verifying_key().to_bytes(),
+            changed_at: Utc::now(),
+            version: 1,
+            rotate_calls: 0,
+        },
+    )
+    .await;
+    state.signing_service = Some(
+        crate::signing_service::SigningServiceClient::new(base_url, None)
+            .expect("build ceiling mock client"),
+    );
+    let auth = AuthContext {
+        user_id,
+        org_id,
+        org_name: org_name.clone(),
+        role: Role::Owner,
+        api_key: None,
+        management_origin: crate::auth::middleware::ManagementOrigin::Public,
+    };
+    let request = rotation_request(
+        org_id,
+        user_id,
+        &current_key,
+        &replacement_key,
+        2,
+        2,
+        Utc::now(),
+        "version ceiling",
+    );
+    let error = rotate_org_owner(auth, State(state), Path(org_name.clone()), Json(request))
+        .await
+        .expect_err("a request below the ceiling version must be rejected, not panic");
+    let body = serde_json::to_string(&error.1.0).expect("serialize error body");
+    assert!(
+        body.contains("stale"),
+        "expected the stale-version conflict, got: {body}"
+    );
+}
+
+/// Regression: removing the caller between phase 1's receipt commit and
+/// phase 2's membership lock must prevent a successor keyring write.
+/// The upstream change remains recoverable by an active owner using the
+/// persisted receipt. The mock removes membership during phase 2's
+/// second owner-status GET, before the phase-2 membership lock.
+#[tokio::test]
+async fn owner_rotation_rejects_removed_caller_mid_request() {
+    let pool = database_test_pool().await;
+    let org_id = Uuid::new_v4();
+    let user_id = Uuid::new_v4();
+    let suffix = org_id.simple().to_string();
+    let org_name = format!("rotate-midremoval-{suffix}");
+    crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+        .await
+        .expect("insert midremoval org");
+    sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Midremoval Owner')")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("insert midremoval user");
+    sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+        .bind(user_id)
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("insert midremoval membership");
+    let current_key = SigningKey::generate(&mut OsRng);
+    let replacement_key = SigningKey::generate(&mut OsRng);
+    sqlx::query(
+        "INSERT INTO user_signing_keys (user_id, pubkey)
+             VALUES ($1, $2), ($1, $3)",
+    )
+    .bind(user_id)
+    .bind(current_key.verifying_key().to_bytes().to_vec())
+    .bind(replacement_key.verifying_key().to_bytes().to_vec())
+    .execute(&pool)
+    .await
+    .expect("insert midremoval signing keys");
+
+    let mut state = crate::test_support::lazy_state();
+    state.db = pool.clone();
+
+    // Mock signing service whose second GET /orgs/{id}/owner call
+    // (phase 2's live-owner read) synchronously deletes the caller's
+    // membership before answering -- the exact mid-request removal.
+    let owner = Arc::new(std::sync::Mutex::new(MockSigningServiceOwner {
+        owner: current_key.verifying_key().to_bytes(),
+        changed_at: Utc::now(),
+        version: 1,
+        rotate_calls: 0,
+    }));
+    let status_owner = owner.clone();
+    let rotate_owner = owner.clone();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let status_calls = calls.clone();
+    let hook_pool = pool.clone();
+    let app = axum::Router::new()
+        .route(
+            &format!("/orgs/{org_id}/owner"),
+            axum::routing::get(move || async move {
+                if status_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 1 {
+                    sqlx::query("DELETE FROM memberships WHERE org_id = $1 AND user_id = $2")
+                        .bind(org_id)
+                        .bind(user_id)
+                        .execute(&hook_pool)
+                        .await
+                        .expect("remove caller membership mid-request");
+                }
+                let state = status_owner.lock().expect("mock owner lock");
+                axum::Json(serde_json::json!({
+                    "org_id": org_id,
+                    "state": "ready",
+                    "version": state.version,
+                    "owner_pubkey_hex": hex::encode(state.owner),
+                    "last_changed_at": state.changed_at,
+                }))
+            }),
+        )
+        .route(
+            "/rotate-owner",
+            axum::routing::post(
+                move |axum::Json(req): axum::Json<serde_json::Value>| async move {
+                    let mut state = rotate_owner.lock().expect("mock owner lock");
+                    let signer = req["signing_pubkey_b64"]
+                        .as_str()
+                        .and_then(|raw| B64.decode(raw).ok())
+                        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok());
+                    if signer != Some(state.owner) {
+                        return (
+                            StatusCode::CONFLICT,
+                            axum::Json(serde_json::json!({
+                                "error": "rotation signer does not match the current owner"
+                            })),
+                        );
+                    }
+                    let replacement: [u8; 32] = B64
+                        .decode(req["replacement_owner_pubkey_b64"].as_str().unwrap_or(""))
+                        .expect("mock replacement owner decodes")
+                        .try_into()
+                        .expect("mock replacement owner is 32 bytes");
+                    state.owner = replacement;
+                    state.changed_at = Utc::now();
+                    state.version += 1;
+                    state.rotate_calls += 1;
+                    (
+                        StatusCode::OK,
+                        axum::Json(serde_json::json!({
+                            "org_id": req["org_id"].clone(),
+                            "version": state.version,
+                            "owner_pubkey_fingerprint": hex::encode(replacement),
+                            "rotated_at": state.changed_at,
+                        })),
+                    )
+                },
+            ),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind midremoval mock");
+    let address = listener.local_addr().expect("midremoval mock address");
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve midremoval mock");
+    });
+    state.signing_service = Some(
+        crate::signing_service::SigningServiceClient::new(format!("http://{address}/"), None)
+            .expect("build midremoval mock client"),
+    );
+
+    let auth = AuthContext {
+        user_id,
+        org_id,
+        org_name: org_name.clone(),
+        role: Role::Owner,
+        api_key: None,
+        management_origin: crate::auth::middleware::ManagementOrigin::Public,
+    };
+    let _ = put_keyring(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(signed_keyring_request(org_id, user_id, &current_key, 1, 1)),
+    )
+    .await
+    .expect("insert v1 keyring");
+    // PUT's authority fence also reads owner status; count only the
+    // rotation's phase-1 and phase-2 reads for this removal hook.
+    calls.store(0, std::sync::atomic::Ordering::SeqCst);
+
+    let request = rotation_request(
+        org_id,
+        user_id,
+        &current_key,
+        &replacement_key,
+        2,
+        2,
+        Utc::now(),
+        "mid-request membership removal",
+    );
+    let rejection = rotate_org_owner(
+        auth,
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(request),
+    )
+    .await
+    .expect_err("removed caller must not finalize a successor keyring");
+    assert_eq!(rejection.0, StatusCode::FORBIDDEN);
+    let membership_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM memberships WHERE org_id = $1 AND user_id = $2")
+            .bind(org_id)
+            .bind(user_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count caller membership");
+    assert_eq!(
+        membership_count, 0,
+        "the mid-request removal hook must have fired"
+    );
+    let stored: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM org_keyrings WHERE org_id = $1 AND version = 2")
+            .bind(org_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count v2 keyring");
+    assert_eq!(stored, 0, "removed owner must not write successor keyring");
+    let receipts: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM org_rotation_upstream_receipts WHERE org_id = $1")
+            .bind(org_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count recovery receipts");
+    assert_eq!(receipts, 1, "upstream change must remain recoverable");
+
+    sqlx::query("DELETE FROM audit_log WHERE org_id = $1")
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("delete midremoval audit rows");
+    sqlx::query("DELETE FROM organizations WHERE id = $1")
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("delete midremoval org");
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("delete midremoval user");
+}
+
+/// Regression (PR #185 review, Devin "concurrent upload leaves owner
+/// authority drifted"): rotate_org_owner pins the replacement in the
+/// signing service before it writes the successor keyring version and
+/// releases the lane between those phases. In that window an upload
+/// signed by the still-pinned owner must not be able to claim the
+/// successor version (409), while the identical request succeeds as
+/// soon as the service owner and the pinned owner agree again.
+#[tokio::test]
+async fn keyring_upload_fence_refuses_successor_while_service_owner_diverges() {
+    let pool = database_test_pool().await;
+    let org_id = Uuid::new_v4();
+    let user_id = Uuid::new_v4();
+    let suffix = org_id.simple().to_string();
+    let org_name = format!("keyring-fence-{suffix}");
+    crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+        .await
+        .expect("insert keyring fence org");
+    sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Fence Owner')")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("insert fence owner");
+    sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+        .bind(user_id)
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("insert fence membership");
+    let current_key = SigningKey::generate(&mut OsRng);
+    let replacement_key = SigningKey::generate(&mut OsRng);
+    sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2)")
+        .bind(user_id)
+        .bind(current_key.verifying_key().to_bytes().to_vec())
+        .execute(&pool)
+        .await
+        .expect("insert fence signing key");
+
+    let mut state = crate::test_support::lazy_state();
+    state.db = pool.clone();
+    // The interleave window: the signing service already holds the
+    // replacement owner while CAP still pins the current owner on v1.
+    state.signing_service = Some(
+        crate::signing_service::SigningServiceClient::new(
+            mock_signing_service_owner_api(org_id, replacement_key.verifying_key().to_bytes())
+                .await,
+            None,
+        )
+        .expect("build divergent mock signing service client"),
+    );
+    let auth = AuthContext {
+        user_id,
+        org_id,
+        org_name: org_name.clone(),
+        role: Role::Owner,
+        api_key: None,
+        management_origin: crate::auth::middleware::ManagementOrigin::Public,
+    };
+    let _ = put_keyring(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(signed_keyring_request(org_id, user_id, &current_key, 1, 1)),
+    )
+    .await
+    .expect("insert v1 keyring");
+
+    let successor = signed_keyring_request(org_id, user_id, &current_key, 2, 2);
+    let fenced = put_keyring(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(successor),
+    )
+    .await
+    .expect_err("the successor version must not be claimable while the service owner diverges");
+    assert_eq!(fenced.0, StatusCode::CONFLICT);
+    assert_eq!(
+        fenced.1.0["error"],
+        "signing service owner does not match the current pinned owner (owner rotation in progress)"
+    );
+    let counts_after_fence: (i64, i64) = sqlx::query_as(
+        "SELECT
+                 (SELECT count(*) FROM org_keyrings WHERE org_id = $1),
+                 (SELECT count(*) FROM audit_log
+                   WHERE org_id = $1 AND action = 'org.keyring.put')",
+    )
+    .bind(org_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count rows after fenced upload");
+    assert_eq!(
+        counts_after_fence,
+        (1, 1),
+        "the fenced upload must not mutate keyring or audit authority"
+    );
+
+    // Fail closed (self-check P1): an unreadable owner status is not
+    // evidence of agreement. With a signing service configured but
+    // unreachable, the successor insert must be refused with 502 and
+    // still write nothing -- this is the exact inter-phase window where
+    // the race re-opened in the fail-open variant of this fence.
+    state.signing_service = Some(
+        crate::signing_service::SigningServiceClient::new("http://127.0.0.1:1".to_string(), None)
+            .expect("build unreachable mock signing service client"),
+    );
+    let closed = put_keyring(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(signed_keyring_request(org_id, user_id, &current_key, 2, 2)),
+    )
+    .await
+    .expect_err("an unreadable owner status must not clear the successor insert");
+    assert_eq!(closed.0, StatusCode::BAD_GATEWAY);
+    let counts_after_closed: (i64, i64) = sqlx::query_as(
+        "SELECT
+                 (SELECT count(*) FROM org_keyrings WHERE org_id = $1),
+                 (SELECT count(*) FROM audit_log
+                   WHERE org_id = $1 AND action = 'org.keyring.put')",
+    )
+    .bind(org_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count rows after fail-closed upload");
+    assert_eq!(
+        counts_after_closed,
+        (1, 1),
+        "the fail-closed upload must not mutate keyring or audit authority"
+    );
+
+    // Positive control: once the service owner and the pinned owner
+    // agree again, the identical successor request is accepted.
+    state.signing_service = Some(
+        crate::signing_service::SigningServiceClient::new(
+            mock_signing_service_owner_api(org_id, current_key.verifying_key().to_bytes()).await,
+            None,
+        )
+        .expect("build aligned mock signing service client"),
+    );
+    let _ = put_keyring(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(signed_keyring_request(org_id, user_id, &current_key, 2, 2)),
+    )
+    .await
+    .expect("aligned service owner accepts the successor upload");
+}
+
+#[tokio::test]
+async fn membership_privileged_role_changes_require_owner() {
+    let pool = database_test_pool().await;
+    let org_id = Uuid::new_v4();
+    let owner_id = Uuid::new_v4();
+    let admin_id = Uuid::new_v4();
+    let victim_admin_id = Uuid::new_v4();
+    let member_id = Uuid::new_v4();
+    let suffix = org_id.simple().to_string();
+    let org_name = format!("member-escalation-{suffix}");
+    crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+        .await
+        .expect("insert member escalation org");
+    sqlx::query(
+        "INSERT INTO users (id, display_name)
+             VALUES ($1, 'Escalation Owner'), ($2, 'Escalation Admin'),
+                    ($3, 'Victim Admin'), ($4, 'Plain Member')",
+    )
+    .bind(owner_id)
+    .bind(admin_id)
+    .bind(victim_admin_id)
+    .bind(member_id)
+    .execute(&pool)
+    .await
+    .expect("insert member escalation users");
+    sqlx::query(
+        "INSERT INTO memberships (user_id, org_id, role)
+             VALUES ($1, $5, 'owner'), ($2, $5, 'admin'),
+                    ($3, $5, 'admin'), ($4, $5, 'member')",
+    )
+    .bind(owner_id)
+    .bind(admin_id)
+    .bind(victim_admin_id)
+    .bind(member_id)
+    .bind(org_id)
+    .execute(&pool)
+    .await
+    .expect("insert member escalation memberships");
+    let victim_email = format!("victim-admin-{suffix}@example.test");
+    let member_email = format!("plain-member-{suffix}@example.test");
+    let admin_email = format!("self-admin-{suffix}@example.test");
+    sqlx::query(
+        "INSERT INTO user_identities (id, user_id, provider, identifier)
+             VALUES ($1, $4, 'email', $7), ($2, $5, 'email', $8), ($3, $6, 'email', $9)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(Uuid::new_v4())
+    .bind(Uuid::new_v4())
+    .bind(victim_admin_id)
+    .bind(member_id)
+    .bind(admin_id)
+    .bind(&victim_email)
+    .bind(&member_email)
+    .bind(&admin_email)
+    .execute(&pool)
+    .await
+    .expect("insert member escalation identities");
+
+    let mut state = crate::test_support::lazy_state();
+    state.db = pool.clone();
+    let admin_auth = membership_test_auth(admin_id, org_id, &org_name, Role::Admin);
+    let owner_auth = membership_test_auth(owner_id, org_id, &org_name, Role::Owner);
+
+    // Admin cannot promote a plain member to admin (invite path).
+    let promote = invite_member(
+        admin_auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(InviteRequest {
+            email: member_email.clone(),
+            role: Some("admin".to_string()),
+        }),
+    )
+    .await
+    .expect_err("admin must not promote a member to admin");
+    assert_eq!(promote.0, StatusCode::FORBIDDEN);
+
+    // Admin cannot remove an existing admin.
+    let remove_admin = remove_member(
+        admin_auth.clone(),
+        State(state.clone()),
+        Path((org_name.clone(), victim_admin_id)),
+    )
+    .await
+    .expect_err("admin must not remove another admin");
+    assert_eq!(remove_admin.0, StatusCode::FORBIDDEN);
+
+    // Admin cannot demote an existing admin by re-inviting as member.
+    let demote = invite_member(
+        admin_auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(InviteRequest {
+            email: victim_email.clone(),
+            role: Some("member".to_string()),
+        }),
+    )
+    .await
+    .expect_err("admin must not demote another admin");
+    assert_eq!(demote.0, StatusCode::FORBIDDEN);
+    let victim_role: String = sqlx::query_scalar(
+        "SELECT role::text FROM memberships
+              WHERE org_id = $1 AND user_id = $2 AND removed_at IS NULL",
+    )
+    .bind(org_id)
+    .bind(victim_admin_id)
+    .fetch_one(&pool)
+    .await
+    .expect("victim admin role unchanged after rejected demotion");
+    assert_eq!(victim_role, "admin");
+
+    // Admin can still manage plain members (invite as member, remove).
+    let invite_member_ok = invite_member(
+        admin_auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(InviteRequest {
+            email: member_email.clone(),
+            role: Some("member".to_string()),
+        }),
+    )
+    .await
+    .expect("admin can re-invite a plain member as member");
+    assert_eq!(invite_member_ok.0, StatusCode::OK);
+    let remove_member_ok = remove_member(
+        admin_auth.clone(),
+        State(state.clone()),
+        Path((org_name.clone(), member_id)),
+    )
+    .await
+    .expect("admin can remove a plain member");
+    assert_eq!(remove_member_ok, StatusCode::NO_CONTENT);
+
+    // Self-service: the admin cannot re-invite themselves as admin
+    // (keeping the privileged role), but CAN demote themselves to
+    // member — the self-release exemption.
+    let self_keep = invite_member(
+        admin_auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(InviteRequest {
+            email: admin_email.clone(),
+            role: Some("admin".to_string()),
+        }),
+    )
+    .await
+    .expect_err("admin must not re-grant their own admin role");
+    assert_eq!(self_keep.0, StatusCode::FORBIDDEN);
+    let self_demote = invite_member(
+        admin_auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(InviteRequest {
+            email: admin_email.clone(),
+            role: Some("member".to_string()),
+        }),
+    )
+    .await
+    .expect("admin can demote themselves to member");
+    assert_eq!(self_demote.0, StatusCode::OK);
+    let self_role: String = sqlx::query_scalar(
+        "SELECT role::text FROM memberships
+              WHERE org_id = $1 AND user_id = $2 AND removed_at IS NULL",
+    )
+    .bind(org_id)
+    .bind(admin_id)
+    .fetch_one(&pool)
+    .await
+    .expect("admin role after self-demotion");
+    assert_eq!(self_role, "member");
+
+    // After self-demotion the caller is a plain member: the org:admin
+    // scope gate now rejects further privileged management attempts.
+    let demoted_promote = invite_member(
+        admin_auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(InviteRequest {
+            email: member_email.clone(),
+            role: Some("admin".to_string()),
+        }),
+    )
+    .await
+    .expect_err("demoted admin must not promote anyone");
+    assert_eq!(demoted_promote.0, StatusCode::FORBIDDEN);
+
+    // Owner can still promote to admin and remove an admin.
+    let owner_promote = invite_member(
+        owner_auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(InviteRequest {
+            email: member_email.clone(),
+            role: Some("admin".to_string()),
+        }),
+    )
+    .await
+    .expect("owner can promote a member to admin");
+    assert_eq!(owner_promote.0, StatusCode::OK);
+    let owner_remove = remove_member(
+        owner_auth.clone(),
+        State(state.clone()),
+        Path((org_name.clone(), victim_admin_id)),
+    )
+    .await
+    .expect("owner can remove an admin");
+    assert_eq!(owner_remove, StatusCode::NO_CONTENT);
+
+    // The rejected admin mutations must not have altered memberships:
+    // the victim admin is only gone because the owner removed them, the
+    // plain member is an admin only because the owner promoted them, and
+    // the acting admin is a member only because they demoted themselves.
+    let roles: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT user_id, role::text FROM memberships
+              WHERE org_id = $1 AND removed_at IS NULL ORDER BY user_id",
+    )
+    .bind(org_id)
+    .fetch_all(&pool)
+    .await
+    .expect("load post-escalation-attempt memberships");
+    let role_of = |uid: Uuid| {
+        roles
+            .iter()
+            .find(|(id, _)| *id == uid)
+            .map(|(_, role)| role.as_str())
+            .unwrap_or("removed")
+    };
+    assert_eq!(role_of(owner_id), "owner");
+    assert_eq!(role_of(admin_id), "member");
+    assert_eq!(role_of(victim_admin_id), "removed");
+    assert_eq!(role_of(member_id), "admin");
+
+    // Self-removal via DELETE: owner re-promotes the acting admin, then
+    // the admin removes themselves without an owner present. The
+    // self-release exemption must waive the owner gate (target is caller,
+    // requested role None, both reads say admin) and the row must end up
+    // removed in the database.
+    let owner_repromote = invite_member(
+        owner_auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(InviteRequest {
+            email: admin_email.clone(),
+            role: Some("admin".to_string()),
+        }),
+    )
+    .await
+    .expect("owner re-promotes admin for self-removal case");
+    assert_eq!(owner_repromote.0, StatusCode::OK);
+    let self_remove = remove_member(admin_auth, State(state), Path((org_name, admin_id)))
+        .await
+        .expect("admin can remove themselves without an owner");
+    assert_eq!(self_remove, StatusCode::NO_CONTENT);
+    let removed_role: Option<String> = sqlx::query_scalar(
+        "SELECT role::text FROM memberships
+              WHERE org_id = $1 AND user_id = $2 AND removed_at IS NOT NULL",
+    )
+    .bind(org_id)
+    .bind(admin_id)
+    .fetch_optional(&pool)
+    .await
+    .expect("load admin row after self-removal");
+    assert!(
+        removed_role.is_some(),
+        "self-removed admin row must be tombstoned, still active"
+    );
+
+    sqlx::query("DELETE FROM organizations WHERE id = $1")
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("delete member escalation org");
+    sqlx::query("DELETE FROM users WHERE id IN ($1, $2, $3, $4)")
+        .bind(owner_id)
+        .bind(admin_id)
+        .bind(victim_admin_id)
+        .bind(member_id)
+        .execute(&pool)
+        .await
+        .expect("delete member escalation users");
+}
+
+// Stable-invalid directives must be rejected before the intent insert.
+// org_rotation_intents has no purge path, so a compromised owner key
+// could otherwise grow the table with presentations the lane would
+// always reject. Only verdicts that cannot flip while queueing for the
+// lane are pre-lane: future signed_at beyond the clock-skew allowance,
+// a version strictly below the current latest, and a too-old directive
+// with no committed receipt. A receipted expired directive and a fresh
+// valid directive still record an intent.
+#[tokio::test]
+async fn owner_rotation_prechecks_reject_invalid_directives_without_persisting_intents() {
+    let pool = database_test_pool().await;
+    let org_id = Uuid::new_v4();
+    let user_id = Uuid::new_v4();
+    let suffix = org_id.simple().to_string();
+    let org_name = format!("keyring-intent-stable-precheck-{suffix}");
+    crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+        .await
+        .expect("insert stable precheck org");
+    sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Stable Precheck Owner')")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("insert stable precheck user");
+    sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+        .bind(user_id)
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("insert stable precheck membership");
+    let current_key = SigningKey::generate(&mut OsRng);
+    let replacement_key = SigningKey::generate(&mut OsRng);
+    sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2), ($1, $3)")
+        .bind(user_id)
+        .bind(current_key.verifying_key().to_bytes().to_vec())
+        .bind(replacement_key.verifying_key().to_bytes().to_vec())
+        .execute(&pool)
+        .await
+        .expect("insert stable precheck signing keys");
+
+    let (mock_url, mock) = spawn_mock_signing_service_owner(
+        org_id,
+        MockSigningServiceOwner {
+            owner: current_key.verifying_key().to_bytes(),
+            changed_at: Utc::now(),
+            version: 1,
+            rotate_calls: 0,
+        },
+    )
+    .await;
+    let mut state = crate::test_support::lazy_state();
+    state.db = pool.clone();
+    state.signing_service = Some(
+        crate::signing_service::SigningServiceClient::new(mock_url, None)
+            .expect("build mock signing service client"),
+    );
+    let auth = AuthContext {
+        user_id,
+        org_id,
+        org_name: org_name.clone(),
+        role: Role::Owner,
+        api_key: None,
+        management_origin: crate::auth::middleware::ManagementOrigin::Public,
+    };
+    for version in 1..=3 {
+        let _ = put_keyring(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(signed_keyring_request(
+                org_id,
+                user_id,
+                &current_key,
+                version,
+                version as u32,
+            )),
+        )
+        .await
+        .expect("publish sequential keyring");
+    }
+
+    async fn intent_count(pool: &sqlx::PgPool, org_id: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM org_rotation_intents WHERE org_id = $1")
+            .bind(org_id)
+            .fetch_one(pool)
+            .await
+            .expect("count rotation intents")
+    }
+
+    // Strictly below the current latest: versions only increment, so
+    // this can never become a legal new version or an exact replay.
+    let stale = rotation_request(
+        org_id,
+        user_id,
+        &current_key,
+        &replacement_key,
+        2,
+        2,
+        Utc::now(),
+        "precheck-stale-version",
+    );
+    let rejected = rotate_org_owner(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(stale),
+    )
+    .await
+    .expect_err("a strictly stale version is rejected");
+    assert_eq!(rejected.0, StatusCode::CONFLICT);
+    assert_eq!(rejected.1.0["error"], "keyring version is stale");
+    assert_eq!(
+        intent_count(&pool, org_id).await,
+        0,
+        "a strictly stale version must not persist an intent"
+    );
+
+    // Beyond the pre-lane clock-skew allowance. A few minutes of future
+    // skew can still be legitimized by host-clock drift and is left to
+    // the lane; ten minutes cannot.
+    let future = rotation_request(
+        org_id,
+        user_id,
+        &current_key,
+        &replacement_key,
+        4,
+        4,
+        Utc::now() + chrono::Duration::minutes(10),
+        "precheck-future",
+    );
+    let rejected = rotate_org_owner(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(future),
+    )
+    .await
+    .expect_err("a far-future directive is rejected");
+    assert_eq!(rejected.0, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        rejected.1.0["error"],
+        "owner rotation directive signed_at is in the future"
+    );
+    assert_eq!(
+        intent_count(&pool, org_id).await,
+        0,
+        "a far-future directive must not persist an intent"
+    );
+
+    let expired = rotation_request(
+        org_id,
+        user_id,
+        &current_key,
+        &replacement_key,
+        4,
+        5,
+        Utc::now() - chrono::Duration::hours(2),
+        "precheck-expired",
+    );
+    let rejected = rotate_org_owner(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(expired),
+    )
+    .await
+    .expect_err("an expired directive without a receipt is rejected");
+    assert_eq!(rejected.0, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        rejected.1.0["error"],
+        "owner rotation directive signed_at is too old"
+    );
+    assert_eq!(
+        intent_count(&pool, org_id).await,
+        0,
+        "an expired directive without a receipt must not persist an intent"
+    );
+
+    // A receipt cannot exist without its intent (FK). Seed both, and
+    // point the live service at the receipt, so the lane waives the
+    // max-age check. The directive still predates v3, which only the
+    // lane enforces: that error proves the precheck did not reject it
+    // as too old. Without the receipt the same request is the case above.
+    let receipted_at = Utc::now() - chrono::Duration::hours(2);
+    let upstream_rotated_at = Utc::now() - chrono::Duration::minutes(5);
+    let receipted = rotation_request(
+        org_id,
+        user_id,
+        &current_key,
+        &replacement_key,
+        4,
+        6,
+        receipted_at,
+        "precheck-receipted",
+    );
+    let receipt_directive = Sha256::digest(owner_rotation_directive_bytes(
+        org_id,
+        &current_key.verifying_key().to_bytes(),
+        &replacement_key.verifying_key().to_bytes(),
+        receipted_at,
+        "precheck-receipted",
+    ));
+    let receipt_keyring = Sha256::digest(normalized_keyring_bytes(
+        org_id,
+        user_id,
+        replacement_key.verifying_key().to_bytes(),
+        4,
+        6,
+    ));
+    seed_rotation_presentation(
+        &pool,
+        org_id,
+        receipt_directive.as_slice(),
+        receipt_keyring.as_slice(),
+        receipted_at,
+    )
+    .await;
+    sqlx::query(
+            "INSERT INTO org_rotation_upstream_receipts
+                 (org_id, directive_sha256, keyring_sha256, upstream_owner_version, upstream_rotated_at)
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(org_id)
+        .bind(receipt_directive.as_slice())
+        .bind(receipt_keyring.as_slice())
+        .bind(2_i64)
+        .bind(upstream_rotated_at)
+        .execute(&pool)
+        .await
+        .expect("seed receipt for the expired precheck waiver");
+    {
+        let mut service = mock.lock().expect("mock owner lock");
+        service.owner = replacement_key.verifying_key().to_bytes();
+        service.version = 2;
+        service.changed_at = upstream_rotated_at;
+    }
+    let waived = rotate_org_owner(
+        auth.clone(),
+        State(state.clone()),
+        Path(org_name.clone()),
+        Json(receipted),
+    )
+    .await
+    .expect_err("the lane still rejects a directive that predates v3");
+    assert_eq!(waived.0, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        waived.1.0["error"], "owner rotation directive predates the current keyring version",
+        "a receipted expired directive must reach the lane, not the precheck"
+    );
+    assert_eq!(
+        intent_count(&pool, org_id).await,
+        1,
+        "the waiver must not record a second intent for the seeded presentation"
+    );
+    // The waiver receipt occupies upstream owner version 2. The positive
+    // control below mints that same version from a fresh RPC; leave the
+    // intent (so the count stays honest) but drop the receipt.
+    sqlx::query("DELETE FROM org_rotation_upstream_receipts WHERE org_id = $1")
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("drop the waiver receipt before the positive control");
+    {
+        let mut service = mock.lock().expect("mock owner lock");
+        service.owner = current_key.verifying_key().to_bytes();
+        service.version = 1;
+        service.changed_at = Utc::now();
+        service.rotate_calls = 0;
+    }
+
+    let valid = rotation_request(
+        org_id,
+        user_id,
+        &current_key,
+        &replacement_key,
+        4,
+        7,
+        Utc::now(),
+        "precheck-valid",
+    );
+    let response = rotate_org_owner(auth, State(state), Path(org_name), Json(valid))
+        .await
+        .expect("fresh valid rotation succeeds");
+    assert_eq!(response.keyring_version, 4);
+    assert_eq!(
+        intent_count(&pool, org_id).await,
+        2,
+        "the valid presentation still records its intent"
+    );
+
+    sqlx::query("DELETE FROM audit_log WHERE org_id = $1")
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("delete stable precheck audit rows");
+    sqlx::query("DELETE FROM organizations WHERE id = $1")
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("delete stable precheck org");
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("delete stable precheck user");
+}
+
+// The quota counts `created_at > statement_timestamp() - interval '1 hour'`
+// in the post-lock statement, but the column default `now()` is
+// transaction_timestamp (BEGIN). A writer that waited on the advisory
+// lock would stamp its intent early and leave the rolling hour early.
+// The sleep after BEGIN is that wait with the clock moved, not raced:
+// `created_at` must be the INSERT's statement time, later than a mark
+// taken before the transaction started.
+#[tokio::test]
+async fn queued_intent_created_at_excludes_pre_lock_wait() {
+    let pool = database_test_pool().await;
+    let org_id = Uuid::new_v4();
+    let suffix = org_id.simple().to_string();
+    let org_name = format!("intent-clock-{suffix}");
+    crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+        .await
+        .expect("insert intent clock org");
+
+    let pre_begin = Utc::now();
+    let mut intent_tx = pool.begin().await.expect("begin intent clock transaction");
+    let tx_start: DateTime<Utc> = sqlx::query_scalar("SELECT transaction_timestamp()")
+        .fetch_one(&mut *intent_tx)
+        .await
+        .expect("read intent transaction timestamp");
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let directive = [0xABu8; 32];
+    let keyring = [0xCDu8; 32];
+    let inserted = sqlx::query(ORG_ROTATION_INTENT_INSERT_SQL)
+        .bind(org_id)
+        .bind(directive.as_slice())
+        .bind(keyring.as_slice())
+        .bind(MAX_INTENTS_PER_HOUR)
+        .execute(&mut *intent_tx)
+        .await
+        .expect("insert queued rotation intent")
+        .rows_affected();
+    assert_eq!(inserted, 1, "the clock probe must record one intent");
+    intent_tx
+        .commit()
+        .await
+        .expect("commit intent clock transaction");
+
+    let created_at: DateTime<Utc> = sqlx::query_scalar(
+        "SELECT created_at FROM org_rotation_intents
+              WHERE org_id = $1 AND directive_sha256 = $2 AND keyring_sha256 = $3",
+    )
+    .bind(org_id)
+    .bind(directive.as_slice())
+    .bind(keyring.as_slice())
+    .fetch_one(&pool)
+    .await
+    .expect("load queued intent created_at");
+    let threshold = pre_begin + chrono::Duration::seconds(1);
+    assert!(
+        created_at > threshold,
+        "queued intent created_at={created_at:?} tx_start={tx_start:?} pre_begin={pre_begin:?} threshold={threshold:?}; default now() stamps BEGIN and the row leaves the rolling hour early"
+    );
+
+    sqlx::query("DELETE FROM organizations WHERE id = $1")
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("delete intent clock org");
+}
