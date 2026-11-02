@@ -55,6 +55,16 @@ fn validate_edge_reconciliation_mode(
     Ok(())
 }
 
+fn kubernetes_required(
+    management_mode: CapManagementMode,
+    deployment_dispatch_enabled: bool,
+    edge_reconciliation_disabled: bool,
+) -> bool {
+    management_mode == CapManagementMode::PaasManaged
+        || deployment_dispatch_enabled
+        || !edge_reconciliation_disabled
+}
+
 fn env_nonempty(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
@@ -720,6 +730,10 @@ where
     Ok(())
 }
 
+// Below Kubernetes' default 30 s grace period so a SIGTERM'd pod still exits
+// by itself before the kubelet escalates to SIGKILL.
+const SHUTDOWN_DRAIN: std::time::Duration = std::time::Duration::from_secs(20);
+
 #[tokio::main]
 async fn main() {
     bootstrap_runtime_crypto_provider();
@@ -1033,9 +1047,29 @@ async fn main() {
     // cluster must not make startup probes restart us before /livez exists.
     // The shared atomic is opened only after the initial sweep converges.
     let mut dispatch_admission = false;
-    let kube_client = kube::Client::try_default()
-        .await
-        .expect("failed to configure the Kubernetes client");
+    let kube_client = match kube::Client::try_default().await {
+        Ok(client) => client,
+        Err(error)
+            if kubernetes_required(
+                management_mode,
+                deployment_dispatch_enabled,
+                edge_reconciliation_disabled,
+            ) =>
+        {
+            panic!("failed to configure the Kubernetes client: {error:?}");
+        }
+        Err(error) => {
+            // Kubernetes is optional in this configuration: every kube call
+            // fails per request with an error naming the missing cluster.
+            tracing::warn!("Kubernetes client not configured: {error}");
+            kube::Client::try_from(kube::Config::new(
+                "http://kubernetes-not-configured.invalid"
+                    .parse()
+                    .expect("static url"),
+            ))
+            .expect("failed to build unconfigured Kubernetes client")
+        }
+    };
     let state = AppState {
         db: pool,
         kube_client: kube_client.clone(),
@@ -1104,6 +1138,11 @@ async fn main() {
         }
         tracing::info!("shutdown signal received; stopping background tasks");
         signal_shutdown.cancel();
+        // Bound the drain: follow streams and startup convergence otherwise
+        // block exit until Kubernetes kills the pod.
+        tokio::time::sleep(SHUTDOWN_DRAIN).await;
+        tracing::warn!("graceful shutdown drain expired; forcing exit");
+        std::process::exit(0);
     });
     let server = {
         let shutdown = shutdown.clone();
@@ -1283,6 +1322,31 @@ fn spawn_pull_secret_sweep_reconciler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kubernetes_is_optional_only_in_compose_mode() {
+        assert!(kubernetes_required(
+            CapManagementMode::PaasManaged,
+            false,
+            true
+        ));
+        assert!(kubernetes_required(
+            CapManagementMode::Standalone,
+            true,
+            true
+        ));
+        assert!(kubernetes_required(
+            CapManagementMode::Standalone,
+            false,
+            false
+        ));
+        // Compose: standalone, no dispatch, edge reconciliation disabled.
+        assert!(!kubernetes_required(
+            CapManagementMode::Standalone,
+            false,
+            true
+        ));
+    }
 
     #[test]
     fn sweep_retry_backoff_is_bounded() {
