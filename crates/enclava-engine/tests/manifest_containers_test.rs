@@ -596,7 +596,11 @@ fn caddy_container_dns01_broker_waits_for_tls_handoff_before_starting_caddy() {
     assert!(args[2].contains("tenant-ingress waiting for TLS certificate handoff"));
     assert!(args[2].contains("\n  if [ -r '/run/enclava/caddy-runtime/certificates/tls.crt' ]"));
     assert!(args[2].contains("/usr/bin/caddy validate --config /etc/caddy/Caddyfile"));
-    assert!(args[2].contains("/usr/bin/caddy run --config /etc/caddy/Caddyfile"));
+    assert!(args[2].contains("/usr/bin/caddy run --config /etc/caddy/Caddyfile &"));
+    // `admin off` means no reload API: the wrapper must watch tls.crt and
+    // restart caddy on change.
+    assert!(args[2].contains("cksum '/run/enclava/caddy-runtime/certificates/tls.crt'"));
+    assert!(args[2].contains("kill \"$caddy_pid\""));
 }
 
 #[test]

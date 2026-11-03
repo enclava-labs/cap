@@ -3,7 +3,7 @@ use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use enclava_init::chown::{self, ExecIdentity, IdentityKind};
@@ -27,6 +27,11 @@ const DEFAULT_KBS_PROXY_HEALTH_POLL_SECONDS: u64 = 2;
 const CADDY_RUNTIME_HANDOFF_PATH: &str = "/run/enclava/caddy-runtime";
 const PUBLIC_TLS_CERT_HANDOFF_PATH: &str = "/run/enclava/public-tls/certificates/tls.crt";
 const CADDY_RUNTIME_SYNC_INTERVAL_SECONDS: u64 = 5;
+/// Broker-mode workload certificate re-check cadence. A 90-day certificate
+/// enters its renewal window at ~60 days, so a six-hour tick leaves
+/// hundreds of attempts before expiry while keeping each check a cheap
+/// local read (the broker is contacted only when the certificate is due).
+const TLS_RENEWAL_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const DEFAULT_STAGE_FILE: &str = "/run/enclava/init-stage";
 const MANAGED_CONFIG_ROOT: &str = ".enclava";
 const MANAGED_CONFIG_DIR: &str = ".enclava/config";
@@ -445,11 +450,18 @@ fn write_ready_file_state(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 fn stay_alive_forever(cfg: &Config) -> ! {
+    let mut next_tls_check = Instant::now() + TLS_RENEWAL_CHECK_INTERVAL;
     loop {
         if caddy_runtime_back_sync_required(cfg)
             && let Err(err) = sync_caddy_runtime_back(cfg)
         {
             tracing::warn!(error = %err, "caddy runtime persistence sync failed");
+        }
+        if tls_renewal_check_required(cfg) && next_tls_check <= Instant::now() {
+            next_tls_check = Instant::now() + TLS_RENEWAL_CHECK_INTERVAL;
+            if let Err(err) = renew_workload_tls_certificate(cfg) {
+                tracing::warn!(error = %format!("{err:#}"), "workload TLS certificate renewal failed");
+            }
         }
         std::thread::sleep(Duration::from_secs(CADDY_RUNTIME_SYNC_INTERVAL_SECONDS));
     }
@@ -457,6 +469,53 @@ fn stay_alive_forever(cfg: &Config) -> ! {
 
 fn caddy_runtime_back_sync_required(cfg: &Config) -> bool {
     cfg.tls_certificate_broker_url.is_none()
+}
+
+/// The broker-issued workload certificate must be re-checked for renewal:
+/// broker mode has no back-sync work, so without this a certificate would
+/// silently expire inside its validity and the next boot would wedge.
+/// Failures are warn-only; the certificate phase itself decides whether
+/// the retained certificate still serves.
+fn tls_renewal_check_required(cfg: &Config) -> bool {
+    cfg.tls_certificate_broker_url.is_some() && !cfg.tls_certificate_hostnames.is_empty()
+}
+
+/// Run one certificate check (provisions/renews only when due) and mirror
+/// a successful renewal into the caddy runtime handoff so tenant-ingress
+/// picks it up on its certificate watch.
+fn renew_workload_tls_certificate(cfg: &Config) -> Result<()> {
+    provision_static_tls_certificate(cfg)?;
+    let persistent = caddy_tls_bind_dir(Path::new(&cfg.tls_state.mount_path));
+    let runtime = Path::new(CADDY_RUNTIME_HANDOFF_PATH);
+    let caddy_identity = numeric_identity(cfg.caddy_uid, cfg.caddy_gid);
+    refresh_caddy_runtime_certificate_at(&persistent, runtime, caddy_identity, |path, identity| {
+        chown::chown_recursive(path, identity).map_err(Into::into)
+    })
+}
+
+/// Atomically copy the retained tls.crt/tls.key into the caddy runtime
+/// handoff with caddy ownership. Atomic writes keep the tenant-ingress
+/// certificate watcher from ever observing a half-written certificate.
+fn refresh_caddy_runtime_certificate_at<F>(
+    persistent: &Path,
+    runtime: &Path,
+    caddy_identity: chown::ExecIdentity,
+    chown_runtime: F,
+) -> Result<()>
+where
+    F: FnOnce(&Path, chown::ExecIdentity) -> Result<()>,
+{
+    for (relative, mode) in [
+        (tls_certificate::CERT_RELATIVE_PATH, 0o644),
+        (tls_certificate::KEY_RELATIVE_PATH, 0o600),
+    ] {
+        let source = persistent.join(relative);
+        let bytes =
+            std::fs::read(&source).with_context(|| format!("reading {}", source.display()))?;
+        writes::atomic_write(&runtime.join(relative), &bytes, mode)
+            .with_context(|| format!("refreshing {}", runtime.join(relative).display()))?;
+    }
+    chown_runtime(runtime, caddy_identity).with_context(|| format!("chown {}", runtime.display()))
 }
 
 fn stay_alive_after_failure() -> ! {

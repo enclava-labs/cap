@@ -23,12 +23,24 @@
 //! Retained-state policy: reuse is only permitted when the retained
 //! certificate and key are regular files and the full anchored validation
 //! passes. Anything else — non-regular files, symlinks (including dangling
-//! ones), unreadable state, malformed/expired/untrusted chains, key
-//! mismatches — aborts provisioning without ordering a replacement
-//! certificate and without replacing the retained private key. Only an
-//! actually absent certificate (ENOENT) starts issuance; a certificate-less
-//! retained key is reused for the new CSR so an interrupted first issuance
-//! retries with the same key.
+//! ones), unreadable state, malformed/expired-otherwise-invalid/untrusted
+//! chains, key mismatches — aborts provisioning without ordering a
+//! replacement certificate and without replacing the retained private key.
+//! Only an actually absent certificate (ENOENT) starts issuance; a
+//! certificate-less retained key is reused for the new CSR so an
+//! interrupted first issuance retries with the same key.
+//!
+//! Renewal: a retained certificate that is still valid but whose remaining
+//! lifetime is under one third of its total validity — or that is expired
+//! but validates against its own validity window — is due for renewal. A
+//! due certificate is reordered through the same broker path, with the CSR
+//! built from the retained private key and the configured hostnames (the
+//! exact identifier set, so the CA counts it as a renewal). The broker
+//! response passes the same anchored validation before `tls.crt` is
+//! replaced atomically; the retained key is never rotated. A failed
+//! renewal keeps an unexpired retained certificate serving (the failure is
+//! logged and retried at the next check); a failed renewal of an expired
+//! retained certificate stays terminal.
 //!
 //! Failure contract: broker responses are consumed with a bounded body
 //! read, and terminal issuance failures are reduced to the broker's safe
@@ -52,6 +64,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use webpki::{EndEntityCert, KeyUsage};
 use webpki_roots::TLS_SERVER_ROOTS;
+use x509_parser::prelude::FromDer;
 
 use crate::config::Config;
 use crate::safe_diagnostics::{SafeBootstrapDiagnostic, SafeDiagnosticCode};
@@ -463,10 +476,12 @@ fn provision_with_policy(
     if retained_path_is_regular_file(&cert_path)
         .with_context(|| format!("checking retained TLS certificate {}", cert_path.display()))?
     {
-        // Fail closed on retained state: an incomplete, malformed, expired,
-        // untrusted, or mismatched certificate never triggers a new broker
-        // order and the retained private key is never replaced. An operator
-        // must remove the stale certificate explicitly to force reissuance.
+        // Retained state stays fail-closed: an incomplete, malformed,
+        // untrusted, or mismatched certificate never reaches the broker and
+        // the retained private key is never replaced. The only new exit
+        // from this branch is renewal: a certificate that is expired but
+        // otherwise valid, or valid but inside its last third of lifetime,
+        // is reordered with the retained key instead of wedging the boot.
         if !retained_path_is_regular_file(&key_path)
             .with_context(|| format!("checking retained TLS private key {}", key_path.display()))?
         {
@@ -477,23 +492,121 @@ fn provision_with_policy(
                 key_path.display()
             ));
         }
-        validate_retained_tls_state(
-            trust_anchors,
+        let chain_pem = std::fs::read_to_string(&cert_path)
+            .with_context(|| format!("reading retained TLS certificate {}", cert_path.display()))?;
+        let key_pem = std::fs::read_to_string(&key_path)
+            .with_context(|| format!("reading retained TLS private key {}", key_path.display()))?;
+        let key_pair = KeyPair::from_pem(&key_pem)
+            .with_context(|| format!("parsing retained TLS private key {}", key_path.display()))?;
+
+        let validity = leaf_validity_secs(&chain_pem);
+        let expired = validity
+            .as_ref()
+            .is_ok_and(|(_, not_after)| (wait.now)().timestamp() > *not_after);
+        let at = if expired {
+            // The certificate is expired, but renewal applies only when the
+            // chain was otherwise trustworthy: re-run the full anchored
+            // validation at the start of the leaf's own window. Any other
+            // defect — malformed, untrusted, hostname- or key-mismatched —
+            // fails here exactly like the current-time check does.
+            let not_before = validity
+                .as_ref()
+                .map(|(not_before, _)| *not_before)
+                .unwrap_or_default();
+            UnixTime::since_unix_epoch(Duration::from_secs((not_before + 1).max(0) as u64))
+        } else {
+            UnixTime::now()
+        };
+        let validated = validate_certificate_chain(
+            &chain_pem,
+            &key_pair,
             &cfg.tls_certificate_hostnames,
-            &cert_path,
-            &key_path,
-        )
-        .context("validating retained static TLS certificate")?;
+            trust_anchors,
+            at,
+        );
+        let due = match (validated, validity) {
+            (Ok(()), Ok((not_before, not_after))) => {
+                let now_secs = (wait.now)().timestamp();
+                renewal_due(now_secs, not_before, not_after)
+            }
+            (Ok(()), Err(_)) => {
+                return Err(anyhow!(
+                    "validated TLS certificate leaf validity could not be re-parsed"
+                ));
+            }
+            (Err(err), _) => {
+                return Err(err.context("validating retained static TLS certificate"));
+            }
+        };
+        if !due {
+            tracing::info!(
+                cert = %cert_path.display(),
+                key = %key_path.display(),
+                "retained static TLS certificate validated; skipping issuance"
+            );
+            return Ok(());
+        }
         tracing::info!(
             cert = %cert_path.display(),
-            key = %key_path.display(),
-            "retained static TLS certificate validated; skipping issuance"
+            expired,
+            "retained static TLS certificate is due for renewal with the retained key"
         );
-        return Ok(());
+        match issue_via_broker(
+            cfg,
+            broker_url,
+            persistent_root,
+            &key_pair,
+            trust_anchors,
+            wait,
+        ) {
+            Ok(()) => {
+                tracing::info!(
+                    cert = %cert_path.display(),
+                    "renewed static TLS certificate persisted"
+                );
+                return Ok(());
+            }
+            Err(err) if !expired => {
+                // The retained certificate still serves: keep it and retry
+                // the renewal at the next boot or stay-alive check.
+                tracing::warn!(
+                    error = %format!("{err:#}"),
+                    "TLS certificate renewal failed; continuing with the retained certificate"
+                );
+                return Ok(());
+            }
+            Err(err) => {
+                return Err(err.context("renewing expired retained static TLS certificate"));
+            }
+        }
     }
 
     let key_pair = load_or_generate_key(&key_path)?;
-    let csr_der = build_csr_der(&cfg.tls_certificate_hostnames, &key_pair)?;
+    issue_via_broker(
+        cfg,
+        broker_url,
+        persistent_root,
+        &key_pair,
+        trust_anchors,
+        wait,
+    )
+}
+
+/// Order a certificate chain from the broker for `key_pair`, honoring the
+/// persisted and live ACME rate-limit cooldowns, validate the response
+/// with the same anchored checks, and atomically replace the retained
+/// `tls.crt`. Used for first issuance and for renewals alike; the caller
+/// guarantees `key_pair` is the retained workload key on renewal.
+fn issue_via_broker(
+    cfg: &Config,
+    broker_url: &str,
+    persistent_root: &Path,
+    key_pair: &KeyPair,
+    trust_anchors: &[TrustAnchor<'_>],
+    wait: &AcmeWait,
+) -> Result<()> {
+    let cert_path = cert_path(persistent_root);
+    let csr_der = build_csr_der(&cfg.tls_certificate_hostnames, key_pair)?;
     let request_sha256 =
         acme_request_fingerprint(&key_pair.serialize_pem(), &cfg.tls_certificate_hostnames);
 
@@ -597,9 +710,10 @@ fn provision_with_policy(
         })?;
     validate_certificate_chain(
         &body.certificate_chain_pem,
-        &key_pair,
+        key_pair,
         &cfg.tls_certificate_hostnames,
         trust_anchors,
+        UnixTime::now(),
     )
     .context("validating TLS certificate broker response")?;
     writes::atomic_write(&cert_path, body.certificate_chain_pem.as_bytes(), 0o644)
@@ -643,20 +757,40 @@ fn retained_path_is_regular_file(path: &Path) -> Result<bool> {
     }
 }
 
-/// Validate retained TLS state read from the confidential encrypted volume.
-fn validate_retained_tls_state(
-    trust_anchors: &[TrustAnchor<'_>],
-    hostnames: &[String],
-    cert_path: &Path,
-    key_path: &Path,
-) -> Result<()> {
-    let chain_pem = std::fs::read_to_string(cert_path)
-        .with_context(|| format!("reading retained TLS certificate {}", cert_path.display()))?;
-    let key_pem = std::fs::read_to_string(key_path)
-        .with_context(|| format!("reading retained TLS private key {}", key_path.display()))?;
-    let key_pair = KeyPair::from_pem(&key_pem)
-        .with_context(|| format!("parsing retained TLS private key {}", key_path.display()))?;
-    validate_certificate_chain(&chain_pem, &key_pair, hostnames, trust_anchors)
+/// `(notBefore, notAfter)` of the leaf certificate, in unix seconds.
+///
+/// Reads the first PEM block only: the same value
+/// `validate_certificate_chain` treats as `certs[0]`. Used to pick the
+/// validation instant for an expired retained chain and to compute whether
+/// the retained certificate is due for renewal.
+fn leaf_validity_secs(chain_pem: &str) -> Result<(i64, i64)> {
+    let block = pem::parse(chain_pem).context("parsing TLS certificate chain PEM")?;
+    if block.tag() != "CERTIFICATE" {
+        return Err(anyhow!(
+            "unexpected PEM block {:?} at position 0 in TLS certificate chain",
+            block.tag()
+        ));
+    }
+    let (_, leaf) = x509_parser::certificate::X509Certificate::from_der(block.contents())
+        .map_err(|_| anyhow!("parsing TLS leaf certificate"))?;
+    let validity = leaf.validity();
+    Ok((
+        validity.not_before.to_datetime().unix_timestamp(),
+        validity.not_after.to_datetime().unix_timestamp(),
+    ))
+}
+
+/// Whether the retained certificate is due for renewal at `now_secs`: its
+/// remaining lifetime is under one third of its total validity
+/// (`notAfter - notBefore`). Degenerate (zero/negative-validity) and
+/// expired certificates are always due.
+fn renewal_due(now_secs: i64, not_before_secs: i64, not_after_secs: i64) -> bool {
+    let remaining = not_after_secs - now_secs;
+    if remaining <= 0 {
+        return true;
+    }
+    let total = not_after_secs - not_before_secs;
+    total <= 0 || remaining.saturating_mul(3) < total
 }
 
 /// Validate a PEM certificate chain against the retained private key, the
@@ -675,6 +809,7 @@ fn validate_certificate_chain(
     key_pair: &KeyPair,
     hostnames: &[String],
     trust_anchors: &[TrustAnchor<'_>],
+    at: UnixTime,
 ) -> Result<()> {
     let pems = pem::parse_many(chain_pem).context("parsing TLS certificate chain PEM")?;
     if pems.is_empty() {
@@ -723,21 +858,24 @@ fn validate_certificate_chain(
             })?;
     }
 
-    verify_anchored_path(&end_entity, intermediates, trust_anchors)
+    verify_anchored_path(&end_entity, intermediates, trust_anchors, at)
 }
 
-/// Anchored path validation with a bounded `notBefore` clock-skew retry.
+/// Anchored path validation with a bounded `notBefore` clock-skew retry,
+/// evaluated as of `at` — the current time for live reuse and broker
+/// responses, or the start of the leaf's own window when judging whether
+/// an expired retained chain was otherwise trustworthy.
 fn verify_anchored_path(
     end_entity: &EndEntityCert<'_>,
     intermediates: &[CertificateDer<'static>],
     trust_anchors: &[TrustAnchor<'_>],
+    at: UnixTime,
 ) -> Result<()> {
-    let now = UnixTime::now();
     match end_entity.verify_for_usage(
         SUPPORTED_SIG_ALGS,
         trust_anchors,
         intermediates,
-        now,
+        at,
         KeyUsage::server_auth(),
         None,
         None,
@@ -745,9 +883,9 @@ fn verify_anchored_path(
         Ok(_) => Ok(()),
         // Bounded clock-skew tolerance: if the chain becomes valid within
         // NOT_BEFORE_TOLERANCE_SECS, re-run validation at the certificate's
-        // own notBefore time. Expiry remains strict at the current time.
+        // own notBefore time. Expiry remains strict at `at`.
         Err(webpki::Error::CertNotValidYet { not_before, .. })
-            if now.as_secs().saturating_add(NOT_BEFORE_TOLERANCE_SECS) >= not_before.as_secs() =>
+            if at.as_secs().saturating_add(NOT_BEFORE_TOLERANCE_SECS) >= not_before.as_secs() =>
         {
             end_entity
                 .verify_for_usage(
@@ -1157,11 +1295,63 @@ hkdf-info = "tls-state-luks-key"
     }
 
     #[test]
-    fn retained_expired_certificate_fails_closed_without_reissue_or_key_replacement() {
+    fn retained_expired_certificate_renews_through_broker_with_retained_key() {
+        // An expired retained certificate that was otherwise valid is due:
+        // the broker re-orders for the retained key (same CSR identifier
+        // set), the renewed chain replaces tls.crt, and the key is never
+        // touched.
         let dir = tempdir().unwrap();
-        let cfg = broker_config(dir.path(), TEST_HOSTNAMES);
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let (root, chain) = mint_test_chain(TEST_HOSTNAMES, |params| {
-            params.not_after = rcgen::date_time_ymd(2000, 1, 1);
+            params.not_before = rcgen::date_time_ymd(2000, 1, 1);
+            params.not_after = rcgen::date_time_ymd(2001, 1, 1);
+        });
+        let anchors = [root.anchor()];
+        let persistent = write_retained_state(
+            dir.path(),
+            &full_chain_pem(&[&chain.chain_pem, &root.cert.pem()]),
+            &chain.leaf_key_pem,
+        );
+        let retained_key = KeyPair::from_pem(&chain.leaf_key_pem).unwrap();
+        let renewed_pem = mint_leaf_for_key(&root.params, &root.key, &retained_key, TEST_HOSTNAMES);
+        let renewed_chain = full_chain_pem(&[&renewed_pem, &root.cert.pem()]);
+        let success_body = json!({"certificate_chain_pem": renewed_chain}).to_string();
+        let (base, _server) =
+            spawn_scripted_broker(vec![("200 OK".to_string(), success_body)], events.clone());
+        let cfg = broker_config_with_endpoints(
+            dir.path(),
+            TEST_HOSTNAMES,
+            &format!("{base}/broker"),
+            &format!("{base}/kbs-token"),
+        );
+        let (wait, _clock) = fake_wait(
+            dir.path().join("init-acme-cooldown"),
+            Utc::now(),
+            events.clone(),
+        );
+
+        provision_with_policy(&cfg, &persistent, &anchors, &wait).unwrap();
+
+        assert_eq!(*events.lock().unwrap(), vec!["post"]);
+        assert_eq!(
+            std::fs::read_to_string(cert_path(&persistent)).unwrap(),
+            renewed_chain
+        );
+        assert_eq!(
+            std::fs::read_to_string(key_path(&persistent)).unwrap(),
+            chain.leaf_key_pem
+        );
+    }
+
+    #[test]
+    fn retained_expired_certificate_renewal_failure_stays_terminal() {
+        // The retained certificate no longer serves, so a failed renewal is
+        // the provisioning error — there is nothing to keep serving.
+        let dir = tempdir().unwrap();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (root, chain) = mint_test_chain(TEST_HOSTNAMES, |params| {
+            params.not_before = rcgen::date_time_ymd(2000, 1, 1);
+            params.not_after = rcgen::date_time_ymd(2001, 1, 1);
         });
         let anchors = [root.anchor()];
         let persistent = write_retained_state(
@@ -1170,13 +1360,182 @@ hkdf-info = "tls-state-luks-key"
             &chain.leaf_key_pem,
         );
         let cert_before = std::fs::read(cert_path(&persistent)).unwrap();
-        let key_before = std::fs::read(key_path(&persistent)).unwrap();
+        let (base, _server) = spawn_scripted_broker(
+            vec![(
+                "503 Service Unavailable".to_string(),
+                rate_limited_body(None),
+            )],
+            events.clone(),
+        );
+        let cfg = broker_config_with_endpoints(
+            dir.path(),
+            TEST_HOSTNAMES,
+            &format!("{base}/broker"),
+            &format!("{base}/kbs-token"),
+        );
+        let (wait, _clock) = fake_wait(
+            dir.path().join("init-acme-cooldown"),
+            Utc::now(),
+            events.clone(),
+        );
+
+        let error = provision_with_policy(&cfg, &persistent, &anchors, &wait).unwrap_err();
+
+        assert!(error.downcast_ref::<TlsBrokerFailure>().is_some());
+        assert_eq!(*events.lock().unwrap(), vec!["post"]);
+        assert_eq!(std::fs::read(cert_path(&persistent)).unwrap(), cert_before);
+        assert_eq!(
+            std::fs::read_to_string(key_path(&persistent)).unwrap(),
+            chain.leaf_key_pem
+        );
+    }
+
+    #[test]
+    fn retained_due_but_valid_certificate_renews_with_retained_key() {
+        // A retained certificate inside its last third of validity is due:
+        // the renewal order goes out while the old certificate still
+        // serves. The window below stays valid and due for decades
+        // (remaining < total/3 for the whole run of this codebase).
+        let dir = tempdir().unwrap();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (root, chain) = mint_test_chain(TEST_HOSTNAMES, |params| {
+            params.not_before = rcgen::date_time_ymd(1990, 1, 1);
+            params.not_after = rcgen::date_time_ymd(2043, 1, 1);
+        });
+        let anchors = [root.anchor()];
+        let persistent = write_retained_state(
+            dir.path(),
+            &full_chain_pem(&[&chain.chain_pem, &root.cert.pem()]),
+            &chain.leaf_key_pem,
+        );
+        let retained_key = KeyPair::from_pem(&chain.leaf_key_pem).unwrap();
+        let renewed_pem = mint_leaf_for_key(&root.params, &root.key, &retained_key, TEST_HOSTNAMES);
+        let renewed_chain = full_chain_pem(&[&renewed_pem, &root.cert.pem()]);
+        let success_body = json!({"certificate_chain_pem": renewed_chain}).to_string();
+        let (base, _server) =
+            spawn_scripted_broker(vec![("200 OK".to_string(), success_body)], events.clone());
+        let cfg = broker_config_with_endpoints(
+            dir.path(),
+            TEST_HOSTNAMES,
+            &format!("{base}/broker"),
+            &format!("{base}/kbs-token"),
+        );
+        let (wait, _clock) = fake_wait(
+            dir.path().join("init-acme-cooldown"),
+            Utc::now(),
+            events.clone(),
+        );
+
+        provision_with_policy(&cfg, &persistent, &anchors, &wait).unwrap();
+
+        assert_eq!(*events.lock().unwrap(), vec!["post"]);
+        assert_eq!(
+            std::fs::read_to_string(cert_path(&persistent)).unwrap(),
+            renewed_chain
+        );
+        assert_eq!(
+            std::fs::read_to_string(key_path(&persistent)).unwrap(),
+            chain.leaf_key_pem
+        );
+    }
+
+    #[test]
+    fn renewal_failure_while_retained_certificate_is_valid_keeps_serving_it() {
+        // A due but unexpired retained certificate tolerates a failed
+        // renewal: provisioning reports success, the certificate stays
+        // untouched, and the next check retries.
+        let dir = tempdir().unwrap();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (root, chain) = mint_test_chain(TEST_HOSTNAMES, |params| {
+            params.not_before = rcgen::date_time_ymd(1990, 1, 1);
+            params.not_after = rcgen::date_time_ymd(2043, 1, 1);
+        });
+        let anchors = [root.anchor()];
+        let retained_chain = full_chain_pem(&[&chain.chain_pem, &root.cert.pem()]);
+        let persistent = write_retained_state(dir.path(), &retained_chain, &chain.leaf_key_pem);
+        let (base, _server) = spawn_scripted_broker(
+            vec![(
+                "503 Service Unavailable".to_string(),
+                rate_limited_body(None),
+            )],
+            events.clone(),
+        );
+        let cfg = broker_config_with_endpoints(
+            dir.path(),
+            TEST_HOSTNAMES,
+            &format!("{base}/broker"),
+            &format!("{base}/kbs-token"),
+        );
+        let (wait, _clock) = fake_wait(
+            dir.path().join("init-acme-cooldown"),
+            Utc::now(),
+            events.clone(),
+        );
+
+        provision_with_policy(&cfg, &persistent, &anchors, &wait).unwrap();
+
+        assert_eq!(*events.lock().unwrap(), vec!["post"]);
+        assert_eq!(
+            std::fs::read_to_string(cert_path(&persistent)).unwrap(),
+            retained_chain
+        );
+        assert_eq!(
+            std::fs::read_to_string(key_path(&persistent)).unwrap(),
+            chain.leaf_key_pem
+        );
+    }
+
+    #[test]
+    fn retained_expired_untrusted_chain_fails_closed_without_reissue() {
+        // An expired chain that never validated against the anchors is not
+        // "valid except for being expired": it still fails closed and no
+        // broker order is placed.
+        let dir = tempdir().unwrap();
+        let cfg = broker_config(dir.path(), TEST_HOSTNAMES);
+        let (trusted_root, _) = mint_test_chain(TEST_HOSTNAMES, |_| {});
+        let (untrusted_root, chain) = mint_test_chain(TEST_HOSTNAMES, |params| {
+            params.not_before = rcgen::date_time_ymd(2000, 1, 1);
+            params.not_after = rcgen::date_time_ymd(2001, 1, 1);
+        });
+        let anchors = [trusted_root.anchor()];
+        let persistent = write_retained_state(
+            dir.path(),
+            &full_chain_pem(&[&chain.chain_pem, &untrusted_root.cert.pem()]),
+            &chain.leaf_key_pem,
+        );
+        let cert_before = std::fs::read(cert_path(&persistent)).unwrap();
 
         let error = provision_with_trust_anchors(&cfg, &persistent, &anchors).unwrap_err();
         let message = format!("{error:#}");
-        assert!(message.contains("expired"), "unexpected error: {message}");
+        assert!(
+            message.contains("validation failed"),
+            "unexpected error: {message}"
+        );
         assert_eq!(std::fs::read(cert_path(&persistent)).unwrap(), cert_before);
-        assert_eq!(std::fs::read(key_path(&persistent)).unwrap(), key_before);
+        // The validation failure precedes any broker contact: the unroutable
+        // broker URL would surface token-resolution errors otherwise.
+    }
+
+    #[test]
+    fn renewal_due_boundary_is_exactly_one_third_of_total_validity() {
+        // remaining >= total/3 is not due; remaining < total/3 is.
+        assert!(!renewal_due(0, 0, 90));
+        assert!(!renewal_due(60, 0, 90));
+        assert!(renewal_due(61, 0, 90));
+        assert!(renewal_due(89, 0, 90));
+        // Expired and degenerate windows are always due.
+        assert!(renewal_due(90, 0, 90));
+        assert!(renewal_due(100, 0, 90));
+        assert!(renewal_due(0, 90, 90));
+        assert!(renewal_due(0, 90, 10));
+        // Not-yet-valid certificates are not due by this predicate alone
+        // (retained not-yet-valid state fails closed before renewal).
+        assert!(!renewal_due(0, 90, 180));
+        // Non-divisible totals: due once remaining*3 < total (remaining
+        // strictly below total/3).
+        assert!(!renewal_due(60, 0, 91));
+        assert!(renewal_due(61, 0, 91));
+        assert!(renewal_due(62, 0, 91));
     }
 
     #[test]

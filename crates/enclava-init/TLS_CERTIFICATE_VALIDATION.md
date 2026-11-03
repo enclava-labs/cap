@@ -36,8 +36,11 @@ the workload-attested broker and validates retained state on the encrypted
   full anchored validation passes. Repeated valid reuse performs zero broker
   calls.
 - Invalid retained state aborts init without ordering a replacement
-  certificate and without replacing the retained private key. Recovery is
-  explicit operator removal of the stale `tls.crt`.
+  certificate and without replacing the retained private key. This covers
+  malformed, untrusted, hostname-mismatched, and key-mismatched state, and
+  certificates that are expired but were *not* otherwise valid within their
+  own window (see renewal below). Recovery is explicit operator removal of
+  the stale `tls.crt`.
 - Only an actually missing certificate (`ENOENT`) starts issuance. A
   certificate-less retained key is kept and reused for the new CSR, so an
   interrupted first issuance retries with the same key.
@@ -46,3 +49,29 @@ the workload-attested broker and validates retained state on the encrypted
 
 `notBefore` tolerates at most 300 s of clock skew (validation is retried at
 the certificate's own `notBefore`); expiry is strict at the current time.
+
+## Renewal
+
+A retained certificate is **due** when it is expired but otherwise valid —
+the full anchored validation passes when evaluated at the start of the
+leaf's own validity window — or when it is valid but its remaining lifetime
+is under one third of its total validity (`notAfter − notBefore`, ~30 days
+for a 90-day Let's Encrypt certificate).
+
+- Due certificates are renewed through the same broker path as first
+  issuance. The CSR is built from the *retained* private key and the
+  configured hostnames, so the ACME order carries the exact same identifier
+  set and the CA counts it as a renewal rather than a new certificate. The
+  retained key is never rotated or regenerated while a certificate exists.
+- The renewed chain is validated with the identical anchored checks before
+  `tls.crt` is replaced atomically (`writes::atomic_write`).
+- If renewal fails while the retained certificate is still unexpired, it
+  keeps serving: the failure is logged as a warning and the next check
+  retries. If the retained certificate is expired, a failed renewal is the
+  terminal provisioning error.
+- Checks run at every boot and, in broker mode, every six hours inside the
+  enclava-init stay-alive loop (the same persisted ACME cooldown marker and
+  per-attempt attestation token apply). A successful renewal is mirrored
+  into the caddy runtime handoff atomically; tenant-ingress watches
+  `tls.crt` and restarts caddy on change because the generated Caddyfile
+  runs with `admin off`.

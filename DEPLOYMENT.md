@@ -255,7 +255,7 @@ For production deploys with policy-read mode enabled:
 | `TENANT_DNS_TARGET` | A/AAAA target for tenant DNS records. |
 | `TLS_CERTIFICATE_BROKER_URL` | Required when `TENANT_CADDY_TLS_MODE=dns01-broker`. |
 | `ACME_DIRECTORY_URL` | ACME directory for DNS-01 broker certificates. |
-| `ACME_ACCOUNT_CREDENTIALS_PATH` | Optional persisted ACME account credentials path. |
+| `ACME_ACCOUNT_CREDENTIALS_PATH` | Optional persisted ACME account credentials path. Account registration is single-flight per process and the credentials file is written atomically with 0600 permissions, so concurrent first issuances register one account; Let's Encrypt allows only 10 new accounts per IP per 3 hours. |
 | `ACME_DNS_PROPAGATION_SECONDS` | DNS propagation wait for the certificate broker. Defaults to `30`. |
 | `ACME_DNS_LOOKUP_PREFER_SYSTEM` | Broker TXT resolver preference: exactly `true` or `false` (default). `true` tries the pod system resolver first; either order falls back only on lookup error, never on successful empty/nonmatching TXT answers. |
 | `ACME_DNS_LOOKUP_TIMEOUT_SECONDS` | Optional positive integer timeout for each complete broker TXT resolver lookup, including fallback (two attempts can consume twice this budget). Invalid/zero values fail startup. Unset preserves native resolver budgets; the historical unmerged branch's ten-second default is deliberately not introduced. No DNS egress policy changes are required. |
