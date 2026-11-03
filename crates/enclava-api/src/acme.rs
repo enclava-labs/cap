@@ -708,11 +708,17 @@ fn write_account_credentials(
         std::fs::create_dir_all(parent)?;
     }
     let tmp = path.with_extension("tmp");
+    // Never follow or reuse a pre-existing temp path: remove any leftover
+    // entry (a symlink is unlinked, not followed) and create exclusively.
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
     {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
             .open(&tmp)?;
         std::io::Write::write_all(&mut file, &serde_json::to_vec(credentials)?)?;
