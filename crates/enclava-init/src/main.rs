@@ -474,12 +474,14 @@ fn stay_alive_forever(cfg: &Config) -> ! {
         if tls_renewal_check_required(cfg) && next_readiness_check <= Instant::now() {
             next_readiness_check = Instant::now() + TLS_READINESS_CHECK_INTERVAL;
             // Readiness follows the certificate caddy serves, whatever the
-            // renewal check last did: a publish or copy error — or a
-            // deferred rate-limited renewal — with a valid runtime
-            // certificate keeps serving, an expired or not-yet-valid one
-            // does not.
+            // renewal check last did. Restoring readiness additionally
+            // waits out the tenant-ingress reload window so a freshly
+            // mirrored certificate isn't reported before caddy serves it;
+            // marking unusable stays immediate.
             let ready_file = ready_file_path();
-            if runtime_certificate_valid(Path::new(CADDY_RUNTIME_HANDOFF_PATH)) {
+            let runtime_cert =
+                Path::new(CADDY_RUNTIME_HANDOFF_PATH).join(tls_certificate::CERT_RELATIVE_PATH);
+            if runtime_certificate_ready(&runtime_cert, &ready_file) {
                 if !ready_file_exists(&ready_file)
                     && let Err(err) = mark_ready_file(&ready_file)
                 {
@@ -521,14 +523,42 @@ fn renew_workload_tls_certificate(cfg: &Config) -> Result<()> {
     })
 }
 
-fn runtime_certificate_valid(runtime: &Path) -> bool {
-    std::fs::read_to_string(runtime.join(tls_certificate::CERT_RELATIVE_PATH))
-        .is_ok_and(|pem| tls_certificate::leaf_valid_at(&pem, chrono::Utc::now().timestamp()))
+/// Whether the runtime handoff certificate may be reported as ready:
+/// valid right now, and — once readiness has been marked unusable — old
+/// enough that the tenant-ingress certificate watcher has certainly
+/// reloaded it before readiness is restored.
+fn runtime_certificate_ready(runtime_cert: &Path, ready_file: &Path) -> bool {
+    let valid = std::fs::read_to_string(runtime_cert)
+        .is_ok_and(|pem| tls_certificate::leaf_valid_at(&pem, chrono::Utc::now().timestamp()));
+    let settled = std::fs::metadata(runtime_cert)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age >= TLS_CERT_SETTLE_BEFORE_READY);
+    readiness_restorable(valid, settled, ready_file_exists(ready_file))
 }
 
-/// Atomically copy the retained tls.crt/tls.key into the caddy runtime
-/// handoff with caddy ownership. Atomic writes keep the tenant-ingress
-/// certificate watcher from ever observing a half-written certificate.
+/// Age a renewed runtime certificate must reach before a cleared ready
+/// file is restored: the tenant-ingress wrapper picks a certificate change
+/// up within ~75 s, so 120 s leaves margin before readiness says the new
+/// certificate is actually being served.
+const TLS_CERT_SETTLE_BEFORE_READY: Duration = Duration::from_secs(120);
+
+/// Pure readiness decision: a valid certificate that is already reported
+/// ready stays ready (the settle delay applies only to restoring
+/// readiness, not to keeping it); an invalid or missing certificate is
+/// never ready.
+fn readiness_restorable(valid: bool, settled: bool, already_ready: bool) -> bool {
+    valid && (already_ready || settled)
+}
+
+/// Atomically copy a renewed retained tls.crt into the caddy runtime
+/// handoff, only when the bytes actually changed. Only the certificate is
+/// refreshed: renewals reuse the retained key, and rewriting tls.key here
+/// could leave it briefly root-owned in the runtime dir — caddy keeps the
+/// key the boot handoff delivered. The ownership refresh afterwards is
+/// best-effort: a failure leaves a world-readable certificate, which
+/// caddy can still serve.
 fn refresh_caddy_runtime_certificate_at<F>(
     persistent: &Path,
     runtime: &Path,
@@ -538,17 +568,20 @@ fn refresh_caddy_runtime_certificate_at<F>(
 where
     F: FnOnce(&Path, chown::ExecIdentity) -> Result<()>,
 {
-    for (relative, mode) in [
-        (tls_certificate::CERT_RELATIVE_PATH, 0o644),
-        (tls_certificate::KEY_RELATIVE_PATH, 0o600),
-    ] {
-        let source = persistent.join(relative);
-        let bytes =
-            std::fs::read(&source).with_context(|| format!("reading {}", source.display()))?;
-        writes::atomic_write(&runtime.join(relative), &bytes, mode)
-            .with_context(|| format!("refreshing {}", runtime.join(relative).display()))?;
+    let source = persistent.join(tls_certificate::CERT_RELATIVE_PATH);
+    let destination = runtime.join(tls_certificate::CERT_RELATIVE_PATH);
+    let bytes = std::fs::read(&source).with_context(|| format!("reading {}", source.display()))?;
+    if std::fs::read(&destination).ok().as_deref() != Some(bytes.as_slice()) {
+        writes::atomic_write(&destination, &bytes, 0o644)
+            .with_context(|| format!("refreshing {}", destination.display()))?;
     }
-    chown_runtime(runtime, caddy_identity).with_context(|| format!("chown {}", runtime.display()))
+    if let Err(err) = chown_runtime(runtime, caddy_identity) {
+        tracing::warn!(
+            error = %format!("{err:#}"),
+            "re-owning caddy runtime certificate failed; continuing"
+        );
+    }
+    Ok(())
 }
 
 fn stay_alive_after_failure() -> ! {

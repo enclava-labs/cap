@@ -745,9 +745,8 @@ fn write_account_credentials(
     path: &std::path::Path,
     credentials: &AccountCredentials,
 ) -> Result<(), AcmeError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    let dir = credentials_dir(path);
+    std::fs::create_dir_all(dir)?;
     // Never follow or reuse a pre-existing temp path: create a uniquely-named
     // sibling exclusively and only ever remove the file we created. The name
     // is short and independent of the destination so a long (but valid)
@@ -757,11 +756,10 @@ fn write_account_credentials(
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
-    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
     let mut file = None;
-    let mut tmp = parent.to_path_buf();
+    let mut tmp = dir.to_path_buf();
     for attempt in 0..8u32 {
-        tmp = parent.join(format!(".acme-account.{pid}.{nanos}.{attempt}.tmp"));
+        tmp = dir.join(format!(".acme-account.{pid}.{nanos}.{attempt}.tmp"));
         match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -795,8 +793,19 @@ fn write_account_credentials(
         return Err(err);
     }
     // fsync the parent directory so the rename itself survives a crash.
-    std::fs::File::open(parent)?.sync_all()?;
+    std::fs::File::open(dir)?.sync_all()?;
     Ok(())
+}
+
+/// Directory the credentials file and its temp sibling live in. A bare
+/// relative file name like `account.json` has `parent() == Some("")`; an
+/// empty parent fails to open as a directory and would break the temp
+/// sibling create and the post-rename fsync, so it resolves to `"."`.
+fn credentials_dir(path: &std::path::Path) -> &std::path::Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => std::path::Path::new("."),
+    }
 }
 
 #[cfg(test)]
@@ -1922,6 +1931,31 @@ mod tests {
             new_accounts.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "exactly one ACME account must be registered"
+        );
+    }
+
+    #[test]
+    fn credentials_dir_resolves_bare_file_names_to_current_dir() {
+        assert_eq!(
+            credentials_dir(std::path::Path::new("account.json")),
+            std::path::Path::new(".")
+        );
+        assert_eq!(
+            credentials_dir(std::path::Path::new("./account.json")),
+            std::path::Path::new(".")
+        );
+        assert_eq!(
+            credentials_dir(std::path::Path::new("/etc/ssl/account.json")),
+            std::path::Path::new("/etc/ssl")
+        );
+        assert_eq!(
+            credentials_dir(std::path::Path::new("nested/account.json")),
+            std::path::Path::new("nested")
+        );
+        // No parent at all: still usable for temp creation and fsync.
+        assert_eq!(
+            credentials_dir(std::path::Path::new("")),
+            std::path::Path::new(".")
         );
     }
 }

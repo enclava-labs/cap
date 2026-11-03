@@ -75,16 +75,22 @@ for a 90-day Let's Encrypt certificate).
   local validation: the broker is contacted only when the certificate is
   due and no persisted cooldown deadline is still pending, so a deferred
   rate-limited renewal retries within 15 minutes of the cooldown ending.
-  Only the boot check waits out a rate limit: the runtime renewal never
-  sleeps on an ACME cooldown — a still-pending persisted deadline returns
-  before any broker request, and a fresh `acme_rate_limited` response
-  persists the broker's deadline and defers to a later check, so a long
-  provider cooldown cannot park the loop. A successful renewal is
-  mirrored into the caddy runtime handoff atomically; tenant-ingress
-  watches `tls.crt` and restarts caddy on change because the generated
-  Caddyfile runs with `admin off`.
+  Only the boot check waits out a rate limit (bounded at four hours per
+  wait): the runtime renewal never sleeps on an ACME cooldown — a
+  still-pending persisted deadline returns before any broker request, and
+  a fresh `acme_rate_limited` response persists the broker's deadline
+  (honored out to eight days, covering the provider's weekly windows) and
+  defers to a later check, so a long provider cooldown neither parks the
+  loop nor triggers a re-order inside the limit. A successful renewal is
+  mirrored into the caddy runtime handoff atomically — `tls.crt` only,
+  since renewals reuse the retained key and the runtime `tls.key` never
+  changes; tenant-ingress watches `tls.crt` and restarts caddy on change
+  because the generated Caddyfile runs with `admin off`.
 - In broker mode the stay-alive loop also re-evaluates readiness from the
   certificate caddy currently serves once a minute, independent of the
   renewal check: an expired or not-yet-valid runtime certificate clears
   readiness (`tls-certificate-unusable`) within a minute even while a
-  rate-limited renewal is deferred, and a valid one keeps or restores it.
+  rate-limited renewal is deferred. Restoring readiness waits until the
+  runtime `tls.crt` has been in place for two minutes, past the
+  tenant-ingress certificate-watch reload window, so readiness never
+  claims a renewed certificate is served before caddy actually loads it.
