@@ -755,7 +755,10 @@ fn enclava_init_ready_probe() -> Probe {
         }),
         period_seconds: Some(5),
         timeout_seconds: Some(2),
-        failure_threshold: Some(17_280), // 24h for password-unlock pods.
+        // Unlock stays reachable while not ready (the Service publishes
+        // not-ready addresses), so a ready pod can drop out after 30s, e.g.
+        // when enclava-init marks its served TLS certificate unusable.
+        failure_threshold: Some(6),
         ..Default::default()
     }
 }
