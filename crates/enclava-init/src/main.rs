@@ -459,25 +459,23 @@ fn stay_alive_forever(cfg: &Config) -> ! {
         }
         if tls_renewal_check_required(cfg) && next_tls_check <= Instant::now() {
             next_tls_check = Instant::now() + TLS_RENEWAL_CHECK_INTERVAL;
+            if let Err(err) = renew_workload_tls_certificate(cfg) {
+                tracing::warn!(error = %format!("{err:#}"), "workload TLS certificate check failed");
+            }
+            // Readiness follows the certificate caddy serves, whichever
+            // step above failed: a publish or copy error with a valid
+            // runtime certificate keeps serving, an expired one does not.
             let ready_file = ready_file_path();
-            match renew_workload_tls_certificate(cfg) {
-                Ok(()) => {
-                    if !ready_file_exists(&ready_file)
-                        && let Err(err) = mark_ready_file(&ready_file)
-                    {
-                        tracing::warn!(error = %err, "restoring readiness after TLS renewal failed");
-                    }
+            if runtime_certificate_unexpired(Path::new(CADDY_RUNTIME_HANDOFF_PATH)) {
+                if !ready_file_exists(&ready_file)
+                    && let Err(err) = mark_ready_file(&ready_file)
+                {
+                    tracing::warn!(error = %err, "restoring readiness after TLS check failed");
                 }
-                // The retained certificate can no longer be served (expired or
-                // invalid, renewal failed): stop advertising readiness.
-                Err(err) => {
-                    tracing::warn!(error = %format!("{err:#}"), "workload TLS certificate renewal failed");
-                    if let Err(err) =
-                        write_ready_file_state(&ready_file, b"tls-certificate-unusable\n")
-                    {
-                        tracing::warn!(error = %err, "clearing readiness after TLS failure failed");
-                    }
-                }
+            } else if let Err(err) =
+                write_ready_file_state(&ready_file, b"tls-certificate-unusable\n")
+            {
+                tracing::warn!(error = %err, "clearing readiness after TLS failure failed");
             }
         }
         std::thread::sleep(Duration::from_secs(CADDY_RUNTIME_SYNC_INTERVAL_SECONDS));
@@ -505,17 +503,14 @@ fn renew_workload_tls_certificate(cfg: &Config) -> Result<()> {
     let persistent = caddy_tls_bind_dir(Path::new(&cfg.tls_state.mount_path));
     let runtime = Path::new(CADDY_RUNTIME_HANDOFF_PATH);
     let caddy_identity = numeric_identity(cfg.caddy_uid, cfg.caddy_gid);
-    // A failed runtime copy leaves caddy on the still-valid retained
-    // certificate, so it must not clear readiness like an unusable one.
-    if let Err(err) = refresh_caddy_runtime_certificate_at(
-        &persistent,
-        runtime,
-        caddy_identity,
-        |path, identity| chown::chown_recursive(path, identity).map_err(Into::into),
-    ) {
-        tracing::warn!(error = %format!("{err:#}"), "refreshing caddy runtime TLS certificate failed");
-    }
-    Ok(())
+    refresh_caddy_runtime_certificate_at(&persistent, runtime, caddy_identity, |path, identity| {
+        chown::chown_recursive(path, identity).map_err(Into::into)
+    })
+}
+
+fn runtime_certificate_unexpired(runtime: &Path) -> bool {
+    std::fs::read_to_string(runtime.join(tls_certificate::CERT_RELATIVE_PATH))
+        .is_ok_and(|pem| tls_certificate::leaf_unexpired_at(&pem, chrono::Utc::now().timestamp()))
 }
 
 /// Atomically copy the retained tls.crt/tls.key into the caddy runtime

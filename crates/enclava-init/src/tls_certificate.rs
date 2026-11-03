@@ -757,6 +757,11 @@ fn retained_path_is_regular_file(path: &Path) -> Result<bool> {
     }
 }
 
+/// Whether the leaf of `chain_pem` is still within its validity at `now_secs`.
+pub fn leaf_unexpired_at(chain_pem: &str, now_secs: i64) -> bool {
+    leaf_validity_secs(chain_pem).is_ok_and(|(_, not_after)| now_secs <= not_after)
+}
+
 /// `(notBefore, notAfter)` of the leaf certificate, in unix seconds.
 ///
 /// Reads the first PEM block only: the same value
@@ -1292,6 +1297,18 @@ hkdf-info = "tls-state-luks-key"
         );
 
         provision_with_trust_anchors(&cfg, &persistent, &anchors).unwrap();
+    }
+
+    #[test]
+    fn leaf_unexpired_at_flips_after_not_after() {
+        let (_root, chain) = mint_test_chain(TEST_HOSTNAMES, |params| {
+            params.not_before = rcgen::date_time_ymd(2000, 1, 1);
+            params.not_after = rcgen::date_time_ymd(2001, 1, 1);
+        });
+        let not_after = 978_307_200; // 2001-01-01T00:00:00Z
+        assert!(leaf_unexpired_at(&chain.chain_pem, not_after));
+        assert!(!leaf_unexpired_at(&chain.chain_pem, not_after + 1));
+        assert!(!leaf_unexpired_at("not a certificate", 0));
     }
 
     #[test]
