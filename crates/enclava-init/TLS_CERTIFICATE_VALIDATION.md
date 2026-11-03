@@ -75,13 +75,17 @@ for a 90-day Let's Encrypt certificate).
   local validation: the broker is contacted only when the certificate is
   due and no persisted cooldown deadline is still pending, so a deferred
   rate-limited renewal retries within 15 minutes of the cooldown ending.
-  Only the boot check waits out a rate limit (bounded at four hours per
-  wait): the runtime renewal never sleeps on an ACME cooldown — a
-  still-pending persisted deadline returns before any broker request, and
-  a fresh `acme_rate_limited` response persists the broker's deadline
-  (honored out to eight days, covering the provider's weekly windows) and
-  defers to a later check, so a long provider cooldown neither parks the
-  loop nor triggers a re-order inside the limit. A successful renewal is
+  Only the boot check waits out a rate limit, and only while the
+  remaining cooldown fits a single honored wait (four hours): a pending
+  persisted deadline beyond that defers too — the persisted deadline is
+  honored policy-independently out to eight days (covering the provider's
+  weekly windows), so a runtime-deferred cooldown also suppresses a new
+  order when a restart takes the boot path. The runtime renewal never
+  sleeps on an ACME cooldown — a still-pending persisted deadline returns
+  before any broker request, and a fresh `acme_rate_limited` response
+  persists the broker's deadline and defers to a later check, so a long
+  provider cooldown neither parks the loop nor triggers a re-order inside
+  the limit. A successful renewal is
   mirrored into the caddy runtime handoff atomically — `tls.crt` only,
   since renewals reuse the retained key and the runtime `tls.key` never
   changes; tenant-ingress watches `tls.crt` and restarts caddy on change
