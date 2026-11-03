@@ -91,3 +91,8 @@ impl Tier {
         }
     }
 }
+
+/// TLS port the tenant-ingress caddy serves end-user traffic on inside the
+/// pod. Shared so the manifest that assigns the port and enclava-init's
+/// readiness probe of the served certificate cannot drift.
+pub const TENANT_INGRESS_TLS_PORT: u16 = 10443;

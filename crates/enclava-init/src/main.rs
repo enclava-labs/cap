@@ -6,6 +6,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
+use enclava_common::types::TENANT_INGRESS_TLS_PORT;
 use enclava_init::chown::{self, ExecIdentity, IdentityKind};
 use enclava_init::config::{
     Config, LOG_SPOOL_STORAGE_STATE_BIND, LogEncryptionHandoff, LogEncryptionHandoffFile, Mode,
@@ -14,8 +15,8 @@ use enclava_init::config::{
 use enclava_init::safe_diagnostics::SafeBootstrapDiagnostic;
 use enclava_init::secrets::{DerivedSeed, OwnerSeed, Password};
 use enclava_init::{
-    dev_no_luks_override, env_override, log_relay, luks, luks2_seal, seeds, socket,
-    tls_certificate, trustee_verify, unlock, writes,
+    dev_no_luks_override, env_override, log_relay, luks, luks2_seal, seeds, served_certificate,
+    socket, tls_certificate, trustee_verify, unlock, writes,
 };
 use serde::Deserialize;
 
@@ -473,24 +474,30 @@ fn stay_alive_forever(cfg: &Config) -> ! {
         }
         if tls_renewal_check_required(cfg) && next_readiness_check <= Instant::now() {
             next_readiness_check = Instant::now() + TLS_READINESS_CHECK_INTERVAL;
-            // Readiness follows the certificate caddy serves, whatever the
-            // renewal check last did. Restoring readiness additionally
-            // waits out the tenant-ingress reload window so a freshly
-            // mirrored certificate isn't reported before caddy serves it;
-            // marking unusable stays immediate.
+            // Readiness follows the certificate tenant-ingress actually
+            // serves, whatever the renewal check last did: a served leaf
+            // inside its validity window marks the workload ready; an
+            // expired or not-yet-valid served leaf clears it. A listener
+            // that cannot be probed (caddy restarting, refused connection)
+            // leaves the marker unchanged — its TCP readiness probe covers
+            // "not serving" without this marker claiming unusable.
             let ready_file = ready_file_path();
-            let runtime_cert =
-                Path::new(CADDY_RUNTIME_HANDOFF_PATH).join(tls_certificate::CERT_RELATIVE_PATH);
-            if runtime_certificate_ready(&runtime_cert, &ready_file) {
-                if !ready_file_exists(&ready_file)
-                    && let Err(err) = mark_ready_file(&ready_file)
-                {
-                    tracing::warn!(error = %err, "restoring readiness after TLS check failed");
+            match served_certificate_valid(cfg) {
+                Some(true) => {
+                    if !ready_file_exists(&ready_file)
+                        && let Err(err) = mark_ready_file(&ready_file)
+                    {
+                        tracing::warn!(error = %err, "restoring readiness after TLS check failed");
+                    }
                 }
-            } else if let Err(err) =
-                write_ready_file_state(&ready_file, b"tls-certificate-unusable\n")
-            {
-                tracing::warn!(error = %err, "clearing readiness after TLS failure failed");
+                Some(false) => {
+                    if let Err(err) =
+                        write_ready_file_state(&ready_file, b"tls-certificate-unusable\n")
+                    {
+                        tracing::warn!(error = %err, "clearing readiness after TLS failure failed");
+                    }
+                }
+                None => {}
             }
         }
         std::thread::sleep(Duration::from_secs(CADDY_RUNTIME_SYNC_INTERVAL_SECONDS));
@@ -523,33 +530,30 @@ fn renew_workload_tls_certificate(cfg: &Config) -> Result<()> {
     })
 }
 
-/// Whether the runtime handoff certificate may be reported as ready:
-/// valid right now, and — once readiness has been marked unusable — old
-/// enough that the tenant-ingress certificate watcher has certainly
-/// reloaded it before readiness is restored.
-fn runtime_certificate_ready(runtime_cert: &Path, ready_file: &Path) -> bool {
-    let valid = std::fs::read_to_string(runtime_cert)
-        .is_ok_and(|pem| tls_certificate::leaf_valid_at(&pem, chrono::Utc::now().timestamp()));
-    let settled = std::fs::metadata(runtime_cert)
-        .and_then(|meta| meta.modified())
-        .ok()
-        .and_then(|modified| modified.elapsed().ok())
-        .is_some_and(|age| age >= TLS_CERT_SETTLE_BEFORE_READY);
-    readiness_restorable(valid, settled, ready_file_exists(ready_file))
-}
-
-/// Age a renewed runtime certificate must reach before a cleared ready
-/// file is restored: the tenant-ingress wrapper picks a certificate change
-/// up within ~75 s, so 120 s leaves margin before readiness says the new
-/// certificate is actually being served.
-const TLS_CERT_SETTLE_BEFORE_READY: Duration = Duration::from_secs(120);
-
-/// Pure readiness decision: a valid certificate that is already reported
-/// ready stays ready (the settle delay applies only to restoring
-/// readiness, not to keeping it); an invalid or missing certificate is
-/// never ready.
-fn readiness_restorable(valid: bool, settled: bool, already_ready: bool) -> bool {
-    valid && (already_ready || settled)
+/// Whether the certificate tenant-ingress serves for the first configured
+/// hostname is inside its validity window right now. `None` means the
+/// listener could not be probed (caddy restarting, refused connection,
+/// handshake failure) and callers must leave the readiness marker
+/// unchanged.
+fn served_certificate_valid(cfg: &Config) -> Option<bool> {
+    let host = cfg.tls_certificate_hostnames.first()?;
+    match served_certificate::fetch_served_certificate(
+        host,
+        TENANT_INGRESS_TLS_PORT,
+        Duration::from_secs(5),
+    ) {
+        Ok(leaf) => Some(tls_certificate::leaf_der_valid_at(
+            leaf.as_ref(),
+            chrono::Utc::now().timestamp(),
+        )),
+        Err(err) => {
+            tracing::warn!(
+                error = %format!("{err:#}"),
+                "tenant-ingress certificate probe failed; leaving readiness unchanged"
+            );
+            None
+        }
+    }
 }
 
 /// Atomically copy a renewed retained tls.crt into the caddy runtime

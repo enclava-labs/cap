@@ -48,7 +48,7 @@ pub fn enclava_init_image() -> String {
 pub const ENCLAVA_WAIT_EXEC_PATH: &str = "/enclava-tools/enclava-wait-exec";
 pub const APP_SEED_PATH: &str = "/state/app/seed";
 pub const CADDY_SEED_PATH: &str = "/state/caddy/seed";
-pub const CADDY_ACME_TLS_PORT: i32 = 10443;
+pub const CADDY_ACME_TLS_PORT: i32 = enclava_common::types::TENANT_INGRESS_TLS_PORT as i32;
 pub const CADDY_INTERNAL_TLS_PORT: i32 = 10443;
 pub const CADDY_INTERNAL_RUNTIME_PATH: &str = "/run/enclava/caddy-runtime";
 pub const UNLOCK_SOCKET_PATH: &str = "/run/enclava-unlock/unlock.sock";

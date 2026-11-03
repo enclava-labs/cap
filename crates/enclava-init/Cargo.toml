@@ -41,6 +41,7 @@ libcryptsetup-rs = { version = "0.15", features = ["mutex"] }
 enclava-common = { workspace = true }
 rcgen = "0.14"
 pem = "3"
+rustls = { workspace = true, features = ["ring"] }
 rustls-pki-types = "1"
 x509-parser = "0.18"
 rustls-webpki = { version = "0.103", default-features = false, features = ["alloc", "std", "ring"] }
