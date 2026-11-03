@@ -757,9 +757,13 @@ fn retained_path_is_regular_file(path: &Path) -> Result<bool> {
     }
 }
 
-/// Whether the leaf of `chain_pem` is still within its validity at `now_secs`.
-pub fn leaf_unexpired_at(chain_pem: &str, now_secs: i64) -> bool {
-    leaf_validity_secs(chain_pem).is_ok_and(|(_, not_after)| now_secs <= not_after)
+/// Whether the leaf of `chain_pem` is within its validity window at `now_secs`
+/// (with the same notBefore skew tolerance as chain validation).
+pub fn leaf_valid_at(chain_pem: &str, now_secs: i64) -> bool {
+    leaf_validity_secs(chain_pem).is_ok_and(|(not_before, not_after)| {
+        now_secs.saturating_add(NOT_BEFORE_TOLERANCE_SECS as i64) >= not_before
+            && now_secs <= not_after
+    })
 }
 
 /// `(notBefore, notAfter)` of the leaf certificate, in unix seconds.
@@ -1300,15 +1304,19 @@ hkdf-info = "tls-state-luks-key"
     }
 
     #[test]
-    fn leaf_unexpired_at_flips_after_not_after() {
+    fn leaf_valid_at_tracks_the_validity_window() {
         let (_root, chain) = mint_test_chain(TEST_HOSTNAMES, |params| {
             params.not_before = rcgen::date_time_ymd(2000, 1, 1);
             params.not_after = rcgen::date_time_ymd(2001, 1, 1);
         });
+        let not_before = 946_684_800; // 2000-01-01T00:00:00Z
         let not_after = 978_307_200; // 2001-01-01T00:00:00Z
-        assert!(leaf_unexpired_at(&chain.chain_pem, not_after));
-        assert!(!leaf_unexpired_at(&chain.chain_pem, not_after + 1));
-        assert!(!leaf_unexpired_at("not a certificate", 0));
+        let tolerance = NOT_BEFORE_TOLERANCE_SECS as i64;
+        assert!(leaf_valid_at(&chain.chain_pem, not_after));
+        assert!(!leaf_valid_at(&chain.chain_pem, not_after + 1));
+        assert!(leaf_valid_at(&chain.chain_pem, not_before - tolerance));
+        assert!(!leaf_valid_at(&chain.chain_pem, not_before - tolerance - 1));
+        assert!(!leaf_valid_at("not a certificate", not_before));
     }
 
     #[test]

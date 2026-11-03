@@ -464,9 +464,10 @@ fn stay_alive_forever(cfg: &Config) -> ! {
             }
             // Readiness follows the certificate caddy serves, whichever
             // step above failed: a publish or copy error with a valid
-            // runtime certificate keeps serving, an expired one does not.
+            // runtime certificate keeps serving, an expired or not-yet-valid
+            // one does not.
             let ready_file = ready_file_path();
-            if runtime_certificate_unexpired(Path::new(CADDY_RUNTIME_HANDOFF_PATH)) {
+            if runtime_certificate_valid(Path::new(CADDY_RUNTIME_HANDOFF_PATH)) {
                 if !ready_file_exists(&ready_file)
                     && let Err(err) = mark_ready_file(&ready_file)
                 {
@@ -508,9 +509,9 @@ fn renew_workload_tls_certificate(cfg: &Config) -> Result<()> {
     })
 }
 
-fn runtime_certificate_unexpired(runtime: &Path) -> bool {
+fn runtime_certificate_valid(runtime: &Path) -> bool {
     std::fs::read_to_string(runtime.join(tls_certificate::CERT_RELATIVE_PATH))
-        .is_ok_and(|pem| tls_certificate::leaf_unexpired_at(&pem, chrono::Utc::now().timestamp()))
+        .is_ok_and(|pem| tls_certificate::leaf_valid_at(&pem, chrono::Utc::now().timestamp()))
 }
 
 /// Atomically copy the retained tls.crt/tls.key into the caddy runtime
