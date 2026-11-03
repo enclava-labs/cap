@@ -3,7 +3,7 @@ use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use enclava_init::chown::{self, ExecIdentity, IdentityKind};
@@ -27,6 +27,18 @@ const DEFAULT_KBS_PROXY_HEALTH_POLL_SECONDS: u64 = 2;
 const CADDY_RUNTIME_HANDOFF_PATH: &str = "/run/enclava/caddy-runtime";
 const PUBLIC_TLS_CERT_HANDOFF_PATH: &str = "/run/enclava/public-tls/certificates/tls.crt";
 const CADDY_RUNTIME_SYNC_INTERVAL_SECONDS: u64 = 5;
+/// Broker-mode workload certificate re-check cadence. Each check is a
+/// cheap local validation — the broker is contacted only when the
+/// certificate is due and no persisted cooldown deadline is pending — so a
+/// 15-minute tick leaves thousands of attempts before a 90-day
+/// certificate's renewal window closes while letting a deferred
+/// rate-limited renewal retry within 15 minutes of the cooldown ending.
+const TLS_RENEWAL_CHECK_INTERVAL: Duration = Duration::from_secs(15 * 60);
+/// Broker-mode readiness cadence: readiness follows the certificate caddy
+/// currently serves, so it is re-evaluated on a short tick of its own —
+/// independent of the renewal check, which may legitimately defer on an
+/// ACME rate limit while the served certificate expires.
+const TLS_READINESS_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 const DEFAULT_STAGE_FILE: &str = "/run/enclava/init-stage";
 const MANAGED_CONFIG_ROOT: &str = ".enclava";
 const MANAGED_CONFIG_DIR: &str = ".enclava/config";
@@ -445,11 +457,41 @@ fn write_ready_file_state(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 fn stay_alive_forever(cfg: &Config) -> ! {
+    let mut next_tls_check = Instant::now() + TLS_RENEWAL_CHECK_INTERVAL;
+    let mut next_readiness_check = Instant::now();
     loop {
         if caddy_runtime_back_sync_required(cfg)
             && let Err(err) = sync_caddy_runtime_back(cfg)
         {
             tracing::warn!(error = %err, "caddy runtime persistence sync failed");
+        }
+        if tls_renewal_check_required(cfg) && next_tls_check <= Instant::now() {
+            next_tls_check = Instant::now() + TLS_RENEWAL_CHECK_INTERVAL;
+            if let Err(err) = renew_workload_tls_certificate(cfg) {
+                tracing::warn!(error = %format!("{err:#}"), "workload TLS certificate check failed");
+            }
+        }
+        if tls_renewal_check_required(cfg) && next_readiness_check <= Instant::now() {
+            next_readiness_check = Instant::now() + TLS_READINESS_CHECK_INTERVAL;
+            // Readiness follows the certificate caddy serves, whatever the
+            // renewal check last did. Restoring readiness additionally
+            // waits out the tenant-ingress reload window so a freshly
+            // mirrored certificate isn't reported before caddy serves it;
+            // marking unusable stays immediate.
+            let ready_file = ready_file_path();
+            let runtime_cert =
+                Path::new(CADDY_RUNTIME_HANDOFF_PATH).join(tls_certificate::CERT_RELATIVE_PATH);
+            if runtime_certificate_ready(&runtime_cert, &ready_file) {
+                if !ready_file_exists(&ready_file)
+                    && let Err(err) = mark_ready_file(&ready_file)
+                {
+                    tracing::warn!(error = %err, "restoring readiness after TLS check failed");
+                }
+            } else if let Err(err) =
+                write_ready_file_state(&ready_file, b"tls-certificate-unusable\n")
+            {
+                tracing::warn!(error = %err, "clearing readiness after TLS failure failed");
+            }
         }
         std::thread::sleep(Duration::from_secs(CADDY_RUNTIME_SYNC_INTERVAL_SECONDS));
     }
@@ -457,6 +499,89 @@ fn stay_alive_forever(cfg: &Config) -> ! {
 
 fn caddy_runtime_back_sync_required(cfg: &Config) -> bool {
     cfg.tls_certificate_broker_url.is_none()
+}
+
+/// The broker-issued workload certificate must be re-checked for renewal:
+/// broker mode has no back-sync work, so without this a certificate would
+/// silently expire inside its validity and the next boot would wedge.
+/// Failures are warn-only; the certificate phase itself decides whether
+/// the retained certificate still serves.
+fn tls_renewal_check_required(cfg: &Config) -> bool {
+    cfg.tls_certificate_broker_url.is_some() && !cfg.tls_certificate_hostnames.is_empty()
+}
+
+/// Run one certificate check (provisions/renews only when due) and mirror
+/// a successful renewal into the caddy runtime handoff so tenant-ingress
+/// picks it up on its certificate watch.
+fn renew_workload_tls_certificate(cfg: &Config) -> Result<()> {
+    renew_static_tls_certificate(cfg)?;
+    let persistent = caddy_tls_bind_dir(Path::new(&cfg.tls_state.mount_path));
+    let runtime = Path::new(CADDY_RUNTIME_HANDOFF_PATH);
+    let caddy_identity = numeric_identity(cfg.caddy_uid, cfg.caddy_gid);
+    refresh_caddy_runtime_certificate_at(&persistent, runtime, caddy_identity, |path, identity| {
+        chown::chown_recursive(path, identity).map_err(Into::into)
+    })
+}
+
+/// Whether the runtime handoff certificate may be reported as ready:
+/// valid right now, and — once readiness has been marked unusable — old
+/// enough that the tenant-ingress certificate watcher has certainly
+/// reloaded it before readiness is restored.
+fn runtime_certificate_ready(runtime_cert: &Path, ready_file: &Path) -> bool {
+    let valid = std::fs::read_to_string(runtime_cert)
+        .is_ok_and(|pem| tls_certificate::leaf_valid_at(&pem, chrono::Utc::now().timestamp()));
+    let settled = std::fs::metadata(runtime_cert)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age >= TLS_CERT_SETTLE_BEFORE_READY);
+    readiness_restorable(valid, settled, ready_file_exists(ready_file))
+}
+
+/// Age a renewed runtime certificate must reach before a cleared ready
+/// file is restored: the tenant-ingress wrapper picks a certificate change
+/// up within ~75 s, so 120 s leaves margin before readiness says the new
+/// certificate is actually being served.
+const TLS_CERT_SETTLE_BEFORE_READY: Duration = Duration::from_secs(120);
+
+/// Pure readiness decision: a valid certificate that is already reported
+/// ready stays ready (the settle delay applies only to restoring
+/// readiness, not to keeping it); an invalid or missing certificate is
+/// never ready.
+fn readiness_restorable(valid: bool, settled: bool, already_ready: bool) -> bool {
+    valid && (already_ready || settled)
+}
+
+/// Atomically copy a renewed retained tls.crt into the caddy runtime
+/// handoff, only when the bytes actually changed. Only the certificate is
+/// refreshed: renewals reuse the retained key, and rewriting tls.key here
+/// could leave it briefly root-owned in the runtime dir — caddy keeps the
+/// key the boot handoff delivered. The ownership refresh afterwards is
+/// best-effort: a failure leaves a world-readable certificate, which
+/// caddy can still serve.
+fn refresh_caddy_runtime_certificate_at<F>(
+    persistent: &Path,
+    runtime: &Path,
+    caddy_identity: chown::ExecIdentity,
+    chown_runtime: F,
+) -> Result<()>
+where
+    F: FnOnce(&Path, chown::ExecIdentity) -> Result<()>,
+{
+    let source = persistent.join(tls_certificate::CERT_RELATIVE_PATH);
+    let destination = runtime.join(tls_certificate::CERT_RELATIVE_PATH);
+    let bytes = std::fs::read(&source).with_context(|| format!("reading {}", source.display()))?;
+    if std::fs::read(&destination).ok().as_deref() != Some(bytes.as_slice()) {
+        writes::atomic_write(&destination, &bytes, 0o644)
+            .with_context(|| format!("refreshing {}", destination.display()))?;
+    }
+    if let Err(err) = chown_runtime(runtime, caddy_identity) {
+        tracing::warn!(
+            error = %format!("{err:#}"),
+            "re-owning caddy runtime certificate failed; continuing"
+        );
+    }
+    Ok(())
 }
 
 fn stay_alive_after_failure() -> ! {
@@ -1415,12 +1540,34 @@ where
 }
 
 fn provision_static_tls_certificate(cfg: &Config) -> Result<()> {
+    provision_static_tls_certificate_with(cfg, |persistent| {
+        tls_certificate::provision_static_tls_certificate(
+            cfg,
+            persistent,
+            &acme_cooldown_file_path(),
+        )
+    })
+}
+
+/// Runtime renewal uses the no-wait policy: a rate-limited broker defers
+/// to the next stay-alive check instead of parking the loop (and its
+/// readiness evaluation) inside a cooldown sleep.
+fn renew_static_tls_certificate(cfg: &Config) -> Result<()> {
+    provision_static_tls_certificate_with(cfg, |persistent| {
+        tls_certificate::renew_static_tls_certificate_without_waiting(
+            cfg,
+            persistent,
+            &acme_cooldown_file_path(),
+        )
+    })
+}
+
+fn provision_static_tls_certificate_with(
+    cfg: &Config,
+    provision: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
     let persistent = caddy_tls_bind_dir(Path::new(&cfg.tls_state.mount_path));
-    tls_certificate::provision_static_tls_certificate(
-        cfg,
-        &persistent,
-        &acme_cooldown_file_path(),
-    )?;
+    provision(&persistent)?;
     let caddy_identity = numeric_identity(cfg.caddy_uid, cfg.caddy_gid);
     for path in [
         tls_certificate::cert_path(&persistent),

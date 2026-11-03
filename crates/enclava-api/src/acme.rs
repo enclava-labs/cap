@@ -1,8 +1,10 @@
+use std::collections::BTreeMap;
 use std::future::Future;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::dns::{self, DnsConfig};
 use crate::workload_tls_timing::{DnsErrorCategory, Phase, RequestTiming};
@@ -637,22 +639,92 @@ async fn cleanup_challenges(
     }
 }
 
+/// Process-wide single-flight for ACME account registration. Let's Encrypt
+/// allows only a handful of new accounts per IP per window, so concurrent
+/// first issuances must not each register their own account: the first
+/// caller registers and persists the credentials under this lock, and
+/// waiters re-load the file instead of registering again.
+static ACCOUNT_REGISTRATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// In-memory fallback when no credentials file is configured: the registered
+/// account's serialized credentials keyed by ACME directory URL, kept for the
+/// process lifetime. `Account` objects are never cached — failure headers are
+/// deliberately issuance-local — so each caller rebuilds an `Account` from
+/// the shared credentials with its own HTTP client.
+static MEMORY_ACCOUNT_CREDENTIALS: tokio::sync::Mutex<BTreeMap<String, Vec<u8>>> =
+    tokio::sync::Mutex::const_new(BTreeMap::new());
+
 async fn load_or_create_account(
     config: &AcmeConfig,
     http: Box<dyn instant_acme::HttpClient>,
 ) -> Result<Account, AcmeError> {
-    if let Some(path) = config.account_credentials_path.as_ref()
-        && path.is_file()
-    {
-        let bytes = std::fs::read(path)?;
-        let credentials: AccountCredentials = serde_json::from_slice(&bytes)?;
-        return Account::builder_with_http(http)
-            .from_credentials(credentials)
-            .await
-            .map_err(AcmeError::Acme);
+    match config.account_credentials_path.as_ref() {
+        Some(path) if path.is_file() => return load_account(path, http).await,
+        Some(_) => {}
+        None => {
+            if let Some(bytes) = MEMORY_ACCOUNT_CREDENTIALS
+                .lock()
+                .await
+                .get(&config.directory_url)
+                .cloned()
+            {
+                return account_from_credentials_bytes(http, &bytes).await;
+            }
+        }
     }
 
-    let (account, credentials) = Account::builder_with_http(http)
+    let _registration = ACCOUNT_REGISTRATION_LOCK.lock().await;
+    match config.account_credentials_path.as_ref() {
+        Some(path) if path.is_file() => load_account(path, http).await,
+        Some(path) => {
+            let (account, credentials) = register_account(config, http).await?;
+            write_account_credentials(path, &credentials)?;
+            Ok(account)
+        }
+        None => {
+            let bytes = MEMORY_ACCOUNT_CREDENTIALS
+                .lock()
+                .await
+                .get(&config.directory_url)
+                .cloned();
+            if let Some(bytes) = bytes {
+                return account_from_credentials_bytes(http, &bytes).await;
+            }
+            let (account, credentials) = register_account(config, http).await?;
+            let bytes = serde_json::to_vec(&credentials)?;
+            MEMORY_ACCOUNT_CREDENTIALS
+                .lock()
+                .await
+                .insert(config.directory_url.clone(), bytes);
+            Ok(account)
+        }
+    }
+}
+
+async fn account_from_credentials_bytes(
+    http: Box<dyn instant_acme::HttpClient>,
+    bytes: &[u8],
+) -> Result<Account, AcmeError> {
+    let credentials: AccountCredentials = serde_json::from_slice(bytes)?;
+    Account::builder_with_http(http)
+        .from_credentials(credentials)
+        .await
+        .map_err(AcmeError::Acme)
+}
+
+async fn load_account(
+    path: &std::path::Path,
+    http: Box<dyn instant_acme::HttpClient>,
+) -> Result<Account, AcmeError> {
+    let bytes = std::fs::read(path)?;
+    account_from_credentials_bytes(http, &bytes).await
+}
+
+async fn register_account(
+    config: &AcmeConfig,
+    http: Box<dyn instant_acme::HttpClient>,
+) -> Result<(Account, AccountCredentials), AcmeError> {
+    Account::builder_with_http(http)
         .create(
             &NewAccount {
                 contact: &[],
@@ -662,14 +734,78 @@ async fn load_or_create_account(
             config.directory_url.clone(),
             None,
         )
-        .await?;
-    if let Some(path) = config.account_credentials_path.as_ref() {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+        .await
+        .map_err(AcmeError::Acme)
+}
+
+/// Persist account credentials atomically with owner-only permissions: a
+/// temporary sibling file is written, fsynced, then renamed so a concurrent
+/// reader (or a crash mid-write) never observes a partial credentials file.
+fn write_account_credentials(
+    path: &std::path::Path,
+    credentials: &AccountCredentials,
+) -> Result<(), AcmeError> {
+    let dir = credentials_dir(path);
+    std::fs::create_dir_all(dir)?;
+    // Never follow or reuse a pre-existing temp path: create a uniquely-named
+    // sibling exclusively and only ever remove the file we created. The name
+    // is short and independent of the destination so a long (but valid)
+    // destination file name cannot overflow the 255-byte component limit.
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let mut file = None;
+    let mut tmp = dir.to_path_buf();
+    for attempt in 0..8u32 {
+        tmp = dir.join(format!(".acme-account.{pid}.{nanos}.{attempt}.tmp"));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+        {
+            Ok(opened) => {
+                file = Some(opened);
+                break;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err.into()),
         }
-        std::fs::write(path, serde_json::to_vec(&credentials)?)?;
     }
-    Ok(account)
+    let Some(mut file) = file else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not create a unique account credentials temp file",
+        )
+        .into());
+    };
+    let persisted = (|| -> Result<(), AcmeError> {
+        std::io::Write::write_all(&mut file, &serde_json::to_vec(credentials)?)?;
+        file.sync_all()?;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if let Err(err) = persisted {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
+    }
+    // fsync the parent directory so the rename itself survives a crash.
+    std::fs::File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
+/// Directory the credentials file and its temp sibling live in. A bare
+/// relative file name like `account.json` has `parent() == Some("")`; an
+/// empty parent fails to open as a directory and would break the temp
+/// sibling create and the post-rename fsync, so it resolves to `"."`.
+fn credentials_dir(path: &std::path::Path) -> &std::path::Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => std::path::Path::new("."),
+    }
 }
 
 #[cfg(test)]
@@ -1220,70 +1356,97 @@ mod tests {
         assert_eq!(second.retry_after(), Some(now + TimeDelta::hours(24)));
     }
 
-    async fn spawn_test_acme_server(
-        respond: impl Fn(&str) -> (u16, Option<&'static str>, String) + Send + Sync + 'static,
-    ) -> std::net::SocketAddr {
+    /// Serve requests on `listener` until it is dropped. `respond` maps a
+    /// request path to a `(status, headers, body)` reply; for HEAD requests
+    /// the computed body is suppressed. Request bodies are consumed so
+    /// keep-alive connections stay usable.
+    async fn serve_test_acme_server(
+        listener: tokio::net::TcpListener,
+        respond: impl Fn(&str) -> (u16, HeaderMap, String) + Send + Sync + 'static,
+    ) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+        let respond = Arc::new(respond);
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let respond = Arc::clone(&respond);
+            tokio::spawn(async move {
+                let mut buffer = Vec::new();
+                let mut chunk = [0u8; 1024];
+                loop {
+                    let head_end = loop {
+                        if let Some(position) =
+                            buffer.windows(4).position(|window| window == b"\r\n\r\n")
+                        {
+                            break Some(position);
+                        }
+                        match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break None,
+                            Ok(read) => buffer.extend_from_slice(&chunk[..read]),
+                        }
+                    };
+                    let Some(head_end) = head_end else { return };
+                    let head = String::from_utf8_lossy(&buffer[..head_end]).into_owned();
+                    buffer.drain(..head_end + 4);
+                    let method = head.split_whitespace().next().unwrap_or("").to_string();
+                    let path = head
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or("/")
+                        .split('?')
+                        .next()
+                        .unwrap_or("/")
+                        .to_string();
+                    let content_length = head
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    while buffer.len() < content_length {
+                        match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(read) => buffer.extend_from_slice(&chunk[..read]),
+                        }
+                    }
+                    buffer.drain(..content_length);
+                    let (status, headers, body) = respond(&path);
+                    let reason = StatusCode::from_u16(status)
+                        .ok()
+                        .and_then(|status| status.canonical_reason())
+                        .unwrap_or("Status");
+                    let mut response = format!("HTTP/1.1 {status} {reason}\r\n");
+                    for (name, value) in headers.iter() {
+                        if let Ok(value) = value.to_str() {
+                            response.push_str(&format!("{name}: {value}\r\n"));
+                        }
+                    }
+                    let (length, body) = if method == "HEAD" {
+                        (0, String::new())
+                    } else {
+                        (body.len(), body)
+                    };
+                    response.push_str(&format!(
+                        "Content-Length: {length}\r\nConnection: keep-alive\r\n\r\n"
+                    ));
+                    response.push_str(&body);
+                    if stream.write_all(response.as_bytes()).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    }
+
+    async fn spawn_test_acme_server(
+        respond: impl Fn(&str) -> (u16, HeaderMap, String) + Send + Sync + 'static,
+    ) -> std::net::SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("loopback bind");
         let addr = listener.local_addr().expect("loopback address");
-        let respond = Arc::new(respond);
-        tokio::spawn(async move {
-            while let Ok((mut stream, _)) = listener.accept().await {
-                let respond = Arc::clone(&respond);
-                tokio::spawn(async move {
-                    let mut buffer = Vec::new();
-                    let mut chunk = [0u8; 1024];
-                    loop {
-                        // Test requests carry no body, so a complete head
-                        // delimits each request.
-                        let head_end = loop {
-                            if let Some(position) =
-                                buffer.windows(4).position(|window| window == b"\r\n\r\n")
-                            {
-                                break Some(position);
-                            }
-                            match stream.read(&mut chunk).await {
-                                Ok(0) | Err(_) => break None,
-                                Ok(read) => buffer.extend_from_slice(&chunk[..read]),
-                            }
-                        };
-                        let Some(head_end) = head_end else { return };
-                        let head = String::from_utf8_lossy(&buffer[..head_end]).into_owned();
-                        buffer.drain(..head_end + 4);
-                        let path = head
-                            .split_whitespace()
-                            .nth(1)
-                            .unwrap_or("/")
-                            .split('?')
-                            .next()
-                            .unwrap_or("/")
-                            .to_string();
-                        let (status, retry_after, body) = respond(&path);
-                        let reason = StatusCode::from_u16(status)
-                            .ok()
-                            .and_then(|status| status.canonical_reason())
-                            .unwrap_or("Status");
-                        let mut response = format!(
-                            "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\n",
-                            body.len()
-                        );
-                        if let Some(value) = retry_after {
-                            response.push_str("Retry-After: ");
-                            response.push_str(value);
-                            response.push_str("\r\n");
-                        }
-                        response.push_str("Connection: keep-alive\r\n\r\n");
-                        response.push_str(&body);
-                        if stream.write_all(response.as_bytes()).await.is_err() {
-                            return;
-                        }
-                    }
-                });
-            }
-        });
+        tokio::spawn(serve_test_acme_server(listener, respond));
         addr
     }
 
@@ -1311,10 +1474,14 @@ mod tests {
     #[tokio::test]
     async fn issuance_transport_forwards_traffic_and_captures_failure_retry_after() {
         let addr = spawn_test_acme_server(|path| match path {
-            "/ok" => (200, Some("999"), "{\"ok\":true}".to_string()),
+            "/ok" => (
+                200,
+                header_map(&[("Retry-After", "999")]),
+                "{\"ok\":true}".to_string(),
+            ),
             _ => (
                 429,
-                Some("120"),
+                header_map(&[("Retry-After", "120")]),
                 "{\"type\":\"urn:ietf:params:acme:error:rateLimited\"}".to_string(),
             ),
         })
@@ -1363,9 +1530,13 @@ mod tests {
     #[tokio::test]
     async fn concurrent_issuances_share_transport_but_not_retry_metadata() {
         let addr = spawn_test_acme_server(|path| match path {
-            "/first" => (429, Some("100"), "{}".to_string()),
-            "/second" => (429, Some("86400"), "{}".to_string()),
-            _ => (200, Some("999"), "{}".to_string()),
+            "/first" => (429, header_map(&[("Retry-After", "100")]), "{}".to_string()),
+            "/second" => (
+                429,
+                header_map(&[("Retry-After", "86400")]),
+                "{}".to_string(),
+            ),
+            _ => (200, header_map(&[("Retry-After", "999")]), "{}".to_string()),
         })
         .await;
         let shared = test_loopback_client();
@@ -1445,20 +1616,20 @@ mod tests {
                 if challenge_visits.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
                     (
                         400,
-                        Some("999"),
+                        header_map(&[("Retry-After", "999")]),
                         "{\"type\":\"urn:ietf:params:acme:error:badNonce\"}".to_string(),
                     )
                 } else {
-                    (200, None, "{}".to_string())
+                    (200, HeaderMap::new(), "{}".to_string())
                 }
             }
-            "/redirect" => (302, Some("999"), String::new()),
+            "/redirect" => (302, header_map(&[("Retry-After", "999")]), String::new()),
             "/rate-limited" => (
                 429,
-                Some("120"),
+                header_map(&[("Retry-After", "120")]),
                 "{\"type\":\"urn:ietf:params:acme:error:rateLimited\"}".to_string(),
             ),
-            _ => (200, None, "{}".to_string()),
+            _ => (200, HeaderMap::new(), "{}".to_string()),
         })
         .await;
         let failures = FailureHeaders::default();
@@ -1620,5 +1791,171 @@ mod tests {
         .await
         .expect("propagation success must reach readiness");
         assert!(signaled.get());
+    }
+
+    #[tokio::test]
+    async fn concurrent_first_issuances_register_one_account() {
+        let new_accounts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback bind");
+        let addr = listener.local_addr().expect("loopback address");
+        let base = format!("http://{addr}");
+        let count = new_accounts.clone();
+        let directory = base.clone();
+        tokio::spawn(serve_test_acme_server(listener, move |path| match path {
+            "/dir" => (
+                200,
+                HeaderMap::new(),
+                format!(
+                    "{{\"newNonce\":\"{directory}/nonce\",\"newAccount\":\"{directory}/new-acct\",\"newOrder\":\"{directory}/new-order\"}}"
+                ),
+            ),
+            "/nonce" => (200, header_map(&[("Replay-Nonce", "nonce")]), String::new()),
+            "/new-acct" => {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    http::header::LOCATION,
+                    format!("{directory}/accounts/1").parse().unwrap(),
+                );
+                (201, headers, String::new())
+            }
+            _ => (404, HeaderMap::new(), String::new()),
+        }));
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let credentials_path = dir.path().join("credentials.json");
+        let client = test_loopback_client();
+        let config = AcmeConfig {
+            directory_url: format!("{base}/dir"),
+            account_credentials_path: Some(credentials_path.clone()),
+            dns_propagation_wait: Duration::ZERO,
+            dns_lookup_prefer_system: false,
+            dns_lookup_timeout: None,
+        };
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let config = config.clone();
+            let client = client.clone();
+            handles.push(tokio::spawn(async move {
+                load_or_create_account(
+                    &config,
+                    Box::new(IssuanceHttpClient {
+                        client,
+                        failures: FailureHeaders::default(),
+                    }),
+                )
+                .await
+            }));
+        }
+        for handle in handles {
+            handle.await.expect("task panicked").expect("account load");
+        }
+        assert_eq!(
+            new_accounts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one ACME account must be registered"
+        );
+        assert!(credentials_path.is_file());
+    }
+
+    #[tokio::test]
+    async fn concurrent_first_issuances_without_credentials_file_register_one_account() {
+        let new_accounts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback bind");
+        let addr = listener.local_addr().expect("loopback address");
+        let base = format!("http://{addr}");
+        let count = new_accounts.clone();
+        let directory = base.clone();
+        tokio::spawn(serve_test_acme_server(listener, move |path| match path {
+            "/dir" => (
+                200,
+                HeaderMap::new(),
+                format!(
+                    "{{\"newNonce\":\"{directory}/nonce\",\"newAccount\":\"{directory}/new-acct\",\"newOrder\":\"{directory}/new-order\"}}"
+                ),
+            ),
+            "/nonce" => (200, header_map(&[("Replay-Nonce", "nonce")]), String::new()),
+            "/new-acct" => {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    http::header::LOCATION,
+                    format!("{directory}/accounts/1").parse().unwrap(),
+                );
+                (201, headers, String::new())
+            }
+            _ => (404, HeaderMap::new(), String::new()),
+        }));
+
+        let client = test_loopback_client();
+        let config = AcmeConfig {
+            directory_url: format!("{base}/dir"),
+            account_credentials_path: None,
+            dns_propagation_wait: Duration::ZERO,
+            dns_lookup_prefer_system: false,
+            dns_lookup_timeout: None,
+        };
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let config = config.clone();
+            let client = client.clone();
+            handles.push(tokio::spawn(async move {
+                load_or_create_account(
+                    &config,
+                    Box::new(IssuanceHttpClient {
+                        client,
+                        failures: FailureHeaders::default(),
+                    }),
+                )
+                .await
+            }));
+        }
+        for handle in handles {
+            handle.await.expect("task panicked").expect("account load");
+        }
+        // Sequential re-issuance must reuse the cached account as well.
+        load_or_create_account(
+            &config,
+            Box::new(IssuanceHttpClient {
+                client,
+                failures: FailureHeaders::default(),
+            }),
+        )
+        .await
+        .expect("account load");
+        assert_eq!(
+            new_accounts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one ACME account must be registered"
+        );
+    }
+
+    #[test]
+    fn credentials_dir_resolves_bare_file_names_to_current_dir() {
+        assert_eq!(
+            credentials_dir(std::path::Path::new("account.json")),
+            std::path::Path::new(".")
+        );
+        assert_eq!(
+            credentials_dir(std::path::Path::new("./account.json")),
+            std::path::Path::new(".")
+        );
+        assert_eq!(
+            credentials_dir(std::path::Path::new("/etc/ssl/account.json")),
+            std::path::Path::new("/etc/ssl")
+        );
+        assert_eq!(
+            credentials_dir(std::path::Path::new("nested/account.json")),
+            std::path::Path::new("nested")
+        );
+        // No parent at all: still usable for temp creation and fsync.
+        assert_eq!(
+            credentials_dir(std::path::Path::new("")),
+            std::path::Path::new(".")
+        );
     }
 }

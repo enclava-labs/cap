@@ -81,3 +81,4 @@ sev = { version = "7.1.0", default-features = false, features = ["snp", "openssl
 # start_paused for the pull-secret cleanup tests: the delete conflict backoff
 # (~60 s budget) and the finalizer poll (30 s) run in simulated time.
 tokio = { version = "1", features = ["full", "test-util"] }
+tempfile = "3"

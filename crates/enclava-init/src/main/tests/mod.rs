@@ -1651,3 +1651,84 @@ fn luks_rollout_policy_unknown_value_fails_boot() {
     let err = luks_rollout_policy(Some(&seal_cc_init_data(Some("maybe")))).expect_err("unknown");
     assert!(err.to_string().contains("luks2_header_seal"));
 }
+
+#[test]
+fn readiness_restore_waits_for_cert_settle_but_ready_stays_ready() {
+    // Invalid is never ready.
+    for (settled, already_ready) in [(true, true), (true, false), (false, true), (false, false)] {
+        assert!(!readiness_restorable(false, settled, already_ready));
+    }
+    // Valid + already marked ready stays ready even when the cert is
+    // brand new (the settle delay must not flap existing readiness).
+    assert!(readiness_restorable(true, false, true));
+    assert!(readiness_restorable(true, true, true));
+    // Valid + not ready restores only once the cert has outlived the
+    // tenant-ingress reload window.
+    assert!(!readiness_restorable(true, false, false));
+    assert!(readiness_restorable(true, true, false));
+}
+
+#[test]
+fn caddy_runtime_refresh_copies_only_changed_cert_never_key() {
+    let dir = tempdir().unwrap();
+    let persistent = dir.path().join("persistent");
+    let runtime = dir.path().join("runtime");
+    std::fs::create_dir_all(persistent.join("certificates")).unwrap();
+    std::fs::create_dir_all(runtime.join("certificates")).unwrap();
+    std::fs::write(persistent.join("certificates/tls.crt"), b"new-cert").unwrap();
+    std::fs::write(persistent.join("certificates/tls.key"), b"new-key").unwrap();
+    std::fs::write(runtime.join("certificates/tls.crt"), b"old-cert").unwrap();
+    std::fs::write(runtime.join("certificates/tls.key"), b"runtime-key").unwrap();
+    let identity = numeric_identity(10002, 10002);
+
+    let mut chowned = Vec::new();
+    refresh_caddy_runtime_certificate_at(&persistent, &runtime, identity, |path, id| {
+        chowned.push((path.to_path_buf(), id));
+        Ok(())
+    })
+    .unwrap();
+
+    assert_eq!(
+        std::fs::read(runtime.join("certificates/tls.crt")).unwrap(),
+        b"new-cert"
+    );
+    // tls.key is never rewritten or copied into the runtime handoff.
+    assert_eq!(
+        std::fs::read(runtime.join("certificates/tls.key")).unwrap(),
+        b"runtime-key"
+    );
+    assert_eq!(chowned, vec![(runtime.clone(), identity)]);
+
+    // Identical bytes are not rewritten: the file keeps its inode.
+    let before = std::fs::metadata(runtime.join("certificates/tls.crt"))
+        .unwrap()
+        .ino();
+    refresh_caddy_runtime_certificate_at(&persistent, &runtime, identity, |_, _| Ok(())).unwrap();
+    let after = std::fs::metadata(runtime.join("certificates/tls.crt"))
+        .unwrap()
+        .ino();
+    assert_eq!(before, after);
+}
+
+#[test]
+fn caddy_runtime_refresh_chown_failure_is_best_effort() {
+    let dir = tempdir().unwrap();
+    let persistent = dir.path().join("persistent");
+    let runtime = dir.path().join("runtime");
+    std::fs::create_dir_all(persistent.join("certificates")).unwrap();
+    std::fs::write(persistent.join("certificates/tls.crt"), b"cert").unwrap();
+
+    refresh_caddy_runtime_certificate_at(
+        &persistent,
+        &runtime,
+        numeric_identity(10002, 10002),
+        |_, _| Err(anyhow::anyhow!("simulated chown failure")),
+    )
+    .unwrap();
+
+    assert_eq!(
+        std::fs::read(runtime.join("certificates/tls.crt")).unwrap(),
+        b"cert"
+    );
+    assert!(!runtime.join("certificates/tls.key").exists());
+}
