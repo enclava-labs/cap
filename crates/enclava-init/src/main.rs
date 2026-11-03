@@ -36,12 +36,14 @@ const CADDY_RUNTIME_SYNC_INTERVAL_SECONDS: u64 = 5;
 /// certificate's renewal window closes while letting a deferred
 /// rate-limited renewal retry within 15 minutes of the cooldown ending.
 const TLS_RENEWAL_CHECK_INTERVAL: Duration = Duration::from_secs(15 * 60);
-/// Broker-mode readiness cadence: readiness follows the certificate caddy
-/// actually serves, so it is re-evaluated on a short tick of its own —
-/// independent of the renewal check, which may legitimately defer on an
-/// ACME rate limit while the served certificate expires. Readiness
-/// withdrawal lands within ~45 s: ≤10 s check interval + 5 s handshake
-/// deadline + the Kubernetes probe's 30 s threshold.
+/// Broker-mode readiness cadence for the dedicated served-TLS readiness
+/// watch thread: readiness follows the certificate caddy actually
+/// serves, so it is re-evaluated on a short tick of its own — apart from
+/// the renewal check, which may legitimately defer on an ACME rate limit
+/// or block on a slow broker request while the served certificate
+/// expires. Readiness withdrawal lands within ~45 s: ≤10 s check
+/// interval + 5 s handshake deadline + the Kubernetes probe's 30 s
+/// threshold.
 const TLS_READINESS_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 /// Faster readiness cadence while the served-certificate probe fails, so
 /// a boot-time not-yet-listening caddy recovers within seconds instead of
@@ -157,9 +159,15 @@ fn run_with_stats(stats: &mut init_stats::BootStats) -> Result<()> {
     if stay_alive {
         clear_ready_file(&ready_file)
             .with_context(|| format!("clearing stale ready file {}", ready_file.display()))?;
-        // A TLS marker from a previous run must not suppress readiness in
-        // this boot — the probe subtracts it from init-ready.
-        clear_tls_unusable(&tls_unusable_file_path());
+        // Broker mode holds readiness closed until the served-TLS probe
+        // first succeeds; non-broker mode clears the stale marker because
+        // nothing will ever remove it.
+        let tls_marker = tls_unusable_file_path();
+        if tls_marker_present_at_boot(tls_renewal_check_required(&cfg)) {
+            mark_tls_unusable(&tls_marker);
+        } else {
+            clear_tls_unusable(&tls_marker);
+        }
     }
 
     record_stage("verifying trustee policy").ok();
@@ -406,6 +414,16 @@ fn probe_ready(init_ready_contents: &str, tls_marker_present: bool) -> bool {
     init_ready_contents.trim() == "ready" && !tls_marker_present
 }
 
+/// Boot-time marker policy: broker mode starts with the marker PRESENT —
+/// readiness stays closed until the first successful served-TLS probe
+/// removes it, so a boot can never claim usable while caddy still serves
+/// nothing (init-ready stays the separate startup gate, so there is no
+/// deadlock). Outside broker mode nothing will ever clear the marker, so
+/// a stale one must be dropped.
+fn tls_marker_present_at_boot(broker_mode: bool) -> bool {
+    broker_mode
+}
+
 /// Record that tenant-ingress is not serving a usable certificate. Atomic
 /// write so the probe never observes a half-written marker; content is
 /// fixed — presence is the signal.
@@ -499,7 +517,13 @@ fn write_ready_file_state(path: &Path, bytes: &[u8]) -> Result<()> {
 
 fn stay_alive_forever(cfg: &Config) -> ! {
     let mut next_tls_check = Instant::now() + TLS_RENEWAL_CHECK_INTERVAL;
-    let mut next_readiness_check = Instant::now();
+    if tls_renewal_check_required(cfg)
+        && let Err(err) = spawn_served_tls_readiness_watch(cfg.clone())
+    {
+        // The marker was created at boot, so a spawn failure leaves the
+        // pod reporting unusable instead of wrongly ready.
+        tracing::warn!(error = %err, "spawning served-TLS readiness watch failed");
+    }
     loop {
         if caddy_runtime_back_sync_required(cfg)
             && let Err(err) = sync_caddy_runtime_back(cfg)
@@ -512,32 +536,46 @@ fn stay_alive_forever(cfg: &Config) -> ! {
                 tracing::warn!(error = %format!("{err:#}"), "workload TLS certificate check failed");
             }
         }
-        if tls_renewal_check_required(cfg) && next_readiness_check <= Instant::now() {
-            // Readiness follows the certificate tenant-ingress actually
-            // serves, whatever the renewal check last did — via a separate
-            // tls-unusable marker, never init-ready itself: init-ready is
-            // also the startup gate enclava-wait-exec blocks caddy on, so
-            // the probe must not be able to clear it. A full validating
-            // TLS handshake drops the marker; any failure — refused,
-            // timeout, TLS alert, untrusted, expired, wrong name —
-            // writes it.
-            let tls_marker = tls_unusable_file_path();
-            match served_https_usable(cfg) {
-                Ok(()) => {
-                    clear_tls_unusable(&tls_marker);
-                    next_readiness_check = Instant::now() + TLS_READINESS_CHECK_INTERVAL;
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        error = %format!("{err:#}"),
-                        "tenant-ingress served-certificate probe failed"
-                    );
-                    mark_tls_unusable(&tls_marker);
-                    next_readiness_check = Instant::now() + TLS_READINESS_RETRY_INTERVAL;
-                }
+        std::thread::sleep(Duration::from_secs(CADDY_RUNTIME_SYNC_INTERVAL_SECONDS));
+    }
+}
+
+/// Spawn the served-TLS readiness watch as its own thread. It lives apart
+/// from the stay-alive loop so a slow broker renewal request (up to the
+/// HTTP timeout) can never delay readiness re-evaluation; the thread only
+/// ever touches the `tls-unusable` marker, never init-ready.
+fn spawn_served_tls_readiness_watch(cfg: Config) -> std::io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("tls-served-readiness".to_string())
+        .spawn(move || served_tls_readiness_watch(cfg))
+}
+
+/// Readiness follows the certificate tenant-ingress actually serves,
+/// whatever the renewal check last did — via a separate tls-unusable
+/// marker, never init-ready itself: init-ready is also the startup gate
+/// enclava-wait-exec blocks caddy on, so the probe must not be able to
+/// clear it. A full validating TLS handshake drops the marker; any
+/// failure — refused, timeout, TLS alert, untrusted, expired, wrong
+/// name — writes it. Success re-checks on the normal cadence, failure on
+/// the retry cadence so a boot-time not-yet-listening caddy recovers
+/// quickly.
+fn served_tls_readiness_watch(cfg: Config) {
+    let tls_marker = tls_unusable_file_path();
+    loop {
+        match served_https_usable(&cfg) {
+            Ok(()) => {
+                clear_tls_unusable(&tls_marker);
+                std::thread::sleep(TLS_READINESS_CHECK_INTERVAL);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %format!("{err:#}"),
+                    "tenant-ingress served-certificate probe failed"
+                );
+                mark_tls_unusable(&tls_marker);
+                std::thread::sleep(TLS_READINESS_RETRY_INTERVAL);
             }
         }
-        std::thread::sleep(Duration::from_secs(CADDY_RUNTIME_SYNC_INTERVAL_SECONDS));
     }
 }
 

@@ -90,18 +90,22 @@ for a 90-day Let's Encrypt certificate).
   since renewals reuse the retained key and the runtime `tls.key` never
   changes; tenant-ingress watches `tls.crt` and restarts caddy on change
   because the generated Caddyfile runs with `admin off`.
-- In broker mode the stay-alive loop also re-evaluates readiness from the
-  certificate tenant-ingress actually serves, not any file: a full
-  validating TLS handshake against `127.0.0.1:10443` (SNI = first
-  configured hostname) — chain anchored to the same public root store,
-  hostname, and validity windows — bounded by an absolute deadline. The
-  tick never writes `init-ready` (that file is also the startup gate
-  enclava-wait-exec blocks caddy on); instead a probe failure —
-  refused connection, timeout, TLS alert, untrusted chain, expired or
+- In broker mode readiness is re-evaluated continuously from the
+  certificate tenant-ingress actually serves, not any file: a dedicated
+  served-TLS readiness watch thread (spawned by the stay-alive loop, so a
+  slow broker renewal request can never delay it) runs a full validating
+  TLS handshake against `127.0.0.1:10443` (SNI = first configured
+  hostname) — chain anchored to the same public root store, hostname,
+  and validity windows — bounded by an absolute deadline. The watch
+  never writes `init-ready` (that file is also the startup gate
+  enclava-wait-exec blocks caddy on); instead a probe failure — refused
+  connection, timeout, TLS alert, untrusted chain, expired or
   not-yet-valid leaf, or wrong name — writes `/run/enclava/tls-unusable`
-  atomically and success removes it. `--probe-ready` reports ready only
-  when `init-ready` says `ready` and the marker is absent, so readiness
-  withdrawal lands in about 45 s (≤10 s check cadence + 5 s handshake
-  deadline + the Kubernetes probe's 30 s threshold) while a failed probe
-  retries every 5 s, letting a not-yet-listening caddy at boot recover
-  within seconds.
+  atomically and success removes it. Boot creates the marker in broker
+  mode (readiness stays closed until the first successful probe clears
+  it) and clears any stale one in non-broker mode, where nothing would
+  ever remove it. `--probe-ready` reports ready only when `init-ready`
+  says `ready` and the marker is absent, so readiness withdrawal lands
+  in about 45 s (≤10 s check cadence + 5 s handshake deadline + the
+  Kubernetes probe's 30 s threshold) while a failed probe retries every
+  5 s, letting a not-yet-listening caddy at boot recover within seconds.

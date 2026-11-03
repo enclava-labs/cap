@@ -1962,3 +1962,33 @@ fn served_https_probe_honors_absolute_deadline_against_trickling_peer() {
     );
     assert!(format!("{error:#}").contains("handshake"));
 }
+
+#[test]
+fn boot_marker_policy_holds_readiness_closed_in_broker_mode() {
+    // Broker mode boots with the marker present: `--probe-ready` must
+    // report unready even when init-ready already says ready, until the
+    // first successful served-TLS probe clears it. Non-broker mode drops
+    // any stale marker because nothing would ever remove it.
+    assert!(tls_marker_present_at_boot(true));
+    assert!(!tls_marker_present_at_boot(false));
+    assert!(!probe_ready("ready\n", tls_marker_present_at_boot(true)));
+    assert!(probe_ready("ready\n", tls_marker_present_at_boot(false)));
+}
+
+#[test]
+fn tls_unusable_marker_write_and_clear_roundtrip() {
+    let dir = tempdir().unwrap();
+    let marker = dir.path().join("run/enclava/tls-unusable");
+
+    assert!(!marker.exists());
+    mark_tls_unusable(&marker);
+    assert!(marker.exists());
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap(),
+        "tls-certificate-unusable\n"
+    );
+    clear_tls_unusable(&marker);
+    assert!(!marker.exists());
+    // Clearing a missing marker is fine (boot-time stale-state cleanup).
+    clear_tls_unusable(&marker);
+}

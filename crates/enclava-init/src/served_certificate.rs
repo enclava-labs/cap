@@ -56,8 +56,10 @@ pub fn served_https_usable(
     // Drive the handshake one underlying read/write at a time: rustls
     // `complete_io` loops internally, which would let a peer trickling
     // bytes reset per-read socket timeouts forever — here each blocking
-    // call carries only the time left to the absolute deadline.
-    while conn.is_handshaking() {
+    // call carries only the time left to the absolute deadline. The loop
+    // also outlives `is_handshaking` itself so the client's final flight
+    // (Finished) is actually written before `Ok` returns.
+    while conn.is_handshaking() || conn.wants_write() {
         stream
             .set_read_timeout(Some(remaining("TLS handshake read")?))
             .context("setting TLS read timeout")?;
