@@ -192,6 +192,9 @@ fn render_caddyfile_from_spec(spec: &CaddyfileSpec) -> String {
     let mut out = String::new();
     out.push_str("{\n");
     out.push_str("  admin off\n");
+    // Caddy's default shutdown drain is eternal; a certificate-pickup restart
+    // must not be held open by one long-lived request.
+    out.push_str("  grace_period 10s\n");
     out.push_str("  persist_config off\n");
     out.push_str("  auto_https disable_redirects\n");
     out.push_str("  email ");
