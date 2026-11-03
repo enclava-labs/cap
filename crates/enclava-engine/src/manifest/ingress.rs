@@ -192,9 +192,12 @@ fn render_caddyfile_from_spec(spec: &CaddyfileSpec) -> String {
     let mut out = String::new();
     out.push_str("{\n");
     out.push_str("  admin off\n");
-    // Caddy's default shutdown drain is eternal; a certificate-pickup restart
-    // must not be held open by one long-lived request.
-    out.push_str("  grace_period 10s\n");
+    // Broker mode restarts caddy to pick up renewed certificates; Caddy's
+    // default shutdown drain is eternal, so one long-lived request must not
+    // hold that restart open.
+    if spec.tls_mode == CaddyTlsMode::Dns01Broker {
+        out.push_str("  grace_period 10s\n");
+    }
     out.push_str("  persist_config off\n");
     out.push_str("  auto_https disable_redirects\n");
     out.push_str("  email ");
@@ -309,6 +312,28 @@ mod tests {
     #[test]
     fn validate_email_accepts_simple() {
         assert!(validate_email("infra@enclava.dev").is_ok());
+    }
+
+    #[test]
+    fn only_broker_mode_bounds_the_shutdown_drain() {
+        for (mode, bounded) in [
+            (CaddyTlsMode::Dns01Broker, true),
+            (CaddyTlsMode::Acme, false),
+            (CaddyTlsMode::Internal, false),
+        ] {
+            let spec = CaddyfileSpec {
+                hosts: vec!["app.example.com".to_string()],
+                app_port: 8080,
+                acme_ca: "https://acme-v02.api.letsencrypt.org/directory".to_string(),
+                tls_mode: mode,
+                contact_email: "infra@enclava.dev".to_string(),
+            };
+            assert_eq!(
+                render_caddyfile_from_spec(&spec).contains("\n  grace_period 10s\n"),
+                bounded,
+                "{mode:?}"
+            );
+        }
     }
 
     #[test]

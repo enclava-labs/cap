@@ -136,6 +136,12 @@ pub(crate) struct AcmeWait {
     pub cooldown_file: PathBuf,
     pub now: Box<dyn Fn() -> DateTime<Utc> + Send + Sync>,
     pub sleep_until: Box<dyn Fn(DateTime<Utc>) + Send + Sync>,
+    /// How many rate-limit waits this call may honor. Boot provisioning
+    /// uses [`ACME_RETRY_MAX_ROUNDS`]; runtime renewal uses 0 so the
+    /// stay-alive loop never parks on a cooldown and readiness keeps being
+    /// re-evaluated — a needed wait defers to the next check instead
+    /// (the deadline is still persisted so later attempts respect it).
+    pub max_wait_rounds: u32,
 }
 
 impl AcmeWait {
@@ -154,6 +160,7 @@ impl AcmeWait {
                     std::thread::sleep(remaining.min(Duration::from_secs(60)));
                 }
             }),
+            max_wait_rounds: ACME_RETRY_MAX_ROUNDS,
         }
     }
 }
@@ -428,6 +435,23 @@ pub fn provision_static_tls_certificate(
     )
 }
 
+/// Runtime variant of [`provision_static_tls_certificate`] used by the
+/// stay-alive renewal tick: it never sleeps on an ACME rate-limit
+/// cooldown. A still-pending persisted deadline returns an error before
+/// any broker request is sent; a fresh broker rate-limit response has its
+/// deadline persisted exactly like a waitable one and then returns the
+/// rate-limit failure. The renewal defers to a later check so the loop's
+/// readiness re-evaluation is never parked behind a cooldown.
+pub fn renew_static_tls_certificate_without_waiting(
+    cfg: &Config,
+    persistent_root: &Path,
+    cooldown_file: &Path,
+) -> Result<()> {
+    let mut wait = AcmeWait::production(cooldown_file);
+    wait.max_wait_rounds = 0;
+    provision_with_policy(cfg, persistent_root, TLS_SERVER_ROOTS, &wait)
+}
+
 /// Same as [`provision_static_tls_certificate`], with the trust anchor set
 /// injected by the in-module tests (synthetic independently trusted
 /// anchors) and a wait policy that panics if code under test tries to
@@ -452,6 +476,7 @@ fn provision_with_trust_anchors(
             sleep_until: Box::new(|deadline| {
                 panic!("unexpected ACME rate-limit wait for {deadline}")
             }),
+            max_wait_rounds: ACME_RETRY_MAX_ROUNDS,
         },
     )
 }
@@ -620,6 +645,16 @@ fn issue_via_broker(
             "resuming persisted ACME rate-limit cooldown"
         );
         write_acme_cooldown_marker(&wait.cooldown_file, deadline);
+        if wait.max_wait_rounds == 0 {
+            // No-wait policy: defer the renewal to a later check instead
+            // of sleeping; the persisted deadline stays in force.
+            return Err(anyhow::Error::new(TlsBrokerFailure {
+                diagnostic: SafeBootstrapDiagnostic {
+                    code: SafeDiagnosticCode::AcmeRateLimited,
+                    retry_after: Some(deadline),
+                },
+            }));
+        }
         (wait.sleep_until)(deadline);
     } else {
         // A container restart inside the same pod keeps /run/enclava; a
@@ -668,9 +703,12 @@ fn issue_via_broker(
             None => SafeBootstrapDiagnostic::acme_failed(),
         };
         let now = (wait.now)();
-        let cooldown = waitable_rate_limit(&diagnostic, now)
-            .filter(|_| rate_limit_rounds < ACME_RETRY_MAX_ROUNDS);
-        let Some(deadline) = cooldown else {
+        // A waitable rate limit counts against the wait budget — except
+        // under the no-wait policy, whose runtime renewal defers on every
+        // waitable response below instead of taking this terminal path.
+        let Some(deadline) = waitable_rate_limit(&diagnostic, now)
+            .filter(|_| wait.max_wait_rounds == 0 || rate_limit_rounds < wait.max_wait_rounds)
+        else {
             clear_acme_cooldown_marker(&wait.cooldown_file);
             tracing::warn!(
                 error = diagnostic.code.as_str(),
@@ -682,11 +720,21 @@ fn issue_via_broker(
         };
         // Waitable cooldown: persist the deadline so a pod restart resumes
         // it instead of burning another order, publish the non-terminal
-        // marker the proxy's init-ready watch honors, then wait.
-        rate_limit_rounds += 1;
+        // marker the proxy's init-ready watch honors, then wait — or, under
+        // the no-wait policy, defer the retry to a later check.
         persist_retry_deadline(persistent_root, &request_sha256, deadline)
             .context("recording ACME rate-limit cooldown")?;
         write_acme_cooldown_marker(&wait.cooldown_file, deadline);
+        if wait.max_wait_rounds == 0 {
+            tracing::warn!(
+                error = diagnostic.code.as_str(),
+                terminal = true,
+                retry_after = %deadline.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                "ACME rate limit honored; deferring certificate issuance retry"
+            );
+            return Err(anyhow::Error::new(TlsBrokerFailure { diagnostic }));
+        }
+        rate_limit_rounds += 1;
         tracing::warn!(
             error = diagnostic.code.as_str(),
             terminal = false,
@@ -2503,6 +2551,7 @@ hkdf-info = "tls-state-luks-key"
                     sleep_clock.sleeps.lock().unwrap().push(deadline);
                     *sleep_clock.now.lock().unwrap() = deadline;
                 }),
+                max_wait_rounds: ACME_RETRY_MAX_ROUNDS,
             },
             clock,
         )
@@ -2809,6 +2858,105 @@ hkdf-info = "tls-state-luks-key"
     }
 
     #[test]
+    fn no_wait_policy_defers_before_broker_when_persisted_deadline_pending() {
+        // The runtime renewal policy never resumes a persisted cooldown:
+        // a due (here expired) retained certificate returns the deferred
+        // rate-limit error promptly, before any broker request, and the
+        // persisted deadline stays in force for the next check.
+        let dir = tempdir().unwrap();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let start = DateTime::from_timestamp(1789000000, 0).unwrap();
+        let deadline = start + TimeDelta::minutes(45);
+        let (root, chain) = mint_test_chain(TEST_HOSTNAMES, |params| {
+            params.not_before = rcgen::date_time_ymd(2000, 1, 1);
+            params.not_after = rcgen::date_time_ymd(2001, 1, 1);
+        });
+        let anchors = [root.anchor()];
+        let persistent = write_retained_state(
+            dir.path(),
+            &full_chain_pem(&[&chain.chain_pem, &root.cert.pem()]),
+            &chain.leaf_key_pem,
+        );
+        let hosts: Vec<String> = TEST_HOSTNAMES.iter().map(|h| h.to_string()).collect();
+        let fingerprint = acme_request_fingerprint(
+            &std::fs::read_to_string(key_path(&persistent)).unwrap(),
+            &hosts,
+        );
+        persist_retry_deadline(&persistent, &fingerprint, deadline).unwrap();
+        let success_body = json!({"certificate_chain_pem": "unused"}).to_string();
+        let (base, _server) =
+            spawn_scripted_broker(vec![("200 OK".to_string(), success_body)], events.clone());
+        let cfg = broker_config_with_endpoints(
+            dir.path(),
+            TEST_HOSTNAMES,
+            &format!("{base}/broker"),
+            &format!("{base}/kbs-token"),
+        );
+        let (mut wait, clock) =
+            fake_wait(dir.path().join("init-acme-cooldown"), start, events.clone());
+        wait.max_wait_rounds = 0;
+
+        let error = provision_with_policy(&cfg, &persistent, &anchors, &wait).unwrap_err();
+
+        let failure = error.downcast_ref::<TlsBrokerFailure>().unwrap();
+        assert_eq!(failure.diagnostic.code, SafeDiagnosticCode::AcmeRateLimited);
+        assert_eq!(failure.diagnostic.retry_after, Some(deadline));
+        // No sleep and no broker POST; the deadline persists for later checks.
+        assert!(clock.sleeps.lock().unwrap().is_empty());
+        assert!(events.lock().unwrap().is_empty());
+        assert!(acme_retry_marker_path(&persistent).exists());
+    }
+
+    #[test]
+    fn no_wait_policy_persists_broker_deadline_without_sleeping() {
+        // A fresh broker rate-limit response under the runtime policy is
+        // persisted exactly like a waitable one, then returned immediately
+        // — the renewal defers to a later check instead of sleeping.
+        let dir = tempdir().unwrap();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let start = DateTime::from_timestamp(1789000000, 0).unwrap();
+        let deadline = start + TimeDelta::minutes(30);
+        let (root, chain) = mint_test_chain(TEST_HOSTNAMES, |params| {
+            params.not_before = rcgen::date_time_ymd(2000, 1, 1);
+            params.not_after = rcgen::date_time_ymd(2001, 1, 1);
+        });
+        let anchors = [root.anchor()];
+        let persistent = write_retained_state(
+            dir.path(),
+            &full_chain_pem(&[&chain.chain_pem, &root.cert.pem()]),
+            &chain.leaf_key_pem,
+        );
+        let cooldown = dir.path().join("init-acme-cooldown");
+        let (base, _server) = spawn_scripted_broker(
+            vec![(
+                "503 Service Unavailable".to_string(),
+                rate_limited_body(Some(deadline)),
+            )],
+            events.clone(),
+        );
+        let cfg = broker_config_with_endpoints(
+            dir.path(),
+            TEST_HOSTNAMES,
+            &format!("{base}/broker"),
+            &format!("{base}/kbs-token"),
+        );
+        let (mut wait, clock) = fake_wait(cooldown.clone(), start, events.clone());
+        wait.max_wait_rounds = 0;
+
+        let error = provision_with_policy(&cfg, &persistent, &anchors, &wait).unwrap_err();
+
+        let failure = error.downcast_ref::<TlsBrokerFailure>().unwrap();
+        assert_eq!(failure.diagnostic.code, SafeDiagnosticCode::AcmeRateLimited);
+        assert_eq!(failure.diagnostic.retry_after, Some(deadline));
+        // One POST, zero sleeps; the broker's deadline is persisted and the
+        // non-terminal cooldown marker stays published for the proxy.
+        assert_eq!(*events.lock().unwrap(), vec!["post"]);
+        assert!(clock.sleeps.lock().unwrap().is_empty());
+        assert!(acme_retry_marker_path(&persistent).exists());
+        assert!(cooldown.exists());
+    }
+
+    #[test]
     fn mismatched_persisted_deadline_is_dropped_and_ignored() {
         let dir = tempdir().unwrap();
         let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -2876,6 +3024,7 @@ hkdf-info = "tls-state-luks-key"
                 sleep_clock.sleeps.lock().unwrap().push(d);
                 *sleep_clock.now.lock().unwrap() = d;
             }),
+            max_wait_rounds: ACME_RETRY_MAX_ROUNDS,
         };
         let root = mint_root("R");
         let anchors = [root.anchor()];

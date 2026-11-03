@@ -32,6 +32,11 @@ const CADDY_RUNTIME_SYNC_INTERVAL_SECONDS: u64 = 5;
 /// hundreds of attempts before expiry while keeping each check a cheap
 /// local read (the broker is contacted only when the certificate is due).
 const TLS_RENEWAL_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+/// Broker-mode readiness cadence: readiness follows the certificate caddy
+/// currently serves, so it is re-evaluated on a short tick of its own —
+/// independent of the six-hour renewal check, which may legitimately defer
+/// on an ACME rate limit for hours while the served certificate expires.
+const TLS_READINESS_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 const DEFAULT_STAGE_FILE: &str = "/run/enclava/init-stage";
 const MANAGED_CONFIG_ROOT: &str = ".enclava";
 const MANAGED_CONFIG_DIR: &str = ".enclava/config";
@@ -451,6 +456,7 @@ fn write_ready_file_state(path: &Path, bytes: &[u8]) -> Result<()> {
 
 fn stay_alive_forever(cfg: &Config) -> ! {
     let mut next_tls_check = Instant::now() + TLS_RENEWAL_CHECK_INTERVAL;
+    let mut next_readiness_check = Instant::now();
     loop {
         if caddy_runtime_back_sync_required(cfg)
             && let Err(err) = sync_caddy_runtime_back(cfg)
@@ -462,10 +468,14 @@ fn stay_alive_forever(cfg: &Config) -> ! {
             if let Err(err) = renew_workload_tls_certificate(cfg) {
                 tracing::warn!(error = %format!("{err:#}"), "workload TLS certificate check failed");
             }
-            // Readiness follows the certificate caddy serves, whichever
-            // step above failed: a publish or copy error with a valid
-            // runtime certificate keeps serving, an expired or not-yet-valid
-            // one does not.
+        }
+        if tls_renewal_check_required(cfg) && next_readiness_check <= Instant::now() {
+            next_readiness_check = Instant::now() + TLS_READINESS_CHECK_INTERVAL;
+            // Readiness follows the certificate caddy serves, whatever the
+            // renewal check last did: a publish or copy error — or a
+            // deferred rate-limited renewal — with a valid runtime
+            // certificate keeps serving, an expired or not-yet-valid one
+            // does not.
             let ready_file = ready_file_path();
             if runtime_certificate_valid(Path::new(CADDY_RUNTIME_HANDOFF_PATH)) {
                 if !ready_file_exists(&ready_file)
@@ -500,7 +510,7 @@ fn tls_renewal_check_required(cfg: &Config) -> bool {
 /// a successful renewal into the caddy runtime handoff so tenant-ingress
 /// picks it up on its certificate watch.
 fn renew_workload_tls_certificate(cfg: &Config) -> Result<()> {
-    provision_static_tls_certificate(cfg)?;
+    renew_static_tls_certificate(cfg)?;
     let persistent = caddy_tls_bind_dir(Path::new(&cfg.tls_state.mount_path));
     let runtime = Path::new(CADDY_RUNTIME_HANDOFF_PATH);
     let caddy_identity = numeric_identity(cfg.caddy_uid, cfg.caddy_gid);
@@ -1495,12 +1505,34 @@ where
 }
 
 fn provision_static_tls_certificate(cfg: &Config) -> Result<()> {
+    provision_static_tls_certificate_with(cfg, |persistent| {
+        tls_certificate::provision_static_tls_certificate(
+            cfg,
+            persistent,
+            &acme_cooldown_file_path(),
+        )
+    })
+}
+
+/// Runtime renewal uses the no-wait policy: a rate-limited broker defers
+/// to the next stay-alive check instead of parking the loop (and its
+/// readiness evaluation) inside a cooldown sleep.
+fn renew_static_tls_certificate(cfg: &Config) -> Result<()> {
+    provision_static_tls_certificate_with(cfg, |persistent| {
+        tls_certificate::renew_static_tls_certificate_without_waiting(
+            cfg,
+            persistent,
+            &acme_cooldown_file_path(),
+        )
+    })
+}
+
+fn provision_static_tls_certificate_with(
+    cfg: &Config,
+    provision: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
     let persistent = caddy_tls_bind_dir(Path::new(&cfg.tls_state.mount_path));
-    tls_certificate::provision_static_tls_certificate(
-        cfg,
-        &persistent,
-        &acme_cooldown_file_path(),
-    )?;
+    provision(&persistent)?;
     let caddy_identity = numeric_identity(cfg.caddy_uid, cfg.caddy_gid);
     for path in [
         tls_certificate::cert_path(&persistent),

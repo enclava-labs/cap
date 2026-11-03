@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
@@ -645,26 +646,70 @@ async fn cleanup_challenges(
 /// waiters re-load the file instead of registering again.
 static ACCOUNT_REGISTRATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// In-memory fallback when no credentials file is configured: the registered
+/// account's serialized credentials keyed by ACME directory URL, kept for the
+/// process lifetime. `Account` objects are never cached — failure headers are
+/// deliberately issuance-local — so each caller rebuilds an `Account` from
+/// the shared credentials with its own HTTP client.
+static MEMORY_ACCOUNT_CREDENTIALS: tokio::sync::Mutex<BTreeMap<String, Vec<u8>>> =
+    tokio::sync::Mutex::const_new(BTreeMap::new());
+
 async fn load_or_create_account(
     config: &AcmeConfig,
     http: Box<dyn instant_acme::HttpClient>,
 ) -> Result<Account, AcmeError> {
-    let Some(path) = config.account_credentials_path.as_ref() else {
-        return register_account(config, http)
-            .await
-            .map(|(account, _)| account);
-    };
-    if path.is_file() {
-        return load_account(path, http).await;
+    match config.account_credentials_path.as_ref() {
+        Some(path) if path.is_file() => return load_account(path, http).await,
+        Some(_) => {}
+        None => {
+            if let Some(bytes) = MEMORY_ACCOUNT_CREDENTIALS
+                .lock()
+                .await
+                .get(&config.directory_url)
+                .cloned()
+            {
+                return account_from_credentials_bytes(http, &bytes).await;
+            }
+        }
     }
 
     let _registration = ACCOUNT_REGISTRATION_LOCK.lock().await;
-    if path.is_file() {
-        return load_account(path, http).await;
+    match config.account_credentials_path.as_ref() {
+        Some(path) if path.is_file() => load_account(path, http).await,
+        Some(path) => {
+            let (account, credentials) = register_account(config, http).await?;
+            write_account_credentials(path, &credentials)?;
+            Ok(account)
+        }
+        None => {
+            let bytes = MEMORY_ACCOUNT_CREDENTIALS
+                .lock()
+                .await
+                .get(&config.directory_url)
+                .cloned();
+            if let Some(bytes) = bytes {
+                return account_from_credentials_bytes(http, &bytes).await;
+            }
+            let (account, credentials) = register_account(config, http).await?;
+            let bytes = serde_json::to_vec(&credentials)?;
+            MEMORY_ACCOUNT_CREDENTIALS
+                .lock()
+                .await
+                .insert(config.directory_url.clone(), bytes);
+            Ok(account)
+        }
     }
-    let (account, credentials) = register_account(config, http).await?;
-    write_account_credentials(path, &credentials)?;
-    Ok(account)
+}
+
+async fn account_from_credentials_bytes(
+    http: Box<dyn instant_acme::HttpClient>,
+    bytes: &[u8],
+) -> Result<Account, AcmeError> {
+    let credentials: AccountCredentials = serde_json::from_slice(bytes)?;
+    Account::builder_with_http(http)
+        .from_credentials(credentials)
+        .await
+        .map_err(AcmeError::Acme)
 }
 
 async fn load_account(
@@ -672,11 +717,7 @@ async fn load_account(
     http: Box<dyn instant_acme::HttpClient>,
 ) -> Result<Account, AcmeError> {
     let bytes = std::fs::read(path)?;
-    let credentials: AccountCredentials = serde_json::from_slice(&bytes)?;
-    Account::builder_with_http(http)
-        .from_credentials(credentials)
-        .await
-        .map_err(AcmeError::Acme)
+    account_from_credentials_bytes(http, &bytes).await
 }
 
 async fn register_account(
@@ -1779,5 +1820,79 @@ mod tests {
             "exactly one ACME account must be registered"
         );
         assert!(credentials_path.is_file());
+    }
+
+    #[tokio::test]
+    async fn concurrent_first_issuances_without_credentials_file_register_one_account() {
+        let new_accounts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback bind");
+        let addr = listener.local_addr().expect("loopback address");
+        let base = format!("http://{addr}");
+        let count = new_accounts.clone();
+        let directory = base.clone();
+        tokio::spawn(serve_test_acme_server(listener, move |path| match path {
+            "/dir" => (
+                200,
+                HeaderMap::new(),
+                format!(
+                    "{{\"newNonce\":\"{directory}/nonce\",\"newAccount\":\"{directory}/new-acct\",\"newOrder\":\"{directory}/new-order\"}}"
+                ),
+            ),
+            "/nonce" => (200, header_map(&[("Replay-Nonce", "nonce")]), String::new()),
+            "/new-acct" => {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    http::header::LOCATION,
+                    format!("{directory}/accounts/1").parse().unwrap(),
+                );
+                (201, headers, String::new())
+            }
+            _ => (404, HeaderMap::new(), String::new()),
+        }));
+
+        let client = test_loopback_client();
+        let config = AcmeConfig {
+            directory_url: format!("{base}/dir"),
+            account_credentials_path: None,
+            dns_propagation_wait: Duration::ZERO,
+            dns_lookup_prefer_system: false,
+            dns_lookup_timeout: None,
+        };
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let config = config.clone();
+            let client = client.clone();
+            handles.push(tokio::spawn(async move {
+                load_or_create_account(
+                    &config,
+                    Box::new(IssuanceHttpClient {
+                        client,
+                        failures: FailureHeaders::default(),
+                    }),
+                )
+                .await
+            }));
+        }
+        for handle in handles {
+            handle.await.expect("task panicked").expect("account load");
+        }
+        // Sequential re-issuance must reuse the cached account as well.
+        load_or_create_account(
+            &config,
+            Box::new(IssuanceHttpClient {
+                client,
+                failures: FailureHeaders::default(),
+            }),
+        )
+        .await
+        .expect("account load");
+        assert_eq!(
+            new_accounts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one ACME account must be registered"
+        );
     }
 }
