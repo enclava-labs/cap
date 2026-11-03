@@ -23,6 +23,7 @@ use serde::Deserialize;
 const DEFAULT_READY_FILE: &str = "/run/enclava/init-ready";
 const DEFAULT_ERROR_FILE: &str = "/run/enclava/init-error";
 const DEFAULT_ACME_COOLDOWN_FILE: &str = "/run/enclava/init-acme-cooldown";
+const DEFAULT_TLS_UNUSABLE_FILE: &str = "/run/enclava/tls-unusable";
 const DEFAULT_AA_TOKEN_WAIT_SECONDS: u64 = 300;
 const DEFAULT_KBS_PROXY_HEALTH_POLL_SECONDS: u64 = 2;
 const CADDY_RUNTIME_HANDOFF_PATH: &str = "/run/enclava/caddy-runtime";
@@ -38,11 +39,13 @@ const TLS_RENEWAL_CHECK_INTERVAL: Duration = Duration::from_secs(15 * 60);
 /// Broker-mode readiness cadence: readiness follows the certificate caddy
 /// actually serves, so it is re-evaluated on a short tick of its own —
 /// independent of the renewal check, which may legitimately defer on an
-/// ACME rate limit while the served certificate expires.
-const TLS_READINESS_CHECK_INTERVAL: Duration = Duration::from_secs(60);
-/// Faster readiness cadence while the marker is not ready, so a
-/// boot-time not-yet-listening caddy recovers within seconds instead of
-/// accumulating minute-long unready spans.
+/// ACME rate limit while the served certificate expires. Readiness
+/// withdrawal lands within ~45 s: ≤10 s check interval + 5 s handshake
+/// deadline + the Kubernetes probe's 30 s threshold.
+const TLS_READINESS_CHECK_INTERVAL: Duration = Duration::from_secs(10);
+/// Faster readiness cadence while the served-certificate probe fails, so
+/// a boot-time not-yet-listening caddy recovers within seconds instead of
+/// accumulating longer unready spans.
 const TLS_READINESS_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_STAGE_FILE: &str = "/run/enclava/init-stage";
 const MANAGED_CONFIG_ROOT: &str = ".enclava";
@@ -62,7 +65,8 @@ fn main() -> ExitCode {
     }
 
     if args.first().map(String::as_str) == Some("--probe-ready") {
-        return if ready_file_exists(&ready_file_path()) {
+        let init_ready = std::fs::read_to_string(ready_file_path()).unwrap_or_default();
+        return if probe_ready(&init_ready, tls_unusable_file_path().exists()) {
             ExitCode::SUCCESS
         } else {
             ExitCode::from(1)
@@ -153,6 +157,9 @@ fn run_with_stats(stats: &mut init_stats::BootStats) -> Result<()> {
     if stay_alive {
         clear_ready_file(&ready_file)
             .with_context(|| format!("clearing stale ready file {}", ready_file.display()))?;
+        // A TLS marker from a previous run must not suppress readiness in
+        // this boot — the probe subtracts it from init-ready.
+        clear_tls_unusable(&tls_unusable_file_path());
     }
 
     record_stage("verifying trustee policy").ok();
@@ -281,6 +288,10 @@ fn acme_cooldown_file_path() -> PathBuf {
     )
 }
 
+fn tls_unusable_file_path() -> PathBuf {
+    init_surface_path("ENCLAVA_INIT_TLS_UNUSABLE_FILE", DEFAULT_TLS_UNUSABLE_FILE)
+}
+
 fn stage_file_path() -> PathBuf {
     init_surface_path("ENCLAVA_INIT_STAGE_FILE", DEFAULT_STAGE_FILE)
 }
@@ -385,6 +396,37 @@ fn clear_error_file(path: &Path) {
     }
 }
 
+/// Pure readiness gate: `--probe-ready` reports ready only when the
+/// init-ready file carries `ready` and no `tls-unusable` marker exists.
+/// The TLS tick never writes init-ready itself — that file is also the
+/// startup gate enclava-wait-exec blocks tenant-ingress on, so a
+/// not-yet-listening caddy must not be able to clear it; the marker is a
+/// separate surface the probe subtracts from init readiness.
+fn probe_ready(init_ready_contents: &str, tls_marker_present: bool) -> bool {
+    init_ready_contents.trim() == "ready" && !tls_marker_present
+}
+
+/// Record that tenant-ingress is not serving a usable certificate. Atomic
+/// write so the probe never observes a half-written marker; content is
+/// fixed — presence is the signal.
+fn mark_tls_unusable(path: &Path) {
+    if let Err(err) = writes::atomic_write(path, b"tls-certificate-unusable\n", 0o644) {
+        tracing::warn!(path = %path.display(), error = %err, "writing TLS unusable marker failed");
+    }
+}
+
+/// Drop the TLS unusable marker (served certificate usable again, or a
+/// boot clearing stale runtime state). Missing is fine.
+fn clear_tls_unusable(path: &Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "clearing TLS unusable marker failed")
+        }
+    }
+}
+
 /// Write the safe failure JSON to the init-error file and the termination
 /// log.
 ///
@@ -436,12 +478,6 @@ fn mark_ready_file(path: &Path) -> Result<()> {
     write_ready_file_state(path, b"ready\n")
 }
 
-fn ready_file_exists(path: &Path) -> bool {
-    std::fs::read_to_string(path)
-        .map(|value| value.trim() == "ready")
-        .unwrap_or(false)
-}
-
 fn write_ready_file_state(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path
         .parent()
@@ -478,18 +514,17 @@ fn stay_alive_forever(cfg: &Config) -> ! {
         }
         if tls_renewal_check_required(cfg) && next_readiness_check <= Instant::now() {
             // Readiness follows the certificate tenant-ingress actually
-            // serves, whatever the renewal check last did: a full TLS
-            // handshake that validates chain, name, and validity marks the
-            // workload ready; any probe failure — refused, timeout, TLS
-            // alert, untrusted, expired, wrong name — clears it.
-            let ready_file = ready_file_path();
+            // serves, whatever the renewal check last did — via a separate
+            // tls-unusable marker, never init-ready itself: init-ready is
+            // also the startup gate enclava-wait-exec blocks caddy on, so
+            // the probe must not be able to clear it. A full validating
+            // TLS handshake drops the marker; any failure — refused,
+            // timeout, TLS alert, untrusted, expired, wrong name —
+            // writes it.
+            let tls_marker = tls_unusable_file_path();
             match served_https_usable(cfg) {
                 Ok(()) => {
-                    if !ready_file_exists(&ready_file)
-                        && let Err(err) = mark_ready_file(&ready_file)
-                    {
-                        tracing::warn!(error = %err, "restoring readiness after TLS check failed");
-                    }
+                    clear_tls_unusable(&tls_marker);
                     next_readiness_check = Instant::now() + TLS_READINESS_CHECK_INTERVAL;
                 }
                 Err(err) => {
@@ -497,11 +532,7 @@ fn stay_alive_forever(cfg: &Config) -> ! {
                         error = %format!("{err:#}"),
                         "tenant-ingress served-certificate probe failed"
                     );
-                    if let Err(err) =
-                        write_ready_file_state(&ready_file, b"tls-certificate-unusable\n")
-                    {
-                        tracing::warn!(error = %err, "clearing readiness after TLS failure failed");
-                    }
+                    mark_tls_unusable(&tls_marker);
                     next_readiness_check = Instant::now() + TLS_READINESS_RETRY_INTERVAL;
                 }
             }
@@ -539,7 +570,11 @@ fn renew_workload_tls_certificate(cfg: &Config) -> Result<()> {
 /// Probe the certificate tenant-ingress serves for the first configured
 /// hostname with a full validating TLS handshake — the same public root
 /// store the brokered-chain validation trusts. `Ok` means a client could
-/// actually be served right now; every failure is an `Err`.
+/// actually be served right now; every failure is an `Err`. The 5 s
+/// absolute deadline bounds a stalled or trickling handshake without
+/// parking the stay-alive loop; the Kubernetes probe threshold (30 s) is
+/// separate, so readiness withdrawal lands in ~45 s (≤10 s check
+/// interval + 5 s handshake deadline + 30 s probe threshold).
 fn served_https_usable(cfg: &Config) -> Result<()> {
     let host = cfg
         .tls_certificate_hostnames

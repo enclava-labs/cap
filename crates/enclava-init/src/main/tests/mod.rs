@@ -80,12 +80,13 @@ fn caddy_runtime_certificate_is_published_and_refreshed() {
 fn ready_probe_reflects_ready_file_state() {
     let dir = tempdir().unwrap();
     let ready = dir.path().join("run/enclava/init-ready");
+    let contents = |path: &Path| std::fs::read_to_string(path).unwrap_or_default();
 
-    assert!(!ready_file_exists(&ready));
+    assert!(!probe_ready(&contents(&ready), false));
     mark_ready_file(&ready).unwrap();
-    assert!(ready_file_exists(&ready));
+    assert!(probe_ready(&contents(&ready), false));
     clear_ready_file(&ready).unwrap();
-    assert!(!ready_file_exists(&ready));
+    assert!(!probe_ready(&contents(&ready), false));
     assert_eq!(std::fs::read_to_string(&ready).unwrap(), "not-ready\n");
 }
 
@@ -1895,4 +1896,69 @@ fn caddy_runtime_refresh_chown_failure_is_best_effort() {
         b"cert"
     );
     assert!(!runtime.join("certificates/tls.key").exists());
+}
+
+#[test]
+fn probe_ready_requires_init_ready_and_no_tls_marker() {
+    // init-ready is the boot gate; the TLS marker only subtracts.
+    for contents in ["ready", "ready\n", "  ready\n"] {
+        assert!(probe_ready(contents, false), "contents: {contents:?}");
+        assert!(!probe_ready(contents, true), "contents: {contents:?}");
+    }
+    for contents in ["", "not-ready\n", "tls-certificate-unusable\n", "readyx"] {
+        assert!(!probe_ready(contents, false), "contents: {contents:?}");
+        assert!(!probe_ready(contents, true), "contents: {contents:?}");
+    }
+}
+
+#[test]
+fn served_https_probe_honors_absolute_deadline_against_trickling_peer() {
+    // A peer that accepts and trickles bytes without ever completing TLS
+    // must not reset the handshake deadline: the probe returns an error
+    // in roughly the configured timeout, not whenever the peer stops. The
+    // peer announces a valid incomplete handshake record (type 0x16,
+    // TLS 1.2 version, a legal 64-byte body) then trickles one body byte
+    // every ~100 ms without finishing it, so the deadline — not an
+    // instant parse error — has to fire.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let _server = std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            std::thread::spawn(move || {
+                if std::io::Write::write_all(&mut stream, b"\x16\x03\x03\x00\x40").is_err() {
+                    return;
+                }
+                loop {
+                    if std::io::Write::write_all(&mut stream, &[0u8]).is_err() {
+                        return;
+                    }
+                    if std::io::Write::flush(&mut stream).is_err() {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            });
+        }
+    });
+
+    let started = std::time::Instant::now();
+    let error = served_certificate::served_https_usable(
+        "app.example.test",
+        port,
+        std::sync::Arc::new(rustls::RootCertStore::empty()),
+        Duration::from_millis(500),
+    )
+    .unwrap_err();
+    let elapsed = started.elapsed();
+
+    // The error must come from the deadline expiring, not an immediate
+    // parse failure, and the absolute deadline must hold: ≥~400 ms (the
+    // record could not have completed) and well under the unlimited-wait
+    // case.
+    assert!(
+        elapsed >= Duration::from_millis(400) && elapsed < Duration::from_secs(2),
+        "probe did not time out near the deadline: {elapsed:?}"
+    );
+    assert!(format!("{error:#}").contains("handshake"));
 }
