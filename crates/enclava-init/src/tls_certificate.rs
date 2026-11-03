@@ -846,19 +846,6 @@ pub fn leaf_valid_at(chain_pem: &str, now_secs: i64) -> bool {
     })
 }
 
-/// Whether the leaf certificate `der` is within its validity window at
-/// `now_secs` — the DER counterpart of [`leaf_valid_at`] used for the
-/// certificate tenant-ingress actually serves (same skew tolerance).
-pub fn leaf_der_valid_at(der: &[u8], now_secs: i64) -> bool {
-    let Ok((_, leaf)) = x509_parser::certificate::X509Certificate::from_der(der) else {
-        return false;
-    };
-    let validity = leaf.validity();
-    now_secs.saturating_add(NOT_BEFORE_TOLERANCE_SECS as i64)
-        >= validity.not_before.to_datetime().unix_timestamp()
-        && now_secs <= validity.not_after.to_datetime().unix_timestamp()
-}
-
 /// `(notBefore, notAfter)` of the leaf certificate, in unix seconds.
 ///
 /// Reads the first PEM block only: the same value

@@ -90,14 +90,14 @@ for a 90-day Let's Encrypt certificate).
   since renewals reuse the retained key and the runtime `tls.key` never
   changes; tenant-ingress watches `tls.crt` and restarts caddy on change
   because the generated Caddyfile runs with `admin off`.
-- In broker mode the stay-alive loop also re-evaluates readiness once a
-  minute, independent of the renewal check — from the certificate
-  tenant-ingress actually serves, not any file: a short TLS handshake
-  against `127.0.0.1:10443` (SNI = first configured hostname) returns the
-  presented leaf. A served leaf outside its validity window clears
-  readiness (`tls-certificate-unusable`) within a minute — including the
-  reload window where caddy still serves an expired certificate a renewal
-  just replaced on disk — and a valid served leaf restores it. A probe
-  that fails outright (refused connection, handshake error while caddy
-  restarts) leaves the marker unchanged; the tenant-ingress TCP readiness
-  probe already covers a listener that is not serving.
+- In broker mode the stay-alive loop also re-evaluates readiness from the
+  certificate tenant-ingress actually serves, not any file: a full
+  validating TLS handshake against `127.0.0.1:10443` (SNI = first
+  configured hostname) — chain anchored to the same public root store,
+  hostname, and validity windows — must succeed for the workload to be
+  ready. Any failure clears readiness (`tls-certificate-unusable`):
+  refused connection, timeout, TLS alert, untrusted chain, expired or
+  not-yet-valid leaf, or wrong name — including the reload window where
+  caddy still serves an expired certificate a renewal just replaced on
+  disk. The probe runs every 60 s while ready and every 5 s while not,
+  so a not-yet-listening caddy at boot recovers within seconds.

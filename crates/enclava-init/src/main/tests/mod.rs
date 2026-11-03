@@ -1652,10 +1652,10 @@ fn luks_rollout_policy_unknown_value_fails_boot() {
     assert!(err.to_string().contains("luks2_header_seal"));
 }
 
-/// In-process rustls server presenting `cert`/`key` on 127.0.0.1 for the
+/// In-process rustls server presenting `chain`/`key` on 127.0.0.1 for the
 /// served-certificate readiness probe tests.
 fn spawn_tls_server(
-    cert_der: rustls::pki_types::CertificateDer<'static>,
+    chain: Vec<rustls::pki_types::CertificateDer<'static>>,
     key_der: rustls::pki_types::PrivatePkcs8KeyDer<'static>,
 ) -> (u16, std::thread::JoinHandle<()>) {
     let config = rustls::ServerConfig::builder_with_provider(
@@ -1664,7 +1664,7 @@ fn spawn_tls_server(
     .with_safe_default_protocol_versions()
     .unwrap()
     .with_no_client_auth()
-    .with_single_cert(vec![cert_der], key_der.into())
+    .with_single_cert(chain, key_der.into())
     .unwrap();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -1685,79 +1685,151 @@ fn spawn_tls_server(
     (port, handle)
 }
 
-fn mint_self_signed_cert(
+/// Mint a test CA and a leaf it issues for `san_hosts`, returning the
+/// server chain (leaf + root), the leaf key, and the root store a client
+/// validating against this CA uses.
+fn mint_ca_and_leaf(
+    san_hosts: &[&str],
     not_before: (i32, u8, u8),
     not_after: (i32, u8, u8),
 ) -> (
-    rustls::pki_types::CertificateDer<'static>,
+    Vec<rustls::pki_types::CertificateDer<'static>>,
     rustls::pki_types::PrivatePkcs8KeyDer<'static>,
+    rustls::RootCertStore,
 ) {
-    let key = rcgen::KeyPair::generate().unwrap();
-    let mut params = rcgen::CertificateParams::new(vec!["app.example.test".to_string()]).unwrap();
-    params.not_before = rcgen::date_time_ymd(not_before.0, not_before.1, not_before.2);
-    params.not_after = rcgen::date_time_ymd(not_after.0, not_after.1, not_after.2);
-    let cert = params.self_signed(&key).unwrap();
+    let root_key = rcgen::KeyPair::generate().unwrap();
+    let mut root_params = rcgen::CertificateParams::default();
+    root_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let root_cert = root_params.self_signed(&root_key).unwrap();
+
+    let leaf_key = rcgen::KeyPair::generate().unwrap();
+    let mut leaf_params =
+        rcgen::CertificateParams::new(san_hosts.iter().map(|h| h.to_string()).collect::<Vec<_>>())
+            .unwrap();
+    leaf_params.not_before = rcgen::date_time_ymd(not_before.0, not_before.1, not_before.2);
+    leaf_params.not_after = rcgen::date_time_ymd(not_after.0, not_after.1, not_after.2);
+    let leaf_cert = leaf_params
+        .signed_by(
+            &leaf_key,
+            &rcgen::Issuer::from_params(&root_params, &root_key),
+        )
+        .unwrap();
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls::pki_types::CertificateDer::from(
+            root_cert.der().to_vec(),
+        ))
+        .unwrap();
     (
-        rustls::pki_types::CertificateDer::from(cert.der().to_vec()),
-        rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der()),
+        vec![
+            rustls::pki_types::CertificateDer::from(leaf_cert.der().to_vec()),
+            rustls::pki_types::CertificateDer::from(root_cert.der().to_vec()),
+        ],
+        rustls::pki_types::PrivatePkcs8KeyDer::from(leaf_key.serialize_der()),
+        roots,
     )
 }
 
 #[test]
-fn served_certificate_probe_returns_the_leaf_the_server_presents() {
-    let (cert_der, key_der) = mint_self_signed_cert((2000, 1, 1), (2100, 1, 1));
-    let expected = cert_der.as_ref().to_vec();
-    let (port, _server) = spawn_tls_server(cert_der, key_der);
+fn served_https_probe_accepts_valid_chain_for_sni_hostname() {
+    let (chain, key, roots) = mint_ca_and_leaf(&["app.example.test"], (2000, 1, 1), (2100, 1, 1));
+    let (port, _server) = spawn_tls_server(chain, key);
 
-    let served = served_certificate::fetch_served_certificate(
+    served_certificate::served_https_usable(
         "app.example.test",
         port,
+        std::sync::Arc::new(roots),
         Duration::from_secs(5),
     )
     .unwrap();
-
-    assert_eq!(served.as_ref(), expected.as_slice());
-    assert!(tls_certificate::leaf_der_valid_at(
-        served.as_ref(),
-        chrono::Utc::now().timestamp()
-    ));
 }
 
 #[test]
-fn served_certificate_decision_tracks_the_served_leaf_validity() {
-    // The readiness answer follows the leaf the server presents: a
-    // currently-valid served cert decides true, an expired one false.
-    let now = chrono::Utc::now().timestamp();
-    let (expired_der, expired_key) = mint_self_signed_cert((2000, 1, 1), (2001, 1, 1));
-    let (expired_port, _server) = spawn_tls_server(expired_der, expired_key);
-    let served = served_certificate::fetch_served_certificate(
+fn served_https_probe_rejects_expired_leaf() {
+    let (chain, key, roots) = mint_ca_and_leaf(&["app.example.test"], (2000, 1, 1), (2001, 1, 1));
+    let (port, _server) = spawn_tls_server(chain, key);
+
+    let error = served_certificate::served_https_usable(
         "app.example.test",
-        expired_port,
+        port,
+        std::sync::Arc::new(roots),
         Duration::from_secs(5),
     )
-    .unwrap();
-    assert!(!tls_certificate::leaf_der_valid_at(served.as_ref(), now));
-
-    let (valid_der, _) = mint_self_signed_cert((2000, 1, 1), (2100, 1, 1));
-    assert!(tls_certificate::leaf_der_valid_at(valid_der.as_ref(), now));
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("handshake"));
 }
 
 #[test]
-fn served_certificate_probe_errors_when_nothing_listens() {
-    // A refused connection leaves the marker-unchanged path: the probe
-    // reports an error rather than a validity answer.
+fn served_https_probe_rejects_wrong_hostname() {
+    // The leaf is valid and trusted but issued for a different name than
+    // the probed SNI — a client could not be served under this hostname.
+    let (chain, key, roots) = mint_ca_and_leaf(&["other.example.test"], (2000, 1, 1), (2100, 1, 1));
+    let (port, _server) = spawn_tls_server(chain, key);
+
+    let error = served_certificate::served_https_usable(
+        "app.example.test",
+        port,
+        std::sync::Arc::new(roots),
+        Duration::from_secs(5),
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("handshake"));
+}
+
+#[test]
+fn served_https_probe_rejects_untrusted_chain() {
+    let (chain, key, _roots) = mint_ca_and_leaf(&["app.example.test"], (2000, 1, 1), (2100, 1, 1));
+    let (port, _server) = spawn_tls_server(chain, key);
+
+    // A store that does not contain the issuing CA fails validation.
+    let error = served_certificate::served_https_usable(
+        "app.example.test",
+        port,
+        std::sync::Arc::new(rustls::RootCertStore::empty()),
+        Duration::from_secs(5),
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("handshake"));
+}
+
+#[test]
+fn served_https_probe_errors_when_nothing_listens() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     drop(listener);
 
-    let error = served_certificate::fetch_served_certificate(
+    let error = served_certificate::served_https_usable(
         "app.example.test",
         port,
+        std::sync::Arc::new(rustls::RootCertStore::empty()),
         Duration::from_secs(2),
     )
     .unwrap_err();
 
     assert!(format!("{error:#}").contains("connecting to 127.0.0.1"));
+}
+
+#[test]
+fn served_https_probe_errors_when_listener_closes_without_tls() {
+    // A listener that accepts TCP and immediately closes fails the
+    // handshake — TCP-up is not "serving".
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let _server = std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            drop(stream);
+        }
+    });
+
+    let error = served_certificate::served_https_usable(
+        "app.example.test",
+        port,
+        std::sync::Arc::new(rustls::RootCertStore::empty()),
+        Duration::from_secs(5),
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("handshake"));
 }
 
 #[test]

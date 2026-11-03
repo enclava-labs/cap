@@ -36,10 +36,14 @@ const CADDY_RUNTIME_SYNC_INTERVAL_SECONDS: u64 = 5;
 /// rate-limited renewal retry within 15 minutes of the cooldown ending.
 const TLS_RENEWAL_CHECK_INTERVAL: Duration = Duration::from_secs(15 * 60);
 /// Broker-mode readiness cadence: readiness follows the certificate caddy
-/// currently serves, so it is re-evaluated on a short tick of its own —
+/// actually serves, so it is re-evaluated on a short tick of its own —
 /// independent of the renewal check, which may legitimately defer on an
 /// ACME rate limit while the served certificate expires.
 const TLS_READINESS_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+/// Faster readiness cadence while the marker is not ready, so a
+/// boot-time not-yet-listening caddy recovers within seconds instead of
+/// accumulating minute-long unready spans.
+const TLS_READINESS_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_STAGE_FILE: &str = "/run/enclava/init-stage";
 const MANAGED_CONFIG_ROOT: &str = ".enclava";
 const MANAGED_CONFIG_DIR: &str = ".enclava/config";
@@ -473,31 +477,33 @@ fn stay_alive_forever(cfg: &Config) -> ! {
             }
         }
         if tls_renewal_check_required(cfg) && next_readiness_check <= Instant::now() {
-            next_readiness_check = Instant::now() + TLS_READINESS_CHECK_INTERVAL;
             // Readiness follows the certificate tenant-ingress actually
-            // serves, whatever the renewal check last did: a served leaf
-            // inside its validity window marks the workload ready; an
-            // expired or not-yet-valid served leaf clears it. A listener
-            // that cannot be probed (caddy restarting, refused connection)
-            // leaves the marker unchanged — its TCP readiness probe covers
-            // "not serving" without this marker claiming unusable.
+            // serves, whatever the renewal check last did: a full TLS
+            // handshake that validates chain, name, and validity marks the
+            // workload ready; any probe failure — refused, timeout, TLS
+            // alert, untrusted, expired, wrong name — clears it.
             let ready_file = ready_file_path();
-            match served_certificate_valid(cfg) {
-                Some(true) => {
+            match served_https_usable(cfg) {
+                Ok(()) => {
                     if !ready_file_exists(&ready_file)
                         && let Err(err) = mark_ready_file(&ready_file)
                     {
                         tracing::warn!(error = %err, "restoring readiness after TLS check failed");
                     }
+                    next_readiness_check = Instant::now() + TLS_READINESS_CHECK_INTERVAL;
                 }
-                Some(false) => {
+                Err(err) => {
+                    tracing::warn!(
+                        error = %format!("{err:#}"),
+                        "tenant-ingress served-certificate probe failed"
+                    );
                     if let Err(err) =
                         write_ready_file_state(&ready_file, b"tls-certificate-unusable\n")
                     {
                         tracing::warn!(error = %err, "clearing readiness after TLS failure failed");
                     }
+                    next_readiness_check = Instant::now() + TLS_READINESS_RETRY_INTERVAL;
                 }
-                None => {}
             }
         }
         std::thread::sleep(Duration::from_secs(CADDY_RUNTIME_SYNC_INTERVAL_SECONDS));
@@ -530,30 +536,23 @@ fn renew_workload_tls_certificate(cfg: &Config) -> Result<()> {
     })
 }
 
-/// Whether the certificate tenant-ingress serves for the first configured
-/// hostname is inside its validity window right now. `None` means the
-/// listener could not be probed (caddy restarting, refused connection,
-/// handshake failure) and callers must leave the readiness marker
-/// unchanged.
-fn served_certificate_valid(cfg: &Config) -> Option<bool> {
-    let host = cfg.tls_certificate_hostnames.first()?;
-    match served_certificate::fetch_served_certificate(
+/// Probe the certificate tenant-ingress serves for the first configured
+/// hostname with a full validating TLS handshake — the same public root
+/// store the brokered-chain validation trusts. `Ok` means a client could
+/// actually be served right now; every failure is an `Err`.
+fn served_https_usable(cfg: &Config) -> Result<()> {
+    let host = cfg
+        .tls_certificate_hostnames
+        .first()
+        .ok_or_else(|| anyhow!("tls-certificate-hostnames is empty"))?;
+    served_certificate::served_https_usable(
         host,
         TENANT_INGRESS_TLS_PORT,
-        Duration::from_secs(5),
-    ) {
-        Ok(leaf) => Some(tls_certificate::leaf_der_valid_at(
-            leaf.as_ref(),
-            chrono::Utc::now().timestamp(),
+        std::sync::Arc::new(rustls::RootCertStore::from_iter(
+            webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
         )),
-        Err(err) => {
-            tracing::warn!(
-                error = %format!("{err:#}"),
-                "tenant-ingress certificate probe failed; leaving readiness unchanged"
-            );
-            None
-        }
-    }
+        Duration::from_secs(5),
+    )
 }
 
 /// Atomically copy a renewed retained tls.crt into the caddy runtime
