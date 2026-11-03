@@ -749,8 +749,9 @@ fn write_account_credentials(
         std::fs::create_dir_all(parent)?;
     }
     // Never follow or reuse a pre-existing temp path: create a uniquely-named
-    // sibling exclusively and only ever remove the file we created.
-    let file_name = path.file_name().unwrap_or_default();
+    // sibling exclusively and only ever remove the file we created. The name
+    // is short and independent of the destination so a long (but valid)
+    // destination file name cannot overflow the 255-byte component limit.
     let pid = std::process::id();
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -760,13 +761,7 @@ fn write_account_credentials(
     let mut file = None;
     let mut tmp = parent.to_path_buf();
     for attempt in 0..8u32 {
-        tmp = parent.join(format!(
-            ".{}.{}.{}.{}.tmp",
-            file_name.to_string_lossy(),
-            pid,
-            nanos,
-            attempt
-        ));
+        tmp = parent.join(format!(".acme-account.{pid}.{nanos}.{attempt}.tmp"));
         match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
