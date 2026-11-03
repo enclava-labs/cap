@@ -27,15 +27,17 @@ const DEFAULT_KBS_PROXY_HEALTH_POLL_SECONDS: u64 = 2;
 const CADDY_RUNTIME_HANDOFF_PATH: &str = "/run/enclava/caddy-runtime";
 const PUBLIC_TLS_CERT_HANDOFF_PATH: &str = "/run/enclava/public-tls/certificates/tls.crt";
 const CADDY_RUNTIME_SYNC_INTERVAL_SECONDS: u64 = 5;
-/// Broker-mode workload certificate re-check cadence. A 90-day certificate
-/// enters its renewal window at ~60 days, so a six-hour tick leaves
-/// hundreds of attempts before expiry while keeping each check a cheap
-/// local read (the broker is contacted only when the certificate is due).
-const TLS_RENEWAL_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+/// Broker-mode workload certificate re-check cadence. Each check is a
+/// cheap local validation — the broker is contacted only when the
+/// certificate is due and no persisted cooldown deadline is pending — so a
+/// 15-minute tick leaves thousands of attempts before a 90-day
+/// certificate's renewal window closes while letting a deferred
+/// rate-limited renewal retry within 15 minutes of the cooldown ending.
+const TLS_RENEWAL_CHECK_INTERVAL: Duration = Duration::from_secs(15 * 60);
 /// Broker-mode readiness cadence: readiness follows the certificate caddy
 /// currently serves, so it is re-evaluated on a short tick of its own —
-/// independent of the six-hour renewal check, which may legitimately defer
-/// on an ACME rate limit for hours while the served certificate expires.
+/// independent of the renewal check, which may legitimately defer on an
+/// ACME rate limit while the served certificate expires.
 const TLS_READINESS_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 const DEFAULT_STAGE_FILE: &str = "/run/enclava/init-stage";
 const MANAGED_CONFIG_ROOT: &str = ".enclava";

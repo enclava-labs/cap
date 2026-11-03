@@ -4,7 +4,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::dns::{self, DnsConfig};
 use crate::workload_tls_timing::{DnsErrorCategory, Phase, RequestTiming};
@@ -748,25 +748,59 @@ fn write_account_credentials(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("tmp");
-    // Never follow or reuse a pre-existing temp path: remove any leftover
-    // entry (a symlink is unlinked, not followed) and create exclusively.
-    match std::fs::remove_file(&tmp) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(err.into()),
-    }
-    {
-        let mut file = std::fs::OpenOptions::new()
+    // Never follow or reuse a pre-existing temp path: create a uniquely-named
+    // sibling exclusively and only ever remove the file we created.
+    let file_name = path.file_name().unwrap_or_default();
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let mut file = None;
+    let mut tmp = parent.to_path_buf();
+    for attempt in 0..8u32 {
+        tmp = parent.join(format!(
+            ".{}.{}.{}.{}.tmp",
+            file_name.to_string_lossy(),
+            pid,
+            nanos,
+            attempt
+        ));
+        match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(&tmp)?;
+            .open(&tmp)
+        {
+            Ok(opened) => {
+                file = Some(opened);
+                break;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err.into()),
+        }
+    }
+    let Some(mut file) = file else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not create a unique account credentials temp file",
+        )
+        .into());
+    };
+    let persisted = (|| -> Result<(), AcmeError> {
         std::io::Write::write_all(&mut file, &serde_json::to_vec(credentials)?)?;
         file.sync_all()?;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if let Err(err) = persisted {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
     }
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    std::fs::rename(&tmp, path)?;
+    // fsync the parent directory so the rename itself survives a crash.
+    std::fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
 
