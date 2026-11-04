@@ -48,7 +48,7 @@ pub fn enclava_init_image() -> String {
 pub const ENCLAVA_WAIT_EXEC_PATH: &str = "/enclava-tools/enclava-wait-exec";
 pub const APP_SEED_PATH: &str = "/state/app/seed";
 pub const CADDY_SEED_PATH: &str = "/state/caddy/seed";
-pub const CADDY_ACME_TLS_PORT: i32 = 10443;
+pub const CADDY_ACME_TLS_PORT: i32 = enclava_common::types::TENANT_INGRESS_TLS_PORT as i32;
 pub const CADDY_INTERNAL_TLS_PORT: i32 = 10443;
 pub const CADDY_INTERNAL_RUNTIME_PATH: &str = "/run/enclava/caddy-runtime";
 pub const UNLOCK_SOCKET_PATH: &str = "/run/enclava-unlock/unlock.sock";
@@ -755,7 +755,10 @@ fn enclava_init_ready_probe() -> Probe {
         }),
         period_seconds: Some(5),
         timeout_seconds: Some(2),
-        failure_threshold: Some(17_280), // 24h for password-unlock pods.
+        // Unlock stays reachable while not ready (the Service publishes
+        // not-ready addresses), so a ready pod can drop out after 30s, e.g.
+        // when enclava-init marks its served TLS certificate unusable.
+        failure_threshold: Some(6),
         ..Default::default()
     }
 }

@@ -53,6 +53,7 @@ pub mod luks2_seal;
 pub mod safe_diagnostics;
 pub mod secrets;
 pub mod seeds;
+pub mod served_certificate;
 pub mod socket;
 pub mod tls_certificate;
 pub mod trustee_verify;

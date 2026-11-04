@@ -80,12 +80,13 @@ fn caddy_runtime_certificate_is_published_and_refreshed() {
 fn ready_probe_reflects_ready_file_state() {
     let dir = tempdir().unwrap();
     let ready = dir.path().join("run/enclava/init-ready");
+    let contents = |path: &Path| std::fs::read_to_string(path).unwrap_or_default();
 
-    assert!(!ready_file_exists(&ready));
+    assert!(!probe_ready(&contents(&ready), false));
     mark_ready_file(&ready).unwrap();
-    assert!(ready_file_exists(&ready));
+    assert!(probe_ready(&contents(&ready), false));
     clear_ready_file(&ready).unwrap();
-    assert!(!ready_file_exists(&ready));
+    assert!(!probe_ready(&contents(&ready), false));
     assert_eq!(std::fs::read_to_string(&ready).unwrap(), "not-ready\n");
 }
 
@@ -1652,20 +1653,184 @@ fn luks_rollout_policy_unknown_value_fails_boot() {
     assert!(err.to_string().contains("luks2_header_seal"));
 }
 
+/// In-process rustls server presenting `chain`/`key` on 127.0.0.1 for the
+/// served-certificate readiness probe tests.
+fn spawn_tls_server(
+    chain: Vec<rustls::pki_types::CertificateDer<'static>>,
+    key_der: rustls::pki_types::PrivatePkcs8KeyDer<'static>,
+) -> (u16, std::thread::JoinHandle<()>) {
+    let config = rustls::ServerConfig::builder_with_provider(
+        rustls::crypto::ring::default_provider().into(),
+    )
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(chain, key_der.into())
+    .unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let Ok(mut conn) = rustls::ServerConnection::new(std::sync::Arc::new(config.clone()))
+            else {
+                continue;
+            };
+            while conn.is_handshaking() {
+                if conn.complete_io(&mut stream).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    (port, handle)
+}
+
+/// Mint a test CA and a leaf it issues for `san_hosts`, returning the
+/// server chain (leaf + root), the leaf key, and the root store a client
+/// validating against this CA uses.
+fn mint_ca_and_leaf(
+    san_hosts: &[&str],
+    not_before: (i32, u8, u8),
+    not_after: (i32, u8, u8),
+) -> (
+    Vec<rustls::pki_types::CertificateDer<'static>>,
+    rustls::pki_types::PrivatePkcs8KeyDer<'static>,
+    rustls::RootCertStore,
+) {
+    let root_key = rcgen::KeyPair::generate().unwrap();
+    let mut root_params = rcgen::CertificateParams::default();
+    root_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let root_cert = root_params.self_signed(&root_key).unwrap();
+
+    let leaf_key = rcgen::KeyPair::generate().unwrap();
+    let mut leaf_params =
+        rcgen::CertificateParams::new(san_hosts.iter().map(|h| h.to_string()).collect::<Vec<_>>())
+            .unwrap();
+    leaf_params.not_before = rcgen::date_time_ymd(not_before.0, not_before.1, not_before.2);
+    leaf_params.not_after = rcgen::date_time_ymd(not_after.0, not_after.1, not_after.2);
+    let leaf_cert = leaf_params
+        .signed_by(
+            &leaf_key,
+            &rcgen::Issuer::from_params(&root_params, &root_key),
+        )
+        .unwrap();
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls::pki_types::CertificateDer::from(
+            root_cert.der().to_vec(),
+        ))
+        .unwrap();
+    (
+        vec![
+            rustls::pki_types::CertificateDer::from(leaf_cert.der().to_vec()),
+            rustls::pki_types::CertificateDer::from(root_cert.der().to_vec()),
+        ],
+        rustls::pki_types::PrivatePkcs8KeyDer::from(leaf_key.serialize_der()),
+        roots,
+    )
+}
+
 #[test]
-fn readiness_restore_waits_for_cert_settle_but_ready_stays_ready() {
-    // Invalid is never ready.
-    for (settled, already_ready) in [(true, true), (true, false), (false, true), (false, false)] {
-        assert!(!readiness_restorable(false, settled, already_ready));
-    }
-    // Valid + already marked ready stays ready even when the cert is
-    // brand new (the settle delay must not flap existing readiness).
-    assert!(readiness_restorable(true, false, true));
-    assert!(readiness_restorable(true, true, true));
-    // Valid + not ready restores only once the cert has outlived the
-    // tenant-ingress reload window.
-    assert!(!readiness_restorable(true, false, false));
-    assert!(readiness_restorable(true, true, false));
+fn served_https_probe_accepts_valid_chain_for_sni_hostname() {
+    let (chain, key, roots) = mint_ca_and_leaf(&["app.example.test"], (2000, 1, 1), (2100, 1, 1));
+    let (port, _server) = spawn_tls_server(chain, key);
+
+    served_certificate::served_https_usable(
+        "app.example.test",
+        port,
+        std::sync::Arc::new(roots),
+        Duration::from_secs(5),
+    )
+    .unwrap();
+}
+
+#[test]
+fn served_https_probe_rejects_expired_leaf() {
+    let (chain, key, roots) = mint_ca_and_leaf(&["app.example.test"], (2000, 1, 1), (2001, 1, 1));
+    let (port, _server) = spawn_tls_server(chain, key);
+
+    let error = served_certificate::served_https_usable(
+        "app.example.test",
+        port,
+        std::sync::Arc::new(roots),
+        Duration::from_secs(5),
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("handshake"));
+}
+
+#[test]
+fn served_https_probe_rejects_wrong_hostname() {
+    // The leaf is valid and trusted but issued for a different name than
+    // the probed SNI — a client could not be served under this hostname.
+    let (chain, key, roots) = mint_ca_and_leaf(&["other.example.test"], (2000, 1, 1), (2100, 1, 1));
+    let (port, _server) = spawn_tls_server(chain, key);
+
+    let error = served_certificate::served_https_usable(
+        "app.example.test",
+        port,
+        std::sync::Arc::new(roots),
+        Duration::from_secs(5),
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("handshake"));
+}
+
+#[test]
+fn served_https_probe_rejects_untrusted_chain() {
+    let (chain, key, _roots) = mint_ca_and_leaf(&["app.example.test"], (2000, 1, 1), (2100, 1, 1));
+    let (port, _server) = spawn_tls_server(chain, key);
+
+    // A store that does not contain the issuing CA fails validation.
+    let error = served_certificate::served_https_usable(
+        "app.example.test",
+        port,
+        std::sync::Arc::new(rustls::RootCertStore::empty()),
+        Duration::from_secs(5),
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("handshake"));
+}
+
+#[test]
+fn served_https_probe_errors_when_nothing_listens() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let error = served_certificate::served_https_usable(
+        "app.example.test",
+        port,
+        std::sync::Arc::new(rustls::RootCertStore::empty()),
+        Duration::from_secs(2),
+    )
+    .unwrap_err();
+
+    assert!(format!("{error:#}").contains("connecting to 127.0.0.1"));
+}
+
+#[test]
+fn served_https_probe_errors_when_listener_closes_without_tls() {
+    // A listener that accepts TCP and immediately closes fails the
+    // handshake — TCP-up is not "serving".
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let _server = std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            drop(stream);
+        }
+    });
+
+    let error = served_certificate::served_https_usable(
+        "app.example.test",
+        port,
+        std::sync::Arc::new(rustls::RootCertStore::empty()),
+        Duration::from_secs(5),
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("handshake"));
 }
 
 #[test]
@@ -1731,4 +1896,99 @@ fn caddy_runtime_refresh_chown_failure_is_best_effort() {
         b"cert"
     );
     assert!(!runtime.join("certificates/tls.key").exists());
+}
+
+#[test]
+fn probe_ready_requires_init_ready_and_no_tls_marker() {
+    // init-ready is the boot gate; the TLS marker only subtracts.
+    for contents in ["ready", "ready\n", "  ready\n"] {
+        assert!(probe_ready(contents, false), "contents: {contents:?}");
+        assert!(!probe_ready(contents, true), "contents: {contents:?}");
+    }
+    for contents in ["", "not-ready\n", "tls-certificate-unusable\n", "readyx"] {
+        assert!(!probe_ready(contents, false), "contents: {contents:?}");
+        assert!(!probe_ready(contents, true), "contents: {contents:?}");
+    }
+}
+
+#[test]
+fn served_https_probe_honors_absolute_deadline_against_trickling_peer() {
+    // A peer that accepts and trickles bytes without ever completing TLS
+    // must not reset the handshake deadline: the probe returns an error
+    // in roughly the configured timeout, not whenever the peer stops. The
+    // peer announces a valid incomplete handshake record (type 0x16,
+    // TLS 1.2 version, a legal 64-byte body) then trickles one body byte
+    // every ~100 ms without finishing it, so the deadline — not an
+    // instant parse error — has to fire.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let _server = std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            std::thread::spawn(move || {
+                if std::io::Write::write_all(&mut stream, b"\x16\x03\x03\x00\x40").is_err() {
+                    return;
+                }
+                loop {
+                    if std::io::Write::write_all(&mut stream, &[0u8]).is_err() {
+                        return;
+                    }
+                    if std::io::Write::flush(&mut stream).is_err() {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            });
+        }
+    });
+
+    let started = std::time::Instant::now();
+    let error = served_certificate::served_https_usable(
+        "app.example.test",
+        port,
+        std::sync::Arc::new(rustls::RootCertStore::empty()),
+        Duration::from_millis(500),
+    )
+    .unwrap_err();
+    let elapsed = started.elapsed();
+
+    // The error must come from the deadline expiring, not an immediate
+    // parse failure, and the absolute deadline must hold: ≥~400 ms (the
+    // record could not have completed) and well under the unlimited-wait
+    // case.
+    assert!(
+        elapsed >= Duration::from_millis(400) && elapsed < Duration::from_secs(2),
+        "probe did not time out near the deadline: {elapsed:?}"
+    );
+    assert!(format!("{error:#}").contains("handshake"));
+}
+
+#[test]
+fn boot_marker_policy_holds_readiness_closed_in_broker_mode() {
+    // Broker mode boots with the marker present: `--probe-ready` must
+    // report unready even when init-ready already says ready, until the
+    // first successful served-TLS probe clears it. Non-broker mode drops
+    // any stale marker because nothing would ever remove it.
+    assert!(tls_marker_present_at_boot(true));
+    assert!(!tls_marker_present_at_boot(false));
+    assert!(!probe_ready("ready\n", tls_marker_present_at_boot(true)));
+    assert!(probe_ready("ready\n", tls_marker_present_at_boot(false)));
+}
+
+#[test]
+fn tls_unusable_marker_write_and_clear_roundtrip() {
+    let dir = tempdir().unwrap();
+    let marker = dir.path().join("run/enclava/tls-unusable");
+
+    assert!(!marker.exists());
+    mark_tls_unusable(&marker);
+    assert!(marker.exists());
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap(),
+        "tls-certificate-unusable\n"
+    );
+    clear_tls_unusable(&marker);
+    assert!(!marker.exists());
+    // Clearing a missing marker is fine (boot-time stale-state cleanup).
+    clear_tls_unusable(&marker);
 }
