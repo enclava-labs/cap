@@ -329,6 +329,16 @@ pub(crate) fn confidential_app_for_cc_hash(
         workload_security_profile,
         log_encryption,
     } = params;
+    // Trust-anchor parity (the seal-claim rule): the anchors are rendered
+    // into cc_init_data from the platform's installed value, so install
+    // the API's published value before hashing or producers of
+    // `expected_cc_init_data_hash` diverge.
+    if let Some(anchors) = deployment_context
+        .tls_certificate_trust_anchors_pem
+        .as_deref()
+    {
+        enclava_engine::manifest::cc_init_data::set_tls_certificate_trust_anchors_pem(anchors);
+    }
     let api_signing_pubkey = deployment_context.api_signing_pubkey.trim().to_string();
     if api_signing_pubkey.is_empty() {
         return Err("platform deployment context did not include api_signing_pubkey".into());

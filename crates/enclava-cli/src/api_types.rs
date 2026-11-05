@@ -535,6 +535,10 @@ pub struct DeploymentContextResponse {
     pub api_signing_pubkey: String,
     #[serde(default)]
     pub tls_certificate_broker_url: Option<String>,
+    /// PEM trust anchors for workload TLS certificate validation, present
+    /// only when the platform pins a non-public tenant ACME issuer.
+    #[serde(default)]
+    pub tls_certificate_trust_anchors_pem: Option<String>,
     /// Whether the API's deployed enclava-init performs the log-spool
     /// state-PVC bind (cap#290 review). An API deployment capability, not
     /// release metadata: absent on older APIs, which default to false so

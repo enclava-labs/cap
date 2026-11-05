@@ -448,12 +448,32 @@ pub fn provision_static_tls_certificate(
     persistent_root: &Path,
     cooldown_file: &Path,
 ) -> Result<()> {
-    provision_with_policy(
-        cfg,
-        persistent_root,
-        TLS_SERVER_ROOTS,
-        &AcmeWait::production(cooldown_file),
-    )
+    // A configured anchor bundle replaces the public store entirely: the
+    // platform pins the issuers it expects (TLS_CERTIFICATE_VALIDATION.md)
+    // and trust is never inferred from URLs, chain contents, or broker
+    // responses. A malformed bundle fails closed — no public-store
+    // fallback.
+    let configured_anchors = cfg
+        .tls_certificate_trust_anchors_pem
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(parse_anchor_ders)
+        .transpose()?;
+    match configured_anchors.as_ref() {
+        Some(ders) => provision_with_policy(
+            cfg,
+            persistent_root,
+            &trust_anchors_from_ders(ders)?,
+            &AcmeWait::production(cooldown_file),
+        ),
+        None => provision_with_policy(
+            cfg,
+            persistent_root,
+            TLS_SERVER_ROOTS,
+            &AcmeWait::production(cooldown_file),
+        ),
+    }
 }
 
 /// Runtime variant of [`provision_static_tls_certificate`] used by the
@@ -880,6 +900,45 @@ fn renewal_due(now_secs: i64, not_before_secs: i64, not_after_secs: i64) -> bool
     }
     let total = not_after_secs - not_before_secs;
     total <= 0 || remaining.saturating_mul(3) < total
+}
+
+/// Parse a configured PEM trust-anchor bundle into DER certificates.
+///
+/// Fails closed: an empty bundle or any non-certificate PEM block is an
+/// error — a misconfigured anchor set must never silently fall back to the
+/// public root store.
+fn parse_anchor_ders(anchor_pem: &str) -> Result<Vec<CertificateDer<'static>>> {
+    let pems = pem::parse_many(anchor_pem).context("parsing tls_certificate_trust_anchors_pem")?;
+    if pems.is_empty() {
+        return Err(anyhow!(
+            "tls_certificate_trust_anchors_pem contains no PEM blocks"
+        ));
+    }
+    pems.iter()
+        .enumerate()
+        .map(|(index, block)| {
+            if block.tag() != "CERTIFICATE" {
+                return Err(anyhow!(
+                    "unexpected PEM block {:?} at position {index} in \
+                     tls_certificate_trust_anchors_pem",
+                    block.tag()
+                ));
+            }
+            Ok(CertificateDer::from(block.contents().to_vec()))
+        })
+        .collect()
+}
+
+/// Build webpki trust anchors from parsed DER certificates.
+fn trust_anchors_from_ders<'a>(
+    ders: &'a [CertificateDer<'static>],
+) -> Result<Vec<TrustAnchor<'a>>> {
+    ders.iter()
+        .map(|der| {
+            webpki::anchor_from_trusted_cert(der)
+                .map_err(|error| anyhow!("parsing trust anchor certificate: {error}"))
+        })
+        .collect()
 }
 
 /// Validate a PEM certificate chain against the retained private key, the
@@ -1925,6 +1984,79 @@ hkdf-info = "tls-state-luks-key"
             message.contains("validation failed"),
             "unexpected error: {message}"
         );
+    }
+
+    #[test]
+    fn configured_trust_anchors_accept_pinned_issuer_chains() {
+        // The staging/private-PKI path (TLS_CERTIFICATE_VALIDATION.md): the
+        // platform pins its reviewed anchors and the guest validates
+        // against them instead of the public store. Same synthetic chain
+        // the default path rejects above — the positive control for it.
+        let dir = tempdir().unwrap();
+        let (synthetic_root, chain) = mint_test_chain(TEST_HOSTNAMES, |_| {});
+        let synthetic_chain = full_chain_pem(&[&chain.chain_pem, &synthetic_root.cert.pem()]);
+        let persistent = write_retained_state(dir.path(), &synthetic_chain, &chain.leaf_key_pem);
+
+        let mut cfg = broker_config(dir.path(), TEST_HOSTNAMES);
+        cfg.tls_certificate_trust_anchors_pem = Some(synthetic_root.cert.pem());
+        provision_static_tls_certificate(&cfg, &persistent, &dir.path().join("init-acme-cooldown"))
+            .expect("the configured anchors accept the pinned-issuer chain");
+    }
+
+    #[test]
+    fn configured_trust_anchors_reject_other_issuers() {
+        // The configured set replaces the public store entirely — a chain
+        // from any other root is rejected exactly like an untrusted chain.
+        let dir = tempdir().unwrap();
+        let (chain_root, chain) = mint_test_chain(TEST_HOSTNAMES, |_| {});
+        let (other_root, _) = mint_test_chain(TEST_HOSTNAMES, |_| {});
+        let chain_pem = full_chain_pem(&[&chain.chain_pem, &chain_root.cert.pem()]);
+        let persistent = write_retained_state(dir.path(), &chain_pem, &chain.leaf_key_pem);
+
+        let mut cfg = broker_config(dir.path(), TEST_HOSTNAMES);
+        cfg.tls_certificate_trust_anchors_pem = Some(other_root.cert.pem());
+        let error = provision_static_tls_certificate(
+            &cfg,
+            &persistent,
+            &dir.path().join("init-acme-cooldown"),
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("validation failed"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn malformed_configured_trust_anchors_fail_closed() {
+        // A malformed bundle must fail at parsing — and must never fall
+        // back to the public store, where the pinned-issuer chain would be
+        // rejected and hide the misconfiguration.
+        let dir = tempdir().unwrap();
+        let (synthetic_root, chain) = mint_test_chain(TEST_HOSTNAMES, |_| {});
+        let synthetic_chain = full_chain_pem(&[&chain.chain_pem, &synthetic_root.cert.pem()]);
+        let persistent = write_retained_state(dir.path(), &synthetic_chain, &chain.leaf_key_pem);
+
+        for garbage in [
+            "not a PEM bundle",
+            "-----BEGIN PRIVATE KEY-----\nZm9v\n-----END PRIVATE KEY-----",
+        ] {
+            let mut cfg = broker_config(dir.path(), TEST_HOSTNAMES);
+            cfg.tls_certificate_trust_anchors_pem = Some(garbage.to_string());
+            let error = provision_static_tls_certificate(
+                &cfg,
+                &persistent,
+                &dir.path().join("init-acme-cooldown"),
+            )
+            .unwrap_err();
+            let message = format!("{error:#}");
+            assert!(
+                !message.contains("validation failed"),
+                "malformed anchors must fail at parsing, not fall through to chain \
+                 validation: {message}"
+            );
+        }
     }
 
     #[test]

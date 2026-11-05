@@ -19,14 +19,15 @@ the workload-attested broker and validates retained state on the encrypted
   verifies the leaf was issued for exactly the retained/generated private key.
 - The public root store deliberately does not contain the Let's Encrypt
   **staging** roots, so staging-issued chains are rejected by default.
-  Production evidence (enclava-work, reviewed 2026-09-09) shows the live
-  `ACME_DIRECTORY_URL`/`TENANT_CADDY_ACME_CA`/signed-release
-  `tenant_caddy_acme_ca` all point at the production Let's Encrypt directory,
-  whose chains validate against the public store. A future staging deployment
-  needs explicit, separately reviewed trust support (e.g. pinned reviewed
-  staging roots plus a signed issuer selection); it must never be inferred
-  from URLs, chain contents, or broker responses, and it is not implemented
-  here.
+- A deployment whose tenant ACME issuer is not publicly trusted (the
+  Let's Encrypt staging directory, a private PKI) pins its reviewed trust
+  anchors through the platform instead: `TLS_CERTIFICATE_TRUST_ANCHORS_PEM`
+  (operator configuration, reviewed in the platform's GitOps surface) is
+  rendered into the **signed** cc_init_data as
+  `tls_certificate_trust_anchors_pem`, which **replaces** the public store
+  for every chain check (retained and fresh). The anchors are never
+  inferred from URLs, chain contents, or broker responses; an empty or
+  malformed bundle fails closed and never falls back to the public store.
 
 ## Retained-state policy
 

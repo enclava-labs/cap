@@ -643,6 +643,7 @@ fn unsigned_config() -> Config {
         workload_artifacts_url: Some("file:///artifacts.json".to_string()),
         tls_certificate_broker_url: None,
         tls_certificate_hostnames: Vec::new(),
+        tls_certificate_trust_anchors_pem: None,
         trustee_policy_url: Some("file:///policy.json".to_string()),
         kbs_attestation_token_url: "http://127.0.0.1:8006/aa/token?token_type=kbs".to_string(),
         cc_init_data_path: None,

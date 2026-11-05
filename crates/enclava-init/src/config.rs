@@ -159,6 +159,13 @@ pub struct Config {
     #[serde(default)]
     pub tls_certificate_hostnames: Vec<String>,
 
+    /// PEM trust anchors for workload TLS certificate validation. When
+    /// set, the bundle REPLACES the public webpki-roots store for every
+    /// chain check (TLS_CERTIFICATE_VALIDATION.md: pinned, reviewed roots
+    /// delivered through the signed cc_init_data).
+    #[serde(default)]
+    pub tls_certificate_trust_anchors_pem: Option<String>,
+
     #[serde(default)]
     pub trustee_policy_url: Option<String>,
 

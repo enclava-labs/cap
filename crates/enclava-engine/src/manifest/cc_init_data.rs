@@ -49,6 +49,40 @@ pub fn trustee_kbs_resource_url() -> String {
 /// value.
 static LUKS2_HEADER_SEAL_CLAIM: OnceLock<String> = OnceLock::new();
 
+/// PEM trust anchors for workload TLS certificate validation, rendered
+/// into the signed cc_init_data as `tls_certificate_trust_anchors_pem`.
+/// Sourced from the API's `TLS_CERTIFICATE_TRUST_ANCHORS_PEM` env (operator
+/// configuration, reviewed in the platform's GitOps surface). Producers of
+/// `expected_cc_init_data_hash` must render identical bytes — the same
+/// rule as [`set_luks2_header_seal_claim`]: the CLI installs the API's
+/// published (deployment-context) value before hashing instead of relying
+/// on its own environment. Empty/absent leaves the guest on the public
+/// webpki-roots store (publicly trusted tenant issuers).
+static TLS_CERTIFICATE_TRUST_ANCHORS_PEM: OnceLock<String> = OnceLock::new();
+
+/// Install the platform's anchor set before rendering (called by
+/// producers that must hash identical cc_init_data bytes — see
+/// [`tls_certificate_trust_anchors_pem`]).
+pub fn set_tls_certificate_trust_anchors_pem(value: &str) {
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        return;
+    }
+    let _ = TLS_CERTIFICATE_TRUST_ANCHORS_PEM.set(value);
+}
+
+/// The anchors rendered into cc_init_data: the installed value when set,
+/// else the `TLS_CERTIFICATE_TRUST_ANCHORS_PEM` env fallback.
+pub fn tls_certificate_trust_anchors_pem() -> Option<String> {
+    TLS_CERTIFICATE_TRUST_ANCHORS_PEM
+        .get()
+        .cloned()
+        .or_else(|| {
+            nonempty_env("TLS_CERTIFICATE_TRUST_ANCHORS_PEM")
+                .map(|value| value.replace("\\n", "\n"))
+        })
+}
+
 /// Install the release-sourced rollout claim (called once at process
 /// startup by producers that have verified a signed platform release).
 pub fn set_luks2_header_seal_claim(value: &str) {
@@ -408,6 +442,9 @@ pub fn build_toml_with_options(app: &ConfidentialApp, options: &CcInitDataOption
                 &serde_json::to_string(&tls_certificate_hostnames(app))
                     .expect("hostname list serialization is infallible"),
             );
+            if let Some(anchors) = tls_certificate_trust_anchors_pem() {
+                push_toml_string(&mut toml, "tls_certificate_trust_anchors_pem", &anchors);
+            }
         }
         if let Some(url) = app
             .attestation
