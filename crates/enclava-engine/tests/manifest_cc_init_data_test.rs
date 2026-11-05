@@ -1,9 +1,10 @@
 use enclava_engine::manifest::cc_init_data::{
     ALLOW_DEV_RUNTIME_CLASS_ENV, COCO_DEV_RUNTIME_CLASS, CcInitDataOptions, DEFAULT_RUNTIME_CLASS,
     RUNTIME_CLASS_ENV, RuntimeClassConfigError, build_toml, build_toml_with_options,
-    encode_cc_init_data, resolve_runtime_class_with_env, sha256_hex,
-    validate_luks2_header_seal_claim,
+    encode_cc_init_data, resolve_runtime_class_with_env, set_tls_certificate_trust_anchors_pem,
+    sha256_hex, validate_luks2_header_seal_claim,
 };
+use enclava_engine::manifest::enclava_init_config::generate_enclava_init_configmap;
 use enclava_engine::testutil::sample_app;
 use enclava_engine::types::{
     GeneratedAgentPolicy, WorkloadArtifactBinding, WorkloadSecurityProfile,
@@ -714,4 +715,49 @@ fn v2_log_spool_storage_claim_is_bound_to_cc_init_data() {
         .and_then(toml::Value::as_table)
         .unwrap();
     assert!(no_log_data.get("log_spool_storage").is_none());
+}
+
+#[test]
+fn configured_anchors_render_into_both_guest_documents() {
+    // Regression (PR #354 round 1): the anchors reached the signed claim
+    // but not the ConfigMap the guest reads — the guest never saw them.
+    // Both documents are runtime outputs of the production renderers. The
+    // install is process-global (first-set-wins), harmless here: every
+    // other test in this binary asserts positive content or hash
+    // properties, never key absence.
+    set_tls_certificate_trust_anchors_pem(Some(
+        "-----BEGIN CERTIFICATE-----\nQUFBQQ==\n-----END CERTIFICATE-----",
+    ));
+    let mut app = sample_app();
+    app.attestation.trustee_policy_read_available = true;
+    app.attestation.tls_certificate_broker_url = Some("https://broker.example.test".to_string());
+    app.attestation.trustee_policy_url = Some("https://broker.example.test/policy".to_string());
+    app.attestation.workload_artifacts_url =
+        Some("https://broker.example.test/artifacts".to_string());
+
+    let claim = build_toml(&app);
+    assert!(
+        claim.contains("tls_certificate_trust_anchors_pem"),
+        "the signed claim must carry the anchors"
+    );
+    assert!(
+        claim.contains("QUFBQQ=="),
+        "the claim must carry the anchor bytes"
+    );
+
+    let configmap = generate_enclava_init_configmap(&app);
+    let config = configmap
+        .data
+        .as_ref()
+        .expect("configmap data")
+        .get("config.toml")
+        .expect("config.toml rendered");
+    assert!(
+        config.contains("tls-certificate-trust-anchors-pem"),
+        "the ConfigMap the guest reads must carry the anchors"
+    );
+    assert!(
+        config.contains("QUFBQQ=="),
+        "the ConfigMap must carry the anchor bytes"
+    );
 }

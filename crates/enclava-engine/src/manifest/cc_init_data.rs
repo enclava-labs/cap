@@ -972,23 +972,6 @@ mod anchor_tests {
         // fail-closed instead of silently widening trust.
         assert_eq!(normalize_anchor_pem("\\n\\n"), "");
     }
-
-    #[test]
-    fn both_renderers_carry_the_anchor_key() {
-        // Regression (PR #354 round 1): the anchors reached the signed
-        // claim but not the ConfigMap the init actually reads — the guest
-        // never saw them. Needle both renderers.
-        let claim = include_str!("cc_init_data.rs").replace("\r\n", "\n");
-        let config = include_str!("enclava_init_config.rs").replace("\r\n", "\n");
-        assert!(
-            claim.contains("\"tls_certificate_trust_anchors_pem\""),
-            "cc_init_data must render the anchor claim"
-        );
-        assert!(
-            config.contains("\"tls-certificate-trust-anchors-pem\""),
-            "the ConfigMap renderer must render the anchor transport key"
-        );
-    }
 }
 
 #[cfg(test)]
