@@ -49,6 +49,53 @@ pub fn trustee_kbs_resource_url() -> String {
 /// value.
 static LUKS2_HEADER_SEAL_CLAIM: OnceLock<String> = OnceLock::new();
 
+/// PEM trust anchors for workload TLS certificate validation, rendered
+/// into the signed cc_init_data AND the workload ConfigMap as
+/// `tls_certificate_trust_anchors_pem`. Sourced from the API's
+/// `TLS_CERTIFICATE_TRUST_ANCHORS_PEM` env (operator configuration,
+/// reviewed in the platform's GitOps surface). Producers of
+/// `expected_cc_init_data_hash` must render identical bytes — the same
+/// rule as [`set_luks2_header_seal_claim`]: the CLI installs the API's
+/// published (deployment-context) value before hashing instead of relying
+/// on its own environment. Absent/empty leaves the guest on the public
+/// webpki-roots store (publicly trusted tenant issuers).
+static TLS_CERTIFICATE_TRUST_ANCHORS_PEM: OnceLock<Option<String>> = OnceLock::new();
+
+/// Normalize the anchor bundle: the escaped-newline form decodes to real
+/// newlines, and the decoded bundle is trimmed. The single normalized
+/// form is what both producers hash, so API and CLI renders cannot
+/// diverge on trailing whitespace.
+fn normalize_anchor_pem(raw: &str) -> String {
+    raw.replace("\\n", "\n").trim().to_string()
+}
+
+/// Install the platform's anchor set before rendering (called by
+/// producers that must hash identical cc_init_data bytes — see
+/// [`tls_certificate_trust_anchors_pem`]). `None` records "the platform
+/// pins no anchors" explicitly and disables the env fallback, so a
+/// producer's local environment can never diverge from the API's render.
+/// A present-but-blank value is preserved (not filtered): the guest
+/// rejects it fail-closed instead of silently widening trust to the
+/// public store.
+pub fn set_tls_certificate_trust_anchors_pem(value: Option<&str>) {
+    let _ = TLS_CERTIFICATE_TRUST_ANCHORS_PEM.set(value.map(normalize_anchor_pem));
+}
+
+/// The anchors rendered into cc_init_data and the ConfigMap: the
+/// installed value when set (including the explicit "none" record), else
+/// the `TLS_CERTIFICATE_TRUST_ANCHORS_PEM` env fallback. Absent leaves
+/// the guest on the public webpki-roots store; a present-but-empty value
+/// is preserved so the guest fails closed.
+pub fn tls_certificate_trust_anchors_pem() -> Option<String> {
+    match TLS_CERTIFICATE_TRUST_ANCHORS_PEM.get() {
+        Some(value) => value.clone(),
+        None => match std::env::var("TLS_CERTIFICATE_TRUST_ANCHORS_PEM") {
+            Ok(value) => Some(normalize_anchor_pem(&value)),
+            Err(_) => None,
+        },
+    }
+}
+
 /// Install the release-sourced rollout claim (called once at process
 /// startup by producers that have verified a signed platform release).
 pub fn set_luks2_header_seal_claim(value: &str) {
@@ -408,6 +455,9 @@ pub fn build_toml_with_options(app: &ConfidentialApp, options: &CcInitDataOption
                 &serde_json::to_string(&tls_certificate_hostnames(app))
                     .expect("hostname list serialization is infallible"),
             );
+            if let Some(anchors) = tls_certificate_trust_anchors_pem() {
+                push_toml_string(&mut toml, "tls_certificate_trust_anchors_pem", &anchors);
+            }
         }
         if let Some(url) = app
             .attestation
@@ -898,6 +948,29 @@ pub fn verify_runtime_class_binding(
             "rendered Pod runtimeClassName is `{other}`, expected `{expected}`"
         )),
         None => Err("rendered Pod has no runtimeClassName".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod anchor_tests {
+    use super::normalize_anchor_pem;
+
+    #[test]
+    fn normalization_unescapes_then_trims_on_every_path() {
+        // The API render (env path) and the CLI render (installed path)
+        // must hash identical bytes: an escaped bundle with a trailing
+        // newline converges to the trimmed decoded form.
+        assert_eq!(
+            normalize_anchor_pem(
+                "-----BEGIN CERTIFICATE-----\\nYQ==\\n-----END CERTIFICATE-----\\n"
+            ),
+            "-----BEGIN CERTIFICATE-----\nYQ==\n-----END CERTIFICATE-----"
+        );
+        assert_eq!(normalize_anchor_pem("  pem  "), "pem");
+        // Escaped-newline-only bundles normalize to empty and are
+        // preserved as present-but-empty: the guest rejects them
+        // fail-closed instead of silently widening trust.
+        assert_eq!(normalize_anchor_pem("\\n\\n"), "");
     }
 }
 

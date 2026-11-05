@@ -85,6 +85,11 @@ const SUPPORTED_SIG_ALGS: &[&dyn SignatureVerificationAlgorithm] = &[
     webpki::ring::RSA_PKCS1_2048_8192_SHA256,
     webpki::ring::RSA_PKCS1_2048_8192_SHA384,
     webpki::ring::RSA_PKCS1_2048_8192_SHA512,
+    // Private PKIs commonly sign with RSA-PSS — the configured-anchor
+    // path must verify those issuer signatures too.
+    webpki::ring::RSA_PSS_2048_8192_SHA256_LEGACY_KEY,
+    webpki::ring::RSA_PSS_2048_8192_SHA384_LEGACY_KEY,
+    webpki::ring::RSA_PSS_2048_8192_SHA512_LEGACY_KEY,
 ];
 
 /// Reuse clock tolerance for `notBefore`: broker-issued certificates can
@@ -448,12 +453,25 @@ pub fn provision_static_tls_certificate(
     persistent_root: &Path,
     cooldown_file: &Path,
 ) -> Result<()> {
-    provision_with_policy(
-        cfg,
-        persistent_root,
-        TLS_SERVER_ROOTS,
-        &AcmeWait::production(cooldown_file),
-    )
+    // A configured anchor bundle replaces the public store entirely: the
+    // platform pins the issuers it expects (TLS_CERTIFICATE_VALIDATION.md)
+    // and trust is never inferred from URLs, chain contents, or broker
+    // responses. A malformed or empty bundle fails closed — no
+    // public-store fallback (see `configured_trust_anchor_ders`).
+    match configured_trust_anchor_ders(cfg.tls_certificate_trust_anchors_pem.as_deref())? {
+        Some(ders) => provision_with_policy(
+            cfg,
+            persistent_root,
+            &trust_anchors_from_ders(&ders)?,
+            &AcmeWait::production(cooldown_file),
+        ),
+        None => provision_with_policy(
+            cfg,
+            persistent_root,
+            TLS_SERVER_ROOTS,
+            &AcmeWait::production(cooldown_file),
+        ),
+    }
 }
 
 /// Runtime variant of [`provision_static_tls_certificate`] used by the
@@ -470,7 +488,16 @@ pub fn renew_static_tls_certificate_without_waiting(
 ) -> Result<()> {
     let mut wait = AcmeWait::production(cooldown_file);
     wait.max_wait_rounds = 0;
-    provision_with_policy(cfg, persistent_root, TLS_SERVER_ROOTS, &wait)
+    // Same anchor selection as the boot path — a pinned issuer must renew.
+    match configured_trust_anchor_ders(cfg.tls_certificate_trust_anchors_pem.as_deref())? {
+        Some(ders) => provision_with_policy(
+            cfg,
+            persistent_root,
+            &trust_anchors_from_ders(&ders)?,
+            &wait,
+        ),
+        None => provision_with_policy(cfg, persistent_root, TLS_SERVER_ROOTS, &wait),
+    }
 }
 
 /// Same as [`provision_static_tls_certificate`], with the trust anchor set
@@ -882,6 +909,60 @@ fn renewal_due(now_secs: i64, not_before_secs: i64, not_after_secs: i64) -> bool
     total <= 0 || remaining.saturating_mul(3) < total
 }
 
+/// The configured trust-anchor bundle as parsed DERs: `None` when the
+/// platform pins nothing (the public webpki-roots store applies), `Err`
+/// for a present-but-empty or malformed bundle — the fail-closed contract
+/// (`TLS_CERTIFICATE_VALIDATION.md`), never a silent fallback to the
+/// public store. Shared by the provisioning, renewal, and served-probe
+/// paths so the anchor set is one decision everywhere.
+pub fn configured_trust_anchor_ders(
+    pem: Option<&str>,
+) -> Result<Option<Vec<CertificateDer<'static>>>> {
+    let Some(raw) = pem else {
+        return Ok(None);
+    };
+    Ok(Some(parse_anchor_ders(raw)?))
+}
+
+/// Parse a configured PEM trust-anchor bundle into DER certificates.
+///
+/// Fails closed: an empty bundle or any non-certificate PEM block is an
+/// error — a misconfigured anchor set must never silently fall back to the
+/// public root store.
+fn parse_anchor_ders(anchor_pem: &str) -> Result<Vec<CertificateDer<'static>>> {
+    let pems = pem::parse_many(anchor_pem).context("parsing tls_certificate_trust_anchors_pem")?;
+    if pems.is_empty() {
+        return Err(anyhow!(
+            "tls_certificate_trust_anchors_pem contains no PEM blocks"
+        ));
+    }
+    pems.iter()
+        .enumerate()
+        .map(|(index, block)| {
+            if block.tag() != "CERTIFICATE" {
+                return Err(anyhow!(
+                    "unexpected PEM block {:?} at position {index} in \
+                     tls_certificate_trust_anchors_pem",
+                    block.tag()
+                ));
+            }
+            Ok(CertificateDer::from(block.contents().to_vec()))
+        })
+        .collect()
+}
+
+/// Build webpki trust anchors from parsed DER certificates.
+fn trust_anchors_from_ders<'a>(
+    ders: &'a [CertificateDer<'static>],
+) -> Result<Vec<TrustAnchor<'a>>> {
+    ders.iter()
+        .map(|der| {
+            webpki::anchor_from_trusted_cert(der)
+                .map_err(|error| anyhow!("parsing trust anchor certificate: {error}"))
+        })
+        .collect()
+}
+
 /// Validate a PEM certificate chain against the retained private key, the
 /// configured hostnames, and the given trust anchors.
 ///
@@ -1068,6 +1149,82 @@ mod tests {
     use tempfile::tempdir;
 
     const TEST_HOSTNAMES: &[&str] = &["app.example.test", "www.example.test"];
+    /// RSA-PSS fixture root (openssl-minted 2026-11; rcgen cannot sign PSS).
+    const PSS_ROOT_PEM: &str = concat!(
+        "-----BEGIN CERTIFICATE-----\n",
+        "MIIDnzCCAlOgAwIBAgIUR/6yf3ZDwzFRSdequRlBxqV2V+cwQQYJKoZIhvcNAQEK\n",
+        "MDSgDzANBglghkgBZQMEAgEFAKEcMBoGCSqGSIb3DQEBCDANBglghkgBZQMEAgEF\n",
+        "AKIDAgEgMCMxITAfBgNVBAMMGEVuY2xhdmEgVGVzdCBQU1MgUm9vdCBDQTAeFw0y\n",
+        "NjExMDUxNzIxMTRaFw00NjEwMzExNzIxMTRaMCMxITAfBgNVBAMMGEVuY2xhdmEg\n",
+        "VGVzdCBQU1MgUm9vdCBDQTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEB\n",
+        "ALQeO16Ku5SLPWKTakkNZKglblNumk4yUp4XNa9KhK/BBdWSKRyaaacE5HN4aDbA\n",
+        "/40rb0xKdrENSdb8K5TGgshmBynHUCF3v3gCa2USFZ63uz9QWt2AbsnWNH//KKx4\n",
+        "tVJc3j7UPZlI8Ve4OGEOLpa5mtimFtPxTZnYp0KgVzqW/k/Uohlexud3/2YuABrK\n",
+        "ce4ZWFpX128g6v6FGzt6GAOumbMv+cG2i0cIA+I/WY+ulBbvxOIYQrTAZOExNqro\n",
+        "vzBCh4V2LkLUlNVCC3Af35/bv+nEshdniNTw/nYZagoZxDn1+emto2Qy/cN1TiAl\n",
+        "WKFl69bdB5FdNgBs4fvc3IMCAwEAAaNjMGEwHQYDVR0OBBYEFF4sBRiUTjo9SuXn\n",
+        "Nqsok6CbZEupMB8GA1UdIwQYMBaAFF4sBRiUTjo9SuXnNqsok6CbZEupMA8GA1Ud\n",
+        "EwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEGMEEGCSqGSIb3DQEBCjA0oA8wDQYJ\n",
+        "YIZIAWUDBAIBBQChHDAaBgkqhkiG9w0BAQgwDQYJYIZIAWUDBAIBBQCiAwIBIAOC\n",
+        "AQEAANl3/ntDKXnO4aDRRYKpKewlcRC5CNfquGH7PV6Q5DLE/o6Wm6UjZ8fdYwwu\n",
+        "lJ0GqvZHBGRuk4cACykrwcXBdULDrz+vj/Yylr61kUt0xaU4HSl+PZxr76JZX4OK\n",
+        "TvixCNqDv3Oi1QVcqCHeltHSE6mi9v4T5gNpVp3Xh/q+tE8hout7y1lIz5PDSJPc\n",
+        "ozOZa5MdT0gUHFNyExNof0kvZ7aX1/p6sFOSNeVTWtSvqFksoRLwj2spxN7ZfzWG\n",
+        "BSVjZtqkljHZxH9gbHmzht3iFRJJ4byb/fFmaNie5u35A0KwCgf7gbDGARbghhTT\n",
+        "caoaqN7Mc9PBdzkarAIzdQHGVQ==\n",
+        "-----END CERTIFICATE-----\n"
+    );
+    /// Fixture chain: ECDSA leaf issued under the RSA-PSS root.
+    const PSS_CHAIN_PEM: &str = concat!(
+        "-----BEGIN CERTIFICATE-----\n",
+        "MIIC2jCCAY6gAwIBAgIUO1pzyQElpxKtryZRLeozvDY++oswQQYJKoZIhvcNAQEK\n",
+        "MDSgDzANBglghkgBZQMEAgEFAKEcMBoGCSqGSIb3DQEBCDANBglghkgBZQMEAgEF\n",
+        "AKIDAgEgMCMxITAfBgNVBAMMGEVuY2xhdmEgVGVzdCBQU1MgUm9vdCBDQTAeFw0y\n",
+        "NjExMDUxNzIxMTRaFw00NjEwMzExNzIxMTRaMBsxGTAXBgNVBAMMEGFwcC5leGFt\n",
+        "cGxlLnRlc3QwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAS1mnN9EwJiEnkxNpR6\n",
+        "5pITeFjZnVd+fBsEtSKV9qFVdzEassr4mE95Fk+edPyBJ8VpRaPwmCS+TEOrnzIv\n",
+        "8YcIo3EwbzAtBgNVHREEJjAkghBhcHAuZXhhbXBsZS50ZXN0ghB3d3cuZXhhbXBs\n",
+        "ZS50ZXN0MB0GA1UdDgQWBBSEXGIMv1DO4gQEDZmcgnxXc01kHzAfBgNVHSMEGDAW\n",
+        "gBReLAUYlE46PUrl5zarKJOgm2RLqTBBBgkqhkiG9w0BAQowNKAPMA0GCWCGSAFl\n",
+        "AwQCAQUAoRwwGgYJKoZIhvcNAQEIMA0GCWCGSAFlAwQCAQUAogMCASADggEBAC0h\n",
+        "nPft2HGBRf+b6CEmGdcvG+vuzSfs07RmrXglFFYJPwe26FuEElemdgCfYurTh5W7\n",
+        "kwtR/Mu4yFqHNWl4PFUpy2pKtslS/vP9St9MpoT0cSkDYmxmgVqdP1ks+REH0D9Y\n",
+        "th34GblFJNwsDxL/nogawg0+FPBZVrxZPTtbu8bOlJU4/nA0phGou5n+Y6mW6AkF\n",
+        "0r11MOJ+tsku4s0qdnmINZoTgyH5Ngf3L6RcBKJMn1zwNvtu1zR6LnrZWKSSVCKZ\n",
+        "kG0d85Skr/sj2LEcI6+EZediclmOp9tSBU5gJZMkfDbAsbGfJBnGIFoaqxt5wlbk\n",
+        "+fKrpwYw60qgwqqfcHw=\n",
+        "-----END CERTIFICATE-----\n",
+        "-----BEGIN CERTIFICATE-----\n",
+        "MIIDnzCCAlOgAwIBAgIUR/6yf3ZDwzFRSdequRlBxqV2V+cwQQYJKoZIhvcNAQEK\n",
+        "MDSgDzANBglghkgBZQMEAgEFAKEcMBoGCSqGSIb3DQEBCDANBglghkgBZQMEAgEF\n",
+        "AKIDAgEgMCMxITAfBgNVBAMMGEVuY2xhdmEgVGVzdCBQU1MgUm9vdCBDQTAeFw0y\n",
+        "NjExMDUxNzIxMTRaFw00NjEwMzExNzIxMTRaMCMxITAfBgNVBAMMGEVuY2xhdmEg\n",
+        "VGVzdCBQU1MgUm9vdCBDQTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEB\n",
+        "ALQeO16Ku5SLPWKTakkNZKglblNumk4yUp4XNa9KhK/BBdWSKRyaaacE5HN4aDbA\n",
+        "/40rb0xKdrENSdb8K5TGgshmBynHUCF3v3gCa2USFZ63uz9QWt2AbsnWNH//KKx4\n",
+        "tVJc3j7UPZlI8Ve4OGEOLpa5mtimFtPxTZnYp0KgVzqW/k/Uohlexud3/2YuABrK\n",
+        "ce4ZWFpX128g6v6FGzt6GAOumbMv+cG2i0cIA+I/WY+ulBbvxOIYQrTAZOExNqro\n",
+        "vzBCh4V2LkLUlNVCC3Af35/bv+nEshdniNTw/nYZagoZxDn1+emto2Qy/cN1TiAl\n",
+        "WKFl69bdB5FdNgBs4fvc3IMCAwEAAaNjMGEwHQYDVR0OBBYEFF4sBRiUTjo9SuXn\n",
+        "Nqsok6CbZEupMB8GA1UdIwQYMBaAFF4sBRiUTjo9SuXnNqsok6CbZEupMA8GA1Ud\n",
+        "EwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEGMEEGCSqGSIb3DQEBCjA0oA8wDQYJ\n",
+        "YIZIAWUDBAIBBQChHDAaBgkqhkiG9w0BAQgwDQYJYIZIAWUDBAIBBQCiAwIBIAOC\n",
+        "AQEAANl3/ntDKXnO4aDRRYKpKewlcRC5CNfquGH7PV6Q5DLE/o6Wm6UjZ8fdYwwu\n",
+        "lJ0GqvZHBGRuk4cACykrwcXBdULDrz+vj/Yylr61kUt0xaU4HSl+PZxr76JZX4OK\n",
+        "TvixCNqDv3Oi1QVcqCHeltHSE6mi9v4T5gNpVp3Xh/q+tE8hout7y1lIz5PDSJPc\n",
+        "ozOZa5MdT0gUHFNyExNof0kvZ7aX1/p6sFOSNeVTWtSvqFksoRLwj2spxN7ZfzWG\n",
+        "BSVjZtqkljHZxH9gbHmzht3iFRJJ4byb/fFmaNie5u35A0KwCgf7gbDGARbghhTT\n",
+        "caoaqN7Mc9PBdzkarAIzdQHGVQ==\n",
+        "-----END CERTIFICATE-----\n"
+    );
+    /// Fixture leaf key (synthetic ECDSA, test-only).
+    const PSS_LEAF_KEY_PEM: &str = concat!(
+        "-----BEGIN PRIVATE KEY-----\n",
+        "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgdgkT67+tK2XAYGUo\n",
+        "tcgBxqu33lMuILIkp/QsCZa+euChRANCAAS1mnN9EwJiEnkxNpR65pITeFjZnVd+\n",
+        "fBsEtSKV9qFVdzEassr4mE95Fk+edPyBJ8VpRaPwmCS+TEOrnzIv8YcI\n",
+        "-----END PRIVATE KEY-----\n",
+    );
     /// Synthetic provider secret planted in raw/malformed broker bodies; it
     /// must never reach any error chain, log field, or written file.
     const SYNTHETIC_PROVIDER_SENTINEL: &str = "SYNTHETIC-PROVIDER-SECRET";
@@ -1925,6 +2082,127 @@ hkdf-info = "tls-state-luks-key"
             message.contains("validation failed"),
             "unexpected error: {message}"
         );
+    }
+
+    #[test]
+    fn configured_anchors_accept_rsa_pss_issuer_chains() {
+        // Private PKIs commonly sign with RSA-PSS; the anchor path must
+        // verify those issuer signatures (PR #354 review). Fixture minted
+        // with openssl (rsassaPss issuer signature) because rcgen 0.14
+        // cannot sign PSS; regenerate the fixture after 2046.
+        let dir = tempdir().unwrap();
+        let persistent = write_retained_state(dir.path(), PSS_CHAIN_PEM, PSS_LEAF_KEY_PEM);
+
+        let mut cfg = broker_config(dir.path(), TEST_HOSTNAMES);
+        cfg.tls_certificate_trust_anchors_pem = Some(PSS_ROOT_PEM.to_string());
+        provision_static_tls_certificate(&cfg, &persistent, &dir.path().join("init-acme-cooldown"))
+            .expect("the anchor path must verify RSA-PSS issuer signatures");
+    }
+
+    #[test]
+    fn configured_trust_anchors_accept_pinned_issuer_chains() {
+        // The staging/private-PKI path (TLS_CERTIFICATE_VALIDATION.md): the
+        // platform pins its reviewed anchors and the guest validates
+        // against them instead of the public store. Same synthetic chain
+        // the default path rejects above — the positive control for it.
+        let dir = tempdir().unwrap();
+        let (synthetic_root, chain) = mint_test_chain(TEST_HOSTNAMES, |_| {});
+        let synthetic_chain = full_chain_pem(&[&chain.chain_pem, &synthetic_root.cert.pem()]);
+        let persistent = write_retained_state(dir.path(), &synthetic_chain, &chain.leaf_key_pem);
+
+        let mut cfg = broker_config(dir.path(), TEST_HOSTNAMES);
+        cfg.tls_certificate_trust_anchors_pem = Some(synthetic_root.cert.pem());
+        provision_static_tls_certificate(&cfg, &persistent, &dir.path().join("init-acme-cooldown"))
+            .expect("the configured anchors accept the pinned-issuer chain");
+    }
+
+    #[test]
+    fn configured_trust_anchors_reject_other_issuers() {
+        // The configured set replaces the public store entirely — a chain
+        // from any other root is rejected exactly like an untrusted chain.
+        let dir = tempdir().unwrap();
+        let (chain_root, chain) = mint_test_chain(TEST_HOSTNAMES, |_| {});
+        let (other_root, _) = mint_test_chain(TEST_HOSTNAMES, |_| {});
+        let chain_pem = full_chain_pem(&[&chain.chain_pem, &chain_root.cert.pem()]);
+        let persistent = write_retained_state(dir.path(), &chain_pem, &chain.leaf_key_pem);
+
+        let mut cfg = broker_config(dir.path(), TEST_HOSTNAMES);
+        cfg.tls_certificate_trust_anchors_pem = Some(other_root.cert.pem());
+        let error = provision_static_tls_certificate(
+            &cfg,
+            &persistent,
+            &dir.path().join("init-acme-cooldown"),
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("validation failed"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn malformed_configured_trust_anchors_fail_closed() {
+        // A malformed bundle must fail at parsing — and must never fall
+        // back to the public store, where the pinned-issuer chain would be
+        // rejected and hide the misconfiguration.
+        let dir = tempdir().unwrap();
+        let (synthetic_root, chain) = mint_test_chain(TEST_HOSTNAMES, |_| {});
+        let synthetic_chain = full_chain_pem(&[&chain.chain_pem, &synthetic_root.cert.pem()]);
+        let persistent = write_retained_state(dir.path(), &synthetic_chain, &chain.leaf_key_pem);
+
+        for garbage in [
+            "not a PEM bundle",
+            "-----BEGIN PRIVATE KEY-----\nZm9v\n-----END PRIVATE KEY-----",
+        ] {
+            let mut cfg = broker_config(dir.path(), TEST_HOSTNAMES);
+            cfg.tls_certificate_trust_anchors_pem = Some(garbage.to_string());
+            let error = provision_static_tls_certificate(
+                &cfg,
+                &persistent,
+                &dir.path().join("init-acme-cooldown"),
+            )
+            .unwrap_err();
+            let message = format!("{error:#}");
+            assert!(
+                !message.contains("validation failed"),
+                "malformed anchors must fail at parsing, not fall through to chain \
+                 validation: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicitly_empty_configured_trust_anchors_fail_closed() {
+        // A present-but-empty bundle is a configuration error (the
+        // fail-closed contract), never a silent fallback to the public
+        // store; absent stays on the public-store default.
+        let error = configured_trust_anchor_ders(Some(" \n ")).unwrap_err();
+        assert!(
+            error.to_string().contains("contains no PEM blocks"),
+            "present-but-empty must fail as a parse error: {error}"
+        );
+        assert!(configured_trust_anchor_ders(None).unwrap().is_none());
+    }
+
+    #[test]
+    fn renewal_entry_point_honors_configured_trust_anchors() {
+        // Regression (PR #354 review): the renewal tick passed the public
+        // store unconditionally, so a pinned-issuer retained certificate
+        // failed validation on every tick and could never renew.
+        let dir = tempdir().unwrap();
+        let (root, chain) = mint_test_chain(TEST_HOSTNAMES, |_| {});
+        let chain_pem = full_chain_pem(&[&chain.chain_pem, &root.cert.pem()]);
+        let persistent = write_retained_state(dir.path(), &chain_pem, &chain.leaf_key_pem);
+
+        let mut cfg = broker_config(dir.path(), TEST_HOSTNAMES);
+        cfg.tls_certificate_trust_anchors_pem = Some(root.cert.pem());
+        renew_static_tls_certificate_without_waiting(
+            &cfg,
+            &persistent,
+            &dir.path().join("init-acme-cooldown"),
+        )
+        .expect("the retained pinned-issuer chain must pass the renewal entry's validation");
     }
 
     #[test]

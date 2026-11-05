@@ -153,6 +153,7 @@ fn test_deployment_context() -> DeploymentContextResponse {
     DeploymentContextResponse {
         api_signing_pubkey: "test-api-signing-pubkey".to_string(),
         tls_certificate_broker_url: None,
+        tls_certificate_trust_anchors_pem: None,
         current_platform_release_id: None,
         platform_release_envelope: None,
         log_spool_state_bind_supported: false,
@@ -221,6 +222,7 @@ fn deployment_context_platform_release_is_verified_and_selected() {
     let deployment_context = DeploymentContextResponse {
         api_signing_pubkey: "test-api-signing-pubkey".to_string(),
         tls_certificate_broker_url: None,
+        tls_certificate_trust_anchors_pem: None,
         current_platform_release_id: Some(expected_release_id.clone()),
         platform_release_envelope: Some(envelope),
         log_spool_state_bind_supported: false,
@@ -246,6 +248,7 @@ fn deployment_context_platform_release_tampering_fails_closed() {
     let deployment_context = DeploymentContextResponse {
         api_signing_pubkey: "test-api-signing-pubkey".to_string(),
         tls_certificate_broker_url: None,
+        tls_certificate_trust_anchors_pem: None,
         current_platform_release_id: Some(envelope.payload.platform_release_version.clone()),
         platform_release_envelope: Some(envelope),
         log_spool_state_bind_supported: false,
@@ -334,6 +337,7 @@ fn signed_cc_hash_app_uses_api_deployment_context_without_env_exports() {
             "http://cap-api.cap.svc.cluster.local/api/v1/workload/tls/dns01-certificate"
                 .to_string(),
         ),
+        tls_certificate_trust_anchors_pem: None,
         current_platform_release_id: None,
         platform_release_envelope: None,
         log_spool_state_bind_supported: false,

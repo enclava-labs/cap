@@ -143,6 +143,13 @@ fn render_config_toml(app: &ConfidentialApp) -> String {
                 "tls-certificate-hostnames",
                 &tls_certificate_hostnames(app),
             );
+            if let Some(anchors) = cc_init_data::tls_certificate_trust_anchors_pem() {
+                push_optional_option(
+                    &mut out,
+                    "tls-certificate-trust-anchors-pem",
+                    Some(&anchors),
+                );
+            }
         }
         push_required_option(
             &mut out,
