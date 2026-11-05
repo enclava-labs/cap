@@ -85,6 +85,11 @@ const SUPPORTED_SIG_ALGS: &[&dyn SignatureVerificationAlgorithm] = &[
     webpki::ring::RSA_PKCS1_2048_8192_SHA256,
     webpki::ring::RSA_PKCS1_2048_8192_SHA384,
     webpki::ring::RSA_PKCS1_2048_8192_SHA512,
+    // Private PKIs commonly sign with RSA-PSS — the configured-anchor
+    // path must verify those issuer signatures too.
+    webpki::ring::RSA_PSS_2048_8192_SHA256_LEGACY_KEY,
+    webpki::ring::RSA_PSS_2048_8192_SHA384_LEGACY_KEY,
+    webpki::ring::RSA_PSS_2048_8192_SHA512_LEGACY_KEY,
 ];
 
 /// Reuse clock tolerance for `notBefore`: broker-issued certificates can
@@ -1144,6 +1149,82 @@ mod tests {
     use tempfile::tempdir;
 
     const TEST_HOSTNAMES: &[&str] = &["app.example.test", "www.example.test"];
+    /// RSA-PSS fixture root (openssl-minted 2026-11; rcgen cannot sign PSS).
+    const PSS_ROOT_PEM: &str = concat!(
+        "-----BEGIN CERTIFICATE-----\n",
+        "MIIDnzCCAlOgAwIBAgIUR/6yf3ZDwzFRSdequRlBxqV2V+cwQQYJKoZIhvcNAQEK\n",
+        "MDSgDzANBglghkgBZQMEAgEFAKEcMBoGCSqGSIb3DQEBCDANBglghkgBZQMEAgEF\n",
+        "AKIDAgEgMCMxITAfBgNVBAMMGEVuY2xhdmEgVGVzdCBQU1MgUm9vdCBDQTAeFw0y\n",
+        "NjExMDUxNzIxMTRaFw00NjEwMzExNzIxMTRaMCMxITAfBgNVBAMMGEVuY2xhdmEg\n",
+        "VGVzdCBQU1MgUm9vdCBDQTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEB\n",
+        "ALQeO16Ku5SLPWKTakkNZKglblNumk4yUp4XNa9KhK/BBdWSKRyaaacE5HN4aDbA\n",
+        "/40rb0xKdrENSdb8K5TGgshmBynHUCF3v3gCa2USFZ63uz9QWt2AbsnWNH//KKx4\n",
+        "tVJc3j7UPZlI8Ve4OGEOLpa5mtimFtPxTZnYp0KgVzqW/k/Uohlexud3/2YuABrK\n",
+        "ce4ZWFpX128g6v6FGzt6GAOumbMv+cG2i0cIA+I/WY+ulBbvxOIYQrTAZOExNqro\n",
+        "vzBCh4V2LkLUlNVCC3Af35/bv+nEshdniNTw/nYZagoZxDn1+emto2Qy/cN1TiAl\n",
+        "WKFl69bdB5FdNgBs4fvc3IMCAwEAAaNjMGEwHQYDVR0OBBYEFF4sBRiUTjo9SuXn\n",
+        "Nqsok6CbZEupMB8GA1UdIwQYMBaAFF4sBRiUTjo9SuXnNqsok6CbZEupMA8GA1Ud\n",
+        "EwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEGMEEGCSqGSIb3DQEBCjA0oA8wDQYJ\n",
+        "YIZIAWUDBAIBBQChHDAaBgkqhkiG9w0BAQgwDQYJYIZIAWUDBAIBBQCiAwIBIAOC\n",
+        "AQEAANl3/ntDKXnO4aDRRYKpKewlcRC5CNfquGH7PV6Q5DLE/o6Wm6UjZ8fdYwwu\n",
+        "lJ0GqvZHBGRuk4cACykrwcXBdULDrz+vj/Yylr61kUt0xaU4HSl+PZxr76JZX4OK\n",
+        "TvixCNqDv3Oi1QVcqCHeltHSE6mi9v4T5gNpVp3Xh/q+tE8hout7y1lIz5PDSJPc\n",
+        "ozOZa5MdT0gUHFNyExNof0kvZ7aX1/p6sFOSNeVTWtSvqFksoRLwj2spxN7ZfzWG\n",
+        "BSVjZtqkljHZxH9gbHmzht3iFRJJ4byb/fFmaNie5u35A0KwCgf7gbDGARbghhTT\n",
+        "caoaqN7Mc9PBdzkarAIzdQHGVQ==\n",
+        "-----END CERTIFICATE-----\n"
+    );
+    /// Fixture chain: ECDSA leaf issued under the RSA-PSS root.
+    const PSS_CHAIN_PEM: &str = concat!(
+        "-----BEGIN CERTIFICATE-----\n",
+        "MIIC2jCCAY6gAwIBAgIUO1pzyQElpxKtryZRLeozvDY++oswQQYJKoZIhvcNAQEK\n",
+        "MDSgDzANBglghkgBZQMEAgEFAKEcMBoGCSqGSIb3DQEBCDANBglghkgBZQMEAgEF\n",
+        "AKIDAgEgMCMxITAfBgNVBAMMGEVuY2xhdmEgVGVzdCBQU1MgUm9vdCBDQTAeFw0y\n",
+        "NjExMDUxNzIxMTRaFw00NjEwMzExNzIxMTRaMBsxGTAXBgNVBAMMEGFwcC5leGFt\n",
+        "cGxlLnRlc3QwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAS1mnN9EwJiEnkxNpR6\n",
+        "5pITeFjZnVd+fBsEtSKV9qFVdzEassr4mE95Fk+edPyBJ8VpRaPwmCS+TEOrnzIv\n",
+        "8YcIo3EwbzAtBgNVHREEJjAkghBhcHAuZXhhbXBsZS50ZXN0ghB3d3cuZXhhbXBs\n",
+        "ZS50ZXN0MB0GA1UdDgQWBBSEXGIMv1DO4gQEDZmcgnxXc01kHzAfBgNVHSMEGDAW\n",
+        "gBReLAUYlE46PUrl5zarKJOgm2RLqTBBBgkqhkiG9w0BAQowNKAPMA0GCWCGSAFl\n",
+        "AwQCAQUAoRwwGgYJKoZIhvcNAQEIMA0GCWCGSAFlAwQCAQUAogMCASADggEBAC0h\n",
+        "nPft2HGBRf+b6CEmGdcvG+vuzSfs07RmrXglFFYJPwe26FuEElemdgCfYurTh5W7\n",
+        "kwtR/Mu4yFqHNWl4PFUpy2pKtslS/vP9St9MpoT0cSkDYmxmgVqdP1ks+REH0D9Y\n",
+        "th34GblFJNwsDxL/nogawg0+FPBZVrxZPTtbu8bOlJU4/nA0phGou5n+Y6mW6AkF\n",
+        "0r11MOJ+tsku4s0qdnmINZoTgyH5Ngf3L6RcBKJMn1zwNvtu1zR6LnrZWKSSVCKZ\n",
+        "kG0d85Skr/sj2LEcI6+EZediclmOp9tSBU5gJZMkfDbAsbGfJBnGIFoaqxt5wlbk\n",
+        "+fKrpwYw60qgwqqfcHw=\n",
+        "-----END CERTIFICATE-----\n",
+        "-----BEGIN CERTIFICATE-----\n",
+        "MIIDnzCCAlOgAwIBAgIUR/6yf3ZDwzFRSdequRlBxqV2V+cwQQYJKoZIhvcNAQEK\n",
+        "MDSgDzANBglghkgBZQMEAgEFAKEcMBoGCSqGSIb3DQEBCDANBglghkgBZQMEAgEF\n",
+        "AKIDAgEgMCMxITAfBgNVBAMMGEVuY2xhdmEgVGVzdCBQU1MgUm9vdCBDQTAeFw0y\n",
+        "NjExMDUxNzIxMTRaFw00NjEwMzExNzIxMTRaMCMxITAfBgNVBAMMGEVuY2xhdmEg\n",
+        "VGVzdCBQU1MgUm9vdCBDQTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEB\n",
+        "ALQeO16Ku5SLPWKTakkNZKglblNumk4yUp4XNa9KhK/BBdWSKRyaaacE5HN4aDbA\n",
+        "/40rb0xKdrENSdb8K5TGgshmBynHUCF3v3gCa2USFZ63uz9QWt2AbsnWNH//KKx4\n",
+        "tVJc3j7UPZlI8Ve4OGEOLpa5mtimFtPxTZnYp0KgVzqW/k/Uohlexud3/2YuABrK\n",
+        "ce4ZWFpX128g6v6FGzt6GAOumbMv+cG2i0cIA+I/WY+ulBbvxOIYQrTAZOExNqro\n",
+        "vzBCh4V2LkLUlNVCC3Af35/bv+nEshdniNTw/nYZagoZxDn1+emto2Qy/cN1TiAl\n",
+        "WKFl69bdB5FdNgBs4fvc3IMCAwEAAaNjMGEwHQYDVR0OBBYEFF4sBRiUTjo9SuXn\n",
+        "Nqsok6CbZEupMB8GA1UdIwQYMBaAFF4sBRiUTjo9SuXnNqsok6CbZEupMA8GA1Ud\n",
+        "EwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEGMEEGCSqGSIb3DQEBCjA0oA8wDQYJ\n",
+        "YIZIAWUDBAIBBQChHDAaBgkqhkiG9w0BAQgwDQYJYIZIAWUDBAIBBQCiAwIBIAOC\n",
+        "AQEAANl3/ntDKXnO4aDRRYKpKewlcRC5CNfquGH7PV6Q5DLE/o6Wm6UjZ8fdYwwu\n",
+        "lJ0GqvZHBGRuk4cACykrwcXBdULDrz+vj/Yylr61kUt0xaU4HSl+PZxr76JZX4OK\n",
+        "TvixCNqDv3Oi1QVcqCHeltHSE6mi9v4T5gNpVp3Xh/q+tE8hout7y1lIz5PDSJPc\n",
+        "ozOZa5MdT0gUHFNyExNof0kvZ7aX1/p6sFOSNeVTWtSvqFksoRLwj2spxN7ZfzWG\n",
+        "BSVjZtqkljHZxH9gbHmzht3iFRJJ4byb/fFmaNie5u35A0KwCgf7gbDGARbghhTT\n",
+        "caoaqN7Mc9PBdzkarAIzdQHGVQ==\n",
+        "-----END CERTIFICATE-----\n"
+    );
+    /// Fixture leaf key (synthetic ECDSA, test-only).
+    const PSS_LEAF_KEY_PEM: &str = concat!(
+        "-----BEGIN PRIVATE KEY-----\n",
+        "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgdgkT67+tK2XAYGUo\n",
+        "tcgBxqu33lMuILIkp/QsCZa+euChRANCAAS1mnN9EwJiEnkxNpR65pITeFjZnVd+\n",
+        "fBsEtSKV9qFVdzEassr4mE95Fk+edPyBJ8VpRaPwmCS+TEOrnzIv8YcI\n",
+        "-----END PRIVATE KEY-----\n",
+    );
     /// Synthetic provider secret planted in raw/malformed broker bodies; it
     /// must never reach any error chain, log field, or written file.
     const SYNTHETIC_PROVIDER_SENTINEL: &str = "SYNTHETIC-PROVIDER-SECRET";
@@ -2001,6 +2082,21 @@ hkdf-info = "tls-state-luks-key"
             message.contains("validation failed"),
             "unexpected error: {message}"
         );
+    }
+
+    #[test]
+    fn configured_anchors_accept_rsa_pss_issuer_chains() {
+        // Private PKIs commonly sign with RSA-PSS; the anchor path must
+        // verify those issuer signatures (PR #354 review). Fixture minted
+        // with openssl (rsassaPss issuer signature) because rcgen 0.14
+        // cannot sign PSS; regenerate the fixture after 2046.
+        let dir = tempdir().unwrap();
+        let persistent = write_retained_state(dir.path(), PSS_CHAIN_PEM, PSS_LEAF_KEY_PEM);
+
+        let mut cfg = broker_config(dir.path(), TEST_HOSTNAMES);
+        cfg.tls_certificate_trust_anchors_pem = Some(PSS_ROOT_PEM.to_string());
+        provision_static_tls_certificate(&cfg, &persistent, &dir.path().join("init-acme-cooldown"))
+            .expect("the anchor path must verify RSA-PSS issuer signatures");
     }
 
     #[test]

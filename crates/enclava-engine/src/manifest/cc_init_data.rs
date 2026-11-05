@@ -74,22 +74,25 @@ fn normalize_anchor_pem(raw: &str) -> String {
 /// [`tls_certificate_trust_anchors_pem`]). `None` records "the platform
 /// pins no anchors" explicitly and disables the env fallback, so a
 /// producer's local environment can never diverge from the API's render.
+/// A present-but-blank value is preserved (not filtered): the guest
+/// rejects it fail-closed instead of silently widening trust to the
+/// public store.
 pub fn set_tls_certificate_trust_anchors_pem(value: Option<&str>) {
-    let value = value
-        .map(normalize_anchor_pem)
-        .filter(|value| !value.is_empty());
-    let _ = TLS_CERTIFICATE_TRUST_ANCHORS_PEM.set(value);
+    let _ = TLS_CERTIFICATE_TRUST_ANCHORS_PEM.set(value.map(normalize_anchor_pem));
 }
 
 /// The anchors rendered into cc_init_data and the ConfigMap: the
 /// installed value when set (including the explicit "none" record), else
-/// the `TLS_CERTIFICATE_TRUST_ANCHORS_PEM` env fallback.
+/// the `TLS_CERTIFICATE_TRUST_ANCHORS_PEM` env fallback. Absent leaves
+/// the guest on the public webpki-roots store; a present-but-empty value
+/// is preserved so the guest fails closed.
 pub fn tls_certificate_trust_anchors_pem() -> Option<String> {
     match TLS_CERTIFICATE_TRUST_ANCHORS_PEM.get() {
         Some(value) => value.clone(),
-        None => nonempty_env("TLS_CERTIFICATE_TRUST_ANCHORS_PEM")
-            .map(|value| normalize_anchor_pem(&value))
-            .filter(|value| !value.is_empty()),
+        None => match std::env::var("TLS_CERTIFICATE_TRUST_ANCHORS_PEM") {
+            Ok(value) => Some(normalize_anchor_pem(&value)),
+            Err(_) => None,
+        },
     }
 }
 
@@ -964,6 +967,10 @@ mod anchor_tests {
             "-----BEGIN CERTIFICATE-----\nYQ==\n-----END CERTIFICATE-----"
         );
         assert_eq!(normalize_anchor_pem("  pem  "), "pem");
+        // Escaped-newline-only bundles normalize to empty and are
+        // preserved as present-but-empty: the guest rejects them
+        // fail-closed instead of silently widening trust.
+        assert_eq!(normalize_anchor_pem("\\n\\n"), "");
     }
 
     #[test]
