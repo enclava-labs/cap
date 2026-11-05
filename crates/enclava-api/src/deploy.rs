@@ -3800,16 +3800,14 @@ pub async fn cleanup_stale_tenant_image_pull_secrets_at_startup(
         Ok(true) => true,
         Ok(false) => {
             tracing::error!(
-                "tenant image pull secret cleanup did not converge: stale secrets may remain \
-                 and workload admission stays closed until a clean sweep converges"
+                "tenant image pull secret cleanup did not converge: stale secrets may remain"
             );
             false
         }
         Err(error) => {
             tracing::error!(
                 %error,
-                "tenant image pull secret cleanup failed; stale secrets may remain and \
-                 workload admission stays closed until a clean sweep converges"
+                "tenant image pull secret cleanup failed; stale secrets may remain"
             );
             false
         }
