@@ -62,7 +62,7 @@ pub enum Command {
     /// Authenticate with the platform
     Login(auth::LoginArgs),
     /// Show authenticated user and active organization
-    Whoami,
+    Whoami(auth::WhoamiArgs),
     /// Clear the saved platform session
     Logout,
     /// Generate enclava.toml for manual deployment
@@ -127,7 +127,7 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Command::Signup(args) => auth::signup(args).await,
         Command::Login(args) => auth::login(args).await,
-        Command::Whoami => auth::whoami().await,
+        Command::Whoami(args) => auth::whoami(args).await,
         Command::Logout => auth::logout().await,
         Command::Init(args) => init::init(args).await,
         Command::Prepare(args) => prepare::prepare(args).await,
@@ -208,6 +208,21 @@ mod tests {
         assert!(Cli::try_parse_from(["enclava", "signup", "--nostr", "--npub", "npub1x"]).is_ok());
         assert!(Cli::try_parse_from(["enclava", "login", "--replace-session"]).is_ok());
         assert!(Cli::try_parse_from(["enclava", "status", "--json"]).is_ok());
+    }
+
+    #[test]
+    fn json_flags_parse_on_data_commands() {
+        for argv in [
+            vec!["enclava", "whoami", "--json"],
+            vec!["enclava", "config", "get", "--json"],
+            vec!["enclava", "log-key", "list", "--json"],
+            vec!["enclava", "template", "list", "--json"],
+            vec!["enclava", "domains", "list", "--json"],
+            vec!["enclava", "key", "status", "--json"],
+        ] {
+            let label = argv.join(" ");
+            Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{label}: {e}"));
+        }
     }
 
     #[test]

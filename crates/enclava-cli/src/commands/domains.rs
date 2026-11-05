@@ -28,6 +28,9 @@ pub enum DomainsCommand {
         /// App name (defaults to enclava.toml app.name)
         #[arg(long)]
         app: Option<String>,
+        /// Print machine-readable JSON on stdout instead of the human report
+        #[arg(long)]
+        json: bool,
     },
     /// Remove a custom domain
     Remove {
@@ -88,11 +91,21 @@ pub async fn run(cmd: DomainsCommand) -> Result<(), Box<dyn std::error::Error>> 
             );
         }
 
-        DomainsCommand::List { app } => {
+        DomainsCommand::List { app, json } => {
             let app_name = resolve_app_name(&app)?;
             let api = build_api_client()?;
 
             let resp = api.get_domain(&app_name).await?;
+
+            if json {
+                // Stable shape: the API domain object as-is — every field
+                // always present, absent domains `null`.
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::to_value(&resp)?)?
+                );
+                return Ok(());
+            }
 
             println!("Domains for {app_name}:");
             println!("  Platform: https://{}", resp.platform_domain);

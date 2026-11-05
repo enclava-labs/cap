@@ -4100,3 +4100,87 @@ async fn deploy_unlock_touches_nothing_when_attestation_fails() {
         }
     }
 }
+
+#[test]
+fn log_key_json_entries_share_one_stable_shape_across_scopes() {
+    let app_key = LogEncryptionKey {
+        key_id: "logs-a".to_string(),
+        algorithm: "x25519".to_string(),
+        public_key_base64url: "pub".to_string(),
+        public_key_sha256: "sha".to_string(),
+        label: Some("laptop".to_string()),
+        status: "active".to_string(),
+        active_for_app: true,
+        selected_at: Some("2026-01-01T00:00:00Z".to_string()),
+        created_at: "2026-01-01T00:00:00Z".to_string(),
+        revoked_at: None,
+    };
+    let org_key = OrgLogEncryptionKey {
+        key_id: "logs-b".to_string(),
+        algorithm: "x25519".to_string(),
+        public_key_base64url: "pub".to_string(),
+        public_key_sha256: "sha".to_string(),
+        label: None,
+        status: "active".to_string(),
+        selected_by_count: 2,
+        created_at: "2026-01-01T00:00:00Z".to_string(),
+        revoked_at: None,
+    };
+
+    let app_payload = log_key_list_json_payload(
+        "app",
+        Some("demo"),
+        Some("logs-a"),
+        vec![app_log_key_json(&app_key)],
+    );
+    let org_payload =
+        log_key_list_json_payload("org", None, None, vec![org_log_key_json(&org_key)]);
+
+    // Envelope: every key always present in both scopes; scope-inapplicable
+    // fields are null, never missing.
+    for (payload, scope) in [(&app_payload, "app"), (&org_payload, "org")] {
+        assert_eq!(payload["scope"], serde_json::json!(scope));
+        for field in ["app_name", "active_key_id"] {
+            assert!(
+                payload.get(field).is_some(),
+                "{scope}: {field} must be present"
+            );
+        }
+    }
+    assert_eq!(app_payload["app_name"], serde_json::json!("demo"));
+    assert_eq!(org_payload["app_name"], serde_json::Value::Null);
+    assert_eq!(org_payload["active_key_id"], serde_json::Value::Null);
+
+    // Entries: one shape for both modes — same 11 fields, mode-only fields null.
+    let app_entry = &app_payload["keys"][0];
+    let org_entry = &org_payload["keys"][0];
+    for entry in [app_entry, org_entry] {
+        for field in [
+            "key_id",
+            "algorithm",
+            "public_key_base64url",
+            "public_key_sha256",
+            "label",
+            "status",
+            "created_at",
+            "revoked_at",
+            "active_for_app",
+            "selected_at",
+            "selected_by_count",
+        ] {
+            assert!(
+                entry.get(field).is_some(),
+                "entry field {field} must be present"
+            );
+        }
+    }
+    assert_eq!(app_entry["active_for_app"], serde_json::json!(true));
+    assert_eq!(
+        app_entry["selected_at"],
+        serde_json::json!("2026-01-01T00:00:00Z")
+    );
+    assert_eq!(app_entry["selected_by_count"], serde_json::Value::Null);
+    assert_eq!(org_entry["active_for_app"], serde_json::Value::Null);
+    assert_eq!(org_entry["selected_at"], serde_json::Value::Null);
+    assert_eq!(org_entry["selected_by_count"], serde_json::json!(2));
+}

@@ -1,4 +1,4 @@
-use clap::Subcommand;
+use clap::{Args, Subcommand};
 use ed25519_dalek::{Signature, VerifyingKey};
 use enclava_common::crypto::owner_rotation_directive_bytes;
 use sha2::{Digest, Sha256};
@@ -21,7 +21,7 @@ use enclava_cli::keys;
 #[derive(Subcommand)]
 pub enum KeyCommand {
     /// Show local recovery and deploy key status
-    Status,
+    Status(KeyStatusArgs),
     /// Export an encrypted recovery-seed backup
     Backup {
         /// Backup file path
@@ -91,7 +91,7 @@ pub enum KeyCommand {
 
 pub async fn run(cmd: KeyCommand) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
-        KeyCommand::Status => status().await,
+        KeyCommand::Status(args) => status(args).await,
         KeyCommand::Backup {
             output,
             org,
@@ -318,9 +318,81 @@ async fn verify_or_initialize_remote_keyring(
     }
 }
 
-async fn status() -> Result<(), Box<dyn std::error::Error>> {
+#[derive(Args)]
+pub struct KeyStatusArgs {
+    /// Print machine-readable JSON on stdout instead of the human report
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Machine-readable local key status with a stable shape — every key always
+/// present; values whose check did not run (no seed, no session, lookup
+/// failed) are `null`, never a value that reads as a verified result (the
+/// `status --json` contract).
+fn key_status_json_payload(
+    seed_present: bool,
+    seed_fingerprint: Option<String>,
+    active_org: Option<(String, String)>,
+    owner_key_fingerprint: Option<String>,
+    keyring_trust: Option<&str>,
+    stored_mnemonics: Option<(usize, Vec<String>)>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "recovery_seed": { "present": seed_present, "fingerprint": seed_fingerprint },
+        "active_org": active_org.map(|(name, id)| serde_json::json!({ "name": name, "id": id })),
+        "owner_key_fingerprint": owner_key_fingerprint,
+        "keyring_trust": keyring_trust,
+        "stored_recovery_mnemonics": stored_mnemonics.map(|(count, apps)| {
+            serde_json::json!({ "count": count, "apps": apps })
+        }),
+    })
+}
+
+async fn status(args: KeyStatusArgs) -> Result<(), Box<dyn std::error::Error>> {
     let paths = CliPaths::resolve()?;
     let seed = keys::load_recovery_seed(&paths)?;
+
+    if args.json {
+        let seed_fingerprint = seed.as_ref().map(keys::seed_fingerprint);
+        let mut active_org = None;
+        let mut owner_key_fingerprint = None;
+        let mut keyring_trust = None;
+        let mut stored_mnemonics = None;
+        if let Some(seed) = &seed
+            && let Some((_api, me)) = current_user(&paths).await?
+        {
+            let user_id = Uuid::parse_str(&me.user_id)?;
+            let org_id = Uuid::parse_str(&me.active_org.id)?;
+            let org_name = me.active_org.name.clone();
+            let owner = keys::derive_org_owner_key(user_id, org_id, seed)?;
+            active_org = Some((org_name.clone(), me.active_org.id.clone()));
+            owner_key_fingerprint = Some(fingerprint(&owner.public));
+            if let Some(trusted) = load_trusted_owner(&org_id)? {
+                keyring_trust = Some(if trusted.to_bytes() == owner.public.to_bytes() {
+                    "matches_local_trusted_owner"
+                } else {
+                    "does_not_match_local_trusted_owner"
+                });
+            }
+            stored_mnemonics = keys::list_app_mnemonics(&paths, &org_name)
+                .ok()
+                .map(|mnemonics| {
+                    let apps: Vec<String> = mnemonics.iter().map(|(a, _)| a.clone()).collect();
+                    (apps.len(), apps)
+                });
+        }
+        let payload = key_status_json_payload(
+            seed.is_some(),
+            seed_fingerprint,
+            active_org,
+            owner_key_fingerprint,
+            keyring_trust,
+            stored_mnemonics,
+        );
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        return Ok(());
+    }
+
     match seed {
         Some(seed) => {
             println!("Recovery seed: present");
@@ -953,6 +1025,53 @@ async fn rotate_owner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_status_json_payload_is_stable_with_nulls_for_unrun_checks() {
+        // Logged out, no seed: every check that did not run reads `null`,
+        // never as a verified result.
+        let payload = key_status_json_payload(false, None, None, None, None, None);
+        assert_eq!(
+            payload["recovery_seed"]["present"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            payload["recovery_seed"]["fingerprint"],
+            serde_json::Value::Null
+        );
+        assert_eq!(payload["active_org"], serde_json::Value::Null);
+        assert_eq!(payload["owner_key_fingerprint"], serde_json::Value::Null);
+        assert_eq!(payload["keyring_trust"], serde_json::Value::Null);
+        assert_eq!(
+            payload["stored_recovery_mnemonics"],
+            serde_json::Value::Null
+        );
+
+        // Full state: all keys present, empty mnemonic list is verified empty.
+        let payload = key_status_json_payload(
+            true,
+            Some("fp".to_string()),
+            Some(("org".to_string(), "id".to_string())),
+            Some("owner-fp".to_string()),
+            Some("matches_local_trusted_owner"),
+            Some((0, vec![])),
+        );
+        assert_eq!(payload["recovery_seed"]["present"], serde_json::json!(true));
+        assert_eq!(
+            payload["recovery_seed"]["fingerprint"],
+            serde_json::json!("fp")
+        );
+        assert_eq!(payload["active_org"]["name"], serde_json::json!("org"));
+        assert_eq!(payload["active_org"]["id"], serde_json::json!("id"));
+        assert_eq!(
+            payload["keyring_trust"],
+            serde_json::json!("matches_local_trusted_owner")
+        );
+        assert_eq!(
+            payload["stored_recovery_mnemonics"],
+            serde_json::json!({ "count": 0, "apps": [] })
+        );
+    }
 
     #[cfg(unix)]
     #[test]

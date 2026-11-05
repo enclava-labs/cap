@@ -21,6 +21,9 @@ pub enum ConfigCommand {
         /// App name (defaults to enclava.toml app.name)
         #[arg(long)]
         app: Option<String>,
+        /// Print machine-readable JSON on stdout instead of the human report
+        #[arg(long)]
+        json: bool,
     },
     /// Remove a config secret (takes effect at the workload's next boot)
     Unset {
@@ -106,11 +109,22 @@ pub async fn run(cmd: ConfigCommand) -> Result<(), Box<dyn std::error::Error>> {
             println!("Config updated ({} key(s)).", pairs.len());
         }
 
-        ConfigCommand::Get { app } => {
+        ConfigCommand::Get { app, json } => {
             let app_name = resolve_app_name(&app)?;
             let (api, _paths, _cli_config) = build_api_client()?;
 
             let resp = api.list_config_keys(&app_name).await?;
+
+            if json {
+                // Stable shape: key metadata only (values never leave the
+                // TEE); `keys: []` means verified empty.
+                let payload = serde_json::json!({
+                    "app_name": app_name,
+                    "keys": resp.keys,
+                });
+                println!("{}", serde_json::to_string_pretty(&payload)?);
+                return Ok(());
+            }
 
             if resp.keys.is_empty() {
                 println!("No config keys set for {app_name}.");

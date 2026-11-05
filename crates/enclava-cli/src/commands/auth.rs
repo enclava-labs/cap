@@ -651,12 +651,29 @@ fn try_open_browser(url: &str) -> bool {
         .any(|(program, args)| Command::new(program).args(*args).spawn().is_ok())
 }
 
-pub async fn whoami() -> Result<(), Box<dyn std::error::Error>> {
+#[derive(Args)]
+pub struct WhoamiArgs {
+    /// Print machine-readable JSON on stdout instead of the human report
+    #[arg(long)]
+    pub json: bool,
+}
+
+pub async fn whoami(args: WhoamiArgs) -> Result<(), Box<dyn std::error::Error>> {
     let paths = CliPaths::resolve()?;
     let cli_config = config::load_config(&paths)?;
     let creds = config::load_credentials(&paths)?;
     let api = ApiClient::from_config(&cli_config, &creds);
     let me = api.get_current_user().await?;
+
+    if args.json {
+        // Stable shape: the API identity object as-is — every field always
+        // present, absent values `null` (the `status --json` contract).
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::to_value(&me)?)?
+        );
+        return Ok(());
+    }
 
     println!("User: {} ({})", me.display_name, me.user_id);
     println!(

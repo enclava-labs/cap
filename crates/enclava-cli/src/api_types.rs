@@ -86,7 +86,7 @@ pub struct DeviceLoginPollResponse {
     pub auth: Option<AuthResponse>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CurrentUserResponse {
     pub user_id: String,
     pub display_name: String,
@@ -94,7 +94,7 @@ pub struct CurrentUserResponse {
     pub orgs: Vec<CurrentUserOrg>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CurrentUserOrg {
     pub id: String,
     pub name: String,
@@ -241,7 +241,7 @@ pub struct DeployResponse {
 
 // --- Hosted Templates ---
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostedTemplate {
     pub slug: String,
     pub name: String,
@@ -338,7 +338,7 @@ pub struct HostedTemplateEgressRule {
     pub ports: Vec<u16>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostedTemplateConfigKey {
     pub key: String,
     pub label: String,
@@ -352,7 +352,7 @@ pub struct HostedTemplateConfigKey {
     pub validation: Option<HostedTemplateConfigValidation>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostedTemplateConfigValidation {
     #[serde(default)]
     pub format: Option<String>,
@@ -1022,7 +1022,7 @@ impl<'de> Deserialize<'de> for ConfigKeysResponse {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ConfigKeyMeta {
     pub key: String,
     pub updated_at: String,
@@ -1050,7 +1050,7 @@ pub struct VerifyResponse {
     pub verified_at: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct DomainResponse {
     pub platform_domain: String,
     pub tee_domain: Option<String>,

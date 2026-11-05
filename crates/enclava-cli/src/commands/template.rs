@@ -80,7 +80,7 @@ const MAX_SSH_COMMAND_BYTES: usize = 256;
 #[derive(Subcommand)]
 pub enum TemplateCommand {
     /// List hosted templates available to the active organization
-    List,
+    List(TemplateListArgs),
     /// Deploy a hosted template instance
     Deploy(TemplateDeployArgs),
     /// Fetch and validate the PaaS-rendered stable SSH endpoint command for a hosted Debian SSH app
@@ -199,15 +199,31 @@ fn build_api_client() -> Result<ApiClient, Box<dyn std::error::Error>> {
 
 pub async fn run(cmd: TemplateCommand) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
-        TemplateCommand::List => list().await,
+        TemplateCommand::List(args) => list(args).await,
         TemplateCommand::Deploy(args) => deploy(args).await,
         TemplateCommand::SshCommand(args) => ssh_command(args).await,
     }
 }
 
-async fn list() -> Result<(), Box<dyn std::error::Error>> {
+#[derive(Args)]
+pub struct TemplateListArgs {
+    /// Print machine-readable JSON on stdout instead of the human report
+    #[arg(long)]
+    pub json: bool,
+}
+
+async fn list(args: TemplateListArgs) -> Result<(), Box<dyn std::error::Error>> {
     let api = build_api_client()?;
     let templates = api.list_templates().await?;
+    if args.json {
+        // Stable shape: the template DTOs as-is under `templates` (the raw
+        // contract — the human summaries derive from it); `[]` means none.
+        let payload = serde_json::json!({
+            "templates": serde_json::to_value(&templates)?,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        return Ok(());
+    }
     if templates.is_empty() {
         println!("No hosted templates are available.");
         return Ok(());

@@ -3212,6 +3212,9 @@ pub struct LogKeyAppArgs {
     /// App name (defaults to enclava.toml app.name)
     #[arg(long)]
     pub app: Option<String>,
+    /// Print machine-readable JSON on stdout instead of the human report
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args)]
@@ -3445,11 +3448,72 @@ fn verify_private_log_key_permissions(path: &Path) -> Result<(), Box<dyn std::er
     Ok(())
 }
 
+/// Machine-readable log-key listing: one stable shape for both scopes (the
+/// human listing mixes app and org views). Every key always present;
+/// scope-inapplicable fields are `null`. A unified key entry keeps automation
+/// on one parser for both modes.
+fn log_key_list_json_payload(
+    scope: &str,
+    app_name: Option<&str>,
+    active_key_id: Option<&str>,
+    keys: Vec<serde_json::Value>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "scope": scope,
+        "app_name": app_name,
+        "active_key_id": active_key_id,
+        "keys": keys,
+    })
+}
+
+fn app_log_key_json(key: &LogEncryptionKey) -> serde_json::Value {
+    serde_json::json!({
+        "key_id": key.key_id,
+        "algorithm": key.algorithm,
+        "public_key_base64url": key.public_key_base64url,
+        "public_key_sha256": key.public_key_sha256,
+        "label": key.label,
+        "status": key.status,
+        "created_at": key.created_at,
+        "revoked_at": key.revoked_at,
+        "active_for_app": key.active_for_app,
+        "selected_at": key.selected_at,
+        "selected_by_count": serde_json::Value::Null,
+    })
+}
+
+fn org_log_key_json(key: &OrgLogEncryptionKey) -> serde_json::Value {
+    serde_json::json!({
+        "key_id": key.key_id,
+        "algorithm": key.algorithm,
+        "public_key_base64url": key.public_key_base64url,
+        "public_key_sha256": key.public_key_sha256,
+        "label": key.label,
+        "status": key.status,
+        "created_at": key.created_at,
+        "revoked_at": key.revoked_at,
+        "active_for_app": serde_json::Value::Null,
+        "selected_at": serde_json::Value::Null,
+        "selected_by_count": key.selected_by_count,
+    })
+}
+
 async fn list_log_keys(args: LogKeyAppArgs) -> Result<(), Box<dyn std::error::Error>> {
     let (api, _paths, _cli_config) = build_api_client()?;
     match resolve_optional_app_name(&args.app)? {
         Some(app_name) => {
             let list = api.list_log_keys(&app_name).await?;
+            if args.json {
+                let keys = list.keys.iter().map(app_log_key_json).collect();
+                let payload = log_key_list_json_payload(
+                    "app",
+                    Some(&list.app_name),
+                    list.active_key_id.as_deref(),
+                    keys,
+                );
+                println!("{}", serde_json::to_string_pretty(&payload)?);
+                return Ok(());
+            }
             println!("App: {}", list.app_name);
             println!(
                 "Active key: {}",
@@ -3465,6 +3529,12 @@ async fn list_log_keys(args: LogKeyAppArgs) -> Result<(), Box<dyn std::error::Er
         }
         None => {
             let list = api.list_org_log_keys().await?;
+            if args.json {
+                let keys = list.keys.iter().map(org_log_key_json).collect();
+                let payload = log_key_list_json_payload("org", None, None, keys);
+                println!("{}", serde_json::to_string_pretty(&payload)?);
+                return Ok(());
+            }
             for key in list.keys {
                 println!(
                     "{} {} selected-by={} {}",
