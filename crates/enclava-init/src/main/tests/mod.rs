@@ -728,6 +728,12 @@ trustee_policy_read_available = "{trustee}"
     if let Some(gid) = cfg.managed_config_gid {
         out.push_str(&format!("managed_config_gid = {gid}\n"));
     }
+    if let Some(anchors) = cfg.tls_certificate_trust_anchors_pem.as_deref() {
+        out.push_str(&format!(
+            "tls_certificate_trust_anchors_pem = {}\n",
+            serde_json::to_string(anchors).unwrap()
+        ));
+    }
     if let Some(mode) = cfg.managed_config_dir_mode {
         out.push_str(&format!("managed_config_dir_mode = {mode}\n"));
     }
@@ -1355,6 +1361,31 @@ fn log_encryption_handoff_uses_single_cc_init_data_snapshot() {
     assert!(
         err.to_string()
             .contains("does not match signed cc_init_data claim")
+    );
+}
+
+#[test]
+fn signed_cc_init_data_claims_bind_configmap_anchor_bundles() {
+    // The anchors are host-transportable (ConfigMap) only when they match
+    // the signed claim — a host that swaps the pinned CA must be refused.
+    let dir = tempdir().unwrap();
+    let anchors = "-----BEGIN CERTIFICATE-----\nYWJj\n-----END CERTIFICATE-----";
+    let mut cfg = unsigned_config();
+    cfg.tls_certificate_trust_anchors_pem = Some(anchors.to_string());
+    let cc_path = dir.path().join("cc-init-data.toml");
+    std::fs::write(&cc_path, signed_cc_claims_toml(&cfg)).unwrap();
+    cfg.cc_init_data_path = Some(cc_path.display().to_string());
+    validate_transport(&cfg).expect("matching anchors must pass the cross-check");
+
+    let mut other = unsigned_config();
+    other.tls_certificate_trust_anchors_pem =
+        Some("-----BEGIN CERTIFICATE-----\nb3RoZXI=\n-----END CERTIFICATE-----".to_string());
+    std::fs::write(&cc_path, signed_cc_claims_toml(&other)).unwrap();
+    let err = validate_transport(&cfg).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("tls-certificate-trust-anchors-pem"),
+        "the anchors must be bound to the signed claim: {err}"
     );
 }
 

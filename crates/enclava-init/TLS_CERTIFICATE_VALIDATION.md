@@ -23,11 +23,15 @@ the workload-attested broker and validates retained state on the encrypted
   Let's Encrypt staging directory, a private PKI) pins its reviewed trust
   anchors through the platform instead: `TLS_CERTIFICATE_TRUST_ANCHORS_PEM`
   (operator configuration, reviewed in the platform's GitOps surface) is
-  rendered into the **signed** cc_init_data as
-  `tls_certificate_trust_anchors_pem`, which **replaces** the public store
-  for every chain check (retained and fresh). The anchors are never
-  inferred from URLs, chain contents, or broker responses; an empty or
-  malformed bundle fails closed and never falls back to the public store.
+  rendered as `tls_certificate_trust_anchors_pem` into the **signed
+  cc_init_data** and into the workload ConfigMap, and the init
+  cross-checks the ConfigMap value against the signed claim before any
+  value is used (a host-swapped bundle is refused). The configured
+  anchors **replace** the public store for every chain check —
+  provisioning, renewal, and the served-certificate probe. The anchors
+  are never inferred from URLs, chain contents, or broker responses; a
+  present-but-empty or malformed bundle fails closed and never falls
+  back to the public store.
 
 ## Retained-state policy
 

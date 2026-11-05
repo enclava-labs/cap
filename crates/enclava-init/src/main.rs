@@ -606,8 +606,9 @@ fn renew_workload_tls_certificate(cfg: &Config) -> Result<()> {
 }
 
 /// Probe the certificate tenant-ingress serves for the first configured
-/// hostname with a full validating TLS handshake — the same public root
-/// store the brokered-chain validation trusts. `Ok` means a client could
+/// hostname with a full validating TLS handshake — the same trust anchors
+/// the brokered-chain validation trusts: the configured pinned set when
+/// the platform pins one, else the public root store. `Ok` means a client could
 /// actually be served right now; every failure is an `Err`. The 5 s
 /// absolute deadline bounds a stalled or trickling handshake without
 /// parking the stay-alive loop; the Kubernetes probe threshold (30 s) is
@@ -618,12 +619,23 @@ fn served_https_usable(cfg: &Config) -> Result<()> {
         .tls_certificate_hostnames
         .first()
         .ok_or_else(|| anyhow!("tls-certificate-hostnames is empty"))?;
+    let mut roots = rustls::RootCertStore::empty();
+    match tls_certificate::configured_trust_anchor_ders(
+        cfg.tls_certificate_trust_anchors_pem.as_deref(),
+    )? {
+        Some(ders) => {
+            for der in ders {
+                roots
+                    .add(der)
+                    .map_err(|err| anyhow!("parsing tls_certificate_trust_anchors_pem: {err}"))?;
+            }
+        }
+        None => roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
+    }
     served_certificate::served_https_usable(
         host,
         TENANT_INGRESS_TLS_PORT,
-        std::sync::Arc::new(rustls::RootCertStore::from_iter(
-            webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
-        )),
+        std::sync::Arc::new(roots),
         Duration::from_secs(5),
     )
 }
@@ -953,6 +965,12 @@ fn validate_configmap_transport_against_signed_cc_init_data(
             "tls_certificate_hostnames",
             &cfg.tls_certificate_hostnames,
             "tls-certificate-hostnames",
+        )?;
+        require_optional_signed_config_match(
+            data,
+            "tls_certificate_trust_anchors_pem",
+            cfg.tls_certificate_trust_anchors_pem.as_deref(),
+            "tls-certificate-trust-anchors-pem",
         )?;
         require_signed_config_match(
             data,

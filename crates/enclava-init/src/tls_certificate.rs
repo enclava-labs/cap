@@ -451,20 +451,13 @@ pub fn provision_static_tls_certificate(
     // A configured anchor bundle replaces the public store entirely: the
     // platform pins the issuers it expects (TLS_CERTIFICATE_VALIDATION.md)
     // and trust is never inferred from URLs, chain contents, or broker
-    // responses. A malformed bundle fails closed — no public-store
-    // fallback.
-    let configured_anchors = cfg
-        .tls_certificate_trust_anchors_pem
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(parse_anchor_ders)
-        .transpose()?;
-    match configured_anchors.as_ref() {
+    // responses. A malformed or empty bundle fails closed — no
+    // public-store fallback (see `configured_trust_anchor_ders`).
+    match configured_trust_anchor_ders(cfg.tls_certificate_trust_anchors_pem.as_deref())? {
         Some(ders) => provision_with_policy(
             cfg,
             persistent_root,
-            &trust_anchors_from_ders(ders)?,
+            &trust_anchors_from_ders(&ders)?,
             &AcmeWait::production(cooldown_file),
         ),
         None => provision_with_policy(
@@ -490,7 +483,16 @@ pub fn renew_static_tls_certificate_without_waiting(
 ) -> Result<()> {
     let mut wait = AcmeWait::production(cooldown_file);
     wait.max_wait_rounds = 0;
-    provision_with_policy(cfg, persistent_root, TLS_SERVER_ROOTS, &wait)
+    // Same anchor selection as the boot path — a pinned issuer must renew.
+    match configured_trust_anchor_ders(cfg.tls_certificate_trust_anchors_pem.as_deref())? {
+        Some(ders) => provision_with_policy(
+            cfg,
+            persistent_root,
+            &trust_anchors_from_ders(&ders)?,
+            &wait,
+        ),
+        None => provision_with_policy(cfg, persistent_root, TLS_SERVER_ROOTS, &wait),
+    }
 }
 
 /// Same as [`provision_static_tls_certificate`], with the trust anchor set
@@ -900,6 +902,21 @@ fn renewal_due(now_secs: i64, not_before_secs: i64, not_after_secs: i64) -> bool
     }
     let total = not_after_secs - not_before_secs;
     total <= 0 || remaining.saturating_mul(3) < total
+}
+
+/// The configured trust-anchor bundle as parsed DERs: `None` when the
+/// platform pins nothing (the public webpki-roots store applies), `Err`
+/// for a present-but-empty or malformed bundle — the fail-closed contract
+/// (`TLS_CERTIFICATE_VALIDATION.md`), never a silent fallback to the
+/// public store. Shared by the provisioning, renewal, and served-probe
+/// paths so the anchor set is one decision everywhere.
+pub fn configured_trust_anchor_ders(
+    pem: Option<&str>,
+) -> Result<Option<Vec<CertificateDer<'static>>>> {
+    let Some(raw) = pem else {
+        return Ok(None);
+    };
+    Ok(Some(parse_anchor_ders(raw)?))
 }
 
 /// Parse a configured PEM trust-anchor bundle into DER certificates.
@@ -2057,6 +2074,39 @@ hkdf-info = "tls-state-luks-key"
                  validation: {message}"
             );
         }
+    }
+
+    #[test]
+    fn explicitly_empty_configured_trust_anchors_fail_closed() {
+        // A present-but-empty bundle is a configuration error (the
+        // fail-closed contract), never a silent fallback to the public
+        // store; absent stays on the public-store default.
+        let error = configured_trust_anchor_ders(Some(" \n ")).unwrap_err();
+        assert!(
+            error.to_string().contains("contains no PEM blocks"),
+            "present-but-empty must fail as a parse error: {error}"
+        );
+        assert!(configured_trust_anchor_ders(None).unwrap().is_none());
+    }
+
+    #[test]
+    fn renewal_entry_point_honors_configured_trust_anchors() {
+        // Regression (PR #354 review): the renewal tick passed the public
+        // store unconditionally, so a pinned-issuer retained certificate
+        // failed validation on every tick and could never renew.
+        let dir = tempdir().unwrap();
+        let (root, chain) = mint_test_chain(TEST_HOSTNAMES, |_| {});
+        let chain_pem = full_chain_pem(&[&chain.chain_pem, &root.cert.pem()]);
+        let persistent = write_retained_state(dir.path(), &chain_pem, &chain.leaf_key_pem);
+
+        let mut cfg = broker_config(dir.path(), TEST_HOSTNAMES);
+        cfg.tls_certificate_trust_anchors_pem = Some(root.cert.pem());
+        renew_static_tls_certificate_without_waiting(
+            &cfg,
+            &persistent,
+            &dir.path().join("init-acme-cooldown"),
+        )
+        .expect("the retained pinned-issuer chain must pass the renewal entry's validation");
     }
 
     #[test]
