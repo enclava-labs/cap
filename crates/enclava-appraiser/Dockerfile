@@ -9,7 +9,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --locked --release --bin enclava-appraiser && \
     cp target/release/enclava-appraiser /usr/local/bin/enclava-appraiser
 
-FROM alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
+FROM alpine:3.24.4@sha256:93b41ef40b1677fce8fcc64ff4af09daddfacf5040afde618bc46c1e2d1cc7d4
 RUN addgroup -g 1000 enclava && adduser -D -u 1000 -G enclava enclava
 COPY --from=builder /usr/local/bin/enclava-appraiser /usr/local/bin/enclava-appraiser
 USER enclava
