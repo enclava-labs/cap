@@ -6,6 +6,7 @@ use std::{
     time::Duration,
 };
 
+use crate::models::App;
 use enclava_common::descriptor::{DeploymentDescriptor, LaunchIdentity};
 use enclava_snp::AttestError;
 
@@ -109,6 +110,27 @@ pub(crate) async fn load_admissible_launch_identities(
     Ok(identities)
 }
 
+/// Build the attested, SPKI-pinned channel to the app's TEE endpoint for
+/// reads that carry no bearer token (e.g. `unlock_status`). Same identity
+/// authority and Gateway hairpin fallback as [`attest_teardown_channel`].
+pub(crate) async fn attested_tee_channel(
+    app: &App,
+    pool: &sqlx::PgPool,
+    kube_client: &kube::Client,
+    kds_base_url: Option<&str>,
+) -> Result<reqwest::Client, TeeAttestError> {
+    let identities = load_admissible_launch_identities(pool, app).await?;
+    let gateway_ip = crate::routes::logs::resolve_tenant_gateway_ip(
+        app.id,
+        kube_client,
+        &app.name,
+        &app.namespace,
+    )
+    .await;
+    let domain = app.tee_domain.as_deref().unwrap_or(&app.domain);
+    attest_teardown_channel(domain, gateway_ip, &identities, kds_base_url).await
+}
+
 /// Attest the TEE endpoint and return an SPKI-pinned HTTP client for it.
 ///
 /// Tries the resolved tenant-Gateway address first (hairpin-blocked
@@ -152,4 +174,28 @@ pub(crate) async fn attest_teardown_channel(
     builder
         .build()
         .map_err(|_| TeeAttestError::Attest(AttestError::Transport))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// No admissible launch identity must fail closed before any network
+    /// I/O — the same guarantee `attest_tee` gives every caller.
+    #[tokio::test]
+    async fn attest_teardown_channel_without_identity_fails_before_connecting() {
+        let error = attest_teardown_channel(
+            "app.tee.example.test",
+            None,
+            &[],
+            Some("http://127.0.0.1:1"),
+        )
+        .await
+        .expect_err("attestation without an expected launch must fail closed");
+        assert_eq!(error.category(), "attestation");
+        assert_eq!(
+            error.reason(),
+            "no signed deployment identity to bind TEE evidence"
+        );
+    }
 }

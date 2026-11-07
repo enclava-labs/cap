@@ -1162,17 +1162,35 @@ pub async fn unlock_status(
     let domain = app.tee_domain.as_deref().unwrap_or(&app.domain);
     let tee_url = format!("https://{domain}/.well-known/confidential");
 
-    let status_url = format!("https://{domain}/.well-known/confidential/status");
-    let ownership_state = match state.tee_http_client.get(&status_url).send().await {
-        Ok(resp) if resp.status().is_success() => {
-            resp.json::<serde_json::Value>().await.ok().and_then(|v| {
-                v.get("ownership_state")
-                    .or_else(|| v.get("state"))
-                    .and_then(|s| s.as_str())
-                    .map(String::from)
-            })
+    // Tenant TEE endpoints serve self-signed RA-TLS leaves; only the
+    // SNP-attested, SPKI-pinned channel authenticates them. Any failure is
+    // reported as `ownership_state: null` — never an unauthenticated read.
+    let tee_client = match crate::tee_attestation::attested_tee_channel(
+        &app,
+        &state.db,
+        &state.kube_client,
+        state
+            .attestation
+            .as_ref()
+            .and_then(|config| config.amd_kds_base_url.as_deref()),
+    )
+    .await
+    {
+        Ok(client) => Some(client),
+        Err(error) => {
+            tracing::warn!(
+                app_id = %app.id,
+                category = error.category(),
+                reason = error.reason(),
+                code = "unlock_status_attestation",
+                "unlock status TEE channel failed attestation"
+            );
+            None
         }
-        _ => None,
+    };
+    let ownership_state = match tee_client {
+        Some(client) => tee_ownership_state(&client, domain).await,
+        None => None,
     };
 
     Ok(Json(UnlockStatusResponse {
@@ -1180,6 +1198,47 @@ pub async fn unlock_status(
         tee_url,
         ownership_state,
     }))
+}
+
+/// Fetch and parse the guest `ownership_state` over an attested channel.
+/// Returns `None` on transport, non-2xx, or malformed responses.
+async fn tee_ownership_state(client: &reqwest::Client, domain: &str) -> Option<String> {
+    let status_url = format!("https://{domain}/.well-known/confidential/status");
+    match client.get(&status_url).send().await {
+        Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
+            Ok(v) => tee_ownership_state_from_value(&v),
+            Err(_) => {
+                tracing::warn!(
+                    code = "unlock_status_malformed",
+                    "unlock status TEE response was not JSON"
+                );
+                None
+            }
+        },
+        Ok(resp) => {
+            tracing::warn!(
+                status = %resp.status(),
+                code = "unlock_status_http",
+                "unlock status TEE returned non-success status"
+            );
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                code = "unlock_status_transport",
+                "unlock status TEE request failed"
+            );
+            None
+        }
+    }
+}
+
+fn tee_ownership_state_from_value(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("ownership_state")
+        .or_else(|| value.get("state"))
+        .and_then(|s| s.as_str())
+        .map(String::from)
 }
 
 #[derive(Debug, Serialize)]
@@ -1625,6 +1684,8 @@ pub async fn update_unlock_mode(
 
 #[cfg(test)]
 mod tests {
+    use axum::Json;
+    use axum::extract::{Path, State};
     use axum::http::StatusCode;
     use base64::{
         Engine as _,
@@ -1644,7 +1705,8 @@ mod tests {
         BUILTIN_AMD_ARK_SHA256_PINS, ReceiptEnvelope, ReceiptPayloadView, RequestedUnlockMode,
         SignedReceiptResponse, TransitionQuoteError, TransitionReceiptAttestation,
         TransitionSnpQuote, UnlockModeCommitRequest, auto_unlock_disabled_error,
-        commit_unlock_mode_transition, snp_guest_policy_allows_debug, transition_receipt_is_fresh,
+        commit_unlock_mode_transition, snp_guest_policy_allows_debug,
+        tee_ownership_state_from_value, transition_receipt_is_fresh, unlock_status,
         validate_transition, verify_transition_attestation, verify_transition_receipt,
         verify_transition_snp_quote,
     };
@@ -3627,5 +3689,59 @@ mod tests {
         let (status, body) = auto_unlock_disabled_error();
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body.0["error"], "auto_unlock_disabled");
+    }
+
+    #[test]
+    fn tee_ownership_state_parses_guest_status_fields() {
+        assert_eq!(
+            tee_ownership_state_from_value(&serde_json::json!({"ownership_state": "locked"})),
+            Some("locked".to_string())
+        );
+        assert_eq!(
+            tee_ownership_state_from_value(&serde_json::json!({"state": "unlocked"})),
+            Some("unlocked".to_string())
+        );
+        assert_eq!(
+            tee_ownership_state_from_value(&serde_json::json!({"ownership_state": 7})),
+            None
+        );
+        assert_eq!(tee_ownership_state_from_value(&serde_json::json!({})), None);
+    }
+
+    /// With no admissible launch identity the attested channel fails closed:
+    /// `ownership_state` must be null, and the unverified
+    /// `state.tee_http_client` must never be consulted (it would "succeed"
+    /// against a plain-HTTP double while attestation is impossible).
+    #[tokio::test]
+    async fn unlock_status_reports_null_when_attestation_fails() {
+        let pool = database_test_pool().await;
+        let fixture = insert_unlock_test_app(&pool).await;
+        let app_name = fixture.app.name.clone();
+
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        // A trap client: any use of the unverified channel fails the test.
+        state.tee_http_client = reqwest::Client::builder()
+            .https_only(true)
+            .build()
+            .expect("build trap client");
+
+        let auth = crate::auth::middleware::AuthContext {
+            user_id: fixture.user_id,
+            org_id: fixture.app.org_id,
+            org_name: "unlock-status-test".to_string(),
+            role: crate::models::Role::Owner,
+            api_key: None,
+            management_origin: crate::auth::middleware::ManagementOrigin::Public,
+        };
+
+        let Json(body) = unlock_status(auth, State(state), Path(app_name.clone()))
+            .await
+            .expect("unlock status must succeed");
+        assert_eq!(body.ownership_state, None);
+        assert_eq!(body.unlock_mode, "auto");
+        assert!(body.tee_url.ends_with("/.well-known/confidential"));
+
+        delete_unlock_test_org(&pool, fixture.app.org_id).await;
     }
 }
