@@ -842,8 +842,15 @@ fn build_sigstore_policy(policy: &VerificationPolicy) -> Result<SigstorePolicy, 
 /// tenant-supplied, digest-pinned reference is attacker-chosen — is checked
 /// against the allowlist, the literal-IP blocklist, and DNS before the
 /// unguarded transport dials anything.
+///
+/// `principal` partitions the egress-proxy connection budget (cap#266).
+/// Pass [`crate::egress_proxy::org_egress_principal`] for a tenant deploy
+/// and [`crate::egress_proxy::PLATFORM_EGRESS_PRINCIPAL`] for platform-owned
+/// fetches. The value is not logged; it is embedded in the proxy URL as
+/// Basic userinfo next to a process-local secret.
 pub async fn verify_image(
     egress: &EgressGuard,
+    principal: &str,
     image_ref: &str,
     image_digest: &str,
     policy: &VerificationPolicy,
@@ -887,7 +894,7 @@ pub async fn verify_image(
     // validated answers (no second resolution).
     let proxy_url = egress
         .proxy
-        .url()
+        .url_for_principal(principal)
         .map_err(|e| CosignError::VerificationFailed(format!("egress proxy unavailable: {e}")))?;
     let realm_policy_proxy = proxy_url.clone();
     oci_client_config.https_proxy = Some(proxy_url.clone());
@@ -1512,8 +1519,12 @@ pub async fn fetch_attestations(
 /// builds its own reqwest stack with the default (follow) redirect policy
 /// and no custom resolver, so the tenant-chosen registry host is validated
 /// before any manifest, blob, or referrers request is issued.
+///
+/// `principal` is the same egress-budget partition key as
+/// [`verify_image`] (cap#266).
 pub async fn fetch_portable_verification_material(
     egress: &EgressGuard,
+    principal: &str,
     image_ref: &str,
     image_digest: &str,
 ) -> Result<PortableVerificationMaterial, CosignError> {
@@ -1548,7 +1559,7 @@ pub async fn fetch_portable_verification_material(
     // destination the oci-client transport follows (cap#241 review).
     let proxy_url = egress
         .proxy
-        .url()
+        .url_for_principal(principal)
         .map_err(|e| CosignError::VerificationFailed(format!("egress proxy unavailable: {e}")))?;
     let realm_policy_proxy = proxy_url.clone();
     config.https_proxy = Some(proxy_url.clone());
@@ -1981,7 +1992,14 @@ pub async fn verify_sidecars_at_startup(
     let mut ap = String::new();
     let mut ca = String::new();
     for pin in pins {
-        let v = verify_image(egress, &pin.image_ref, &pin.image_digest, &pin.policy).await?;
+        let v = verify_image(
+            egress,
+            crate::egress_proxy::PLATFORM_EGRESS_PRINCIPAL,
+            &pin.image_ref,
+            &pin.image_digest,
+            &pin.policy,
+        )
+        .await?;
         tracing::info!(
             sidecar = %pin.label,
             digest = %v.digest,
@@ -2161,6 +2179,7 @@ mod tests {
         let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let err = verify_image(
             &guard,
+            "test",
             "10.0.5.7/team/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             digest,
             &url_policy(),
@@ -2174,6 +2193,7 @@ mod tests {
         // ::/96 spelling must fail identically.
         let err = verify_image(
             &guard,
+            "test",
             "[::10.0.5.7]/team/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             digest,
             &url_policy(),
@@ -2202,6 +2222,7 @@ mod tests {
         let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let err = verify_image(
             &guard,
+            "test",
             "internal.svc.cluster.local/repo/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             digest,
             &url_policy(),
@@ -2247,7 +2268,7 @@ mod tests {
             "169.254.169.254/repo/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "evil.example/repo/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         ] {
-            let err = fetch_portable_verification_material(&guard, image, digest)
+            let err = fetch_portable_verification_material(&guard, "test", image, digest)
                 .await
                 .unwrap_err();
             assert!(
@@ -2260,6 +2281,7 @@ mod tests {
         // fail closed, just with the parse error.
         let err = fetch_portable_verification_material(
             &guard,
+            "test",
             "[::ffff:10.0.5.7]/repo/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             digest,
         )
@@ -3366,13 +3388,13 @@ mod tests {
             let policy = VerificationPolicy::PublicKey {
                 pem: "unused".into(),
             };
-            let err = verify_image(&egress, &image, &digest, &policy)
+            let err = verify_image(&egress, "test", &image, &digest, &policy)
                 .await
                 .unwrap_err();
             // Empty pinned-root path deterministically stops after preflight,
             // without contacting the public TUF service.
             assert!(matches!(err, CosignError::TrustRoot(_)), "{err}");
-            let err = fetch_portable_verification_material(&egress, &image, &digest)
+            let err = fetch_portable_verification_material(&egress, "test", &image, &digest)
                 .await
                 .unwrap_err();
             assert!(
