@@ -9298,10 +9298,45 @@ async fn idempotency_reaper_terminalizes_only_long_abandoned_reservations() {
     .await
     .expect("insert capability reservation");
 
-    let reaped = reap_abandoned_idempotency_reservations(&pool)
+    // Publication-pending checkpoints (keyring policy or signer rotation)
+    // hold a committed mutation awaiting publication; the reclaim path
+    // deliberately resumes them, so the reaper must never fence them even
+    // when they are old and unleasd.
+    let mut checkpoint_keys = Vec::new();
+    for (label, code) in [
+        ("keyring", "keyring_policy_reconciliation_pending"),
+        ("signer", "signer_rotation_publication_pending"),
+    ] {
+        let checkpoint_key = format!("reap-checkpoint-{label}-{suffix}");
+        sqlx::query(
+            "INSERT INTO cap_internal_idempotency (
+                 idempotency_key, method, path, request_hash, reservation_token,
+                 operation_id, lease_expires_at, recovery_kind, response_status,
+                 response_body, updated_at
+             )
+             VALUES (
+                 $1, 'POST', $2, $3, $4, $4,
+                 clock_timestamp() - interval '25 hours', 'fail_closed', 503,
+                 jsonb_build_object('code', $5::text),
+                 clock_timestamp() - interval '25 hours'
+             )",
+        )
+        .bind(&checkpoint_key)
+        .bind(format!("/internal/test/reap-checkpoint-{label}/{suffix}"))
+        .bind(&hash)
+        .bind(Uuid::new_v4())
+        .bind(code)
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("insert {label} checkpoint reservation: {error}"));
+        checkpoint_keys.push(checkpoint_key);
+    }
+
+    let _reaped = reap_abandoned_idempotency_reservations(&pool)
         .await
         .expect("reap abandoned reservations");
-    assert!(reaped >= 1, "the abandoned reservation must be reaped");
+    // The shared test DB may hold other agents' abandoned rows; assert on
+    // this fixture's own terminal state rather than the batch count.
 
     let row: (
         Option<Uuid>,
@@ -9340,6 +9375,8 @@ async fn idempotency_reaper_terminalizes_only_long_abandoned_reservations() {
         (&live_key, false),
         (&known_key, false),
         (&capability_key, false),
+        (&checkpoint_keys[0], false),
+        (&checkpoint_keys[1], false),
     ] {
         let completed: bool = sqlx::query_scalar(
             "SELECT completed_at IS NOT NULL
@@ -9352,6 +9389,59 @@ async fn idempotency_reaper_terminalizes_only_long_abandoned_reservations() {
         .unwrap_or_else(|error| panic!("read untouched reservation {key}: {error}"));
         assert_eq!(completed, expected_completed, "{key} must stay incomplete");
     }
+
+    // A heartbeat/defer refreshes updated_at; once refreshed the row is no
+    // longer abandonment-quiet and a reap pass must leave it alone. The
+    // terminal UPDATE re-checks the same predicates inside its own
+    // transaction so a refresh landing between selection and write is never
+    // fenced. Insert an aged row, refresh it, and confirm a second reap pass
+    // refuses it.
+    let refreshed_key = format!("reap-refreshed-{suffix}");
+    sqlx::query(
+        "INSERT INTO cap_internal_idempotency (
+             idempotency_key, method, path, request_hash, reservation_token,
+             operation_id, lease_expires_at, recovery_kind, updated_at
+         )
+         VALUES (
+             $1, 'POST', $2, $3, $4, $4,
+             clock_timestamp() - interval '25 hours', 'retry_safe',
+             clock_timestamp() - interval '25 hours'
+         )",
+    )
+    .bind(&refreshed_key)
+    .bind(format!("/internal/test/reap-refreshed/{suffix}"))
+    .bind(&hash)
+    .bind(Uuid::new_v4())
+    .execute(&pool)
+    .await
+    .expect("insert refreshed reservation");
+    // Simulate the mid-flight refresh: touch updated_at after the row would
+    // have been selected, before the terminal UPDATE re-checks it.
+    sqlx::query(
+        "UPDATE cap_internal_idempotency
+            SET updated_at = clock_timestamp()
+          WHERE idempotency_key = $1",
+    )
+    .bind(&refreshed_key)
+    .execute(&pool)
+    .await
+    .expect("refresh reservation mid-flight");
+    let _ = reap_abandoned_idempotency_reservations(&pool)
+        .await
+        .expect("second reap pass");
+    let refreshed_completed: bool = sqlx::query_scalar(
+        "SELECT completed_at IS NOT NULL
+           FROM cap_internal_idempotency
+          WHERE idempotency_key = $1",
+    )
+    .bind(&refreshed_key)
+    .fetch_one(&pool)
+    .await
+    .expect("read refreshed reservation");
+    assert!(
+        !refreshed_completed,
+        "a reservation refreshed after selection must not be terminalized"
+    );
 
     // The receipt reader now reports the tombstone as completed, and a
     // same-key retry replays the stored recovery receipt instead of
