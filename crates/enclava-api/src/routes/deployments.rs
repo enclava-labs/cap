@@ -1449,6 +1449,7 @@ async fn deploy_app_candidate(
         &state.cosign_egress,
         &body.image,
         &image_digest,
+        &policy,
     )
     .await
     .map_err(|_| {
