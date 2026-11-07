@@ -9154,3 +9154,250 @@ mod confidentiality_tests {
         assert_eq!(projected.as_deref(), Some(live));
     }
 }
+
+#[tokio::test]
+async fn idempotency_reaper_terminalizes_only_long_abandoned_reservations() {
+    let pool = database_test_pool().await;
+    let state = idempotency_test_state(pool.clone());
+    let suffix = Uuid::new_v4().simple().to_string();
+    let hash = Sha256::digest(b"reaper-request").to_vec();
+
+    // A reservation whose claimant vanished beyond the reap horizon.
+    let abandoned_key = format!("reap-abandoned-{suffix}");
+    let abandoned_path = format!("/internal/test/reap/{suffix}");
+    let abandoned_lease = expect_idempotency_execution(
+        begin_idempotent_request_with_recovery(
+            &state,
+            &abandoned_key,
+            "POST",
+            &abandoned_path,
+            &hash,
+            IdempotencyRecovery::RetrySafe,
+        )
+        .await
+        .expect("reserve abandoned attempt"),
+    );
+    drop(abandoned_lease);
+    sqlx::query(
+        "UPDATE cap_internal_idempotency
+            SET lease_expires_at = clock_timestamp() - interval '25 hours',
+                updated_at = clock_timestamp() - interval '25 hours'
+          WHERE idempotency_key = $1",
+    )
+    .bind(&abandoned_key)
+    .execute(&pool)
+    .await
+    .expect("age abandoned reservation");
+
+    // A deferred retry inside the horizon: lease expired long ago relative to
+    // the lease but the row was touched recently, so it must survive.
+    let deferred_key = format!("reap-deferred-{suffix}");
+    let deferred_path = format!("/internal/test/reap-deferred/{suffix}");
+    let deferred_lease = expect_idempotency_execution(
+        begin_idempotent_request_with_recovery(
+            &state,
+            &deferred_key,
+            "POST",
+            &deferred_path,
+            &hash,
+            IdempotencyRecovery::RetrySafe,
+        )
+        .await
+        .expect("reserve deferred attempt"),
+    );
+    drop(deferred_lease);
+    sqlx::query(
+        "UPDATE cap_internal_idempotency
+            SET lease_expires_at = clock_timestamp() - interval '25 hours',
+                updated_at = clock_timestamp() - interval '1 hour'
+          WHERE idempotency_key = $1",
+    )
+    .bind(&deferred_key)
+    .execute(&pool)
+    .await
+    .expect("age only the deferred lease");
+
+    // A live lease must survive regardless of row age.
+    let live_key = format!("reap-live-{suffix}");
+    let live_path = format!("/internal/test/reap-live/{suffix}");
+    let live_lease = expect_idempotency_execution(
+        begin_idempotent_request_with_recovery(
+            &state,
+            &live_key,
+            "POST",
+            &live_path,
+            &hash,
+            IdempotencyRecovery::RetrySafe,
+        )
+        .await
+        .expect("reserve live attempt"),
+    );
+    sqlx::query(
+        "UPDATE cap_internal_idempotency
+            SET lease_expires_at = clock_timestamp() + interval '1 hour',
+                updated_at = clock_timestamp() - interval '25 hours'
+          WHERE idempotency_key = $1",
+    )
+    .bind(&live_key)
+    .execute(&pool)
+    .await
+    .expect("age live reservation row");
+
+    // known_not_applied rows are CHECK-bound to stay incomplete; the reaper
+    // must leave them for the reclaim path.
+    let known_key = format!("reap-known-{suffix}");
+    sqlx::query(
+        "INSERT INTO cap_internal_idempotency (
+             idempotency_key, method, path, request_hash, reservation_token,
+             operation_id, lease_expires_at, recovery_kind, known_not_applied,
+             updated_at
+         )
+         VALUES (
+             $1, 'POST', $2, $3, $4, $4,
+             clock_timestamp() - interval '25 hours', 'retry_safe', true,
+             clock_timestamp() - interval '25 hours'
+         )",
+    )
+    .bind(&known_key)
+    .bind(format!("/internal/test/reap-known/{suffix}"))
+    .bind(&hash)
+    .bind(Uuid::new_v4())
+    .execute(&pool)
+    .await
+    .expect("insert known_not_applied reservation");
+
+    // Config-token capability rows carry receipt columns the generic tombstone
+    // cannot satisfy; their own replay path owns their terminal shape.
+    let capability_key = format!("reap-capability-{suffix}");
+    let capability_path = format!(
+        "/internal/paas/orgs/{}/apps/{}/config-token",
+        Uuid::new_v4().simple(),
+        Uuid::new_v4().simple()
+    );
+    sqlx::query(
+        "INSERT INTO cap_internal_idempotency (
+             idempotency_key, method, path, request_hash, reservation_token,
+             operation_id, lease_expires_at, recovery_kind,
+             capability_receipt_version, capability_resource_id,
+             capability_instance_id, updated_at
+         )
+         VALUES (
+             $1, 'POST', $2, $3, $4, $4,
+             clock_timestamp() - interval '25 hours',
+             'deterministic_expiring_capability', 1, $5, $6,
+             clock_timestamp() - interval '25 hours'
+         )",
+    )
+    .bind(&capability_key)
+    .bind(&capability_path)
+    .bind(&hash)
+    .bind(Uuid::new_v4())
+    .bind(Uuid::new_v4())
+    .bind(format!("instance-{}", Uuid::new_v4().simple()))
+    .execute(&pool)
+    .await
+    .expect("insert capability reservation");
+
+    let reaped = reap_abandoned_idempotency_reservations(&pool)
+        .await
+        .expect("reap abandoned reservations");
+    assert!(reaped >= 1, "the abandoned reservation must be reaped");
+
+    let row: (
+        Option<Uuid>,
+        Option<Uuid>,
+        Option<chrono::DateTime<chrono::Utc>>,
+        String,
+    ) = sqlx::query_as(
+        "SELECT reservation_token, operation_id, lease_expires_at, recovery_kind
+               FROM cap_internal_idempotency
+              WHERE idempotency_key = $1",
+    )
+    .bind(&abandoned_key)
+    .fetch_one(&pool)
+    .await
+    .expect("read reaped reservation");
+    assert!(row.0.is_some(), "reaped row keeps a fencing token");
+    assert!(row.1.is_some(), "reaped row keeps an operation identity");
+    assert_eq!(row.2, None, "reaped row releases its lease");
+    assert_eq!(row.3, "retry_safe", "stored recovery kind is preserved");
+    let terminal: (bool, bool, bool) = sqlx::query_as(
+        "SELECT completed_at IS NOT NULL,
+                response_status = 409,
+                response_body = '{\"error\":\"idempotency_recovery_required\",\"retryable\":false,\"disposition\":\"reconcile_then_retry_with_new_key\",\"idempotency_disposition\":\"completed\"}'::jsonb
+           FROM cap_internal_idempotency
+          WHERE idempotency_key = $1",
+    )
+    .bind(&abandoned_key)
+    .fetch_one(&pool)
+    .await
+    .expect("read reaped terminal shape");
+    assert_eq!(terminal, (true, true, true));
+
+    // Untouched shapes stay incomplete and reclaimable.
+    for (key, expected_completed) in [
+        (&deferred_key, false),
+        (&live_key, false),
+        (&known_key, false),
+        (&capability_key, false),
+    ] {
+        let completed: bool = sqlx::query_scalar(
+            "SELECT completed_at IS NOT NULL
+               FROM cap_internal_idempotency
+              WHERE idempotency_key = $1",
+        )
+        .bind(key)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("read untouched reservation {key}: {error}"));
+        assert_eq!(completed, expected_completed, "{key} must stay incomplete");
+    }
+
+    // The receipt reader now reports the tombstone as completed, and a
+    // same-key retry replays the stored recovery receipt instead of
+    // re-executing the mutation.
+    let Json(receipt) = get_paas_idempotency_receipt(
+        internal_test_auth(),
+        State(state.clone()),
+        Query(IdempotencyReceiptQuery {
+            key: abandoned_key.clone(),
+        }),
+    )
+    .await
+    .expect("read reaped receipt");
+    assert_eq!(receipt["state"], "completed");
+    assert_eq!(receipt["response_status"], 409);
+
+    let (status, body) = expect_idempotency_replay(
+        begin_idempotent_request_with_recovery(
+            &state,
+            &abandoned_key,
+            "POST",
+            &abandoned_path,
+            &hash,
+            IdempotencyRecovery::RetrySafe,
+        )
+        .await
+        .expect("same-key retry must replay the recovery receipt"),
+    );
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"], "idempotency_recovery_required");
+    assert_eq!(body["disposition"], "reconcile_then_retry_with_new_key");
+    assert_eq!(body["idempotency_disposition"], "completed");
+
+    // The deferred row is still reclaimable, not fenced.
+    let retry = begin_idempotent_request_with_recovery(
+        &state,
+        &deferred_key,
+        "POST",
+        &deferred_path,
+        &hash,
+        IdempotencyRecovery::RetrySafe,
+    )
+    .await;
+    assert!(
+        matches!(retry, Ok(IdempotencyBegin::Execute(_))),
+        "a recent deferred reservation must stay reclaimable"
+    );
+    drop(live_lease);
+}
