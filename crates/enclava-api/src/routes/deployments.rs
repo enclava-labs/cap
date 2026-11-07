@@ -1436,17 +1436,27 @@ async fn deploy_app_candidate(
             ));
         }
     };
-    let verified =
-        crate::cosign::verify_image(&state.cosign_egress, &body.image, &image_digest, &policy)
-            .await
-            .map_err(|_| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": "cosign_verification_failed"})),
-                )
-            })?;
+    // Charge this deploy's registry tunnels to the org, not the shared
+    // anonymous bucket, so one tenant cannot occupy the global egress
+    // budget (cap#266).
+    let egress_principal = crate::egress_proxy::org_egress_principal(&auth.org_id);
+    let verified = crate::cosign::verify_image(
+        &state.cosign_egress,
+        &egress_principal,
+        &body.image,
+        &image_digest,
+        &policy,
+    )
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "cosign_verification_failed"})),
+        )
+    })?;
     let portable_material = crate::cosign::fetch_portable_verification_material(
         &state.cosign_egress,
+        &egress_principal,
         &body.image,
         &image_digest,
     )

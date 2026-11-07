@@ -28,8 +28,10 @@
 //!   debug-only `COSIGN_ALLOW_HTTP_REGISTRY` flag routes cleartext registry
 //!   traffic as absolute-form proxy requests; those are served too, but the
 //!   destination is resolved and blocklist-checked here exactly like a
-//!   CONNECT target and the cleartext request is forwarded verbatim to the
-//!   validated address only (cap#241 review). Everything else — including
+//!   CONNECT target and the cleartext request is forwarded to the
+//!   validated address only, minus hop-by-hop `Proxy-Authorization`
+//!   (the process-local tenant credential must not leave the proxy;
+//!   cap#241 review, cap#266). Everything else — including
 //!   `https://` absolute-form (a cleartext request cannot carry TLS) and
 //!   origin-form requests — is refused.
 //! - The registry allowlist is NOT re-enforced here: a custom allowlisted
@@ -54,17 +56,26 @@
 //!   silent one does) are torn down; at most
 //!   `MAX_PROXY_CONNECTIONS` connections are served concurrently, so even
 //!   a never-idle local client cannot accumulate unbounded tasks/sockets;
-//!   a single DNS resolution or upstream dial is bounded by
-//!   `DNS_RESOLVE_TIMEOUT`/`HTTP_UPSTREAM_CONNECT_TIMEOUT` so a slow
+//!   that global budget is further partitioned by authenticated principal
+//!   (`MAX_PER_TENANT_CONNECTIONS`) so one tenant cannot occupy every
+//!   permit (cap#266); a single DNS resolution or upstream dial is bounded
+//!   by `DNS_RESOLVE_TIMEOUT`/`HTTP_UPSTREAM_CONNECT_TIMEOUT` so a slow
 //!   resolver or unresponsive destination cannot hold a permit
-//!   indefinitely; and the accept loop retries transient accept failures
-//!   (e.g. temporary FD exhaustion) with a bounded backoff instead of
-//!   dying while callers keep the cached URL.
+//!   indefinitely; a tunnel that only trickles (below
+//!   `MIN_PROGRESS_BYTES` per `TUNNEL_PROGRESS_WINDOW`) or that outlives
+//!   `TUNNEL_MAX_LIFETIME` is torn down even though any byte still resets
+//!   the idle clock — a floor-meeting transfer is not cut at the idle
+//!   window (cap#241); and the accept loop retries transient accept
+//!   failures (e.g. temporary FD exhaustion) with a bounded backoff
+//!   instead of dying while callers keep the cached URL.
 
+use std::collections::HashMap;
+use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -114,7 +125,55 @@ const MAX_PROXY_CONNECTIONS: usize = 4;
 #[cfg(not(test))]
 const MAX_PROXY_CONNECTIONS: usize = 64;
 
-#[derive(Debug, Clone)]
+/// Per-principal share of the proxy budget (cap#266). The global cap stays
+/// the backstop; this partition is what stops one tenant from starving
+/// every other tenant's verification fetches. Anonymous clients (no
+/// `Proxy-Authorization`) share one bucket of the same size, so a path
+/// that forgets to present identity cannot fill the global budget either.
+#[cfg(test)]
+const MAX_PER_TENANT_CONNECTIONS: usize = 2;
+#[cfg(not(test))]
+const MAX_PER_TENANT_CONNECTIONS: usize = 16;
+
+/// Window in which a tunnel must forward at least `MIN_PROGRESS_BYTES`.
+/// Sub-floor traffic does not move this deadline (unlike the idle clock,
+/// which any byte resets). A transfer that meets the floor refreshes the
+/// window and may continue, so a healthy long pull is not cut merely for
+/// having run past `TUNNEL_IDLE_TIMEOUT` (cap#241).
+#[cfg(test)]
+const TUNNEL_PROGRESS_WINDOW: Duration = Duration::from_secs(5);
+#[cfg(not(test))]
+const TUNNEL_PROGRESS_WINDOW: Duration = Duration::from_secs(300);
+
+/// Minimum bytes that must be *forwarded* (written to the peer, not merely
+/// read) in each `TUNNEL_PROGRESS_WINDOW`. A 1-byte drip resets the idle
+/// clock and still loses the permit when the window ends.
+#[cfg(test)]
+const MIN_PROGRESS_BYTES: u64 = 4096;
+#[cfg(not(test))]
+const MIN_PROGRESS_BYTES: u64 = 64 * 1024;
+
+/// Absolute occupancy ceiling from tunnel start. Independent of throughput,
+/// so a stream calibrated to just meet the progress floor cannot hold a
+/// permit forever. Far longer than the 5-minute total cap cap#241 removed:
+/// an actively streaming transfer is not cut at the idle window, only after
+/// this backstop. The test value stays above
+/// `active_transfer_survives_beyond_idle_timeout`.
+#[cfg(test)]
+const TUNNEL_MAX_LIFETIME: Duration = Duration::from_secs(20);
+#[cfg(not(test))]
+const TUNNEL_MAX_LIFETIME: Duration = Duration::from_secs(2 * 60 * 60);
+
+/// Partition key for platform-owned fetches (sidecar startup verification)
+/// that must not be charged to a customer org.
+pub const PLATFORM_EGRESS_PRINCIPAL: &str = "platform";
+
+/// Bucket key for connections that present no proxy credentials. Not a
+/// valid caller principal (`valid_principal` rejects the NUL), so a client
+/// cannot join this bucket by choosing its name.
+const ANONYMOUS_PRINCIPAL: &str = "\0anonymous";
+
+#[derive(Clone)]
 pub struct EgressProxy {
     blocked: Arc<BlockedNetworks>,
     bound: Arc<Mutex<Option<String>>>,
@@ -124,6 +183,18 @@ pub struct EgressProxy {
     /// cannot be downgraded to cleartext by an `http://` redirect or
     /// token realm advertised by a registry (cap#241 review).
     allow_http_forwarding: bool,
+    /// Process-local admission state shared with the listener spawned by
+    /// `url()`. The credential is redacted from `Debug`.
+    admission: Arc<Admission>,
+}
+
+impl fmt::Debug for EgressProxy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EgressProxy")
+            .field("allow_http_forwarding", &self.allow_http_forwarding)
+            .field("bound", &self.bound)
+            .finish_non_exhaustive()
+    }
 }
 
 impl EgressProxy {
@@ -142,10 +213,17 @@ impl EgressProxy {
             blocked,
             bound: Arc::new(Mutex::new(None)),
             allow_http_forwarding: allow,
+            admission: Arc::new(Admission::generate()),
         }
     }
 
-    /// Return the proxy URL, binding the loopback listener on first use.
+    /// Return the credential-less proxy URL, binding the loopback listener
+    /// on first use.
+    ///
+    /// Connections that present no `Proxy-Authorization` share one anonymous
+    /// bucket of `MAX_PER_TENANT_CONNECTIONS` (cap#266). Production callers
+    /// must use [`Self::url_for_principal`] so a tenant is charged to its own
+    /// bucket. This URL is for tests and for binding the listener.
     ///
     /// The listener is created lazily so guards constructed in tests (or
     /// processes that never run the cosign paths) hold no sockets. Fails
@@ -174,19 +252,64 @@ impl EgressProxy {
             .map_err(|e| ClientError::InvalidUrl(format!("egress proxy local addr: {e}")))?;
         let blocked = Arc::clone(&self.blocked);
         let allow_http_forwarding = self.allow_http_forwarding;
+        let admission = Arc::clone(&self.admission);
         tokio::spawn(async move {
-            accept_loop(listener, blocked, allow_http_forwarding).await;
+            accept_loop(listener, blocked, allow_http_forwarding, admission).await;
         });
         let url = format!("http://{addr}");
         *bound = Some(url.clone());
         Ok(url)
     }
+
+    /// Proxy URL that attributes connections to `principal`.
+    ///
+    /// reqwest / hyper-util turn the userinfo into `Proxy-Authorization:
+    /// Basic`. The password is a process-local secret so a local process
+    /// that discovers the ephemeral port cannot mint extra tenant buckets
+    /// and bypass the per-tenant cap. Do not log the returned URL.
+    ///
+    /// `principal` is the partition key — an org id rendered by
+    /// [`org_egress_principal`], or [`PLATFORM_EGRESS_PRINCIPAL`].
+    pub fn url_for_principal(&self, principal: &str) -> Result<String, ClientError> {
+        if !valid_principal(principal) {
+            return Err(ClientError::InvalidUrl(
+                "egress principal must be 1-128 chars of [A-Za-z0-9._-]".into(),
+            ));
+        }
+        let mut url = reqwest::Url::parse(&self.url()?)
+            .map_err(|e| ClientError::InvalidUrl(format!("egress proxy url: {e}")))?;
+        url.set_username(principal).map_err(|_| {
+            ClientError::InvalidUrl("egress principal rejected by URL grammar".into())
+        })?;
+        url.set_password(Some(&self.admission.secret_hex))
+            .map_err(|_| {
+                ClientError::InvalidUrl("egress proxy credential rejected by URL grammar".into())
+            })?;
+        Ok(url.to_string())
+    }
+
+    /// `Proxy-Authorization` header value for raw-TCP tests. Same credential
+    /// `url_for_principal` embeds. Production callers use the proxy URL.
+    #[cfg(test)]
+    pub(crate) fn authorization_header(&self, principal: &str) -> String {
+        use base64::Engine;
+        let token = base64::engine::general_purpose::STANDARD
+            .encode(format!("{principal}:{}", self.admission.secret_hex));
+        format!("Proxy-Authorization: Basic {token}")
+    }
+}
+
+/// Partition key for an authenticated org. Hyphens only — a colon would
+/// split userinfo into username/password before percent-encoding.
+pub fn org_egress_principal(org_id: &impl fmt::Display) -> String {
+    format!("org-{org_id}")
 }
 
 async fn accept_loop(
     listener: TcpListener,
     blocked: Arc<BlockedNetworks>,
     allow_http_forwarding: bool,
+    admission: Arc<Admission>,
 ) {
     let mut backoff = ACCEPT_BACKOFF_START;
     // One permit per in-flight connection: head read, tunnel, or forward.
@@ -194,6 +317,8 @@ async fn accept_loop(
     // is accepted (no gap a connection could slip through), released when
     // the handler finishes. `MAX_PROXY_CONNECTIONS` bounds the worst case
     // even against a client that never goes idle (cap#241 review).
+    // Per-tenant permits are acquired later, once the request head has
+    // named a principal (cap#266).
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_PROXY_CONNECTIONS));
     loop {
         match listener.accept().await {
@@ -213,8 +338,9 @@ async fn accept_loop(
                 };
                 let blocked = Arc::clone(&blocked);
                 let allow_http = allow_http_forwarding;
+                let admission = Arc::clone(&admission);
                 tokio::spawn(async move {
-                    handle_conn(stream, blocked, allow_http).await;
+                    handle_conn(stream, blocked, allow_http, admission).await;
                     drop(permit);
                 });
             }
@@ -237,6 +363,7 @@ async fn handle_conn(
     mut stream: TcpStream,
     blocked: Arc<BlockedNetworks>,
     allow_http_forwarding: bool,
+    admission: Arc<Admission>,
 ) {
     let (head, body_prefix) = match read_request_head(&mut stream).await {
         Some(parts) => parts,
@@ -244,6 +371,29 @@ async fn handle_conn(
             // Includes idle-timeout: a client that never sends a request
             // head is refused and closed, bounding the connection cost.
             let _ = write_forbidden(&mut stream).await;
+            return;
+        }
+    };
+    // Attribute the connection before spending a dial or a tunnel on it.
+    // Invalid credentials are refused outright (not folded into the
+    // anonymous bucket) so a wrong secret cannot be used to probe.
+    let principal = match classify_principal(&head, &admission.secret_hex) {
+        PrincipalDecision::Invalid => {
+            tracing::warn!("egress proxy refused invalid proxy authorization");
+            let _ = write_forbidden(&mut stream).await;
+            return;
+        }
+        PrincipalDecision::Anonymous => ANONYMOUS_PRINCIPAL.to_string(),
+        PrincipalDecision::Named(principal) => principal,
+    };
+    let _tenant_permit = match admission.tenants.try_acquire(&principal) {
+        Some(permit) => permit,
+        None => {
+            tracing::warn!(
+                principal = principal_label(&principal),
+                "egress proxy per-tenant connection cap; refusing"
+            );
+            let _ = write_unavailable(&mut stream).await;
             return;
         }
     };
@@ -325,11 +475,12 @@ async fn handle_conn(
                     }
                 };
                 let mut upstream = upstream;
-                // Replay the full request head verbatim, followed by any
-                // body bytes that arrived in the same TCP read as the
-                // head (coalesced head+body); anything after that still
-                // sits in the socket and flows through the pipe below.
-                if upstream.write_all(head.as_bytes()).await.is_err() {
+                // Replay the request head, minus hop-by-hop proxy
+                // credentials. `Proxy-Authorization` carries the
+                // process-local tenant secret (cap#266); forwarding it
+                // would hand that secret to the destination.
+                let forwarded = head_for_upstream(&head);
+                if upstream.write_all(forwarded.as_bytes()).await.is_err() {
                     return;
                 }
                 if !body_prefix.is_empty() && upstream.write_all(&body_prefix).await.is_err() {
@@ -393,53 +544,53 @@ fn find_head_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
-/// Bidirectional copy torn down only after `TUNNEL_IDLE_TIMEOUT` elapses
-/// with NO traffic in either direction, and only after BOTH directions
-/// have finished. Implemented as a chunked loop (not
-/// `timeout(copy_bidirectional)`, which would cap the TOTAL duration and
-/// cut healthy long transfers at exactly the deadline): each loop
-/// iteration races the still-open directions' next read against the
-/// remaining idle budget, and any progress resets the deadline.
+/// Bidirectional copy torn down when:
+/// - both directions have finished, or
+/// - `TUNNEL_IDLE_TIMEOUT` elapses with no traffic in either direction, or
+/// - a `TUNNEL_PROGRESS_WINDOW` elapses without `MIN_PROGRESS_BYTES`
+///   actually forwarded (a slow drip resets the idle clock and still loses
+///   the permit — cap#266), or
+/// - `TUNNEL_MAX_LIFETIME` elapses from tunnel start, even if the progress
+///   floor is being met.
+///
+/// Implemented as a chunked loop (not `timeout(copy_bidirectional)`, which
+/// would cap the TOTAL duration at the idle window and cut healthy long
+/// transfers): each iteration races the still-open directions' next read
+/// against the earliest of the three deadlines. Any read or forwarded byte
+/// resets the *idle* clock. Only a full progress-floor of forwarded bytes
+/// resets the progress window. The lifetime deadline never moves, so a
+/// floor-meeting transfer can run far past the idle window (cap#241) and
+/// still cannot occupy a permit forever (cap#266).
 /// EOF is tracked per direction and only the peer's WRITE half is shut
 /// down when one side finishes: a half-closing client (request sent,
 /// write side closed) must still receive the upstream's reply
-/// (cap#241 review).
+/// (cap#241 review). EOF does not refresh any deadline.
 async fn idle_bounded_copy(a: &mut TcpStream, b: &mut TcpStream) -> std::io::Result<()> {
     let mut buf_a = [0u8; 8192];
     let mut buf_b = [0u8; 8192];
-    // Absolute idle deadline: only actual traffic (a read completing, a
-    // write advancing) moves it. EOF handling does NOT refresh it, so a
-    // direction that goes silent just before the deadline cannot gain a
-    // fresh full window by half-closing — the tunnel is torn down when
-    // the absolute deadline passes without progress (cap#241 review).
-    let mut deadline = tokio::time::Instant::now() + TUNNEL_IDLE_TIMEOUT;
+    let mut budget = TunnelBudget::new();
     // EOF seen on `a` (a is done sending) / on `b`. A closed direction is
     // no longer polled; the opposite direction keeps flowing until it too
-    // EOFs or the idle deadline expires.
+    // EOFs or a deadline expires.
     let mut eof_a = false;
     let mut eof_b = false;
     loop {
         if eof_a && eof_b {
             return Ok(());
         }
-        // Race whichever directions are still open against the deadline
-        // (branch futures are not evaluated when the precondition is
-        // false, so `a`/`b` are only borrowed by live reads). The futures
-        // (and their borrows) end when the `select!` does, before the
-        // shutdown/write below.
+        // Race whichever directions are still open against the earliest
+        // deadline (branch futures are not evaluated when the precondition
+        // is false, so `a`/`b` are only borrowed by live reads). The
+        // futures (and their borrows) end when the `select!` does, before
+        // the shutdown/write below.
         let outcome = tokio::select! {
             res = a.read(&mut buf_a), if !eof_a => Some((true, res?)),
             res = b.read(&mut buf_b), if !eof_b => Some((false, res?)),
-            _ = tokio::time::sleep_until(deadline) => None,
+            _ = tokio::time::sleep_until(budget.effective_deadline()) => None,
         };
         let (from_a, n) = match outcome {
             Some(x) => x,
-            None => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "egress proxy tunnel idle",
-                ));
-            }
+            None => return Err(budget.tear_down()),
         };
         if n == 0 {
             // EOF on one side: propagate it as a write-half shutdown of
@@ -453,24 +604,26 @@ async fn idle_bounded_copy(a: &mut TcpStream, b: &mut TcpStream) -> std::io::Res
                 eof_b = true;
                 let _ = a.shutdown().await;
             }
-            // EOF is not traffic: the absolute deadline is NOT moved.
+            // EOF is not traffic: no deadline moves.
             continue;
         }
+        // A completed read is idle-liveness only. It does not count toward
+        // the progress floor until those bytes are actually written — a
+        // peer that accepts the read side and drains the write side slowly
+        // must not be able to refresh the progress window (cap#266).
+        budget.on_read_liveness();
         let data: Vec<u8> = if from_a {
             buf_a[..n].to_vec()
         } else {
             buf_b[..n].to_vec()
         };
         let dst = if from_a { &mut *b } else { &mut *a };
-        // Forward the chunk with the idle deadline enforced per WRITE,
-        // not per chunk: a peer that drains a full socket SLOWLY makes
-        // partial progress (each positive write moves the deadline, so a
-        // live transfer is never cut), while a peer that stops reading
-        // entirely cannot hold the tunnel — and its proxy slot — past one
-        // idle window without write progress (cap#241 review).
-        deadline = tokio::time::Instant::now() + TUNNEL_IDLE_TIMEOUT;
         let mut off = 0;
         while off < data.len() {
+            // Recomputed each partial write. A sub-floor write refreshes
+            // idle but not the progress window or the lifetime, so the
+            // effective deadline stays put for a slow drain.
+            let deadline = budget.effective_deadline();
             match tokio::time::timeout_at(deadline, dst.write(&data[off..])).await {
                 Ok(Ok(0)) => {
                     return Err(std::io::Error::new(
@@ -480,17 +633,73 @@ async fn idle_bounded_copy(a: &mut TcpStream, b: &mut TcpStream) -> std::io::Res
                 }
                 Ok(Ok(written)) => {
                     off += written;
-                    deadline = tokio::time::Instant::now() + TUNNEL_IDLE_TIMEOUT; // write progress moves the clock
+                    budget.on_forwarded(written);
                 }
                 Ok(Err(e)) => return Err(e),
-                Err(_) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "egress proxy tunnel idle (stalled forward write)",
-                    ));
-                }
+                Err(_) => return Err(budget.tear_down()),
             }
         }
+    }
+}
+
+/// Deadlines for one tunnel. Idle moves on any read or forwarded byte.
+/// The progress window moves only when the byte floor is met. Lifetime
+/// never moves.
+struct TunnelBudget {
+    started: tokio::time::Instant,
+    idle_deadline: tokio::time::Instant,
+    window_start: tokio::time::Instant,
+    window_bytes: u64,
+}
+
+impl TunnelBudget {
+    fn new() -> Self {
+        let now = tokio::time::Instant::now();
+        Self {
+            started: now,
+            idle_deadline: now + TUNNEL_IDLE_TIMEOUT,
+            window_start: now,
+            window_bytes: 0,
+        }
+    }
+
+    fn effective_deadline(&self) -> tokio::time::Instant {
+        self.idle_deadline
+            .min(self.window_start + TUNNEL_PROGRESS_WINDOW)
+            .min(self.started + TUNNEL_MAX_LIFETIME)
+    }
+
+    fn on_read_liveness(&mut self) {
+        self.idle_deadline = tokio::time::Instant::now() + TUNNEL_IDLE_TIMEOUT;
+    }
+
+    /// `n` is bytes successfully written to the peer.
+    fn on_forwarded(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let now = tokio::time::Instant::now();
+        self.idle_deadline = now + TUNNEL_IDLE_TIMEOUT;
+        self.window_bytes = self.window_bytes.saturating_add(n as u64);
+        if self.window_bytes >= MIN_PROGRESS_BYTES {
+            self.window_start = now;
+            self.window_bytes = 0;
+        }
+    }
+
+    fn tear_down(&self) -> std::io::Error {
+        let now = tokio::time::Instant::now();
+        let msg = if now >= self.started + TUNNEL_MAX_LIFETIME {
+            "egress proxy tunnel lifetime exceeded"
+        } else if now >= self.window_start + TUNNEL_PROGRESS_WINDOW {
+            "egress proxy tunnel below minimum progress"
+        } else {
+            "egress proxy tunnel idle"
+        };
+        if msg != "egress proxy tunnel idle" {
+            tracing::info!(reason = msg, "egress proxy tunnel torn down");
+        }
+        std::io::Error::new(std::io::ErrorKind::TimedOut, msg)
     }
 }
 
@@ -638,6 +847,172 @@ async fn write_forbidden(stream: &mut TcpStream) -> std::io::Result<()> {
     stream
         .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
         .await
+}
+
+async fn write_unavailable(stream: &mut TcpStream) -> std::io::Result<()> {
+    stream
+        .write_all(
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await
+}
+
+/// Process-local credential plus the per-principal counters. Shared by
+/// every clone of an `EgressProxy` and by the listener it spawns.
+struct Admission {
+    secret_hex: String,
+    tenants: Arc<TenantBudget>,
+}
+
+impl Admission {
+    fn generate() -> Self {
+        use rand::RngCore;
+        let mut bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        Self {
+            secret_hex: hex::encode(bytes),
+            tenants: Arc::new(TenantBudget::default()),
+        }
+    }
+}
+
+#[derive(Default)]
+struct TenantBudget {
+    counts: Mutex<HashMap<String, usize>>,
+}
+
+struct TenantPermit {
+    key: String,
+    budget: Arc<TenantBudget>,
+}
+
+impl TenantBudget {
+    fn try_acquire(self: &Arc<Self>, key: &str) -> Option<TenantPermit> {
+        let mut counts = self
+            .counts
+            .lock()
+            .expect("egress tenant budget mutex poisoned");
+        let n = counts.entry(key.to_string()).or_insert(0);
+        if *n >= MAX_PER_TENANT_CONNECTIONS {
+            return None;
+        }
+        *n += 1;
+        drop(counts);
+        Some(TenantPermit {
+            key: key.to_string(),
+            budget: Arc::clone(self),
+        })
+    }
+}
+
+impl Drop for TenantPermit {
+    fn drop(&mut self) {
+        let mut counts = self
+            .budget
+            .counts
+            .lock()
+            .expect("egress tenant budget mutex poisoned");
+        if let Some(n) = counts.get_mut(&self.key) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                counts.remove(&self.key);
+            }
+        }
+    }
+}
+
+enum PrincipalDecision {
+    Anonymous,
+    Named(String),
+    Invalid,
+}
+
+fn valid_principal(principal: &str) -> bool {
+    let n = principal.len();
+    (1..=128).contains(&n)
+        && principal.bytes().all(|b| {
+            matches!(
+                b,
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-'
+            )
+        })
+}
+
+fn principal_label(key: &str) -> &str {
+    if key == ANONYMOUS_PRINCIPAL {
+        "anonymous"
+    } else {
+        key
+    }
+}
+
+fn secrets_equal(presented: &[u8], expected: &[u8]) -> bool {
+    let n = presented.len().min(expected.len());
+    let prefix_eq = presented[..n].ct_eq(&expected[..n]);
+    presented.len() == expected.len() && bool::from(prefix_eq)
+}
+
+/// `None` when the header is absent (anonymous). `Some(Err)` when it is
+/// present but not a usable Basic credential.
+fn proxy_basic_userinfo(head: &str) -> Option<Result<(String, String), ()>> {
+    let value = head.lines().find_map(|line| {
+        let line = line.trim_end_matches('\r');
+        let (name, rest) = line.split_once(':')?;
+        if name.eq_ignore_ascii_case("Proxy-Authorization") {
+            Some(rest.trim())
+        } else {
+            None
+        }
+    })?;
+    let encoded = match value
+        .strip_prefix("Basic ")
+        .or_else(|| value.strip_prefix("basic "))
+    {
+        Some(encoded) => encoded,
+        None => return Some(Err(())),
+    };
+    let bytes =
+        match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded.trim()) {
+            Ok(bytes) => bytes,
+            Err(_) => return Some(Err(())),
+        };
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(_) => return Some(Err(())),
+    };
+    match text.split_once(':') {
+        Some((user, pass)) => Some(Ok((user.to_string(), pass.to_string()))),
+        None => Some(Err(())),
+    }
+}
+
+fn head_for_upstream(head: &str) -> String {
+    let mut out = String::with_capacity(head.len());
+    for line in head.split_inclusive('\n') {
+        let name = line.split(':').next().unwrap_or("");
+        let name = name.trim();
+        if name.eq_ignore_ascii_case("Proxy-Authorization")
+            || name.eq_ignore_ascii_case("Proxy-Connection")
+        {
+            continue;
+        }
+        out.push_str(line);
+    }
+    out
+}
+
+fn classify_principal(head: &str, secret_hex: &str) -> PrincipalDecision {
+    match proxy_basic_userinfo(head) {
+        None => PrincipalDecision::Anonymous,
+        Some(Err(())) => PrincipalDecision::Invalid,
+        Some(Ok((user, pass))) => {
+            if !secrets_equal(pass.as_bytes(), secret_hex.as_bytes()) || !valid_principal(&user) {
+                PrincipalDecision::Invalid
+            } else {
+                PrincipalDecision::Named(user)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -986,22 +1361,30 @@ mod tests {
         }
         assert!(String::from_utf8_lossy(&head).starts_with("HTTP/1.1 200"));
 
-        // Keep the tunnel busy for well past the (test) idle timeout:
-        // 4 rounds of sleep(idle/2) + echo, total ~2x the idle window.
+        // Keep the tunnel busy for well past the (test) idle timeout and
+        // past one progress window: each round forwards at least
+        // MIN_PROGRESS_BYTES, so the floor is met and the tunnel must NOT
+        // be cut (cap#241: an active transfer survives; cap#266: only a
+        // sub-floor drip is cut by the progress window). 4 rounds of
+        // sleep(idle/2) total ~2x the idle window, still under
+        // TUNNEL_MAX_LIFETIME.
         for i in 0..4 {
             tokio::time::sleep(TUNNEL_IDLE_TIMEOUT / 2).await;
-            let payload = format!("round-{i}");
-            stream.write_all(payload.as_bytes()).await.unwrap();
-            let mut echoed = [0u8; 64];
-            let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut echoed))
-                .await
-                .expect("active tunnel must not be torn down by the idle timeout")
-                .expect("echo read failed");
-            assert_eq!(
-                &echoed[..n],
-                payload.as_bytes(),
-                "round {i} must round-trip"
-            );
+            let mut payload = vec![b'a' + (i as u8); MIN_PROGRESS_BYTES as usize];
+            payload[0] = i as u8;
+            stream.write_all(&payload).await.unwrap();
+            let mut echoed = vec![0u8; payload.len()];
+            let mut off = 0;
+            while off < echoed.len() {
+                let n =
+                    tokio::time::timeout(Duration::from_secs(5), stream.read(&mut echoed[off..]))
+                        .await
+                        .expect("active tunnel must not be torn down by the idle timeout")
+                        .expect("echo read failed");
+                assert!(n > 0, "active tunnel closed mid-echo on round {i}");
+                off += n;
+            }
+            assert_eq!(echoed, payload, "round {i} must round-trip");
         }
     }
 
@@ -1252,5 +1635,406 @@ mod tests {
             parse_absolute_form_http_target("GET http://u:p@x/ HTTP/1.1").is_none(),
             "userinfo must be rejected"
         );
+    }
+
+    async fn read_status_head(stream: &mut TcpStream) -> String {
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            let n = tokio::time::timeout(Duration::from_secs(8), stream.read(&mut byte))
+                .await
+                .expect("proxy response must not hang")
+                .unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            head.push(byte[0]);
+            if head.ends_with(b"\r\n\r\n") || head.len() > 4096 {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&head).into_owned()
+    }
+
+    async fn connect_request(proxy: &EgressProxy, request: &str) -> TcpStream {
+        let mut stream = connect_raw(&proxy.url().unwrap()).await;
+        stream.write_all(request.as_bytes()).await.unwrap();
+        stream
+    }
+
+    fn spawn_discard_upstream() -> SocketAddr {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let listener = TcpListener::from_std(listener).unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    loop {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if sock.write_all(&buf[..n]).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn drip_tunnel_loses_permit_within_progress_window() {
+        // Traffic arrives well inside the idle window, so the idle clock
+        // keeps resetting. The bytes are below the progress floor, so the
+        // tunnel (and its permit) must still die when the progress window
+        // ends — not at the absolute lifetime.
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = upstream.accept().await {
+                loop {
+                    if sock.write_all(b"x").await.is_err() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                }
+            }
+        });
+
+        let proxy = EgressProxy::with_http_forwarding(Arc::new(BlockedNetworks::empty()), true);
+        let mut stream = connect_request(
+            &proxy,
+            &format!("CONNECT {upstream_addr} HTTP/1.1\r\nHost: {upstream_addr}\r\n\r\n"),
+        )
+        .await;
+        let head = read_status_head(&mut stream).await;
+        assert!(
+            head.starts_with("HTTP/1.1 200"),
+            "drip setup must tunnel, got: {head}"
+        );
+
+        let start = std::time::Instant::now();
+        let mut buf = [0u8; 16];
+        // One deadline for the whole drip, not per read: a byte every 400ms
+        // would otherwise refresh a per-read timeout forever and the test
+        // would hang on the pre-fix idle-only clock instead of failing.
+        let closed = tokio::time::timeout(TUNNEL_PROGRESS_WINDOW + Duration::from_secs(6), async {
+            loop {
+                match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => continue,
+                }
+            }
+        })
+        .await;
+        assert!(
+            closed.is_ok(),
+            "drip tunnel still open after {:?}",
+            start.elapsed()
+        );
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed + Duration::from_secs(1) >= TUNNEL_PROGRESS_WINDOW,
+            "drip teardown at {elapsed:?} was too fast to be the progress window"
+        );
+        assert!(
+            elapsed < TUNNEL_MAX_LIFETIME,
+            "drip tunnel lived {elapsed:?}; expected the progress window, not the lifetime"
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_draining_write_loses_permit_under_same_budget() {
+        // Upstream accepts writes but drains far below the progress floor.
+        // Partial writes reset the idle clock; they must not refresh the
+        // progress window (cap#266).
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = upstream.accept().await {
+                let mut one = [0u8; 1];
+                // Drain one byte at a time, pausing between reads, so the
+                // proxy's forward write makes partial progress well below
+                // the byte floor. Exit when the proxy tears the socket down.
+                loop {
+                    match sock.read(&mut one).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                        }
+                    }
+                }
+            }
+        });
+
+        let proxy = EgressProxy::with_http_forwarding(Arc::new(BlockedNetworks::empty()), true);
+        let mut stream = connect_request(
+            &proxy,
+            &format!("CONNECT {upstream_addr} HTTP/1.1\r\nHost: {upstream_addr}\r\n\r\n"),
+        )
+        .await;
+        let head = read_status_head(&mut stream).await;
+        assert!(
+            head.starts_with("HTTP/1.1 200"),
+            "slow-drain setup must tunnel, got: {head}"
+        );
+
+        let big = vec![b'x'; 4 * 1024 * 1024];
+        let start = std::time::Instant::now();
+        let write_result =
+            tokio::time::timeout(TUNNEL_PROGRESS_WINDOW * 4, stream.write_all(&big)).await;
+        let mut chunk = [0u8; 64];
+        let n = tokio::time::timeout(TUNNEL_PROGRESS_WINDOW * 2, stream.read(&mut chunk))
+            .await
+            .expect("slow-draining tunnel must be torn down, not hang")
+            .unwrap_or(0);
+        assert!(
+            n == 0 || write_result.unwrap_or(Ok(())).is_err(),
+            "slow-draining write must lose the tunnel, got {n} bytes"
+        );
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed + Duration::from_secs(1) >= TUNNEL_PROGRESS_WINDOW,
+            "teardown at {elapsed:?} was too fast to be the progress budget"
+        );
+        assert!(
+            elapsed < TUNNEL_MAX_LIFETIME,
+            "slow drain lived {elapsed:?}; expected the progress budget, not the lifetime"
+        );
+    }
+
+    #[tokio::test]
+    async fn floor_meeting_tunnel_still_dies_at_absolute_lifetime() {
+        // A transfer that keeps meeting the progress floor must survive
+        // the idle window (covered by active_transfer_survives_beyond_idle_timeout)
+        // and still lose its permit at TUNNEL_MAX_LIFETIME.
+        let upstream_addr = spawn_discard_upstream();
+        let proxy = EgressProxy::with_http_forwarding(Arc::new(BlockedNetworks::empty()), true);
+        let mut stream = connect_request(
+            &proxy,
+            &format!("CONNECT {upstream_addr} HTTP/1.1\r\nHost: {upstream_addr}\r\n\r\n"),
+        )
+        .await;
+        let head = read_status_head(&mut stream).await;
+        assert!(
+            head.starts_with("HTTP/1.1 200"),
+            "lifetime setup must tunnel, got: {head}"
+        );
+        let payload = vec![b'z'; MIN_PROGRESS_BYTES as usize];
+        let start = std::time::Instant::now();
+        // Write continuously. A 2s pause between rounds plus a slow echo
+        // can miss the 5s test progress window and die early, which is a
+        // flake rather than a lifetime failure (review).
+        let closed = tokio::time::timeout(TUNNEL_MAX_LIFETIME + Duration::from_secs(8), async {
+            loop {
+                if stream.write_all(&payload).await.is_err() {
+                    return;
+                }
+                let mut echoed = vec![0u8; payload.len()];
+                let mut off = 0;
+                while off < echoed.len() {
+                    match stream.read(&mut echoed[off..]).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => off += n,
+                    }
+                }
+            }
+        })
+        .await;
+        assert!(
+            closed.is_ok(),
+            "floor-meeting tunnel must be cut at the absolute lifetime"
+        );
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed + Duration::from_secs(4) >= TUNNEL_MAX_LIFETIME,
+            "lifetime teardown at {elapsed:?} was too fast"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_tenant_cap_refuses_saturated_tenant_and_admits_another() {
+        let upstream_addr = spawn_discard_upstream();
+        let proxy = EgressProxy::with_http_forwarding(Arc::new(BlockedNetworks::empty()), true);
+        let mut holders = Vec::new();
+        for _ in 0..MAX_PER_TENANT_CONNECTIONS {
+            let auth = proxy.authorization_header("tenant-a");
+            let mut stream = connect_request(
+                &proxy,
+                &format!(
+                    "CONNECT {upstream_addr} HTTP/1.1\r\nHost: {upstream_addr}\r\n{auth}\r\n\r\n"
+                ),
+            )
+            .await;
+            let head = read_status_head(&mut stream).await;
+            assert!(
+                head.starts_with("HTTP/1.1 200"),
+                "holder must be admitted, got: {head}"
+            );
+            holders.push(stream);
+        }
+
+        let auth = proxy.authorization_header("tenant-a");
+        let mut refused = connect_request(
+            &proxy,
+            &format!("CONNECT {upstream_addr} HTTP/1.1\r\nHost: {upstream_addr}\r\n{auth}\r\n\r\n"),
+        )
+        .await;
+        let refused_head = read_status_head(&mut refused).await;
+        assert!(
+            refused_head.starts_with("HTTP/1.1 503"),
+            "tenant at its cap must be refused, got: {refused_head}"
+        );
+
+        let auth_b = proxy.authorization_header("tenant-b");
+        let mut other = connect_request(
+            &proxy,
+            &format!(
+                "CONNECT {upstream_addr} HTTP/1.1\r\nHost: {upstream_addr}\r\n{auth_b}\r\n\r\n"
+            ),
+        )
+        .await;
+        let other_head = read_status_head(&mut other).await;
+        assert!(
+            other_head.starts_with("HTTP/1.1 200"),
+            "another tenant must still be admitted under the global budget, got: {other_head}"
+        );
+        other.write_all(b"ping").await.unwrap();
+        let mut echoed = [0u8; 4];
+        let n = tokio::time::timeout(Duration::from_secs(3), other.read(&mut echoed))
+            .await
+            .expect("other tenant's fetch must succeed")
+            .unwrap();
+        assert_eq!(&echoed[..n], b"ping");
+        drop(holders);
+    }
+
+    #[tokio::test]
+    async fn credentialed_proxy_url_is_charged_to_that_principal() {
+        // The production path (oci-client / reqwest) learns the principal
+        // from proxy-URL userinfo, not from a header we add by hand.
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = upstream.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    let _ = sock
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
+                        .await;
+                });
+            }
+        });
+
+        let proxy = EgressProxy::with_http_forwarding(Arc::new(BlockedNetworks::empty()), true);
+        let mut holders = Vec::new();
+        for _ in 0..MAX_PER_TENANT_CONNECTIONS {
+            let auth = proxy.authorization_header("tenant-b");
+            let mut stream = connect_request(
+                &proxy,
+                &format!(
+                    "CONNECT {upstream_addr} HTTP/1.1\r\nHost: {upstream_addr}\r\n{auth}\r\n\r\n"
+                ),
+            )
+            .await;
+            let head = read_status_head(&mut stream).await;
+            assert!(head.starts_with("HTTP/1.1 200"), "holder: {head}");
+            holders.push(stream);
+        }
+
+        let saturated = proxy.url_for_principal("tenant-b").unwrap();
+        let saturated_client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(&saturated).unwrap())
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let denied = saturated_client
+            .get(format!("http://{upstream_addr}/v2/"))
+            .send()
+            .await;
+        // reqwest returns `Ok(503)` when the proxy answers; a reset is also
+        // a refusal. Either way the saturated principal must not get a 200.
+        match denied {
+            Err(_) => {}
+            Ok(resp) => assert_eq!(
+                resp.status(),
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                "credentialed URL for a saturated principal must be refused"
+            ),
+        }
+
+        let other = proxy.url_for_principal("tenant-c").unwrap();
+        let other_client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(&other).unwrap())
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let ok = other_client
+            .get(format!("http://{upstream_addr}/v2/"))
+            .send()
+            .await
+            .expect("another principal must still fetch through the global budget");
+        assert_eq!(ok.status(), reqwest::StatusCode::OK);
+        drop(holders);
+    }
+
+    #[tokio::test]
+    async fn invalid_proxy_authorization_is_refused_without_taking_a_slot() {
+        let upstream_addr = spawn_discard_upstream();
+        let proxy = EgressProxy::with_http_forwarding(Arc::new(BlockedNetworks::empty()), true);
+        let mut bad = connect_request(
+            &proxy,
+            &format!(
+                "CONNECT {upstream_addr} HTTP/1.1\r\nHost: {upstream_addr}\r\nProxy-Authorization: Basic bm90LXZhbGlk\r\n\r\n"
+            ),
+        )
+        .await;
+        let head = read_status_head(&mut bad).await;
+        assert!(
+            head.starts_with("HTTP/1.1 403"),
+            "bad credentials must be refused, got: {head}"
+        );
+
+        let auth = proxy.authorization_header("tenant-a");
+        let mut ok = connect_request(
+            &proxy,
+            &format!("CONNECT {upstream_addr} HTTP/1.1\r\nHost: {upstream_addr}\r\n{auth}\r\n\r\n"),
+        )
+        .await;
+        let ok_head = read_status_head(&mut ok).await;
+        assert!(
+            ok_head.starts_with("HTTP/1.1 200"),
+            "a valid principal must still be admitted after a bad credential, got: {ok_head}"
+        );
+    }
+
+    #[test]
+    fn org_principal_is_url_safe_and_distinct() {
+        let a = org_egress_principal(&"11111111-1111-1111-1111-111111111111");
+        let b = org_egress_principal(&"22222222-2222-2222-2222-222222222222");
+        assert_ne!(a, b);
+        assert!(valid_principal(&a), "{a}");
+        assert!(valid_principal(PLATFORM_EGRESS_PRINCIPAL));
+        assert!(!a.contains(':'));
     }
 }
