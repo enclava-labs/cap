@@ -1162,17 +1162,35 @@ pub async fn unlock_status(
     let domain = app.tee_domain.as_deref().unwrap_or(&app.domain);
     let tee_url = format!("https://{domain}/.well-known/confidential");
 
-    let status_url = format!("https://{domain}/.well-known/confidential/status");
-    let ownership_state = match state.tee_http_client.get(&status_url).send().await {
-        Ok(resp) if resp.status().is_success() => {
-            resp.json::<serde_json::Value>().await.ok().and_then(|v| {
-                v.get("ownership_state")
-                    .or_else(|| v.get("state"))
-                    .and_then(|s| s.as_str())
-                    .map(String::from)
-            })
+    // Tenant TEE endpoints serve self-signed RA-TLS leaves; only the
+    // SNP-attested, SPKI-pinned channel authenticates them. Any failure is
+    // reported as `ownership_state: null` — never an unauthenticated read.
+    let tee_client = match crate::tee_attestation::attested_tee_channel(
+        &app,
+        &state.db,
+        &state.kube_client,
+        state
+            .attestation
+            .as_ref()
+            .and_then(|config| config.amd_kds_base_url.as_deref()),
+    )
+    .await
+    {
+        Ok(client) => Some(client),
+        Err(error) => {
+            tracing::warn!(
+                app_id = %app.id,
+                category = error.category(),
+                reason = error.reason(),
+                code = "unlock_status_attestation",
+                "unlock status TEE channel failed attestation"
+            );
+            None
         }
-        _ => None,
+    };
+    let ownership_state = match tee_client {
+        Some(client) => tee_ownership_state(&client, domain).await,
+        None => None,
     };
 
     Ok(Json(UnlockStatusResponse {
@@ -1180,6 +1198,47 @@ pub async fn unlock_status(
         tee_url,
         ownership_state,
     }))
+}
+
+/// Fetch and parse the guest `ownership_state` over an attested channel.
+/// Returns `None` on transport, non-2xx, or malformed responses.
+async fn tee_ownership_state(client: &reqwest::Client, domain: &str) -> Option<String> {
+    let status_url = format!("https://{domain}/.well-known/confidential/status");
+    match client.get(&status_url).send().await {
+        Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
+            Ok(v) => tee_ownership_state_from_value(&v),
+            Err(_) => {
+                tracing::warn!(
+                    code = "unlock_status_malformed",
+                    "unlock status TEE response was not JSON"
+                );
+                None
+            }
+        },
+        Ok(resp) => {
+            tracing::warn!(
+                status = %resp.status(),
+                code = "unlock_status_http",
+                "unlock status TEE returned non-success status"
+            );
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                code = "unlock_status_transport",
+                "unlock status TEE request failed"
+            );
+            None
+        }
+    }
+}
+
+fn tee_ownership_state_from_value(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("ownership_state")
+        .or_else(|| value.get("state"))
+        .and_then(|s| s.as_str())
+        .map(String::from)
 }
 
 #[derive(Debug, Serialize)]
@@ -1625,6 +1684,8 @@ pub async fn update_unlock_mode(
 
 #[cfg(test)]
 mod tests {
+    use axum::Json;
+    use axum::extract::{Path, State};
     use axum::http::StatusCode;
     use base64::{
         Engine as _,
@@ -1644,7 +1705,8 @@ mod tests {
         BUILTIN_AMD_ARK_SHA256_PINS, ReceiptEnvelope, ReceiptPayloadView, RequestedUnlockMode,
         SignedReceiptResponse, TransitionQuoteError, TransitionReceiptAttestation,
         TransitionSnpQuote, UnlockModeCommitRequest, auto_unlock_disabled_error,
-        commit_unlock_mode_transition, snp_guest_policy_allows_debug, transition_receipt_is_fresh,
+        commit_unlock_mode_transition, snp_guest_policy_allows_debug,
+        tee_ownership_state_from_value, transition_receipt_is_fresh, unlock_status,
         validate_transition, verify_transition_attestation, verify_transition_receipt,
         verify_transition_snp_quote,
     };
@@ -3627,5 +3689,130 @@ mod tests {
         let (status, body) = auto_unlock_disabled_error();
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body.0["error"], "auto_unlock_disabled");
+    }
+
+    #[test]
+    fn tee_ownership_state_parses_guest_status_fields() {
+        assert_eq!(
+            tee_ownership_state_from_value(&serde_json::json!({"ownership_state": "locked"})),
+            Some("locked".to_string())
+        );
+        assert_eq!(
+            tee_ownership_state_from_value(&serde_json::json!({"state": "unlocked"})),
+            Some("unlocked".to_string())
+        );
+        assert_eq!(
+            tee_ownership_state_from_value(&serde_json::json!({"ownership_state": 7})),
+            None
+        );
+        assert_eq!(tee_ownership_state_from_value(&serde_json::json!({})), None);
+    }
+
+    /// With no admissible launch identity the attested channel fails closed:
+    /// `ownership_state` must be null even though the unverified
+    /// `state.tee_http_client` is wired to a live TLS endpoint that would
+    /// happily answer `{"ownership_state":"unlocked"}` — any fallback to it
+    /// is observable as `Some("unlocked")` and fails this test.
+    #[tokio::test]
+    async fn unlock_status_reports_null_when_attestation_fails() {
+        use std::net::SocketAddr;
+        use std::sync::Once;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio_rustls::TlsAcceptor;
+
+        static INSTALL_PROVIDER: Once = Once::new();
+        INSTALL_PROVIDER.call_once(|| {
+            let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+        });
+
+        // Self-signed HTTPS double answering the guest status endpoint the
+        // way a real (unlocked) guest would — over a certificate no CA chain
+        // trusts, exactly like the production RA-TLS leaf.
+        let cert =
+            rcgen::generate_simple_self_signed(vec!["status-double.example.test".to_string()])
+                .expect("self-signed certificate");
+        let tls_config = tokio_rustls::rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![tokio_rustls::rustls::pki_types::CertificateDer::from(
+                    cert.cert.der().to_vec(),
+                )],
+                tokio_rustls::rustls::pki_types::PrivateKeyDer::Pkcs8(
+                    cert.signing_key.serialize_der().into(),
+                ),
+            )
+            .expect("TLS server config");
+        let acceptor = TlsAcceptor::from(std::sync::Arc::new(tls_config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let double_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    continue;
+                };
+                let Ok(mut stream) = acceptor.accept(stream).await else {
+                    continue;
+                };
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while let Ok(read) = stream.read(&mut buf).await {
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..read]);
+                    if request.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let body = r#"{"ownership_state":"unlocked"}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let pool = database_test_pool().await;
+        let fixture = insert_unlock_test_app(&pool).await;
+        let app_name = fixture.app.name.clone();
+        let tee_domain = fixture.app.tee_domain.clone().expect("fixture tee_domain");
+
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        // The unverified channel, pointed at the live double: if any code
+        // path falls back to it, the test observes "unlocked".
+        state.tee_http_client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .resolve(
+                &tee_domain,
+                SocketAddr::new(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    double_addr.port(),
+                ),
+            )
+            .https_only(true)
+            .no_proxy()
+            .build()
+            .expect("build unverified trap client");
+
+        let auth = crate::auth::middleware::AuthContext {
+            user_id: fixture.user_id,
+            org_id: fixture.app.org_id,
+            org_name: "unlock-status-test".to_string(),
+            role: crate::models::Role::Owner,
+            api_key: None,
+            management_origin: crate::auth::middleware::ManagementOrigin::Public,
+        };
+
+        let Json(body) = unlock_status(auth, State(state), Path(app_name.clone()))
+            .await
+            .expect("unlock status must succeed");
+        assert_eq!(body.ownership_state, None);
+        assert_eq!(body.unlock_mode, "auto");
+        assert!(body.tee_url.ends_with("/.well-known/confidential"));
+
+        delete_unlock_test_org(&pool, fixture.app.org_id).await;
     }
 }
