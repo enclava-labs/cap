@@ -456,6 +456,186 @@ pub async fn get_paas_idempotency_receipt(
     })))
 }
 
+/// How long an incomplete reservation must stay untouched before the reaper
+/// terminalizes it. Deferred retries re-arm `lease_expires_at` for only
+/// seconds at a time and every lease/heartbeat refreshes `updated_at`, so a
+/// row still quiet after a day has no live claimant and no scheduled retry.
+const IDEMPOTENCY_REAP_HORIZON_SECONDS: i64 = 24 * 60 * 60;
+const IDEMPOTENCY_REAP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+const IDEMPOTENCY_REAP_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
+const IDEMPOTENCY_REAP_BATCH: i64 = 100;
+
+/// SQL predicate template shared by candidate selection and the terminal
+/// UPDATE so a row refreshed between the two is never fenced: the
+/// reservation must still be incomplete, unleasd past the horizon, and
+/// untouched for the horizon. `{}` is the horizon in seconds (a literal,
+/// not a bind, so the same text works for both statements whose parameter
+/// numbering differs). Publication-pending checkpoints (keyring policy or
+/// signer rotation) are excluded: they are the one incomplete fail-closed
+/// shape a same-key retry deliberately reclaims to finish publication of an
+/// already-committed mutation, so fencing them would strand committed work.
+const IDEMPOTENCY_REAP_CANDIDATE_PREDICATE: &str = "\
+    completed_at IS NULL
+    AND known_not_applied = false
+    AND (
+        recovery_kind IS NULL
+        OR recovery_kind NOT IN (
+            'expiring_capability',
+            'deterministic_expiring_capability'
+        )
+    )
+    AND lease_expires_at <= clock_timestamp()
+        - ({} * interval '1 second')
+    AND updated_at <= clock_timestamp()
+        - ({} * interval '1 second')
+    AND NOT COALESCE(
+        response_status = 503
+        AND response_body->>'code' IN (
+            'keyring_policy_reconciliation_pending',
+            'signer_rotation_publication_pending'
+        ),
+        false
+    )";
+
+fn idempotency_reap_predicate() -> String {
+    IDEMPOTENCY_REAP_CANDIDATE_PREDICATE
+        .replace("{}", &IDEMPOTENCY_REAP_HORIZON_SECONDS.to_string())
+}
+
+/// Terminalize `cap_internal_idempotency` reservations whose claimant is gone
+/// for good: `completed_at` still NULL, no live lease, and no write for the
+/// full horizon. Without this, an abandoned reservation classifies as
+/// `abandoned` forever in the receipt reader and only settles if the caller
+/// happens to retry the same key — PaaS callers that gave up leave the row
+/// (and, for fail-closed routes, the org's mutation fence) stuck.
+///
+/// The written receipt is the same `idempotency_recovery_required` /
+/// `reconcile_then_retry_with_new_key` tombstone migration
+/// `0040_cap_internal_idempotency_leases.sql` used for stale legacy rows, so
+/// a same-key retry replays the stored 409 instead of re-executing.
+///
+/// Excluded on purpose:
+/// - `known_not_applied` rows: CHECK-constrained to stay incomplete; their
+///   effect never applied and any same-key retry may still re-execute.
+/// - `expiring_capability` / `deterministic_expiring_capability` rows: they
+///   carry capability-receipt columns the generic tombstone cannot satisfy,
+///   and their own replay path already terminalizes them with the bounded
+///   `idempotency_capability_expired` proof on the next same-key retry.
+/// - Publication-pending checkpoints (see the predicate above).
+/// - Rows still inside the horizon on either clock: a live lease or a recent
+///   defer/heartbeat is a claimant that must not be fenced.
+pub async fn reap_abandoned_idempotency_reservations(
+    pool: &sqlx::PgPool,
+) -> Result<u64, sqlx::Error> {
+    let mut reaped = 0_u64;
+    // Selection and terminal write share one transaction per row: the
+    // FOR UPDATE lock would otherwise be released before the UPDATE, letting
+    // a second replica pick the same batch. SKIP LOCKED keeps replicas from
+    // contending, and the UPDATE re-checks every predicate plus the observed
+    // reservation_token so a heartbeat/defer landing between select and
+    // write leaves the row untouched.
+    // Bound total attempts, not just misses: a row that refreshes between
+    // selection and write counts as an attempt, and a backlog of such rows
+    // must not spin the tick forever.
+    let mut attempts = 0_u32;
+    while reaped < IDEMPOTENCY_REAP_BATCH as u64 && attempts < (IDEMPOTENCY_REAP_BATCH * 10) as u32
+    {
+        attempts += 1;
+        let mut tx = pool.begin().await?;
+        let candidate: Option<(String, Option<Uuid>)> = sqlx::query_as(&format!(
+            "SELECT idempotency_key, reservation_token
+               FROM cap_internal_idempotency
+              WHERE {}
+              ORDER BY updated_at
+              LIMIT 1
+              FOR UPDATE SKIP LOCKED",
+            idempotency_reap_predicate()
+        ))
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((key, previous_token)) = candidate else {
+            tx.rollback().await?;
+            break;
+        };
+        // The owner guard compares the configured token against the row's
+        // current reservation_token. Rows without one predate the guard and
+        // need no configured token.
+        if let Some(previous_token) = previous_token {
+            sqlx::query_scalar::<_, String>(
+                "SELECT set_config('enclava.idempotency_reservation_token', $1, true)",
+            )
+            .bind(previous_token.to_string())
+            .fetch_one(&mut *tx)
+            .await?;
+        }
+        let terminal_token = Uuid::new_v4();
+        let updated = sqlx::query(&format!(
+            "UPDATE cap_internal_idempotency
+                SET reservation_token = $2,
+                    operation_id = COALESCE(operation_id, $2),
+                    lease_expires_at = NULL,
+                    recovery_kind = COALESCE(recovery_kind, 'fail_closed'),
+                    response_status = $3,
+                    response_body = $4,
+                    completed_at = clock_timestamp(),
+                    updated_at = clock_timestamp(),
+                    attempt_count = attempt_count + 1
+              WHERE idempotency_key = $1
+                AND reservation_token IS NOT DISTINCT FROM $5
+                AND {}",
+            idempotency_reap_predicate()
+        ))
+        .bind(&key)
+        .bind(terminal_token)
+        .bind(StatusCode::CONFLICT.as_u16() as i32)
+        .bind(idempotency_recovery_required_body())
+        .bind(previous_token)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() == 1 {
+            tx.commit().await?;
+            reaped += 1;
+        } else {
+            // The row changed under us (heartbeat, defer, or a concurrent
+            // completion); leave it for the next tick.
+            tx.rollback().await?;
+        }
+    }
+    Ok(reaped)
+}
+
+/// Periodic reaper for abandoned idempotency reservations (see
+/// `reap_abandoned_idempotency_reservations`).
+pub fn spawn_idempotency_reaper(pool: sqlx::PgPool, shutdown: tokio_util::sync::CancellationToken) {
+    crate::reconciler::spawn_reconciler("idempotency-reaper", shutdown, async move {
+        use tokio::time::{MissedTickBehavior, interval};
+
+        // First tick fires immediately, which also cleans up any backlog
+        // left by a previous instance.
+        let mut interval = interval(IDEMPOTENCY_REAP_INTERVAL);
+        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            // On failure, re-attempt at the short retry cadence rather than
+            // deferring to the next tick, so a transient DB blip cannot
+            // stretch the accumulation window.
+            loop {
+                match reap_abandoned_idempotency_reservations(&pool).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        tracing::debug!(reaped = n, "reaped abandoned idempotency reservations");
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "idempotency reservation reap failed");
+                        tokio::time::sleep(IDEMPOTENCY_REAP_RETRY).await;
+                    }
+                }
+            }
+        }
+    });
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UpsertPaaSOrgRequest {
     pub name: String,
