@@ -120,6 +120,13 @@ pub(crate) async fn attested_tee_channel(
     kds_base_url: Option<&str>,
 ) -> Result<reqwest::Client, TeeAttestError> {
     let identities = load_admissible_launch_identities(pool, app).await?;
+    // attest_tee rejects an empty set before connecting; skip the bounded
+    // Gateway lookup so a workload with no admissible identity fails fast.
+    if identities.is_empty() {
+        return Err(rejected(
+            "no signed deployment identity to bind TEE evidence",
+        ));
+    }
     let gateway_ip = crate::routes::logs::resolve_tenant_gateway_ip(
         app.id,
         kube_client,

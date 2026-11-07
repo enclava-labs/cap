@@ -3709,22 +3709,93 @@ mod tests {
     }
 
     /// With no admissible launch identity the attested channel fails closed:
-    /// `ownership_state` must be null, and the unverified
-    /// `state.tee_http_client` must never be consulted (it would "succeed"
-    /// against a plain-HTTP double while attestation is impossible).
+    /// `ownership_state` must be null even though the unverified
+    /// `state.tee_http_client` is wired to a live TLS endpoint that would
+    /// happily answer `{"ownership_state":"unlocked"}` — any fallback to it
+    /// is observable as `Some("unlocked")` and fails this test.
     #[tokio::test]
     async fn unlock_status_reports_null_when_attestation_fails() {
+        use std::net::SocketAddr;
+        use std::sync::Once;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio_rustls::TlsAcceptor;
+
+        static INSTALL_PROVIDER: Once = Once::new();
+        INSTALL_PROVIDER.call_once(|| {
+            let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+        });
+
+        // Self-signed HTTPS double answering the guest status endpoint the
+        // way a real (unlocked) guest would — over a certificate no CA chain
+        // trusts, exactly like the production RA-TLS leaf.
+        let cert =
+            rcgen::generate_simple_self_signed(vec!["status-double.example.test".to_string()])
+                .expect("self-signed certificate");
+        let tls_config = tokio_rustls::rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![tokio_rustls::rustls::pki_types::CertificateDer::from(
+                    cert.cert.der().to_vec(),
+                )],
+                tokio_rustls::rustls::pki_types::PrivateKeyDer::Pkcs8(
+                    cert.signing_key.serialize_der().into(),
+                ),
+            )
+            .expect("TLS server config");
+        let acceptor = TlsAcceptor::from(std::sync::Arc::new(tls_config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let double_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    continue;
+                };
+                let Ok(mut stream) = acceptor.accept(stream).await else {
+                    continue;
+                };
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while let Ok(read) = stream.read(&mut buf).await {
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..read]);
+                    if request.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let body = r#"{"ownership_state":"unlocked"}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+
         let pool = database_test_pool().await;
         let fixture = insert_unlock_test_app(&pool).await;
         let app_name = fixture.app.name.clone();
+        let tee_domain = fixture.app.tee_domain.clone().expect("fixture tee_domain");
 
         let mut state = crate::test_support::lazy_state();
         state.db = pool.clone();
-        // A trap client: any use of the unverified channel fails the test.
+        // The unverified channel, pointed at the live double: if any code
+        // path falls back to it, the test observes "unlocked".
         state.tee_http_client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .resolve(
+                &tee_domain,
+                SocketAddr::new(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    double_addr.port(),
+                ),
+            )
             .https_only(true)
+            .no_proxy()
             .build()
-            .expect("build trap client");
+            .expect("build unverified trap client");
 
         let auth = crate::auth::middleware::AuthContext {
             user_id: fixture.user_id,
