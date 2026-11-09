@@ -16,12 +16,16 @@
 //!
 //! ```json
 //! {"error":"acme_rate_limited"|"acme_certificate_issuance_failed"|"enclava_init_failed",
-//!  "terminal":true,"retry_after":null|"2026-09-10T09:30:00Z"}
+//!  "terminal":true,"retry_after":null|"2026-09-10T09:30:00Z",
+//!  "stage":"<exact INIT_STAGE_VOCABULARY phrase, omitted when unknown>"}
 //! ```
 //!
-//! Only exact recognized codes and a validated UTC deadline are ever
-//! emitted; unknown, malformed, or out-of-bounds input degrades to the
-//! generic failure with a null deadline.
+//! `stage` is optional and only ever one of [`INIT_STAGE_VOCABULARY`].
+//! The attestation proxy currently ignores it and still reads the stage
+//! file for `/status`; the termination log is the copy that survives a
+//! container restart. Unknown, malformed, or out-of-bounds input degrades
+//! to the generic failure with a null deadline, and a non-vocabulary
+//! stage is omitted rather than echoed.
 
 use anyhow;
 use chrono::{DateTime, TimeDelta, Utc};
@@ -35,6 +39,24 @@ pub(crate) const MAX_RETRY_AFTER_HORIZON_SECS: i64 = 365 * 24 * 60 * 60;
 /// Longest `retry_after` string ever parsed. RFC 3339 timestamps fit far
 /// below this; anything longer is treated as malformed without parsing.
 const MAX_RETRY_AFTER_LEN: usize = 64;
+
+/// Exact phrases enclava-init records, in boot order. A failure diagnostic
+/// may carry one of these and nothing else. Must stay aligned with the
+/// attestation-proxy stage vocabulary and API `LAST_INIT_STAGES`.
+pub const INIT_STAGE_VOCABULARY: [&str; 12] = [
+    "loading config",
+    "validating signed config",
+    "verifying trustee policy",
+    "waiting for owner seed",
+    "opening luks volumes",
+    "preparing mount ownership",
+    "provisioning static tls certificate",
+    "writing component seeds",
+    "waiting for workload containers",
+    "binding workload mount namespaces",
+    "seeding caddy runtime handoff",
+    "marking ready",
+];
 
 /// Bounded, provider-text-free diagnostic code for a bootstrap failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,17 +178,18 @@ impl SafeBootstrapDiagnostic {
     /// Render the single-line safe JSON contract used by the init-error
     /// file, the termination log, stderr, and tracing.
     ///
-    /// `stage` is an optional exact vocabulary phrase already validated by
-    /// the caller. It is omitted when absent. The stage file is overwritten
-    /// on the next boot, so the termination log is the surface that survives
-    /// a restart; unknown or caller-supplied text must never be passed here.
+    /// `stage` is included only when it is exactly one of
+    /// [`INIT_STAGE_VOCABULARY`]. Anything else is omitted. The stage file
+    /// is overwritten on the next boot, so the termination log is the
+    /// surface that survives a restart. The attestation proxy's `/status`
+    /// path still reads the stage file until it accepts this field.
     pub fn render_json_with_stage(&self, stage: Option<&str>) -> String {
         let mut value = serde_json::json!({
             "error": self.code.as_str(),
             "terminal": true,
             "retry_after": self.retry_after_rfc3339(),
         });
-        if let Some(stage) = stage {
+        if let Some(stage) = stage.filter(|stage| INIT_STAGE_VOCABULARY.contains(stage)) {
             value["stage"] = serde_json::Value::String(stage.to_string());
         }
         value.to_string()
@@ -202,6 +225,21 @@ mod tests {
         assert_eq!(
             SafeDiagnosticCode::from_broker_code("enclava_init_failed"),
             None
+        );
+    }
+
+    #[test]
+    fn non_vocabulary_stage_is_omitted_from_the_diagnostic() {
+        let rendered = SafeBootstrapDiagnostic::generic()
+            .render_json_with_stage(Some("provisioning static tls certificate SYNTHETIC"));
+        let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert!(parsed.get("stage").is_none());
+        assert!(!rendered.contains("SYNTHETIC"));
+        let kept = SafeBootstrapDiagnostic::generic()
+            .render_json_with_stage(Some("provisioning static tls certificate"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&kept).unwrap()["stage"],
+            "provisioning static tls certificate"
         );
     }
 

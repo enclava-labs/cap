@@ -3,8 +3,11 @@
 //! Group by process/pod and request_seq; nested stages must not be added to totals.
 //! Success means that operation returned Ok, not that subsequent validation passed.
 //! DNS lookup errors optionally add error_category: nxdomain, nodata, timeout,
-//! transport or other. This classification is diagnostic only: negative DNS
-//! answers remain errors and still trigger the existing alternate-resolver retry.
+//! transport or other. Negative answers remain errors and still trigger the
+//! alternate-resolver retry. Propagation additionally accepts a successful
+//! non-matching TXT from the other resolver, and an authoritative-nameserver
+//! hit when both recursive resolvers miss. This classification is diagnostic
+//! only: it never changes the issuance result by itself.
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;

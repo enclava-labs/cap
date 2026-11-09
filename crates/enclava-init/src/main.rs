@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -12,7 +12,7 @@ use enclava_init::config::{
     Config, LOG_SPOOL_STORAGE_STATE_BIND, LogEncryptionHandoff, LogEncryptionHandoffFile, Mode,
     VolumeConfig,
 };
-use enclava_init::safe_diagnostics::SafeBootstrapDiagnostic;
+use enclava_init::safe_diagnostics::{INIT_STAGE_VOCABULARY, SafeBootstrapDiagnostic};
 use enclava_init::secrets::{DerivedSeed, OwnerSeed, Password};
 use enclava_init::{
     dev_no_luks_override, env_override, log_relay, luks, luks2_seal, seeds, served_certificate,
@@ -50,25 +50,9 @@ const TLS_READINESS_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 /// accumulating longer unready spans.
 const TLS_READINESS_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_STAGE_FILE: &str = "/run/enclava/init-stage";
-/// Exact phrases [`record_stage`] writes, in boot order. A failure
-/// diagnostic may carry one of these and nothing else: the stage file is
-/// overwritten when the restarted container re-enters `record_stage`, so
-/// the termination log is the only copy that survives (cap#345). Must stay
-/// aligned with the attestation-proxy and API status vocabularies.
-const INIT_STAGE_VOCABULARY: [&str; 12] = [
-    "loading config",
-    "validating signed config",
-    "verifying trustee policy",
-    "waiting for owner seed",
-    "opening luks volumes",
-    "preparing mount ownership",
-    "provisioning static tls certificate",
-    "writing component seeds",
-    "waiting for workload containers",
-    "binding workload mount namespaces",
-    "seeding caddy runtime handoff",
-    "marking ready",
-];
+/// Largest stage file ever read. The producer writes one short phrase;
+/// anything larger is host-controlled and is omitted rather than buffered.
+const INIT_STAGE_MAX_BYTES: u64 = 256;
 const MANAGED_CONFIG_ROOT: &str = ".enclava";
 const MANAGED_CONFIG_DIR: &str = ".enclava/config";
 const MANAGED_CONFIG_DIR_MODE: u32 = 0o750;
@@ -516,7 +500,15 @@ fn record_stage(stage: &str) -> Result<()> {
 /// Anything else — missing file, extra text, a lookalike — is omitted so
 /// the diagnostic cannot become a channel for supplied values.
 fn recorded_stage() -> Option<&'static str> {
-    let bytes = std::fs::read(stage_file_path()).ok()?;
+    let file = std::fs::File::open(stage_file_path()).ok()?;
+    let len = file.metadata().ok()?.len();
+    if len == 0 || len > INIT_STAGE_MAX_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(INIT_STAGE_MAX_BYTES)
+        .read_to_end(&mut bytes)
+        .ok()?;
     let text = std::str::from_utf8(&bytes).ok()?;
     let stage = text.trim();
     INIT_STAGE_VOCABULARY

@@ -417,17 +417,17 @@ async fn wait_for_txt_record(
 
     let deadline = tokio::time::Instant::now() + config.dns_propagation_wait;
     loop {
-        // A non-matching answer from the preferred resolver is not
-        // authoritative for this check. Cluster DNS negative-caches the
-        // deletion of the previous same-name `_acme-challenge` TXT (destroy
-        // → immediate recreate) and can keep returning that stale view for
-        // the whole propagation budget. Production sets that budget equal
-        // to the guest's broker-client timeout, so the guest times out and
-        // reports a generic `enclava_init_failed` instead of receiving a
-        // certificate Let's Encrypt can already validate via public DNS.
-        // A hit on either configured resolver is enough to proceed; neither
-        // seeing the value still waits out the budget.
-        let visible = challenge_txt_visible(
+        // A same-name recreate can hide the current challenge from the
+        // caching resolvers this broker polls:
+        // - a successful TXT answer that is only the previous challenge
+        //   (the #104 helper does not fall back on a successful answer);
+        // - NODATA/NXDOMAIN, which hickory returns as a lookup error. The
+        //   other recursive resolver is consulted on that error, but both
+        //   can still be caching the deletion. The authoritative
+        //   nameserver is not. Let's Encrypt validates from resolvers that
+        //   did not observe that deletion, so an authoritative hit is
+        //   enough to proceed. Neither view seeing the value still waits.
+        let visible = challenge_published(
             config,
             timing,
             &mut |system| async move {
@@ -437,6 +437,7 @@ async fn wait_for_txt_record(
                     lookup_txt_external(record_name).await
                 }
             },
+            lookup_txt_authoritative(record_name),
             expected_value,
         )
         .await;
@@ -454,12 +455,43 @@ async fn wait_for_txt_record(
     }
 }
 
-/// Whether any configured resolver already published `expected_value`.
+/// Whether the current challenge is already published.
+///
+/// Recursive resolvers are checked first. A successful answer that lacks
+/// the expected value does not stop the search: that is a stale previous
+/// challenge, and the #104 helper would have treated it as final. If no
+/// recursive resolver has the value, the authoritative nameserver is
+/// checked. A caching denial (hickory `NoRecordsFound`) on both recursive
+/// resolvers must not hide a record the authoritative server already
+/// serves — Let's Encrypt does not use this process's resolver cache.
+async fn challenge_published<F, Fut, A>(
+    config: &AcmeConfig,
+    timing: RequestTiming,
+    recursive: &mut F,
+    authoritative: A,
+    expected_value: &str,
+) -> bool
+where
+    F: FnMut(bool) -> Fut,
+    Fut: Future<Output = Result<Vec<String>, DnsLookupError>>,
+    A: Future<Output = Result<Vec<String>, DnsLookupError>>,
+{
+    if challenge_txt_visible(config, timing, recursive, expected_value).await {
+        return true;
+    }
+    match authoritative.await {
+        Ok(values) => values.iter().any(|value| value == expected_value),
+        Err(_) => false,
+    }
+}
+
+/// Whether any configured recursive resolver already published `expected_value`.
 ///
 /// Unlike [`lookup_txt_with_resolvers`], a successful but non-matching
-/// answer does not stop the search: the preferred resolver's stale NODATA
-/// or previous-challenge TXT must not hide a current challenge that the
-/// other resolver (the public view Let's Encrypt queries) can already see.
+/// answer does not stop the search: that answer is a previous challenge's
+/// TXT, not evidence the current value is absent. A lookup error still
+/// continues to the other resolver. NODATA on both is not success — the
+/// caller then asks the authoritative nameserver.
 async fn challenge_txt_visible<F, Fut>(
     config: &AcmeConfig,
     timing: RequestTiming,
@@ -674,6 +706,79 @@ async fn lookup_txt_system(name: &str) -> Result<Vec<String>, DnsLookupError> {
     .map_err(DnsLookupError::from)
 }
 
+/// TXT values from the zone's authoritative nameservers, not from a
+/// caching recursive resolver. NS discovery uses the public resolver
+/// (those records are stable); the TXT query itself is sent to the
+/// discovered addresses so a negative cache of a just-deleted
+/// same-name challenge cannot hide a record the zone already serves.
+async fn lookup_txt_authoritative(name: &str) -> Result<Vec<String>, DnsLookupError> {
+    let recursive = TokioResolver::builder_with_config(
+        ResolverConfig::udp_and_tcp(&CLOUDFLARE),
+        TokioRuntimeProvider::default(),
+    )
+    .with_options(ResolverOpts::default())
+    .build()
+    .map_err(DnsLookupError::from)?;
+    let ns_ips = authoritative_nameserver_ips(&recursive, name).await?;
+    let config = ResolverConfig::from_parts(
+        None,
+        Vec::new(),
+        ns_ips
+            .into_iter()
+            .map(hickory_resolver::config::NameServerConfig::udp_and_tcp)
+            .collect(),
+    );
+    let authoritative = TokioResolver::builder_with_config(config, TokioRuntimeProvider::default())
+        .with_options(ResolverOpts::default())
+        .build()
+        .map_err(DnsLookupError::from)?;
+    collect_txt_values(
+        authoritative
+            .lookup(name, hickory_resolver::proto::rr::RecordType::TXT)
+            .await
+            .map_err(DnsLookupError::from)?,
+    )
+    .map_err(DnsLookupError::from)
+}
+
+async fn authoritative_nameserver_ips(
+    recursive: &TokioResolver,
+    name: &str,
+) -> Result<Vec<std::net::IpAddr>, DnsLookupError> {
+    let mut candidate = name.trim_end_matches('.').to_string();
+    loop {
+        if let Ok(lookup) = recursive
+            .lookup(&candidate, hickory_resolver::proto::rr::RecordType::NS)
+            .await
+        {
+            let mut ips = Vec::new();
+            for record in lookup.answers() {
+                let RData::NS(ns) = &record.data else {
+                    continue;
+                };
+                let ns_name = ns.to_utf8();
+                if let Ok(addrs) = recursive.lookup_ip(ns_name).await {
+                    ips.extend(addrs.iter());
+                }
+            }
+            if !ips.is_empty() {
+                return Ok(ips);
+            }
+        }
+        let Some((_, parent)) = candidate.split_once('.') else {
+            break;
+        };
+        if !parent.contains('.') {
+            break;
+        }
+        candidate = parent.to_string();
+    }
+    Err(DnsLookupError {
+        message: "authoritative nameserver not found".to_string(),
+        category: DnsErrorCategory::Other,
+    })
+}
+
 fn collect_txt_values(response: hickory_resolver::lookup::Lookup) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     for record in response.answers() {
@@ -712,42 +817,87 @@ impl ChallengeCleanup {
     }
 
     fn push(&self, record: dns::DnsRecordHandle) {
-        self.records
-            .lock()
-            .expect("challenge records lock poisoned")
-            .push(record);
+        if let Ok(mut records) = self.records.lock() {
+            records.push(record);
+        }
     }
 
     async fn cleanup(&self, timing: RequestTiming) {
-        let records = std::mem::take(
-            &mut *self
-                .records
-                .lock()
-                .expect("challenge records lock poisoned"),
+        let records = match self.records.lock() {
+            Ok(mut records) => std::mem::take(&mut *records),
+            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+        };
+        // The taken handles live in this guard for the await. Cancelling
+        // the handler here drops the guard, which still deletes them.
+        InflightChallengeDeletes::new(self.client.clone(), self.dns_config.clone(), records)
+            .finish(timing)
+            .await;
+    }
+}
+
+/// Deletes held TXT handles, including when the enclosing future is
+/// cancelled mid-request.
+struct InflightChallengeDeletes {
+    client: reqwest::Client,
+    dns_config: DnsConfig,
+    records: Vec<dns::DnsRecordHandle>,
+}
+
+impl InflightChallengeDeletes {
+    fn new(
+        client: reqwest::Client,
+        dns_config: DnsConfig,
+        records: Vec<dns::DnsRecordHandle>,
+    ) -> Self {
+        Self {
+            client,
+            dns_config,
+            records,
+        }
+    }
+
+    async fn finish(mut self, timing: RequestTiming) {
+        cleanup_challenges(&self.client, &self.dns_config, &self.records, timing).await;
+        // Clear only after the delete finishes. A cancel during the await
+        // drops `self` while it still holds the handles, so Drop deletes them.
+        self.records.clear();
+    }
+}
+
+impl Drop for InflightChallengeDeletes {
+    fn drop(&mut self) {
+        spawn_challenge_deletes(
+            self.client.clone(),
+            self.dns_config.clone(),
+            std::mem::take(&mut self.records),
         );
-        cleanup_challenges(&self.client, &self.dns_config, &records, timing).await;
     }
 }
 
 impl Drop for ChallengeCleanup {
     fn drop(&mut self) {
-        let records = std::mem::take(
-            &mut *self
-                .records
-                .lock()
-                .expect("challenge records lock poisoned"),
-        );
-        if records.is_empty() {
-            return;
-        }
-        let client = self.client.clone();
-        let dns_config = self.dns_config.clone();
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                cleanup_challenges(&client, &dns_config, &records, RequestTiming::new()).await;
-            });
-        }
+        let records = match self.records.lock() {
+            Ok(mut records) => std::mem::take(&mut *records),
+            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+        };
+        spawn_challenge_deletes(self.client.clone(), self.dns_config.clone(), records);
     }
+}
+
+fn spawn_challenge_deletes(
+    client: reqwest::Client,
+    dns_config: DnsConfig,
+    records: Vec<dns::DnsRecordHandle>,
+) {
+    if records.is_empty() {
+        return;
+    }
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    handle.spawn(async move {
+        cleanup_challenges(&client, &dns_config, &records, RequestTiming::new()).await;
+    });
 }
 
 async fn cleanup_challenges(
@@ -1132,37 +1282,56 @@ mod tests {
         }
     }
 
-    /// cap#345: a reused hostname's preferred resolver can still be serving the
-    /// previous challenge (or a negative cache of its deletion) while the
-    /// other resolver already has the current TXT. Propagation must see that
-    /// hit instead of burning the whole budget on the stale view.
+    /// cap#345: a reused hostname's preferred resolver can still answer with
+    /// the previous challenge's TXT. That is a successful non-matching
+    /// answer, which the #104 helper does not fall back from. Propagation
+    /// must keep looking.
     #[tokio::test]
     async fn stale_preferred_answer_does_not_hide_challenge_on_the_other_resolver() {
         for prefer_system in [false, true] {
-            for stale in [vec![], vec!["previous-challenge".to_string()]] {
-                let mut calls = Vec::new();
-                let visible = challenge_txt_visible(
-                    &config(prefer_system, None),
-                    RequestTiming::new(),
-                    &mut |system| {
-                        calls.push(system);
-                        let values = if system == prefer_system {
-                            stale.clone()
-                        } else {
-                            vec!["current-challenge".to_string()]
-                        };
-                        std::future::ready(Ok(values))
-                    },
-                    "current-challenge",
-                )
-                .await;
-                assert!(
-                    visible,
-                    "prefer_system={prefer_system} stale={stale:?} must not hide the current challenge"
-                );
-                assert_eq!(calls, vec![prefer_system, !prefer_system]);
-            }
+            let mut calls = Vec::new();
+            let visible = challenge_txt_visible(
+                &config(prefer_system, None),
+                RequestTiming::new(),
+                &mut |system| {
+                    calls.push(system);
+                    let values = if system == prefer_system {
+                        vec!["previous-challenge".to_string()]
+                    } else {
+                        vec!["current-challenge".to_string()]
+                    };
+                    std::future::ready(Ok(values))
+                },
+                "current-challenge",
+            )
+            .await;
+            assert!(visible, "prefer_system={prefer_system}");
+            assert_eq!(calls, vec![prefer_system, !prefer_system]);
         }
+    }
+
+    /// Hickory reports NODATA/NXDOMAIN as a lookup error, not `Ok([])`.
+    /// Both recursive resolvers denying the name must not hide a record
+    /// the authoritative server already serves.
+    #[tokio::test]
+    async fn recursive_denial_does_not_hide_an_authoritative_challenge() {
+        use hickory_resolver::net::NoRecords;
+        use hickory_resolver::proto::op::Query;
+        use hickory_resolver::proto::rr::{Name, RecordType};
+        let query = Query::query(
+            Name::from_ascii("_acme-challenge.app.enclava.dev.").unwrap(),
+            RecordType::TXT,
+        );
+        let denial = NetError::from(NoRecords::new(query, ResponseCode::NXDomain));
+        let visible = challenge_published(
+            &config(true, None),
+            RequestTiming::new(),
+            &mut |_| std::future::ready(Err(DnsLookupError::from(denial.clone()))),
+            std::future::ready(Ok(vec!["current-challenge".to_string()])),
+            "current-challenge",
+        )
+        .await;
+        assert!(visible);
     }
 
     #[tokio::test]
