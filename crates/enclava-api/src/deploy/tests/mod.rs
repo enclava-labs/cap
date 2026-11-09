@@ -1968,6 +1968,16 @@ struct FakeCluster {
     /// secret after this replica passed its pre-write check.
     raise_rollout_authority_on_secret_get: Option<(i64, i64)>,
     rollout_authority_pool: Option<PgPool>,
+    /// One-shot: the first cluster-scoped Namespace GET raises fleet
+    /// rollout authority before answering. Models a narrowing rollout
+    /// publishing a newer epoch after this replica's pre-probe authority
+    /// check and before the mutation guard accepts the absent-namespace
+    /// skip (#310).
+    raise_rollout_authority_on_namespace_get: Option<(i64, i64)>,
+    /// Secret POSTs observed by the fake, including ones rejected before
+    /// the object is stored (a missing namespace 404s the create). The
+    /// absent-namespace skip must leave this at zero (#310).
+    secret_create_attempts: u32,
     /// When set, cluster-scoped Namespace GET/PATCH echo this mutation
     /// generation so deploy-path tests can pass `apply_namespace`.
     echo_namespace_generation: Option<i64>,
@@ -2153,6 +2163,46 @@ fn reconcile_engine(cluster: Arc<Mutex<FakeCluster>>) -> ApplyEngine {
                         .await
                         .expect("raise rollout authority from the fake");
                     }
+                }
+                // #310: the absence probe is a cluster-scoped Namespace GET.
+                // Raising authority here is the only way a test can publish a
+                // newer epoch after the sweep's pre-probe check and before
+                // the mutation guard re-reads it.
+                let namespace_get = method.as_str() == "GET"
+                    && path
+                        .trim_start_matches('/')
+                        .starts_with("api/v1/namespaces/")
+                    && path
+                        .trim_start_matches("/api/v1/namespaces/")
+                        .trim_end_matches('/')
+                        .find('/')
+                        .is_none();
+                if namespace_get {
+                    let raise = {
+                        let mut state = cluster.lock().unwrap();
+                        state
+                            .raise_rollout_authority_on_namespace_get
+                            .take()
+                            .zip(state.rollout_authority_pool.clone())
+                    };
+                    if let Some(((scope_epoch, credential_epoch), pool)) = raise {
+                        sqlx::query(
+                            "UPDATE tenant_pull_secret_rollout_authority \
+                                 SET max_scope_epoch = GREATEST(max_scope_epoch, $1), \
+                                     max_credential_epoch = GREATEST(max_credential_epoch, $2)",
+                        )
+                        .bind(scope_epoch)
+                        .bind(credential_epoch)
+                        .execute(&pool)
+                        .await
+                        .expect("raise rollout authority from the namespace probe");
+                    }
+                }
+                // Count creates rejected by the missing-namespace short-circuit
+                // too: that arm returns before the POST handler records a
+                // field manager.
+                if method.as_str() == "POST" && path.contains("/secrets") {
+                    cluster.lock().unwrap().secret_create_attempts += 1;
                 }
                 let mut state = cluster.lock().unwrap();
                 let (status, value) =
@@ -3341,6 +3391,202 @@ async fn exhausted_shared_budget_does_not_buy_a_second_window() {
         started.elapsed() < std::time::Duration::from_secs(1),
         "both steps must fall through immediately: the shared budget is one window, not one per step"
     );
+}
+
+/// Process-wide env mutation with restore, including on panic. The sweep
+/// reads pull-secret scope from the environment; a leaked value would
+/// change later tests in the same process.
+struct RestoreProcessEnv {
+    previous: Vec<(&'static str, Option<String>)>,
+}
+
+impl RestoreProcessEnv {
+    fn set(pairs: &[(&'static str, &str)]) -> Self {
+        let previous = pairs
+            .iter()
+            .map(|(key, value)| {
+                let previous = std::env::var(key).ok();
+                unsafe { std::env::set_var(key, value) };
+                (*key, previous)
+            })
+            .collect();
+        Self { previous }
+    }
+}
+
+impl Drop for RestoreProcessEnv {
+    fn drop(&mut self) {
+        for (key, previous) in &self.previous {
+            unsafe {
+                match previous {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+}
+
+async fn insert_deleting_in_scope_app(pool: &PgPool, namespace: &str, image_ref: &str) {
+    let org_id = uuid::Uuid::new_v4();
+    let app_id = uuid::Uuid::new_v4();
+    let suffix = app_id.simple().to_string();
+    sqlx::query("INSERT INTO organizations (id, name, cust_slug) VALUES ($1, $2, $3)")
+        .bind(org_id)
+        .bind(format!("absent-ns-{org_id}"))
+        .bind(&suffix[..8])
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO apps (
+             id, org_id, name, namespace, instance_id, tenant_id,
+             service_account, bootstrap_owner_pubkey_hash,
+             tenant_instance_identity_hash, unlock_mode, domain, tee_domain,
+             status, egress_allowlist, egress_mode, created_at, updated_at
+         ) VALUES (
+             $1, $2, $3, $4, $5, $6, $7, $8, $9, 'password',
+             $10, $11, 'deleting', '[]'::jsonb, 'restricted',
+             clock_timestamp(), clock_timestamp()
+         )",
+    )
+    .bind(app_id)
+    .bind(org_id)
+    .bind(format!("absent-ns-{}", &suffix[..12]))
+    .bind(namespace)
+    .bind(&suffix[..8])
+    .bind(format!("absent-ns-{suffix}"))
+    .bind("cap-absent-ns-sa")
+    .bind("11".repeat(32))
+    .bind("22".repeat(32))
+    .bind(format!("{namespace}.example.test"))
+    .bind(format!("{namespace}.tee.example.test"))
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO app_containers (id, app_id, name, image_ref, is_primary)
+         VALUES ($1, $2, 'web', $3, true)",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(app_id)
+    .bind(image_ref)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// #310: the helper tests call `namespace_absent` directly, so deleting the
+/// sweep's skip — or moving it back above the mutation guard — stays green
+/// while an in-scope row whose namespace is already gone wedges admission
+/// (#305). This drives `cleanup_stale_tenant_image_pull_secrets` (the
+/// function that would call `ensure_configured_pull_secret_for_in_scope_accounts`)
+/// against a fake cluster:
+///
+/// - a current replica skips the absent namespace only after the guard
+///   accepts, stays converged, and never POSTs the configured secret;
+/// - an epoch published by the probe itself is caught by the guard's
+///   re-read, so the skip is not accepted and the sweep stays unconverged.
+#[tokio::test]
+async fn sweep_skips_absent_in_scope_namespace_only_after_guard_acceptance() {
+    let _env = RestoreProcessEnv::set(&[
+        ("GHCR_USERNAME", "cap-bot"),
+        ("GHCR_TOKEN", "ghp_platform"),
+        (
+            "TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES",
+            "ghcr.io/enclava-ai/templates/*",
+        ),
+        ("TENANT_IMAGE_PULL_SCOPE_GENERATION", "0"),
+        ("TENANT_IMAGE_PULL_CREDENTIAL_GENERATION", "0"),
+    ]);
+    let image_ref = format!(
+        "ghcr.io/enclava-ai/templates/demo@sha256:{}",
+        "a".repeat(64)
+    );
+    let config = tenant_image_pull_secret_config_from_env().expect("scoped pull-secret config");
+    let image = ImageRef::parse(&image_ref).unwrap();
+    assert!(
+        app_keeps_tenant_image_pull_secret(&config, Some(&vec![image])),
+        "the fixture row must be in scope, or deleting the skip still converges"
+    );
+
+    let isolated_name = "cap310_absent_ns";
+    let (_cleanup, pool) = crate::test_support::isolated_database_test_pool(isolated_name).await;
+    let namespace = "cap310-absent-ns";
+    insert_deleting_in_scope_app(&pool, namespace, &image_ref).await;
+
+    let cluster = Arc::new(Mutex::new(FakeCluster {
+        namespace_missing: true,
+        ..Default::default()
+    }));
+    let engine = reconcile_engine(cluster.clone());
+    let converged = cleanup_stale_tenant_image_pull_secrets(&pool, engine.client())
+        .await
+        .expect("absent-namespace sweep must not error");
+    assert!(
+        converged,
+        "an in-scope row whose namespace is absent must leave the sweep converged"
+    );
+    assert_eq!(
+        cluster.lock().unwrap().secret_create_attempts,
+        0,
+        "the skip must not enter ensure_configured_pull_secret_for_in_scope_accounts"
+    );
+    let fence: i64 = sqlx::query_scalar(
+        "SELECT scope_epoch FROM tenant_pull_secret_scope_fences WHERE namespace = $1",
+    )
+    .bind(namespace)
+    .fetch_one(&pool)
+    .await
+    .expect("the sweep must reach the per-namespace fence before skipping");
+    assert_eq!(
+        fence, 0,
+        "the current replica records its own epoch, then skips"
+    );
+    let leases: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM external_resource_mutation_leases \
+         WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1",
+    )
+    .bind(namespace)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        leases, 0,
+        "the skip must happen before the missing-lease publish"
+    );
+
+    // Epoch published by the probe, after the pre-probe authority check.
+    // Acceptance is the guard's re-read: a skip placed above the guard would
+    // report this namespace converged.
+    sqlx::query(
+        "UPDATE tenant_pull_secret_rollout_authority \
+         SET max_scope_epoch = 0, max_credential_epoch = 0",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let cluster = Arc::new(Mutex::new(FakeCluster {
+        namespace_missing: true,
+        raise_rollout_authority_on_namespace_get: Some((9, 9)),
+        rollout_authority_pool: Some(pool.clone()),
+        ..Default::default()
+    }));
+    let engine = reconcile_engine(cluster.clone());
+    let converged = cleanup_stale_tenant_image_pull_secrets(&pool, engine.client())
+        .await
+        .expect("guard-deferred absent-namespace sweep must not error");
+    assert!(
+        !converged,
+        "an epoch raised before guard acceptance must defer; the skip is not a bypass"
+    );
+    assert_eq!(
+        cluster.lock().unwrap().secret_create_attempts,
+        0,
+        "a deferred guard must not fall through into secret creation"
+    );
+
+    crate::test_support::drop_isolated_database(isolated_name, pool).await;
 }
 
 /// Self-check blocking finding on #243 ("a delete conflict is treated as
