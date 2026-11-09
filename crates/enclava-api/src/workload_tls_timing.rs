@@ -5,9 +5,8 @@
 //! DNS lookup errors optionally add error_category: nxdomain, nodata, timeout,
 //! transport or other. Negative answers remain errors and still trigger the
 //! alternate-resolver retry. Propagation additionally accepts a successful
-//! non-matching TXT from the other resolver, and an authoritative-nameserver
-//! hit when both recursive resolvers miss. This classification is diagnostic
-//! only: it never changes the issuance result by itself.
+//! non-matching TXT from the other resolver, and an HTTPS read of the
+//! TXT row this issuance created when both recursive resolvers miss.
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;

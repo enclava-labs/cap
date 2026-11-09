@@ -108,16 +108,15 @@ const TLS_KEY_BINDING_PROBE: &[u8] = b"enclava-init tls certificate key binding 
 /// treated as an unbounded (malformed) body and never read into memory.
 const MAX_BROKER_RESPONSE_BYTES: usize = 64 * 1024;
 
-/// Broker HTTP budget. Production sets `ACME_DNS_PROPAGATION_SECONDS=180`,
-/// and a platform domain plus one custom domain each wait that long
-/// (`tls_certificate_hostnames` emits at most those two). The order then
-/// has two 30s ACME polls. A client timeout equal to one propagation
-/// window fires while the broker is still working; that transport timeout
-/// is not a typed broker failure, so it collapses to generic
-/// `enclava_init_failed` and the ownership watch latches an unrecoverable
-/// `error` (cap#345). 600s covers two propagation windows plus the polls
-/// and setup, and stays under the attestation-proxy ready-watch (900s).
-const TLS_BROKER_CLIENT_TIMEOUT: Duration = Duration::from_secs(600);
+/// Broker HTTP budget. Production sets `ACME_DNS_PROPAGATION_SECONDS=180`.
+/// Custom domains are outside the managed zone and fail at TXT create,
+/// before this wait, so one propagation window is the budget. The order
+/// then has two 30s ACME polls. A client timeout equal to that window
+/// fires while the broker is still working; that transport timeout is not
+/// a typed broker failure, so it collapses to generic `enclava_init_failed`
+/// (cap#345). 360s covers the window plus the polls and setup, and stays
+/// under the attestation-proxy ready-watch (900s).
+const TLS_BROKER_CLIENT_TIMEOUT: Duration = Duration::from_secs(360);
 
 /// Farthest a single honored ACME `retry_after` deadline may lie in the
 /// future. A broker deadline beyond this is not waited on: provisioning
@@ -1163,20 +1162,16 @@ mod tests {
 
     #[test]
     fn broker_client_timeout_exceeds_the_production_propagation_budget() {
-        // ops-manifests sets ACME_DNS_PROPAGATION_SECONDS=180. A release
-        // can request the platform domain and one custom domain, and each
-        // authorization waits that budget. The order then polls ready and
-        // the certificate for 30s each.
+        // Custom domains fail at TXT create (outside the managed zone) and
+        // never enter this wait, so one production propagation window is
+        // the budget, plus the two 30s order polls and setup.
         const PRODUCTION_PROPAGATION_SECS: u64 = 180;
-        const MAX_HOSTNAMES: u64 = 2;
         const POLL_BUDGET_SECS: u64 = 30 + 30;
         const SETUP_MARGIN_SECS: u64 = 60;
         assert!(
             TLS_BROKER_CLIENT_TIMEOUT
                 >= Duration::from_secs(
-                    PRODUCTION_PROPAGATION_SECS * MAX_HOSTNAMES
-                        + POLL_BUDGET_SECS
-                        + SETUP_MARGIN_SECS
+                    PRODUCTION_PROPAGATION_SECS + POLL_BUDGET_SECS + SETUP_MARGIN_SECS
                 )
         );
         // Stay under the attestation-proxy ready-watch so a slow issuance

@@ -370,9 +370,17 @@ async fn issue_dns01_certificate_attempt(
                     dns::create_txt_record(http_client, dns_config, &record_name, &record_value),
                 )
                 .await?;
-            challenges.push(record);
+            challenges.push(record.clone());
             await_propagation_then_ready(
-                wait_for_txt_record(&record_name, &record_value, acme_config, timing),
+                wait_for_txt_record(
+                    &record_name,
+                    &record_value,
+                    acme_config,
+                    timing,
+                    http_client,
+                    dns_config,
+                    &record,
+                ),
                 || async { challenge.set_ready().await },
                 || challenges.cleanup(timing),
                 timing,
@@ -410,6 +418,9 @@ async fn wait_for_txt_record(
     expected_value: &str,
     config: &AcmeConfig,
     timing: RequestTiming,
+    http_client: &reqwest::Client,
+    dns_config: &DnsConfig,
+    created: &dns::DnsRecordHandle,
 ) -> Result<(), AcmeError> {
     if config.dns_propagation_wait.is_zero() {
         return Ok(());
@@ -418,15 +429,15 @@ async fn wait_for_txt_record(
     let deadline = tokio::time::Instant::now() + config.dns_propagation_wait;
     loop {
         // A same-name recreate can hide the current challenge from the
-        // caching resolvers this broker polls:
-        // - a successful TXT answer that is only the previous challenge
-        //   (the #104 helper does not fall back on a successful answer);
-        // - NODATA/NXDOMAIN, which hickory returns as a lookup error. The
-        //   other recursive resolver is consulted on that error, but both
-        //   can still be caching the deletion. The authoritative
-        //   nameserver is not. Let's Encrypt validates from resolvers that
-        //   did not observe that deletion, so an authoritative hit is
-        //   enough to proceed. Neither view seeing the value still waits.
+        // caching resolvers this broker polls. A successful TXT answer that
+        // is only the previous challenge does not stop the search. NODATA
+        // is a lookup error; both recursive resolvers can still be caching
+        // the deletion (the zone SOA minimum is longer than the propagation
+        // budget). The record was just created through the Cloudflare API,
+        // which is the already-allowed HTTPS path — not port 53 to a public
+        // resolver, which cap-api egress does not permit. A provider read of
+        // that row is enough to proceed. Let's Encrypt does not use this
+        // process's negative cache. Neither view seeing the value still waits.
         let visible = challenge_published(
             config,
             timing,
@@ -437,7 +448,7 @@ async fn wait_for_txt_record(
                     lookup_txt_external(record_name).await
                 }
             },
-            lookup_txt_authoritative(record_name),
+            dns::created_txt_matches(http_client, dns_config, created, expected_value),
             expected_value,
         )
         .await;
@@ -459,30 +470,27 @@ async fn wait_for_txt_record(
 ///
 /// Recursive resolvers are checked first. A successful answer that lacks
 /// the expected value does not stop the search: that is a stale previous
-/// challenge, and the #104 helper would have treated it as final. If no
-/// recursive resolver has the value, the authoritative nameserver is
-/// checked. A caching denial (hickory `NoRecordsFound`) on both recursive
-/// resolvers must not hide a record the authoritative server already
-/// serves — Let's Encrypt does not use this process's resolver cache.
+/// challenge. If no recursive resolver has the value, the DNS provider
+/// read of the row this issuance just created is checked. That read is
+/// HTTPS to the API already used to create the record, not port 53.
+/// A caching denial on both recursive resolvers must not hide a record
+/// the provider already accepted.
 async fn challenge_published<F, Fut, A>(
     config: &AcmeConfig,
     timing: RequestTiming,
     recursive: &mut F,
-    authoritative: A,
+    provider_has_record: A,
     expected_value: &str,
 ) -> bool
 where
     F: FnMut(bool) -> Fut,
     Fut: Future<Output = Result<Vec<String>, DnsLookupError>>,
-    A: Future<Output = Result<Vec<String>, DnsLookupError>>,
+    A: Future<Output = bool>,
 {
     if challenge_txt_visible(config, timing, recursive, expected_value).await {
         return true;
     }
-    match authoritative.await {
-        Ok(values) => values.iter().any(|value| value == expected_value),
-        Err(_) => false,
-    }
+    provider_has_record.await
 }
 
 /// Whether any configured recursive resolver already published `expected_value`.
@@ -704,79 +712,6 @@ async fn lookup_txt_system(name: &str) -> Result<Vec<String>, DnsLookupError> {
             .map_err(DnsLookupError::from)?,
     )
     .map_err(DnsLookupError::from)
-}
-
-/// TXT values from the zone's authoritative nameservers, not from a
-/// caching recursive resolver. NS discovery uses the public resolver
-/// (those records are stable); the TXT query itself is sent to the
-/// discovered addresses so a negative cache of a just-deleted
-/// same-name challenge cannot hide a record the zone already serves.
-async fn lookup_txt_authoritative(name: &str) -> Result<Vec<String>, DnsLookupError> {
-    let recursive = TokioResolver::builder_with_config(
-        ResolverConfig::udp_and_tcp(&CLOUDFLARE),
-        TokioRuntimeProvider::default(),
-    )
-    .with_options(ResolverOpts::default())
-    .build()
-    .map_err(DnsLookupError::from)?;
-    let ns_ips = authoritative_nameserver_ips(&recursive, name).await?;
-    let config = ResolverConfig::from_parts(
-        None,
-        Vec::new(),
-        ns_ips
-            .into_iter()
-            .map(hickory_resolver::config::NameServerConfig::udp_and_tcp)
-            .collect(),
-    );
-    let authoritative = TokioResolver::builder_with_config(config, TokioRuntimeProvider::default())
-        .with_options(ResolverOpts::default())
-        .build()
-        .map_err(DnsLookupError::from)?;
-    collect_txt_values(
-        authoritative
-            .lookup(name, hickory_resolver::proto::rr::RecordType::TXT)
-            .await
-            .map_err(DnsLookupError::from)?,
-    )
-    .map_err(DnsLookupError::from)
-}
-
-async fn authoritative_nameserver_ips(
-    recursive: &TokioResolver,
-    name: &str,
-) -> Result<Vec<std::net::IpAddr>, DnsLookupError> {
-    let mut candidate = name.trim_end_matches('.').to_string();
-    loop {
-        if let Ok(lookup) = recursive
-            .lookup(&candidate, hickory_resolver::proto::rr::RecordType::NS)
-            .await
-        {
-            let mut ips = Vec::new();
-            for record in lookup.answers() {
-                let RData::NS(ns) = &record.data else {
-                    continue;
-                };
-                let ns_name = ns.to_utf8();
-                if let Ok(addrs) = recursive.lookup_ip(ns_name).await {
-                    ips.extend(addrs.iter());
-                }
-            }
-            if !ips.is_empty() {
-                return Ok(ips);
-            }
-        }
-        let Some((_, parent)) = candidate.split_once('.') else {
-            break;
-        };
-        if !parent.contains('.') {
-            break;
-        }
-        candidate = parent.to_string();
-    }
-    Err(DnsLookupError {
-        message: "authoritative nameserver not found".to_string(),
-        category: DnsErrorCategory::Other,
-    })
 }
 
 fn collect_txt_values(response: hickory_resolver::lookup::Lookup) -> Result<Vec<String>, String> {
@@ -1327,11 +1262,81 @@ mod tests {
             &config(true, None),
             RequestTiming::new(),
             &mut |_| std::future::ready(Err(DnsLookupError::from(denial.clone()))),
-            std::future::ready(Ok(vec!["current-challenge".to_string()])),
+            std::future::ready(true),
             "current-challenge",
         )
         .await;
         assert!(visible);
+    }
+
+    /// The provider confirmation is an HTTPS read of the row this issuance
+    /// created, not a port 53 query. A recursive denial plus that read must
+    /// count as published.
+    #[tokio::test]
+    async fn provider_https_read_confirms_challenge_when_resolvers_deny() {
+        use std::sync::{Arc, Mutex};
+        let hits = Arc::new(Mutex::new(0u32));
+        let hits_route = hits.clone();
+        let app = axum::Router::new().route(
+            "/zones/{zone_id}/dns_records/{record_id}",
+            axum::routing::get(
+                move |axum::extract::Path((zone, id)): axum::extract::Path<(String, String)>| {
+                    let hits_route = hits_route.clone();
+                    async move {
+                        *hits_route.lock().unwrap() += 1;
+                        assert_eq!(zone, "zone-1");
+                        assert_eq!(id, "rec-9");
+                        (
+                            axum::http::StatusCode::OK,
+                            axum::Json(serde_json::json!({
+                                "success": true,
+                                "errors": [],
+                                "result": {"content": "current-challenge"}
+                            })),
+                        )
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake dns");
+        let address = listener.local_addr().expect("fake dns address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve fake dns");
+        });
+        let dns = crate::dns::DnsConfig {
+            cloudflare_api_token: "token".to_string(),
+            cloudflare_api_base_url: format!("http://{address}"),
+            cloudflare_zone_id: Some("zone-1".to_string()),
+            cloudflare_zone_name: "enclava.dev".to_string(),
+            target: "192.0.2.1".to_string(),
+            required: true,
+        };
+        let created = crate::dns::DnsRecordHandle::for_test(
+            "zone-1",
+            "rec-9",
+            "_acme-challenge.app.enclava.dev",
+        );
+        let client = reqwest::Client::new();
+        let visible = challenge_published(
+            &config(true, None),
+            RequestTiming::new(),
+            &mut |_| {
+                std::future::ready(Err(DnsLookupError {
+                    message: "nodata".into(),
+                    category: DnsErrorCategory::NoData,
+                }))
+            },
+            dns::created_txt_matches(&client, &dns, &created, "current-challenge"),
+            "current-challenge",
+        )
+        .await;
+        assert!(visible);
+        assert_eq!(*hits.lock().unwrap(), 1);
+        let wrong = dns::created_txt_matches(&client, &dns, &created, "other-challenge").await;
+        assert!(!wrong);
+        server.abort();
     }
 
     #[tokio::test]

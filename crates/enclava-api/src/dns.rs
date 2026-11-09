@@ -341,6 +341,48 @@ pub async fn delete_txt_record(
     Ok(())
 }
 
+/// Whether the TXT row this issuance created is still the expected value
+/// at the DNS provider. Uses the same HTTPS API as create/delete, so it
+/// does not need port 53 to a public or authoritative resolver. A caching
+/// recursive denial of a just-deleted same-name challenge cannot hide a
+/// record the provider already accepted.
+pub async fn created_txt_matches(
+    client: &reqwest::Client,
+    config: &DnsConfig,
+    record: &DnsRecordHandle,
+    expected: &str,
+) -> bool {
+    if !config.manages_hostname(&record.hostname) {
+        return false;
+    }
+    let Ok(response) = client
+        .get(config.api_url(&format!(
+            "/zones/{}/dns_records/{}",
+            record.zone_id, record.record_id
+        )))
+        .bearer_auth(&config.cloudflare_api_token)
+        .send()
+        .await
+    else {
+        return false;
+    };
+    if !response.status().is_success() {
+        return false;
+    }
+    #[derive(Deserialize)]
+    struct CreatedTxt {
+        content: String,
+    }
+    let Ok(body) = response.json::<CloudflareSingle<CreatedTxt>>().await else {
+        return false;
+    };
+    body.success
+        && body
+            .result
+            .as_ref()
+            .is_some_and(|created| created.content == expected)
+}
+
 pub async fn ensure_dns_record(
     pool: &PgPool,
     client: &reqwest::Client,
