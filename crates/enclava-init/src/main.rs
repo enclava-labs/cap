@@ -50,6 +50,25 @@ const TLS_READINESS_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 /// accumulating longer unready spans.
 const TLS_READINESS_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_STAGE_FILE: &str = "/run/enclava/init-stage";
+/// Exact phrases [`record_stage`] writes, in boot order. A failure
+/// diagnostic may carry one of these and nothing else: the stage file is
+/// overwritten when the restarted container re-enters `record_stage`, so
+/// the termination log is the only copy that survives (cap#345). Must stay
+/// aligned with the attestation-proxy and API status vocabularies.
+const INIT_STAGE_VOCABULARY: [&str; 12] = [
+    "loading config",
+    "validating signed config",
+    "verifying trustee policy",
+    "waiting for owner seed",
+    "opening luks volumes",
+    "preparing mount ownership",
+    "provisioning static tls certificate",
+    "writing component seeds",
+    "waiting for workload containers",
+    "binding workload mount namespaces",
+    "seeding caddy runtime handoff",
+    "marking ready",
+];
 const MANAGED_CONFIG_ROOT: &str = ".enclava";
 const MANAGED_CONFIG_DIR: &str = ".enclava/config";
 const MANAGED_CONFIG_DIR_MODE: u32 = 0o750;
@@ -114,7 +133,7 @@ fn main() -> ExitCode {
 /// paths, supplied values, or provider text — is never rendered here.
 fn report_failure(error: &anyhow::Error) {
     let diagnostic = SafeBootstrapDiagnostic::diagnose(error);
-    let safe_json = diagnostic.render_json();
+    let safe_json = diagnostic.render_json_with_stage(recorded_stage());
     record_failure_file(&safe_json);
     tracing::error!(
         error = diagnostic.code.as_str(),
@@ -448,11 +467,12 @@ fn clear_tls_unusable(path: &Path) {
 /// Write the safe failure JSON to the init-error file and the termination
 /// log.
 ///
-/// Both files carry exactly the bounded safe contract
-/// (`{"error","terminal","retry_after"}`) consumed by the attestation
-/// proxy worker and operators — never the anyhow chain, raw broker
-/// response text, or other supplied values. Stage markers stay in their
-/// own init-stage file.
+/// Both files carry the bounded safe contract
+/// (`{"error","terminal","retry_after"}`, plus an optional exact-vocabulary
+/// `stage`) consumed by the attestation proxy worker and operators — never
+/// the anyhow chain, raw broker response text, or other supplied values.
+/// The proxy ignores `stage`; the termination log keeps it after the
+/// restarted container overwrites the stage file.
 fn record_failure_file(safe_json: &str) {
     let body = format!("{safe_json}\n");
     let path = error_file_path();
@@ -490,6 +510,19 @@ fn record_stage(stage: &str) -> Result<()> {
     tracing::info!(stage, "enclava-init stage");
     writes::atomic_write(&stage_file_path(), format!("{stage}\n").as_bytes(), 0o644)
         .map_err(Into::into)
+}
+
+/// The last recorded stage, if it is exactly one vocabulary phrase.
+/// Anything else — missing file, extra text, a lookalike — is omitted so
+/// the diagnostic cannot become a channel for supplied values.
+fn recorded_stage() -> Option<&'static str> {
+    let bytes = std::fs::read(stage_file_path()).ok()?;
+    let text = std::str::from_utf8(&bytes).ok()?;
+    let stage = text.trim();
+    INIT_STAGE_VOCABULARY
+        .iter()
+        .copied()
+        .find(|known| *known == stage)
 }
 
 fn mark_ready_file(path: &Path) -> Result<()> {

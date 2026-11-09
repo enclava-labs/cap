@@ -341,7 +341,7 @@ async fn issue_dns01_certificate_attempt(
         )
         .await?;
 
-    let mut challenge_records = Vec::new();
+    let challenges = ChallengeCleanup::arm(http_client.clone(), dns_config.clone());
     {
         let mut authorizations = order.authorizations();
         loop {
@@ -370,11 +370,11 @@ async fn issue_dns01_certificate_attempt(
                     dns::create_txt_record(http_client, dns_config, &record_name, &record_value),
                 )
                 .await?;
-            challenge_records.push(record);
+            challenges.push(record);
             await_propagation_then_ready(
                 wait_for_txt_record(&record_name, &record_value, acme_config, timing),
                 || async { challenge.set_ready().await },
-                || cleanup_challenges(http_client, dns_config, &challenge_records, timing),
+                || challenges.cleanup(timing),
                 timing,
             )
             .await?;
@@ -388,7 +388,7 @@ async fn issue_dns01_certificate_attempt(
         )
         .await?;
     if status != OrderStatus::Ready {
-        cleanup_challenges(http_client, dns_config, &challenge_records, timing).await;
+        challenges.cleanup(timing).await;
         return Err(AcmeError::OrderStatus(status));
     }
 
@@ -401,7 +401,7 @@ async fn issue_dns01_certificate_attempt(
             order.poll_certificate(&RetryPolicy::default()),
         )
         .await?;
-    cleanup_challenges(http_client, dns_config, &challenge_records, timing).await;
+    challenges.cleanup(timing).await;
     Ok(cert_chain)
 }
 
@@ -417,11 +417,33 @@ async fn wait_for_txt_record(
 
     let deadline = tokio::time::Instant::now() + config.dns_propagation_wait;
     loop {
-        match lookup_txt(record_name, config, timing).await {
-            Ok(values) if values.iter().any(|value| value == expected_value) => return Ok(()),
-            Ok(_) => tracing::info!("waiting for ACME DNS-01 TXT propagation"),
-            Err(_) => tracing::info!("waiting for ACME DNS-01 TXT lookup"),
+        // A non-matching answer from the preferred resolver is not
+        // authoritative for this check. Cluster DNS negative-caches the
+        // deletion of the previous same-name `_acme-challenge` TXT (destroy
+        // → immediate recreate) and can keep returning that stale view for
+        // the whole propagation budget. Production sets that budget equal
+        // to the guest's broker-client timeout, so the guest times out and
+        // reports a generic `enclava_init_failed` instead of receiving a
+        // certificate Let's Encrypt can already validate via public DNS.
+        // A hit on either configured resolver is enough to proceed; neither
+        // seeing the value still waits out the budget.
+        let visible = challenge_txt_visible(
+            config,
+            timing,
+            &mut |system| async move {
+                if system {
+                    lookup_txt_system(record_name).await
+                } else {
+                    lookup_txt_external(record_name).await
+                }
+            },
+            expected_value,
+        )
+        .await;
+        if visible {
+            return Ok(());
         }
+        tracing::info!("waiting for ACME DNS-01 TXT propagation");
 
         if tokio::time::Instant::now() >= deadline {
             return Err(AcmeError::DnsPropagation {
@@ -430,6 +452,63 @@ async fn wait_for_txt_record(
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
+}
+
+/// Whether any configured resolver already published `expected_value`.
+///
+/// Unlike [`lookup_txt_with_resolvers`], a successful but non-matching
+/// answer does not stop the search: the preferred resolver's stale NODATA
+/// or previous-challenge TXT must not hide a current challenge that the
+/// other resolver (the public view Let's Encrypt queries) can already see.
+async fn challenge_txt_visible<F, Fut>(
+    config: &AcmeConfig,
+    timing: RequestTiming,
+    lookup: &mut F,
+    expected_value: &str,
+) -> bool
+where
+    F: FnMut(bool) -> Fut,
+    Fut: Future<Output = Result<Vec<String>, DnsLookupError>>,
+{
+    for system in [
+        config.dns_lookup_prefer_system,
+        !config.dns_lookup_prefer_system,
+    ] {
+        let phase = if system {
+            Phase::DnsSystemLookup
+        } else {
+            Phase::DnsExternalLookup
+        };
+        let result = {
+            let mut stage = timing.start(phase);
+            let result = async {
+                let work = lookup(system);
+                match config.dns_lookup_timeout {
+                    Some(timeout) => {
+                        tokio::time::timeout(timeout, work)
+                            .await
+                            .map_err(|_| DnsLookupError {
+                                message: "DNS TXT lookup timed out".to_string(),
+                                category: DnsErrorCategory::Timeout,
+                            })?
+                    }
+                    None => work.await,
+                }
+            }
+            .await;
+            match &result {
+                Ok(_) => stage.finish(true),
+                Err(error) => stage.finish_dns_error(error.category),
+            }
+            result
+        };
+        if let Ok(values) = result
+            && values.iter().any(|value| value == expected_value)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 // Construct the CA operation only after DNS propagation succeeds.
@@ -455,23 +534,12 @@ where
         .map_err(Into::into)
 }
 
-async fn lookup_txt(
-    name: &str,
-    config: &AcmeConfig,
-    timing: RequestTiming,
-) -> Result<Vec<String>, String> {
-    lookup_txt_with_resolvers(config, timing, |system| async move {
-        if system {
-            lookup_txt_system(name).await
-        } else {
-            lookup_txt_external(name).await
-        }
-    })
-    .await
-}
-
 #[derive(Clone, Debug)]
 struct DnsLookupError {
+    /// Asserted by resolver tests. Production classifies by `category` only
+    /// and does not render this string (provider/resolver text stays out of
+    /// broker diagnostics).
+    #[cfg_attr(not(test), allow(dead_code))]
     message: String,
     category: DnsErrorCategory,
 }
@@ -514,6 +582,10 @@ impl From<&str> for DnsLookupError {
     }
 }
 
+/// Resolver-contract helper kept for the #104 tests: a successful answer,
+/// including a negative or non-matching one, does not fall back. Propagation
+/// visibility is [`challenge_txt_visible`], which must keep searching.
+#[cfg(test)]
 async fn lookup_txt_with_resolvers<
     F: std::future::Future<Output = Result<Vec<String>, DnsLookupError>>,
 >(
@@ -615,6 +687,67 @@ fn collect_txt_values(response: hickory_resolver::lookup::Lookup) -> Result<Vec<
         }
     }
     Ok(out)
+}
+
+/// TXT records created for one issuance. Explicit [`ChallengeCleanup::cleanup`]
+/// drains them. If the handler is cancelled first — the guest's broker
+/// client times out, or destroy drops the connection while the previous
+/// same-name issuance is still in flight — `Drop` still deletes them.
+/// Destroy does not know these records (they are not rows in `dns_records`),
+/// so a cancelled issuance is otherwise name-derived residue for the next
+/// recreate.
+struct ChallengeCleanup {
+    client: reqwest::Client,
+    dns_config: DnsConfig,
+    records: std::sync::Mutex<Vec<dns::DnsRecordHandle>>,
+}
+
+impl ChallengeCleanup {
+    fn arm(client: reqwest::Client, dns_config: DnsConfig) -> Self {
+        Self {
+            client,
+            dns_config,
+            records: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn push(&self, record: dns::DnsRecordHandle) {
+        self.records
+            .lock()
+            .expect("challenge records lock poisoned")
+            .push(record);
+    }
+
+    async fn cleanup(&self, timing: RequestTiming) {
+        let records = std::mem::take(
+            &mut *self
+                .records
+                .lock()
+                .expect("challenge records lock poisoned"),
+        );
+        cleanup_challenges(&self.client, &self.dns_config, &records, timing).await;
+    }
+}
+
+impl Drop for ChallengeCleanup {
+    fn drop(&mut self) {
+        let records = std::mem::take(
+            &mut *self
+                .records
+                .lock()
+                .expect("challenge records lock poisoned"),
+        );
+        if records.is_empty() {
+            return;
+        }
+        let client = self.client.clone();
+        let dns_config = self.dns_config.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                cleanup_challenges(&client, &dns_config, &records, RequestTiming::new()).await;
+            });
+        }
+    }
 }
 
 async fn cleanup_challenges(
@@ -997,6 +1130,126 @@ mod tests {
                 assert_eq!(calls, vec![system]);
             }
         }
+    }
+
+    /// cap#345: a reused hostname's preferred resolver can still be serving the
+    /// previous challenge (or a negative cache of its deletion) while the
+    /// other resolver already has the current TXT. Propagation must see that
+    /// hit instead of burning the whole budget on the stale view.
+    #[tokio::test]
+    async fn stale_preferred_answer_does_not_hide_challenge_on_the_other_resolver() {
+        for prefer_system in [false, true] {
+            for stale in [vec![], vec!["previous-challenge".to_string()]] {
+                let mut calls = Vec::new();
+                let visible = challenge_txt_visible(
+                    &config(prefer_system, None),
+                    RequestTiming::new(),
+                    &mut |system| {
+                        calls.push(system);
+                        let values = if system == prefer_system {
+                            stale.clone()
+                        } else {
+                            vec!["current-challenge".to_string()]
+                        };
+                        std::future::ready(Ok(values))
+                    },
+                    "current-challenge",
+                )
+                .await;
+                assert!(
+                    visible,
+                    "prefer_system={prefer_system} stale={stale:?} must not hide the current challenge"
+                );
+                assert_eq!(calls, vec![prefer_system, !prefer_system]);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn preferred_challenge_hit_does_not_consult_the_other_resolver() {
+        for prefer_system in [false, true] {
+            let mut calls = Vec::new();
+            let visible = challenge_txt_visible(
+                &config(prefer_system, None),
+                RequestTiming::new(),
+                &mut |system| {
+                    calls.push(system);
+                    std::future::ready(Ok(vec!["current-challenge".to_string()]))
+                },
+                "current-challenge",
+            )
+            .await;
+            assert!(visible);
+            assert_eq!(calls, vec![prefer_system]);
+        }
+    }
+
+    #[tokio::test]
+    async fn challenge_is_not_visible_when_neither_resolver_has_the_value() {
+        let visible = challenge_txt_visible(
+            &config(true, None),
+            RequestTiming::new(),
+            &mut |_| std::future::ready(Ok(vec!["previous-challenge".to_string()])),
+            "current-challenge",
+        )
+        .await;
+        assert!(!visible);
+    }
+
+    #[tokio::test]
+    async fn dropped_challenge_guard_deletes_the_txt_record() {
+        use std::sync::{Arc, Mutex};
+        let deleted = Arc::new(Mutex::new(Vec::new()));
+        let deleted_route = deleted.clone();
+        let app = axum::Router::new().route(
+            "/zones/{zone_id}/dns_records/{record_id}",
+            axum::routing::delete(
+                move |axum::extract::Path((zone, id)): axum::extract::Path<(String, String)>| {
+                    let deleted_route = deleted_route.clone();
+                    async move {
+                        deleted_route.lock().unwrap().push((zone, id));
+                        (
+                            axum::http::StatusCode::OK,
+                            axum::Json(serde_json::json!({"success": true, "errors": []})),
+                        )
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake dns");
+        let address = listener.local_addr().expect("fake dns address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve fake dns");
+        });
+        let dns = crate::dns::DnsConfig {
+            cloudflare_api_token: "token".to_string(),
+            cloudflare_api_base_url: format!("http://{address}"),
+            cloudflare_zone_id: Some("zone-1".to_string()),
+            cloudflare_zone_name: "enclava.dev".to_string(),
+            target: "192.0.2.1".to_string(),
+            required: true,
+        };
+        let guard = ChallengeCleanup::arm(reqwest::Client::new(), dns);
+        guard.push(crate::dns::DnsRecordHandle::for_test(
+            "zone-1",
+            "rec-9",
+            "_acme-challenge.app.enclava.dev",
+        ));
+        drop(guard);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if !deleted.lock().unwrap().is_empty() || tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            deleted.lock().unwrap().as_slice(),
+            [("zone-1".to_string(), "rec-9".to_string())]
+        );
+        server.abort();
     }
 
     #[tokio::test]

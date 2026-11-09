@@ -155,13 +155,25 @@ impl SafeBootstrapDiagnostic {
 
     /// Render the single-line safe JSON contract used by the init-error
     /// file, the termination log, stderr, and tracing.
-    pub fn render_json(&self) -> String {
-        serde_json::json!({
+    ///
+    /// `stage` is an optional exact vocabulary phrase already validated by
+    /// the caller. It is omitted when absent. The stage file is overwritten
+    /// on the next boot, so the termination log is the surface that survives
+    /// a restart; unknown or caller-supplied text must never be passed here.
+    pub fn render_json_with_stage(&self, stage: Option<&str>) -> String {
+        let mut value = serde_json::json!({
             "error": self.code.as_str(),
             "terminal": true,
             "retry_after": self.retry_after_rfc3339(),
-        })
-        .to_string()
+        });
+        if let Some(stage) = stage {
+            value["stage"] = serde_json::Value::String(stage.to_string());
+        }
+        value.to_string()
+    }
+
+    pub fn render_json(&self) -> String {
+        self.render_json_with_stage(None)
     }
 }
 

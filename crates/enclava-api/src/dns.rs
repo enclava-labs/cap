@@ -97,6 +97,15 @@ impl DnsRecordHandle {
     pub fn hostname(&self) -> &str {
         &self.hostname
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(zone_id: &str, record_id: &str, hostname: &str) -> Self {
+        Self {
+            zone_id: zone_id.to_string(),
+            record_id: record_id.to_string(),
+            hostname: hostname.to_string(),
+        }
+    }
 }
 
 fn cloudflare_error(errors: &[CloudflareApiError]) -> String {
