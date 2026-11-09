@@ -17,8 +17,9 @@ use enclava_cli::api_types::DeploymentEntry;
 use enclava_cli::{
     api_client::{ApiClient, ApiError, read_bounded_body},
     api_types::{
-        AppResponse, CreateAppRequest, CreateTemplateInstanceRequest, HostedTemplate,
-        HostedTemplateConfigKey, ServiceSpec, SshCommandResponse, TemplateInstanceResponse,
+        AppResponse, ConfigTokenResponse, CreateAppRequest, CreateTemplateInstanceRequest,
+        HostedTemplate, HostedTemplateConfigKey, ServiceSpec, SshCommandResponse,
+        TemplateInstanceResponse,
     },
     app_config::{
         AppConfig, AppSection, HealthSection, ResourcesSection, StorageSection, UnlockSection,
@@ -615,161 +616,79 @@ async fn deploy_with_timings(
                 .await?;
         }
     }
-    if !template.paas_managed_config_keys.is_empty() {
-        pb.set_message("Delivering platform-managed config...");
-        let (managed_key_baseline, managed_delivered_receipt, managed_delivery_id) = timings
-            .run(DeployPhase::ManagedConfigEnqueue, async {
-                // These pre-release reads obey the same deadline as the
-                // waits below: the tighter of the roll hold and the requested
-                // phase budget, so a stalled request cannot run past a
-                // shorter `--ssh-timeout-seconds` and eat the release
-                // reserve from the far end of the hold.
-                let deadline =
-                    Some(Instant::now() + phase_budget(args.ssh_timeout_seconds));
-                // Snapshot each expected key's `updated_at` before the
-                // enqueue: config metadata persists across deployments, so
-                // key presence alone can prove only that the *previous*
-                // value reached the TEE.
-                let baseline = snapshot_managed_key_updates(api, &instance_name, deadline).await?;
-                // The enqueue is a held pre-release request: bound it by the
-                // same deadline so a stalled response cannot consume the
-                // release reserve either.
-                let managed = match bounded_request(
-                    deadline,
-                    api.deliver_managed_template_config(&instance_name),
-                )
-                .await
-                {
-                    Some(result) => result,
-                    None => {
-                        return Err("this phase's deadline was reached with the managed-config delivery request still in flight".into());
-                    }
-                };
-                let managed = managed.map_err(managed_template_config_api_error)?;
-                if !matches!(managed.status.as_str(), "queued" | "delivered") {
-                    return Err(format!(
-                        "PaaS managed config delivery returned unexpected status `{}`",
-                        managed.status
-                    )
-                    .into());
+    // Phase order is the cap#314 contract (`template_config_phase_order`):
+    // unheld deploys store customer config after the durable enqueue and
+    // before the long managed wait. Held redeploys keep the historical
+    // order so an abandoned deploy does not mutate the live TEE volume.
+    let mut managed_enqueued: Option<ManagedConfigEnqueueState> = None;
+    let mut customer_config_stored = false;
+    for phase in template_config_phase_order(customer_config_hold) {
+        match phase {
+            TemplateConfigPhase::ManagedEnqueue => {
+                if template.paas_managed_config_keys.is_empty() {
+                    continue;
                 }
-                // A `delivered` response is this call's delivery receipt and
-                // satisfies the keys it covers; `queued` proves nothing
-                // reached the TEE, so the wait below needs fresh metadata.
-                let delivered_receipt = managed.status == "delivered";
-                Ok::<(HashMap<String, Option<String>>, bool, Option<String>), Box<dyn std::error::Error>>(
-                    (baseline, delivered_receipt, managed.delivery_id),
-                )
-            })
-            .await?;
-        pb.set_message("Waiting for platform-managed config...");
-        timings
-            .run(
-                DeployPhase::ManagedConfigWait,
-                wait_for_paas_managed_config_keys(
+                managed_enqueued = Some(
+                    enqueue_managed_template_config(
+                        api,
+                        timings,
+                        &instance_name,
+                        phase_budget(args.ssh_timeout_seconds),
+                        &pb,
+                    )
+                    .await?,
+                );
+            }
+            TemplateConfigPhase::CustomerWrite => {
+                let token = response
+                    .config_token
+                    .as_ref()
+                    .ok_or("PaaS did not return a TEE config token")?;
+                deliver_customer_template_config(
                     api,
+                    timings,
+                    token,
                     &instance_name,
-                    &template.paas_managed_config_keys,
                     deployment,
-                    phase_budget(args.ssh_timeout_seconds),
+                    template.unlock_mode == "password",
+                    args.ssh_timeout_seconds,
                     pre_release_deadline,
-                    &managed_key_baseline,
-                    managed_delivered_receipt,
-                    managed_delivery_id.as_deref(),
                     &pb,
-                ),
-            )
-            .await?;
-    }
-    pb.set_message("Delivering config to TEE...");
-
-    let token = response
-        .config_token
-        .as_ref()
-        .ok_or("PaaS did not return a TEE config token")?;
-    let tee_url = token
-        .tee_url
-        .as_deref()
-        .ok_or("PaaS did not return a TEE config URL")?;
-    let tee_url = template_config_endpoint_url(tee_url)?;
-    let mut tee_resolve_ip = token.tee_resolve_ip;
-    let tee = TeeClient::from_config_url_with_resolve_ip(&tee_url, tee_resolve_ip);
-    // A held redeploy must stop attestation before CAP expires the hold.
-    // Unheld deploys keep the unbounded retry loop.
-    let mut tee = timings
-        .run(
-            DeployPhase::CustomerConfigAttestation,
-            attest_template_config_tee_with_retry(tee, pre_release_deadline),
-        )
-        .await?;
-    let mut tee_url = tee_url;
-
-    let mut config_token = token.token.clone();
-    let config_pairs = debian_ssh_config_pairs(public_keys);
-    pb.set_message(counted_progress("Customer config", 0, config_pairs.len()));
-    let delivered = timings
-        .run(
-            DeployPhase::CustomerConfigWrite,
-            deliver_template_config_with_retry(
-                api,
-                DeliverTemplateConfigTarget {
-                    instance_name: &instance_name,
-                    deployment,
-                    password_mode: template.unlock_mode == "password",
-                    owner_wait_budget: bounded_phase(
-                        pre_release_deadline,
-                        Duration::from_secs(args.ssh_timeout_seconds),
-                    ),
-                    hold_deadline: pre_release_deadline,
-                    progress: &pb,
-                    timings_mode: args.timings,
-                },
-                &mut tee,
-                &mut config_token,
-                &mut tee_url,
-                &mut tee_resolve_ip,
-                &config_pairs,
-            ),
-        )
-        .await;
-    if let Err(error) = delivered {
-        let values_stored = error
-            .downcast_ref::<TemplateConfigStoredSyncFailed>()
-            .is_some();
-        if customer_config_hold && values_stored {
-            pb.set_message("Customer config stored; releasing workload roll...");
-            release_customer_config_roll_with_retry(
-                api,
-                &instance_name,
-                &deployment_id,
-                hold_expires_at.expect("a held roll always resolves an expiry"),
-            )
-            .await?;
-            return Err(error);
+                    args.timings,
+                    &public_keys,
+                    customer_config_hold,
+                    &deployment_id,
+                    hold_expires_at,
+                )
+                .await?;
+                customer_config_stored = true;
+            }
+            TemplateConfigPhase::ManagedWait => {
+                let Some(enqueued) = managed_enqueued.take() else {
+                    continue;
+                };
+                pb.set_message("Waiting for platform-managed config...");
+                timings
+                    .run(
+                        DeployPhase::ManagedConfigWait,
+                        wait_for_paas_managed_config_keys(
+                            api,
+                            &instance_name,
+                            &template.paas_managed_config_keys,
+                            deployment,
+                            phase_budget(args.ssh_timeout_seconds),
+                            pre_release_deadline,
+                            &enqueued.baseline,
+                            enqueued.delivered_receipt,
+                            enqueued.delivery_id.as_deref(),
+                            &pb,
+                            customer_config_stored,
+                        ),
+                    )
+                    .await?;
+            }
         }
-        if customer_config_hold {
-            return Err(format!(
-                "{error}\nThe workload roll was not released, so this deployment will not replace the running workload."
-            )
-            .into());
-        }
-        return Err(error);
     }
-    if customer_config_hold {
-        pb.set_message("Customer config stored; releasing workload roll...");
-        release_customer_config_roll_with_retry(
-            api,
-            &instance_name,
-            &deployment_id,
-            hold_expires_at.expect("a held roll always resolves an expiry"),
-        )
-        .await?;
-    }
-    pb.set_message(counted_progress(
-        "Customer config",
-        config_pairs.len(),
-        config_pairs.len(),
-    ));
     pb.set_position(4);
 
     let mut app_url = app_url_from_template_response_cap(&response.cap)?;
@@ -1161,6 +1080,233 @@ fn release_failure_message(
             "customer config was stored, but the workload roll was not released: {error}. The running workload was left unchanged."
         ))
     }
+}
+
+/// Config-delivery phases for one template deploy.
+///
+/// `ManagedEnqueue` is always first: that outbox event survives client
+/// death. `ManagedWait` is the long, interruptible poll. Unheld deploys
+/// write customer config between those two so a kill during the poll cannot
+/// strand the guest on `waiting_for_config`. Held redeploys keep customer
+/// config last: the write lands in the still-running TEE, and an abandoned
+/// deploy must not mutate that volume before the roll is committed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TemplateConfigPhase {
+    ManagedEnqueue,
+    CustomerWrite,
+    ManagedWait,
+}
+
+fn template_config_phase_order(customer_config_hold: bool) -> &'static [TemplateConfigPhase] {
+    if customer_config_hold {
+        // The write targets the still-running TEE. Doing it before the wait
+        // would mutate that volume even if this deploy is later abandoned
+        // and the hold expires without rolling.
+        &[
+            TemplateConfigPhase::ManagedEnqueue,
+            TemplateConfigPhase::ManagedWait,
+            TemplateConfigPhase::CustomerWrite,
+        ]
+    } else {
+        // No live workload to protect. Enqueue first so managed delivery
+        // survives client death, then store customer keys before the long
+        // poll. A kill during that poll is the cap#314 strand: the guest
+        // is already up and loops `waiting_for_config` on the missing key.
+        &[
+            TemplateConfigPhase::ManagedEnqueue,
+            TemplateConfigPhase::CustomerWrite,
+            TemplateConfigPhase::ManagedWait,
+        ]
+    }
+}
+
+/// Clause embedded in managed-wait failures.
+///
+/// `delivery_continues` is false when the receipt is terminal (`exhausted`
+/// or `cancelled`): managed delivery will not finish on its own, so the
+/// clause must not say that it will.
+fn managed_wait_customer_config_clause(
+    customer_config_stored: bool,
+    delivery_continues: bool,
+) -> &'static str {
+    match (customer_config_stored, delivery_continues) {
+        (false, _) => "this command did not deliver customer config",
+        (true, true) => {
+            "customer config is already in the TEE; platform-managed delivery continues on its own"
+        }
+        (true, false) => "customer config is already in the TEE",
+    }
+}
+
+struct ManagedConfigEnqueueState {
+    baseline: HashMap<String, Option<String>>,
+    delivered_receipt: bool,
+    delivery_id: Option<String>,
+}
+
+async fn enqueue_managed_template_config<F>(
+    api: &ApiClient,
+    timings: &DeployTimings<F>,
+    instance_name: &str,
+    phase_budget: Duration,
+    progress: &ProgressBar,
+) -> Result<ManagedConfigEnqueueState, Box<dyn std::error::Error>>
+where
+    F: Fn(&[u8]) -> std::io::Result<()>,
+{
+    progress.set_message("Delivering platform-managed config...");
+    let (baseline, delivered_receipt, delivery_id) = timings
+        .run(DeployPhase::ManagedConfigEnqueue, async {
+            // These pre-release reads obey the same deadline as the waits
+            // below: the tighter of the roll hold and the requested phase
+            // budget, so a stalled request cannot run past a shorter
+            // `--ssh-timeout-seconds` and eat the release reserve from the
+            // far end of the hold.
+            let deadline = Some(Instant::now() + phase_budget);
+            // Snapshot each expected key's `updated_at` before the enqueue:
+            // config metadata persists across deployments, so key presence
+            // alone can prove only that the *previous* value reached the TEE.
+            let baseline = snapshot_managed_key_updates(api, instance_name, deadline).await?;
+            // The enqueue is a held pre-release request: bound it by the same
+            // deadline so a stalled response cannot consume the release
+            // reserve either.
+            let managed = match bounded_request(
+                deadline,
+                api.deliver_managed_template_config(instance_name),
+            )
+            .await
+            {
+                Some(result) => result,
+                None => {
+                    return Err("this phase's deadline was reached with the managed-config delivery request still in flight".into());
+                }
+            };
+            let managed = managed.map_err(managed_template_config_api_error)?;
+            if !matches!(managed.status.as_str(), "queued" | "delivered") {
+                return Err(format!(
+                    "PaaS managed config delivery returned unexpected status `{}`",
+                    managed.status
+                )
+                .into());
+            }
+            // A `delivered` response is this call's delivery receipt and
+            // satisfies the keys it covers; `queued` proves nothing reached
+            // the TEE, so the wait below needs fresh metadata.
+            let delivered_receipt = managed.status == "delivered";
+            Ok::<_, Box<dyn std::error::Error>>((baseline, delivered_receipt, managed.delivery_id))
+        })
+        .await?;
+    Ok(ManagedConfigEnqueueState {
+        baseline,
+        delivered_receipt,
+        delivery_id,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn deliver_customer_template_config<F>(
+    api: &ApiClient,
+    timings: &DeployTimings<F>,
+    token: &ConfigTokenResponse,
+    instance_name: &str,
+    deployment: DeploymentWait<'_>,
+    password_mode: bool,
+    ssh_timeout_seconds: u64,
+    pre_release_deadline: Option<Instant>,
+    progress: &ProgressBar,
+    timings_mode: bool,
+    public_keys: &str,
+    customer_config_hold: bool,
+    deployment_id: &str,
+    hold_expires_at: Option<Instant>,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: Fn(&[u8]) -> std::io::Result<()>,
+{
+    progress.set_message("Delivering config to TEE...");
+    let tee_url = token
+        .tee_url
+        .as_deref()
+        .ok_or("PaaS did not return a TEE config URL")?;
+    let tee_url = template_config_endpoint_url(tee_url)?;
+    let mut tee_resolve_ip = token.tee_resolve_ip;
+    let tee = TeeClient::from_config_url_with_resolve_ip(&tee_url, tee_resolve_ip);
+    // A held redeploy must stop attestation before CAP expires the hold.
+    // Unheld deploys keep the unbounded retry loop.
+    let mut tee = timings
+        .run(
+            DeployPhase::CustomerConfigAttestation,
+            attest_template_config_tee_with_retry(tee, pre_release_deadline),
+        )
+        .await?;
+    let mut tee_url = tee_url;
+    let mut config_token = token.token.clone();
+    let config_pairs = debian_ssh_config_pairs(public_keys.to_string());
+    progress.set_message(counted_progress("Customer config", 0, config_pairs.len()));
+    let delivered = timings
+        .run(
+            DeployPhase::CustomerConfigWrite,
+            deliver_template_config_with_retry(
+                api,
+                DeliverTemplateConfigTarget {
+                    instance_name,
+                    deployment,
+                    password_mode,
+                    owner_wait_budget: bounded_phase(
+                        pre_release_deadline,
+                        Duration::from_secs(ssh_timeout_seconds),
+                    ),
+                    hold_deadline: pre_release_deadline,
+                    progress,
+                    timings_mode,
+                },
+                &mut tee,
+                &mut config_token,
+                &mut tee_url,
+                &mut tee_resolve_ip,
+                &config_pairs,
+            ),
+        )
+        .await;
+    if let Err(error) = delivered {
+        let values_stored = error
+            .downcast_ref::<TemplateConfigStoredSyncFailed>()
+            .is_some();
+        if customer_config_hold && values_stored {
+            progress.set_message("Customer config stored; releasing workload roll...");
+            release_customer_config_roll_with_retry(
+                api,
+                instance_name,
+                deployment_id,
+                hold_expires_at.expect("a held roll always resolves an expiry"),
+            )
+            .await?;
+            return Err(error);
+        }
+        if customer_config_hold {
+            return Err(format!(
+                "{error}\nThe workload roll was not released, so this deployment will not replace the running workload."
+            )
+            .into());
+        }
+        return Err(error);
+    }
+    if customer_config_hold {
+        progress.set_message("Customer config stored; releasing workload roll...");
+        release_customer_config_roll_with_retry(
+            api,
+            instance_name,
+            deployment_id,
+            hold_expires_at.expect("a held roll always resolves an expiry"),
+        )
+        .await?;
+    }
+    progress.set_message(counted_progress(
+        "Customer config",
+        config_pairs.len(),
+        config_pairs.len(),
+    ));
+    Ok(())
 }
 
 fn customer_config_roll_hold_seconds(ssh_timeout_seconds: u64) -> u32 {
@@ -2519,7 +2665,11 @@ async fn wait_for_paas_managed_config_keys(
     delivered_receipt: bool,
     delivery_id: Option<&str>,
     progress: &ProgressBar,
+    customer_config_stored: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let pending_customer_clause = managed_wait_customer_config_clause(customer_config_stored, true);
+    let terminal_customer_clause =
+        managed_wait_customer_config_clause(customer_config_stored, false);
     let deployment_id = deployment.deployment_id;
     let start = Instant::now();
     let deadline = hold_deadline.map_or(start + timeout, |hold| hold.min(start + timeout));
@@ -2591,7 +2741,7 @@ async fn wait_for_paas_managed_config_keys(
         // message.
         if Instant::now() >= deadline {
             return Err(format!(
-                "platform config for app {instance_name} timed out after {} ({}/{} ready); this command did not deliver customer config; missing entries: {}; inspect progress with `enclava config get --app {instance_name}`",
+                "platform config for app {instance_name} timed out after {} ({}/{} ready); {pending_customer_clause}; missing entries: {}; inspect progress with `enclava config get --app {instance_name}`",
                 format_duration(timeout),
                 expected.len() - last_missing.len(),
                 expected.len(),
@@ -2632,7 +2782,7 @@ async fn wait_for_paas_managed_config_keys(
                 ManagedDeliveryPoll::Pending => {}
                 ManagedDeliveryPoll::Failed(status) => {
                     return Err(format!(
-                        "platform config delivery for app {instance_name} reported `{status}`; this command did not deliver customer config; redeploy to enqueue a fresh delivery"
+                        "platform config delivery for app {instance_name} reported `{status}`; {terminal_customer_clause}; redeploy to enqueue a fresh delivery"
                     )
                     .into());
                 }
@@ -2687,7 +2837,7 @@ async fn wait_for_paas_managed_config_keys(
                 }
                 if Instant::now() >= deadline {
                     return Err(format!(
-                        "platform config for app {instance_name} timed out after {} ({ready}/{} ready); this command did not deliver customer config; missing entries: {}; inspect progress with `enclava config get --app {instance_name}`",
+                        "platform config for app {instance_name} timed out after {} ({ready}/{} ready); {pending_customer_clause}; missing entries: {}; inspect progress with `enclava config get --app {instance_name}`",
                         format_duration(timeout),
                         expected.len(),
                         missing.join(", ")
@@ -2703,7 +2853,7 @@ async fn wait_for_paas_managed_config_keys(
                 ));
                 if Instant::now() >= deadline {
                     return Err(format!(
-                        "platform config status for app {instance_name} did not become available within {}: {error}; this command did not deliver customer config; retry `enclava config get --app {instance_name}`",
+                        "platform config status for app {instance_name} did not become available within {}: {error}; {pending_customer_clause}; retry `enclava config get --app {instance_name}`",
                         format_duration(timeout)
                     )
                     .into());
@@ -2723,7 +2873,7 @@ async fn wait_for_paas_managed_config_keys(
             }
             None => {
                 return Err(format!(
-                    "platform config status for app {instance_name} did not become available within {}: this wait's deadline was reached with the status read still in flight; this command did not deliver customer config; retry `enclava config get --app {instance_name}`",
+                    "platform config status for app {instance_name} did not become available within {}: this wait's deadline was reached with the status read still in flight; {pending_customer_clause}; retry `enclava config get --app {instance_name}`",
                     format_duration(timeout)
                 )
                 .into());
@@ -4600,6 +4750,93 @@ mod tests {
     }
 
     #[test]
+    fn unheld_template_deploy_stores_customer_config_before_the_managed_wait() {
+        let order = template_config_phase_order(false);
+        let customer = order
+            .iter()
+            .position(|phase| *phase == TemplateConfigPhase::CustomerWrite)
+            .expect("customer config is always delivered");
+        let wait = order
+            .iter()
+            .position(|phase| *phase == TemplateConfigPhase::ManagedWait)
+            .expect("managed delivery is waited out");
+        let enqueue = order
+            .iter()
+            .position(|phase| *phase == TemplateConfigPhase::ManagedEnqueue)
+            .expect("managed delivery is enqueued");
+        assert!(
+            enqueue < customer && customer < wait,
+            "an unheld deploy must enqueue managed config, store customer config, then wait; killing the client during the wait is otherwise a permanent waiting_for_config loop. order={order:?}"
+        );
+    }
+
+    #[test]
+    fn held_template_deploy_keeps_customer_config_after_the_managed_wait() {
+        let order = template_config_phase_order(true);
+        assert_eq!(
+            order,
+            &[
+                TemplateConfigPhase::ManagedEnqueue,
+                TemplateConfigPhase::ManagedWait,
+                TemplateConfigPhase::CustomerWrite,
+            ]
+        );
+    }
+
+    #[test]
+    fn managed_wait_failure_does_not_claim_customer_config_is_missing_after_it_was_stored() {
+        for continues in [true, false] {
+            let stored = managed_wait_customer_config_clause(true, continues);
+            assert!(
+                !stored.contains("did not deliver customer config"),
+                "a wait failure after the TEE write must not tell the operator the customer key is missing: {stored}"
+            );
+        }
+        let terminal = managed_wait_customer_config_clause(true, false);
+        assert!(
+            !terminal.contains("continues on its own"),
+            "an exhausted managed delivery does not continue: {terminal}"
+        );
+        assert_eq!(
+            managed_wait_customer_config_clause(false, true),
+            "this command did not deliver customer config"
+        );
+        assert_eq!(
+            managed_wait_customer_config_clause(false, false),
+            "this command did not deliver customer config"
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_config_wait_names_already_stored_customer_config_on_timeout() {
+        let api = ApiClient::new("http://127.0.0.1:1", Some("test-token".to_string()));
+        let error = wait_for_paas_managed_config_keys(
+            &api,
+            "shell",
+            &["MANAGED_KEY".to_string()],
+            DeploymentWait::trusted("deploy-1", None),
+            Duration::from_secs(0),
+            None,
+            &HashMap::new(),
+            false,
+            None,
+            &ProgressBar::hidden(),
+            true,
+        )
+        .await
+        .expect_err("a zero budget must time the wait out immediately");
+        let message = error.to_string();
+        assert!(
+            message.contains("already in the TEE"),
+            "stored customer config must be named: {message}"
+        );
+        assert!(
+            !message.contains("did not deliver customer config"),
+            "the timeout must not claim the customer key is missing: {message}"
+        );
+    }
+
+    #[test]
     fn managed_config_progress_reports_safe_counts() {
         assert_eq!(
             managed_config_progress_message(
@@ -5861,6 +6098,7 @@ mod tests {
                 false,
                 None,
                 &progress,
+                false,
             ),
         )
         .await
@@ -5903,6 +6141,7 @@ mod tests {
                 false,
                 None,
                 &progress,
+                false,
             ),
         )
         .await
@@ -6231,6 +6470,7 @@ mod tests {
             false,
             None,
             &progress,
+            false,
         )
         .await
         .expect_err("an unchanged timestamp must never release the wait");
@@ -6291,6 +6531,7 @@ mod tests {
             false,
             None,
             &progress,
+            false,
         )
         .await
         .expect("a strictly newer timestamp proves the enqueued write landed");
@@ -6329,6 +6570,7 @@ mod tests {
             true,
             None,
             &progress,
+            false,
         )
         .await
         .expect("the enqueue's delivered receipt satisfies the key");
@@ -6383,6 +6625,7 @@ mod tests {
             false,
             Some("11111111-2222-3333-4444-555555555555"),
             &progress,
+            false,
         )
         .await
         .expect("a matching delivered receipt satisfies the key");
@@ -6432,6 +6675,7 @@ mod tests {
             false,
             Some("11111111-2222-3333-4444-555555555555"),
             &progress,
+            false,
         )
         .await
         .expect_err("an exhausted delivery must fail the wait");
