@@ -2170,9 +2170,9 @@ async fn signed_acceptance_rolls_back_artifact_and_generation_together() {
     crate::test_support::drop_isolated_database("cap340_accept_rollback", pool).await;
 }
 
-/// #263: a registered customer keyring and a supplied policy artifact are
-/// not a canonical-policy witness. Absence of the signing service stays
-/// 503 after customer authority has already succeeded.
+/// #263: absence of the signing service stays 503 when a customer artifact
+/// is supplied. The fixture keyring is checked first so a broken fixture
+/// cannot be mistaken for that 503.
 #[tokio::test]
 async fn customer_artifact_without_signing_service_stays_503() {
     let (_cleanup, pool) =
@@ -2250,6 +2250,11 @@ async fn customer_artifact_without_signing_service_stays_503() {
     .execute(&pool)
     .await
     .expect("insert registered keyring");
+
+    artifacts
+        .validate_customer_authority(&pool)
+        .await
+        .expect("fixture keyring must pass customer authority");
 
     let mut state = crate::test_support::lazy_state();
     state.db = pool.clone();

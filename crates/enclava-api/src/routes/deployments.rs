@@ -288,8 +288,9 @@ pub(crate) async fn resolve_signed_policy_artifact(
         })),
     ))?;
     // #263: customer authority above is not a canonical-policy witness.
-    // Absence stays 503 until the reviewed witness in
-    // docs/canonical-policy-without-signing-service.md is implemented.
+    // Absence stays 503 until the proposed witness in
+    // docs/canonical-policy-without-signing-service.md is implemented
+    // and its measurement bind is in the signed release bytes.
     // Do not accept `provided_artifact` on this branch.
     let signing_service = state.signing_service.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
