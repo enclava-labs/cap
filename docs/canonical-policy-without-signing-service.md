@@ -27,7 +27,7 @@ config:
   generated values
 - artifact `metadata.genpolicy_version_pin` equals the generated pin
 
-Deploy and unlock redeploy both enter through this function. Both must
+Deploy and `update_unlock_mode` both enter through this function. Both must
 keep that single gate. Do not add a second acceptance function for the
 absent-service case.
 
@@ -74,15 +74,30 @@ The generator measurement therefore follows the `luks2_header_seal`
 pattern, not a JSON-only additive field:
 
 - Add `canonical_policy_generator_id`,
-  `canonical_policy_generator_digest` (lowercase hex sha256), and
-  `canonical_policy_input_schema` to `PlatformRelease` in both crates.
-- Emit them in both `canonical_release_bytes` functions only when the
-  digest is non-empty, as one record each, in the same order, before
-  `created_at`. Empty digest omits all three records, so envelopes
-  signed before the field existed keep verifying byte-for-byte. A
-  tampered, stripped, or half-present value changes the signed bytes
-  and fails verification. Digest present with empty id or schema is
-  invalid and fails closed at release load, not at accept time.
+  `canonical_policy_generator_digest`, and
+  `canonical_policy_input_schema` to `PlatformRelease` in both crates,
+  each with `#[serde(default)]`. Without that attribute a pre-field
+  envelope fails to deserialize before verify. `luks2_header_seal`
+  already has it.
+- Emit the three records in both `canonical_release_bytes` functions
+  only when the digest is non-empty, in this order, immediately after
+  the optional `luks2_header_seal` record and immediately before
+  `created_at`: id, digest, schema. Empty digest omits all three, so
+  envelopes signed before the field existed keep verifying. A tampered
+  or stripped value changes the signed bytes and fails verification.
+  The two canonicalizers must emit the same records; a cross-crate
+  byte fixture is part of the gate, not a comment.
+- `canonical_policy_generator_id` is a log label. It is not a path and
+  not a selector. Do not exec by id.
+- `canonical_policy_generator_digest` must match `^[0-9a-f]{64}$` at
+  release load. Do not reuse `hex32`: that helper trims, and a trimmed
+  value must not become a path component or a compare against file
+  bytes.
+- `canonical_policy_input_schema` is a contract, not a label. When the
+  digest is non-empty, release load fails closed unless the schema
+  equals the one string this binary implements,
+  `agent-policy-stdin-v1`. Any other string, including empty, is
+  invalid. CAP must not feed a framing the signed schema does not name.
 - `policy_template_text` is already in those signed bytes. That is the
   template the witness may use. Do not add a second unsigned template
   path.
@@ -94,33 +109,58 @@ release.
 ### What is executed
 
 A release field does not measure "whatever this CAP binary linked."
-In-process code is not a witness unless a digest compiled into the
-measured binary equals the signed digest, the compare happens before
-the function runs, and mismatch refuses. This design does not take
-that option: CAP does not contain genpolicy, and a function pointer has
-no separate bytes to hash.
+This design does not use an in-process function. CAP does not contain
+genpolicy, and a function pointer has no separate bytes to hash.
 
-The witness is a helper file. Before exec:
+The witness is one static ELF. Before any accept:
 
-1. CAP opens one path derived from the signed digest
-   (`<release-generator-dir>/<digest>`), not from `PATH`, the request,
-   or the release JSON. `release-generator-dir` is a startup config
-   directory, not a per-request input.
-2. CAP hashes those exact file bytes and compares them to
-   `canonical_policy_generator_digest`. Mismatch, missing file, extra
-   files, or a non-regular file is a broken witness: 503, do not exec.
-3. CAP execs that file with a cleared environment, no extra arguments
-   that name a template path, and the already validated inputs on
-   stdin: the signature-checked descriptor, the validated
-   `log_encryption` config, the release-pinned `policy_template_text`,
-   and `genpolicy_version`. The helper must not open the release file,
-   a template path, or any other policy file. If it needs bytes, they
-   were on stdin. A helper that reads anything else is not an
-   implementation of this design.
+1. Do not exec unless `signed_policy_artifact` is present and
+   `validate_signed_artifact` has already succeeded. The helper inputs
+   do not include the artifact. Signature-first does not weaken the
+   compare, and it avoids running the helper on a body the platform
+   key did not sign. Signature failure stays terminal; do not fall
+   through to `/sign`.
+2. Open `<release-generator-dir>/<digest>` with `O_NOFOLLOW | O_CLOEXEC`.
+   `release-generator-dir` is a startup directory, not a per-request
+   input, and the leaf is the 64-hex digest, not the id. `fstat` that
+   fd. Reject anything that is not a regular file. Do not follow a
+   symlink. Other files in the directory are irrelevant; do not reject
+   the witness because a previous digest's file is still there.
+3. Read that fd to EOF and hash those bytes. Compare to the signed
+   digest. Mismatch or a short read is 503. Do not hash a path and
+   then exec the path: the host can replace the inode between those
+   steps, and a test that tampers the file before the hash does not
+   see that swap.
+4. Execute those same bytes, not a path. Copy them to a memfd and
+   `fexecve` that fd, or the equivalent that does not resolve a path
+   again. Empty argv. Cleared environment. No interpreter: reject a
+   non-ELF, a script, and any ELF with a `PT_INTERP` (dynamically
+   linked helper or shebang). The dynamic loader and libc are not in
+   the digest. A wrapper whose text matches the digest and then runs
+   a host genpolicy is not this witness.
+5. In the child, after fork and before `fexecve`, apply a landlock
+   (or equivalent) that denies every filesystem open. Do not apply it
+   to the CAP process. The helper may use only the already-open
+   stdin, stdout, and stderr. If that restriction cannot be installed,
+   503 and do not exec. "The helper must not open files" is not a
+   check. The host can change a default template path the helper
+   reads, the digest still matches, and the witness emits the weaker
+   policy the artifact was signed to.
+6. Stdin framing is `agent-policy-stdin-v1`, not `AgentPolicyRequest`.
+   The live `/agent-policy` body does not carry the template. The
+   framing is length-prefixed canonical fields, in order: descriptor
+   canonical bytes, the validated `log_encryption` JSON or a zero
+   length if absent, `policy_template_text` bytes, and
+   `genpolicy_version` bytes. No paths.
+7. Bound the helper the way the signing-service client is bounded:
+   wall time 120 seconds (`DEFAULT_SIGNING_SERVICE_TIMEOUT_SECONDS`),
+   stdout capped at the existing agent-policy field cap, and a CPU
+   rlimit no larger than that wall time. Exceeding any of them is a
+   broken witness: 503, kill the child, do not accept.
 
-Output is an `AgentPolicyResponse`. Acceptance then calls the existing
-`validate_canonical_agent_policy` only after the witness self-checks
-below. No parallel compare. CAP never holds the signing-service private
+Output is an `AgentPolicyResponse` parsed from that capped stdout.
+Acceptance then calls `validate_canonical_agent_policy` only after the
+witness self-checks below. CAP never holds the signing-service private
 key and never calls `/sign` on this path.
 
 Rejected alternatives:
@@ -136,6 +176,9 @@ Rejected alternatives:
 - A serde field that `canonical_release_bytes` does not emit. Unsigned.
 - An in-process function whose digest is not compared to bytes this
   process will execute.
+- Hash the path, then `execve` that path. The host replaces the inode
+  between the hash read and exec. Execute the hashed bytes
+  (`fexecve` of a memfd), not the path.
 
 ## Acceptance rules
 
@@ -145,14 +188,14 @@ a live service response and a local witness is an operator alarm in
 parity tests, never a reason to accept the witness output instead.
 
 The release envelope is loaded once at startup and is not re-read under
-the signing-authority lane. Repeating the witness compare inside the
-acceptance transaction would observe the same release as the pre-lock
-call. The lane serializes keyring rotation, which does not change
-generator output; customer authority is already repeated inside the
-lock for that reason. The pre-lock compare in
-`resolve_signed_policy_artifact` is the authority for both deploy and
-unlock redeploy, because both call that function. Do not add a second
-compare on only one of those paths.
+the signing-authority lane. Repeating the agent-policy text compare
+inside the acceptance transaction would observe the same release as the
+call in `resolve_signed_policy_artifact`. That text compare stays in
+that function, which both callers use: `deploy_app_candidate` and
+`update_unlock_mode`. Do not add a second text compare on only one of
+them. The `signed_at` future bound is not that compare. It cannot live
+in `resolve_signed_policy_artifact`, because that function runs before
+either acceptance transaction. See Stale and replay.
 
 `platform_release_envelope` immutability is also why
 `descriptor_platform_binding_for` does not need a new in-lock repeat
@@ -164,12 +207,12 @@ When the client is absent:
 
 | Condition | HTTP |
 | --- | --- |
-| No release loaded, digest empty, measurement mismatch, helper fails, helper pin ≠ `release.genpolicy_version`, or witness hash ≠ `sha256(witness text)` | 503 `canonical policy validation requires the platform signing service`. Check witness self-consistency before `validate_canonical_agent_policy`. A self-inconsistent witness must not become 400. |
+| No release loaded, digest empty, digest not 64 lowercase hex, schema not `agent-policy-stdin-v1`, measurement mismatch, helper fails, landlock unavailable, helper pin ≠ `release.genpolicy_version`, or witness hash ≠ `sha256(witness text)` | 503 `canonical policy validation requires the platform signing service`. Log a distinct reason for each cause. The HTTP string stays shared, so a test that asserts only the body cannot tell the causes apart; sabotage tests assert the log reason. Check witness self-consistency before `validate_canonical_agent_policy`. A self-inconsistent witness must not become 400. |
 | Witness configured, no `signed_policy_artifact` | 503 `signed_policy_artifact required when the platform signing service is absent`. Do not synthesize an artifact. |
 | Pubkey absent | 503 `platform signing-service pubkey required for signed_policy_artifact verification`. Unchanged. |
 | `validate_signed_artifact` fails (signature, field caps, metadata binds) | Terminal. Existing `signing_error_response` for that error. Do not fall through to `/sign`. |
-| Witness is self-consistent and the artifact disagrees | 400 `signed_artifact_mismatch`. The HTTP body does not include the internal name. Internal names, for logs only, are the existing `validate_canonical_agent_policy` mismatches: `generated_agent_policy.agent_policy_sha256`, `generated_agent_policy.expected_agent_policy_hash`, `canonical_agent_policy_sha256`, `canonical_agent_policy_text`, `canonical_genpolicy_version_pin`. |
-| `signed_at` unparseable, in the future, or before `release.created_at` | 400 `signed_artifact_mismatch`. Internal log name `canonical_signed_at`. |
+| Witness is self-consistent and the artifact disagrees | 400 `signed_artifact_mismatch`. The HTTP body does not include the internal name. Internal names, for logs only: `generated_agent_policy.expected_agent_policy_hash`, `canonical_agent_policy_sha256`, `canonical_agent_policy_text`, `canonical_genpolicy_version_pin`. `generated_agent_policy.agent_policy_sha256` is the self-inconsistent witness and is the 503 above, not this row. |
+| `signed_at` unparseable, after the post-lock clock, or before `release.created_at` | 400 `signed_artifact_mismatch`. Internal log name `canonical_signed_at`. Parse with `DateTime::parse_from_rfc3339`, the parser release load already uses. Do not use a lenient parser. |
 
 `signing_error_response` maps every `Mismatch` to 400
 `signed_artifact_mismatch` and drops the name. Tests of this path
@@ -205,35 +248,42 @@ Existing metadata binds stay and are not optional: `app_id`,
 or cross-release artifact already fails those compares.
 
 `PolicyMetadata.signed_at` is a `String`. The signature covers those
-raw bytes. It is not parsed today. The witness path parses both
-`signed_at` and `release.created_at` as `DateTime<Utc>` and fails
+raw bytes. It is not parsed today. Parse both `signed_at` and
+`release.created_at` with `DateTime::parse_from_rfc3339` and fail
 closed on any unparseable value. A string compare is not acceptable:
 unpadded dates and offsets would still verify under the signature.
 
 The freshness window is new. It is not the owner-rotation directive
-rule.
+rule. The floor and the future bound are different checks and live in
+different functions. Putting both in `resolve_signed_policy_artifact`
+is wrong: that function runs before either acceptance transaction, and
+a `Utc::now()` sample there is not the post-lock clock.
 
+- `created_at` floor: in `resolve_signed_policy_artifact`, because the
+  release envelope is immutable for the process. Parsed
+  `release.created_at <= signed_at`. This is not
+  `enforce_release_not_older_than_bundled`. That check rejects
+  envelopes older than the compiled baseline. The artifact claims
+  `platform_release_version`, not `created_at`.
+- Future bound: after `lock_org_signing_authority_lane` and before
+  `accept_signed_workload_artifacts`, on that transaction's
+  `clock_timestamp()`, in both acceptance transactions:
+  `deploy_app_candidate` (the `begin` in `routes/deployments.rs`) and
+  `commit_unlock_mode_transition` (`routes/unlock.rs`). Window:
+  `signed_at <=` that instant, zero skew. A missing check on either
+  transaction is a failed gate, not a follow-up. Do not sample
+  `Utc::now()` before the lock and call it the bound.
 - Do not copy `PRECHECK_CLOCK_SKEW_SECONDS` (300s, `routes/orgs.rs`).
   That constant runs before the lane, against `Utc::now()`. After the
   lock, the owner-rotation future check is `signed_at > lane_now` with
   zero skew. `lock_org_signing_authority_lane_now` returns post-lock
-  `clock_timestamp()` and does not add 300s.
-- Deploy and unlock call `lock_org_signing_authority_lane`, not
-  `_now`. The implementation reads `clock_timestamp()` after that lock
-  is held, on the same transaction, and uses that instant. Do not
-  sample `Utc::now()` before the lock and call it the bound.
-- Authoritative window, parsed instants:
-  `release.created_at <= signed_at <= post-lock clock_timestamp()`.
-  No added skew. `signed_at` in the future of that clock fails closed.
-- This floor is not `enforce_release_not_older_than_bundled`. That
-  check rejects envelopes older than the compiled baseline. The
-  artifact claims `platform_release_version`, not `created_at`. The
-  `created_at` floor is an additional anti-replay bound for this path
-  only.
-- Content staleness of agent policy is the witness text compare. An
-  old artifact whose agent-policy text is not what the measured helper
-  emits now fails `canonical_agent_policy_text`, even if the signature
-  and the pin string still verify.
+  `clock_timestamp()` and does not add 300s. Deploy and
+  `commit_unlock_mode_transition` call
+  `lock_org_signing_authority_lane`, not `_now`. Read
+  `clock_timestamp()` after that lock, on the same transaction.
+- Content staleness of agent policy is the witness text compare, which
+  stays in `resolve_signed_policy_artifact`. That is not a second copy
+  of the future bound.
 - Key rotation is the pubkey check. After
   `signing_service_pubkey_hex` changes, artifacts signed by the retired
   key fail `InvalidSignature`. Do not accept them under the witness.
@@ -268,19 +318,19 @@ measurement and release-pin checks above.
 `accept_signed_workload_artifacts` inserts the workload-artifact row
 and calls `enqueue_signed_policy_reconciliation` on the same
 transaction. That bumps
-`kbs_signed_policy_reconciliation.desired_generation`. Deploy and
-unlock redeploy already call it only after
-`resolve_signed_policy_artifact` returns `Ok`, inside the transaction
-that also holds the org signing-authority lane and repeats
-`validate_customer_authority_in_tx`. Rollback of that transaction rolls
-back the row and the generation together.
+`kbs_signed_policy_reconciliation.desired_generation`. Both callers
+already invoke it only after `resolve_signed_policy_artifact` returns
+`Ok`, inside the transaction that also holds the org signing-authority
+lane and repeats `validate_customer_authority_in_tx`. Rollback of that
+transaction rolls back the row and the generation together.
 
 The witness path must return into that same caller. It must not enqueue
 from `resolve_signed_policy_artifact`, and it must not open its own
-transaction. Unlock-mode transition and rollback revalidate a stored
-artifact (`validate_stored_authority`) and must not grow a witness
-dependency. That is a different path from unlock redeploy, which does
-call `resolve_signed_policy_artifact` and therefore gets this gate.
+transaction. The `signed_at` future bound is the one check added inside
+those two transactions, after the lane lock and before
+`accept_signed_workload_artifacts`. Rollback and dispatch revalidate a
+stored artifact via `validate_stored_authority` and must not grow a
+witness dependency.
 
 ## Threats
 
@@ -293,7 +343,7 @@ call `resolve_signed_policy_artifact` and therefore gets this gate.
 | Replay onto another app, deploy, descriptor, or release | Existing metadata binds reject. |
 | Replay of an artifact whose parsed `signed_at` is before the loaded release `created_at` | 400 `signed_artifact_mismatch`. |
 | Host rewrites a generator digest that is not in `canonical_release_bytes` | Not possible under this design: the digest is in both canonicalizers, or the witness is not configured. |
-| Host swaps the helper file after release verify | Exec-time hash of the bytes CAP will run fails closed. |
+| Host swaps the helper inode after the hash read and before exec | Not possible under this design: the hashed fd bytes are what `fexecve` runs. A path `execve` after a separate hash is rejected by the gate. |
 | Signing service suppressed to force a weaker path | Empty digest means the same 503 as today. Configured witness means the agent-policy compares above, not a customer-only accept. |
 | Split brain between service and witness | Service present: service wins. Witness is not an accept path. |
 | Witness or release missing | 503. Never fall through to customer checks. |
@@ -305,12 +355,19 @@ call `resolve_signed_policy_artifact` and therefore gets this gate.
   PaaS forwarder) returns a different 503, `platform signing service
   is not configured`. That route is a preflight broker. It does not
   accept artifacts and must not grow a witness. Ruled out.
-- Unlock-mode transition revalidates a stored artifact with
-  `validate_signed_artifact` and the signing-service pubkey. It does
-  not call `/agent-policy`. Requiring a fresh witness there would fail
-  unlock when the generator moves. Ruled out. Unlock redeploy is not
-  this path; it calls `resolve_signed_policy_artifact`.
-- Rollback revalidates a stored artifact and enqueues. Ruled out.
+- Both callers of `resolve_signed_policy_artifact` keep this gate:
+  `deploy_app_candidate` and `update_unlock_mode`.
+  `update_unlock_mode` is the unlock-mode transition. When artifacts
+  are present it calls resolve, which calls `/agent-policy` today.
+  There is no separate "unlock redeploy" path. Do not rule
+  `update_unlock_mode` out.
+- `commit_unlock_mode_transition` rechecks the signature of the
+  artifact resolve just returned. It does not call
+  `validate_stored_authority`, and that artifact is not a previously
+  stored row. The `signed_at` future bound is added here and in the
+  deploy transaction. It is not a witness text compare.
+- `validate_stored_authority` is rollback and dispatch. Those do not
+  call `/agent-policy`. Ruled out.
 - Org owner bootstrap and rotation talk to the signing service for
   owner state, not for canonical agent policy. Ruled out.
 
@@ -324,12 +381,19 @@ release. Clearing it restores the 503. No second flag. No migration.
 No KBS schema change.
 
 1. Both `canonical_release_bytes` functions emit the three generator
-   records under the empty-omission rule above, and a test shows a
-   tampered digest fails envelope verification while a pre-field
-   envelope still verifies.
-2. Exec-time hash: the bytes CAP will exec are hashed and compared to
-   the signed digest before exec. Mismatch is the 503, and a test
-   tampers the helper bytes and shows no exec and no accept.
+   records immediately after the optional `luks2_header_seal` record
+   and immediately before `created_at`, under the empty-omission rule.
+   A cross-crate fixture shows the signed bytes match. A tampered
+   digest fails envelope verification. A pre-field envelope still
+   deserializes (`serde(default)`) and still verifies.
+2. Executed bytes, not a path. Open with `O_NOFOLLOW`, hash the fd,
+   `fexecve` those same bytes from a memfd. A test that replaces the
+   inode after the hash read and before exec still runs the hashed
+   bytes, or fails closed. A test that tampers the file only before
+   the hash is not sufficient. A `PT_INTERP` ELF and a script are
+   rejected. A landlock (or equivalent) that cannot be installed is
+   503 and does not exec. A gate test mutates a file that is not the
+   hashed bytes and not stdin and requires identical helper output.
 3. Parity fixture: the same descriptor and log-encryption inputs
    through the live `/agent-policy` client and the measured helper
    produce byte-identical `agent_policy_text`, `agent_policy_sha256`,
@@ -339,9 +403,12 @@ No KBS schema change.
 4. Fail-closed tests, asserting the HTTP bodies in the table: mismatched
    text, mismatched hash, stale pin, tampered signature, tampered text,
    cross-deploy id, cross-release, unparseable `signed_at`, `signed_at`
-   before `release.created_at`, `signed_at` after the post-lock clock,
-   customer-key signature, trustee-key signature. Signature failure
-   does not fall through.
+   before `release.created_at`, `signed_at` after the post-lock clock
+   on both `deploy_app_candidate` and `commit_unlock_mode_transition`,
+   customer-key signature, trustee-key signature. A deploy-only future
+   bound test is not enough. Signature failure does not fall through.
+   Each 503 cause is distinguishable in logs even though the HTTP
+   string is shared.
 5. Isolated DB test: valid artifact, service absent, witness present,
    release loaded. The acceptance transaction persists the artifact and
    increments `desired_generation` together; aborting the transaction
