@@ -519,6 +519,8 @@ pub struct ManagedConfigDeliveryStatusResponse {
 #[derive(Debug, Serialize)]
 pub struct AgentPolicyRequest {
     pub descriptor: enclava_common::descriptor::DeploymentDescriptor,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_encryption: Option<LogEncryptionConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -968,6 +970,11 @@ pub struct UnlockLockedGeneration {
     pub resources: Option<UnlockLockedGenerationResources>,
     #[serde(default)]
     pub app: Option<UnlockLockedGenerationApp>,
+    /// Outer None means the server omitted the field. Some(None) is an
+    /// explicit no-recipient generation. Some(Some) is the public recipient
+    /// the unlock handler binds into cc_init_data.
+    #[serde(default)]
+    pub log_encryption: Option<Option<LogEncryptionConfig>>,
 }
 
 #[derive(Debug, Deserialize)]

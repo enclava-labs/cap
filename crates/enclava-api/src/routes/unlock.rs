@@ -105,6 +105,10 @@ pub struct UnlockLockedGeneration {
     pub resources: Option<UnlockLockedGenerationResources>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub app: Option<UnlockLockedGenerationApp>,
+    /// Generation `spec_snapshot.log_encryption`. Null is an explicit
+    /// no-recipient generation. Omitted only on a refused snapshot, which
+    /// the CLI must not sign.
+    pub log_encryption: Option<enclava_engine::types::LogEncryptionConfig>,
 }
 
 type ApplyGenerationRow = (Uuid, String, Option<String>, serde_json::Value);
@@ -129,6 +133,7 @@ fn refused_generation(
         workload_security_profile: None,
         resources: None,
         app: None,
+        log_encryption: None,
     }
 }
 
@@ -190,12 +195,20 @@ fn signable_command(raw: Option<&str>) -> Option<Vec<String>> {
     Some(argv)
 }
 
-fn signable_storage_paths(paths: Option<&[String]>) -> Option<Vec<String>> {
-    let paths = paths?;
-    if paths.is_empty() || paths.iter().any(|path| path.is_empty() || path == "/state") {
-        return None;
+fn signable_storage_paths(paths: Option<&[String]>) -> Result<Vec<String>, &'static str> {
+    let Some(paths) = paths else {
+        return Err("stored primary storage paths are missing");
+    };
+    if paths.iter().any(|path| path.is_empty()) {
+        return Err("stored primary storage paths contain an empty path");
     }
-    Some(paths.to_vec())
+    // Match descriptor_storage_paths: the platform /state mount is not a
+    // user path, and an empty remainder is a valid no-extra-mount workload.
+    Ok(paths
+        .iter()
+        .filter(|path| path.as_str() != "/state")
+        .cloned()
+        .collect())
 }
 
 fn signable_image_ref(image_ref: &str, digest: &str) -> bool {
@@ -271,12 +284,11 @@ fn locked_generation_snapshot(
             "stored primary command is missing or not a JSON argv",
         );
     };
-    let Some(storage_paths) = signable_storage_paths(primary.storage_paths.as_deref()) else {
-        return refused_generation(
-            Some(generation.0),
-            Some(generation.1.clone()),
-            "stored primary storage paths are missing",
-        );
+    let storage_paths = match signable_storage_paths(primary.storage_paths.as_deref()) {
+        Ok(paths) => paths,
+        Err(reason) => {
+            return refused_generation(Some(generation.0), Some(generation.1.clone()), reason);
+        }
     };
     if profile
         .parse::<enclava_engine::types::WorkloadSecurityProfile>()
@@ -330,6 +342,26 @@ fn locked_generation_snapshot(
             "stored app identity is incomplete",
         );
     }
+    if let Some(reason) = crate::routes::deployments::runtime_reapply_status_error(app.status) {
+        return refused_generation(Some(generation.0), Some(generation.1.clone()), reason);
+    }
+    let log_encryption =
+        match serde_json::from_value::<Option<enclava_engine::types::LogEncryptionConfig>>(
+            generation
+                .3
+                .get("log_encryption")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        ) {
+            Ok(value) => value,
+            Err(_) => {
+                return refused_generation(
+                    Some(generation.0),
+                    Some(generation.1.clone()),
+                    "stored log encryption metadata is invalid",
+                );
+            }
+        };
     UnlockLockedGeneration {
         source: LOCKED_GENERATION_SOURCE.to_string(),
         acceptable: true,
@@ -362,6 +394,7 @@ fn locked_generation_snapshot(
             signer_identity_subject: subject.to_string(),
             signer_identity_issuer: issuer.to_string(),
         }),
+        log_encryption,
     }
 }
 
@@ -387,12 +420,27 @@ async fn load_unlock_locked_generation(
         .fetch_optional(db)
         .await
         .map_err(|_| unlock_database_error())?;
-    Ok(locked_generation_snapshot(
+    let mut snapshot = locked_generation_snapshot(
         generation.as_ref(),
         primary.as_ref(),
         resources.as_ref(),
         app,
-    ))
+    );
+    if snapshot.acceptable {
+        let mut tx = db.begin().await.map_err(|_| unlock_database_error())?;
+        let busy = crate::mutation_leases::desired_state_mutation_in_progress(&mut tx, app.id)
+            .await
+            .map_err(|_| unlock_database_error())?;
+        tx.rollback().await.map_err(|_| unlock_database_error())?;
+        if busy {
+            snapshot = refused_generation(
+                snapshot.deployment_id,
+                snapshot.status,
+                "app mutation already in progress",
+            );
+        }
+    }
+    Ok(snapshot)
 }
 
 #[derive(Debug, Deserialize)]
@@ -4107,6 +4155,31 @@ mod tests {
         assert_eq!(ok.image_ref.as_deref(), Some(primary.image_ref.as_str()));
         assert_eq!(ok.app.as_ref().map(|identity| identity.id), Some(app.id));
         assert!(ok.app.as_ref().unwrap().signer_identity_subject == "cosign-subject");
+        assert!(ok.log_encryption.is_none());
+
+        let mut stopped = app.clone();
+        stopped.status = AppStatus::Stopped;
+        let stopped = locked_generation_snapshot(
+            Some(&generation),
+            Some(&primary),
+            Some(&resources),
+            &stopped,
+        );
+        assert_eq!(
+            stopped.refusal.as_deref(),
+            Some("start the stopped app before deploying")
+        );
+
+        let mut empty_paths = primary.clone();
+        empty_paths.storage_paths = Some(vec!["/state".to_string()]);
+        let empty = locked_generation_snapshot(
+            Some(&generation),
+            Some(&empty_paths),
+            Some(&resources),
+            &app,
+        );
+        assert!(empty.acceptable, "{empty:?}");
+        assert_eq!(empty.storage_paths.as_deref(), Some(&[][..]));
 
         let (pending, primary, resources) = generation_fixture(
             "pending",

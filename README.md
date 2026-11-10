@@ -76,10 +76,13 @@ No local `enclava.toml` is required. The command signs the stored primary from
 the CAP apply generation on `GET /apps/NAME/unlock/status`
 (`locked_generation.source = apply_job_generation`). Hosted platforms proxy
 that status; a hosted deployment list is not a substitute and is refused.
-`--image` must be digest-pinned and must match that generation. The command
-re-reads the generation immediately before removing the guest wrap. This
-preserves the owner seed and volumes, but cannot revoke a previously copied
-auto-sealed seed. `enclava auto-unlock enable` stays refused
+`--image` must be digest-pinned and its digest must match that generation.
+The stored image reference is what gets signed, even if `--image` names a
+different repository with the same digest. The command re-reads the
+generation immediately before removing the guest wrap. Hosted platforms must
+forward unlock status unchanged; a proxy that drops `locked_generation` is
+refused. This preserves the owner seed and volumes, but cannot revoke a
+previously copied auto-sealed seed. `enclava auto-unlock enable` stays refused
 (`auto_unlock_disabled`).
 
 For encrypted workload logs, use the current CLI and the tenant's log private key:

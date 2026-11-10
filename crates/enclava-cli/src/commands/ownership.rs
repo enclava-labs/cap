@@ -735,6 +735,7 @@ struct SignedDisableShape {
     container_name: String,
     image_ref: String,
     generation: UnlockLockedGeneration,
+    log_encryption: Option<enclava_engine::types::LogEncryptionConfig>,
 }
 
 /// A local project file is not the signed shape. A name mismatch or an
@@ -757,6 +758,15 @@ fn guard_local_project_file(
         }
         Err(err) => Err(err.to_string()),
     }
+}
+
+fn image_ref_pinned_to(image_ref: &str, digest: &str) -> bool {
+    let Some(repository) = image_ref.strip_suffix(&format!("@{digest}")) else {
+        return false;
+    };
+    !repository.is_empty()
+        && !repository.ends_with('@')
+        && enclava_common::validate::validate_image_digest(digest).is_ok()
 }
 
 fn non_empty(value: Option<String>) -> Option<String> {
@@ -822,6 +832,13 @@ fn require_signable_generation(
             requested.digest()
         ));
     }
+    if !image_ref_pinned_to(&image_ref, &digest) {
+        return Err(
+            "locked generation image_ref is not digest-pinned to image_digest; refusing to sign \
+             a substituted reference"
+                .into(),
+        );
+    }
     let port = generation
         .port
         .filter(|port| *port > 0)
@@ -882,6 +899,11 @@ fn require_signable_generation(
                 .into(),
         );
     }
+    let log_encryption = generation.log_encryption.clone().ok_or_else(|| {
+        "locked generation omitted log_encryption; refusing to sign a pre-claim descriptor that \
+         would drop a stored log recipient"
+            .to_string()
+    })?;
     Ok(SignedDisableShape {
         app_config: AppConfig {
             app: AppSection {
@@ -908,6 +930,7 @@ fn require_signable_generation(
         container_name,
         image_ref,
         generation,
+        log_encryption,
     })
 }
 
@@ -979,6 +1002,14 @@ pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::erro
             // Probe first. A missing project file is the hosted path; a
             // mismatched or unreadable one still refuses, and is never signed.
             guard_local_project_file(&app_name, AppConfig::find_and_load())?;
+            if let Ok(config) = AppConfig::find_and_load()
+                && config.app.name == app_name
+            {
+                eprintln!(
+                    "Found enclava.toml for {app_name}; it is not signed. The stored CAP \
+                     generation is the workload that will be signed."
+                );
+            }
             let cli_config = config::load_config(&paths)?;
             let creds = config::load_credentials(&paths)?;
             let mut app_meta = api.get_app(&app_name).await?;
@@ -1039,6 +1070,7 @@ pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::erro
                     target_unlock_mode: Some("password"),
                     workload_security_profile: signed.workload_security_profile,
                     container_name: signed.container_name.as_str(),
+                    log_encryption: signed.log_encryption.clone(),
                 })
                 .await?;
             let endpoint = resolve_tee_endpoint(&api, &app_name).await?;
@@ -1049,9 +1081,10 @@ pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::erro
             // working through a KDS outage.
             tee.complete_transition_quote_crl(&mut transition_attestation)
                 .await?;
-            // Re-read after the password prompt and signing. A few milliseconds
-            // of TOCTOU after this check is the remaining window; the prompt
-            // is not.
+            // Re-read after the password prompt and signing, immediately before
+            // the guest wrap is removed. disable_auto_unlock and receipt
+            // signing still run after this check; the server rejects a changed
+            // generation, but those TEE calls are the leftover window.
             let latest = api.get_unlock_status(&app_name).await?;
             require_same_locked_generation(&signed.generation, &latest)?;
 
@@ -1182,6 +1215,7 @@ mod tests {
                     signer_identity_issuer: "https://token.actions.githubusercontent.com"
                         .to_string(),
                 }),
+                log_encryption: Some(None),
             }),
         }
     }
@@ -1270,6 +1304,21 @@ mod tests {
             missing_identity.contains("hosted projection"),
             "{missing_identity}"
         );
+
+        let mut unpinned = acceptable_status(9090);
+        unpinned.locked_generation.as_mut().unwrap().image_ref =
+            Some("ghcr.io/acme/app:latest".to_string());
+        let substituted = require_signable_generation(&unpinned, &image).unwrap_err();
+        assert!(substituted.contains("digest-pinned"), "{substituted}");
+
+        let mut omitted_log = acceptable_status(9090);
+        omitted_log
+            .locked_generation
+            .as_mut()
+            .unwrap()
+            .log_encryption = None;
+        let dropped = require_signable_generation(&omitted_log, &image).unwrap_err();
+        assert!(dropped.contains("log_encryption"), "{dropped}");
     }
 
     #[test]
