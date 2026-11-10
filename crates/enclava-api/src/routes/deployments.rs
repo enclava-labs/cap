@@ -264,6 +264,20 @@ pub(crate) fn select_local_signed_artifact_delivery(
     attestation.local_trustee_policy_json = Some("{}".to_string());
 }
 
+pub(crate) fn canonical_agent_policy_log_encryption(
+    log_encryption: Option<LogEncryptionConfig>,
+    pin_log_encryption: bool,
+) -> Option<Option<LogEncryptionConfig>> {
+    if pin_log_encryption {
+        // Unlock disable pins the stored recipient, including an explicit none.
+        Some(log_encryption)
+    } else {
+        // A concrete recipient on an ordinary deploy must stay pinned. Omitting
+        // the field is only the preflight signal that a broker may select one.
+        log_encryption.map(Some)
+    }
+}
+
 pub(crate) async fn resolve_signed_policy_artifact(
     state: &AppState,
     artifacts: &crate::signing_service::DeploymentSigningArtifacts,
@@ -298,7 +312,10 @@ pub(crate) async fn resolve_signed_policy_artifact(
     let generated = signing_service
         .agent_policy(&crate::signing_service::AgentPolicyRequest {
             descriptor: artifacts.descriptor.clone(),
-            log_encryption: pin_log_encryption.then(|| log_encryption.clone()),
+            log_encryption: canonical_agent_policy_log_encryption(
+                log_encryption.clone(),
+                pin_log_encryption,
+            ),
         })
         .await
         .map_err(signing_error_response)?;
@@ -2523,6 +2540,24 @@ mod tests {
             Some(PUBLIC_DEPLOYMENT_ERROR_MESSAGE)
         );
         assert_eq!(public_deployment_error_message(None), None);
+    }
+
+    #[test]
+    fn ordinary_deploy_pins_a_concrete_recipient_and_unlock_pins_null() {
+        let config = valid_log_encryption_config();
+        assert_eq!(
+            canonical_agent_policy_log_encryption(Some(config.clone()), false),
+            Some(Some(config.clone()))
+        );
+        assert_eq!(canonical_agent_policy_log_encryption(None, false), None);
+        assert_eq!(
+            canonical_agent_policy_log_encryption(None, true),
+            Some(None)
+        );
+        assert_eq!(
+            canonical_agent_policy_log_encryption(Some(config.clone()), true),
+            Some(Some(config))
+        );
     }
 
     #[test]

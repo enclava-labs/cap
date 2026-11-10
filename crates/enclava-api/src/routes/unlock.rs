@@ -245,8 +245,50 @@ fn normalized_locked_workload(
     Ok((command_json, port, storage_paths))
 }
 
-/// A signed unlock-mode redeploy must not change the running workload.
-///
+/// The signed OCI spec also carries the primary name and CPU/memory limits.
+/// Command, port, and storage paths are checked separately. A proxy that
+/// rewrites the name or limits in both status reads would otherwise pass
+/// this preview, then have the apply job render the locked rows under a
+/// policy that describes the rewritten shape.
+fn signed_identity_matches_locked_runtime(
+    primary: &crate::models::AppContainer,
+    resources: &crate::models::AppResources,
+    env: &[enclava_common::descriptor::EnvVar],
+    limits: &[enclava_common::descriptor::EnvVar],
+) -> Result<(), &'static str> {
+    let signed_name = env
+        .iter()
+        .find(|var| var.name == "ENCLAVA_CONTAINER_NAME")
+        .map(|var| var.value.as_str())
+        .filter(|value| !value.is_empty());
+    let Some(signed_name) = signed_name else {
+        return Err("signed descriptor omitted ENCLAVA_CONTAINER_NAME");
+    };
+    if signed_name != primary.name {
+        return Err("signed descriptor container name does not match the locked primary");
+    }
+    let limit = |name: &str| {
+        limits
+            .iter()
+            .find(|var| var.name == name)
+            .map(|var| var.value.as_str())
+            .filter(|value| !value.is_empty())
+    };
+    let Some(cpu) = limit("cpu") else {
+        return Err("signed descriptor omitted cpu limit");
+    };
+    let Some(memory) = limit("memory") else {
+        return Err("signed descriptor omitted memory limit");
+    };
+    if cpu != resources.cpu_limit {
+        return Err("signed descriptor cpu limit does not match the locked resources");
+    }
+    if memory != resources.memory_limit {
+        return Err("signed descriptor memory limit does not match the locked resources");
+    }
+    Ok(())
+}
+
 /// The CLI signs the status object's command, port, and storage paths. A
 /// proxy that rewrites both status reads can still present a different
 /// descriptor at PUT, and `require_same_locked_generation` will not catch
@@ -1298,6 +1340,16 @@ async fn commit_unlock_mode_transition(
             .fetch_one(&mut *tx)
             .await
             .map_err(|_| unlock_database_error())?;
+    if let Some(artifacts) = request.signing_artifacts
+        && let Err(reason) = signed_identity_matches_locked_runtime(
+            locked_primary,
+            &resources,
+            &artifacts.descriptor.oci_runtime_spec.env,
+            &artifacts.descriptor.oci_runtime_spec.resources.limits,
+        )
+    {
+        return Err(unlock_transition_conflict(reason));
+    }
     crate::routes::deployments::enforce_authoritative_entitlement(
         &mut tx,
         request.org_id,
@@ -2101,6 +2153,14 @@ pub async fn update_unlock_mode(
             signed_workload_command.as_deref(),
             signed_container_port,
             signed_storage_paths.as_deref(),
+        ) {
+            return Err(unlock_transition_conflict(reason));
+        }
+        if let Err(reason) = signed_identity_matches_locked_runtime(
+            &primary,
+            &observed_resources,
+            &artifacts.descriptor.oci_runtime_spec.env,
+            &artifacts.descriptor.oci_runtime_spec.resources.limits,
         ) {
             return Err(unlock_transition_conflict(reason));
         }
@@ -4637,6 +4697,87 @@ mod tests {
             )
             .unwrap_err(),
             "signed descriptor omitted command, port, or storage paths"
+        );
+    }
+
+    #[test]
+    fn signed_identity_rejects_a_rewritten_name_or_limit() {
+        use enclava_common::descriptor::EnvVar;
+        let primary = crate::models::AppContainer {
+            id: Uuid::nil(),
+            app_id: Uuid::nil(),
+            name: "app".to_string(),
+            image_ref: "ghcr.io/acme/app:latest".to_string(),
+            image_digest: None,
+            port: Some(8080),
+            command: None,
+            storage_paths: None,
+            workload_security_profile: None,
+            is_primary: true,
+        };
+        let resources = crate::models::AppResources {
+            app_id: Uuid::nil(),
+            cpu_limit: "1".to_string(),
+            memory_limit: "1Gi".to_string(),
+            app_data_size: "5Gi".to_string(),
+            tls_data_size: "2Gi".to_string(),
+        };
+        let env = |name: &str| {
+            vec![EnvVar {
+                name: "ENCLAVA_CONTAINER_NAME".to_string(),
+                value: name.to_string(),
+            }]
+        };
+        let limits = |cpu: &str, memory: &str| {
+            vec![
+                EnvVar {
+                    name: "cpu".to_string(),
+                    value: cpu.to_string(),
+                },
+                EnvVar {
+                    name: "memory".to_string(),
+                    value: memory.to_string(),
+                },
+            ]
+        };
+        assert!(
+            super::signed_identity_matches_locked_runtime(
+                &primary,
+                &resources,
+                &env("app"),
+                &limits("1", "1Gi"),
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            super::signed_identity_matches_locked_runtime(
+                &primary,
+                &resources,
+                &env("rewritten"),
+                &limits("1", "1Gi"),
+            )
+            .unwrap_err(),
+            "signed descriptor container name does not match the locked primary"
+        );
+        assert_eq!(
+            super::signed_identity_matches_locked_runtime(
+                &primary,
+                &resources,
+                &env("app"),
+                &limits("2", "1Gi"),
+            )
+            .unwrap_err(),
+            "signed descriptor cpu limit does not match the locked resources"
+        );
+        assert_eq!(
+            super::signed_identity_matches_locked_runtime(
+                &primary,
+                &resources,
+                &env("app"),
+                &limits("1", "2Gi"),
+            )
+            .unwrap_err(),
+            "signed descriptor memory limit does not match the locked resources"
         );
     }
 
