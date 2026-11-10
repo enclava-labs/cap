@@ -695,6 +695,30 @@ fn destroy_removes_the_template_deploy_resume_file_for_that_name() {
     );
     // A second destroy of an already-cleared name is not an error.
     forget_destroyed_app_template_deploy(&paths, &cli_config, &creds, origin, "shell").unwrap();
+    enclava_cli::template_deploy_retry::save_template_deploy_attempt(
+        &paths,
+        &scope,
+        "app-uuid",
+        "deploy-1",
+        &request,
+        &enclava_cli::template_deploy_retry::NewTemplateDeployAttempt {
+            unlock_mode: "password".to_string(),
+            paas_managed_config_keys: Vec::new(),
+            log_key_id: None,
+            log_private_key_file: None,
+        },
+    )
+    .unwrap();
+    forget_destroyed_app_template_deploy(&paths, &cli_config, &creds, origin, "Shell").unwrap();
+    assert!(
+        matches!(
+            enclava_cli::template_deploy_retry::load_template_deploy_attempt(
+                &paths, &scope, "shell"
+            ),
+            enclava_cli::template_deploy_retry::LoadedTemplateDeployAttempt::Absent
+        ),
+        "destroy must clear the resume file under the lowercased template-deploy name"
+    );
 }
 
 #[test]

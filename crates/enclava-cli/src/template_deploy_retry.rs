@@ -545,12 +545,30 @@ fn select_unproven_app_mismatch(
     if !stored.completed
         && (replay_within_window(&stored, now_unix) || !replay_window_known(&stored))
     {
-        return TemplateDeployAttempt::Refuse(format!(
-            "the stored template deploy request for `{}` was signed for app id `{}`, but this app's id is `{}` and deployment `{}` is not listed. The stored request was not sent, and a new deployment was not started. Retry once that deployment is listed, or destroy the app and deploy again.",
-            stable.instance_name, stored.app_id, current_app.id, stored.deploy_id
+        return TemplateDeployAttempt::Refuse(absent_or_unproven_message(
+            stable,
+            &stored,
+            current_app,
         ));
     }
     TemplateDeployAttempt::Fresh
+}
+
+fn absent_or_unproven_message(
+    stable: &StableTemplateDeployInputs,
+    stored: &StoredTemplateDeployAttempt,
+    current_app: &CurrentTemplateApp,
+) -> String {
+    if current_app.id.is_empty() {
+        return format!(
+            "app `{}` was not found, and a stored template deploy request signed for app id `{}` is still on this machine. The stored request was not sent, and a new deployment was not started. Retry when that app is listed, or destroy the name and deploy again. Destroying the app removes the stored request.",
+            stable.instance_name, stored.app_id
+        );
+    }
+    format!(
+        "the stored template deploy request for `{}` was signed for app id `{}`, but this app's id is `{}` and deployment `{}` is not listed. The stored request was not sent, and a new deployment was not started. Retry once that deployment is listed, or destroy the app and deploy again.",
+        stable.instance_name, stored.app_id, current_app.id, stored.deploy_id
+    )
 }
 
 fn attempt_without_listing(
@@ -567,6 +585,13 @@ fn attempt_without_listing(
             // must not be replayed against it.
             StoredAppIdentity::Recreated => return TemplateDeployAttempt::Fresh,
             StoredAppIdentity::Unproven => {
+                if current_app.id.is_empty() {
+                    return TemplateDeployAttempt::Refuse(absent_or_unproven_message(
+                        stable,
+                        &stored,
+                        current_app,
+                    ));
+                }
                 return TemplateDeployAttempt::Refuse(format!(
                     "could not list deployments for `{}`, and the stored template deploy request was signed for app id `{}` while this app's id is `{}`. The stored request was not sent, and a new deployment was not started. Retry when deployment status is available, or destroy the app and deploy again.",
                     stable.instance_name, stored.app_id, current_app.id
@@ -1795,8 +1820,13 @@ mod tests {
         let TemplateDeployAttempt::Refuse(message) = recent else {
             panic!("a recent stored request must not be replayed or replaced when the app is gone");
         };
+        assert!(message.contains("was not found"), "{message}");
         assert!(message.contains("was not sent"), "{message}");
         assert!(message.contains("was not started"), "{message}");
+        assert!(
+            !message.contains("this app's id is"),
+            "a missing app must not be reported as a blank id: {message}"
+        );
 
         let mut old = stored(&stable, "deploy-1");
         old.created_at_unix = NOW - 86_400;

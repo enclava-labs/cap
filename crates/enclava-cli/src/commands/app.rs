@@ -3908,8 +3908,10 @@ pub async fn destroy(args: DestroyArgs) -> Result<(), Box<dyn std::error::Error>
     // cleanup. Without it a deploy can save a signed request for the app this
     // command just deleted, or lose the acceptance stamp of a POST that
     // already succeeded.
+    let resume_name = template_resume_instance_name(&app_name);
     let _deploy_lock =
-        enclava_cli::template_deploy_retry::lock_template_deploy(&paths, &scope, &app_name).await?;
+        enclava_cli::template_deploy_retry::lock_template_deploy(&paths, &scope, &resume_name)
+            .await?;
 
     let spinner = ProgressBar::new_spinner();
     spinner.set_style(ProgressStyle::default_spinner().template("{spinner:.red} {msg}")?);
@@ -3973,6 +3975,15 @@ pub async fn destroy(args: DestroyArgs) -> Result<(), Box<dyn std::error::Error>
 #[path = "app/tests/mod.rs"]
 pub(crate) mod tests;
 
+/// Name template deploy uses for the resume file and its lock.
+///
+/// `template deploy` lowercases the instance name before signing. Destroy
+/// must lock and clear that same name, or `Foo` and `foo` neither serialize
+/// nor remove each other's stored request.
+fn template_resume_instance_name(app_name: &str) -> String {
+    crate::commands::template::normalize_slug(app_name).unwrap_or_else(|_| app_name.to_string())
+}
+
 /// Drop the local template-deploy resume file after the named app is gone.
 ///
 /// The file is keyed by app name and the normalized API base. Leaving it
@@ -3995,7 +4006,11 @@ fn forget_destroyed_app_template_deploy(
         cli_config.org.as_deref(),
         api_base,
     );
-    enclava_cli::template_deploy_retry::clear_template_deploy_attempt(paths, &scope, app_name)
+    enclava_cli::template_deploy_retry::clear_template_deploy_attempt(
+        paths,
+        &scope,
+        &template_resume_instance_name(app_name),
+    )
 }
 
 /// Operator guidance for a failed destroy, keyed on the stable API code (or

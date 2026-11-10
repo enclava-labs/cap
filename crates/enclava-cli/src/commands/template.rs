@@ -490,17 +490,16 @@ async fn deploy_with_timings(
         // a resume file exists; the selector already treats that as unavailable.
         enclava_cli::template_deploy_retry::deployment_listing_for_list_error(&loaded, Some(404))
     };
-    let peeked = if template.unlock_mode == "password"
-        && enclava_cli::template_deploy_retry::loaded_attempt_is_password(&loaded)
-    {
+    let peeked = if enclava_cli::template_deploy_retry::loaded_attempt_is_password(&loaded) {
         match peek_password_bootstrap_key(api, &ctx.paths, &instance_name).await {
             Ok(peeked) => peeked,
-            Err(error) => {
+            Err(error) if template.unlock_mode == "password" => {
                 return Err(format!(
                     "could not compare the password bootstrap key with the stored template deploy request for `{instance_name}`: {error}. The stored request was not sent, and the local bootstrap key was not replaced."
                 )
                 .into());
             }
+            Err(_) => None,
         }
     } else {
         None
@@ -1922,7 +1921,7 @@ fn ssh_command_stable_endpoint<'a>(
     .into())
 }
 
-fn normalize_slug(value: &str) -> Result<String, Box<dyn std::error::Error>> {
+pub(crate) fn normalize_slug(value: &str) -> Result<String, Box<dyn std::error::Error>> {
     let slug = value.trim().to_ascii_lowercase();
     if slug.len() < 2
         || slug.len() > 63
