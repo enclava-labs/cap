@@ -2169,3 +2169,118 @@ async fn signed_acceptance_rolls_back_artifact_and_generation_together() {
 
     crate::test_support::drop_isolated_database("cap340_accept_rollback", pool).await;
 }
+
+/// #263: a registered customer keyring and a supplied policy artifact are
+/// not a canonical-policy witness. Absence of the signing service stays
+/// 503 after customer authority has already succeeded.
+#[tokio::test]
+async fn customer_artifact_without_signing_service_stays_503() {
+    let (_cleanup, pool) =
+        crate::test_support::isolated_database_test_pool("cap263_no_signer").await;
+    let owner_key = SigningKey::from_bytes(&[0xdd; 32]);
+    let descriptor = descriptor();
+    let user_id = Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
+    let keyring = OrgKeyring {
+        org_id: descriptor.org_id,
+        version: 1,
+        members: vec![TestKeyringMember {
+            user_id,
+            pubkey: owner_key.verifying_key().to_bytes(),
+            role: TestKeyringRole::Owner,
+            added_at: "2026-04-01T00:00:00Z".parse().unwrap(),
+        }],
+        updated_at: "2026-04-01T00:00:00Z".parse().unwrap(),
+    };
+    let descriptor_blob = serde_json::json!({
+        "descriptor": &descriptor,
+        "signature": hex::encode(
+            owner_key
+                .sign(&enclava_common::descriptor::descriptor_canonical_bytes(&descriptor))
+                .to_bytes()
+        ),
+        "signing_key_id": "owner-key-1",
+        "signing_pubkey": hex::encode(owner_key.verifying_key().to_bytes()),
+    })
+    .to_string();
+    let keyring_blob = serde_json::json!({
+        "keyring": &keyring,
+        "signature": hex::encode(
+            owner_key
+                .sign(&canonical_keyring_bytes_test(&keyring))
+                .to_bytes()
+        ),
+        "signing_pubkey": hex::encode(owner_key.verifying_key().to_bytes()),
+    })
+    .to_string();
+    let artifacts = decode_optional_blobs(Some(descriptor_blob), Some(keyring_blob.clone()))
+        .expect("customer blobs decode")
+        .expect("both blobs present");
+
+    let suffix = descriptor.org_id.simple().to_string();
+    sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'cap263 owner')")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("insert owner");
+    sqlx::query("INSERT INTO organizations (id, name, cust_slug) VALUES ($1, $2, $3)")
+        .bind(descriptor.org_id)
+        .bind(format!("cap263-{suffix}"))
+        .bind(&suffix[..8])
+        .execute(&pool)
+        .await
+        .expect("insert organization");
+    let signing_key_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO user_signing_keys (id, user_id, pubkey) VALUES ($1, $2, $3)")
+        .bind(signing_key_id)
+        .bind(user_id)
+        .bind(artifacts.org_keyring_signing_pubkey.as_slice())
+        .execute(&pool)
+        .await
+        .expect("insert owner signing key");
+    let envelope: serde_json::Value = serde_json::from_str(&keyring_blob).expect("keyring blob");
+    sqlx::query(
+        "INSERT INTO org_keyrings (org_id, version, keyring_payload, signature, signing_key_id)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(descriptor.org_id)
+    .bind(i64::try_from(keyring.version).unwrap())
+    .bind(serde_json::to_vec(&envelope["keyring"]).unwrap())
+    .bind(artifacts.org_keyring_signature.as_slice())
+    .bind(signing_key_id)
+    .execute(&pool)
+    .await
+    .expect("insert registered keyring");
+
+    let mut state = crate::test_support::lazy_state();
+    state.db = pool.clone();
+    state.signing_service = None;
+    let pubkey = state
+        .attestation
+        .as_ref()
+        .expect("lazy state has attestation")
+        .signing_service_pubkey_hex
+        .clone()
+        .expect("pubkey is configured; this case is the canonical-policy 503");
+    let provided = serde_json::json!({
+        "metadata": {"note": "customer-supplied artifact"}
+    })
+    .to_string();
+
+    let err = crate::routes::deployments::resolve_signed_policy_artifact(
+        &state,
+        &artifacts,
+        Some(provided),
+        Some(pubkey.as_str()),
+        None,
+    )
+    .await
+    .expect_err("a supplied artifact must not be accepted without the signing service");
+
+    assert_eq!(err.0.as_u16(), 503);
+    assert_eq!(
+        err.1.0["error"],
+        "canonical policy validation requires the platform signing service"
+    );
+
+    crate::test_support::drop_isolated_database("cap263_no_signer", pool).await;
+}
