@@ -3,13 +3,16 @@ yanked = "deny"
 unmaintained = "none"
 ignore = [
     { id = "RUSTSEC-2023-0071", reason = "No upstream fix (patched = []). rsa 0.9.10 reaches CAP via enclava-verifier (cfg(test)-only interop tests) and sqlx-mysql (unused DB backend). The only RsaPrivateKey/SigningKey references are amd.rs cfg(test) interop tests with ephemeral keys; shipped RSA code performs public-key operations only (PKCS#1 DER decode and hand-rolled modpow with a public exponent). Revisit before any RSA private-key use or when these dependencies drop rsa 0.9.x." },
-    { id = "RUSTSEC-2026-0459", reason = "libsqlite3-sys 0.30.1 is the unused sqlx sqlite driver. Cargo.lock records sqlx's optional database drivers even when the sqlite feature is off (a fresh lock of sqlx 0.8.6 with only the postgres features still contains it; cargo tree -i libsqlite3-sys --target all is empty). CVE-2026-119375 is in the bundled SQLite C source, which the sqlite feature enables via sqlx-sqlite/bundled; CAP does not enable sqlite or bundled, so that source is not compiled. No upgrade clears the lockfile entry: sqlx 0.8.6 pins 0.30.1 and sqlx 0.9.0 (latest) still requires libsqlite3-sys <0.38.0, below the patched >=0.39.0. Revisit when sqlx accepts libsqlite3-sys >=0.39." },
+    # RUSTSEC-2026-0459: vulnerability (CVE-2026-119375). Fixed in libsqlite3-sys >=0.39.0, but no published sqlx accepts that version, so a semver-compatible lockfile bump is impossible.
+    { id = "RUSTSEC-2026-0459", reason = "libsqlite3-sys 0.30.1 is the unused sqlx sqlite driver. Cargo.lock records sqlx's optional database drivers even when the sqlite feature is off (a fresh lock of sqlx 0.8.6 with only the postgres features still contains it; cargo tree -i libsqlite3-sys --target all is empty). CVE-2026-119375 is in the bundled SQLite C source, which the sqlite feature enables via sqlx-sqlite/bundled; CAP does not enable sqlite or bundled, so that source is not compiled. No upgrade clears the lockfile entry: locked sqlx-sqlite 0.8.6 requires ^0.30.1 (`cargo update -p libsqlite3-sys --precise 0.39.1` fails) and sqlx 0.9.0 (latest) still requires libsqlite3-sys >=0.30.1, <0.38.0, below the patched >=0.39.0. Revisit when a published sqlx accepts libsqlite3-sys >=0.39.0." },
     # Tracked transitive advisories with no actionable fix today (issue #140).
     # All are unreachable from CAP's own code paths; each is pinned by a
     # direct dependency that must accept it before we can drop the entry.
     { id = "RUSTSEC-2024-0384", reason = "`instant` unmaintained; transitive via nostr (enclava-api, enclava-cli). No fixed nostr release; revisit on nostr upgrade." },
     { id = "RUSTSEC-2025-0119", reason = "`number_prefix` unmaintained; transitive via indicatif (enclava-cli progress bars). Cosmetic dependency; revisit when indicatif drops it." },
     { id = "RUSTSEC-2026-0173", reason = "`proc-macro-error2` unmaintained; transitive via getset/oci-spec/oci-client. Revisit when oci-spec moves off getset." },
+    # RUSTSEC-2024-0449: unmaintained class, patched = []. No fixed version exists.
+    { id = "RUSTSEC-2024-0449", reason = "unmaintained (patched = []; last release is 0.2.11). No fixed version exists, so a lockfile bump cannot clear it. Transitive via serde_yaml 0.9.34 (direct enclava-engine dependency, also kube). Accepted until serde_yaml is replaced by a maintained parser." },
 ]
 
 [sources]
