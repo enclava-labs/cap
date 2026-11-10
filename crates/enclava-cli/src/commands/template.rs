@@ -412,66 +412,9 @@ async fn deploy_with_timings(
     )?;
     let storage_password =
         StoragePasswordInput::from_file_option(args.storage_password_file.as_ref())?;
-    if template.unlock_mode == "password" {
-        storage_password.ensure_available_for_password_mode("password-mode template deploy")?;
-        // Pre-mutation claim-session gate (same rationale as the deploy
-        // path). The post-submit flow auto-claims only while ownership is
-        // unclaimed (the bootstrap wait skips claimed apps); unresolved
-        // ownership fails closed the same way, since password templates
-        // auto-claim on first boot.
-        let preflight_ownership = api
-            .get_unlock_status(&instance_name)
-            .await
-            .ok()
-            .and_then(|status| status.ownership_state);
-        if deploy_preflight_needs_claim(true, preflight_ownership.as_deref(), "creating") {
-            crate::commands::ownership::ensure_claim_session_now(storage_password.is_from_file())?;
-        }
-    }
+    let capture = mnemonic_capture_from_flags(args.no_store_mnemonic);
     // Authenticate platform authority before keyring registration or app creation.
     fetch_verified_platform_release(api, &ctx.paths).await?;
-    let capture = mnemonic_capture_from_flags(args.no_store_mnemonic);
-    // Password-mode template deploys auto-claim on first boot; refuse the no-store
-    // sink mode before creating anything, while the run can still stop without
-    // side effects. (The authoritative pre-claim gate in the ownership module
-    // re-checks this before the auto-claim fires.)
-    if capture == MnemonicCapture::Skip && template.unlock_mode == "password" {
-        crate::commands::ownership::validate_recovery_mnemonic_sink_mode(capture)?;
-    }
-    let pb = if args.json || args.timings {
-        ProgressBar::hidden()
-    } else {
-        ProgressBar::new(5)
-    };
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("{spinner:.green} [{bar:30.cyan/blue}] {msg}")?
-            .progress_chars("=> "),
-    );
-    // Polls redraw this bar with real state. A steady ticker would race the
-    // password and one-time recovery-mnemonic terminal prompts.
-    pb.set_message("Preparing template app...");
-
-    let bootstrap_pubkey_hash =
-        template_bootstrap_pubkey_hash(api, &ctx.paths, &template, &instance_name).await?;
-    let app = ensure_template_app(
-        api,
-        &template,
-        &instance_name,
-        bootstrap_pubkey_hash.as_deref(),
-    )
-    .await?;
-    // The hold budget is normalized so a retry *can* keep one idempotency key.
-    // The signed blobs cannot: they embed a fresh deploy id and timestamp, so
-    // the key is only stable if this run replays the request already signed
-    // for the in-flight deployment (cap#292).
-    let roll_hold_seconds = customer_config_roll_hold_seconds(args.ssh_timeout_seconds);
-    let stable = enclava_cli::template_deploy_retry::StableTemplateDeployInputs {
-        template_slug: args.template.clone(),
-        instance_name: instance_name.clone(),
-        config: template_create_config(explicit_stable_endpoint.as_deref()),
-        bootstrap_pubkey_hash: bootstrap_pubkey_hash.clone(),
-    };
     let scope = enclava_cli::template_deploy_retry::template_deploy_scope(
         ctx.creds.active_org_id.as_deref(),
         ctx.cli_config.org_id.as_deref(),
@@ -488,6 +431,57 @@ async fn deploy_with_timings(
         &scope,
         &instance_name,
     );
+    // Catalog unlock_mode can change while a deployment is in flight. Password
+    // gates follow the stored signed mode so an auto-to-password catalog flip
+    // does not block the resume, and a password resume still fails before any
+    // mutation when the password is unavailable.
+    let mut password_preflight_done = false;
+    if enclava_cli::template_deploy_retry::resume_expects_password_preflight(
+        &loaded,
+        &template.unlock_mode,
+    ) {
+        ensure_password_mode_preflight(api, &instance_name, &storage_password, capture).await?;
+        password_preflight_done = true;
+    }
+    let pb = if args.json || args.timings {
+        ProgressBar::hidden()
+    } else {
+        ProgressBar::new(5)
+    };
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{bar:30.cyan/blue}] {msg}")?
+            .progress_chars("=> "),
+    );
+    // Polls redraw this bar with real state. A steady ticker would race the
+    // password and one-time recovery-mnemonic terminal prompts.
+    pb.set_message("Preparing template app...");
+
+    let catalog_bootstrap_pubkey_hash =
+        template_bootstrap_pubkey_hash(api, &ctx.paths, &template, &instance_name).await?;
+    let app = ensure_template_app(
+        api,
+        &template,
+        &instance_name,
+        catalog_bootstrap_pubkey_hash.as_deref(),
+    )
+    .await?;
+    // The hold budget is normalized so a retry *can* keep one idempotency key.
+    // The signed blobs cannot: they embed a fresh deploy id and timestamp, so
+    // the key is only stable if this run replays the request already signed
+    // for the in-flight deployment (cap#292). Matching uses the stored
+    // bootstrap hash: the catalog hash above follows the current unlock mode
+    // and would reject a live replay before the signed mode is restored.
+    let roll_hold_seconds = customer_config_roll_hold_seconds(args.ssh_timeout_seconds);
+    let stable = enclava_cli::template_deploy_retry::StableTemplateDeployInputs {
+        template_slug: args.template.clone(),
+        instance_name: instance_name.clone(),
+        config: template_create_config(explicit_stable_endpoint.as_deref()),
+        bootstrap_pubkey_hash: enclava_cli::template_deploy_retry::bootstrap_hash_for_resume_match(
+            &loaded,
+            catalog_bootstrap_pubkey_hash.clone(),
+        ),
+    };
     let deployments = match api.list_deployments(&instance_name).await {
         Ok(entries) => enclava_cli::template_deploy_retry::DeploymentListing::Listed(
             entries
@@ -514,6 +508,10 @@ async fn deploy_with_timings(
     let attempt = enclava_cli::template_deploy_retry::select_template_deploy_attempt(
         loaded,
         &stable,
+        &enclava_cli::template_deploy_retry::CurrentTemplateApp {
+            id: app.id.clone(),
+            created_at_unix: template_app_created_at_unix(&app.created_at),
+        },
         &deployments,
         enclava_cli::template_deploy_retry::unix_now(),
     );
@@ -562,6 +560,10 @@ async fn deploy_with_timings(
             (trusted, request)
         }
         enclava_cli::template_deploy_retry::TemplateDeployAttempt::Fresh => {
+            if template.unlock_mode == "password" && !password_preflight_done {
+                ensure_password_mode_preflight(api, &instance_name, &storage_password, capture)
+                    .await?;
+            }
             let prepared_log_key = prepare_template_log_key(
                 api,
                 &ctx.paths,
@@ -599,7 +601,7 @@ async fn deploy_with_timings(
                 template_slug: stable.template_slug.clone(),
                 instance_name: stable.instance_name.clone(),
                 config: stable.config.clone(),
-                bootstrap_pubkey_hash: stable.bootstrap_pubkey_hash.clone(),
+                bootstrap_pubkey_hash: catalog_bootstrap_pubkey_hash.clone(),
                 customer_descriptor_blob: Some(signed_blobs.customer_descriptor_blob),
                 org_keyring_blob: Some(signed_blobs.org_keyring_blob),
                 signed_policy_artifact: Some(signed_blobs.signed_policy_artifact),
@@ -1391,6 +1393,43 @@ fn customer_config_roll_hold_seconds(ssh_timeout_seconds: u64) -> u32 {
             CUSTOMER_CONFIG_ROLL_HOLD_MAX_SECONDS,
         );
     u32::try_from(budget).unwrap_or(u32::MAX)
+}
+
+/// Password-mode gates that must run before a password deploy mutates remote
+/// state. A replay of a non-password signed request does not call this: the
+/// catalog's current unlock mode is not the mode that request was signed for.
+async fn ensure_password_mode_preflight(
+    api: &ApiClient,
+    instance_name: &str,
+    storage_password: &StoragePasswordInput,
+    capture: MnemonicCapture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    storage_password.ensure_available_for_password_mode("password-mode template deploy")?;
+    // Pre-mutation claim-session gate (same rationale as the deploy path).
+    // The post-submit flow auto-claims only while ownership is unclaimed;
+    // unresolved ownership fails closed the same way, since password templates
+    // auto-claim on first boot.
+    let preflight_ownership = api
+        .get_unlock_status(instance_name)
+        .await
+        .ok()
+        .and_then(|status| status.ownership_state);
+    if deploy_preflight_needs_claim(true, preflight_ownership.as_deref(), "creating") {
+        crate::commands::ownership::ensure_claim_session_now(storage_password.is_from_file())?;
+    }
+    // Password-mode template deploys auto-claim on first boot; refuse the
+    // no-store sink mode before creating anything. The ownership module
+    // re-checks this before the auto-claim fires.
+    if capture == MnemonicCapture::Skip {
+        crate::commands::ownership::validate_recovery_mnemonic_sink_mode(capture)?;
+    }
+    Ok(())
+}
+
+fn template_app_created_at_unix(created_at: &str) -> Option<u64> {
+    chrono::DateTime::parse_from_rfc3339(created_at.trim())
+        .ok()
+        .and_then(|parsed| u64::try_from(parsed.timestamp()).ok())
 }
 
 async fn ensure_template_app(

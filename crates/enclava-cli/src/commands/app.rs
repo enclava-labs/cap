@@ -3867,7 +3867,10 @@ pub struct DestroyArgs {
 
 pub async fn destroy(args: DestroyArgs) -> Result<(), Box<dyn std::error::Error>> {
     let app_name = resolve_app_name(&args.app)?;
-    let (api, _paths, _cli_config) = build_api_client()?;
+    let paths = CliPaths::resolve()?;
+    let cli_config = config::load_config(&paths)?;
+    let creds = config::load_credentials(&paths)?;
+    let api = ApiClient::from_config(&cli_config, &creds);
 
     if !args.force {
         super::interactive::require_prompt("pass --force to destroy without confirmation")?;
@@ -3908,7 +3911,38 @@ pub async fn destroy(args: DestroyArgs) -> Result<(), Box<dyn std::error::Error>
         spinner.finish_with_message(format!("Destroy of '{app_name}' did not complete."));
         eprintln!("Hint: {hint}");
     }
-    result?;
+    let already_gone = matches!(&result, Err(ApiError::Api { status: 404, .. }));
+    if let Err(error) = result {
+        if !already_gone {
+            return Err(error.into());
+        }
+        // The app is already absent. The unreadable-resume refusal tells the
+        // user to destroy and deploy again; a dashboard destroy leaves the
+        // local file, so a 404 must still remove it.
+        return Err(forget_destroyed_app_template_deploy(
+            &paths,
+            &cli_config,
+            &creds,
+            api.origin(),
+            &app_name,
+        )
+        .map(|()| {
+            format!(
+                "{error}. The stored template deploy request for `{app_name}` was removed, so deploying this name again will not replay or refuse on it."
+            )
+        })
+        .unwrap_or_else(|clear_error| {
+            format!("{error}; also failed to remove the stored template deploy request: {clear_error}")
+        })
+        .into());
+    }
+
+    forget_destroyed_app_template_deploy(&paths, &cli_config, &creds, api.origin(), &app_name)
+        .map_err(|err| {
+            format!(
+                "app '{app_name}' was destroyed, but the stored template deploy request could not be removed: {err}. Remove that file before deploying this name again."
+            )
+        })?;
 
     spinner.finish_with_message(format!("App '{app_name}' destroyed."));
 
@@ -3924,6 +3958,29 @@ pub async fn destroy(args: DestroyArgs) -> Result<(), Box<dyn std::error::Error>
 #[cfg(test)]
 #[path = "app/tests/mod.rs"]
 pub(crate) mod tests;
+
+/// Drop the local template-deploy resume file after the named app is gone.
+///
+/// The file is keyed by app name. Leaving it makes the next deploy of that
+/// name replay a descriptor signed for the destroyed app, or refuse forever
+/// when the file cannot be read. `app destroy` is the recovery those refusals
+/// document, so it has to remove the file.
+fn forget_destroyed_app_template_deploy(
+    paths: &CliPaths,
+    cli_config: &config::CliConfig,
+    creds: &config::Credentials,
+    api_origin: &str,
+    app_name: &str,
+) -> Result<(), String> {
+    let scope = enclava_cli::template_deploy_retry::template_deploy_scope(
+        creds.active_org_id.as_deref(),
+        cli_config.org_id.as_deref(),
+        creds.active_org_name.as_deref(),
+        cli_config.org.as_deref(),
+        api_origin,
+    );
+    enclava_cli::template_deploy_retry::clear_template_deploy_attempt(paths, &scope, app_name)
+}
 
 /// Operator guidance for a failed destroy, keyed on the stable API code (or
 /// the in-band cause text hosted deferrals carry). Pure so the prose mapping

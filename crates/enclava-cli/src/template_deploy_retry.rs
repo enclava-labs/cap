@@ -18,6 +18,12 @@
 //! '24 hours'`). Replaying past that window starts another rollout with the
 //! original signed deployment id, so an attempt with no in-window timestamp
 //! fails closed when history cannot be listed.
+//!
+//! A destroy-and-recreate keeps the app name and replaces the id. The stored
+//! descriptor is bound to the old id and must not be replayed against the
+//! replacement. An id change that is not proof of a new row is also not proof
+//! the first POST settled, so that case refuses until the deployment is listed
+//! or the replay window has passed.
 
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -222,9 +228,94 @@ pub fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// The app this command will sign for.
+///
+/// A destroy-and-recreate keeps the name and replaces the id. A still-live
+/// deploy can also change the id the platform serves before its row is listed.
+/// Those are not the same decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurrentTemplateApp {
+    pub id: String,
+    /// Platform `created_at` as unix seconds. `None` when it could not be parsed.
+    pub created_at_unix: Option<u64>,
+}
+
+/// Server clock ahead of this machine must not look like a new app row.
+/// A replacement row is created when the user destroys and recreates, which
+/// is later than this margin. A same-row id change is not.
+const APP_RECREATE_SKEW_SECS: u64 = 300;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoredAppIdentity {
+    Same,
+    /// This app row was created after the stored request. The descriptor is
+    /// bound to a destroyed app and must not be replayed.
+    Recreated,
+    /// Ids differ, but this may still be a presentation change on the same
+    /// row while the first POST is in flight.
+    Unproven,
+}
+
+fn stored_app_identity(
+    stored: &StoredTemplateDeployAttempt,
+    current: &CurrentTemplateApp,
+) -> StoredAppIdentity {
+    if stored.app_id == current.id {
+        return StoredAppIdentity::Same;
+    }
+    // An undated file cannot prove the row is newer. Fail closed.
+    if let Some(created) = current.created_at_unix
+        && stored.created_at_unix != 0
+        && created
+            > stored
+                .created_at_unix
+                .saturating_add(APP_RECREATE_SKEW_SECS)
+    {
+        return StoredAppIdentity::Recreated;
+    }
+    StoredAppIdentity::Unproven
+}
+
+/// Hash to compare against a stored request.
+///
+/// `template_bootstrap_pubkey_hash` follows the catalog's current
+/// `unlock_mode`: password mode derives a key, other modes do not. Using that
+/// value in `matches_inputs` rejects the stored request before the replay
+/// branch can restore the signed unlock mode. Match the hash the stored
+/// request was signed with. A fresh sign still uses the catalog-derived hash.
+pub fn bootstrap_hash_for_resume_match(
+    loaded: &LoadedTemplateDeployAttempt,
+    catalog_derived: Option<String>,
+) -> Option<String> {
+    match loaded {
+        LoadedTemplateDeployAttempt::Ready(stored) => stored.bootstrap_pubkey_hash.clone(),
+        _ => catalog_derived,
+    }
+}
+
+/// Whether this run must satisfy password-mode gates before selection.
+///
+/// A stored request signed for a non-password unlock mode must not be blocked
+/// by the catalog's current mode. The replay branch restores the signed mode
+/// after selection. No stored workflow follows the catalog.
+pub fn resume_expects_password_preflight(
+    loaded: &LoadedTemplateDeployAttempt,
+    catalog_unlock_mode: &str,
+) -> bool {
+    match loaded {
+        LoadedTemplateDeployAttempt::Ready(stored) => stored
+            .workflow
+            .as_ref()
+            .map(|workflow| workflow.unlock_mode == "password")
+            .unwrap_or(catalog_unlock_mode == "password"),
+        _ => catalog_unlock_mode == "password",
+    }
+}
+
 pub fn select_template_deploy_attempt(
     loaded: LoadedTemplateDeployAttempt,
     stable: &StableTemplateDeployInputs,
+    current_app: &CurrentTemplateApp,
     deployments: &DeploymentListing,
     now_unix: u64,
 ) -> TemplateDeployAttempt {
@@ -239,7 +330,7 @@ pub fn select_template_deploy_attempt(
     };
 
     let Some(rows) = listed_rows(deployments) else {
-        return attempt_without_listing(usable, unreadable, stable, now_unix);
+        return attempt_without_listing(usable, unreadable, stable, current_app, now_unix);
     };
 
     let inflight: Vec<&ObservedTemplateDeployment> = rows
@@ -248,7 +339,7 @@ pub fn select_template_deploy_attempt(
         .collect();
 
     if let Some(stored) = usable {
-        return select_stored_attempt(stored, stable, rows, &inflight, now_unix);
+        return select_stored_attempt(stored, stable, current_app, rows, &inflight, now_unix);
     }
 
     // The deploy id is inside the file. Without it, a settled row can be an
@@ -259,22 +350,21 @@ pub fn select_template_deploy_attempt(
             return TemplateDeployAttempt::Refuse(inflight_refuse_message(
                 stable,
                 deployment,
-                "the stored signed request on this machine is unreadable, so it cannot be resumed. A new deployment was not started. Retry from the machine that started it, wait for it to finish, or destroy the app and deploy again.",
+                "the stored signed request on this machine is unreadable, so it cannot be resumed. A new deployment was not started. Retry from the machine that started it, wait for it to finish, or destroy the app and deploy again. Destroying the app removes the stored request.",
             ));
         }
         return TemplateDeployAttempt::Refuse(format!(
-            "the stored template deploy request for `{}` is unreadable, so it is not safe to sign a new one. A new deployment was not started. Retry when that request can be read, or destroy the app and deploy again.",
+            "the stored template deploy request for `{}` is unreadable, so it is not safe to sign a new one. A new deployment was not started. Retry when that request can be read, or destroy the app and deploy again. Destroying the app removes the stored request.",
             stable.instance_name
         ));
     }
 
     if let Some(deployment) = inflight.first().copied() {
-        let why = if unreadable {
-            "the stored signed request on this machine is unreadable, so it cannot be resumed. A new deployment was not started. Retry from the machine that started it, wait for it to finish, or destroy the app and deploy again."
-        } else {
-            "this machine does not have the original signed request to resume it. A new deployment was not started. Retry from the machine that started it, wait for it to finish, or destroy the app and deploy again."
-        };
-        return TemplateDeployAttempt::Refuse(inflight_refuse_message(stable, deployment, why));
+        return TemplateDeployAttempt::Refuse(inflight_refuse_message(
+            stable,
+            deployment,
+            "this machine does not have the original signed request to resume it. A new deployment was not started. Retry from the machine that started it, wait for it to finish, or destroy the app and deploy again.",
+        ));
     }
     TemplateDeployAttempt::Fresh
 }
@@ -282,59 +372,75 @@ pub fn select_template_deploy_attempt(
 fn select_stored_attempt(
     stored: Box<StoredTemplateDeployAttempt>,
     stable: &StableTemplateDeployInputs,
+    current_app: &CurrentTemplateApp,
     rows: &[ObservedTemplateDeployment],
     inflight: &[&ObservedTemplateDeployment],
+    now_unix: u64,
+) -> TemplateDeployAttempt {
+    // `deliver_managed_template_config` is app-scoped. Continuing the stored
+    // workflow while a different deployment is live can enqueue the old
+    // template's configuration for the newer rollout. Refuse even when the
+    // stored row is also still in flight.
+    if let Some(deployment) = inflight
+        .iter()
+        .copied()
+        .find(|deployment| deployment.id != stored.deploy_id)
+    {
+        return TemplateDeployAttempt::Refuse(inflight_refuse_message(
+            stable,
+            deployment,
+            "another deployment is in flight, so the stored request was not sent. Resuming it could apply this template's configuration to the newer rollout, and a new deployment was not started. Wait for every in-flight deployment to finish, or destroy the app, then deploy again.",
+        ));
+    }
+
+    match stored_app_identity(&stored, current_app) {
+        StoredAppIdentity::Recreated => TemplateDeployAttempt::Fresh,
+        StoredAppIdentity::Unproven => {
+            select_unproven_app_mismatch(stored, stable, current_app, rows, now_unix)
+        }
+        StoredAppIdentity::Same => select_same_app_attempt(stored, stable, rows, now_unix),
+    }
+}
+
+fn select_same_app_attempt(
+    stored: Box<StoredTemplateDeployAttempt>,
+    stable: &StableTemplateDeployInputs,
+    rows: &[ObservedTemplateDeployment],
     now_unix: u64,
 ) -> TemplateDeployAttempt {
     let our_row = rows
         .iter()
         .find(|deployment| deployment.id == stored.deploy_id);
     let ours_inflight = our_row.is_some_and(deployment_is_in_flight);
-    let ours_terminal = our_row.is_some_and(deployment_is_terminal);
 
     // A visible row that is not live is not "absent". Replaying it after the
     // server forgets the key restarts a deployment the user cancelled or that
-    // a projection already shows as stale. Sign fresh only when nothing else
-    // is still rolling out.
+    // a projection already shows as stale. A competing in-flight row was
+    // already refused above, so nothing else is rolling out.
     if our_row.is_some() && !ours_inflight {
-        if let Some(deployment) = inflight.first().copied() {
-            let why = if ours_terminal {
-                "an earlier signed request for this app already finished, and another deployment is still in flight. A new deploy was not started. Wait for the in-flight deployment to finish, or destroy the app, then deploy again."
-            } else {
-                "the stored deployment is visible but not live, and another deployment is still in flight. A new deploy was not started. Wait for the in-flight deployment to finish, or destroy the app, then deploy again."
-            };
-            return TemplateDeployAttempt::Refuse(inflight_refuse_message(stable, deployment, why));
-        }
         return TemplateDeployAttempt::Fresh;
     }
 
     if stored.matches_inputs(stable) {
-        if inflight.is_empty() || ours_inflight {
-            if stored.completed && !ours_inflight {
-                return TemplateDeployAttempt::Fresh;
-            }
-            // A live row is affirmative evidence the operation still exists.
-            // An absent row may replay only while the key is still inside the
-            // server window; after that, the same key opens a new generation.
-            if ours_inflight || replay_within_window(&stored, now_unix) {
-                return replay(stored);
-            }
-            if !replay_window_known(&stored) {
-                return TemplateDeployAttempt::Refuse(format!(
-                    "the stored template deploy request for `{}` has no timestamp and its deployment is not visible yet. Replaying or replacing it could race the original request. A new deployment was not started. Retry once that deployment is listed, or destroy the app and deploy again.",
-                    stable.instance_name
-                ));
-            }
+        if stored.completed && !ours_inflight {
             return TemplateDeployAttempt::Fresh;
         }
-        return TemplateDeployAttempt::Refuse(inflight_refuse_message(
-            stable,
-            inflight[0],
-            "its id is not the deployment this machine signed, so the stored request was not sent (that would start a second deployment). Retry this command once the in-flight deployment's id is visible — that resumes it. Destroy the app only if it stays stuck.",
-        ));
+        // A live row is affirmative evidence the operation still exists.
+        // An absent row may replay only while the key is still inside the
+        // server window; after that, the same key opens a new generation.
+        if ours_inflight || replay_within_window(&stored, now_unix) {
+            return replay(stored);
+        }
+        if !replay_window_known(&stored) {
+            return TemplateDeployAttempt::Refuse(format!(
+                "the stored template deploy request for `{}` has no timestamp and its deployment is not visible yet. Replaying or replacing it could race the original request. A new deployment was not started. Retry once that deployment is listed, or destroy the app and deploy again.",
+                stable.instance_name
+            ));
+        }
+        return TemplateDeployAttempt::Fresh;
     }
 
-    if let Some(deployment) = inflight.first().copied() {
+    if let Some(deployment) = our_row.filter(|_| ours_inflight) {
         return TemplateDeployAttempt::Refuse(inflight_refuse_message(
             stable,
             deployment,
@@ -360,13 +466,68 @@ fn select_stored_attempt(
     TemplateDeployAttempt::Fresh
 }
 
+fn select_unproven_app_mismatch(
+    stored: Box<StoredTemplateDeployAttempt>,
+    stable: &StableTemplateDeployInputs,
+    current_app: &CurrentTemplateApp,
+    rows: &[ObservedTemplateDeployment],
+    now_unix: u64,
+) -> TemplateDeployAttempt {
+    let our_row = rows
+        .iter()
+        .find(|deployment| deployment.id == stored.deploy_id);
+    let ours_inflight = our_row.is_some_and(deployment_is_in_flight);
+
+    // The signed deployment is on this app, so the id change is a presentation
+    // change during a live operation, not a recreate. Resume it.
+    if ours_inflight && stored.matches_inputs(stable) {
+        return replay(stored);
+    }
+    if let Some(deployment) = our_row.filter(|_| ours_inflight) {
+        return TemplateDeployAttempt::Refuse(inflight_refuse_message(
+            stable,
+            deployment,
+            "this command's template settings differ from the signed request that started it. Retry the original command to resume that deployment. Destroy the app before changing the template, endpoint, or bootstrap settings.",
+        ));
+    }
+    if our_row.is_some() {
+        return TemplateDeployAttempt::Fresh;
+    }
+    // Not listed on this app. Do not replay a descriptor bound to a different
+    // id (the platform can return the old operation's cached response). Do not
+    // sign fresh while that request may still be running on this row.
+    if !stored.completed
+        && (replay_within_window(&stored, now_unix) || !replay_window_known(&stored))
+    {
+        return TemplateDeployAttempt::Refuse(format!(
+            "the stored template deploy request for `{}` was signed for app id `{}`, but this app's id is `{}` and deployment `{}` is not listed. The stored request was not sent, and a new deployment was not started. Retry once that deployment is listed, or destroy the app and deploy again.",
+            stable.instance_name, stored.app_id, current_app.id, stored.deploy_id
+        ));
+    }
+    TemplateDeployAttempt::Fresh
+}
+
 fn attempt_without_listing(
     usable: Option<Box<StoredTemplateDeployAttempt>>,
     unreadable: bool,
     stable: &StableTemplateDeployInputs,
+    current_app: &CurrentTemplateApp,
     now_unix: u64,
 ) -> TemplateDeployAttempt {
     if let Some(stored) = usable {
+        match stored_app_identity(&stored, current_app) {
+            // The replacement app has no stored attempt of its own. A list
+            // outage must not block that first deploy, and the old descriptor
+            // must not be replayed against it.
+            StoredAppIdentity::Recreated => return TemplateDeployAttempt::Fresh,
+            StoredAppIdentity::Unproven => {
+                return TemplateDeployAttempt::Refuse(format!(
+                    "could not list deployments for `{}`, and the stored template deploy request was signed for app id `{}` while this app's id is `{}`. The stored request was not sent, and a new deployment was not started. Retry when deployment status is available, or destroy the app and deploy again.",
+                    stable.instance_name, stored.app_id, current_app.id
+                ));
+            }
+            StoredAppIdentity::Same => {}
+        }
         if stored.matches_inputs(stable) {
             if stored.completed {
                 return TemplateDeployAttempt::Refuse(format!(
@@ -394,7 +555,7 @@ fn attempt_without_listing(
     }
     if unreadable {
         return TemplateDeployAttempt::Refuse(format!(
-            "could not list deployments for `{}`, and the stored template deploy request is unreadable. A new deployment was not started. Retry when deployment status is available, or destroy the app and deploy again.",
+            "could not list deployments for `{}`, and the stored template deploy request is unreadable. A new deployment was not started. Retry when deployment status is available, or destroy the app and deploy again. Destroying the app removes the stored request.",
             stable.instance_name
         ));
     }
@@ -867,12 +1028,30 @@ mod tests {
         DeploymentListing::Listed(rows)
     }
 
+    fn current_app() -> CurrentTemplateApp {
+        CurrentTemplateApp {
+            id: "app-uuid".to_string(),
+            // Well before any stored attempt in these tests, so an id mismatch
+            // is not mistaken for a recreate.
+            created_at_unix: Some(NOW - 86_400),
+        }
+    }
+
     fn select(
         loaded: LoadedTemplateDeployAttempt,
         stable: &StableTemplateDeployInputs,
         deployments: &DeploymentListing,
     ) -> TemplateDeployAttempt {
-        select_template_deploy_attempt(loaded, stable, deployments, NOW)
+        select_for(loaded, stable, &current_app(), deployments)
+    }
+
+    fn select_for(
+        loaded: LoadedTemplateDeployAttempt,
+        stable: &StableTemplateDeployInputs,
+        current: &CurrentTemplateApp,
+        deployments: &DeploymentListing,
+    ) -> TemplateDeployAttempt {
+        select_template_deploy_attempt(loaded, stable, current, deployments, NOW)
     }
 
     fn record() -> NewTemplateDeployAttempt {
@@ -1064,7 +1243,7 @@ mod tests {
     }
 
     #[test]
-    fn app_id_flip_before_the_row_is_visible_still_replays() {
+    fn app_id_flip_before_the_row_is_visible_does_not_replay_or_sign_fresh() {
         let stable = stable();
         let mut stored = stored(&stable, "deploy-1");
         stored.app_id = "cap-app-uuid".to_string();
@@ -1073,10 +1252,92 @@ mod tests {
             &stable,
             &listed(vec![]),
         );
+        let TemplateDeployAttempt::Refuse(message) = attempt else {
+            panic!("an unproven app id change must not replay the old descriptor or sign fresh");
+        };
+        assert!(message.contains("cap-app-uuid"), "{message}");
+        assert!(message.contains("was not sent"), "{message}");
+        assert!(message.contains("was not started"), "{message}");
+    }
+
+    #[test]
+    fn app_id_flip_with_the_signed_deployment_in_flight_still_replays() {
+        let stable = stable();
+        let mut stored = stored(&stable, "deploy-1");
+        stored.app_id = "cap-app-uuid".to_string();
+        let attempt = select(
+            LoadedTemplateDeployAttempt::Ready(Box::new(stored)),
+            &stable,
+            &listed(vec![row("deploy-1", "applying", Some("applying"))]),
+        );
         assert!(
             matches!(attempt, TemplateDeployAttempt::Replay { .. }),
-            "a changed app id is not evidence the signed request settled"
+            "a live row for the signed deployment is an id transition, not a recreate"
         );
+    }
+
+    #[test]
+    fn recreated_app_does_not_replay_the_previous_descriptor() {
+        let stable = stable();
+        let current = CurrentTemplateApp {
+            id: "new-app-uuid".to_string(),
+            created_at_unix: Some(NOW + APP_RECREATE_SKEW_SECS + 1),
+        };
+        let attempt = select_for(
+            LoadedTemplateDeployAttempt::Ready(Box::new(stored(&stable, "deploy-1"))),
+            &stable,
+            &current,
+            &listed(vec![]),
+        );
+        assert!(
+            matches!(attempt, TemplateDeployAttempt::Fresh),
+            "a row created after the stored request must not replay the destroyed app's descriptor"
+        );
+        let during_outage = select_for(
+            LoadedTemplateDeployAttempt::Ready(Box::new(stored(&stable, "deploy-1"))),
+            &stable,
+            &current,
+            &DeploymentListing::Unavailable,
+        );
+        assert!(
+            matches!(during_outage, TemplateDeployAttempt::Fresh),
+            "a recreated app's first deploy must not be blocked by a list outage"
+        );
+    }
+
+    #[test]
+    fn recreated_app_within_clock_skew_does_not_replay() {
+        let stable = stable();
+        let current = CurrentTemplateApp {
+            id: "new-app-uuid".to_string(),
+            created_at_unix: Some(NOW + APP_RECREATE_SKEW_SECS),
+        };
+        let attempt = select_for(
+            LoadedTemplateDeployAttempt::Ready(Box::new(stored(&stable, "deploy-1"))),
+            &stable,
+            &current,
+            &listed(vec![]),
+        );
+        assert!(
+            matches!(attempt, TemplateDeployAttempt::Refuse(_)),
+            "a created_at inside the skew margin is not proof of a new row"
+        );
+    }
+
+    #[test]
+    fn same_app_id_replays_even_if_created_at_is_later() {
+        let stable = stable();
+        let current = CurrentTemplateApp {
+            id: "app-uuid".to_string(),
+            created_at_unix: Some(NOW + 86_400),
+        };
+        let attempt = select_for(
+            LoadedTemplateDeployAttempt::Ready(Box::new(stored(&stable, "deploy-1"))),
+            &stable,
+            &current,
+            &listed(vec![]),
+        );
+        assert!(matches!(attempt, TemplateDeployAttempt::Replay { .. }));
     }
 
     #[test]
@@ -1313,9 +1574,79 @@ mod tests {
         assert!(message.contains("deploy-2"), "{message}");
         assert!(message.contains("was not sent"), "{message}");
         assert!(
-            message.contains("once the in-flight deployment's id is visible"),
+            message.contains("another deployment is in flight"),
             "{message}"
         );
+    }
+
+    #[test]
+    fn stored_request_is_not_replayed_when_another_deployment_is_also_in_flight() {
+        let stable = stable();
+        let attempt = select(
+            LoadedTemplateDeployAttempt::Ready(Box::new(stored(&stable, "deploy-1"))),
+            &stable,
+            &listed(vec![
+                row("deploy-1", "applying", Some("applying")),
+                row("deploy-2", "pending", Some("pending")),
+            ]),
+        );
+        let TemplateDeployAttempt::Refuse(message) = attempt else {
+            panic!("a competing in-flight row must not replay the stored request");
+        };
+        assert!(message.contains("deploy-2"), "{message}");
+        assert!(message.contains("was not sent"), "{message}");
+        assert!(message.contains("was not started"), "{message}");
+    }
+
+    #[test]
+    fn resume_match_uses_the_stored_bootstrap_hash_not_the_catalog_hash() {
+        let stable = stable();
+        let catalog = Some("ff".repeat(32));
+        let loaded = LoadedTemplateDeployAttempt::Ready(Box::new(stored(&stable, "deploy-1")));
+        assert_eq!(
+            bootstrap_hash_for_resume_match(&loaded, catalog.clone()),
+            Some("ab".repeat(32))
+        );
+        let mut auto = stored(&stable, "deploy-1");
+        auto.bootstrap_pubkey_hash = None;
+        auto.workflow = Some(StoredTemplateWorkflow {
+            unlock_mode: "auto".to_string(),
+            paas_managed_config_keys: Vec::new(),
+        });
+        assert_eq!(
+            bootstrap_hash_for_resume_match(
+                &LoadedTemplateDeployAttempt::Ready(Box::new(auto)),
+                catalog.clone()
+            ),
+            None,
+            "an auto-mode stored request must not match a password-mode catalog hash"
+        );
+        assert_eq!(
+            bootstrap_hash_for_resume_match(&LoadedTemplateDeployAttempt::Absent, catalog.clone()),
+            catalog
+        );
+    }
+
+    #[test]
+    fn password_preflight_follows_the_stored_unlock_mode() {
+        let stable = stable();
+        let password = LoadedTemplateDeployAttempt::Ready(Box::new(stored(&stable, "deploy-1")));
+        assert!(resume_expects_password_preflight(&password, "auto"));
+        let mut auto = stored(&stable, "deploy-1");
+        auto.workflow = Some(StoredTemplateWorkflow {
+            unlock_mode: "auto".to_string(),
+            paas_managed_config_keys: Vec::new(),
+        });
+        let auto = LoadedTemplateDeployAttempt::Ready(Box::new(auto));
+        assert!(!resume_expects_password_preflight(&auto, "password"));
+        assert!(resume_expects_password_preflight(
+            &LoadedTemplateDeployAttempt::Absent,
+            "password"
+        ));
+        assert!(!resume_expects_password_preflight(
+            &LoadedTemplateDeployAttempt::Absent,
+            "auto"
+        ));
     }
 
     #[test]

@@ -610,6 +610,61 @@ fn destroy_failure_hint_covers_lane_conflicts_and_teardown_failures() {
 }
 
 #[test]
+fn destroy_removes_the_template_deploy_resume_file_for_that_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = CliPaths::from_root(dir.path().to_path_buf()).unwrap();
+    let cli_config = config::CliConfig {
+        api_url: "https://api.example".to_string(),
+        org: Some("beta".to_string()),
+        org_id: Some("org-1".to_string()),
+    };
+    let creds = config::Credentials {
+        active_org_id: Some("org-1".to_string()),
+        active_org_name: Some("acme".to_string()),
+        ..config::Credentials::default()
+    };
+    let origin = "https://api.example";
+    let scope = enclava_cli::template_deploy_retry::template_deploy_scope(
+        creds.active_org_id.as_deref(),
+        cli_config.org_id.as_deref(),
+        creds.active_org_name.as_deref(),
+        cli_config.org.as_deref(),
+        origin,
+    );
+    let request = CreateTemplateInstanceRequest {
+        template_slug: "debian-ssh-frp".to_string(),
+        instance_name: "shell".to_string(),
+        config: serde_json::json!({}),
+        bootstrap_pubkey_hash: None,
+        customer_descriptor_blob: Some("descriptor-a".to_string()),
+        org_keyring_blob: Some("keyring-a".to_string()),
+        signed_policy_artifact: Some("policy-a".to_string()),
+        customer_config_roll_hold_seconds: Some(600),
+    };
+    enclava_cli::template_deploy_retry::save_template_deploy_attempt(
+        &paths,
+        &scope,
+        "app-uuid",
+        "deploy-1",
+        &request,
+        &enclava_cli::template_deploy_retry::NewTemplateDeployAttempt {
+            unlock_mode: "password".to_string(),
+            paas_managed_config_keys: Vec::new(),
+            log_key_id: None,
+            log_private_key_file: None,
+        },
+    )
+    .unwrap();
+    forget_destroyed_app_template_deploy(&paths, &cli_config, &creds, origin, "shell").unwrap();
+    assert!(matches!(
+        enclava_cli::template_deploy_retry::load_template_deploy_attempt(&paths, &scope, "shell"),
+        enclava_cli::template_deploy_retry::LoadedTemplateDeployAttempt::Absent
+    ));
+    // A second destroy of an already-cleared name is not an error.
+    forget_destroyed_app_template_deploy(&paths, &cli_config, &creds, origin, "shell").unwrap();
+}
+
+#[test]
 fn deploy_accepts_storage_password_file_flag() {
     use clap::Parser as _;
 
