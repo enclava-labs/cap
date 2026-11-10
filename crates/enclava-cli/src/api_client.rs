@@ -11,6 +11,9 @@ use sha2::{Digest, Sha256};
 pub struct ApiClient {
     base_url: String,
     origin: String,
+    /// Scheme, host, port, and path. Resume files are scoped by this, not by
+    /// `origin`, so `https://host/v1` and `https://host/v2` do not share state.
+    api_base: String,
     http: reqwest::Client,
     auth_token: Option<String>,
     org_hint: Option<String>,
@@ -54,10 +57,12 @@ impl ApiClient {
             .filter(|url| url.host().is_some())
             .map(|url| url.origin().ascii_serialization())
             .unwrap_or_else(|| base_url.clone());
+        let api_base = normalized_api_base(&base_url);
 
         Self {
             base_url,
             origin,
+            api_base,
             http,
             auth_token,
             org_hint: None,
@@ -68,6 +73,14 @@ impl ApiClient {
     /// state such as the platform-release baseline.
     pub fn origin(&self) -> &str {
         &self.origin
+    }
+
+    /// Normalized API base (scheme, host, port, and path) this client actually
+    /// calls. Unlike [`origin`](Self::origin), a discovered base path such as
+    /// `https://host/v1` is kept. Template-deploy resume state is scoped by
+    /// this so two APIs on one host cannot replay each other's signed request.
+    pub fn api_base(&self) -> &str {
+        &self.api_base
     }
 
     /// Create a client from CLI config and credentials.
@@ -1366,6 +1379,25 @@ mod tests {
     }
 }
 
+/// Scheme, host, port, and path, with the same host canonicalization as
+/// `origin()` (lowercase host, default ports omitted) plus the request path.
+/// A trailing slash is not part of the base. Unparseable input is returned
+/// unchanged so a client that could be constructed still has a stable key.
+fn normalized_api_base(base_url: &str) -> String {
+    let Ok(url) = reqwest::Url::parse(base_url) else {
+        return base_url.to_string();
+    };
+    if url.host().is_none() {
+        return base_url.to_string();
+    }
+    let mut normalized = url.origin().ascii_serialization();
+    let path = url.path().trim_end_matches('/');
+    if !path.is_empty() {
+        normalized.push_str(path);
+    }
+    normalized
+}
+
 /// True only for http URLs whose parsed host is exactly `localhost` or a
 /// loopback IP. Anything else — including https URLs and unparseable input —
 /// forces TLS.
@@ -1458,6 +1490,36 @@ mod loopback_tests {
         ] {
             assert!(!loopback_http_url(evil), "{evil}");
         }
+    }
+
+    #[test]
+    fn api_base_keeps_a_discovered_path_and_canonicalizes_the_origin() {
+        for (configured, expected) in [
+            ("https://EXAMPLE.com:443/", "https://example.com"),
+            ("https://example.com", "https://example.com"),
+            ("https://example.com/v1", "https://example.com/v1"),
+            ("https://example.com/v1/", "https://example.com/v1"),
+            (
+                "https://example.com:8443/api",
+                "https://example.com:8443/api",
+            ),
+        ] {
+            assert_eq!(
+                ApiClient::new(configured, None).api_base(),
+                expected,
+                "{configured}"
+            );
+        }
+        assert_ne!(
+            ApiClient::new("https://host.example/v1", None).api_base(),
+            ApiClient::new("https://host.example/v2", None).api_base(),
+            "two base paths on one host must not share resume state"
+        );
+        assert_eq!(
+            ApiClient::new("https://example.com", None).api_base(),
+            ApiClient::new("https://example.com", None).origin(),
+            "a path-less base stays equal to the origin so existing resume files still match"
+        );
     }
 
     #[test]

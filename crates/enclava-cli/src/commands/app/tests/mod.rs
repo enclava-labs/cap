@@ -623,13 +623,21 @@ fn destroy_removes_the_template_deploy_resume_file_for_that_name() {
         active_org_name: Some("acme".to_string()),
         ..config::Credentials::default()
     };
-    let origin = "https://api.example";
+    let origin = "https://api.example/v1";
+    let other = "https://api.example/v2";
     let scope = enclava_cli::template_deploy_retry::template_deploy_scope(
         creds.active_org_id.as_deref(),
         cli_config.org_id.as_deref(),
         creds.active_org_name.as_deref(),
         cli_config.org.as_deref(),
         origin,
+    );
+    let other_scope = enclava_cli::template_deploy_retry::template_deploy_scope(
+        creds.active_org_id.as_deref(),
+        cli_config.org_id.as_deref(),
+        creds.active_org_name.as_deref(),
+        cli_config.org.as_deref(),
+        other,
     );
     let request = CreateTemplateInstanceRequest {
         template_slug: "debian-ssh-frp".to_string(),
@@ -655,11 +663,36 @@ fn destroy_removes_the_template_deploy_resume_file_for_that_name() {
         },
     )
     .unwrap();
+    enclava_cli::template_deploy_retry::save_template_deploy_attempt(
+        &paths,
+        &other_scope,
+        "app-uuid",
+        "deploy-1",
+        &request,
+        &enclava_cli::template_deploy_retry::NewTemplateDeployAttempt {
+            unlock_mode: "password".to_string(),
+            paas_managed_config_keys: Vec::new(),
+            log_key_id: None,
+            log_private_key_file: None,
+        },
+    )
+    .unwrap();
     forget_destroyed_app_template_deploy(&paths, &cli_config, &creds, origin, "shell").unwrap();
     assert!(matches!(
         enclava_cli::template_deploy_retry::load_template_deploy_attempt(&paths, &scope, "shell"),
         enclava_cli::template_deploy_retry::LoadedTemplateDeployAttempt::Absent
     ));
+    assert!(
+        matches!(
+            enclava_cli::template_deploy_retry::load_template_deploy_attempt(
+                &paths,
+                &other_scope,
+                "shell"
+            ),
+            enclava_cli::template_deploy_retry::LoadedTemplateDeployAttempt::Ready(_)
+        ),
+        "destroying against one API base path must not clear another path's resume file"
+    );
     // A second destroy of an already-cleared name is not an error.
     forget_destroyed_app_template_deploy(&paths, &cli_config, &creds, origin, "shell").unwrap();
 }

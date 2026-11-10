@@ -190,18 +190,23 @@ pub struct TemplateDeployLock {
     _guard: crate::fslock::FileLockGuard,
 }
 
-/// Scope the on-disk attempt so two orgs (or two API origins) cannot resume
-/// each other's signed request for the same app name.
+/// Scope the on-disk attempt so two orgs, two API hosts, or two base paths
+/// on one host cannot resume each other's signed request for the same app name.
 ///
 /// `selected_org` is `CliConfig::org`, the name `X-Enclava-Org` actually
 /// sends. `org switch` updates that name and leaves the credential org id
 /// pointing at the previous login, so the id alone must not be the scope.
+///
+/// `api_base` is the normalized API base (`ApiClient::api_base`), including a
+/// discovered path such as `https://host/v1`. The field is still labeled
+/// `origin` so a path-less base keeps the same file as before this included
+/// the path. `https://host/v1` and `https://host/v2` must not share a file.
 pub fn template_deploy_scope(
     active_org_id: Option<&str>,
     config_org_id: Option<&str>,
     active_org_name: Option<&str>,
     selected_org: Option<&str>,
-    api_origin: &str,
+    api_base: &str,
 ) -> String {
     let org_id = [active_org_id, config_org_id]
         .into_iter()
@@ -215,10 +220,11 @@ pub fn template_deploy_scope(
         .map(str::trim)
         .find(|value| !value.is_empty())
         .unwrap_or("-");
-    // Origin is always part of the scope: two API URLs can share an org id.
-    // The selected name is always part of it too: a switch must not reuse the
-    // previous org's resume file just because the credential id is stale.
-    format!("org:{org_id}\nselected:{selected}\norigin:{api_origin}")
+    // The base is always part of the scope: two API URLs can share an org id,
+    // and two base paths on one host are different APIs. The selected name is
+    // always part of it too: a switch must not reuse the previous org's resume
+    // file just because the credential id is stale.
+    format!("org:{org_id}\nselected:{selected}\norigin:{api_base}")
 }
 
 pub fn unix_now() -> u64 {
@@ -276,39 +282,79 @@ fn stored_app_identity(
     StoredAppIdentity::Unproven
 }
 
-/// Hash to compare against a stored request.
+/// Whether the stored request was signed for password mode.
 ///
-/// `template_bootstrap_pubkey_hash` follows the catalog's current
-/// `unlock_mode`: password mode derives a key, other modes do not. Using that
-/// value in `matches_inputs` rejects the stored request before the replay
-/// branch can restore the signed unlock mode. Match the hash the stored
-/// request was signed with. A fresh sign still uses the catalog-derived hash.
-pub fn bootstrap_hash_for_resume_match(
-    loaded: &LoadedTemplateDeployAttempt,
-    catalog_derived: Option<String>,
-) -> Option<String> {
-    match loaded {
-        LoadedTemplateDeployAttempt::Ready(stored) => stored.bootstrap_pubkey_hash.clone(),
-        _ => catalog_derived,
-    }
-}
-
-/// Whether this run must satisfy password-mode gates before selection.
-///
-/// A stored request signed for a non-password unlock mode must not be blocked
-/// by the catalog's current mode. The replay branch restores the signed mode
-/// after selection. No stored workflow follows the catalog.
-pub fn resume_expects_password_preflight(
-    loaded: &LoadedTemplateDeployAttempt,
-    catalog_unlock_mode: &str,
-) -> bool {
+/// Files written before `workflow` existed are password mode only when they
+/// carry a bootstrap hash. Auto mode stores no hash.
+pub fn loaded_attempt_is_password(loaded: &LoadedTemplateDeployAttempt) -> bool {
     match loaded {
         LoadedTemplateDeployAttempt::Ready(stored) => stored
             .workflow
             .as_ref()
             .map(|workflow| workflow.unlock_mode == "password")
-            .unwrap_or(catalog_unlock_mode == "password"),
-        _ => catalog_unlock_mode == "password",
+            .unwrap_or(stored.bootstrap_pubkey_hash.is_some()),
+        _ => false,
+    }
+}
+
+/// Hash to compare against a stored request.
+///
+/// A catalog unlock-mode change must not reject a live replay: match the hash
+/// the request was signed with, and let the replay branch restore that mode.
+/// Password-to-password is different. That hash is derived from the local
+/// recovery seed. Substituting the stored hash would replay a descriptor
+/// after the seed rotated, while ownership claim uses the newly derived key.
+///
+/// `current_password_hash` is that derivation, computed without writing the
+/// bootstrap key. Pass it only when the catalog is password mode. `None`
+/// means it was not derived. A password stored request then does not match,
+/// so a missing or rotated seed cannot resume a descriptor it cannot claim.
+pub fn bootstrap_hash_for_resume_match(
+    loaded: &LoadedTemplateDeployAttempt,
+    catalog_unlock_mode: &str,
+    current_password_hash: Option<String>,
+) -> Option<String> {
+    let LoadedTemplateDeployAttempt::Ready(stored) = loaded else {
+        return current_password_hash;
+    };
+    if loaded_attempt_is_password(loaded) && catalog_unlock_mode == "password" {
+        current_password_hash
+    } else {
+        stored.bootstrap_pubkey_hash.clone()
+    }
+}
+
+/// Whether this attempt must satisfy password-mode gates.
+///
+/// A stored password workflow is not a gate by itself. Selection returns
+/// Fresh when that deployment is terminal, completed, or the template
+/// differs, and a fresh auto-mode deploy must not be rejected for a missing
+/// password. A replay uses the signed unlock mode. A fresh sign uses the
+/// catalog. A refusal deploys nothing.
+pub fn attempt_expects_password_preflight(
+    attempt: &TemplateDeployAttempt,
+    catalog_unlock_mode: &str,
+) -> bool {
+    match attempt {
+        TemplateDeployAttempt::Replay { workflow, .. } => workflow
+            .as_ref()
+            .is_some_and(|workflow| workflow.unlock_mode == "password"),
+        TemplateDeployAttempt::Fresh => catalog_unlock_mode == "password",
+        TemplateDeployAttempt::Refuse(_) => false,
+    }
+}
+
+/// Identity to pass selection when this name has no app.
+///
+/// An empty id cannot equal a stored app id: load rejects an empty id. The
+/// timestamp is the moment this command observed the absence. A stored
+/// request older than the recreate skew is a destroyed app and may sign
+/// fresh. A newer one is unproven: do not replay it, and do not replace it
+/// until it is listed or the replay window has passed.
+pub fn current_app_when_name_is_absent(now_unix: u64) -> CurrentTemplateApp {
+    CurrentTemplateApp {
+        id: String::new(),
+        created_at_unix: Some(now_unix),
     }
 }
 
@@ -758,6 +804,40 @@ pub fn acquire_template_deploy_lock(
     crate::fslock::acquire_file_lock(&path)
         .map(|guard| TemplateDeployLock { _guard: guard })
         .map_err(|err| lock_error(instance_name, &err))
+}
+
+/// Block until this app's template-deploy lock is free, without stalling the
+/// async runtime. `template deploy` and `app destroy` must share this lock:
+/// a destroy that clears the resume file while a deploy is between load and
+/// save, or between POST and the acceptance stamp, leaves a signed request
+/// for a deleted app or drops the state of an accepted one.
+pub async fn lock_template_deploy(
+    paths: &CliPaths,
+    scope: &str,
+    instance_name: &str,
+) -> Result<TemplateDeployLock, String> {
+    let paths_for_try = paths.clone();
+    let scope_for_try = scope.to_string();
+    let name_for_try = instance_name.to_string();
+    let immediate = tokio::task::spawn_blocking(move || {
+        try_acquire_template_deploy_lock(&paths_for_try, &scope_for_try, &name_for_try)
+    })
+    .await
+    .map_err(|err| format!("template deploy lock task failed: {err}"))??;
+    if let Some(guard) = immediate {
+        return Ok(guard);
+    }
+    eprintln!(
+        "another template deploy or destroy for `{instance_name}` is in progress on this machine; waiting for it"
+    );
+    let paths = paths.clone();
+    let scope = scope.to_string();
+    let instance_name = instance_name.to_string();
+    tokio::task::spawn_blocking(move || {
+        acquire_template_deploy_lock(&paths, &scope, &instance_name)
+    })
+    .await
+    .map_err(|err| format!("template deploy lock task failed: {err}"))?
 }
 
 fn lock_error(instance_name: &str, err: &std::io::Error) -> String {
@@ -1599,13 +1679,19 @@ mod tests {
     }
 
     #[test]
-    fn resume_match_uses_the_stored_bootstrap_hash_not_the_catalog_hash() {
+    fn resume_match_uses_the_derived_hash_when_both_sides_are_password() {
         let stable = stable();
-        let catalog = Some("ff".repeat(32));
+        let derived = Some("ff".repeat(32));
         let loaded = LoadedTemplateDeployAttempt::Ready(Box::new(stored(&stable, "deploy-1")));
         assert_eq!(
-            bootstrap_hash_for_resume_match(&loaded, catalog.clone()),
-            Some("ab".repeat(32))
+            bootstrap_hash_for_resume_match(&loaded, "password", derived.clone()),
+            derived,
+            "a rotated seed must not match the hash stored with the old descriptor"
+        );
+        assert_eq!(
+            bootstrap_hash_for_resume_match(&loaded, "auto", derived.clone()),
+            Some("ab".repeat(32)),
+            "a catalog mode change must keep the hash the request was signed with"
         );
         let mut auto = stored(&stable, "deploy-1");
         auto.bootstrap_pubkey_hash = None;
@@ -1616,37 +1702,114 @@ mod tests {
         assert_eq!(
             bootstrap_hash_for_resume_match(
                 &LoadedTemplateDeployAttempt::Ready(Box::new(auto)),
-                catalog.clone()
+                "password",
+                derived.clone()
             ),
             None,
             "an auto-mode stored request must not match a password-mode catalog hash"
         );
         assert_eq!(
-            bootstrap_hash_for_resume_match(&LoadedTemplateDeployAttempt::Absent, catalog.clone()),
-            catalog
+            bootstrap_hash_for_resume_match(
+                &LoadedTemplateDeployAttempt::Absent,
+                "password",
+                derived.clone()
+            ),
+            derived
         );
     }
 
     #[test]
-    fn password_preflight_follows_the_stored_unlock_mode() {
+    fn rotated_bootstrap_hash_does_not_replay_an_in_flight_request() {
         let stable = stable();
-        let password = LoadedTemplateDeployAttempt::Ready(Box::new(stored(&stable, "deploy-1")));
-        assert!(resume_expects_password_preflight(&password, "auto"));
-        let mut auto = stored(&stable, "deploy-1");
+        let mut rotated = stable.clone();
+        rotated.bootstrap_pubkey_hash = Some("cd".repeat(32));
+        let attempt = select(
+            LoadedTemplateDeployAttempt::Ready(Box::new(stored(&stable, "deploy-1"))),
+            &rotated,
+            &listed(vec![row("deploy-1", "applying", Some("applying"))]),
+        );
+        let TemplateDeployAttempt::Refuse(message) = attempt else {
+            panic!("a rotated bootstrap hash must not replay the stored descriptor");
+        };
+        assert!(message.contains("differ"), "{message}");
+        assert!(message.contains("still in flight"), "{message}");
+    }
+
+    #[test]
+    fn password_gates_follow_the_selected_attempt_not_the_stored_file() {
+        let stable = stable();
+        let mut finished = stored(&stable, "deploy-1");
+        finished.completed = true;
+        let fresh = select(
+            LoadedTemplateDeployAttempt::Ready(Box::new(finished)),
+            &stable,
+            &listed(vec![]),
+        );
+        assert!(matches!(fresh, TemplateDeployAttempt::Fresh));
+        assert!(
+            !attempt_expects_password_preflight(&fresh, "auto"),
+            "a finished password deploy must not block a fresh auto redeploy"
+        );
+        assert!(attempt_expects_password_preflight(&fresh, "password"));
+
+        let replay = select(
+            LoadedTemplateDeployAttempt::Ready(Box::new(stored(&stable, "deploy-1"))),
+            &stable,
+            &listed(vec![row("deploy-1", "applying", Some("applying"))]),
+        );
+        assert!(matches!(replay, TemplateDeployAttempt::Replay { .. }));
+        assert!(
+            attempt_expects_password_preflight(&replay, "auto"),
+            "a password replay still requires password gates when the catalog is auto"
+        );
+
+        let mut auto_stable = stable.clone();
+        auto_stable.bootstrap_pubkey_hash = None;
+        let mut auto = stored(&auto_stable, "deploy-1");
+        auto.bootstrap_pubkey_hash = None;
         auto.workflow = Some(StoredTemplateWorkflow {
             unlock_mode: "auto".to_string(),
             paas_managed_config_keys: Vec::new(),
         });
-        let auto = LoadedTemplateDeployAttempt::Ready(Box::new(auto));
-        assert!(!resume_expects_password_preflight(&auto, "password"));
-        assert!(resume_expects_password_preflight(
-            &LoadedTemplateDeployAttempt::Absent,
-            "password"
-        ));
-        assert!(!resume_expects_password_preflight(
-            &LoadedTemplateDeployAttempt::Absent,
-            "auto"
-        ));
+        let auto_replay = select(
+            LoadedTemplateDeployAttempt::Ready(Box::new(auto)),
+            &auto_stable,
+            &listed(vec![row("deploy-1", "applying", Some("applying"))]),
+        );
+        assert!(matches!(auto_replay, TemplateDeployAttempt::Replay { .. }));
+        assert!(
+            !attempt_expects_password_preflight(&auto_replay, "password"),
+            "an auto replay must not require password gates when the catalog is password"
+        );
+    }
+
+    #[test]
+    fn missing_app_does_not_replay_a_recent_stored_request_or_an_old_one() {
+        let stable = stable();
+        let recent = select_for(
+            LoadedTemplateDeployAttempt::Ready(Box::new(stored(&stable, "deploy-1"))),
+            &stable,
+            &current_app_when_name_is_absent(NOW),
+            &DeploymentListing::Unavailable,
+        );
+        let TemplateDeployAttempt::Refuse(message) = recent else {
+            panic!("a recent stored request must not be replayed or replaced when the app is gone");
+        };
+        assert!(message.contains("was not sent"), "{message}");
+        assert!(message.contains("was not started"), "{message}");
+
+        let mut old = stored(&stable, "deploy-1");
+        old.created_at_unix = NOW - 86_400;
+        let replaced = select_for(
+            LoadedTemplateDeployAttempt::Ready(Box::new(old)),
+            &stable,
+            &current_app_when_name_is_absent(NOW),
+            &DeploymentListing::Unavailable,
+        );
+        assert!(
+            matches!(replaced, TemplateDeployAttempt::Fresh),
+            "a stored request older than the recreate skew is a destroyed app"
+        );
     }
 
     #[test]
@@ -1842,6 +2005,11 @@ mod tests {
         assert_ne!(
             template_deploy_scope(Some("org-1"), None, None, None, "https://a.example"),
             template_deploy_scope(Some("org-1"), None, None, None, "https://b.example")
+        );
+        assert_ne!(
+            template_deploy_scope(Some("org-1"), None, None, None, "https://api.example/v1"),
+            template_deploy_scope(Some("org-1"), None, None, None, "https://api.example/v2"),
+            "two API base paths on one host must not share a resume file"
         );
         assert_eq!(
             template_deploy_scope(None, None, None, None, "https://api.example"),

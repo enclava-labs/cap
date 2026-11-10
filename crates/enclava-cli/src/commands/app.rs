@@ -3897,6 +3897,20 @@ pub async fn destroy(args: DestroyArgs) -> Result<(), Box<dyn std::error::Error>
         }
     }
 
+    let scope = enclava_cli::template_deploy_retry::template_deploy_scope(
+        creds.active_org_id.as_deref(),
+        cli_config.org_id.as_deref(),
+        creds.active_org_name.as_deref(),
+        cli_config.org.as_deref(),
+        api.api_base(),
+    );
+    // Same per-app lock as `template deploy`, held across deletion and resume
+    // cleanup. Without it a deploy can save a signed request for the app this
+    // command just deleted, or lose the acceptance stamp of a POST that
+    // already succeeded.
+    let _deploy_lock =
+        enclava_cli::template_deploy_retry::lock_template_deploy(&paths, &scope, &app_name).await?;
+
     let spinner = ProgressBar::new_spinner();
     spinner.set_style(ProgressStyle::default_spinner().template("{spinner:.red} {msg}")?);
     spinner.set_message(format!("Destroying {app_name}..."));
@@ -3923,7 +3937,7 @@ pub async fn destroy(args: DestroyArgs) -> Result<(), Box<dyn std::error::Error>
             &paths,
             &cli_config,
             &creds,
-            api.origin(),
+            api.api_base(),
             &app_name,
         )
         .map(|()| {
@@ -3937,7 +3951,7 @@ pub async fn destroy(args: DestroyArgs) -> Result<(), Box<dyn std::error::Error>
         .into());
     }
 
-    forget_destroyed_app_template_deploy(&paths, &cli_config, &creds, api.origin(), &app_name)
+    forget_destroyed_app_template_deploy(&paths, &cli_config, &creds, api.api_base(), &app_name)
         .map_err(|err| {
             format!(
                 "app '{app_name}' was destroyed, but the stored template deploy request could not be removed: {err}. Remove that file before deploying this name again."
@@ -3961,15 +3975,17 @@ pub(crate) mod tests;
 
 /// Drop the local template-deploy resume file after the named app is gone.
 ///
-/// The file is keyed by app name. Leaving it makes the next deploy of that
-/// name replay a descriptor signed for the destroyed app, or refuse forever
-/// when the file cannot be read. `app destroy` is the recovery those refusals
-/// document, so it has to remove the file.
+/// The file is keyed by app name and the normalized API base. Leaving it
+/// makes the next deploy of that name replay a descriptor signed for the
+/// destroyed app, or refuse forever when the file cannot be read. `app
+/// destroy` is the recovery those refusals document, so it has to remove the
+/// file. The caller holds the template-deploy lock for this name; clearing
+/// without that lock races a deploy that is about to save or stamp the file.
 fn forget_destroyed_app_template_deploy(
     paths: &CliPaths,
     cli_config: &config::CliConfig,
     creds: &config::Credentials,
-    api_origin: &str,
+    api_base: &str,
     app_name: &str,
 ) -> Result<(), String> {
     let scope = enclava_cli::template_deploy_retry::template_deploy_scope(
@@ -3977,7 +3993,7 @@ fn forget_destroyed_app_template_deploy(
         cli_config.org_id.as_deref(),
         creds.active_org_name.as_deref(),
         cli_config.org.as_deref(),
-        api_origin,
+        api_base,
     );
     enclava_cli::template_deploy_retry::clear_template_deploy_attempt(paths, &scope, app_name)
 }

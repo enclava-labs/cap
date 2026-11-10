@@ -37,9 +37,10 @@ use crate::commands::app::{
     deployment_bound_terminal_bootstrap_error,
     deployment_bound_terminal_bootstrap_error_on_channel, ensure_manual_deploy_keyring,
     fail_if_template_deployment_failed, fetch_verified_platform_release, generate_log_key_for_app,
-    reconcile_success_with_deployment_history, tee_supplemental_fields_are_consistent,
-    tee_terminal_diagnostic_probe_due, tee_unlock_state, terminal_bootstrap_failure_message,
-    terminal_diagnostic_budget, terminal_diagnostic_probe_with_budget,
+    reconcile_success_with_deployment_history, resolve_current_user_org,
+    tee_supplemental_fields_are_consistent, tee_terminal_diagnostic_probe_due, tee_unlock_state,
+    terminal_bootstrap_failure_message, terminal_diagnostic_budget,
+    terminal_diagnostic_probe_with_budget,
 };
 use crate::commands::config::CONFIG_APPLICATION_NOTE;
 use crate::commands::ownership::{MnemonicCapture, mnemonic_capture_from_flags};
@@ -420,29 +421,22 @@ async fn deploy_with_timings(
         ctx.cli_config.org_id.as_deref(),
         ctx.creds.active_org_name.as_deref(),
         ctx.cli_config.org.as_deref(),
-        api.origin(),
+        api.api_base(),
     );
     // Hold this until the command returns, including completion. Dropping it
     // after the POST lets a second invocation save a new attempt that this
     // command would then stamp completed.
-    let _deploy_lock = lock_template_deploy(&ctx.paths, &scope, &instance_name).await?;
+    let _deploy_lock = enclava_cli::template_deploy_retry::lock_template_deploy(
+        &ctx.paths,
+        &scope,
+        &instance_name,
+    )
+    .await?;
     let loaded = enclava_cli::template_deploy_retry::load_template_deploy_attempt(
         &ctx.paths,
         &scope,
         &instance_name,
     );
-    // Catalog unlock_mode can change while a deployment is in flight. Password
-    // gates follow the stored signed mode so an auto-to-password catalog flip
-    // does not block the resume, and a password resume still fails before any
-    // mutation when the password is unavailable.
-    let mut password_preflight_done = false;
-    if enclava_cli::template_deploy_retry::resume_expects_password_preflight(
-        &loaded,
-        &template.unlock_mode,
-    ) {
-        ensure_password_mode_preflight(api, &instance_name, &storage_password, capture).await?;
-        password_preflight_done = true;
-    }
     let pb = if args.json || args.timings {
         ProgressBar::hidden()
     } else {
@@ -457,21 +451,75 @@ async fn deploy_with_timings(
     // password and one-time recovery-mnemonic terminal prompts.
     pb.set_message("Preparing template app...");
 
-    let catalog_bootstrap_pubkey_hash =
-        template_bootstrap_pubkey_hash(api, &ctx.paths, &template, &instance_name).await?;
-    let app = ensure_template_app(
-        api,
-        &template,
-        &instance_name,
-        catalog_bootstrap_pubkey_hash.as_deref(),
-    )
-    .await?;
+    // Select before any catalog password work. Deriving a bootstrap key
+    // registers a keyring, requires a recovery seed, and overwrites the local
+    // key. An in-flight auto deploy must resume without that, and a rotated
+    // seed must not be written before we know the old descriptor will not be
+    // replayed.
+    let existing_app = match api.get_app(&instance_name).await {
+        Ok(app) => Some(app),
+        Err(ApiError::Api { status: 404, .. }) => None,
+        Err(error) => return Err(error.into()),
+    };
+    let deployments = if existing_app.is_some() {
+        match api.list_deployments(&instance_name).await {
+            Ok(entries) => enclava_cli::template_deploy_retry::DeploymentListing::Listed(
+                entries
+                    .into_iter()
+                    .map(
+                        |entry| enclava_cli::template_deploy_retry::ObservedTemplateDeployment {
+                            id: entry.id,
+                            status: entry.status,
+                            reconciled_status: entry.reconciled_status,
+                        },
+                    )
+                    .collect(),
+            ),
+            Err(ApiError::Api { status, .. }) => {
+                enclava_cli::template_deploy_retry::deployment_listing_for_list_error(
+                    &loaded,
+                    Some(status),
+                )
+            }
+            Err(_) => {
+                enclava_cli::template_deploy_retry::deployment_listing_for_list_error(&loaded, None)
+            }
+        }
+    } else {
+        // The name is gone. A 404 is not an empty history of a live app when
+        // a resume file exists; the selector already treats that as unavailable.
+        enclava_cli::template_deploy_retry::deployment_listing_for_list_error(&loaded, Some(404))
+    };
+    let peeked = if template.unlock_mode == "password"
+        && enclava_cli::template_deploy_retry::loaded_attempt_is_password(&loaded)
+    {
+        match peek_password_bootstrap_key(api, &ctx.paths, &instance_name).await {
+            Ok(peeked) => peeked,
+            Err(error) => {
+                return Err(format!(
+                    "could not compare the password bootstrap key with the stored template deploy request for `{instance_name}`: {error}. The stored request was not sent, and the local bootstrap key was not replaced."
+                )
+                .into());
+            }
+        }
+    } else {
+        None
+    };
+    let now_unix = enclava_cli::template_deploy_retry::unix_now();
+    let current_app = match &existing_app {
+        Some(app) => enclava_cli::template_deploy_retry::CurrentTemplateApp {
+            id: app.id.clone(),
+            created_at_unix: template_app_created_at_unix(&app.created_at),
+        },
+        None => enclava_cli::template_deploy_retry::current_app_when_name_is_absent(now_unix),
+    };
     // The hold budget is normalized so a retry *can* keep one idempotency key.
     // The signed blobs cannot: they embed a fresh deploy id and timestamp, so
     // the key is only stable if this run replays the request already signed
-    // for the in-flight deployment (cap#292). Matching uses the stored
-    // bootstrap hash: the catalog hash above follows the current unlock mode
-    // and would reject a live replay before the signed mode is restored.
+    // for the in-flight deployment (cap#292). A password-to-password retry
+    // matches the hash the current seed would derive, without saving that key.
+    // Any other stored request matches the hash it was signed with, so a
+    // catalog unlock-mode change does not reject a live replay.
     let roll_hold_seconds = customer_config_roll_hold_seconds(args.ssh_timeout_seconds);
     let stable = enclava_cli::template_deploy_retry::StableTemplateDeployInputs {
         template_slug: args.template.clone(),
@@ -479,42 +527,22 @@ async fn deploy_with_timings(
         config: template_create_config(explicit_stable_endpoint.as_deref()),
         bootstrap_pubkey_hash: enclava_cli::template_deploy_retry::bootstrap_hash_for_resume_match(
             &loaded,
-            catalog_bootstrap_pubkey_hash.clone(),
+            &template.unlock_mode,
+            peeked.as_ref().map(|peeked| peeked.hash.clone()),
         ),
-    };
-    let deployments = match api.list_deployments(&instance_name).await {
-        Ok(entries) => enclava_cli::template_deploy_retry::DeploymentListing::Listed(
-            entries
-                .into_iter()
-                .map(
-                    |entry| enclava_cli::template_deploy_retry::ObservedTemplateDeployment {
-                        id: entry.id,
-                        status: entry.status,
-                        reconciled_status: entry.reconciled_status,
-                    },
-                )
-                .collect(),
-        ),
-        Err(ApiError::Api { status, .. }) => {
-            enclava_cli::template_deploy_retry::deployment_listing_for_list_error(
-                &loaded,
-                Some(status),
-            )
-        }
-        Err(_) => {
-            enclava_cli::template_deploy_retry::deployment_listing_for_list_error(&loaded, None)
-        }
     };
     let attempt = enclava_cli::template_deploy_retry::select_template_deploy_attempt(
         loaded,
         &stable,
-        &enclava_cli::template_deploy_retry::CurrentTemplateApp {
-            id: app.id.clone(),
-            created_at_unix: template_app_created_at_unix(&app.created_at),
-        },
+        &current_app,
         &deployments,
-        enclava_cli::template_deploy_retry::unix_now(),
+        now_unix,
     );
+    let expects_password_preflight =
+        enclava_cli::template_deploy_retry::attempt_expects_password_preflight(
+            &attempt,
+            &template.unlock_mode,
+        );
     let output_log_key: Option<OutputLogKey>;
     let mut resume_unlock_mode: Option<String> = None;
     let mut resume_managed_keys: Option<Vec<String>> = None;
@@ -541,12 +569,24 @@ async fn deploy_with_timings(
                         "stored template deploy request could not be read ({err}); destroy the app before deploying again"
                     )
                 })?;
-            if signed_unlock == "password" {
-                storage_password
-                    .ensure_available_for_password_mode("password-mode template deploy")?;
-                if capture == MnemonicCapture::Skip {
-                    crate::commands::ownership::validate_recovery_mnemonic_sink_mode(capture)?;
+            if signed_unlock == "password" || expects_password_preflight {
+                // Replay is confirmed. Restore the key the descriptor was
+                // signed with when this seed still derives it, so a previous
+                // overwrite cannot make ownership claim use a different key.
+                // Do not write a key that does not match the descriptor.
+                if signed_unlock == "password"
+                    && let Some(peeked) = peeked.as_ref()
+                    && request.bootstrap_pubkey_hash.as_deref() == Some(peeked.hash.as_str())
+                {
+                    config::save_bootstrap_key(
+                        &ctx.paths,
+                        &peeked.org_name,
+                        &instance_name,
+                        &peeked.private_key_hex,
+                    )?;
                 }
+                ensure_password_mode_preflight(api, &instance_name, &storage_password, capture)
+                    .await?;
             }
             // The signed descriptor is what the platform accepted. Catalog
             // `unlock_mode` fetched on this retry must not skip the ownership
@@ -560,10 +600,31 @@ async fn deploy_with_timings(
             (trusted, request)
         }
         enclava_cli::template_deploy_retry::TemplateDeployAttempt::Fresh => {
-            if template.unlock_mode == "password" && !password_preflight_done {
+            // Gates follow this fresh sign, not a finished password file.
+            // Preflight runs before the key write and before app creation.
+            if expects_password_preflight {
                 ensure_password_mode_preflight(api, &instance_name, &storage_password, capture)
                     .await?;
             }
+            let app = match existing_app {
+                Some(app) => app,
+                None => {
+                    fresh_app_after_absence(
+                        api,
+                        &ctx.paths,
+                        &template,
+                        &instance_name,
+                        &scope,
+                        &stable,
+                    )
+                    .await?
+                }
+            };
+            // The app's history was selected as Fresh. Saving the bootstrap
+            // key now cannot overwrite the key of a descriptor we are about
+            // to replay.
+            let catalog_bootstrap_pubkey_hash =
+                template_bootstrap_pubkey_hash(api, &ctx.paths, &template, &instance_name).await?;
             let prepared_log_key = prepare_template_log_key(
                 api,
                 &ctx.paths,
@@ -1011,44 +1072,6 @@ struct OutputLogKey {
     private_key_file: Option<PathBuf>,
 }
 
-async fn lock_template_deploy(
-    paths: &CliPaths,
-    scope: &str,
-    instance_name: &str,
-) -> Result<enclava_cli::template_deploy_retry::TemplateDeployLock, Box<dyn std::error::Error>> {
-    let paths_for_try = paths.clone();
-    let scope_for_try = scope.to_string();
-    let name_for_try = instance_name.to_string();
-    let immediate = tokio::task::spawn_blocking(move || {
-        enclava_cli::template_deploy_retry::try_acquire_template_deploy_lock(
-            &paths_for_try,
-            &scope_for_try,
-            &name_for_try,
-        )
-    })
-    .await
-    .map_err(|err| format!("template deploy lock task failed: {err}"))??;
-    if let Some(guard) = immediate {
-        return Ok(guard);
-    }
-    eprintln!(
-        "another template deploy for `{instance_name}` is in progress on this machine; waiting for it before signing or posting"
-    );
-    let paths = paths.clone();
-    let scope = scope.to_string();
-    let instance_name = instance_name.to_string();
-    tokio::task::spawn_blocking(move || {
-        enclava_cli::template_deploy_retry::acquire_template_deploy_lock(
-            &paths,
-            &scope,
-            &instance_name,
-        )
-    })
-    .await
-    .map_err(|err| format!("template deploy lock task failed: {err}"))?
-    .map_err(|err| -> Box<dyn std::error::Error> { err.into() })
-}
-
 struct PreparedTemplateLogKey {
     config: enclava_engine::types::LogEncryptionConfig,
     private_key_file: Option<PathBuf>,
@@ -1432,6 +1455,90 @@ fn template_app_created_at_unix(created_at: &str) -> Option<u64> {
         .and_then(|parsed| u64::try_from(parsed.timestamp()).ok())
 }
 
+/// The name was absent when selection returned Fresh. Create it, then select
+/// again: a 409 can return an app that appeared in between, and signing
+/// against that history without looking would start a second deployment.
+///
+/// Password bootstrap state is not written here. The caller saves the key
+/// only after this returns, which is only when the second selection is Fresh.
+async fn fresh_app_after_absence(
+    api: &ApiClient,
+    paths: &CliPaths,
+    template: &HostedTemplate,
+    instance_name: &str,
+    scope: &str,
+    stable: &enclava_cli::template_deploy_retry::StableTemplateDeployInputs,
+) -> Result<AppResponse, Box<dyn std::error::Error>> {
+    let app = match api.get_app(instance_name).await {
+        Ok(app) => app,
+        Err(ApiError::Api { status: 404, .. }) => {
+            // Still gone. A password create needs the hash, but the key file
+            // stays untouched until the caller knows this sign is fresh.
+            let hash = if template.unlock_mode == "password" {
+                Some(
+                    derive_template_bootstrap_key(api, paths, instance_name)
+                        .await?
+                        .hash,
+                )
+            } else {
+                None
+            };
+            ensure_template_app(api, template, instance_name, hash.as_deref()).await?
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let loaded = enclava_cli::template_deploy_retry::load_template_deploy_attempt(
+        paths,
+        scope,
+        instance_name,
+    );
+    let deployments = match api.list_deployments(instance_name).await {
+        Ok(entries) => enclava_cli::template_deploy_retry::DeploymentListing::Listed(
+            entries
+                .into_iter()
+                .map(
+                    |entry| enclava_cli::template_deploy_retry::ObservedTemplateDeployment {
+                        id: entry.id,
+                        status: entry.status,
+                        reconciled_status: entry.reconciled_status,
+                    },
+                )
+                .collect(),
+        ),
+        Err(ApiError::Api { status, .. }) => {
+            enclava_cli::template_deploy_retry::deployment_listing_for_list_error(
+                &loaded,
+                Some(status),
+            )
+        }
+        Err(_) => {
+            enclava_cli::template_deploy_retry::deployment_listing_for_list_error(&loaded, None)
+        }
+    };
+    let again = enclava_cli::template_deploy_retry::select_template_deploy_attempt(
+        loaded,
+        stable,
+        &enclava_cli::template_deploy_retry::CurrentTemplateApp {
+            id: app.id.clone(),
+            created_at_unix: template_app_created_at_unix(&app.created_at),
+        },
+        &deployments,
+        enclava_cli::template_deploy_retry::unix_now(),
+    );
+    match again {
+        enclava_cli::template_deploy_retry::TemplateDeployAttempt::Fresh => Ok(app),
+        enclava_cli::template_deploy_retry::TemplateDeployAttempt::Refuse(message) => {
+            Err(message.into())
+        }
+        enclava_cli::template_deploy_retry::TemplateDeployAttempt::Replay { .. } => Err(
+            format!(
+                "the app `{instance_name}` appeared while this deploy was starting and already has a deployment to resume. A new deployment was not started, and the local bootstrap key was not replaced. Retry this command to resume it."
+            )
+            .into(),
+        ),
+    }
+}
+
 async fn ensure_template_app(
     api: &ApiClient,
     template: &HostedTemplate,
@@ -1514,6 +1621,52 @@ fn template_create_app_request(
     })
 }
 
+struct PeekedBootstrapKey {
+    hash: String,
+    private_key_hex: String,
+    org_name: String,
+}
+
+/// Hash the current recovery seed would derive, without creating a seed,
+/// registering a keyring, or writing the bootstrap key.
+///
+/// `None` means there is no seed. That must not be treated as a match against
+/// a stored password hash, and it must not mint a new seed before selection
+/// decides whether the old descriptor will be replayed.
+async fn peek_password_bootstrap_key(
+    api: &ApiClient,
+    paths: &CliPaths,
+    instance_name: &str,
+) -> Result<Option<PeekedBootstrapKey>, Box<dyn std::error::Error>> {
+    let Some(seed) = keys::load_recovery_seed(paths)? else {
+        return Ok(None);
+    };
+    let active = resolve_current_user_org(api).await?;
+    let app_seed = keys::derive_app_bootstrap_seed(active.org_id, instance_name, &seed)?;
+    let signing_key = SigningKey::from_bytes(&app_seed);
+    Ok(Some(PeekedBootstrapKey {
+        hash: hex::encode(Sha256::digest(signing_key.verifying_key().to_bytes())),
+        private_key_hex: hex::encode(app_seed),
+        org_name: active.org_name,
+    }))
+}
+
+async fn derive_template_bootstrap_key(
+    api: &ApiClient,
+    paths: &CliPaths,
+    instance_name: &str,
+) -> Result<PeekedBootstrapKey, Box<dyn std::error::Error>> {
+    let (org_id, org_name, _) = ensure_manual_deploy_keyring(api, paths, false).await?;
+    let seed = keys::load_or_create_recovery_seed(paths)?;
+    let app_seed = keys::derive_app_bootstrap_seed(org_id, instance_name, &seed)?;
+    let signing_key = SigningKey::from_bytes(&app_seed);
+    Ok(PeekedBootstrapKey {
+        hash: hex::encode(Sha256::digest(signing_key.verifying_key().to_bytes())),
+        private_key_hex: hex::encode(app_seed),
+        org_name,
+    })
+}
+
 async fn template_bootstrap_pubkey_hash(
     api: &ApiClient,
     paths: &CliPaths,
@@ -1523,13 +1676,14 @@ async fn template_bootstrap_pubkey_hash(
     if template.unlock_mode != "password" {
         return Ok(None);
     }
-    let (org_id, org_name, _) = ensure_manual_deploy_keyring(api, paths, false).await?;
-    let seed = keys::load_or_create_recovery_seed(paths)?;
-    let app_seed = keys::derive_app_bootstrap_seed(org_id, instance_name, &seed)?;
-    let signing_key = SigningKey::from_bytes(&app_seed);
-    let public_key_hash = hex::encode(Sha256::digest(signing_key.verifying_key().to_bytes()));
-    config::save_bootstrap_key(paths, &org_name, instance_name, &hex::encode(app_seed))?;
-    Ok(Some(public_key_hash))
+    let derived = derive_template_bootstrap_key(api, paths, instance_name).await?;
+    config::save_bootstrap_key(
+        paths,
+        &derived.org_name,
+        instance_name,
+        &derived.private_key_hex,
+    )?;
+    Ok(Some(derived.hash))
 }
 
 fn template_app_config(template: &HostedTemplate, instance_name: &str) -> AppConfig {
