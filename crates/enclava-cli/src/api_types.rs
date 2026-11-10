@@ -366,7 +366,7 @@ pub struct HostedTemplateConfigValidation {
     pub allowed_algorithms: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CreateTemplateInstanceRequest {
     pub template_slug: String,
     pub instance_name: String,
@@ -1093,6 +1093,10 @@ pub struct DeploymentEntry {
     pub template_expected: TemplateExpected,
     pub created_at: String,
     pub completed_at: Option<String>,
+    /// Stored deployment-row status, when the server sends it. Distinct from
+    /// `status`, which may be a freshness projection (`stale`, `partial`).
+    #[serde(default)]
+    pub reconciled_status: Option<String>,
 }
 
 // --- Orgs ---
@@ -1221,6 +1225,12 @@ pub struct ApiErrorBody {
     pub held_by: Option<String>,
     #[serde(default)]
     pub retry_after: Option<i64>,
+    /// CAP/PaaS idempotency completion stamp. `completed` means this key is
+    /// consumed for the replay window; `deferred` means retry the same key.
+    /// Absent on pre-handler and legacy bodies. PaaS keeps only those two
+    /// values; anything else is ignored by the client.
+    #[serde(default)]
+    pub idempotency_disposition: Option<String>,
 }
 
 #[cfg(test)]

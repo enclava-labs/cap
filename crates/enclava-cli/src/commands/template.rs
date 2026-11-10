@@ -460,74 +460,169 @@ async fn deploy_with_timings(
         bootstrap_pubkey_hash.as_deref(),
     )
     .await?;
-    let prepared_log_key = prepare_template_log_key(
-        api,
+    // The hold budget is normalized so a retry *can* keep one idempotency key.
+    // The signed blobs cannot: they embed a fresh deploy id and timestamp, so
+    // the key is only stable if this run replays the request already signed
+    // for the in-flight deployment (cap#292).
+    let roll_hold_seconds = customer_config_roll_hold_seconds(args.ssh_timeout_seconds);
+    let stable = enclava_cli::template_deploy_retry::StableTemplateDeployInputs {
+        template_slug: args.template.clone(),
+        instance_name: instance_name.clone(),
+        config: template_create_config(explicit_stable_endpoint.as_deref()),
+        bootstrap_pubkey_hash: bootstrap_pubkey_hash.clone(),
+    };
+    let scope = enclava_cli::template_deploy_retry::template_deploy_scope(
+        ctx.creds.active_org_id.as_deref(),
+        ctx.cli_config.org_id.as_deref(),
+        ctx.creds.active_org_name.as_deref(),
+        api.origin(),
+    );
+    let loaded = enclava_cli::template_deploy_retry::load_template_deploy_attempt(
         &ctx.paths,
+        &scope,
         &instance_name,
-        args.log_key.as_deref(),
-        args.generate_log_key.as_deref(),
-        args.log_private_key_file.clone(),
-        &pb,
-    )
-    .await?;
-    pb.set_position(1);
-    pb.set_message("Signing deployment descriptor...");
-
-    let app_config = template_app_config(template, &instance_name);
-    let workload_security_profile = template_workload_security_profile(template)?;
-    let signed_blobs = build_signed_deploy_blobs(SignedDeployBlobParams {
-        api,
-        paths: &ctx.paths,
-        cli_config: &ctx.cli_config,
-        creds: &ctx.creds,
-        app: &app,
-        app_config: &app_config,
-        image: &template.image,
-        target_unlock_mode: Some(template.unlock_mode.as_str()),
-        workload_security_profile,
-    })
-    .await?;
-    verify_signed_template_log_key(
-        prepared_log_key.as_ref(),
-        signed_blobs.log_encryption.as_ref(),
-    )?;
-    // Locally trusted deployment identity, captured before the signed blobs
-    // are moved into the template instance request.
-    let trusted_deployment = signed_blobs.deployment.clone();
+    );
+    let deployments = match api.list_deployments(&instance_name).await {
+        Ok(entries) => enclava_cli::template_deploy_retry::DeploymentListing::Listed(
+            entries
+                .into_iter()
+                .map(
+                    |entry| enclava_cli::template_deploy_retry::ObservedTemplateDeployment {
+                        id: entry.id,
+                        status: entry.status,
+                        reconciled_status: entry.reconciled_status,
+                    },
+                )
+                .collect(),
+        ),
+        Err(ApiError::Api { status, .. }) => {
+            enclava_cli::template_deploy_retry::deployment_listing_for_list_error(
+                &loaded,
+                Some(status),
+            )
+        }
+        Err(_) => {
+            enclava_cli::template_deploy_retry::deployment_listing_for_list_error(&loaded, None)
+        }
+    };
+    let attempt = enclava_cli::template_deploy_retry::select_template_deploy_attempt(
+        loaded,
+        &stable,
+        &app.id,
+        &deployments,
+    );
+    let (prepared_log_key, trusted_deployment, request) = match attempt {
+        enclava_cli::template_deploy_retry::TemplateDeployAttempt::Refuse(message) => {
+            return Err(message.into());
+        }
+        enclava_cli::template_deploy_retry::TemplateDeployAttempt::Replay {
+            request,
+            deploy_id,
+        } => {
+            pb.set_position(1);
+            pb.set_message("Resuming in-flight template deployment...");
+            let trusted = trusted_deployment_for_resumed_request(&request, &deploy_id)?;
+            (None, trusted, request)
+        }
+        enclava_cli::template_deploy_retry::TemplateDeployAttempt::Fresh => {
+            let prepared_log_key = prepare_template_log_key(
+                api,
+                &ctx.paths,
+                &instance_name,
+                args.log_key.as_deref(),
+                args.generate_log_key.as_deref(),
+                args.log_private_key_file.clone(),
+                &pb,
+            )
+            .await?;
+            pb.set_position(1);
+            pb.set_message("Signing deployment descriptor...");
+            let app_config = template_app_config(template, &instance_name);
+            let workload_security_profile = template_workload_security_profile(template)?;
+            let signed_blobs = build_signed_deploy_blobs(SignedDeployBlobParams {
+                api,
+                paths: &ctx.paths,
+                cli_config: &ctx.cli_config,
+                creds: &ctx.creds,
+                app: &app,
+                app_config: &app_config,
+                image: &template.image,
+                target_unlock_mode: Some(template.unlock_mode.as_str()),
+                workload_security_profile,
+            })
+            .await?;
+            verify_signed_template_log_key(
+                prepared_log_key.as_ref(),
+                signed_blobs.log_encryption.as_ref(),
+            )?;
+            // Locally trusted deployment identity, captured before the signed
+            // blobs are moved into the template instance request.
+            let trusted_deployment = signed_blobs.deployment.clone();
+            let request = CreateTemplateInstanceRequest {
+                template_slug: stable.template_slug.clone(),
+                instance_name: stable.instance_name.clone(),
+                config: stable.config.clone(),
+                bootstrap_pubkey_hash: stable.bootstrap_pubkey_hash.clone(),
+                customer_descriptor_blob: Some(signed_blobs.customer_descriptor_blob),
+                org_keyring_blob: Some(signed_blobs.org_keyring_blob),
+                signed_policy_artifact: Some(signed_blobs.signed_policy_artifact),
+                customer_config_roll_hold_seconds: Some(roll_hold_seconds),
+            };
+            // Persist before the POST so a client death during the request
+            // retries the same bytes instead of signing a second deployment.
+            enclava_cli::template_deploy_retry::save_template_deploy_attempt(
+                &ctx.paths,
+                &scope,
+                &app.id,
+                &trusted_deployment.deploy_id,
+                &request,
+            )
+            .map_err(|err| -> Box<dyn std::error::Error> { err.into() })?;
+            (prepared_log_key, trusted_deployment, request)
+        }
+    };
     pb.set_position(2);
     pb.set_message("Creating template instance...");
 
-    // Always request the normalized hold so the idempotency key stays stable
-    // across a first-deploy retry: this run may have created the app above,
-    // so gating the request on the app existing would change the key on the
-    // retry. CAP applies the hold only when a live workload is being
-    // replaced and reports that in the response.
-    let roll_hold_seconds = customer_config_roll_hold_seconds(args.ssh_timeout_seconds);
     // CAP arms the hold when it accepts the request below. The deadline
     // anchor starts here, not at deploy_started, so preflight time above
     // (discovery, app creation, key preparation, signing) does not consume
     // the hold. The server-quoted remainder is anchored at this instant:
     // CAP measured it after the request was sent, so anchoring at send can
-    // only shorten the window, never extend it.
+    // only shorten the window, never extend it. A replayed response carries
+    // the original remaining time, so this anchor does not extend that hold.
     let hold_armed_at = Instant::now();
+    let sent_hold_seconds = request
+        .customer_config_roll_hold_seconds
+        .unwrap_or(roll_hold_seconds);
     let response = match timings
         .run(
             DeployPhase::DeployRequest,
-            api.create_template_instance(&CreateTemplateInstanceRequest {
-                template_slug: args.template.clone(),
-                instance_name: instance_name.clone(),
-                config: template_create_config(explicit_stable_endpoint.as_deref()),
-                bootstrap_pubkey_hash: bootstrap_pubkey_hash.clone(),
-                customer_descriptor_blob: Some(signed_blobs.customer_descriptor_blob),
-                org_keyring_blob: Some(signed_blobs.org_keyring_blob),
-                signed_policy_artifact: Some(signed_blobs.signed_policy_artifact),
-                customer_config_roll_hold_seconds: Some(roll_hold_seconds),
-            }),
+            api.create_template_instance(&request),
         )
         .await
     {
         Ok(response) => response,
-        Err(error) => return Err(template_instance_create_api_error(error)),
+        Err(error) => {
+            // A completed rejection is stored server-side under this key for
+            // the replay window. Drop the local copy so the next attempt can
+            // sign a new key once the deployment is no longer in flight.
+            if enclava_cli::template_deploy_retry::template_instance_rejection_retires_attempt(
+                &error,
+            ) && let Err(clear_error) =
+                enclava_cli::template_deploy_retry::clear_template_deploy_attempt(
+                    &ctx.paths,
+                    &scope,
+                    &instance_name,
+                )
+            {
+                return Err(format!(
+                    "{error}; also failed to discard the stored template deploy request, so the next retry may replay this rejection: {clear_error}"
+                )
+                .into());
+            }
+            return Err(template_instance_create_api_error(error));
+        }
     };
     let stable_endpoint = stored_stable_endpoint_from_template_instance_response(
         &response,
@@ -562,7 +657,7 @@ async fn deploy_with_timings(
                 customer_config_hold_remaining_ms,
                 response.customer_config_hold_until.as_deref(),
                 hold_armed_at,
-                roll_hold_seconds,
+                sent_hold_seconds,
             )
         })
         .transpose()?;
@@ -830,6 +925,12 @@ async fn deploy_with_timings(
             format_duration(deploy_started.elapsed())
         );
     }
+    enclava_cli::template_deploy_retry::mark_template_deploy_attempt_completed(
+        &ctx.paths,
+        &scope,
+        &instance_name,
+    )
+    .map_err(|err| -> Box<dyn std::error::Error> { err.into() })?;
     Ok(())
 }
 
@@ -1215,10 +1316,12 @@ async fn ensure_template_app(
                     status,
                     code,
                     message,
+                    idempotency_disposition,
                 } => ApiError::Api {
                     status,
                     code,
                     message: format!("{message} (earlier create attempt: {error})"),
+                    idempotency_disposition,
                 }
                 .into(),
                 other => format!("{other} (earlier create attempt: {error})").into(),
@@ -4106,6 +4209,30 @@ fn paas_ssh_command_api_error(error: ApiError) -> Box<dyn std::error::Error> {
     }
 }
 
+fn trusted_deployment_for_resumed_request(
+    request: &CreateTemplateInstanceRequest,
+    deploy_id: &str,
+) -> Result<enclava_cli::descriptor::TrustedDeploymentExpectation, Box<dyn std::error::Error>> {
+    let blob = request.customer_descriptor_blob.as_deref().ok_or(
+        "stored template deploy request is missing its signed descriptor; destroy the app before deploying again",
+    )?;
+    let trusted =
+        enclava_cli::descriptor::trusted_deployment_expectation_from_descriptor_blob(blob).map_err(
+            |err| {
+                format!(
+                    "stored template deploy request could not be read ({err}); destroy the app before deploying again"
+                )
+            },
+        )?;
+    if trusted.deploy_id != deploy_id {
+        return Err(
+            "stored template deploy request does not match its signed descriptor; destroy the app before deploying again"
+                .into(),
+        );
+    }
+    Ok(trusted)
+}
+
 fn template_instance_create_api_error(error: ApiError) -> Box<dyn std::error::Error> {
     if let Some(message) = stable_ssh_managed_ngrok_setup_error_message(&error) {
         message.into()
@@ -6557,6 +6684,7 @@ mod tests {
             status,
             code: code.map(str::to_string),
             message: "test error".to_string(),
+            idempotency_disposition: None,
         };
         let endpoint_retries =
             |status, code| should_retry_template_bootstrap_endpoint_error(&api_error(status, code));
@@ -6820,6 +6948,7 @@ mod tests {
                 status,
                 code: None,
                 message: "temporary".to_string(),
+                idempotency_disposition: None,
             }));
         }
 
@@ -6828,24 +6957,28 @@ mod tests {
                 status,
                 code: None,
                 message: "permanent".to_string(),
+                idempotency_disposition: None,
             }));
         }
         assert!(!should_retry_paas_ssh_command_error(&ApiError::Api {
             status: 502,
             code: Some("cap_response_invalid".to_string()),
             message: "CAP app response included an invalid app domain".to_string(),
+            idempotency_disposition: None,
         }));
         assert!(!should_retry_paas_ssh_command_error(&ApiError::Api {
             status: 502,
             code: Some("stable_ssh_endpoint_missing".to_string()),
             message: "Hosted Debian SSH app is missing its stored stable SSH endpoint expectation"
                 .to_string(),
+            idempotency_disposition: None,
         }));
         assert!(!should_retry_paas_ssh_command_error(&ApiError::Api {
             status: 502,
             code: Some("stable_ssh_endpoint_invalid".to_string()),
             message: "Hosted Debian SSH app has invalid stored stable SSH endpoint expectation"
                 .to_string(),
+            idempotency_disposition: None,
         }));
         assert!(!should_retry_paas_ssh_command_error(
             &ApiError::NotAuthenticated
@@ -6858,6 +6991,7 @@ mod tests {
             status: 502,
             code: Some("stable_ssh_endpoint_missing".to_string()),
             message: "stored endpoint missing".to_string(),
+            idempotency_disposition: None,
         })
         .unwrap();
         assert!(missing.contains("Stable SSH endpoint metadata is missing"));
@@ -6867,6 +7001,7 @@ mod tests {
             status: 502,
             code: Some("stable_ssh_endpoint_invalid".to_string()),
             message: "stored endpoint invalid".to_string(),
+            idempotency_disposition: None,
         })
         .unwrap();
         assert!(invalid.contains("Stable SSH endpoint metadata is invalid"));
@@ -6876,6 +7011,7 @@ mod tests {
             status: 502,
             code: Some("cap_response_invalid".to_string()),
             message: "CAP app /ssh.txt returned an invalid stable SSH endpoint command".to_string(),
+            idempotency_disposition: None,
         })
         .unwrap();
         assert!(cap_invalid.contains(
@@ -6892,6 +7028,7 @@ mod tests {
                 status: 425,
                 code: Some("ssh_command_not_available".to_string()),
                 message: "pending".to_string(),
+                idempotency_disposition: None,
             })
             .is_none()
         );
@@ -6904,6 +7041,7 @@ mod tests {
             code: Some("service_unavailable".to_string()),
             message: "service_unavailable: DEBIAN_SSH_NGROK_AUTHTOKEN is not configured"
                 .to_string(),
+            idempotency_disposition: None,
         })
         .unwrap();
 
@@ -6918,6 +7056,7 @@ mod tests {
                 status: 502,
                 code: Some("cap_write_failed".to_string()),
                 message: "CAP write failed".to_string(),
+                idempotency_disposition: None,
             })
             .is_none()
         );
@@ -7703,6 +7842,7 @@ mod tests {
                 status,
                 code: Some("transient".to_string()),
                 message: "transient".to_string(),
+                idempotency_disposition: None,
             }));
         }
         assert!(
@@ -7710,6 +7850,7 @@ mod tests {
                 status: 503,
                 code: None,
                 message: "proxy unavailable while refreshing config token".to_string(),
+                idempotency_disposition: None,
             }),
             "config token refresh uses the same transient PaaS retry classifier"
         );
@@ -7746,6 +7887,7 @@ mod tests {
                 status,
                 code: Some("permanent".to_string()),
                 message: "permanent".to_string(),
+                idempotency_disposition: None,
             }));
         }
         assert!(!should_retry_template_config_sync_error(

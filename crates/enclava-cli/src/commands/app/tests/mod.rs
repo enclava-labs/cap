@@ -647,6 +647,7 @@ fn deployment_failure_message_includes_api_error_code_detail() {
         template_expected: Default::default(),
         created_at: "2026-07-03T15:48:25Z".to_string(),
         completed_at: None,
+        reconciled_status: None,
     };
 
     assert_eq!(

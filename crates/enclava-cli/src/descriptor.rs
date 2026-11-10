@@ -281,6 +281,18 @@ pub fn trusted_deployment_expectation_from_descriptor(
     }
 }
 
+/// Recover the trusted deployment identity from a persisted descriptor blob
+/// so a resumed template deploy can still bind a terminal bootstrap diagnostic
+/// to the deployment it is waiting on.
+pub fn trusted_deployment_expectation_from_descriptor_blob(
+    blob: &str,
+) -> Result<TrustedDeploymentExpectation, DescriptorError> {
+    let envelope: DeploymentDescriptorEnvelope = serde_json::from_str(blob)?;
+    Ok(trusted_deployment_expectation_from_descriptor(
+        &envelope.descriptor,
+    ))
+}
+
 pub fn sign(
     deployer: &UserSigningKey,
     descriptor: DeploymentDescriptor,

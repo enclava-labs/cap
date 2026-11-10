@@ -3079,6 +3079,7 @@ pub async fn logs(args: LogsArgs) -> Result<(), Box<dyn std::error::Error>> {
             status: 403,
             code: Some(code),
             message,
+            ..
         }) if code == "missing_scope" && message.contains("apps:logs") => {
             return Err(format!(
                 "{message}\nRun `enclava login --approve-logs` and approve the new session to read workload logs."

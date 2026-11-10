@@ -203,7 +203,7 @@ pub fn save_bootstrap_key(
 /// Atomic secret write: the temp file is created owner-only from birth
 /// (`create_new` + mode 0600), so the plaintext JWT/API key/key hex is never
 /// observable by other local users at any instant, then atomically renamed.
-fn write_secret_atomic(path: &Path, contents: &[u8]) -> Result<(), ConfigError> {
+pub(crate) fn write_secret_atomic(path: &Path, contents: &[u8]) -> Result<(), ConfigError> {
     let temp_path = path.with_extension("tmp");
     if temp_path.exists() {
         // Never follow a pre-planted file: remove and recreate below.

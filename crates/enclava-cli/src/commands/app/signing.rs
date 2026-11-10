@@ -6,7 +6,7 @@ use super::*;
 fn parse_app_id(id: &str) -> Result<Uuid, Box<dyn std::error::Error>> {
     Uuid::parse_str(id).map_err(|err| {
         format!(
-            "app id returned by the platform is not a UUID (got {id:?}; {err}) -- the app              row may be incomplete; retry the deploy once any app quota or in-flight              operation clears, or contact the operator if it persists"
+            "app id returned by the platform is not a UUID (got {id:?}; {err}) -- the app row may be incomplete; retry the deploy once any app quota or in-flight operation clears, or contact the operator if it persists"
         )
         .into()
     })
@@ -719,6 +719,10 @@ pub(crate) async fn build_signed_deploy_blobs(
         org_slug: org_name.clone(),
         app_id,
         app_name: app.name.clone(),
+        // Per-deployment identity, not per-retry. A template-deploy retry must
+        // replay the already-signed request (cap#292) rather than call this
+        // again: a fresh id and timestamp here change the idempotency key and
+        // start a second deployment beside the one still in flight.
         deploy_id: Uuid::new_v4(),
         created_at: Utc::now(),
         app_domain: app.domain.clone(),
