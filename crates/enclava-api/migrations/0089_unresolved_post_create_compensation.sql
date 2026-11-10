@@ -32,7 +32,12 @@ CREATE TABLE unresolved_post_create_compensations (
     CONSTRAINT unresolved_post_create_compensations_resolve_reason_check
         CHECK (
             resolve_reason IS NULL
-            OR resolve_reason IN ('absent', 'deleted', 'stale_replacement')
+            OR resolve_reason IN (
+                'absent',
+                'deleted',
+                'stale_replacement',
+                'later_generation'
+            )
         )
 );
 

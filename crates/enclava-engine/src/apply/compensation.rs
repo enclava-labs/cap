@@ -45,9 +45,7 @@ pub trait UnresolvedCompensationSink: Send + Sync {
 mod tests {
     use super::*;
     use crate::apply::engine::ApplyEngine;
-    use crate::apply::generation::{
-        MUTATION_GENERATION_ANNOTATION, RESOURCE_CREATED_BY_ANNOTATION,
-    };
+    use crate::apply::generation::RESOURCE_CREATED_BY_ANNOTATION;
     use crate::apply::namespace::apply_namespace;
     use axum::http::{Method, Request, Response, StatusCode};
     use http_body_util::BodyExt;
@@ -128,8 +126,10 @@ mod tests {
                         events.lock().expect("events").push("delete");
                         let payload = String::from_utf8_lossy(&body);
                         assert!(
-                            payload.contains(uid) && payload.contains("preconditions"),
-                            "delete was not UID-preconditioned: {payload}"
+                            payload.contains(uid)
+                                && payload.contains("preconditions")
+                                && payload.contains("resourceVersion"),
+                            "delete was not pinned to UID and resourceVersion: {payload}"
                         );
                         if hang_delete {
                             tokio::time::sleep(Duration::from_secs(30)).await;
@@ -311,6 +311,5 @@ mod tests {
             events.contains(&"delete"),
             "UID-pinned delete still attempted: {events:?}"
         );
-        let _ = MUTATION_GENERATION_ANNOTATION;
     }
 }

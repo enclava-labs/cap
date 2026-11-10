@@ -115,7 +115,15 @@ pub(super) async fn compensate_created_object<K>(
         let params = DeleteParams {
             preconditions: Some(Preconditions {
                 uid: Some(uid.clone()),
-                resource_version: None,
+                // Pin the POST response version too. A same-UID write between
+                // this response and the DELETE must 409 instead of being
+                // destroyed. The reconciler repeats that check after the
+                // fence is released (cap#254).
+                resource_version: created
+                    .meta()
+                    .resource_version
+                    .clone()
+                    .filter(|version| !version.is_empty()),
             }),
             ..DeleteParams::default()
         };
