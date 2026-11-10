@@ -9,9 +9,18 @@
 //!
 //! A fresh deploy id remains correct once the previous deployment has reached
 //! a terminal status — an intentional redeploy, or a retry after a definitive
-//! rejection, must not replay the old operation.
+//! rejection, must not replay the old operation. An empty history list is not
+//! that evidence while the saved request is still inside PaaS's replay window:
+//! the first POST can be running before its row appears.
+//!
+//! A list outage is also not evidence the key is still replayable. PaaS keeps
+//! a hosted-operation replay for 24h (`replay_expires_at = now() + interval
+//! '24 hours'`). Replaying past that window starts another rollout with the
+//! original signed deployment id, so an attempt with no in-window timestamp
+//! fails closed when history cannot be listed.
 
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
@@ -20,6 +29,10 @@ use crate::api_types::CreateTemplateInstanceRequest;
 use crate::config::{self, CliPaths};
 
 const STORED_ATTEMPT_VERSION: u32 = 1;
+
+/// Stay an hour inside PaaS's 24h replay window so client/server clock skew
+/// cannot turn a forgotten key into a new rollout.
+pub const TEMPLATE_DEPLOY_REPLAY_WINDOW_SECS: u64 = 23 * 60 * 60;
 
 /// Settings that identify "the same template deploy command". The signed blobs
 /// are deliberately not part of this: they are the volatile half the retry
@@ -58,6 +71,31 @@ pub enum LoadedTemplateDeployAttempt {
     Ready(Box<StoredTemplateDeployAttempt>),
 }
 
+/// Workflow the CLI must repeat on replay. The create response echoes the
+/// catalog at response time, which can change while a deployment is in flight.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StoredTemplateWorkflow {
+    pub unlock_mode: String,
+    pub paas_managed_config_keys: Vec<String>,
+}
+
+/// Log-key output from the invocation that signed the request. A retry that
+/// died before printing still has to report the key the descriptor contains.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StoredTemplateLogKey {
+    pub key_id: String,
+    pub private_key_file: Option<String>,
+}
+
+/// Metadata captured with a newly signed request. Not part of the POST body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewTemplateDeployAttempt {
+    pub unlock_mode: String,
+    pub paas_managed_config_keys: Vec<String>,
+    pub log_key_id: Option<String>,
+    pub log_private_key_file: Option<String>,
+}
+
 /// What this run should POST.
 #[derive(Debug)]
 pub enum TemplateDeployAttempt {
@@ -65,8 +103,10 @@ pub enum TemplateDeployAttempt {
     Fresh,
     /// Re-POST this exact request so the idempotency key hits the in-flight operation.
     Replay {
-        request: CreateTemplateInstanceRequest,
+        request: Box<CreateTemplateInstanceRequest>,
         deploy_id: String,
+        workflow: Option<StoredTemplateWorkflow>,
+        log_key: Option<StoredTemplateLogKey>,
     },
     /// A second signed request would race an in-flight deployment. Do not POST.
     Refuse(String),
@@ -86,6 +126,21 @@ pub struct StoredTemplateDeployAttempt {
     org_keyring_blob: String,
     signed_policy_artifact: String,
     customer_config_roll_hold_seconds: Option<u32>,
+    /// Unix seconds when the request was signed, before the POST. `0` means
+    /// the file predates this field and must not be replayed without a live row.
+    #[serde(default)]
+    created_at_unix: u64,
+    /// Set once the POST returned success, even if later CLI steps did not finish.
+    #[serde(default)]
+    post_accepted: bool,
+    #[serde(default)]
+    post_accepted_at_unix: Option<u64>,
+    /// Catalog workflow used when this request was signed. Absent on files
+    /// written before this field existed.
+    #[serde(default)]
+    workflow: Option<StoredTemplateWorkflow>,
+    #[serde(default)]
+    log_key: Option<StoredTemplateLogKey>,
     /// Set only after this command finished. A later list outage must not
     /// replay a finished request into a new server generation.
     #[serde(default)]
@@ -122,22 +177,49 @@ impl StoredTemplateDeployAttempt {
     }
 }
 
+/// Exclusive lock covering load/list/sign/save/POST for one app. Dropping it
+/// releases the lock, including on process death.
+#[must_use = "dropping the guard releases the template deploy lock"]
+pub struct TemplateDeployLock {
+    _guard: crate::fslock::FileLockGuard,
+}
+
 /// Scope the on-disk attempt so two orgs (or two API origins) cannot resume
 /// each other's signed request for the same app name.
+///
+/// `selected_org` is `CliConfig::org`, the name `X-Enclava-Org` actually
+/// sends. `org switch` updates that name and leaves the credential org id
+/// pointing at the previous login, so the id alone must not be the scope.
 pub fn template_deploy_scope(
     active_org_id: Option<&str>,
     config_org_id: Option<&str>,
     active_org_name: Option<&str>,
+    selected_org: Option<&str>,
     api_origin: &str,
 ) -> String {
-    let org = [active_org_id, config_org_id, active_org_name]
+    let org_id = [active_org_id, config_org_id]
         .into_iter()
         .flatten()
         .map(str::trim)
         .find(|value| !value.is_empty())
         .unwrap_or("unknown");
+    let selected = [selected_org, active_org_name]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .unwrap_or("-");
     // Origin is always part of the scope: two API URLs can share an org id.
-    format!("org:{org}\norigin:{api_origin}")
+    // The selected name is always part of it too: a switch must not reuse the
+    // previous org's resume file just because the credential id is stale.
+    format!("org:{org_id}\nselected:{selected}\norigin:{api_origin}")
+}
+
+pub fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
 }
 
 pub fn select_template_deploy_attempt(
@@ -145,6 +227,7 @@ pub fn select_template_deploy_attempt(
     stable: &StableTemplateDeployInputs,
     current_app_id: &str,
     deployments: &DeploymentListing,
+    now_unix: u64,
 ) -> TemplateDeployAttempt {
     let unreadable = matches!(loaded, LoadedTemplateDeployAttempt::Unreadable);
     let usable = match loaded {
@@ -157,70 +240,16 @@ pub fn select_template_deploy_attempt(
     };
 
     let Some(rows) = listed_rows(deployments) else {
-        return attempt_without_listing(usable, unreadable, stable);
+        return attempt_without_listing(usable, unreadable, stable, now_unix);
     };
 
     let inflight: Vec<&ObservedTemplateDeployment> = rows
         .iter()
         .filter(|deployment| deployment_is_in_flight(deployment))
         .collect();
-    let cached_terminal = usable.as_ref().is_some_and(|stored| {
-        rows.iter().any(|deployment| {
-            deployment.id == stored.deploy_id && deployment_is_terminal(deployment)
-        })
-    });
 
     if let Some(stored) = usable {
-        if cached_terminal && inflight.is_empty() {
-            return TemplateDeployAttempt::Fresh;
-        }
-        if cached_terminal {
-            return TemplateDeployAttempt::Refuse(inflight_refuse_message(
-                stable,
-                inflight[0],
-                "an earlier signed request for this app already finished, and another deployment is still in flight. A new deploy was not started. Wait for the in-flight deployment to finish, or destroy the app, then deploy again.",
-            ));
-        }
-        if stored.matches_inputs(stable) {
-            // An in-flight row whose id is not the signed deploy id is a
-            // different deployment. Replaying a request the server has never
-            // seen would reserve a second one beside it. An empty list can
-            // still replay: the row may not be visible yet.
-            let ours_visible = inflight
-                .iter()
-                .any(|deployment| deployment.id == stored.deploy_id);
-            if inflight.is_empty() || ours_visible {
-                // A finished attempt whose signed id is not a live row must
-                // not be replayed: after the server's replay window that key
-                // opens a new generation carrying the old deploy id. An
-                // unfinished empty list still replays (the row may not be
-                // visible yet).
-                if stored.completed && !ours_visible {
-                    return TemplateDeployAttempt::Fresh;
-                }
-                let deploy_id = stored.deploy_id.clone();
-                return TemplateDeployAttempt::Replay {
-                    request: (*stored).into_request(),
-                    deploy_id,
-                };
-            }
-            return TemplateDeployAttempt::Refuse(inflight_refuse_message(
-                stable,
-                inflight[0],
-                "its id is not the deployment this machine signed, so the stored request was not sent (that would start a second deployment). Retry this command once the in-flight deployment's id is visible — that resumes it. Destroy the app only if it stays stuck.",
-            ));
-        }
-        if let Some(deployment) = inflight.first().copied() {
-            return TemplateDeployAttempt::Refuse(inflight_refuse_message(
-                stable,
-                deployment,
-                "this command's template settings differ from the signed request that started it. Retry the original command to resume that deployment. Destroy the app before changing the template, endpoint, or bootstrap settings.",
-            ));
-        }
-        // Nothing visible is in flight and the stored request does not match
-        // this command. The previous POST did not land a live deployment, so
-        // signing a new one cannot race it.
-        return TemplateDeployAttempt::Fresh;
+        return select_stored_attempt(stored, stable, rows, &inflight, now_unix);
     }
 
     if let Some(deployment) = inflight.first().copied() {
@@ -234,10 +263,92 @@ pub fn select_template_deploy_attempt(
     TemplateDeployAttempt::Fresh
 }
 
+fn select_stored_attempt(
+    stored: Box<StoredTemplateDeployAttempt>,
+    stable: &StableTemplateDeployInputs,
+    rows: &[ObservedTemplateDeployment],
+    inflight: &[&ObservedTemplateDeployment],
+    now_unix: u64,
+) -> TemplateDeployAttempt {
+    let our_row = rows
+        .iter()
+        .find(|deployment| deployment.id == stored.deploy_id);
+    let ours_inflight = our_row.is_some_and(deployment_is_in_flight);
+    let ours_terminal = our_row.is_some_and(deployment_is_terminal);
+
+    // A visible row that is not live is not "absent". Replaying it after the
+    // server forgets the key restarts a deployment the user cancelled or that
+    // a projection already shows as stale. Sign fresh only when nothing else
+    // is still rolling out.
+    if our_row.is_some() && !ours_inflight {
+        if let Some(deployment) = inflight.first().copied() {
+            let why = if ours_terminal {
+                "an earlier signed request for this app already finished, and another deployment is still in flight. A new deploy was not started. Wait for the in-flight deployment to finish, or destroy the app, then deploy again."
+            } else {
+                "the stored deployment is visible but not live, and another deployment is still in flight. A new deploy was not started. Wait for the in-flight deployment to finish, or destroy the app, then deploy again."
+            };
+            return TemplateDeployAttempt::Refuse(inflight_refuse_message(stable, deployment, why));
+        }
+        return TemplateDeployAttempt::Fresh;
+    }
+
+    if stored.matches_inputs(stable) {
+        if inflight.is_empty() || ours_inflight {
+            if stored.completed && !ours_inflight {
+                return TemplateDeployAttempt::Fresh;
+            }
+            // A live row is affirmative evidence the operation still exists.
+            // An absent row may replay only while the key is still inside the
+            // server window; after that, the same key opens a new generation.
+            if ours_inflight || replay_within_window(&stored, now_unix) {
+                return replay(stored);
+            }
+            if !replay_window_known(&stored) {
+                return TemplateDeployAttempt::Refuse(format!(
+                    "the stored template deploy request for `{}` has no timestamp and its deployment is not visible yet. Replaying or replacing it could race the original request. A new deployment was not started. Retry once that deployment is listed, or destroy the app and deploy again.",
+                    stable.instance_name
+                ));
+            }
+            return TemplateDeployAttempt::Fresh;
+        }
+        return TemplateDeployAttempt::Refuse(inflight_refuse_message(
+            stable,
+            inflight[0],
+            "its id is not the deployment this machine signed, so the stored request was not sent (that would start a second deployment). Retry this command once the in-flight deployment's id is visible — that resumes it. Destroy the app only if it stays stuck.",
+        ));
+    }
+
+    if let Some(deployment) = inflight.first().copied() {
+        return TemplateDeployAttempt::Refuse(inflight_refuse_message(
+            stable,
+            deployment,
+            "this command's template settings differ from the signed request that started it. Retry the original command to resume that deployment. Destroy the app before changing the template, endpoint, or bootstrap settings.",
+        ));
+    }
+    // Nothing visible is in flight and the stored request does not match this
+    // command. An empty list is not proof the previous POST settled: the row
+    // can still be missing while that request runs. Keep the saved attempt
+    // authoritative until it is past the replay window.
+    if !stored.completed && replay_within_window(&stored, now_unix) {
+        return TemplateDeployAttempt::Refuse(format!(
+            "a previous template deploy for `{}` was signed on this machine and is not visible in deployment history yet. This command's settings differ from that signed request, so a new deployment was not started (the first request may still be running). Retry the original command to resume it.",
+            stable.instance_name
+        ));
+    }
+    if !stored.completed && !replay_window_known(&stored) {
+        return TemplateDeployAttempt::Refuse(format!(
+            "a previous template deploy for `{}` is stored on this machine without a timestamp, and deployment history does not show it. This command's settings differ, so a new deployment was not started. Retry the original command, or destroy the app and deploy again.",
+            stable.instance_name
+        ));
+    }
+    TemplateDeployAttempt::Fresh
+}
+
 fn attempt_without_listing(
     usable: Option<Box<StoredTemplateDeployAttempt>>,
     unreadable: bool,
     stable: &StableTemplateDeployInputs,
+    now_unix: u64,
 ) -> TemplateDeployAttempt {
     if let Some(stored) = usable {
         if stored.matches_inputs(stable) {
@@ -247,11 +358,18 @@ fn attempt_without_listing(
                     stable.instance_name
                 ));
             }
-            let deploy_id = stored.deploy_id.clone();
-            return TemplateDeployAttempt::Replay {
-                request: (*stored).into_request(),
-                deploy_id,
+            if replay_within_window(&stored, now_unix) {
+                return replay(stored);
+            }
+            let accepted = if stored.post_accepted {
+                " The platform already accepted this request."
+            } else {
+                ""
             };
+            return TemplateDeployAttempt::Refuse(format!(
+                "the stored template deploy request for `{}` is outside the platform's replay window, or it has no timestamp, and deployments could not be listed. Replaying it could start another rollout with the original deployment id.{accepted} A new deployment was not started. Retry when deployment status is available.",
+                stable.instance_name
+            ));
         }
         return TemplateDeployAttempt::Refuse(format!(
             "could not list deployments for `{}` to confirm the previous template deploy finished, and this command's settings differ from the stored request. Retry the original command to resume it. A new deployment was not started.",
@@ -266,6 +384,27 @@ fn attempt_without_listing(
     }
     // No local attempt to resume. A list outage must not block a first deploy.
     TemplateDeployAttempt::Fresh
+}
+
+fn replay(stored: Box<StoredTemplateDeployAttempt>) -> TemplateDeployAttempt {
+    let deploy_id = stored.deploy_id.clone();
+    let workflow = stored.workflow.clone();
+    let log_key = stored.log_key.clone();
+    TemplateDeployAttempt::Replay {
+        request: Box::new((*stored).into_request()),
+        deploy_id,
+        workflow,
+        log_key,
+    }
+}
+
+fn replay_window_known(stored: &StoredTemplateDeployAttempt) -> bool {
+    stored.created_at_unix != 0
+}
+
+fn replay_within_window(stored: &StoredTemplateDeployAttempt, now_unix: u64) -> bool {
+    let created = stored.created_at_unix;
+    created != 0 && now_unix.saturating_sub(created) <= TEMPLATE_DEPLOY_REPLAY_WINDOW_SECS
 }
 
 fn listed_rows(deployments: &DeploymentListing) -> Option<&[ObservedTemplateDeployment]> {
@@ -309,7 +448,7 @@ pub fn lifecycle_status(deployment: &ObservedTemplateDeployment) -> &str {
 pub fn deployment_is_terminal(deployment: &ObservedTemplateDeployment) -> bool {
     matches!(
         lifecycle_status(deployment),
-        "healthy" | "failed" | "rolled_back" | "superseded"
+        "healthy" | "failed" | "rolled_back" | "superseded" | "cancelled"
     )
 }
 
@@ -420,12 +559,41 @@ pub fn deployment_listing_for_list_error(
     DeploymentListing::Unavailable
 }
 
+pub fn try_acquire_template_deploy_lock(
+    paths: &CliPaths,
+    scope: &str,
+    instance_name: &str,
+) -> Result<Option<TemplateDeployLock>, String> {
+    paths.ensure_dirs().map_err(|err| err.to_string())?;
+    let path = lock_path(paths, scope, instance_name);
+    crate::fslock::try_acquire_file_lock(&path)
+        .map(|guard| guard.map(|guard| TemplateDeployLock { _guard: guard }))
+        .map_err(|err| lock_error(instance_name, &err))
+}
+
+pub fn acquire_template_deploy_lock(
+    paths: &CliPaths,
+    scope: &str,
+    instance_name: &str,
+) -> Result<TemplateDeployLock, String> {
+    paths.ensure_dirs().map_err(|err| err.to_string())?;
+    let path = lock_path(paths, scope, instance_name);
+    crate::fslock::acquire_file_lock(&path)
+        .map(|guard| TemplateDeployLock { _guard: guard })
+        .map_err(|err| lock_error(instance_name, &err))
+}
+
+fn lock_error(instance_name: &str, err: &std::io::Error) -> String {
+    format!("could not lock template deploy state for `{instance_name}`: {err}")
+}
+
 pub fn save_template_deploy_attempt(
     paths: &CliPaths,
     scope: &str,
     app_id: &str,
     deploy_id: &str,
     request: &CreateTemplateInstanceRequest,
+    record: &NewTemplateDeployAttempt,
 ) -> Result<(), String> {
     let (customer_descriptor_blob, org_keyring_blob, signed_policy_artifact) = match (
         request.customer_descriptor_blob.as_deref(),
@@ -457,12 +625,34 @@ pub fn save_template_deploy_attempt(
         org_keyring_blob: org_keyring_blob.to_string(),
         signed_policy_artifact: signed_policy_artifact.to_string(),
         customer_config_roll_hold_seconds: request.customer_config_roll_hold_seconds,
+        created_at_unix: unix_now(),
+        post_accepted: false,
+        post_accepted_at_unix: None,
+        workflow: Some(StoredTemplateWorkflow {
+            unlock_mode: record.unlock_mode.clone(),
+            paas_managed_config_keys: record.paas_managed_config_keys.clone(),
+        }),
+        log_key: stored_log_key(record),
         completed: false,
     };
-    let bytes = serde_json::to_vec(&stored).map_err(|err| err.to_string())?;
-    paths.ensure_dirs().map_err(|err| err.to_string())?;
-    let path = attempt_path(paths, scope, &request.instance_name);
-    config::write_secret_atomic(&path, &bytes).map_err(|err| err.to_string())
+    write_stored(paths, &stored)
+}
+
+fn stored_log_key(record: &NewTemplateDeployAttempt) -> Option<StoredTemplateLogKey> {
+    let key_id = record
+        .log_key_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|key_id| !key_id.is_empty())?;
+    Some(StoredTemplateLogKey {
+        key_id: key_id.to_string(),
+        private_key_file: record
+            .log_private_key_file
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(str::to_string),
+    })
 }
 
 pub fn load_template_deploy_attempt(
@@ -508,6 +698,30 @@ pub fn clear_template_deploy_attempt(
     }
 }
 
+/// Remember that the platform accepted the POST, separately from the CLI
+/// finishing config delivery. A later history outage must not treat "the
+/// command did not finish" as "the key was never sent".
+pub fn mark_template_deploy_attempt_posted(
+    paths: &CliPaths,
+    scope: &str,
+    instance_name: &str,
+) -> Result<(), String> {
+    let LoadedTemplateDeployAttempt::Ready(mut stored) =
+        load_template_deploy_attempt(paths, scope, instance_name)
+    else {
+        return Err(
+            "template deploy was accepted but the stored request is missing, so a retry cannot resume it safely"
+                .to_string(),
+        );
+    };
+    if stored.post_accepted {
+        return Ok(());
+    }
+    stored.post_accepted = true;
+    stored.post_accepted_at_unix = Some(unix_now());
+    write_stored(paths, &stored)
+}
+
 /// Remember that this command finished, so a later list outage does not
 /// replay the finished request into a new server generation.
 pub fn mark_template_deploy_attempt_completed(
@@ -521,10 +735,17 @@ pub fn mark_template_deploy_attempt_completed(
         return Ok(());
     };
     stored.completed = true;
-    let bytes = serde_json::to_vec(&stored).map_err(|err| err.to_string())?;
+    write_stored(paths, &stored)
+}
+
+fn write_stored(paths: &CliPaths, stored: &StoredTemplateDeployAttempt) -> Result<(), String> {
+    let bytes = serde_json::to_vec(stored).map_err(|err| err.to_string())?;
     paths.ensure_dirs().map_err(|err| err.to_string())?;
-    config::write_secret_atomic(&attempt_path(paths, scope, instance_name), &bytes)
-        .map_err(|err| err.to_string())
+    config::write_secret_atomic(
+        &attempt_path(paths, &stored.scope, &stored.instance_name),
+        &bytes,
+    )
+    .map_err(|err| err.to_string())
 }
 
 fn attempt_path(paths: &CliPaths, scope: &str, instance_name: &str) -> PathBuf {
@@ -539,6 +760,10 @@ fn attempt_path(paths: &CliPaths, scope: &str, instance_name: &str) -> PathBuf {
         .join(format!("template-deploy-{}.json", &digest[..32]))
 }
 
+fn lock_path(paths: &CliPaths, scope: &str, instance_name: &str) -> PathBuf {
+    attempt_path(paths, scope, instance_name).with_extension("lock")
+}
+
 /// Same key the CLI sends. Exposed for the resume tests; production signing
 /// still goes through `ApiClient::create_template_instance`.
 pub fn idempotency_key_for_request(request: &CreateTemplateInstanceRequest) -> String {
@@ -549,6 +774,8 @@ pub fn idempotency_key_for_request(request: &CreateTemplateInstanceRequest) -> S
 mod tests {
     use super::*;
     use crate::api_client::ApiError;
+
+    const NOW: u64 = 1_700_000_000;
 
     fn stable() -> StableTemplateDeployInputs {
         StableTemplateDeployInputs {
@@ -590,6 +817,17 @@ mod tests {
             org_keyring_blob: request.org_keyring_blob.unwrap(),
             signed_policy_artifact: request.signed_policy_artifact.unwrap(),
             customer_config_roll_hold_seconds: request.customer_config_roll_hold_seconds,
+            created_at_unix: NOW,
+            post_accepted: false,
+            post_accepted_at_unix: None,
+            workflow: Some(StoredTemplateWorkflow {
+                unlock_mode: "password".to_string(),
+                paas_managed_config_keys: vec!["NGROK_AUTHTOKEN".to_string()],
+            }),
+            log_key: Some(StoredTemplateLogKey {
+                key_id: "shell-logs".to_string(),
+                private_key_file: Some("/keys/shell-logs.x25519".to_string()),
+            }),
             completed: false,
         }
     }
@@ -606,21 +844,56 @@ mod tests {
         DeploymentListing::Listed(rows)
     }
 
+    fn select(
+        loaded: LoadedTemplateDeployAttempt,
+        stable: &StableTemplateDeployInputs,
+        app_id: &str,
+        deployments: &DeploymentListing,
+    ) -> TemplateDeployAttempt {
+        select_template_deploy_attempt(loaded, stable, app_id, deployments, NOW)
+    }
+
+    fn record() -> NewTemplateDeployAttempt {
+        NewTemplateDeployAttempt {
+            unlock_mode: "password".to_string(),
+            paas_managed_config_keys: vec!["NGROK_AUTHTOKEN".to_string()],
+            log_key_id: Some("shell-logs".to_string()),
+            log_private_key_file: Some("/keys/shell-logs.x25519".to_string()),
+        }
+    }
+
     #[test]
     fn in_flight_retry_reuses_the_signed_request_and_its_idempotency_key() {
         let stable = stable();
         let stored = stored(&stable, "deploy-1");
         let original = stored.clone().into_request();
-        let attempt = select_template_deploy_attempt(
+        let attempt = select(
             LoadedTemplateDeployAttempt::Ready(Box::new(stored)),
             &stable,
             "app-uuid",
             &listed(vec![row("deploy-1", "applying", Some("applying"))]),
         );
-        let TemplateDeployAttempt::Replay { request, deploy_id } = attempt else {
+        let TemplateDeployAttempt::Replay {
+            request,
+            deploy_id,
+            workflow,
+            log_key,
+        } = attempt
+        else {
             panic!("in-flight retry must replay the stored request, not sign a new one");
         };
+        let request = *request;
         assert_eq!(deploy_id, "deploy-1");
+        assert_eq!(
+            workflow
+                .expect("replay must keep the signed workflow")
+                .unlock_mode,
+            "password"
+        );
+        assert_eq!(
+            log_key.expect("replay must keep the signed log key").key_id,
+            "shell-logs"
+        );
         assert_eq!(
             idempotency_key_for_request(&request),
             idempotency_key_for_request(&original),
@@ -638,7 +911,7 @@ mod tests {
     #[test]
     fn retry_before_any_deployment_row_is_visible_still_reuses_the_request() {
         let stable = stable();
-        let attempt = select_template_deploy_attempt(
+        let attempt = select(
             LoadedTemplateDeployAttempt::Ready(Box::new(stored(&stable, "deploy-1"))),
             &stable,
             "app-uuid",
@@ -650,8 +923,14 @@ mod tests {
     #[test]
     fn terminal_deployment_signs_a_new_request() {
         let stable = stable();
-        for status in ["healthy", "failed", "rolled_back", "superseded"] {
-            let attempt = select_template_deploy_attempt(
+        for status in [
+            "healthy",
+            "failed",
+            "rolled_back",
+            "superseded",
+            "cancelled",
+        ] {
+            let attempt = select(
                 LoadedTemplateDeployAttempt::Ready(Box::new(stored(&stable, "deploy-1"))),
                 &stable,
                 "app-uuid",
@@ -667,7 +946,7 @@ mod tests {
     #[test]
     fn stale_observation_of_a_healthy_row_does_not_block_redeploy() {
         let stable = stable();
-        let attempt = select_template_deploy_attempt(
+        let attempt = select(
             LoadedTemplateDeployAttempt::Ready(Box::new(stored(&stable, "deploy-1"))),
             &stable,
             "app-uuid",
@@ -677,9 +956,26 @@ mod tests {
     }
 
     #[test]
+    fn visible_inactive_row_signs_fresh_instead_of_replaying() {
+        let stable = stable();
+        for (status, reconciled) in [("cancelled", None), ("stale", None), ("partial", None)] {
+            let attempt = select(
+                LoadedTemplateDeployAttempt::Ready(Box::new(stored(&stable, "deploy-1"))),
+                &stable,
+                "app-uuid",
+                &listed(vec![row("deploy-1", status, reconciled)]),
+            );
+            assert!(
+                matches!(attempt, TemplateDeployAttempt::Fresh),
+                "{status} is visible and not live, so it must not be replayed"
+            );
+        }
+    }
+
+    #[test]
     fn in_flight_without_a_stored_request_is_refused() {
         let stable = stable();
-        let attempt = select_template_deploy_attempt(
+        let attempt = select(
             LoadedTemplateDeployAttempt::Absent,
             &stable,
             "app-uuid",
@@ -697,7 +993,7 @@ mod tests {
         let stable = stable();
         let mut changed = stable.clone();
         changed.config = serde_json::json!({"NGROK_TCP_URL": "6.tcp.eu.ngrok.io:1"});
-        let attempt = select_template_deploy_attempt(
+        let attempt = select(
             LoadedTemplateDeployAttempt::Ready(Box::new(stored(&stable, "deploy-1"))),
             &changed,
             "app-uuid",
@@ -707,13 +1003,48 @@ mod tests {
     }
 
     #[test]
-    fn changed_settings_with_nothing_in_flight_may_sign_fresh() {
+    fn changed_settings_with_an_unseen_recent_request_do_not_sign_fresh() {
         let stable = stable();
         let mut changed = stable.clone();
         changed.bootstrap_pubkey_hash = Some("cd".repeat(32));
-        let attempt = select_template_deploy_attempt(
+        let attempt = select(
             LoadedTemplateDeployAttempt::Ready(Box::new(stored(&stable, "deploy-1"))),
             &changed,
+            "app-uuid",
+            &listed(vec![]),
+        );
+        let TemplateDeployAttempt::Refuse(message) = attempt else {
+            panic!("changed settings must not replace a request whose row is not visible yet");
+        };
+        assert!(message.contains("not visible"), "{message}");
+        assert!(message.contains("was not started"), "{message}");
+    }
+
+    #[test]
+    fn changed_settings_may_sign_fresh_once_the_unseen_request_is_past_the_replay_window() {
+        let stable = stable();
+        let mut changed = stable.clone();
+        changed.bootstrap_pubkey_hash = Some("cd".repeat(32));
+        let mut stored = stored(&stable, "deploy-1");
+        stored.created_at_unix = NOW - TEMPLATE_DEPLOY_REPLAY_WINDOW_SECS - 1;
+        let attempt = select(
+            LoadedTemplateDeployAttempt::Ready(Box::new(stored)),
+            &changed,
+            "app-uuid",
+            &listed(vec![]),
+        );
+        assert!(matches!(attempt, TemplateDeployAttempt::Fresh));
+    }
+
+    #[test]
+    fn expired_matching_request_with_an_empty_list_signs_fresh_instead_of_replaying() {
+        let stable = stable();
+        let mut stored = stored(&stable, "deploy-1");
+        stored.created_at_unix = NOW - TEMPLATE_DEPLOY_REPLAY_WINDOW_SECS - 1;
+        stored.post_accepted = true;
+        let attempt = select(
+            LoadedTemplateDeployAttempt::Ready(Box::new(stored)),
+            &stable,
             "app-uuid",
             &listed(vec![]),
         );
@@ -723,7 +1054,7 @@ mod tests {
     #[test]
     fn recreated_app_does_not_replay_the_previous_descriptor() {
         let stable = stable();
-        let attempt = select_template_deploy_attempt(
+        let attempt = select(
             LoadedTemplateDeployAttempt::Ready(Box::new(stored(&stable, "deploy-1"))),
             &stable,
             "new-app-uuid",
@@ -735,20 +1066,54 @@ mod tests {
     #[test]
     fn list_outage_replays_a_matching_stored_request_and_does_not_block_a_first_deploy() {
         let stable = stable();
-        let replay = select_template_deploy_attempt(
+        let replay = select(
             LoadedTemplateDeployAttempt::Ready(Box::new(stored(&stable, "deploy-1"))),
             &stable,
             "app-uuid",
             &DeploymentListing::Unavailable,
         );
         assert!(matches!(replay, TemplateDeployAttempt::Replay { .. }));
-        let first = select_template_deploy_attempt(
+        let first = select(
             LoadedTemplateDeployAttempt::Absent,
             &stable,
             "app-uuid",
             &DeploymentListing::Unavailable,
         );
         assert!(matches!(first, TemplateDeployAttempt::Fresh));
+    }
+
+    #[test]
+    fn list_outage_refuses_an_attempt_outside_the_replay_window() {
+        let stable = stable();
+        let mut stored = stored(&stable, "deploy-1");
+        stored.created_at_unix = NOW - TEMPLATE_DEPLOY_REPLAY_WINDOW_SECS - 1;
+        stored.post_accepted = true;
+        let attempt = select(
+            LoadedTemplateDeployAttempt::Ready(Box::new(stored)),
+            &stable,
+            "app-uuid",
+            &DeploymentListing::Unavailable,
+        );
+        let TemplateDeployAttempt::Refuse(message) = attempt else {
+            panic!("an expired key must not be replayed while history is unavailable");
+        };
+        assert!(message.contains("replay window"), "{message}");
+        assert!(message.contains("already accepted"), "{message}");
+        assert!(message.contains("was not started"), "{message}");
+    }
+
+    #[test]
+    fn list_outage_refuses_a_stored_request_with_no_timestamp() {
+        let stable = stable();
+        let mut stored = stored(&stable, "deploy-1");
+        stored.created_at_unix = 0;
+        let attempt = select(
+            LoadedTemplateDeployAttempt::Ready(Box::new(stored)),
+            &stable,
+            "app-uuid",
+            &DeploymentListing::Unavailable,
+        );
+        assert!(matches!(attempt, TemplateDeployAttempt::Refuse(_)));
     }
 
     #[test]
@@ -891,7 +1256,7 @@ mod tests {
     #[test]
     fn stored_request_does_not_replay_beside_a_different_in_flight_deployment() {
         let stable = stable();
-        let attempt = select_template_deploy_attempt(
+        let attempt = select(
             LoadedTemplateDeployAttempt::Ready(Box::new(stored(&stable, "deploy-1"))),
             &stable,
             "app-uuid",
@@ -932,7 +1297,7 @@ mod tests {
         let stable = stable();
         let mut stored = stored(&stable, "deploy-1");
         stored.completed = true;
-        let attempt = select_template_deploy_attempt(
+        let attempt = select(
             LoadedTemplateDeployAttempt::Ready(Box::new(stored)),
             &stable,
             "app-uuid",
@@ -946,7 +1311,7 @@ mod tests {
         let stable = stable();
         let mut stored = stored(&stable, "deploy-1");
         stored.completed = true;
-        let attempt = select_template_deploy_attempt(
+        let attempt = select(
             LoadedTemplateDeployAttempt::Ready(Box::new(stored)),
             &stable,
             "app-uuid",
@@ -971,13 +1336,22 @@ mod tests {
         let stable = stable();
         let request = request_from(&stable, "descriptor-a");
         let body = serde_json::to_vec(&request).unwrap();
-        save_template_deploy_attempt(&paths, "org:org-1", "app-uuid", "deploy-1", &request)
-            .unwrap();
+        save_template_deploy_attempt(
+            &paths,
+            "org:org-1",
+            "app-uuid",
+            "deploy-1",
+            &request,
+            &record(),
+        )
+        .unwrap();
         let LoadedTemplateDeployAttempt::Ready(stored) =
             load_template_deploy_attempt(&paths, "org:org-1", "shell")
         else {
             panic!("stored request must load");
         };
+        assert!(stored.created_at_unix != 0, "a saved attempt must be dated");
+        assert!(!stored.post_accepted);
         let restored = (*stored).into_request();
         assert_eq!(
             idempotency_key_for_request(&restored),
@@ -991,6 +1365,19 @@ mod tests {
             let mode = std::fs::metadata(path).unwrap().permissions().mode();
             assert_eq!(mode & 0o077, 0, "stored signed request must be owner-only");
         }
+        mark_template_deploy_attempt_posted(&paths, "org:org-1", "shell").unwrap();
+        let LoadedTemplateDeployAttempt::Ready(posted) =
+            load_template_deploy_attempt(&paths, "org:org-1", "shell")
+        else {
+            panic!("posted request must still load");
+        };
+        assert!(posted.post_accepted);
+        assert!(posted.post_accepted_at_unix.is_some());
+        assert_eq!(
+            serde_json::to_vec(&posted.clone().into_request()).unwrap(),
+            body,
+            "recording POST acceptance must not change the signed request"
+        );
         clear_template_deploy_attempt(&paths, "org:org-1", "shell").unwrap();
         assert!(matches!(
             load_template_deploy_attempt(&paths, "org:org-1", "shell"),
@@ -999,18 +1386,76 @@ mod tests {
     }
 
     #[test]
-    fn scope_includes_the_api_origin_even_when_the_org_id_matches() {
+    fn scope_includes_the_selected_org_and_the_api_origin() {
         assert_eq!(
-            template_deploy_scope(Some("org-1"), None, Some("acme"), "https://api.example"),
-            "org:org-1\norigin:https://api.example"
+            template_deploy_scope(
+                Some("org-1"),
+                None,
+                Some("acme"),
+                None,
+                "https://api.example"
+            ),
+            "org:org-1\nselected:acme\norigin:https://api.example"
+        );
+        assert_eq!(
+            template_deploy_scope(
+                Some("org-1"),
+                None,
+                Some("acme"),
+                Some("beta"),
+                "https://api.example"
+            ),
+            "org:org-1\nselected:beta\norigin:https://api.example"
         );
         assert_ne!(
-            template_deploy_scope(Some("org-1"), None, None, "https://a.example"),
-            template_deploy_scope(Some("org-1"), None, None, "https://b.example")
+            template_deploy_scope(
+                Some("org-1"),
+                None,
+                Some("acme"),
+                Some("beta"),
+                "https://api.example"
+            ),
+            template_deploy_scope(
+                Some("org-1"),
+                None,
+                Some("acme"),
+                Some("acme"),
+                "https://api.example"
+            ),
+            "org switch must not reuse the previous org's resume file"
+        );
+        assert_ne!(
+            template_deploy_scope(Some("org-1"), None, None, None, "https://a.example"),
+            template_deploy_scope(Some("org-1"), None, None, None, "https://b.example")
         );
         assert_eq!(
-            template_deploy_scope(None, None, None, "https://api.example"),
-            "org:unknown\norigin:https://api.example"
+            template_deploy_scope(None, None, None, None, "https://api.example"),
+            "org:unknown\nselected:-\norigin:https://api.example"
+        );
+    }
+
+    #[test]
+    fn template_deploy_lock_serializes_a_second_acquire() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = CliPaths::from_root(dir.path().to_path_buf()).unwrap();
+        let first = acquire_template_deploy_lock(&paths, "org:1", "shell").unwrap();
+        assert!(
+            try_acquire_template_deploy_lock(&paths, "org:1", "shell")
+                .unwrap()
+                .is_none(),
+            "a second acquire of the same app must not proceed while the first holds the lock"
+        );
+        assert!(
+            try_acquire_template_deploy_lock(&paths, "org:1", "other")
+                .unwrap()
+                .is_some(),
+            "a different app must not share the lock"
+        );
+        drop(first);
+        assert!(
+            try_acquire_template_deploy_lock(&paths, "org:1", "shell")
+                .unwrap()
+                .is_some()
         );
     }
 }

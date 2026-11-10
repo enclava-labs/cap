@@ -287,10 +287,19 @@ pub fn trusted_deployment_expectation_from_descriptor(
 pub fn trusted_deployment_expectation_from_descriptor_blob(
     blob: &str,
 ) -> Result<TrustedDeploymentExpectation, DescriptorError> {
-    let envelope: DeploymentDescriptorEnvelope = serde_json::from_str(blob)?;
     Ok(trusted_deployment_expectation_from_descriptor(
-        &envelope.descriptor,
+        &descriptor_from_blob(blob)?.descriptor,
     ))
+}
+
+/// Unlock mode baked into the signed descriptor. A resumed template deploy
+/// must follow this, not a catalog row fetched on the retry.
+pub fn unlock_mode_from_descriptor_blob(blob: &str) -> Result<String, DescriptorError> {
+    Ok(descriptor_from_blob(blob)?.descriptor.unlock_mode)
+}
+
+fn descriptor_from_blob(blob: &str) -> Result<DeploymentDescriptorEnvelope, DescriptorError> {
+    Ok(serde_json::from_str(blob)?)
 }
 
 pub fn sign(

@@ -392,11 +392,12 @@ async fn deploy_with_timings(
     let ctx = build_api_context()?;
     let api = &ctx.api;
     let templates = api.list_templates().await?;
-    let template = templates
+    let mut template = templates
         .iter()
         .find(|template| template.slug == args.template)
-        .ok_or_else(|| format!("template '{}' is not available", args.template))?;
-    if template_key(template, "DEBIAN_SSH_AUTHORIZED_KEYS").is_none() {
+        .ok_or_else(|| format!("template '{}' is not available", args.template))?
+        .clone();
+    if template_key(&template, "DEBIAN_SSH_AUTHORIZED_KEYS").is_none() {
         return Err(format!(
             "template '{}' is not a Debian SSH template supported by this CLI",
             args.template
@@ -407,7 +408,7 @@ async fn deploy_with_timings(
     let public_keys = read_ssh_public_keys(&args.ssh_public_keys, &args.ssh_public_key_files)?;
     validate_ssh_public_keys(
         &public_keys,
-        template_key(template, "DEBIAN_SSH_AUTHORIZED_KEYS"),
+        template_key(&template, "DEBIAN_SSH_AUTHORIZED_KEYS"),
     )?;
     let storage_password =
         StoragePasswordInput::from_file_option(args.storage_password_file.as_ref())?;
@@ -452,10 +453,10 @@ async fn deploy_with_timings(
     pb.set_message("Preparing template app...");
 
     let bootstrap_pubkey_hash =
-        template_bootstrap_pubkey_hash(api, &ctx.paths, template, &instance_name).await?;
+        template_bootstrap_pubkey_hash(api, &ctx.paths, &template, &instance_name).await?;
     let app = ensure_template_app(
         api,
-        template,
+        &template,
         &instance_name,
         bootstrap_pubkey_hash.as_deref(),
     )
@@ -475,8 +476,13 @@ async fn deploy_with_timings(
         ctx.creds.active_org_id.as_deref(),
         ctx.cli_config.org_id.as_deref(),
         ctx.creds.active_org_name.as_deref(),
+        ctx.cli_config.org.as_deref(),
         api.origin(),
     );
+    // Hold this across load/list/sign/save/POST. The atomic resume-file
+    // write does not cover that sequence, so two invocations can otherwise
+    // both observe an empty history and POST different idempotency keys.
+    let _deploy_lock = lock_template_deploy(&ctx.paths, &scope, &instance_name).await?;
     let loaded = enclava_cli::template_deploy_retry::load_template_deploy_attempt(
         &ctx.paths,
         &scope,
@@ -510,19 +516,51 @@ async fn deploy_with_timings(
         &stable,
         &app.id,
         &deployments,
+        enclava_cli::template_deploy_retry::unix_now(),
     );
-    let (prepared_log_key, trusted_deployment, request) = match attempt {
+    let output_log_key: Option<OutputLogKey>;
+    let mut resume_unlock_mode: Option<String> = None;
+    let mut resume_managed_keys: Option<Vec<String>> = None;
+    let (trusted_deployment, request) = match attempt {
         enclava_cli::template_deploy_retry::TemplateDeployAttempt::Refuse(message) => {
             return Err(message.into());
         }
         enclava_cli::template_deploy_retry::TemplateDeployAttempt::Replay {
             request,
             deploy_id,
+            workflow,
+            log_key,
         } => {
+            let request = *request;
             pb.set_position(1);
             pb.set_message("Resuming in-flight template deployment...");
             let trusted = trusted_deployment_for_resumed_request(&request, &deploy_id)?;
-            (None, trusted, request)
+            let blob = request.customer_descriptor_blob.as_deref().ok_or(
+                "stored template deploy request is missing its signed descriptor; destroy the app before deploying again",
+            )?;
+            let signed_unlock =
+                enclava_cli::descriptor::unlock_mode_from_descriptor_blob(blob).map_err(|err| {
+                    format!(
+                        "stored template deploy request could not be read ({err}); destroy the app before deploying again"
+                    )
+                })?;
+            if signed_unlock == "password" {
+                storage_password
+                    .ensure_available_for_password_mode("password-mode template deploy")?;
+                if capture == MnemonicCapture::Skip {
+                    crate::commands::ownership::validate_recovery_mnemonic_sink_mode(capture)?;
+                }
+            }
+            // The signed descriptor is what the platform accepted. Catalog
+            // `unlock_mode` fetched on this retry must not skip the ownership
+            // claim or switch password-mode config delivery.
+            resume_unlock_mode = Some(signed_unlock);
+            resume_managed_keys = workflow.map(|stored| stored.paas_managed_config_keys);
+            output_log_key = log_key.map(|key| OutputLogKey {
+                key_id: key.key_id,
+                private_key_file: key.private_key_file.map(PathBuf::from),
+            });
+            (trusted, request)
         }
         enclava_cli::template_deploy_retry::TemplateDeployAttempt::Fresh => {
             let prepared_log_key = prepare_template_log_key(
@@ -537,8 +575,8 @@ async fn deploy_with_timings(
             .await?;
             pb.set_position(1);
             pb.set_message("Signing deployment descriptor...");
-            let app_config = template_app_config(template, &instance_name);
-            let workload_security_profile = template_workload_security_profile(template)?;
+            let app_config = template_app_config(&template, &instance_name);
+            let workload_security_profile = template_workload_security_profile(&template)?;
             let signed_blobs = build_signed_deploy_blobs(SignedDeployBlobParams {
                 api,
                 paths: &ctx.paths,
@@ -576,9 +614,26 @@ async fn deploy_with_timings(
                 &app.id,
                 &trusted_deployment.deploy_id,
                 &request,
+                &enclava_cli::template_deploy_retry::NewTemplateDeployAttempt {
+                    unlock_mode: template.unlock_mode.clone(),
+                    paas_managed_config_keys: template.paas_managed_config_keys.clone(),
+                    log_key_id: prepared_log_key
+                        .as_ref()
+                        .map(|prepared| prepared.config.key_id.clone()),
+                    log_private_key_file: prepared_log_key.as_ref().and_then(|prepared| {
+                        prepared
+                            .private_key_file
+                            .as_ref()
+                            .map(|path| path.to_string_lossy().into_owned())
+                    }),
+                },
             )
             .map_err(|err| -> Box<dyn std::error::Error> { err.into() })?;
-            (prepared_log_key, trusted_deployment, request)
+            output_log_key = prepared_log_key.map(|prepared| OutputLogKey {
+                key_id: prepared.config.key_id,
+                private_key_file: prepared.private_key_file,
+            });
+            (trusted_deployment, request)
         }
     };
     pb.set_position(2);
@@ -602,7 +657,19 @@ async fn deploy_with_timings(
         )
         .await
     {
-        Ok(response) => response,
+        Ok(response) => {
+            // Record acceptance separately from CLI completion. A later
+            // history outage must not treat "config delivery did not finish"
+            // as "this key was never sent".
+            enclava_cli::template_deploy_retry::mark_template_deploy_attempt_posted(
+                &ctx.paths,
+                &scope,
+                &instance_name,
+            )
+            .map_err(|err| -> Box<dyn std::error::Error> { err.into() })?;
+            drop(_deploy_lock);
+            response
+        }
         Err(error) => {
             // A completed rejection is stored server-side under this key for
             // the replay window. Drop the local copy so the next attempt can
@@ -628,6 +695,12 @@ async fn deploy_with_timings(
         &response,
         explicit_stable_endpoint.as_deref(),
     )?;
+    if let Some(mode) = resume_unlock_mode {
+        template.unlock_mode = mode;
+    }
+    if let Some(keys) = resume_managed_keys {
+        template.paas_managed_config_keys = keys;
+    }
     let customer_config_hold = response.customer_config_hold;
     let customer_config_hold_remaining_ms = response.customer_config_hold_remaining_ms;
     // cap#220 review: a missing `cap_deployment_id` must not become a
@@ -910,12 +983,10 @@ async fn deploy_with_timings(
             stable_endpoint: Some(stable_endpoint.as_str()),
             ssh_command: ssh_command.as_deref(),
             ssh_endpoint: ssh_endpoint.as_deref(),
-            log_key_id: prepared_log_key
+            log_key_id: output_log_key.as_ref().map(|key| key.key_id.as_str()),
+            log_private_key_file: output_log_key
                 .as_ref()
-                .map(|prepared| prepared.config.key_id.as_str()),
-            log_private_key_file: prepared_log_key
-                .as_ref()
-                .and_then(|prepared| prepared.private_key_file.as_deref()),
+                .and_then(|key| key.private_key_file.as_deref()),
             json: args.json,
         })?
     );
@@ -932,6 +1003,49 @@ async fn deploy_with_timings(
     )
     .map_err(|err| -> Box<dyn std::error::Error> { err.into() })?;
     Ok(())
+}
+
+struct OutputLogKey {
+    key_id: String,
+    private_key_file: Option<PathBuf>,
+}
+
+async fn lock_template_deploy(
+    paths: &CliPaths,
+    scope: &str,
+    instance_name: &str,
+) -> Result<enclava_cli::template_deploy_retry::TemplateDeployLock, Box<dyn std::error::Error>> {
+    let paths_for_try = paths.clone();
+    let scope_for_try = scope.to_string();
+    let name_for_try = instance_name.to_string();
+    let immediate = tokio::task::spawn_blocking(move || {
+        enclava_cli::template_deploy_retry::try_acquire_template_deploy_lock(
+            &paths_for_try,
+            &scope_for_try,
+            &name_for_try,
+        )
+    })
+    .await
+    .map_err(|err| format!("template deploy lock task failed: {err}"))??;
+    if let Some(guard) = immediate {
+        return Ok(guard);
+    }
+    eprintln!(
+        "another template deploy for `{instance_name}` is in progress on this machine; waiting for it before signing or posting"
+    );
+    let paths = paths.clone();
+    let scope = scope.to_string();
+    let instance_name = instance_name.to_string();
+    tokio::task::spawn_blocking(move || {
+        enclava_cli::template_deploy_retry::acquire_template_deploy_lock(
+            &paths,
+            &scope,
+            &instance_name,
+        )
+    })
+    .await
+    .map_err(|err| format!("template deploy lock task failed: {err}"))?
+    .map_err(|err| -> Box<dyn std::error::Error> { err.into() })
 }
 
 struct PreparedTemplateLogKey {
