@@ -225,14 +225,13 @@ pub fn unix_now() -> u64 {
 pub fn select_template_deploy_attempt(
     loaded: LoadedTemplateDeployAttempt,
     stable: &StableTemplateDeployInputs,
-    current_app_id: &str,
     deployments: &DeploymentListing,
     now_unix: u64,
 ) -> TemplateDeployAttempt {
     let unreadable = matches!(loaded, LoadedTemplateDeployAttempt::Unreadable);
     let usable = match loaded {
         LoadedTemplateDeployAttempt::Ready(stored)
-            if stored.app_id == current_app_id && stored.instance_name == stable.instance_name =>
+            if stored.instance_name == stable.instance_name =>
         {
             Some(stored)
         }
@@ -250,6 +249,15 @@ pub fn select_template_deploy_attempt(
 
     if let Some(stored) = usable {
         return select_stored_attempt(stored, stable, rows, &inflight, now_unix);
+    }
+
+    // An empty list is not proof a previous POST settled. A resume file we
+    // cannot read is the same hazard as a list outage: do not sign a new key.
+    if unreadable && rows.is_empty() {
+        return TemplateDeployAttempt::Refuse(format!(
+            "the stored template deploy request for `{}` is unreadable, and deployment history is empty, so it is not safe to sign a new one. A new deployment was not started. Retry when that request can be read, or destroy the app and deploy again.",
+            stable.instance_name
+        ));
     }
 
     if let Some(deployment) = inflight.first().copied() {
@@ -728,12 +736,19 @@ pub fn mark_template_deploy_attempt_completed(
     paths: &CliPaths,
     scope: &str,
     instance_name: &str,
+    deploy_id: &str,
 ) -> Result<(), String> {
     let LoadedTemplateDeployAttempt::Ready(mut stored) =
         load_template_deploy_attempt(paths, scope, instance_name)
     else {
         return Ok(());
     };
+    // A later invocation may have replaced this file after our POST. Stamping
+    // that newer attempt completed would make the next retry sign a fresh key
+    // while its row is still invisible.
+    if stored.deploy_id != deploy_id {
+        return Ok(());
+    }
     stored.completed = true;
     write_stored(paths, &stored)
 }
@@ -847,10 +862,9 @@ mod tests {
     fn select(
         loaded: LoadedTemplateDeployAttempt,
         stable: &StableTemplateDeployInputs,
-        app_id: &str,
         deployments: &DeploymentListing,
     ) -> TemplateDeployAttempt {
-        select_template_deploy_attempt(loaded, stable, app_id, deployments, NOW)
+        select_template_deploy_attempt(loaded, stable, deployments, NOW)
     }
 
     fn record() -> NewTemplateDeployAttempt {
@@ -870,7 +884,6 @@ mod tests {
         let attempt = select(
             LoadedTemplateDeployAttempt::Ready(Box::new(stored)),
             &stable,
-            "app-uuid",
             &listed(vec![row("deploy-1", "applying", Some("applying"))]),
         );
         let TemplateDeployAttempt::Replay {
@@ -914,7 +927,6 @@ mod tests {
         let attempt = select(
             LoadedTemplateDeployAttempt::Ready(Box::new(stored(&stable, "deploy-1"))),
             &stable,
-            "app-uuid",
             &listed(vec![]),
         );
         assert!(matches!(attempt, TemplateDeployAttempt::Replay { .. }));
@@ -933,7 +945,6 @@ mod tests {
             let attempt = select(
                 LoadedTemplateDeployAttempt::Ready(Box::new(stored(&stable, "deploy-1"))),
                 &stable,
-                "app-uuid",
                 &listed(vec![row("deploy-1", status, Some(status))]),
             );
             assert!(
@@ -949,7 +960,6 @@ mod tests {
         let attempt = select(
             LoadedTemplateDeployAttempt::Ready(Box::new(stored(&stable, "deploy-1"))),
             &stable,
-            "app-uuid",
             &listed(vec![row("deploy-1", "stale", Some("healthy"))]),
         );
         assert!(matches!(attempt, TemplateDeployAttempt::Fresh));
@@ -962,7 +972,6 @@ mod tests {
             let attempt = select(
                 LoadedTemplateDeployAttempt::Ready(Box::new(stored(&stable, "deploy-1"))),
                 &stable,
-                "app-uuid",
                 &listed(vec![row("deploy-1", status, reconciled)]),
             );
             assert!(
@@ -978,7 +987,6 @@ mod tests {
         let attempt = select(
             LoadedTemplateDeployAttempt::Absent,
             &stable,
-            "app-uuid",
             &listed(vec![row("deploy-9", "pending", None)]),
         );
         let TemplateDeployAttempt::Refuse(message) = attempt else {
@@ -996,7 +1004,6 @@ mod tests {
         let attempt = select(
             LoadedTemplateDeployAttempt::Ready(Box::new(stored(&stable, "deploy-1"))),
             &changed,
-            "app-uuid",
             &listed(vec![row("other-id", "watching", Some("watching"))]),
         );
         assert!(matches!(attempt, TemplateDeployAttempt::Refuse(_)));
@@ -1010,7 +1017,6 @@ mod tests {
         let attempt = select(
             LoadedTemplateDeployAttempt::Ready(Box::new(stored(&stable, "deploy-1"))),
             &changed,
-            "app-uuid",
             &listed(vec![]),
         );
         let TemplateDeployAttempt::Refuse(message) = attempt else {
@@ -1030,7 +1036,6 @@ mod tests {
         let attempt = select(
             LoadedTemplateDeployAttempt::Ready(Box::new(stored)),
             &changed,
-            "app-uuid",
             &listed(vec![]),
         );
         assert!(matches!(attempt, TemplateDeployAttempt::Fresh));
@@ -1045,22 +1050,54 @@ mod tests {
         let attempt = select(
             LoadedTemplateDeployAttempt::Ready(Box::new(stored)),
             &stable,
-            "app-uuid",
             &listed(vec![]),
         );
         assert!(matches!(attempt, TemplateDeployAttempt::Fresh));
     }
 
     #[test]
-    fn recreated_app_does_not_replay_the_previous_descriptor() {
+    fn app_id_flip_before_the_row_is_visible_still_replays() {
         let stable = stable();
+        let mut stored = stored(&stable, "deploy-1");
+        stored.app_id = "cap-app-uuid".to_string();
         let attempt = select(
-            LoadedTemplateDeployAttempt::Ready(Box::new(stored(&stable, "deploy-1"))),
+            LoadedTemplateDeployAttempt::Ready(Box::new(stored)),
             &stable,
-            "new-app-uuid",
+            &listed(vec![]),
+        );
+        assert!(
+            matches!(attempt, TemplateDeployAttempt::Replay { .. }),
+            "a changed app id is not evidence the signed request settled"
+        );
+    }
+
+    #[test]
+    fn app_id_mismatch_past_the_replay_window_may_sign_fresh() {
+        let stable = stable();
+        let mut stored = stored(&stable, "deploy-1");
+        stored.app_id = "old-app-uuid".to_string();
+        stored.created_at_unix = NOW - TEMPLATE_DEPLOY_REPLAY_WINDOW_SECS - 1;
+        let attempt = select(
+            LoadedTemplateDeployAttempt::Ready(Box::new(stored)),
+            &stable,
             &listed(vec![]),
         );
         assert!(matches!(attempt, TemplateDeployAttempt::Fresh));
+    }
+
+    #[test]
+    fn unreadable_resume_file_with_an_empty_list_does_not_sign_fresh() {
+        let stable = stable();
+        let attempt = select(
+            LoadedTemplateDeployAttempt::Unreadable,
+            &stable,
+            &listed(vec![]),
+        );
+        let TemplateDeployAttempt::Refuse(message) = attempt else {
+            panic!("an unreadable resume file must not be treated as absent");
+        };
+        assert!(message.contains("unreadable"), "{message}");
+        assert!(message.contains("was not started"), "{message}");
     }
 
     #[test]
@@ -1069,14 +1106,12 @@ mod tests {
         let replay = select(
             LoadedTemplateDeployAttempt::Ready(Box::new(stored(&stable, "deploy-1"))),
             &stable,
-            "app-uuid",
             &DeploymentListing::Unavailable,
         );
         assert!(matches!(replay, TemplateDeployAttempt::Replay { .. }));
         let first = select(
             LoadedTemplateDeployAttempt::Absent,
             &stable,
-            "app-uuid",
             &DeploymentListing::Unavailable,
         );
         assert!(matches!(first, TemplateDeployAttempt::Fresh));
@@ -1091,7 +1126,6 @@ mod tests {
         let attempt = select(
             LoadedTemplateDeployAttempt::Ready(Box::new(stored)),
             &stable,
-            "app-uuid",
             &DeploymentListing::Unavailable,
         );
         let TemplateDeployAttempt::Refuse(message) = attempt else {
@@ -1110,7 +1144,6 @@ mod tests {
         let attempt = select(
             LoadedTemplateDeployAttempt::Ready(Box::new(stored)),
             &stable,
-            "app-uuid",
             &DeploymentListing::Unavailable,
         );
         assert!(matches!(attempt, TemplateDeployAttempt::Refuse(_)));
@@ -1259,7 +1292,6 @@ mod tests {
         let attempt = select(
             LoadedTemplateDeployAttempt::Ready(Box::new(stored(&stable, "deploy-1"))),
             &stable,
-            "app-uuid",
             &listed(vec![row("deploy-2", "applying", Some("applying"))]),
         );
         let TemplateDeployAttempt::Refuse(message) = attempt else {
@@ -1300,7 +1332,6 @@ mod tests {
         let attempt = select(
             LoadedTemplateDeployAttempt::Ready(Box::new(stored)),
             &stable,
-            "app-uuid",
             &DeploymentListing::Unavailable,
         );
         assert!(matches!(attempt, TemplateDeployAttempt::Refuse(_)));
@@ -1314,7 +1345,6 @@ mod tests {
         let attempt = select(
             LoadedTemplateDeployAttempt::Ready(Box::new(stored)),
             &stable,
-            "app-uuid",
             &listed(vec![]),
         );
         assert!(matches!(attempt, TemplateDeployAttempt::Fresh));
@@ -1383,6 +1413,47 @@ mod tests {
             load_template_deploy_attempt(&paths, "org:org-1", "shell"),
             LoadedTemplateDeployAttempt::Absent
         ));
+    }
+
+    #[test]
+    fn completion_does_not_stamp_a_newer_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = CliPaths::from_root(dir.path().to_path_buf()).unwrap();
+        let stable = stable();
+        let request = request_from(&stable, "descriptor-a");
+        save_template_deploy_attempt(
+            &paths,
+            "org:org-1",
+            "app-uuid",
+            "deploy-1",
+            &request,
+            &record(),
+        )
+        .unwrap();
+        save_template_deploy_attempt(
+            &paths,
+            "org:org-1",
+            "app-uuid",
+            "deploy-2",
+            &request,
+            &record(),
+        )
+        .unwrap();
+        mark_template_deploy_attempt_completed(&paths, "org:org-1", "shell", "deploy-1").unwrap();
+        let LoadedTemplateDeployAttempt::Ready(stored) =
+            load_template_deploy_attempt(&paths, "org:org-1", "shell")
+        else {
+            panic!("newer attempt must still load");
+        };
+        assert_eq!(stored.deploy_id, "deploy-2");
+        assert!(!stored.completed);
+        mark_template_deploy_attempt_completed(&paths, "org:org-1", "shell", "deploy-2").unwrap();
+        let LoadedTemplateDeployAttempt::Ready(stored) =
+            load_template_deploy_attempt(&paths, "org:org-1", "shell")
+        else {
+            panic!("completed attempt must still load");
+        };
+        assert!(stored.completed);
     }
 
     #[test]

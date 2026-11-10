@@ -479,9 +479,9 @@ async fn deploy_with_timings(
         ctx.cli_config.org.as_deref(),
         api.origin(),
     );
-    // Hold this across load/list/sign/save/POST. The atomic resume-file
-    // write does not cover that sequence, so two invocations can otherwise
-    // both observe an empty history and POST different idempotency keys.
+    // Hold this until the command returns, including completion. Dropping it
+    // after the POST lets a second invocation save a new attempt that this
+    // command would then stamp completed.
     let _deploy_lock = lock_template_deploy(&ctx.paths, &scope, &instance_name).await?;
     let loaded = enclava_cli::template_deploy_retry::load_template_deploy_attempt(
         &ctx.paths,
@@ -514,7 +514,6 @@ async fn deploy_with_timings(
     let attempt = enclava_cli::template_deploy_retry::select_template_deploy_attempt(
         loaded,
         &stable,
-        &app.id,
         &deployments,
         enclava_cli::template_deploy_retry::unix_now(),
     );
@@ -667,7 +666,6 @@ async fn deploy_with_timings(
                 &instance_name,
             )
             .map_err(|err| -> Box<dyn std::error::Error> { err.into() })?;
-            drop(_deploy_lock);
             response
         }
         Err(error) => {
@@ -1000,6 +998,7 @@ async fn deploy_with_timings(
         &ctx.paths,
         &scope,
         &instance_name,
+        &trusted_deployment.deploy_id,
     )
     .map_err(|err| -> Box<dyn std::error::Error> { err.into() })?;
     Ok(())
