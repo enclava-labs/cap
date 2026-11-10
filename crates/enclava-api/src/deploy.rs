@@ -6927,8 +6927,14 @@ pub async fn reapply_tenant_ingress(
     let cm = enclava_engine::manifest::ingress::generate_ingress_configmap(&app_spec);
 
     let ledger = crate::deployment_failure_cleanup::load_creation_ledger(pool, app.id).await?;
-    let engine =
-        ApplyEngine::new(client.clone(), ApplyConfig::default()).with_creation_ledger(ledger);
+    let sink = std::sync::Arc::new(crate::compensation_reconcile::DbCompensationSink::new(
+        pool.clone(),
+        app.id,
+        deployment_id,
+    ));
+    let engine = ApplyEngine::new(client.clone(), ApplyConfig::default())
+        .with_creation_ledger(ledger)
+        .with_compensation_sink(sink);
     // Domain-only reapply: the pod restart re-opens existing volumes, so the
     // base rollout budget applies — the fresh-initialization allowance is
     // reserved for renders that provision a new claim.
@@ -7427,7 +7433,14 @@ pub async fn apply_deployment_manifests(
     // fails the apply closed — nothing has been written yet.
     let engine = {
         let ledger = crate::deployment_failure_cleanup::load_creation_ledger(&pool, app.id).await?;
-        engine.with_creation_ledger(ledger)
+        let sink = std::sync::Arc::new(crate::compensation_reconcile::DbCompensationSink::new(
+            pool.clone(),
+            app.id,
+            deployment_id,
+        ));
+        engine
+            .with_creation_ledger(ledger)
+            .with_compensation_sink(sink)
     };
     mutation
         .arm_resource_scope_until_reconciled("kubernetes_namespace")

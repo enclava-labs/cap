@@ -14,6 +14,7 @@ use kube::{
 use serde::{Serialize, de::DeserializeOwned};
 use std::{fmt::Debug, time::Duration};
 
+use super::compensation::UnresolvedCompensationRecord;
 use super::creation_ledger::{CreationRecord, LineageProvenance, creation_lineage_provenance};
 use super::engine::{ApplyEngine, ApplyError};
 use super::fields_v1::flatten_owned_paths;
@@ -69,13 +70,25 @@ fn conflict_retry_delay(attempt: usize) -> Duration {
 /// a timeout is UNRESOLVED, not success — reported loudly below with a
 /// stable `error_code` so operators can find the object (the failed-apply
 /// cleanup will not remove it: it fails the creation-evidence gate).
-pub(super) async fn compensate_created_object<K>(api: &Api<K>, name: &str, created: &K)
-where
-    K: Resource + Clone + Debug + DeserializeOwned,
+///
+/// cap#254: the POST-returned UID is written through the engine's
+/// compensation sink BEFORE the DELETE is issued and before this function
+/// returns. A crash during the DELETE is then recoverable. A sink that is
+/// missing or whose write fails is not treated as recorded (`compensation_record_unpersisted`);
+/// the UID-pinned DELETE is still attempted while the UID is in hand, and
+/// the apply stays failed. A name-only DELETE is never issued.
+pub(super) async fn compensate_created_object<K>(
+    engine: &ApplyEngine,
+    api: &Api<K>,
+    name: &str,
+    created: &K,
+    generation: MutationGeneration,
+) where
+    K: Resource + Clone + Debug + DeserializeOwned + Serialize,
 {
     // grok (minor): a missing UID would leave the precondition unpinned —
     // never issue a name-only DELETE that could hit a same-named
-    // replacement. Fail loudly instead.
+    // replacement. Fail loudly instead. There is nothing durable to record.
     let Some(uid) = created.meta().uid.clone() else {
         tracing::error!(
             kind = kind::<K>(),
@@ -85,7 +98,18 @@ where
         );
         return;
     };
-    let deadline = tokio::time::Instant::now() + COMPENSATE_TOTAL_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + engine.compensation_budget();
+    let record = UnresolvedCompensationRecord {
+        kind: observed_kind(created),
+        namespace: api.namespace().map(str::to_string),
+        name: name.to_string(),
+        uid: uid.clone(),
+        mutation_generation: generation.get(),
+    };
+    // Persist before the DELETE. A crash or timeout during the DELETE must
+    // not be the moment the UID is lost. A failed write is fail-closed only
+    // if the DELETE also stays unresolved: a confirmed absence needs no row.
+    let persisted = persist_unresolved_compensation(engine, &record, deadline).await;
     let mut accepted = false;
     for attempt in 0..3 {
         let params = DeleteParams {
@@ -100,16 +124,22 @@ where
                 accepted = true;
                 break;
             }
-            Err(CompensationError::Gone) => return,
+            Err(CompensationError::Gone) => {
+                clear_resolved_compensation(engine, &uid).await;
+                return;
+            }
             Err(CompensationError::Timeout) => {
                 // devin 🔴: budget exhausted while the API server stalls.
                 // Stop hammering it: the fence hold is the cost, and the
                 // object is unresolved either way.
+                note_unpersisted(persisted, &record);
                 tracing::error!(
                     kind = kind::<K>(),
                     name,
+                    uid = %uid,
+                    persisted,
                     error_code = "compensation_timeout_unresolved",
-                    "compensating delete of a just-created object exceeded its bounded budget; leaving the object unresolved — failed-apply cleanup will NOT remove it, manual removal required"
+                    "compensating delete of a just-created object exceeded its bounded budget; leaving the object unresolved — failed-apply cleanup will NOT remove it by name"
                 );
                 return;
             }
@@ -129,9 +159,12 @@ where
         }
     }
     if !accepted {
+        note_unpersisted(persisted, &record);
         tracing::error!(
             kind = kind::<K>(),
             name,
+            uid = %uid,
+            persisted,
             error_code = "compensation_delete_unresolved",
             "compensating delete failed; the object may remain without valid creation evidence"
         );
@@ -140,38 +173,59 @@ where
     // grok (minor): an accepted DELETE can sit on a finalizer, and the
     // failed-apply cleanup will never remove this object afterwards (it
     // fails the creation-evidence gate). Confirm actual absence before
-    // returning; a stuck object needs manual removal, so say so loudly.
+    // returning; a stuck object needs the durable UID, so say so loudly.
     for wait in 0..5 {
         if tokio::time::Instant::now() + Duration::from_secs(2) >= deadline {
             break;
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
         match bounded_compensation(deadline, api.get_opt(name)).await {
-            Ok(None) => return,
-            Ok(Some(_)) => {
-                if wait == 4 {
+            Ok(None) => {
+                clear_resolved_compensation(engine, &uid).await;
+                return;
+            }
+            Ok(Some(live)) => {
+                // A same-named replacement has a different UID. Do not keep
+                // polling it as if it were the object we created, and do not
+                // delete it. The recorded UID remains for the reconciler,
+                // which will observe the mismatch and refuse the delete.
+                if live.meta().uid.as_deref() != Some(uid.as_str()) {
+                    note_unpersisted(persisted, &record);
                     tracing::error!(
                         kind = kind::<K>(),
                         name,
+                        uid = %uid,
                         error_code = "compensation_delete_unresolved",
-                        "compensating delete was accepted but the object is not gone (finalizer?); failed-apply cleanup will NOT remove it — manual removal required"
+                        "name is now a different UID; refusing to treat the replacement as the compensated object"
+                    );
+                    return;
+                }
+                if wait == 4 {
+                    note_unpersisted(persisted, &record);
+                    tracing::error!(
+                        kind = kind::<K>(),
+                        name,
+                        uid = %uid,
+                        persisted,
+                        error_code = "compensation_delete_unresolved",
+                        "compensating delete was accepted but the object is not gone (finalizer?); failed-apply cleanup will NOT remove it by name"
                     );
                 }
             }
             Err(CompensationError::Timeout) => {
+                note_unpersisted(persisted, &record);
                 tracing::error!(
                     kind = kind::<K>(),
                     name,
+                    uid = %uid,
+                    persisted,
                     error_code = "compensation_timeout_unresolved",
-                    "could not confirm compensating delete removed the object within the bounded budget; leaving it unresolved — manual removal required"
+                    "could not confirm compensating delete removed the object within the bounded budget; leaving it unresolved"
                 );
                 return;
             }
             Err(CompensationError::Gone) | Err(CompensationError::Kube(_)) => {
-                // Gone cannot occur on get_opt; a transport failure on the
-                // confirming read leaves the outcome undecidable within the
-                // budget — report it and stop (the earlier log lines carry
-                // the reconciliation evidence).
+                note_unpersisted(persisted, &record);
                 tracing::warn!(
                     kind = kind::<K>(),
                     name,
@@ -181,6 +235,89 @@ where
             }
         }
     }
+    note_unpersisted(persisted, &record);
+}
+
+fn note_unpersisted(persisted: bool, record: &UnresolvedCompensationRecord) {
+    if persisted {
+        return;
+    }
+    tracing::error!(
+        kind = %record.kind,
+        name = %record.name,
+        uid = %record.uid,
+        error_code = "compensation_record_unpersisted",
+        "unresolved compensation left the apply path without a durable POST-returned UID; failing closed — the object will not be deleted by name"
+    );
+}
+
+/// Write the POST-returned UID before the compensating DELETE. Retries stay
+/// inside the compensation budget. `false` means the record is not durable —
+/// the caller must not treat the compensation as recorded.
+async fn persist_unresolved_compensation(
+    engine: &ApplyEngine,
+    record: &UnresolvedCompensationRecord,
+    deadline: tokio::time::Instant,
+) -> bool {
+    let Some(sink) = engine.compensation_sink() else {
+        return false;
+    };
+    for attempt in 0..3 {
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        match sink.persist(record).await {
+            Ok(()) => return true,
+            Err(error) => {
+                tracing::warn!(
+                    kind = %record.kind,
+                    name = %record.name,
+                    uid = %record.uid,
+                    attempt,
+                    error = %error,
+                    "durable compensation record write failed; retrying"
+                );
+                if tokio::time::Instant::now() + conflict_retry_delay(attempt) >= deadline {
+                    return false;
+                }
+                tokio::time::sleep(conflict_retry_delay(attempt)).await;
+            }
+        }
+    }
+    false
+}
+
+/// Best-effort clear after the object is confirmed absent. A failed clear
+/// leaves the row; the reconciler observes 404 and resolves it. Never a
+/// reason to issue another delete.
+async fn clear_resolved_compensation(engine: &ApplyEngine, uid: &str) {
+    let Some(sink) = engine.compensation_sink() else {
+        return;
+    };
+    if let Err(error) = sink.clear_resolved(uid).await {
+        tracing::warn!(
+            uid,
+            error = %error,
+            error_code = "compensation_resolve_unpersisted",
+            "object is gone but the compensation row could not be cleared; reconciliation will observe absence"
+        );
+    }
+}
+
+fn observed_kind<K>(created: &K) -> String
+where
+    K: Resource + Serialize,
+{
+    serde_json::to_value(created)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .filter(|kind| !kind.is_empty())
+        .unwrap_or_else(|| kind::<K>())
 }
 
 /// Total budget for one compensating delete + absence confirmation. Sized
@@ -1126,7 +1263,7 @@ where
                     if let Err(verify_error) = verify_applied_generation(&applied, generation)
                         .and_then(|()| verify_creation_evidence(&applied, generation))
                     {
-                        compensate_created_object(api, name, &applied).await;
+                        compensate_created_object(engine, api, name, &applied, generation).await;
                         return Err(verify_error);
                     }
                     // cap#272: record the creation at the only moment it is

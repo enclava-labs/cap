@@ -1,4 +1,5 @@
 pub mod cleanup;
+pub mod compensation;
 pub mod creation_ledger;
 pub mod drift;
 pub mod engine;
