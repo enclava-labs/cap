@@ -76,7 +76,16 @@ fn conflict_retry_delay(attempt: usize) -> Duration {
 /// returns. A crash during the DELETE is then recoverable. A sink that is
 /// missing or whose write fails is not treated as recorded (`compensation_record_unpersisted`);
 /// the UID-pinned DELETE is still attempted while the UID is in hand, and
-/// the apply stays failed. A name-only DELETE is never issued.
+/// the apply stays failed. A name-only DELETE is never issued. The sink
+/// write itself is bounded by the same deadline: a stalled query must not
+/// hold the mutation lease past the compensation budget.
+///
+/// A controller can bump resourceVersion before the DELETE without advancing
+/// the mutation generation. A 409 re-reads and retries only while the UID
+/// still matches and the generation has not advanced, using the fresh
+/// resourceVersion and the original deadline. It never drops the pin.
+/// Propagation is Orphan: Background GC would treat a tenant-written
+/// ownerReference as deletion authority (cap#254 review).
 pub(super) async fn compensate_created_object<K>(
     engine: &ApplyEngine,
     api: &Api<K>,
@@ -111,21 +120,28 @@ pub(super) async fn compensate_created_object<K>(
     // if the DELETE also stays unresolved: a confirmed absence needs no row.
     let persisted = persist_unresolved_compensation(engine, &record, deadline).await;
     let mut accepted = false;
+    // Start from the POST response version. A 409 refreshes it from a live
+    // read; a missing version is never invented, and a conflict never drops
+    // the pin to make the delete succeed.
+    let mut pinned_version = created
+        .meta()
+        .resource_version
+        .clone()
+        .filter(|version| !version.is_empty());
     for attempt in 0..3 {
         let params = DeleteParams {
             preconditions: Some(Preconditions {
                 uid: Some(uid.clone()),
-                // Pin the POST response version too. A same-UID write between
-                // this response and the DELETE must 409 instead of being
-                // destroyed. The reconciler repeats that check after the
+                // Pin the version observed for this attempt. A same-UID write
+                // between the observation and the DELETE must 409 instead of
+                // being destroyed. The reconciler repeats that check after the
                 // fence is released (cap#254).
-                resource_version: created
-                    .meta()
-                    .resource_version
-                    .clone()
-                    .filter(|version| !version.is_empty()),
+                resource_version: pinned_version.clone(),
             }),
-            ..DeleteParams::default()
+            // Same rule as the adopted-namespace sweep: Background GC would
+            // delete a tenant PVC that attached this UID as an ownerReference.
+            // Orphan dependents; do not cascade.
+            ..DeleteParams::orphan()
         };
         match bounded_compensation(deadline, api.delete(name, &params)).await {
             Ok(_) => {
@@ -133,7 +149,7 @@ pub(super) async fn compensate_created_object<K>(
                 break;
             }
             Err(CompensationError::Gone) => {
-                clear_resolved_compensation(engine, &uid).await;
+                clear_resolved_compensation(engine, &uid, deadline).await;
                 return;
             }
             Err(CompensationError::Timeout) => {
@@ -150,6 +166,39 @@ pub(super) async fn compensate_created_object<K>(
                     "compensating delete of a just-created object exceeded its bounded budget; leaving the object unresolved — failed-apply cleanup will NOT remove it by name"
                 );
                 return;
+            }
+            Err(CompensationError::Kube(error)) if is_conflict(&error) => {
+                // A controller (or any same-UID writer) can change
+                // resourceVersion without advancing the mutation generation.
+                // Retry only when a fresh read still shows this UID and the
+                // generation has not advanced. Preserve the original deadline.
+                // Never fall back to a name-only or UID-only DELETE.
+                match refresh_compensation_target(deadline, api, name, &uid, generation).await {
+                    CompensationRefresh::Gone => {
+                        clear_resolved_compensation(engine, &uid, deadline).await;
+                        return;
+                    }
+                    CompensationRefresh::Refused(code) => {
+                        note_unpersisted(persisted, &record);
+                        tracing::error!(
+                            kind = kind::<K>(),
+                            name,
+                            uid = %uid,
+                            persisted,
+                            error_code = code,
+                            "compensating delete conflicted and the live object is no longer the failed create; refusing a name-only or UID-only delete"
+                        );
+                        return;
+                    }
+                    CompensationRefresh::Retry(version) => {
+                        pinned_version = Some(version);
+                        if tokio::time::Instant::now() >= deadline {
+                            break;
+                        }
+                        continue;
+                    }
+                    CompensationRefresh::Unreadable => break,
+                }
             }
             Err(CompensationError::Kube(error)) => {
                 tracing::warn!(
@@ -189,7 +238,7 @@ pub(super) async fn compensate_created_object<K>(
         tokio::time::sleep(Duration::from_secs(2)).await;
         match bounded_compensation(deadline, api.get_opt(name)).await {
             Ok(None) => {
-                clear_resolved_compensation(engine, &uid).await;
+                clear_resolved_compensation(engine, &uid, deadline).await;
                 return;
             }
             Ok(Some(live)) => {
@@ -259,9 +308,82 @@ fn note_unpersisted(persisted: bool, record: &UnresolvedCompensationRecord) {
     );
 }
 
-/// Write the POST-returned UID before the compensating DELETE. Retries stay
-/// inside the compensation budget. `false` means the record is not durable —
-/// the caller must not treat the compensation as recorded.
+/// Outcome of re-reading a compensation target after a 409.
+enum CompensationRefresh {
+    Gone,
+    /// UID mismatch or a newer mutation generation. Do not delete.
+    Refused(&'static str),
+    /// Same UID, generation not newer. Pin this resourceVersion.
+    Retry(String),
+    /// Could not re-read a pinnable version. Do not issue another delete.
+    Unreadable,
+}
+
+async fn refresh_compensation_target<K>(
+    deadline: tokio::time::Instant,
+    api: &Api<K>,
+    name: &str,
+    uid: &str,
+    generation: MutationGeneration,
+) -> CompensationRefresh
+where
+    K: Resource + Clone + Debug + DeserializeOwned,
+{
+    match bounded_compensation(deadline, api.get_opt(name)).await {
+        Ok(None) | Err(CompensationError::Gone) => CompensationRefresh::Gone,
+        Ok(Some(live)) => classify_compensation_refresh(&live, uid, generation),
+        Err(CompensationError::Timeout) | Err(CompensationError::Kube(_)) => {
+            CompensationRefresh::Unreadable
+        }
+    }
+}
+
+fn is_conflict(error: &kube::Error) -> bool {
+    matches!(error, kube::Error::Api(status) if status.code == 409)
+}
+
+fn classify_compensation_refresh<K>(
+    live: &K,
+    uid: &str,
+    generation: MutationGeneration,
+) -> CompensationRefresh
+where
+    K: Resource,
+{
+    if live.meta().uid.as_deref() != Some(uid) {
+        return CompensationRefresh::Refused("compensation_uid_mismatch");
+    }
+    // Missing or equal generation has not advanced: a webhook may have
+    // stripped the stamp. Only a strictly newer annotation means a later
+    // apply adopted this UID.
+    if live
+        .meta()
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(MUTATION_GENERATION_ANNOTATION))
+        .and_then(|raw| raw.parse::<i64>().ok())
+        .is_some_and(|actual| actual > generation.get())
+    {
+        return CompensationRefresh::Refused("compensation_later_generation");
+    }
+    match live
+        .meta()
+        .resource_version
+        .clone()
+        .filter(|version| !version.is_empty())
+    {
+        Some(version) => CompensationRefresh::Retry(version),
+        // A fresh read without a version must not become a UID-only delete.
+        None => CompensationRefresh::Unreadable,
+    }
+}
+
+/// Write the POST-returned UID before the compensating DELETE. Retries of a
+/// fast error stay inside the compensation budget. A stalled write is bounded
+/// by that same deadline (and the per-request cap) and is not retried: the
+/// stall already consumed a request slot, and the UID-pinned DELETE must
+/// still run while the UID is in hand. `false` means the record is not
+/// durable — the caller must not treat the compensation as recorded.
 async fn persist_unresolved_compensation(
     engine: &ApplyEngine,
     record: &UnresolvedCompensationRecord,
@@ -274,9 +396,10 @@ async fn persist_unresolved_compensation(
         if tokio::time::Instant::now() >= deadline {
             return false;
         }
-        match sink.persist(record).await {
-            Ok(()) => return true,
-            Err(error) => {
+        let per_request = tokio::time::Instant::now() + COMPENSATE_REQUEST_TIMEOUT;
+        match tokio::time::timeout_at(deadline.min(per_request), sink.persist(record)).await {
+            Ok(Ok(())) => return true,
+            Ok(Err(error)) => {
                 tracing::warn!(
                     kind = %record.kind,
                     name = %record.name,
@@ -290,25 +413,59 @@ async fn persist_unresolved_compensation(
                 }
                 tokio::time::sleep(conflict_retry_delay(attempt)).await;
             }
+            Err(_) => {
+                tracing::error!(
+                    kind = %record.kind,
+                    name = %record.name,
+                    uid = %record.uid,
+                    error_code = "compensation_persist_timeout",
+                    "durable compensation record write exceeded the compensation budget; failing closed — the UID-pinned delete is still attempted while the UID is in hand"
+                );
+                return false;
+            }
         }
     }
     false
 }
 
-/// Best-effort clear after the object is confirmed absent. A failed clear
-/// leaves the row; the reconciler observes 404 and resolves it. Never a
-/// reason to issue another delete.
-async fn clear_resolved_compensation(engine: &ApplyEngine, uid: &str) {
+/// Best-effort clear after the object is confirmed absent. A failed or
+/// timed-out clear leaves the row; the reconciler observes 404 and resolves
+/// it. Never a reason to issue another delete, and never a reason to hold
+/// the mutation lease past the compensation deadline.
+async fn clear_resolved_compensation(
+    engine: &ApplyEngine,
+    uid: &str,
+    deadline: tokio::time::Instant,
+) {
     let Some(sink) = engine.compensation_sink() else {
         return;
     };
-    if let Err(error) = sink.clear_resolved(uid).await {
+    if tokio::time::Instant::now() >= deadline {
         tracing::warn!(
             uid,
-            error = %error,
             error_code = "compensation_resolve_unpersisted",
-            "object is gone but the compensation row could not be cleared; reconciliation will observe absence"
+            "object is gone but the compensation deadline elapsed before the row could be cleared; reconciliation will observe absence"
         );
+        return;
+    }
+    let per_request = tokio::time::Instant::now() + COMPENSATE_REQUEST_TIMEOUT;
+    match tokio::time::timeout_at(deadline.min(per_request), sink.clear_resolved(uid)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(
+                uid,
+                error = %error,
+                error_code = "compensation_resolve_unpersisted",
+                "object is gone but the compensation row could not be cleared; reconciliation will observe absence"
+            );
+        }
+        Err(_) => {
+            tracing::warn!(
+                uid,
+                error_code = "compensation_resolve_timeout",
+                "object is gone but clearing the compensation row exceeded the compensation budget; reconciliation will observe absence"
+            );
+        }
     }
 }
 

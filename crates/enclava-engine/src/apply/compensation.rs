@@ -61,6 +61,7 @@ mod tests {
         records: Mutex<Vec<UnresolvedCompensationRecord>>,
         events: Arc<Mutex<Vec<&'static str>>>,
         fail: bool,
+        hang: bool,
     }
 
     impl UnresolvedCompensationSink for MemorySink {
@@ -70,6 +71,9 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
             Box::pin(async move {
                 self.events.lock().expect("events").push("persist");
+                if self.hang {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                }
                 if self.fail {
                     return Err("db down".to_string());
                 }
@@ -128,8 +132,9 @@ mod tests {
                         assert!(
                             payload.contains(uid)
                                 && payload.contains("preconditions")
-                                && payload.contains("resourceVersion"),
-                            "delete was not pinned to UID and resourceVersion: {payload}"
+                                && payload.contains("resourceVersion")
+                                && payload.contains("Orphan"),
+                            "delete was not pinned to UID and resourceVersion with orphan propagation: {payload}"
                         );
                         if hang_delete {
                             tokio::time::sleep(Duration::from_secs(30)).await;
@@ -189,6 +194,7 @@ mod tests {
             records: Mutex::new(Vec::new()),
             events: Arc::clone(&events),
             fail: false,
+            hang: false,
         });
         let engine = engine(Arc::clone(&events), Arc::clone(&sink), true);
         let api: Api<ConfigMap> = Api::namespaced(engine.client().clone(), "tenant-ns");
@@ -242,6 +248,7 @@ mod tests {
             records: Mutex::new(Vec::new()),
             events: Arc::clone(&events),
             fail: false,
+            hang: false,
         });
         let engine = engine(events, Arc::clone(&sink), true);
         let namespace: Namespace = serde_json::from_value(json!({
@@ -280,6 +287,7 @@ mod tests {
             records: Mutex::new(Vec::new()),
             events: Arc::clone(&events),
             fail: true,
+            hang: false,
         });
         let engine = ApplyEngine::new(
             client(Arc::clone(&events), "post-uid-254", false),
@@ -310,6 +318,233 @@ mod tests {
         assert!(
             events.contains(&"delete"),
             "UID-pinned delete still attempted: {events:?}"
+        );
+    }
+
+    #[derive(Clone, Copy)]
+    enum LiveAfterPost {
+        SameUid,
+        LaterGeneration,
+        DifferentUid,
+    }
+
+    fn conflict_client(deletes: Arc<Mutex<Vec<String>>>, live: LiveAfterPost) -> Client {
+        let posted = Arc::new(Mutex::new(false));
+        let gone = Arc::new(Mutex::new(false));
+        Client::new(
+            service_fn(move |request: Request<kube::client::Body>| {
+                let deletes = Arc::clone(&deletes);
+                let posted = Arc::clone(&posted);
+                let gone = Arc::clone(&gone);
+                async move {
+                    let method = request.method().clone();
+                    let body = request.into_body().collect().await.unwrap().to_bytes();
+                    if method == Method::GET {
+                        if !*posted.lock().expect("posted") || *gone.lock().expect("gone") {
+                            return Ok::<_, std::io::Error>(status(StatusCode::NOT_FOUND));
+                        }
+                        let (uid, generation) = match live {
+                            LiveAfterPost::SameUid => ("post-uid-254", None),
+                            LiveAfterPost::LaterGeneration => ("post-uid-254", Some(99_i64)),
+                            LiveAfterPost::DifferentUid => ("replacement-uid", None),
+                        };
+                        let mut annotations = serde_json::Map::new();
+                        if let Some(generation) = generation {
+                            annotations.insert(
+                                crate::apply::generation::MUTATION_GENERATION_ANNOTATION
+                                    .to_string(),
+                                json!(generation.to_string()),
+                            );
+                        }
+                        let object = json!({
+                            "apiVersion": "v1",
+                            "kind": "ConfigMap",
+                            "metadata": {
+                                "name": "pull-secret",
+                                "namespace": "tenant-ns",
+                                "uid": uid,
+                                "resourceVersion": "2",
+                                "annotations": annotations,
+                            }
+                        });
+                        return Ok(json_response(StatusCode::OK, &object));
+                    }
+                    if method == Method::POST {
+                        *posted.lock().expect("posted") = true;
+                        let payload: Value = serde_json::from_slice(&body).unwrap();
+                        let response = stripped_create_response(payload, "post-uid-254");
+                        return Ok(json_response(StatusCode::CREATED, &response));
+                    }
+                    if method == Method::DELETE {
+                        let payload = String::from_utf8_lossy(&body).to_string();
+                        deletes.lock().expect("deletes").push(payload.clone());
+                        let options: Value = serde_json::from_str(&payload).unwrap();
+                        let version = options
+                            .pointer("/preconditions/resourceVersion")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        let uid = options
+                            .pointer("/preconditions/uid")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        // Only a fresh pin of the original UID succeeds. A stale
+                        // version, a missing pin, or any other UID conflicts.
+                        if version == "2"
+                            && uid == "post-uid-254"
+                            && matches!(live, LiveAfterPost::SameUid)
+                        {
+                            *gone.lock().expect("gone") = true;
+                            return Ok(json_response(
+                                StatusCode::OK,
+                                &json!({
+                                    "apiVersion": "v1",
+                                    "kind": "ConfigMap",
+                                    "metadata": {
+                                        "name": "pull-secret",
+                                        "namespace": "tenant-ns",
+                                        "uid": "post-uid-254",
+                                        "resourceVersion": "2"
+                                    }
+                                }),
+                            ));
+                        }
+                        return Ok(status(StatusCode::CONFLICT));
+                    }
+                    Err(std::io::Error::other(format!("unexpected {method}")))
+                }
+            }),
+            "default",
+        )
+    }
+
+    async fn expect_stripped_configmap_failure(engine: &ApplyEngine) {
+        let api: Api<ConfigMap> = Api::namespaced(engine.client().clone(), "tenant-ns");
+        let desired: ConfigMap = serde_json::from_value(json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {"name": "pull-secret", "namespace": "tenant-ns"}
+        }))
+        .unwrap();
+        let error = crate::apply::generation::apply_resource(
+            engine,
+            &api,
+            &desired,
+            crate::apply::generation::MutationGeneration::new(7).unwrap(),
+            false,
+            false,
+        )
+        .await
+        .expect_err("stripped creation evidence must fail the apply");
+        assert!(
+            matches!(
+                error,
+                crate::apply::engine::ApplyError::ProviderGenerationNotApplied { expected: 7, .. }
+            ),
+            "{error:?}"
+        );
+    }
+
+    fn assert_pinned_orphan(payload: &str, uid: &str, version: &str) {
+        let options: Value = serde_json::from_str(payload).expect("delete body");
+        assert_eq!(options["propagationPolicy"], "Orphan", "{payload}");
+        assert_eq!(options["preconditions"]["uid"], uid, "{payload}");
+        assert_eq!(
+            options["preconditions"]["resourceVersion"], version,
+            "{payload}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_post_version_conflict_rereads_and_deletes_same_uid_without_a_sink() {
+        let deletes = Arc::new(Mutex::new(Vec::new()));
+        let engine = ApplyEngine::new(
+            conflict_client(Arc::clone(&deletes), LiveAfterPost::SameUid),
+            Default::default(),
+        )
+        .with_compensation_budget(Duration::from_secs(5));
+        expect_stripped_configmap_failure(&engine).await;
+        let deletes = deletes.lock().expect("deletes").clone();
+        assert!(
+            deletes.len() >= 2,
+            "a 409 on the POST version must be retried with the fresh version: {deletes:?}"
+        );
+        assert_pinned_orphan(&deletes[0], "post-uid-254", "1");
+        assert_pinned_orphan(&deletes[1], "post-uid-254", "2");
+        assert!(
+            deletes.iter().all(|payload| {
+                let options: Value = serde_json::from_str(payload).unwrap();
+                options["preconditions"]["uid"].as_str() == Some("post-uid-254")
+                    && options["preconditions"]["resourceVersion"].is_string()
+            }),
+            "a conflict must not fall back to a name-only delete: {deletes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn conflict_refuses_a_later_generation_without_another_delete() {
+        let deletes = Arc::new(Mutex::new(Vec::new()));
+        let engine = ApplyEngine::new(
+            conflict_client(Arc::clone(&deletes), LiveAfterPost::LaterGeneration),
+            Default::default(),
+        )
+        .with_compensation_budget(Duration::from_secs(5));
+        expect_stripped_configmap_failure(&engine).await;
+        let deletes = deletes.lock().expect("deletes").clone();
+        assert_eq!(
+            deletes.len(),
+            1,
+            "a newer generation must not be deleted: {deletes:?}"
+        );
+        assert_pinned_orphan(&deletes[0], "post-uid-254", "1");
+    }
+
+    #[tokio::test]
+    async fn conflict_refuses_a_replacement_uid_without_another_delete() {
+        let deletes = Arc::new(Mutex::new(Vec::new()));
+        let engine = ApplyEngine::new(
+            conflict_client(Arc::clone(&deletes), LiveAfterPost::DifferentUid),
+            Default::default(),
+        )
+        .with_compensation_budget(Duration::from_secs(5));
+        expect_stripped_configmap_failure(&engine).await;
+        let deletes = deletes.lock().expect("deletes").clone();
+        assert_eq!(
+            deletes.len(),
+            1,
+            "a different UID must not be deleted by name: {deletes:?}"
+        );
+        assert_pinned_orphan(&deletes[0], "post-uid-254", "1");
+    }
+
+    #[tokio::test]
+    async fn stalled_persist_is_bounded_by_the_compensation_deadline() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::new(MemorySink {
+            records: Mutex::new(Vec::new()),
+            events: Arc::clone(&events),
+            fail: false,
+            hang: true,
+        });
+        let engine = ApplyEngine::new(
+            client(Arc::clone(&events), "post-uid-254", false),
+            Default::default(),
+        )
+        .with_compensation_sink(sink.clone())
+        .with_compensation_budget(Duration::from_millis(300));
+        let started = std::time::Instant::now();
+        expect_stripped_configmap_failure(&engine).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "stalled persist held the fence for {elapsed:?}"
+        );
+        assert!(
+            sink.records.lock().expect("records").is_empty(),
+            "a timed-out persist must not be treated as recorded"
+        );
+        assert!(
+            events.lock().expect("events").contains(&"persist"),
+            "persist must be attempted"
         );
     }
 }

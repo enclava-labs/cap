@@ -447,7 +447,11 @@ async fn issue_pinned_delete(
             uid: Some(uid.to_string()),
             resource_version: Some(resource_version.to_string()),
         }),
-        ..DeleteParams::default()
+        // Never Background. A tenant in an adopted namespace can attach this
+        // UID as a PVC ownerReference; GC would then delete their volume.
+        // Same rule as `adopted_sweep_delete_params`. Namespace content
+        // teardown is the namespace finalizer's job, not ownerReference GC.
+        ..DeleteParams::orphan()
     };
     match tokio::time::timeout(timeout, api.delete(name, &params)).await {
         Ok(Ok(_)) => DeleteOutcome::Accepted,
@@ -802,8 +806,9 @@ mod tests {
         assert!(
             deletes[0].contains(uid)
                 && deletes[0].contains("preconditions")
-                && deletes[0].contains("resourceVersion"),
-            "delete was not pinned to UID and resourceVersion: {}",
+                && deletes[0].contains("resourceVersion")
+                && deletes[0].contains("Orphan"),
+            "delete was not pinned to UID and resourceVersion with orphan propagation: {}",
             deletes[0]
         );
         assert!(
