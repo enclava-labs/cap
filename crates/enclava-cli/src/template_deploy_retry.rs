@@ -251,11 +251,19 @@ pub fn select_template_deploy_attempt(
         return select_stored_attempt(stored, stable, rows, &inflight, now_unix);
     }
 
-    // An empty list is not proof a previous POST settled. A resume file we
-    // cannot read is the same hazard as a list outage: do not sign a new key.
-    if unreadable && rows.is_empty() {
+    // The deploy id is inside the file. Without it, a settled row can be an
+    // older rollout while the interrupted POST is still missing from history.
+    // A list outage already refuses this case; a successful list must too.
+    if unreadable {
+        if let Some(deployment) = inflight.first().copied() {
+            return TemplateDeployAttempt::Refuse(inflight_refuse_message(
+                stable,
+                deployment,
+                "the stored signed request on this machine is unreadable, so it cannot be resumed. A new deployment was not started. Retry from the machine that started it, wait for it to finish, or destroy the app and deploy again.",
+            ));
+        }
         return TemplateDeployAttempt::Refuse(format!(
-            "the stored template deploy request for `{}` is unreadable, and deployment history is empty, so it is not safe to sign a new one. A new deployment was not started. Retry when that request can be read, or destroy the app and deploy again.",
+            "the stored template deploy request for `{}` is unreadable, so it is not safe to sign a new one. A new deployment was not started. Retry when that request can be read, or destroy the app and deploy again.",
             stable.instance_name
         ));
     }
@@ -1086,18 +1094,23 @@ mod tests {
     }
 
     #[test]
-    fn unreadable_resume_file_with_an_empty_list_does_not_sign_fresh() {
+    fn unreadable_resume_file_does_not_sign_fresh_beside_a_settled_row() {
         let stable = stable();
-        let attempt = select(
-            LoadedTemplateDeployAttempt::Unreadable,
-            &stable,
-            &listed(vec![]),
-        );
-        let TemplateDeployAttempt::Refuse(message) = attempt else {
-            panic!("an unreadable resume file must not be treated as absent");
-        };
-        assert!(message.contains("unreadable"), "{message}");
-        assert!(message.contains("was not started"), "{message}");
+        for deployments in [
+            listed(vec![]),
+            listed(vec![row("older", "healthy", Some("healthy"))]),
+        ] {
+            let attempt = select(
+                LoadedTemplateDeployAttempt::Unreadable,
+                &stable,
+                &deployments,
+            );
+            let TemplateDeployAttempt::Refuse(message) = attempt else {
+                panic!("an unreadable resume file must not be treated as absent");
+            };
+            assert!(message.contains("unreadable"), "{message}");
+            assert!(message.contains("was not started"), "{message}");
+        }
     }
 
     #[test]
