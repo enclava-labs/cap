@@ -29,6 +29,370 @@ pub struct UnlockStatusResponse {
     pub unlock_mode: String,
     pub tee_url: String,
     pub ownership_state: Option<String>,
+    /// The generation `update_unlock_mode` locks, plus the stored primary
+    /// shape that may be signed. Hosted `GET /apps/{name}/deployments` is a
+    /// different table and must not be substituted for this object.
+    pub locked_generation: UnlockLockedGeneration,
+}
+
+/// Wire marker. A hosted deployment row does not carry this source.
+pub const LOCKED_GENERATION_SOURCE: &str = "apply_job_generation";
+
+const LATEST_APPLY_GENERATION_SQL: &str = "SELECT deployment.id, deployment.status::text, \
+     deployment.image_digest, deployment.spec_snapshot \
+     FROM deployments AS deployment \
+     JOIN deployment_apply_jobs AS apply_job \
+       ON apply_job.deployment_id = deployment.id \
+     WHERE deployment.app_id = $1 \
+     ORDER BY apply_job.generation DESC \
+     LIMIT 1";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UnlockLockedGenerationResources {
+    pub cpu: String,
+    pub memory: String,
+    pub storage: String,
+    pub tls_storage: String,
+}
+
+/// CAP app identity `validate_deployment_inputs` compares. A hosted app
+/// projection is not this record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UnlockLockedGenerationApp {
+    pub id: Uuid,
+    pub name: String,
+    pub namespace: String,
+    pub service_account: String,
+    pub domain: String,
+    pub tee_domain: String,
+    pub custom_domain: Option<String>,
+    pub tenant_instance_identity_hash: String,
+    pub bootstrap_owner_pubkey_hash: String,
+    pub signer_identity_subject: String,
+    pub signer_identity_issuer: String,
+}
+
+/// Signable view of the row the unlock handler locks.
+///
+/// `acceptable` is true only when that handler's generation predicate passes
+/// and the stored primary can be signed without inventing port, command,
+/// storage paths, or a digest. Refused generations omit the signable fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UnlockLockedGeneration {
+    pub source: String,
+    pub acceptable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deployment_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_paths: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workload_security_profile: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resources: Option<UnlockLockedGenerationResources>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app: Option<UnlockLockedGenerationApp>,
+}
+
+type ApplyGenerationRow = (Uuid, String, Option<String>, serde_json::Value);
+
+fn refused_generation(
+    deployment_id: Option<Uuid>,
+    status: Option<String>,
+    reason: &str,
+) -> UnlockLockedGeneration {
+    UnlockLockedGeneration {
+        source: LOCKED_GENERATION_SOURCE.to_string(),
+        acceptable: false,
+        refusal: Some(reason.to_string()),
+        deployment_id,
+        status,
+        image_digest: None,
+        image_ref: None,
+        container_name: None,
+        port: None,
+        command: None,
+        storage_paths: None,
+        workload_security_profile: None,
+        resources: None,
+        app: None,
+    }
+}
+
+/// The predicate `update_unlock_mode` enforces after it has a primary and a
+/// latest apply-job generation. `None` means that handler will not reject
+/// the generation itself.
+#[allow(clippy::too_many_arguments)]
+fn generation_conflict_reason(
+    status: &str,
+    generation_digest: Option<&str>,
+    primary_digest: Option<&str>,
+    spec_snapshot: &serde_json::Value,
+    cpu: &str,
+    memory: &str,
+    storage: &str,
+    tls_storage: &str,
+    primary_profile: &str,
+) -> Option<&'static str> {
+    if matches!(status, "pending" | "applying" | "watching") {
+        return Some("current deployment generation is still in progress");
+    }
+    if generation_digest != primary_digest {
+        return Some("current runtime does not match its deployment generation");
+    }
+    let Some(resolved) = spec_snapshot.get("resolved_resources") else {
+        return Some(
+            "current deployment predates exact resource snapshots; deploy a current generation first",
+        );
+    };
+    let exact = |field: &str, expected: &str| {
+        resolved.get(field).and_then(serde_json::Value::as_str) == Some(expected)
+    };
+    if !exact("cpu", cpu)
+        || !exact("memory", memory)
+        || !exact("storage", storage)
+        || !exact("tls_storage", tls_storage)
+    {
+        return Some("current resource authority does not match its deployment generation");
+    }
+    if spec_snapshot
+        .get("workload_security_profile")
+        .and_then(serde_json::Value::as_str)
+        != Some(primary_profile)
+    {
+        return Some("current workload security profile does not match its deployment generation");
+    }
+    None
+}
+
+fn signable_port(port: Option<i32>) -> Option<u16> {
+    u16::try_from(port?).ok().filter(|port| *port > 0)
+}
+
+fn signable_command(raw: Option<&str>) -> Option<Vec<String>> {
+    let argv = serde_json::from_str::<Vec<String>>(raw?.trim()).ok()?;
+    if argv.is_empty() || argv.iter().any(|arg| arg.is_empty()) {
+        return None;
+    }
+    Some(argv)
+}
+
+fn signable_storage_paths(paths: Option<&[String]>) -> Option<Vec<String>> {
+    let paths = paths?;
+    if paths.is_empty() || paths.iter().any(|path| path.is_empty() || path == "/state") {
+        return None;
+    }
+    Some(paths.to_vec())
+}
+
+fn signable_image_ref(image_ref: &str, digest: &str) -> bool {
+    let Some(repository) = image_ref.strip_suffix(&format!("@{digest}")) else {
+        return false;
+    };
+    !repository.is_empty()
+        && !repository.ends_with('@')
+        && enclava_common::validate::validate_image_digest(digest).is_ok()
+}
+
+/// Build the status object from the same rows the handler locks.
+///
+/// A missing generation is not filled in from the primary container. Callers
+/// that cannot see this object must not remove the guest wrap.
+fn locked_generation_snapshot(
+    generation: Option<&ApplyGenerationRow>,
+    primary: Option<&crate::models::AppContainer>,
+    resources: Option<&crate::models::AppResources>,
+    app: &crate::models::App,
+) -> UnlockLockedGeneration {
+    let Some(primary) = primary else {
+        return refused_generation(None, None, "app has no primary container");
+    };
+    let Some(resources) = resources else {
+        return refused_generation(None, None, "app has no resource record");
+    };
+    let Some(generation) = generation else {
+        return refused_generation(None, None, "app has no deployment generation");
+    };
+    let profile = primary
+        .workload_security_profile
+        .clone()
+        .unwrap_or_else(|| "restricted".to_string());
+    if let Some(reason) = generation_conflict_reason(
+        &generation.1,
+        generation.2.as_deref(),
+        primary.image_digest.as_deref(),
+        &generation.3,
+        &resources.cpu_limit,
+        &resources.memory_limit,
+        &resources.app_data_size,
+        &resources.tls_data_size,
+        &profile,
+    ) {
+        return refused_generation(Some(generation.0), Some(generation.1.clone()), reason);
+    }
+    let Some(digest) = primary.image_digest.clone() else {
+        return refused_generation(
+            Some(generation.0),
+            Some(generation.1.clone()),
+            "stored primary has no image digest",
+        );
+    };
+    if !signable_image_ref(&primary.image_ref, &digest) {
+        return refused_generation(
+            Some(generation.0),
+            Some(generation.1.clone()),
+            "stored primary image is not digest-pinned to the locked generation",
+        );
+    }
+    let Some(port) = signable_port(primary.port) else {
+        return refused_generation(
+            Some(generation.0),
+            Some(generation.1.clone()),
+            "stored primary omitted port; refusing to assume 8080",
+        );
+    };
+    let Some(command) = signable_command(primary.command.as_deref()) else {
+        return refused_generation(
+            Some(generation.0),
+            Some(generation.1.clone()),
+            "stored primary command is missing or not a JSON argv",
+        );
+    };
+    let Some(storage_paths) = signable_storage_paths(primary.storage_paths.as_deref()) else {
+        return refused_generation(
+            Some(generation.0),
+            Some(generation.1.clone()),
+            "stored primary storage paths are missing",
+        );
+    };
+    if profile
+        .parse::<enclava_engine::types::WorkloadSecurityProfile>()
+        .is_err()
+    {
+        return refused_generation(
+            Some(generation.0),
+            Some(generation.1.clone()),
+            "stored workload security profile is invalid",
+        );
+    }
+    if primary.name.trim().is_empty() {
+        return refused_generation(
+            Some(generation.0),
+            Some(generation.1.clone()),
+            "stored primary container name is empty",
+        );
+    }
+    let Some(subject) = app
+        .signer_identity_subject
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    else {
+        return refused_generation(
+            Some(generation.0),
+            Some(generation.1.clone()),
+            "stored app has no signer subject",
+        );
+    };
+    let Some(issuer) = app
+        .signer_identity_issuer
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    else {
+        return refused_generation(
+            Some(generation.0),
+            Some(generation.1.clone()),
+            "stored app has no signer issuer",
+        );
+    };
+    if app.name.is_empty()
+        || app.namespace.is_empty()
+        || app.service_account.is_empty()
+        || app.domain.is_empty()
+        || app.tenant_instance_identity_hash.is_empty()
+        || app.bootstrap_owner_pubkey_hash.is_empty()
+    {
+        return refused_generation(
+            Some(generation.0),
+            Some(generation.1.clone()),
+            "stored app identity is incomplete",
+        );
+    }
+    UnlockLockedGeneration {
+        source: LOCKED_GENERATION_SOURCE.to_string(),
+        acceptable: true,
+        refusal: None,
+        deployment_id: Some(generation.0),
+        status: Some(generation.1.clone()),
+        image_digest: Some(digest),
+        image_ref: Some(primary.image_ref.clone()),
+        container_name: Some(primary.name.clone()),
+        port: Some(port),
+        command: Some(command),
+        storage_paths: Some(storage_paths),
+        workload_security_profile: Some(profile),
+        resources: Some(UnlockLockedGenerationResources {
+            cpu: resources.cpu_limit.clone(),
+            memory: resources.memory_limit.clone(),
+            storage: resources.app_data_size.clone(),
+            tls_storage: resources.tls_data_size.clone(),
+        }),
+        app: Some(UnlockLockedGenerationApp {
+            id: app.id,
+            name: app.name.clone(),
+            namespace: app.namespace.clone(),
+            service_account: app.service_account.clone(),
+            domain: app.domain.clone(),
+            tee_domain: app.tee_domain.clone().unwrap_or_else(|| app.domain.clone()),
+            custom_domain: app.custom_domain.clone(),
+            tenant_instance_identity_hash: app.tenant_instance_identity_hash.clone(),
+            bootstrap_owner_pubkey_hash: app.bootstrap_owner_pubkey_hash.clone(),
+            signer_identity_subject: subject.to_string(),
+            signer_identity_issuer: issuer.to_string(),
+        }),
+    }
+}
+
+async fn load_unlock_locked_generation(
+    db: &sqlx::PgPool,
+    app: &crate::models::App,
+) -> Result<UnlockLockedGeneration, (StatusCode, Json<serde_json::Value>)> {
+    let primary: Option<crate::models::AppContainer> = sqlx::query_as(
+        "SELECT * FROM app_containers WHERE app_id = $1 AND is_primary = true ORDER BY id LIMIT 1",
+    )
+    .bind(app.id)
+    .fetch_optional(db)
+    .await
+    .map_err(|_| unlock_database_error())?;
+    let resources: Option<crate::models::AppResources> =
+        sqlx::query_as("SELECT * FROM app_resources WHERE app_id = $1")
+            .bind(app.id)
+            .fetch_optional(db)
+            .await
+            .map_err(|_| unlock_database_error())?;
+    let generation: Option<ApplyGenerationRow> = sqlx::query_as(LATEST_APPLY_GENERATION_SQL)
+        .bind(app.id)
+        .fetch_optional(db)
+        .await
+        .map_err(|_| unlock_database_error())?;
+    Ok(locked_generation_snapshot(
+        generation.as_ref(),
+        primary.as_ref(),
+        resources.as_ref(),
+        app,
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -795,21 +1159,12 @@ async fn commit_unlock_mode_transition(
     )
     .await?;
 
-    let source: (Uuid, String, Option<String>, serde_json::Value) = sqlx::query_as(
-        "SELECT deployment.id, deployment.status::text,
-                deployment.image_digest, deployment.spec_snapshot
-           FROM deployments AS deployment
-           JOIN deployment_apply_jobs AS apply_job
-             ON apply_job.deployment_id = deployment.id
-          WHERE deployment.app_id = $1
-          ORDER BY apply_job.generation DESC
-          LIMIT 1",
-    )
-    .bind(locked_app.id)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(|_| unlock_database_error())?
-    .ok_or_else(|| unlock_transition_conflict("app has no deployment generation"))?;
+    let source: ApplyGenerationRow = sqlx::query_as(LATEST_APPLY_GENERATION_SQL)
+        .bind(locked_app.id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| unlock_database_error())?
+        .ok_or_else(|| unlock_transition_conflict("app has no deployment generation"))?;
     if source.0 != request.source_deployment_id
         || matches!(source.1.as_str(), "pending" | "applying" | "watching")
         || source.2.as_deref() != request.image_digest
@@ -1192,11 +1547,13 @@ pub async fn unlock_status(
         Some(client) => tee_ownership_state(&client, domain).await,
         None => None,
     };
+    let locked_generation = load_unlock_locked_generation(&state.db, &app).await?;
 
     Ok(Json(UnlockStatusResponse {
         unlock_mode: format!("{:?}", app.unlock_mode).to_lowercase(),
         tee_url,
         ownership_state,
+        locked_generation,
     }))
 }
 
@@ -1454,57 +1811,24 @@ pub async fn update_unlock_mode(
         observed_containers,
         observed_resources.clone(),
     );
-    let source: (Uuid, String, Option<String>, serde_json::Value) = sqlx::query_as(
-        "SELECT deployment.id, deployment.status::text,
-                deployment.image_digest, deployment.spec_snapshot
-           FROM deployments AS deployment
-           JOIN deployment_apply_jobs AS apply_job
-             ON apply_job.deployment_id = deployment.id
-          WHERE deployment.app_id = $1
-          ORDER BY apply_job.generation DESC
-          LIMIT 1",
-    )
-    .bind(app.id)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|_| unlock_database_error())?
-    .ok_or_else(|| unlock_transition_conflict("app has no deployment generation"))?;
-    if matches!(source.1.as_str(), "pending" | "applying" | "watching") {
-        return Err(unlock_transition_conflict(
-            "current deployment generation is still in progress",
-        ));
-    }
-    if source.2.as_deref() != image_digest.as_deref() {
-        return Err(unlock_transition_conflict(
-            "current runtime does not match its deployment generation",
-        ));
-    }
-    let resolved = source.3.get("resolved_resources").ok_or_else(|| {
-        unlock_transition_conflict(
-            "current deployment predates exact resource snapshots; deploy a current generation first",
-        )
-    })?;
-    let exact_resource = |field: &str, expected: &str| {
-        resolved.get(field).and_then(serde_json::Value::as_str) == Some(expected)
-    };
-    if !exact_resource("cpu", &observed_resources.cpu_limit)
-        || !exact_resource("memory", &observed_resources.memory_limit)
-        || !exact_resource("storage", &observed_resources.app_data_size)
-        || !exact_resource("tls_storage", &observed_resources.tls_data_size)
-    {
-        return Err(unlock_transition_conflict(
-            "current resource authority does not match its deployment generation",
-        ));
-    }
-    if source
-        .3
-        .get("workload_security_profile")
-        .and_then(serde_json::Value::as_str)
-        != Some(current_profile.as_str())
-    {
-        return Err(unlock_transition_conflict(
-            "current workload security profile does not match its deployment generation",
-        ));
+    let source: ApplyGenerationRow = sqlx::query_as(LATEST_APPLY_GENERATION_SQL)
+        .bind(app.id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|_| unlock_database_error())?
+        .ok_or_else(|| unlock_transition_conflict("app has no deployment generation"))?;
+    if let Some(reason) = generation_conflict_reason(
+        &source.1,
+        source.2.as_deref(),
+        image_digest.as_deref(),
+        &source.3,
+        &observed_resources.cpu_limit,
+        &observed_resources.memory_limit,
+        &observed_resources.app_data_size,
+        &observed_resources.tls_data_size,
+        current_profile.as_str(),
+    ) {
+        return Err(unlock_transition_conflict(reason));
     }
     let log_encryption: Option<LogEncryptionConfig> = serde_json::from_value(
         source
@@ -1702,13 +2026,13 @@ mod tests {
         crate::signing_service::DescriptorPlatformBinding::EMPTY;
 
     use super::{
-        BUILTIN_AMD_ARK_SHA256_PINS, ReceiptEnvelope, ReceiptPayloadView, RequestedUnlockMode,
-        SignedReceiptResponse, TransitionQuoteError, TransitionReceiptAttestation,
-        TransitionSnpQuote, UnlockModeCommitRequest, auto_unlock_disabled_error,
-        commit_unlock_mode_transition, snp_guest_policy_allows_debug,
-        tee_ownership_state_from_value, transition_receipt_is_fresh, unlock_status,
-        validate_transition, verify_transition_attestation, verify_transition_receipt,
-        verify_transition_snp_quote,
+        BUILTIN_AMD_ARK_SHA256_PINS, LOCKED_GENERATION_SOURCE, ReceiptEnvelope, ReceiptPayloadView,
+        RequestedUnlockMode, SignedReceiptResponse, TransitionQuoteError,
+        TransitionReceiptAttestation, TransitionSnpQuote, UnlockModeCommitRequest,
+        auto_unlock_disabled_error, commit_unlock_mode_transition, locked_generation_snapshot,
+        snp_guest_policy_allows_debug, tee_ownership_state_from_value, transition_receipt_is_fresh,
+        unlock_status, validate_transition, verify_transition_attestation,
+        verify_transition_receipt, verify_transition_snp_quote,
     };
     use crate::models::{App, AppContainer, AppStatus, UnlockMode};
 
@@ -3708,6 +4032,144 @@ mod tests {
         assert_eq!(tee_ownership_state_from_value(&serde_json::json!({})), None);
     }
 
+    fn generation_fixture(
+        status: &str,
+        generation_digest: &str,
+        port: Option<i32>,
+        profile: Option<&str>,
+        snapshot_profile: &str,
+    ) -> (
+        super::ApplyGenerationRow,
+        crate::models::AppContainer,
+        crate::models::AppResources,
+    ) {
+        let digest = generation_digest.to_string();
+        let generation = (
+            Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap(),
+            status.to_string(),
+            Some(digest.clone()),
+            serde_json::json!({
+                "resolved_resources": {
+                    "cpu": "1",
+                    "memory": "1Gi",
+                    "storage": "5Gi",
+                    "tls_storage": "2Gi"
+                },
+                "workload_security_profile": snapshot_profile
+            }),
+        );
+        let primary = crate::models::AppContainer {
+            id: Uuid::nil(),
+            app_id: Uuid::nil(),
+            name: "app".to_string(),
+            image_ref: format!("ghcr.io/acme/app@{digest}"),
+            image_digest: Some(digest),
+            port,
+            command: Some("[\"/bin/app\"]".to_string()),
+            storage_paths: Some(vec!["/data".to_string()]),
+            workload_security_profile: profile.map(str::to_string),
+            is_primary: true,
+        };
+        let resources = crate::models::AppResources {
+            app_id: Uuid::nil(),
+            cpu_limit: "1".to_string(),
+            memory_limit: "1Gi".to_string(),
+            app_data_size: "5Gi".to_string(),
+            tls_data_size: "2Gi".to_string(),
+        };
+        (generation, primary, resources)
+    }
+
+    #[test]
+    fn locked_generation_is_the_apply_job_row_not_a_healthy_container() {
+        let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut app = test_app();
+        app.signer_identity_subject = Some("cosign-subject".to_string());
+        app.signer_identity_issuer =
+            Some("https://token.actions.githubusercontent.com".to_string());
+        let (generation, primary, resources) = generation_fixture(
+            "healthy",
+            digest,
+            Some(9090),
+            Some("rootful-sudo"),
+            "rootful-sudo",
+        );
+        let ok =
+            locked_generation_snapshot(Some(&generation), Some(&primary), Some(&resources), &app);
+        assert!(ok.acceptable, "{ok:?}");
+        assert_eq!(ok.source, LOCKED_GENERATION_SOURCE);
+        assert_eq!(ok.port, Some(9090));
+        assert_eq!(ok.container_name.as_deref(), Some("app"));
+        assert_eq!(
+            ok.workload_security_profile.as_deref(),
+            Some("rootful-sudo")
+        );
+        assert_eq!(ok.image_ref.as_deref(), Some(primary.image_ref.as_str()));
+        assert_eq!(ok.app.as_ref().map(|identity| identity.id), Some(app.id));
+        assert!(ok.app.as_ref().unwrap().signer_identity_subject == "cosign-subject");
+
+        let (pending, primary, resources) = generation_fixture(
+            "pending",
+            digest,
+            Some(9090),
+            Some("restricted"),
+            "restricted",
+        );
+        let refused =
+            locked_generation_snapshot(Some(&pending), Some(&primary), Some(&resources), &app);
+        assert!(!refused.acceptable);
+        assert!(refused.image_ref.is_none());
+        assert_eq!(
+            refused.refusal.as_deref(),
+            Some("current deployment generation is still in progress")
+        );
+
+        let (watching, primary, resources) = generation_fixture(
+            "watching",
+            digest,
+            Some(9090),
+            Some("restricted"),
+            "restricted",
+        );
+        assert!(
+            !locked_generation_snapshot(Some(&watching), Some(&primary), Some(&resources), &app)
+                .acceptable
+        );
+
+        let (healthy, mut drifted, resources) = generation_fixture(
+            "healthy",
+            digest,
+            Some(9090),
+            Some("restricted"),
+            "restricted",
+        );
+        drifted.image_digest = Some(format!("sha256:{}", "b".repeat(64)));
+        let drifted =
+            locked_generation_snapshot(Some(&healthy), Some(&drifted), Some(&resources), &app);
+        assert_eq!(
+            drifted.refusal.as_deref(),
+            Some("current runtime does not match its deployment generation")
+        );
+
+        let (healthy, mut omitted_port, resources) =
+            generation_fixture("healthy", digest, None, Some("restricted"), "restricted");
+        omitted_port.port = None;
+        let omitted =
+            locked_generation_snapshot(Some(&healthy), Some(&omitted_port), Some(&resources), &app);
+        assert_eq!(
+            omitted.refusal.as_deref(),
+            Some("stored primary omitted port; refusing to assume 8080")
+        );
+        assert!(omitted.port.is_none());
+
+        let missing = locked_generation_snapshot(None, Some(&primary), Some(&resources), &app);
+        assert_eq!(
+            missing.refusal.as_deref(),
+            Some("app has no deployment generation")
+        );
+        assert_eq!(missing.source, LOCKED_GENERATION_SOURCE);
+    }
+
     /// With no admissible launch identity the attested channel fails closed:
     /// `ownership_state` must be null even though the unverified
     /// `state.tee_http_client` is wired to a live TLS endpoint that would
@@ -3812,6 +4274,17 @@ mod tests {
         assert_eq!(body.ownership_state, None);
         assert_eq!(body.unlock_mode, "auto");
         assert!(body.tee_url.ends_with("/.well-known/confidential"));
+        // The fixture has a primary and no apply-job row. A container is not
+        // the generation the handler locks, so the field must refuse rather
+        // than look acceptable.
+        assert_eq!(body.locked_generation.source, LOCKED_GENERATION_SOURCE);
+        assert!(!body.locked_generation.acceptable);
+        assert_eq!(
+            body.locked_generation.refusal.as_deref(),
+            Some("app has no deployment generation")
+        );
+        assert!(body.locked_generation.image_digest.is_none());
+        assert!(body.locked_generation.port.is_none());
 
         delete_unlock_test_org(&pool, fixture.app.org_id).await;
     }

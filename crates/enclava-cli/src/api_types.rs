@@ -911,11 +911,74 @@ pub struct ConfigTokenResponse {
     pub expires_in_seconds: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct UnlockLockedGenerationResources {
+    pub cpu: String,
+    pub memory: String,
+    pub storage: String,
+    pub tls_storage: String,
+}
+
+/// CAP app identity the unlock handler compares. A hosted app projection
+/// is not this record.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct UnlockLockedGenerationApp {
+    pub id: String,
+    pub name: String,
+    pub namespace: String,
+    pub service_account: String,
+    pub domain: String,
+    pub tee_domain: String,
+    pub custom_domain: Option<String>,
+    pub tenant_instance_identity_hash: String,
+    pub bootstrap_owner_pubkey_hash: String,
+    pub signer_identity_subject: String,
+    pub signer_identity_issuer: String,
+}
+
+/// The CAP apply generation `PUT /apps/{name}/unlock/mode` locks.
+///
+/// Absent on an older server. A hosted deployment-list row is not this
+/// object: it has no `source` of `apply_job_generation`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct UnlockLockedGeneration {
+    pub source: String,
+    pub acceptable: bool,
+    #[serde(default)]
+    pub refusal: Option<String>,
+    #[serde(default)]
+    pub deployment_id: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub image_digest: Option<String>,
+    #[serde(default)]
+    pub image_ref: Option<String>,
+    #[serde(default)]
+    pub container_name: Option<String>,
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub command: Option<Vec<String>>,
+    #[serde(default)]
+    pub storage_paths: Option<Vec<String>>,
+    #[serde(default)]
+    pub workload_security_profile: Option<String>,
+    #[serde(default)]
+    pub resources: Option<UnlockLockedGenerationResources>,
+    #[serde(default)]
+    pub app: Option<UnlockLockedGenerationApp>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct UnlockStatusResponse {
     pub unlock_mode: String,
     pub tee_url: String,
     pub ownership_state: Option<String>,
+    /// Older servers omit this. Absence is a refusal, not a cue to read
+    /// `GET /apps/{name}/deployments`.
+    #[serde(default)]
+    pub locked_generation: Option<UnlockLockedGeneration>,
 }
 
 #[derive(Debug, Serialize)]

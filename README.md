@@ -71,9 +71,16 @@ fetches its owner seed automatically. After guest replacement, use
 `enclava unlock --app NAME --password-file PATH` with the existing storage password.
 
 For a legacy auto-mode app, run
-`enclava auto-unlock disable --app NAME --image REPO@sha256:DIGEST --password-file PATH`
-from its original `enclava.toml` workspace before redeploying. This preserves the
-owner seed and volumes, but cannot revoke a previously copied auto-sealed seed.
+`enclava auto-unlock disable --app NAME --image REPO@sha256:DIGEST --password-file PATH`.
+No local `enclava.toml` is required. The command signs the stored primary from
+the CAP apply generation on `GET /apps/NAME/unlock/status`
+(`locked_generation.source = apply_job_generation`). Hosted platforms proxy
+that status; a hosted deployment list is not a substitute and is refused.
+`--image` must be digest-pinned and must match that generation. The command
+re-reads the generation immediately before removing the guest wrap. This
+preserves the owner seed and volumes, but cannot revoke a previously copied
+auto-sealed seed. `enclava auto-unlock enable` stays refused
+(`auto_unlock_disabled`).
 
 For encrypted workload logs, use the current CLI and the tenant's log private key:
 

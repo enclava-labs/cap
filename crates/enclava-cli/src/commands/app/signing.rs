@@ -556,6 +556,8 @@ pub(crate) struct SignedDeployBlobParams<'a> {
     pub image: &'a str,
     pub target_unlock_mode: Option<&'a str>,
     pub workload_security_profile: WorkloadSecurityProfile,
+    /// Primary container name. Local project files have none and keep `web`.
+    pub container_name: &'a str,
 }
 
 pub(crate) struct SignedDeployBlobs {
@@ -589,6 +591,7 @@ pub(crate) async fn build_signed_deploy_blobs(
         image,
         target_unlock_mode,
         workload_security_profile,
+        container_name,
     } = params;
     let image_ref = enclava_common::image::ImageRef::parse(image)?;
     let image_ref = if image_ref.has_digest() {
@@ -734,7 +737,7 @@ pub(crate) async fn build_signed_deploy_blobs(
         image_digest: image_ref.digest().to_string(),
         signer_identity,
         oci_runtime_spec: cap_app_oci_runtime_spec(CapAppOciRuntimeSpecInput {
-            container_name: "web".to_string(),
+            container_name: container_name.to_string(),
             port: app_config.app.port,
             workload_command: app_config.app.command.clone(),
             storage_paths: app_config.storage.paths.clone(),
