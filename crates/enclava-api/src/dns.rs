@@ -341,21 +341,37 @@ pub async fn delete_txt_record(
     Ok(())
 }
 
-/// Whether the TXT row this issuance created is still the expected value
-/// at the DNS provider. Uses the same HTTPS API as create/delete, so it
-/// does not need port 53 to a public or authoritative resolver. A caching
-/// recursive denial of a just-deleted same-name challenge cannot hide a
-/// record the provider already accepted.
-pub async fn created_txt_matches(
+/// Outcome of reading the TXT row this issuance created.
+///
+/// [`CreatedTxtRead::Match`] means the provider row exists and its content
+/// is the expected challenge. It is not evidence that a recursive resolver
+/// or Let's Encrypt can see that value. Callers must not treat it as
+/// fulfillment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CreatedTxtRead {
+    Match,
+    /// Row missing, outside the managed zone, or not this challenge.
+    Absent,
+    /// Transport, HTTP, parse, or `success: false`. The label is static:
+    /// `transport`, `http`, `rejected`, or `parse`. It never carries a
+    /// token, URL, or response body.
+    Unreadable(&'static str),
+}
+
+/// Read the TXT row this issuance created over the same HTTPS API as
+/// create/delete. No port 53. A caching recursive denial of a just-deleted
+/// same-name challenge cannot hide a row the provider already accepted;
+/// this read is how the caller tells "absent" from "unreadable".
+pub async fn read_created_txt(
     client: &reqwest::Client,
     config: &DnsConfig,
     record: &DnsRecordHandle,
     expected: &str,
-) -> bool {
+) -> CreatedTxtRead {
     if !config.manages_hostname(&record.hostname) {
-        return false;
+        return CreatedTxtRead::Absent;
     }
-    let Ok(response) = client
+    let response = match client
         .get(config.api_url(&format!(
             "/zones/{}/dns_records/{}",
             record.zone_id, record.record_id
@@ -363,24 +379,61 @@ pub async fn created_txt_matches(
         .bearer_auth(&config.cloudflare_api_token)
         .send()
         .await
-    else {
-        return false;
+    {
+        Ok(response) => response,
+        Err(_) => return CreatedTxtRead::Unreadable("transport"),
     };
     if !response.status().is_success() {
-        return false;
+        return CreatedTxtRead::Unreadable("http");
     }
     #[derive(Deserialize)]
     struct CreatedTxt {
+        #[serde(rename = "type")]
+        record_type: String,
+        name: String,
         content: String,
     }
-    let Ok(body) = response.json::<CloudflareSingle<CreatedTxt>>().await else {
-        return false;
+    let body = match response.json::<CloudflareSingle<CreatedTxt>>().await {
+        Ok(body) => body,
+        Err(_) => return CreatedTxtRead::Unreadable("parse"),
     };
-    body.success
-        && body
-            .result
-            .as_ref()
-            .is_some_and(|created| created.content == expected)
+    if !body.success {
+        return CreatedTxtRead::Unreadable("rejected");
+    }
+    let Some(created) = body.result else {
+        return CreatedTxtRead::Absent;
+    };
+    if !created.record_type.eq_ignore_ascii_case("TXT")
+        || !dns_name_eq(&created.name, &record.hostname)
+        || !txt_content_eq(&created.content, expected)
+    {
+        return CreatedTxtRead::Absent;
+    }
+    CreatedTxtRead::Match
+}
+
+fn dns_name_eq(left: &str, right: &str) -> bool {
+    left.trim()
+        .trim_end_matches('.')
+        .eq_ignore_ascii_case(right.trim().trim_end_matches('.'))
+}
+
+/// Cloudflare may store a space-free TXT value and return it wrapped in
+/// one pair of double quotes. Compare the unquoted challenge, not the
+/// wrapping.
+fn txt_content_eq(raw: &str, expected: &str) -> bool {
+    let trimmed = raw.trim();
+    let unquoted = strip_one_quote_pair(trimmed);
+    unquoted == expected
+}
+
+fn strip_one_quote_pair(value: &str) -> &str {
+    let bytes = value.as_bytes();
+    if bytes.len() >= 2 && bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"' {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    }
 }
 
 pub async fn ensure_dns_record(

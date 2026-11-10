@@ -109,13 +109,16 @@ const TLS_KEY_BINDING_PROBE: &[u8] = b"enclava-init tls certificate key binding 
 const MAX_BROKER_RESPONSE_BYTES: usize = 64 * 1024;
 
 /// Broker HTTP budget. Production sets `ACME_DNS_PROPAGATION_SECONDS=180`.
-/// Custom domains are outside the managed zone and fail at TXT create,
-/// before this wait, so one propagation window is the budget. The order
-/// then has two 30s ACME polls. A client timeout equal to that window
-/// fires while the broker is still working; that transport timeout is not
-/// a typed broker failure, so it collapses to generic `enclava_init_failed`
-/// (cap#345). 360s covers the window plus the polls and setup, and stays
-/// under the attestation-proxy ready-watch (900s).
+/// Hostnames are ordered platform name, then any custom name. The platform
+/// name can spend that propagation window. A custom name is outside the
+/// managed zone and fails at TXT create, which is fast, but that failure
+/// comes after the platform wait — not before it. The order then has two
+/// 30s ACME polls. A client timeout equal to the window fires while the
+/// broker is still working; that transport timeout is not a typed broker
+/// failure, so it collapses to generic `enclava_init_failed` (cap#345).
+/// 360s covers one window plus the polls and setup, and stays under the
+/// attestation-proxy ready-watch (900s). The provider-confirm settle is
+/// inside the propagation window, not added on top.
 const TLS_BROKER_CLIENT_TIMEOUT: Duration = Duration::from_secs(360);
 
 /// Farthest a single honored ACME `retry_after` deadline may lie in the
@@ -1162,9 +1165,9 @@ mod tests {
 
     #[test]
     fn broker_client_timeout_exceeds_the_production_propagation_budget() {
-        // Custom domains fail at TXT create (outside the managed zone) and
-        // never enter this wait, so one production propagation window is
-        // the budget, plus the two 30s order polls and setup.
+        // One production propagation window is the budget. A custom name
+        // fails fast at TXT create, after any platform-name wait, plus the
+        // two 30s order polls and setup.
         const PRODUCTION_PROPAGATION_SECS: u64 = 180;
         const POLL_BUDGET_SECS: u64 = 30 + 30;
         const SETUP_MARGIN_SECS: u64 = 60;
