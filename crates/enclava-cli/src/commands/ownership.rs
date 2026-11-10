@@ -1362,6 +1362,96 @@ mod tests {
         assert!(empty.app_config.storage.paths.is_empty());
     }
 
+    fn acceptable_generation_json(log_encryption: Option<serde_json::Value>) -> serde_json::Value {
+        let digest = digest();
+        let mut generation = serde_json::json!({
+            "source": LOCKED_GENERATION_SOURCE,
+            "acceptable": true,
+            "deployment_id": "33333333-3333-3333-3333-333333333333",
+            "status": "healthy",
+            "image_digest": digest,
+            "image_ref": format!("ghcr.io/acme/app@{digest}"),
+            "container_name": "app",
+            "port": 9090,
+            "command": ["/bin/app"],
+            "storage_paths": ["/data"],
+            "workload_security_profile": "rootful-sudo",
+            "resources": {
+                "cpu": "1",
+                "memory": "1Gi",
+                "storage": "5Gi",
+                "tls_storage": "2Gi"
+            },
+            "app": {
+                "id": "11111111-1111-1111-1111-111111111111",
+                "name": "hosted-app",
+                "namespace": "cap-hosted-app",
+                "service_account": "cap-hosted-app-sa",
+                "domain": "hosted-app.example",
+                "tee_domain": "hosted-app.tee.example",
+                "custom_domain": null,
+                "tenant_instance_identity_hash": "22".repeat(32),
+                "bootstrap_owner_pubkey_hash": "33".repeat(32),
+                "signer_identity_subject": "cosign-subject",
+                "signer_identity_issuer": "https://token.actions.githubusercontent.com"
+            }
+        });
+        if let Some(value) = log_encryption {
+            generation["log_encryption"] = value;
+        }
+        serde_json::json!({
+            "unlock_mode": "auto",
+            "tee_url": "https://app.example/.well-known/confidential",
+            "ownership_state": "unlocked",
+            "locked_generation": generation
+        })
+    }
+
+    #[test]
+    fn null_log_encryption_is_a_signable_no_recipient_generation() {
+        let digest = digest();
+        let image = format!("ghcr.io/acme/app@{digest}");
+        let absent: UnlockStatusResponse =
+            serde_json::from_value(acceptable_generation_json(None)).unwrap();
+        let omitted = require_signable_generation(&absent, &image).unwrap_err();
+        assert!(
+            omitted.contains("omitted log_encryption"),
+            "a missing field must stay a refusal: {omitted}"
+        );
+
+        let null: UnlockStatusResponse =
+            serde_json::from_value(acceptable_generation_json(Some(serde_json::Value::Null)))
+                .unwrap();
+        assert_eq!(
+            null.locked_generation
+                .as_ref()
+                .and_then(|generation| generation.log_encryption.clone()),
+            Some(None)
+        );
+        let signed = require_signable_generation(&null, &image).unwrap();
+        assert!(
+            signed.log_encryption.is_none(),
+            "explicit null is a no-recipient generation, not an omit"
+        );
+
+        let recipient = serde_json::json!({
+            "algorithm": "x25519-hpke-v1",
+            "key_id": "logs",
+            "public_key_base64url": "abc",
+            "public_key_sha256": "sha256:abc"
+        });
+        let present: UnlockStatusResponse =
+            serde_json::from_value(acceptable_generation_json(Some(recipient))).unwrap();
+        let signed = require_signable_generation(&present, &image).unwrap();
+        assert_eq!(
+            signed
+                .log_encryption
+                .as_ref()
+                .map(|config| config.key_id.as_str()),
+            Some("logs")
+        );
+    }
+
     #[test]
     fn stray_project_file_is_not_signed_over_a_hosted_app() {
         let mismatch = AppConfig {

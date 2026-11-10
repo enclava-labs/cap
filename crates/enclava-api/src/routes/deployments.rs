@@ -490,8 +490,12 @@ pub struct RollbackRequest {
 pub struct AgentPolicyRequest {
     pub descriptor: enclava_common::descriptor::DeploymentDescriptor,
     /// Omitted means the broker may select a recipient. Null is an explicit
-    /// no-recipient pin from unlock disable.
-    #[serde(default)]
+    /// no-recipient pin from unlock disable. JSON null must not collapse to
+    /// an omit: the stock `Option` deserializer does that for `Option<Option<T>>`.
+    #[serde(
+        default,
+        deserialize_with = "enclava_common::serde_util::deserialize_some"
+    )]
     pub log_encryption: Option<Option<LogEncryptionConfig>>,
 }
 

@@ -15,5 +15,7 @@ pub mod registry;
 #[cfg(feature = "release-profiles")]
 pub mod release_profiles;
 #[cfg(feature = "runtime")]
+pub mod serde_util;
+#[cfg(feature = "runtime")]
 pub mod types;
 pub mod validate;

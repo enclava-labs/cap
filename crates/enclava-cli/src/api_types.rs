@@ -975,8 +975,12 @@ pub struct UnlockLockedGeneration {
     pub app: Option<UnlockLockedGenerationApp>,
     /// Outer None means the server omitted the field. Some(None) is an
     /// explicit no-recipient generation. Some(Some) is the public recipient
-    /// the unlock handler binds into cc_init_data.
-    #[serde(default)]
+    /// the unlock handler binds into cc_init_data. JSON null is not the same
+    /// as an omitted field; the stock `Option` deserializer collapses both.
+    #[serde(
+        default,
+        deserialize_with = "enclava_common::serde_util::deserialize_some"
+    )]
     pub log_encryption: Option<Option<LogEncryptionConfig>>,
 }
 

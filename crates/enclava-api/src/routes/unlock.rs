@@ -1801,6 +1801,48 @@ pub async fn unlock_endpoint(
     }))
 }
 
+/// Entitlement and fresh-claim gates `commit_unlock_mode_transition` enforces
+/// after the guest wrap is gone. Preview must fail the same way, without
+/// writing mode or deployment rows, or the CLI removes the wrap and the
+/// commit leaves CAP in auto mode. The commit repeats the checks under its
+/// own locks for changes between the two requests.
+async fn preview_unlock_commit_gates(
+    state: &AppState,
+    org_id: Uuid,
+    app: &crate::models::App,
+    resources: &crate::models::AppResources,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let fresh_volume_claims =
+        crate::routes::deployments::fresh_volume_claims(&state.kube_client, app, resources)
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "error": "volume provisioning state could not be verified; retry"
+                    })),
+                )
+            })?;
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|_| unlock_database_error())?;
+    crate::entitlements::lock_org_entitlement_lane(&mut tx, org_id)
+        .await
+        .map_err(|_| unlock_database_error())?;
+    crate::routes::deployments::enforce_authoritative_entitlement(
+        &mut tx,
+        org_id,
+        resources,
+        false,
+        fresh_volume_claims,
+    )
+    .await?;
+    tx.rollback().await.map_err(|_| unlock_database_error())?;
+    Ok(())
+}
+
 /// PUT /apps/{name}/unlock/mode -- update CAP-owned unlock mode and re-apply manifests.
 ///
 /// The owner password must never pass through this route. The CLI calls the
@@ -2147,6 +2189,12 @@ pub async fn update_unlock_mode(
     }
 
     if body.validate_only {
+        // An already-applied mode returns unchanged and never reaches the
+        // commit gates. Only a real transition can remove the wrap and then
+        // be rejected, so only that preview is refused here.
+        if current != requested {
+            preview_unlock_commit_gates(&state, auth.org_id, &app, &observed_resources).await?;
+        }
         return Ok(Json(UpdateUnlockModeResponse {
             app_name: app.name,
             unlock_mode: current.api_value().to_string(),
@@ -4620,6 +4668,12 @@ mod tests {
         assert_eq!(ok.app.as_ref().map(|identity| identity.id), Some(app.id));
         assert!(ok.app.as_ref().unwrap().signer_identity_subject == "cosign-subject");
         assert!(ok.log_encryption.is_none());
+        let wire = serde_json::to_value(&ok).expect("serialize locked generation");
+        assert!(
+            wire.get("log_encryption")
+                .is_some_and(|value| value.is_null()),
+            "a no-recipient generation must emit explicit null, not omit the field: {wire}"
+        );
 
         let mut stopped = app.clone();
         stopped.status = AppStatus::Stopped;
@@ -4837,6 +4891,144 @@ mod tests {
         );
         assert!(body.locked_generation.image_digest.is_none());
         assert!(body.locked_generation.port.is_none());
+
+        delete_unlock_test_org(&pool, fixture.app.org_id).await;
+    }
+
+    #[tokio::test]
+    async fn disable_preview_rejects_the_entitlement_gates_the_commit_enforces() {
+        let pool = database_test_pool().await;
+        let fixture = insert_unlock_test_app(&pool).await;
+        let mut state = crate::test_support::lazy_state();
+        state.side_effect_admission = crate::state::side_effect_admission_for_pool(&pool);
+        state.db = pool.clone();
+        // The fixture has no signed blobs. Turn the signed-artifact requirement
+        // off so this test reaches the entitlement gate instead of the
+        // missing-blob refusal.
+        state.attestation = None;
+        state.signing_service = None;
+        state.require_customer_signed_policy_artifact = false;
+        let auth = crate::auth::middleware::AuthContext {
+            user_id: fixture.user_id,
+            org_id: fixture.app.org_id,
+            org_name: "unlock-preview-test".to_string(),
+            role: crate::models::Role::Owner,
+            api_key: None,
+            management_origin: crate::auth::middleware::ManagementOrigin::Public,
+        };
+        let request = super::UpdateUnlockModeRequest {
+            mode: "password".to_string(),
+            transition_receipt: None,
+            transition_attestation: None,
+            customer_descriptor_blob: None,
+            org_keyring_blob: None,
+            signed_policy_artifact: None,
+            validate_only: true,
+        };
+
+        let Json(accepted) = super::update_unlock_mode(
+            auth.clone(),
+            State(state.clone()),
+            Path(fixture.app.name.clone()),
+            Json(request),
+        )
+        .await
+        .expect("an allowed org must pass the disable preview");
+        assert_eq!(accepted.status, "validated");
+        let mode: String = sqlx::query_scalar("SELECT unlock_mode::text FROM apps WHERE id = $1")
+            .bind(fixture.app.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(mode, "auto", "preview must not write the mode");
+
+        let paas_org_id = format!("paas-{}", fixture.app.org_id.simple());
+        sqlx::query(
+            "INSERT INTO organization_management (org_id, mode, paas_org_id, status)
+             VALUES ($1, 'paas_managed', $2, 'active')",
+        )
+        .bind(fixture.app.org_id)
+        .bind(&paas_org_id)
+        .execute(&pool)
+        .await
+        .expect("mark preview org PaaS managed");
+        sqlx::query(
+            "INSERT INTO organization_entitlements (
+                 org_id, version, deploy_allowed, block_reason, limits
+             ) VALUES ($1, 1, false, 'entitlement_blocked', $2)",
+        )
+        .bind(fixture.app.org_id)
+        .bind(serde_json::json!({
+            "name": "test",
+            "max_apps": 10,
+            "max_cpu": "4",
+            "max_memory": "8Gi",
+            "max_storage": "20Gi"
+        }))
+        .execute(&pool)
+        .await
+        .expect("block preview org deploys");
+
+        let blocked = super::update_unlock_mode(
+            auth.clone(),
+            State(state.clone()),
+            Path(fixture.app.name.clone()),
+            Json(super::UpdateUnlockModeRequest {
+                mode: "password".to_string(),
+                transition_receipt: None,
+                transition_attestation: None,
+                customer_descriptor_blob: None,
+                org_keyring_blob: None,
+                signed_policy_artifact: None,
+                validate_only: true,
+            }),
+        )
+        .await
+        .expect_err("a blocked entitlement must fail the preview");
+        assert_eq!(blocked.0, StatusCode::FORBIDDEN);
+        assert_eq!(blocked.1.0["error"], "deploy_blocked");
+        assert_eq!(blocked.1.0["reason"], "entitlement_blocked");
+        let mode: String = sqlx::query_scalar("SELECT unlock_mode::text FROM apps WHERE id = $1")
+            .bind(fixture.app.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(mode, "auto");
+
+        sqlx::query(
+            "UPDATE organization_entitlements
+                SET deploy_allowed = true, block_reason = NULL, limits = $2
+              WHERE org_id = $1",
+        )
+        .bind(fixture.app.org_id)
+        .bind(serde_json::json!({
+            "name": "test",
+            "max_apps": 10,
+            "max_cpu": "4",
+            "max_memory": "8Gi",
+            "max_storage": "1Gi"
+        }))
+        .execute(&pool)
+        .await
+        .expect("shrink preview org storage limit");
+        let over_limit = super::update_unlock_mode(
+            auth,
+            State(state),
+            Path(fixture.app.name.clone()),
+            Json(super::UpdateUnlockModeRequest {
+                mode: "password".to_string(),
+                transition_receipt: None,
+                transition_attestation: None,
+                customer_descriptor_blob: None,
+                org_keyring_blob: None,
+                signed_policy_artifact: None,
+                validate_only: true,
+            }),
+        )
+        .await
+        .expect_err("a persisted size over the live limit must fail the preview");
+        assert_eq!(over_limit.0, StatusCode::FORBIDDEN);
+        assert_eq!(over_limit.1.0["reason"], "entitlement_storage_limit");
 
         delete_unlock_test_org(&pool, fixture.app.org_id).await;
     }
