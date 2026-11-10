@@ -84,13 +84,15 @@ security review called `expects_fresh_volume` is a `true` bit of
 `FreshVolumeClaims` (`app_data` for the `state` claim, `tls_data` for
 `tls-state`), produced by `inspect_fresh_volume_claims`. It is set for a new
 (absent) claim, an unproven claim (present, including Bound, but without
-live proof), a recreated or terminating claim, a claim with no creation
-timestamp, and a same-second pod/claim pair. State and TLS are independent,
-so a mixed render can mark only one claim fresh. Positive live evidence
-clears the bit: the exact surviving ordinal-zero PVC `<vct>-<workload>-0`
-with a creation timestamp, and the live ordinal-zero pod non-terminating and
-Ready, mounting that exact claim, created in a later whole second than the
-claim — the workload observably running on the initialized device.
+live proof), a terminating claim, a claim with no creation timestamp, and a
+same-second pod/claim pair. A replacement claim is fresh only until that
+same live proof exists for it; recreation does not keep the bit set forever.
+State and TLS are independent, so a mixed render can mark only one claim
+fresh. Positive live evidence clears the bit: the exact surviving
+ordinal-zero PVC `<vct>-<workload>-0` with a creation timestamp, and the
+live ordinal-zero pod non-terminating and Ready, mounting that exact claim,
+created in a later whole second than the claim — the workload observably
+running on the initialized device.
 Deployment history is deliberately not consulted: database and Kubernetes
 clocks cannot order a row against a claim, and a password-timeout redeploy
 can publish healthy without opening storage, so no historical status is
@@ -109,9 +111,11 @@ formatting; the signal only controls the size floor and the rollout budget.
 
 The default rollout baseline is 600s (`ApplyConfig::rollout_timeout`). A
 fresh claim adds a capacity-derived allowance on top of that baseline: two
-sequential passes at 32 MiB/s, rounded up (`ceil(size_MiB / 16)` seconds).
-An already-initialized redeploy, including a domain-only reapply, keeps the
-ordinary 600s budget and does not inherit the allowance. The 32 MiB/s figure
+sequential passes at 32 MiB/s. Selected claims are converted to MiB (each
+rounded up) and summed, then rounded up once (`ceil(total_fresh_MiB / 16)`
+seconds) — not a per-claim ceil. An already-initialized redeploy,
+including a domain-only reapply, keeps the ordinary 600s budget and
+does not inherit the allowance. The 32 MiB/s figure
 is a qualified estimate for the selected backend, not a universal SLA: lower
 the assumption if measurements on that backend are slower. The API computes
 the budget once, before the first provider apply, and persists it as

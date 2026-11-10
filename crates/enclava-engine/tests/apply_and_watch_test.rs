@@ -735,8 +735,9 @@ mod fresh_claim_evidence {
         assert!(!claims.tls_data, "an unchecked claim stays clear");
     }
 
-    /// A bound claim with a creation timestamp but no Ready ordinal-zero pod
-    /// is unproven. PVC existence is not initialization evidence.
+    /// A present claim with a creation timestamp but no Ready ordinal-zero
+    /// pod is unproven. PVC existence is not initialization evidence. Phase
+    /// is not part of the evidence, so the fixture does not set it.
     #[tokio::test]
     async fn unproven_claim_without_ready_pod_expects_fresh_volume() {
         let claims = inspect(
@@ -753,18 +754,19 @@ mod fresh_claim_evidence {
         .expect("lookup succeeds");
         assert!(
             claims.app_data,
-            "a bound claim without a Ready pod is fresh"
+            "a present claim without a Ready pod is fresh"
         );
     }
 
-    /// A terminating claim is recreated by the StatefulSet controller, so
-    /// the replacement is fresh even if a Ready pod still mounts the name.
+    /// A terminating claim is fresh even when a later Ready pod mounts it.
+    /// Both timestamps are set so this fails if the deletion-timestamp
+    /// short-circuit is removed: the pod would otherwise be positive proof.
     #[tokio::test]
     async fn recreated_terminating_claim_expects_fresh_volume() {
+        let (name, mut pvc) = created_pvc_entry("state-test-app-0", CREATED_JAN1);
+        pvc["metadata"]["deletionTimestamp"] = serde_json::json!("2026-10-14T00:00:00Z");
         let claims = inspect(
-            [pvc_entry("state-test-app-0", Some("2026-10-14T00:00:00Z"))]
-                .into_iter()
-                .collect(),
+            [(name, pvc)].into_iter().collect(),
             [pod_entry(
                 &["state-test-app-0"],
                 true,
@@ -780,7 +782,10 @@ mod fresh_claim_evidence {
         )
         .await
         .expect("lookup succeeds");
-        assert!(claims.app_data, "a terminating claim is recreated fresh");
+        assert!(
+            claims.app_data,
+            "a terminating claim stays fresh despite a later Ready pod"
+        );
     }
 
     /// `NONE` performs no Kubernetes I/O — the API floor admission for

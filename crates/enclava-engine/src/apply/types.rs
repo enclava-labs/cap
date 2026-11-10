@@ -91,9 +91,10 @@ impl ApplyConfig {
     /// [`ApplyConfig::default`]) always applies. Only claims `fresh` marked
     /// as lacking positive initialization evidence — the admission signal the
     /// security review called `expects_fresh_volume` — add the first-boot
-    /// allowance: two sequential passes at 32 MiB/s (`ceil(size_MiB / 16)`
-    /// seconds), qualified to the selected storage backend, not a universal
-    /// SLA. An already-initialized volume is opened, never re-scanned, so an
+    /// allowance: two sequential passes at 32 MiB/s. Selected claims are
+    /// summed in MiB (each already ceiled) and rounded up once
+    /// (`ceil(total_fresh_MiB / 16)` seconds), qualified to the selected
+    /// storage backend, not a universal SLA. An already-initialized volume is opened, never re-scanned, so an
     /// ordinary redeploy or domain reapply must not inherit the fresh-format
     /// wait.
     ///
@@ -119,9 +120,9 @@ impl ApplyConfig {
             }
         }
         // Two passes at 32 MiB/s, qualified to the selected storage backend,
-        // not a universal SLA. seconds = ceil(MiB / 16). Recalibrate if
-        // qualified guests on that backend are slower. Not cap#249: this
-        // never skips the in-guest zero scan.
+        // not a universal SLA. seconds = ceil(combined fresh MiB / 16), not
+        // a per-claim ceil. Recalibrate if qualified guests on that backend
+        // are slower. Not cap#249: this never skips the in-guest zero scan.
         let seconds = u64::try_from(total_mib.div_ceil(16))
             .map_err(|_| "volume initialization duration is too large")?;
         self.rollout_timeout
@@ -201,13 +202,14 @@ mod tests {
         );
     }
 
-    /// cap#257: pin the absolute contract, not only relative ordering.
-    /// Default baseline is 600s. A fresh claim adds `ceil(size_MiB / 16)`
-    /// seconds (two passes at the qualified 32 MiB/s selected-backend
-    /// estimate) on top of whatever baseline is configured. An initialized
-    /// redeploy keeps the baseline alone, at any size. The API persists this
-    /// result once as `rollout_timeout_millis`; observer restarts reuse that
-    /// recorded generation deadline instead of recomputing it.
+    /// cap#257: pin the absolute arithmetic, not only relative ordering.
+    /// Default baseline is 600s. Selected fresh claims add
+    /// `ceil(total_fresh_MiB / 16)` seconds (two passes at the qualified
+    /// 32 MiB/s selected-backend estimate) on top of whatever baseline is
+    /// configured. The ceil is on the combined MiB, not per claim. An
+    /// initialized redeploy keeps the baseline alone, at any size.
+    /// Persistence of that result is covered by the API observer test, not
+    /// here.
     #[test]
     fn fresh_claim_budget_is_baseline_plus_two_passes_at_32_mib_s() {
         let config = ApplyConfig::default();
@@ -263,6 +265,13 @@ mod tests {
             .rollout_timeout_for_storage("1Gi", "32Mi", FreshVolumeClaims::ALL)
             .unwrap();
         assert_eq!(both, baseline + Duration::from_secs(64 + 2));
+
+        // Combined ceil, not per-claim: 33+33 = 66 MiB, ceil(66/16) = 5,
+        // not 3+3.
+        let combined = config
+            .rollout_timeout_for_storage("33Mi", "33Mi", FreshVolumeClaims::ALL)
+            .unwrap();
+        assert_eq!(combined, baseline + Duration::from_secs(5));
 
         // The allowance is added to the configured baseline, not a hardcoded
         // 600 inside the function. A non-default baseline must survive.
