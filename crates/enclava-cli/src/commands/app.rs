@@ -2665,6 +2665,22 @@ fn status_json_payload(
     Ok(out)
 }
 
+/// Same bound as `enclava-api`'s `sanitize_tee_error`: the attested `/status`
+/// probe and an older API response are untrusted at this render boundary.
+/// Control characters (terminal escapes included) are stripped and the value
+/// is capped; empty after stripping is absent. The detail stays free-form —
+/// `last_init_stage` is the fixed-vocabulary channel.
+const TEE_ERROR_MAX_CHARS: usize = 512;
+
+fn bounded_tee_error(raw: Option<&str>) -> Option<String> {
+    let clean: String = raw?
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(TEE_ERROR_MAX_CHARS)
+        .collect();
+    if clean.is_empty() { None } else { Some(clean) }
+}
+
 pub async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
     use colored::Colorize;
 
@@ -2672,6 +2688,9 @@ pub async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> 
     let (api, _paths, _cli_config) = build_api_client()?;
 
     let mut status = api.get_status(&app_name).await?;
+    // Re-apply the API bound so an older API, or the direct probe below,
+    // cannot inject terminal escapes into the render or `--json` output.
+    status.tee_error = bounded_tee_error(status.tee_error.as_deref());
     let app_metadata = api.get_app(&app_name).await.ok();
     let stable_ssh_endpoint = app_metadata
         .as_ref()
@@ -2705,10 +2724,11 @@ pub async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> 
                     .map(str::to_string);
             }
             if status.tee_error.is_none() {
-                status.tee_error = tee_status_json
-                    .get("error")
-                    .and_then(|value| value.as_str())
-                    .map(str::to_string);
+                status.tee_error = bounded_tee_error(
+                    tee_status_json
+                        .get("error")
+                        .and_then(|value| value.as_str()),
+                );
             }
         }
     }
@@ -2771,6 +2791,7 @@ pub async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> 
         println!("Unlock:   {unlock}");
     }
     if let Some(tee_error) = &status.tee_error {
+        // Already passed through `bounded_tee_error` (controls stripped, capped).
         println!("TEE error: {}", tee_error.red());
     }
     if let Some(retry_after) = &tee_acme_retry_after {
