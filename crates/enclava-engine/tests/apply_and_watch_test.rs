@@ -716,6 +716,73 @@ mod fresh_claim_evidence {
         assert!(claims.tls_data, "the newer tls claim is fresh");
     }
 
+    /// A missing ordinal-zero claim is a new volume: the admission signal
+    /// (review name `expects_fresh_volume`) is set. An unchecked claim stays
+    /// clear.
+    #[tokio::test]
+    async fn absent_claim_expects_fresh_volume() {
+        let claims = inspect(
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            FreshVolumeClaims {
+                app_data: true,
+                tls_data: false,
+            },
+        )
+        .await
+        .expect("lookup succeeds");
+        assert!(claims.app_data, "a new claim is fresh");
+        assert!(!claims.tls_data, "an unchecked claim stays clear");
+    }
+
+    /// A bound claim with a creation timestamp but no Ready ordinal-zero pod
+    /// is unproven. PVC existence is not initialization evidence.
+    #[tokio::test]
+    async fn unproven_claim_without_ready_pod_expects_fresh_volume() {
+        let claims = inspect(
+            [created_pvc_entry("state-test-app-0", CREATED_JAN1)]
+                .into_iter()
+                .collect(),
+            std::collections::HashMap::new(),
+            FreshVolumeClaims {
+                app_data: true,
+                tls_data: false,
+            },
+        )
+        .await
+        .expect("lookup succeeds");
+        assert!(
+            claims.app_data,
+            "a bound claim without a Ready pod is fresh"
+        );
+    }
+
+    /// A terminating claim is recreated by the StatefulSet controller, so
+    /// the replacement is fresh even if a Ready pod still mounts the name.
+    #[tokio::test]
+    async fn recreated_terminating_claim_expects_fresh_volume() {
+        let claims = inspect(
+            [pvc_entry("state-test-app-0", Some("2026-10-14T00:00:00Z"))]
+                .into_iter()
+                .collect(),
+            [pod_entry(
+                &["state-test-app-0"],
+                true,
+                "2026-01-02T00:00:00Z",
+                None,
+            )]
+            .into_iter()
+            .collect(),
+            FreshVolumeClaims {
+                app_data: true,
+                tls_data: false,
+            },
+        )
+        .await
+        .expect("lookup succeeds");
+        assert!(claims.app_data, "a terminating claim is recreated fresh");
+    }
+
     /// `NONE` performs no Kubernetes I/O — the API floor admission for
     /// normal sizes must stay read-free.
     #[tokio::test]

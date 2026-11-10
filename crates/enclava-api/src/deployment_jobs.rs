@@ -9798,17 +9798,14 @@ pub(crate) mod tests {
         .execute(&pool)
         .await
         .expect("stage mutated app row");
-        let budget = probing_rollout_engine(Arc::new(|| {}))
-            .config()
-            .rollout_timeout_for_storage(
-                &payload.snapshot.resources.app_data_size,
-                &payload.snapshot.resources.tls_data_size,
-                enclava_engine::apply::orchestrator::FreshVolumeClaims::ALL,
-            )
-            .expect("fixture rollout budget");
-        let budget_millis = i64::try_from(budget.as_millis()).unwrap();
+        // cap#257: the resumed deadline is the persisted column, not a
+        // recompute from current sizes or the 600s baseline. A sentinel that
+        // matches neither must come back unchanged. The anchor is already
+        // past that sentinel, so exhaustion classification is unchanged.
+        let recorded = std::time::Duration::from_millis(123_456);
+        let budget_millis = i64::try_from(recorded.as_millis()).unwrap();
         let expired_anchor = chrono::Utc::now()
-            - chrono::Duration::from_std(budget).expect("supported fixture duration")
+            - chrono::Duration::from_std(recorded).expect("supported fixture duration")
             - chrono::Duration::seconds(1);
         sqlx::query(
             "UPDATE deployments
@@ -9846,7 +9843,7 @@ pub(crate) mod tests {
         assert_eq!(observed.status, AppStatus::Running);
         assert_eq!(observed.unlock_mode, crate::models::UnlockMode::Password);
         assert_eq!(manifest_hash, "resumed-manifest");
-        assert_eq!(rollout_timeout, budget);
+        assert_eq!(rollout_timeout, recorded);
 
         // A resumed observer must NOT wait for the owner: with the rollout
         // budget already exhausted, the redeploy classifies a timeout as a
