@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use enclava_cli::api_client::{ApiClient, ApiError};
 use enclava_cli::api_types::{
     UnlockEndpointResponse, UnlockLockedGeneration, UnlockStatusResponse, UpdateUnlockModeRequest,
+    UpdateUnlockModeResponse,
 };
 use enclava_cli::app_config::{
     AppConfig, AppConfigError, AppSection, ResourcesSection, StorageSection, UnlockSection,
@@ -966,6 +967,26 @@ fn apply_locked_app_identity(
     Ok(())
 }
 
+/// Preview must confirm CAP still has the app in auto mode. The status
+/// field is not part of locked_generation, so a proxy can rewrite it and
+/// the receipt from_mode would not match the stored mode after the wrap
+/// is gone.
+fn require_auto_preview(preview: &UpdateUnlockModeResponse, app_name: &str) -> Result<(), String> {
+    if preview.status != "validated" || preview.app_name != app_name {
+        return Err(format!(
+            "CAP did not accept the signed unlock descriptor (status {}); the guest wrap was not removed",
+            preview.status
+        ));
+    }
+    if preview.unlock_mode != "auto" {
+        return Err(format!(
+            "CAP unlock mode is {:?}, not auto; the guest wrap was not removed",
+            preview.unlock_mode
+        ));
+    }
+    Ok(())
+}
+
 /// The password prompt and descriptor signing are not a safe window. The
 /// generation read immediately before `tee.disable_auto_unlock` must still
 /// be the one that was signed.
@@ -1111,13 +1132,13 @@ pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::erro
                     },
                 )
                 .await?;
-            if preview.status != "validated" || preview.app_name != app_name {
-                return Err(format!(
-                    "CAP did not accept the signed unlock descriptor (status {}); the guest wrap was not removed",
-                    preview.status
-                )
-                .into());
+            if let Err(reason) = require_auto_preview(&preview, &app_name) {
+                return Err(reason.into());
             }
+            // The receipt from_mode must be the mode CAP just confirmed, not
+            // the earlier status read. A proxy can rewrite that field without
+            // touching locked_generation or this PUT response.
+            app_meta.unlock_mode = preview.unlock_mode;
 
             println!("Disabling auto-unlock for {app_name}...");
             tee.disable_auto_unlock(&password).await?;
@@ -1351,6 +1372,28 @@ mod tests {
             .log_encryption = None;
         let dropped = require_signable_generation(&omitted_log, &image).unwrap_err();
         assert!(dropped.contains("log_encryption"), "{dropped}");
+
+        require_auto_preview(
+            &UpdateUnlockModeResponse {
+                app_name: "hosted-app".to_string(),
+                unlock_mode: "auto".to_string(),
+                deployment_id: None,
+                status: "validated".to_string(),
+            },
+            "hosted-app",
+        )
+        .unwrap();
+        let refused = require_auto_preview(
+            &UpdateUnlockModeResponse {
+                app_name: "hosted-app".to_string(),
+                unlock_mode: "password".to_string(),
+                deployment_id: None,
+                status: "validated".to_string(),
+            },
+            "hosted-app",
+        )
+        .unwrap_err();
+        assert!(refused.contains("not auto"), "{refused}");
 
         let mut empty_paths = acceptable_status(9090);
         empty_paths
