@@ -783,7 +783,8 @@ fn tee_evidence_fields(body: &Value) -> TeeEvidenceFields {
         tee_error: body
             .get("error")
             .and_then(Value::as_str)
-            .map(str::to_string),
+            .map(sanitize_tee_error)
+            .filter(|clean| !clean.is_empty()),
         supplemental_fields_malformed,
     }
 }
@@ -1057,6 +1058,16 @@ fn classify_live_observation_for_deployment(
         tee_error: fields.tee_error,
         runtime_failure: pod.runtime_failure,
     }
+}
+
+/// Bound the sidecar-supplied error detail at the trust boundary before it
+/// crosses into the owner-facing API: control characters are stripped and the
+/// value is capped, because CLI clients render it directly to a terminal
+/// (contrast `last_init_stage`, which is exact-matched against a fixed
+/// vocabulary — the error detail is free-form by nature, so it is bounded
+/// rather than allowlisted).
+fn sanitize_tee_error(raw: &str) -> String {
+    raw.chars().filter(|c| !c.is_control()).take(512).collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1487,6 +1498,27 @@ mod tests {
             fields.tee_error.as_deref(),
             Some("enclava_init_failed:last_stage=binding workload mount namespaces")
         );
+    }
+
+    #[test]
+    fn tee_error_is_bounded_at_the_trust_boundary() {
+        // Control characters (incl. terminal escapes) are stripped.
+        let fields = tee_evidence_fields(&json!({
+            "pod_status": "Running",
+            "error": "enclava_init_failed:\u{1b}[31mred\u{7}"
+        }));
+        assert_eq!(
+            fields.tee_error.as_deref(),
+            Some("enclava_init_failed:[31mred")
+        );
+
+        // Oversized detail is capped, never forwarded whole.
+        let fields = tee_evidence_fields(&json!({ "error": "x".repeat(2000) }));
+        assert_eq!(fields.tee_error.as_deref().unwrap().len(), 512);
+
+        // Sanitized-empty (all control characters) is absent, not an empty string.
+        let fields = tee_evidence_fields(&json!({ "error": "\u{1b}\u{7}\u{0}" }));
+        assert_eq!(fields.tee_error, None);
     }
 
     #[test]
