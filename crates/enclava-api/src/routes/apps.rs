@@ -455,35 +455,10 @@ async fn request_workload_teardown(
         }
         relaxed
     } else {
-        let identities =
-            match crate::tee_attestation::load_admissible_launch_identities(&state.db, app).await {
-                Ok(identities) => identities,
-                Err(error) => {
-                    tracing::warn!(
-                        app_id = %app.id,
-                        category = error.category(),
-                        reason = error.reason(),
-                        code = "app_delete_teardown_attestation",
-                        "workload teardown identity unavailable"
-                    );
-                    return Err(app_delete_failure(
-                        app.id,
-                        AppDeleteFailure::TeardownEndpoint,
-                        error.category(),
-                    ));
-                }
-            };
-        let gateway_ip = crate::routes::logs::resolve_tenant_gateway_ip(
-            app.id,
+        match crate::tee_attestation::attested_tee_channel(
+            app,
+            &state.db,
             &state.kube_client,
-            &app.name,
-            &app.namespace,
-        )
-        .await;
-        match crate::tee_attestation::attest_teardown_channel(
-            domain,
-            gateway_ip,
-            &identities,
             state
                 .attestation
                 .as_ref()

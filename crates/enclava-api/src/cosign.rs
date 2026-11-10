@@ -1462,24 +1462,27 @@ fn parse_certificate_chain_pem(pem: &str) -> Result<Vec<DerCertificate>, CosignE
     Ok(chain)
 }
 
-/// Fetch provenance attestation and SBOM from OCI registry attestation tags.
+/// Reject unguarded registry destinations, then return no attestation metadata.
 ///
-/// `body_limit` caps how many manifest bytes a registry response may carry
-/// before the read is aborted (see `clients::read_body_capped`); callers
-/// should pass the outbound client's `ClientConfig::body_limit_bytes`.
+/// Digest-derived `.att` / `.sbom` tags are mutable and unsigned. A registry
+/// that served a correctly signed image can still serve arbitrary JSON at
+/// those tags, and that JSON was previously persisted beside
+/// `cosign_verified=true` (cap#227, cap#230). This function no longer fetches
+/// or returns those bodies. Index-bound provenance, when present, is collected
+/// separately by `fetch_portable_verification_material` from descriptors inside
+/// the source manifest.
 ///
-/// `egress` pre-checks the registry host (issue #224): the caller's client
-/// is the guarded `state.http_client` (resolver-backed), but reqwest never
-/// consults a custom resolver for literal-IP hosts, so a literal registry
-/// host must be rejected explicitly before the first request.
+/// `client`, `digest`, and `body_limit` remain in the signature so existing
+/// callers keep compiling; they are unused because the tag read itself is the
+/// bug. The egress pre-check is unchanged (issue #224).
 pub async fn fetch_attestations(
     egress: &EgressGuard,
-    client: &reqwest::Client,
+    _client: &reqwest::Client,
     image_ref: &str,
-    digest: &str,
-    body_limit: u64,
+    _digest: &str,
+    _body_limit: u64,
 ) -> Result<(Option<serde_json::Value>, Option<serde_json::Value>), CosignError> {
-    let (registry, repository) = parse_image_parts(image_ref)?;
+    let (registry, _repository) = parse_image_parts(image_ref)?;
     let base_url = registry_base_url(&registry)
         .map_err(|e| CosignError::VerificationFailed(format!("unsupported registry: {e}")))?;
     let registry_url = reqwest::Url::parse(&base_url)
@@ -1491,21 +1494,18 @@ pub async fn fetch_attestations(
             CosignError::VerificationFailed(format!("registry destination rejected: {e}"))
         })?;
 
-    // Attestation manifests are provenance material: bound the read by the
-    // same cap the portable-material checks enforce, so a malicious registry
-    // cannot force multi-megabyte JSON (and serde_json Value amplification
-    // beyond it) past this fetch even when the generic outbound limit is
-    // higher.
-    let body_limit = body_limit.min(MAX_PROVENANCE_MATERIAL_BYTES as u64);
-    let provenance =
-        fetch_attestation_tag(client, &base_url, &repository, digest, "att", body_limit).await?;
-    let sbom =
-        fetch_attestation_tag(client, &base_url, &repository, digest, "sbom", body_limit).await?;
-
-    Ok((provenance, sbom))
+    // Do not GET the mutable tag. Returning `Some(json)` here is what let a
+    // tenant-controlled registry persist forged provenance next to a signature
+    // that was verified independently.
+    Ok((None, None))
 }
 
 /// Preserve the exact OCI manifests and signed layers needed for offline replay.
+///
+/// `policy` is the app's pinned signer policy. Portable `.sig` tag and referrer
+/// blobs are packaged only when those exact bytes verify under it. A mutable
+/// tag rewrite between `verify_image` and this fetch is not stored unless the
+/// replacement itself verifies (cap#227).
 ///
 /// `egress` guards the oci-client transport the same way `verify_image`
 /// guards the sigstore one (issue #224): `oci_client::client::Client`
@@ -1516,6 +1516,7 @@ pub async fn fetch_portable_verification_material(
     egress: &EgressGuard,
     image_ref: &str,
     image_digest: &str,
+    policy: &VerificationPolicy,
 ) -> Result<PortableVerificationMaterial, CosignError> {
     use oci_client::client::{Client, ClientConfig};
 
@@ -1581,8 +1582,16 @@ pub async fn fetch_portable_verification_material(
             "source manifest digest mismatch".into(),
         ));
     }
-    let signature_objects =
-        pull_signature_objects(&client, &source, &signature, &auth, MANIFEST_TYPES).await?;
+    let signature_objects = pull_signature_objects(
+        &client,
+        &source,
+        &signature,
+        &auth,
+        MANIFEST_TYPES,
+        policy,
+        image_digest,
+    )
+    .await?;
     let provenance_objects = pull_provenance_objects(
         &client,
         &source_manifest,
@@ -1638,7 +1647,15 @@ async fn pull_signature_objects(
     legacy_signature: &oci_client::Reference,
     auth: &oci_client::secrets::RegistryAuth,
     accepted_media_types: &[&str],
+    policy: &VerificationPolicy,
+    image_digest: &str,
 ) -> Result<Vec<(Vec<u8>, Vec<Vec<u8>>)>, CosignError> {
+    // Shape is not evidence. The `.sig` tag is mutable, and a referrer list is
+    // chosen by the registry. Persist an object only when every layer blob
+    // verifies under `policy` and the manifest digest-pins those bytes
+    // (cap#227). Trust-root loading waits until a shape-valid candidate
+    // exists, so a missing signature still fails closed without a TUF fetch.
+    let mut checker = None;
     if let Ok(object) = pull_oci_object(
         client,
         legacy_signature,
@@ -1649,7 +1666,10 @@ async fn pull_signature_objects(
     .await
         && object.1.iter().any(|blob| is_portable_signature_blob(blob))
     {
-        return Ok(vec![object]);
+        let loaded = ensure_portable_signature_checker(&mut checker, policy).await?;
+        if signature_object_is_verified(&object.0, &object.1, loaded, image_digest) {
+            return Ok(vec![object]);
+        }
     }
     let referrers = client
         .pull_referrers(source, None)
@@ -1679,23 +1699,62 @@ async fn pull_signature_objects(
         if manifest
             .pointer("/annotations/dev.sigstore.bundle.predicateType")
             .and_then(serde_json::Value::as_str)
-            == Some("https://sigstore.dev/cosign/sign/v1")
-            && object.1.iter().any(|blob| is_portable_signature_blob(blob))
+            != Some("https://sigstore.dev/cosign/sign/v1")
+            || !object.1.iter().any(|blob| is_portable_signature_blob(blob))
         {
-            if objects.iter().map(oci_object_size).sum::<usize>() + oci_object_size(&object)
-                > MAX_SIGSTORE_MATERIAL_BYTES
-            {
-                return Err(portable_material_too_large());
-            }
-            objects.push(object);
+            continue;
         }
+        let verified = {
+            let loaded = ensure_portable_signature_checker(&mut checker, policy).await?;
+            signature_object_is_verified(&object.0, &object.1, loaded, image_digest)
+        };
+        if !verified {
+            continue;
+        }
+        if objects.iter().map(oci_object_size).sum::<usize>() + oci_object_size(&object)
+            > MAX_SIGSTORE_MATERIAL_BYTES
+        {
+            return Err(portable_material_too_large());
+        }
+        objects.push(object);
     }
     if objects.is_empty() {
         return Err(CosignError::NotSigned(
-            "no portable Sigstore signature object found".into(),
+            "no portable Sigstore signature object matched the app verification policy".into(),
         ));
     }
     Ok(objects)
+}
+
+struct PortableSignatureChecker {
+    verifier: Verifier,
+    policy: SigstorePolicy,
+}
+
+async fn load_portable_signature_checker(
+    policy: &VerificationPolicy,
+) -> Result<PortableSignatureChecker, CosignError> {
+    let policy = build_sigstore_policy(policy)?;
+    let root = load_trust_root().await?;
+    let verifier = Verifier::new(&root).map_err(|error| {
+        CosignError::TrustRoot(format!("sigstore trust root unusable: {error}"))
+    })?;
+    Ok(PortableSignatureChecker { verifier, policy })
+}
+
+async fn ensure_portable_signature_checker<'a>(
+    slot: &'a mut Option<PortableSignatureChecker>,
+    policy: &VerificationPolicy,
+) -> Result<&'a PortableSignatureChecker, CosignError> {
+    if slot.is_none() {
+        *slot = Some(load_portable_signature_checker(policy).await?);
+    }
+    match slot.as_ref() {
+        Some(checker) => Ok(checker),
+        None => Err(CosignError::VerificationFailed(
+            "portable signature checker was not loaded".into(),
+        )),
+    }
 }
 
 fn is_portable_signature_blob(blob: &[u8]) -> bool {
@@ -1709,6 +1768,43 @@ fn is_portable_signature_blob(blob: &[u8]) -> bool {
                 .and_then(serde_json::Value::as_array)
                 .is_some_and(|entries| !entries.is_empty())
     })
+}
+
+fn signature_blob_digest(blob: &[u8]) -> String {
+    format!("sha256:{}", hex::encode(Sha256::digest(blob)))
+}
+
+/// A shape-valid bundle is not evidence. Every layer must verify under the
+/// app policy, and the manifest must digest-pin those exact bytes. That is
+/// what stops a swapped `.sig` tag, or a registry-chosen referrer, from being
+/// stored as verification material (cap#227).
+fn signature_object_is_verified(
+    manifest: &[u8],
+    blobs: &[Vec<u8>],
+    checker: &PortableSignatureChecker,
+    image_digest: &str,
+) -> bool {
+    if blobs.is_empty() {
+        return false;
+    }
+    if !blobs.iter().all(|blob| {
+        is_portable_signature_blob(blob)
+            && verify_referrer_bundle(&checker.verifier, &checker.policy, blob, image_digest)
+                .is_some()
+    }) {
+        return false;
+    }
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(manifest) else {
+        return false;
+    };
+    let Some(layers) = value.get("layers").and_then(serde_json::Value::as_array) else {
+        return false;
+    };
+    layers.len() == blobs.len()
+        && layers.iter().zip(blobs).all(|(layer, blob)| {
+            let digest = signature_blob_digest(blob);
+            layer.get("digest").and_then(serde_json::Value::as_str) == Some(digest.as_str())
+        })
 }
 
 async fn pull_provenance_objects(
@@ -1850,6 +1946,13 @@ fn extend_bounded(
     Ok(())
 }
 
+/// Capped read of a digest-derived attestation tag.
+///
+/// Production no longer calls this (cap#227): the tag is mutable and its body
+/// was persisted unverified. The helper stays so the body-cap regression
+/// (issue #216) still has a subject, and so a future signed ingestion path
+/// cannot reintroduce an unbounded read.
+#[cfg_attr(not(test), allow(dead_code))]
 async fn fetch_attestation_tag(
     client: &reqwest::Client,
     base_url: &str,
@@ -1902,6 +2005,9 @@ async fn fetch_attestation_tag(
 /// Capped read of an attestation manifest body. Returns `Ok(None)`
 /// (treated as "attestation absent") when the body exceeds `body_limit`
 /// or is not valid UTF-8; transport errors propagate as `Err`.
+///
+/// See `fetch_attestation_tag`: retained for the body-cap regression.
+#[cfg_attr(not(test), allow(dead_code))]
 async fn read_attestation_body(
     response: reqwest::Response,
     body_limit: u64,
@@ -2247,7 +2353,7 @@ mod tests {
             "169.254.169.254/repo/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "evil.example/repo/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         ] {
-            let err = fetch_portable_verification_material(&guard, image, digest)
+            let err = fetch_portable_verification_material(&guard, image, digest, &url_policy())
                 .await
                 .unwrap_err();
             assert!(
@@ -2262,6 +2368,7 @@ mod tests {
             &guard,
             "[::ffff:10.0.5.7]/repo/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             digest,
+            &url_policy(),
         )
         .await
         .unwrap_err();
@@ -2577,6 +2684,103 @@ mod tests {
         assert!(is_portable_signature_blob(
             br#"{"dsseEnvelope":{},"verificationMaterial":{"certificate":{"rawBytes":"AA=="},"tlogEntries":[{}]}}"#
         ));
+    }
+
+    /// cap#227: a registry-controlled `.sig` tag can serve a shape-valid bundle
+    /// that was never verified. Persisting it requires the blob to verify
+    /// under the app policy and the manifest to cite that blob's digest — not
+    /// merely `dsseEnvelope` plus a certificate field.
+    #[test]
+    fn portable_signature_material_must_be_policy_verified() {
+        let subject = "https://github.com/kubewarden/kubewarden-controller/.github/workflows/release.yml@refs/tags/v1.34.0";
+        let image_digest =
+            "sha256:c811d58de79c92f03214e63aa339484e488d694ae8a6283b5f3f17a9faf50172";
+        let checker = PortableSignatureChecker {
+            verifier: pinned_trust_root_verifier(),
+            policy: build_sigstore_policy(&VerificationPolicy::FulcioUrlIdentity {
+                fulcio_subject_url: subject.to_string(),
+                fulcio_issuer: FLUX_SIGNER_ISSUER.to_string(),
+            })
+            .unwrap(),
+        };
+        let bundle = include_bytes!("cosign_testdata/kubewarden-controller-v1.34.0.bundle.json");
+        let forged = br#"{"dsseEnvelope":{},"verificationMaterial":{"certificate":{"rawBytes":"AA=="},"tlogEntries":[{}]}}"#;
+        let forged_manifest = manifest_citing_blobs(&[forged]);
+        let bundle_manifest = manifest_citing_blobs(&[bundle]);
+
+        assert!(
+            is_portable_signature_blob(forged),
+            "shape check alone still accepts the forged bundle"
+        );
+        assert!(
+            !signature_object_is_verified(
+                &forged_manifest,
+                &[forged.to_vec()],
+                &checker,
+                image_digest
+            ),
+            "a shape-valid bundle that does not verify must not be stored"
+        );
+        assert!(signature_object_is_verified(
+            &bundle_manifest,
+            &[bundle.to_vec()],
+            &checker,
+            image_digest
+        ));
+        assert!(
+            !signature_object_is_verified(
+                &bundle_manifest,
+                &[bundle.to_vec()],
+                &checker,
+                &format!("sha256:{}", "1".repeat(64)),
+            ),
+            "a bundle for one image must not authorize another digest"
+        );
+
+        let other = PortableSignatureChecker {
+            verifier: pinned_trust_root_verifier(),
+            policy: build_sigstore_policy(&VerificationPolicy::FulcioUrlIdentity {
+                fulcio_subject_url:
+                    "https://github.com/enclava-labs/cap/.github/workflows/api-image.yml@refs/heads/main"
+                        .to_string(),
+                fulcio_issuer: FLUX_SIGNER_ISSUER.to_string(),
+            })
+            .unwrap(),
+        };
+        assert!(
+            !signature_object_is_verified(
+                &bundle_manifest,
+                &[bundle.to_vec()],
+                &other,
+                image_digest
+            ),
+            "another app's pinned identity must not accept this bundle"
+        );
+
+        let mixed = serde_json::to_vec(&serde_json::json!({
+            "layers": [
+                {"digest": signature_blob_digest(bundle)},
+                {"digest": format!("sha256:{}", "1".repeat(64))}
+            ]
+        }))
+        .unwrap();
+        assert!(
+            !signature_object_is_verified(&mixed, &[bundle.to_vec()], &checker, image_digest),
+            "a manifest that cites an unverified layer must not be stored"
+        );
+    }
+
+    fn manifest_citing_blobs(blobs: &[&[u8]]) -> Vec<u8> {
+        let layers: Vec<_> = blobs
+            .iter()
+            .map(|blob| {
+                serde_json::json!({
+                    "digest": signature_blob_digest(blob),
+                    "size": blob.len(),
+                })
+            })
+            .collect();
+        serde_json::to_vec(&serde_json::json!({ "layers": layers })).unwrap()
     }
 
     #[test]
@@ -3372,7 +3576,7 @@ mod tests {
             // Empty pinned-root path deterministically stops after preflight,
             // without contacting the public TUF service.
             assert!(matches!(err, CosignError::TrustRoot(_)), "{err}");
-            let err = fetch_portable_verification_material(&egress, &image, &digest)
+            let err = fetch_portable_verification_material(&egress, &image, &digest, &policy)
                 .await
                 .unwrap_err();
             assert!(
