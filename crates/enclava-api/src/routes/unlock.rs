@@ -226,17 +226,35 @@ fn signable_storage_paths(paths: Option<&[String]>) -> Result<Vec<String>, &'sta
         .collect())
 }
 
+/// The locked primary in the form a signed unlock render uses: JSON argv,
+/// port > 0, and user storage paths with `/state` removed. Persisting this
+/// form, not the raw column and not the raw descriptor, is what keeps the
+/// apply job's cc_init hash equal to the commit-time pin.
+fn normalized_locked_workload(
+    primary: &crate::models::AppContainer,
+) -> Result<(String, i32, Vec<String>), &'static str> {
+    let command = signable_command(primary.command.as_deref())
+        .ok_or("stored primary command is missing or not a JSON argv")?;
+    let command_json = serde_json::to_string(&command)
+        .map_err(|_| "stored primary command is missing or not a JSON argv")?;
+    let port = i32::from(
+        signable_port(primary.port)
+            .ok_or("stored primary omitted port; refusing to assume 8080")?,
+    );
+    let storage_paths = signable_storage_paths(primary.storage_paths.as_deref())?;
+    Ok((command_json, port, storage_paths))
+}
+
 /// A signed unlock-mode redeploy must not change the running workload.
 ///
 /// The CLI signs the status object's command, port, and storage paths. A
 /// proxy that rewrites both status reads can still present a different
 /// descriptor at PUT, and `require_same_locked_generation` will not catch
 /// it. Compare those fields to the locked primary before any container
-/// write, using the same normalization the status builder publishes: JSON
-/// argv, port > 0, and [`signable_storage_paths`] (drop `/state`, allow the
-/// empty remainder). A raw equality check against a `/state`-only column
-/// would refuse that honest empty list. Matching fields are not written
-/// back: the stored primary is already the workload that was signed.
+/// write, using [`normalized_locked_workload`]. A raw equality check against
+/// a `/state`-only column would refuse the honest empty list. A match is
+/// then stored in that normalized form so the apply job does not render a
+/// different cc_init than the one the commit pin checked.
 fn signed_workload_matches_locked_primary(
     primary: &crate::models::AppContainer,
     signed_command: Option<&str>,
@@ -251,22 +269,20 @@ fn signed_workload_matches_locked_primary(
     else {
         return Err("signed descriptor omitted command, port, or storage paths");
     };
-    let locked_command = signable_command(primary.command.as_deref())
+    let (locked_command_json, locked_port, locked_paths) = normalized_locked_workload(primary)?;
+    let locked_command = signable_command(Some(&locked_command_json))
         .ok_or("stored primary command is missing or not a JSON argv")?;
     let signed_argv = signable_command(Some(signed_command))
         .ok_or("signed descriptor command is missing or not a JSON argv")?;
     if signed_argv != locked_command {
         return Err("signed descriptor command does not match the locked primary");
     }
-    let locked_port = signable_port(primary.port)
-        .ok_or("stored primary omitted port; refusing to assume 8080")?;
     let Some(normalized_signed_port) = signable_port(Some(signed_port)) else {
         return Err("signed descriptor port does not match the locked primary");
     };
-    if normalized_signed_port != locked_port {
+    if i32::from(normalized_signed_port) != locked_port {
         return Err("signed descriptor port does not match the locked primary");
     }
-    let locked_paths = signable_storage_paths(primary.storage_paths.as_deref())?;
     let signed_normalized = signable_storage_paths(Some(signed_paths))?;
     if signed_normalized != locked_paths {
         return Err("signed descriptor storage paths do not match the locked primary");
@@ -1249,8 +1265,17 @@ async fn commit_unlock_mode_transition(
         ));
     }
     // Reject a rewritten command, port, or mount list before either UPDATE.
-    // Profile and image digest are already bound; these three are the fields
-    // the descriptor write used to copy onto the primary.
+    // Artifacts without these fields would still pin via the descriptor
+    // overlay and then apply the raw column.
+    if request.signing_artifacts.is_some()
+        && (request.signed_workload_command.is_none()
+            || request.signed_container_port.is_none()
+            || request.signed_storage_paths.is_none())
+    {
+        return Err(unlock_transition_conflict(
+            "signed descriptor omitted command, port, or storage paths",
+        ));
+    }
     if let Err(reason) = signed_workload_matches_locked_primary(
         locked_primary,
         request.signed_workload_command,
@@ -1387,10 +1412,31 @@ async fn commit_unlock_mode_transition(
         return Err(unlock_database_error());
     }
 
-    // Do not copy the signed descriptor's command, port, or storage paths
-    // onto the primary. Those fields were compared to the locked primary
-    // above; writing them back is how a rewritten status changed the
-    // workload. The apply snapshot below reads the unchanged row.
+    // Store the normalized locked workload, not the raw descriptor and not
+    // the raw column. `set_primary_descriptor_runtime` drops `/state` before
+    // the commit pin; `validate_signed_render` and `apply_deployment_manifests`
+    // rebuild cc_init from this snapshot and do not overlay the descriptor.
+    // Leaving `/state` in the column makes those renders hash differently
+    // and the job fails Artifact after the guest wrap is already gone.
+    if request.signed_workload_command.is_some() {
+        let (command_json, port, storage_paths) =
+            normalized_locked_workload(locked_primary).map_err(unlock_transition_conflict)?;
+        let result = sqlx::query(
+            "UPDATE app_containers
+             SET command = $1, port = $2, storage_paths = $3
+             WHERE app_id = $4 AND is_primary = true",
+        )
+        .bind(command_json)
+        .bind(port)
+        .bind(&storage_paths)
+        .bind(locked_app.id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| unlock_database_error())?;
+        if result.rows_affected() != 1 {
+            return Err(unlock_database_error());
+        }
+    }
 
     let updated_app: App = sqlx::query_as("SELECT * FROM apps WHERE id = $1")
         .bind(locked_app.id)
@@ -3321,7 +3367,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn state_only_primary_accepts_empty_signed_paths_without_rewriting_the_column() {
+    async fn state_only_primary_is_stored_as_the_normalized_signed_paths() {
         let pool = database_test_pool().await;
         let mut fixture = insert_unlock_test_app(&pool).await;
         sqlx::query(
@@ -3383,8 +3429,21 @@ mod tests {
         assert_eq!(persisted.port, Some(8080));
         assert_eq!(
             persisted.storage_paths,
-            Some(vec!["/state".to_string()]),
-            "matching signed paths must not be written back over the locked primary"
+            Some(Vec::<String>::new()),
+            "the stored primary must drop /state so the apply snapshot matches the signed render"
+        );
+        let payload: serde_json::Value = sqlx::query_scalar(
+            "SELECT payload FROM deployment_apply_jobs WHERE app_id = $1 AND deployment_id <> $2",
+        )
+        .bind(fixture.app.id)
+        .bind(fixture.source_deployment_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load apply payload");
+        assert_eq!(
+            payload["snapshot"]["containers"][0]["storage_paths"],
+            serde_json::json!([]),
+            "validate_signed_render and apply_deployment_manifests render this snapshot, not the raw column"
         );
         delete_unlock_test_org(&pool, fixture.app.org_id).await;
     }
@@ -3837,6 +3896,8 @@ mod tests {
         let api_signing_pubkey = "test-api-signing-key";
         let (artifacts, signed) =
             test_signing_artifacts(&app, deploy_id, image_digest, api_signing_pubkey);
+        let stored_command = "[\"/bin/old\"]";
+        let stored_paths = vec!["/data".to_string()];
 
         let result = commit_unlock_mode_transition(
             &pool,
@@ -3853,9 +3914,9 @@ mod tests {
                 receipt_json: &receipt_json,
                 deploy_id,
                 image_digest: Some(image_digest),
-                signed_workload_command: None,
-                signed_container_port: None,
-                signed_storage_paths: None,
+                signed_workload_command: Some(stored_command),
+                signed_container_port: Some(8080),
+                signed_storage_paths: Some(&stored_paths),
                 signing_artifacts: Some(&artifacts),
                 signed_policy_artifact: Some(&signed),
                 descriptor_platform_binding: &EMPTY_PLATFORM_BINDING,

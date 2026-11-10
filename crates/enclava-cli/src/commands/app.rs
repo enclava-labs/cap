@@ -500,6 +500,7 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
         workload_security_profile: WorkloadSecurityProfile::Restricted,
         container_name: "web",
         log_encryption: None,
+        pin_log_encryption: false,
     })
     .await?;
     // Locally trusted deployment identity, captured before the signed blobs

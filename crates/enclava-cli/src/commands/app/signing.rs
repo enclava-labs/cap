@@ -560,9 +560,13 @@ pub(crate) struct SignedDeployBlobParams<'a> {
     pub workload_security_profile: WorkloadSecurityProfile,
     /// Primary container name. Local project files have none and keep `web`.
     pub container_name: &'a str,
-    /// Generation log recipient. None is an explicit no-recipient sign, not
-    /// a pre-claim omit.
+    /// Generation log recipient. `None` is an explicit no-recipient sign when
+    /// `pin_log_encryption` is set (unlock disable). Ordinary deploys leave
+    /// the pin unset so a policy broker may still select a recipient.
     pub log_encryption: Option<LogEncryptionConfig>,
+    /// When true, the signing service must echo `log_encryption`. When false,
+    /// a broker-selected recipient is signed instead of failing the echo.
+    pub pin_log_encryption: bool,
 }
 
 pub(crate) struct SignedDeployBlobs {
@@ -598,6 +602,7 @@ pub(crate) async fn build_signed_deploy_blobs(
         workload_security_profile,
         container_name,
         log_encryption,
+        pin_log_encryption,
     } = params;
     let image_ref = enclava_common::image::ImageRef::parse(image)?;
     let image_ref = if image_ref.has_digest() {
@@ -799,13 +804,21 @@ pub(crate) async fn build_signed_deploy_blobs(
     };
     let (generated_agent_policy, echoed_log_encryption) =
         fetch_generated_agent_policy(api, &release, &descriptor, log_encryption.clone()).await?;
-    if echoed_log_encryption != log_encryption {
-        return Err(
-            "policy signing service did not echo the locked generation log_encryption; refusing \
-             to sign a descriptor that would drop encrypted logging"
-                .into(),
-        );
-    }
+    // Unlock disable pins the locked generation's recipient, including an
+    // explicit none. Ordinary deploys do not: a broker may select a key, and
+    // failing `None == response` would retire that contract.
+    let log_encryption = if pin_log_encryption {
+        if echoed_log_encryption != log_encryption {
+            return Err(
+                "policy signing service did not echo the locked generation log_encryption; refusing \
+                 to sign a descriptor that would drop encrypted logging"
+                    .into(),
+            );
+        }
+        log_encryption
+    } else {
+        echoed_log_encryption
+    };
     descriptor.expected_agent_policy_hash = generated_agent_policy.policy_sha256;
     let cc_app = confidential_app_for_cc_hash(
         app,

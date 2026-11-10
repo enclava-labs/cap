@@ -1075,6 +1075,7 @@ pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::erro
                     workload_security_profile: signed.workload_security_profile,
                     container_name: signed.container_name.as_str(),
                     log_encryption: signed.log_encryption.clone(),
+                    pin_log_encryption: true,
                 })
                 .await?;
             let endpoint = resolve_tee_endpoint(&api, &app_name).await?;
