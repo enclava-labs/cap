@@ -2062,6 +2062,30 @@ pub async fn update_unlock_mode(
         ) {
             return Err(unlock_transition_conflict(reason));
         }
+        // The cc_init pin does not separate the two uid-0 profiles. The commit
+        // rejects that swap; the preview must too, or the wrap is removed and
+        // the mode stays auto.
+        let signed_profile =
+            crate::routes::deployments::signed_descriptor_profile(&artifacts.descriptor)
+                .ok_or_else(|| {
+                    crate::routes::deployments::signing_error_response(
+                        crate::signing_service::SigningServiceError::Mismatch(
+                            "workload_security_profile".to_string(),
+                        ),
+                    )
+                })?;
+        let locked_profile = current_profile
+            .parse::<enclava_engine::types::WorkloadSecurityProfile>()
+            .map_err(|_| {
+                unlock_transition_conflict("stored workload security profile is invalid")
+            })?;
+        if signed_profile != locked_profile {
+            return Err(crate::routes::deployments::signing_error_response(
+                crate::signing_service::SigningServiceError::Mismatch(
+                    "workload_security_profile".to_string(),
+                ),
+            ));
+        }
         let attestation = state.attestation.as_ref().ok_or((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({

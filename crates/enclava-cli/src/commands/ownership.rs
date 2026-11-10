@@ -1095,19 +1095,29 @@ pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::erro
             // CAP must accept the signed descriptor before the wrap is removed.
             // A proxy that rewrote both status reads fails here, with the guest
             // wrap still in place.
-            api.update_unlock_mode(
-                &app_name,
-                &UpdateUnlockModeRequest {
-                    mode: "password".to_string(),
-                    transition_receipt: None,
-                    transition_attestation: None,
-                    customer_descriptor_blob: Some(signed_blobs.customer_descriptor_blob.clone()),
-                    org_keyring_blob: Some(signed_blobs.org_keyring_blob.clone()),
-                    signed_policy_artifact: Some(signed_blobs.signed_policy_artifact.clone()),
-                    validate_only: true,
-                },
-            )
-            .await?;
+            let preview = api
+                .update_unlock_mode(
+                    &app_name,
+                    &UpdateUnlockModeRequest {
+                        mode: "password".to_string(),
+                        transition_receipt: None,
+                        transition_attestation: None,
+                        customer_descriptor_blob: Some(
+                            signed_blobs.customer_descriptor_blob.clone(),
+                        ),
+                        org_keyring_blob: Some(signed_blobs.org_keyring_blob.clone()),
+                        signed_policy_artifact: Some(signed_blobs.signed_policy_artifact.clone()),
+                        validate_only: true,
+                    },
+                )
+                .await?;
+            if preview.status != "validated" || preview.app_name != app_name {
+                return Err(format!(
+                    "CAP did not accept the signed unlock descriptor (status {}); the guest wrap was not removed",
+                    preview.status
+                )
+                .into());
+            }
 
             println!("Disabling auto-unlock for {app_name}...");
             tee.disable_auto_unlock(&password).await?;
