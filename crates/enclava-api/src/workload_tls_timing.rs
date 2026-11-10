@@ -4,9 +4,11 @@
 //! Success means that operation returned Ok, not that subsequent validation passed.
 //! DNS lookup errors optionally add error_category: nxdomain, nodata, timeout,
 //! transport or other. Negative answers remain errors and still trigger the
-//! alternate-resolver retry. Propagation additionally accepts a successful
-//! non-matching TXT from the other resolver, and an HTTPS read of the
-//! TXT row this issuance created when both recursive resolvers miss.
+//! alternate-resolver retry. Propagation also accepts the current challenge
+//! from the other resolver when the preferred one returns a non-matching TXT.
+//! An HTTPS read of the created row is not acceptance: it starts a settle,
+//! and only after both resolvers missed. A live previous-challenge TXT is
+//! not overridden by that read.
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
