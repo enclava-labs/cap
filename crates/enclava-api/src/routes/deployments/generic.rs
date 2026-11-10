@@ -226,7 +226,10 @@ pub async fn generate_agent_policy(
             Json(serde_json::json!({"error": "app not found"})),
         ))?;
 
-    let log_encryption = validate_log_encryption_config(body.log_encryption.clone())?;
+    let log_encryption = match body.log_encryption {
+        None => None,
+        Some(inner) => Some(validate_log_encryption_config(inner)?),
+    };
     let descriptor = body.descriptor;
     let expected_identity_hash = hex::decode(&app.tenant_instance_identity_hash).map_err(|_| {
         (
@@ -265,7 +268,7 @@ pub async fn generate_agent_policy(
         agent_policy_text: response.agent_policy_text,
         agent_policy_sha256: response.agent_policy_sha256,
         genpolicy_version_pin: response.genpolicy_version_pin,
-        log_encryption,
+        log_encryption: log_encryption.flatten(),
     }))
 }
 

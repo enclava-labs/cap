@@ -519,8 +519,11 @@ pub struct ManagedConfigDeliveryStatusResponse {
 #[derive(Debug, Serialize)]
 pub struct AgentPolicyRequest {
     pub descriptor: enclava_common::descriptor::DeploymentDescriptor,
+    /// `None` omits the field (ordinary deploy; a broker may select a key).
+    /// `Some(None)` is an explicit null, used when unlock disable pins a
+    /// no-recipient generation. `Some(Some(_))` is a pinned recipient.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub log_encryption: Option<LogEncryptionConfig>,
+    pub log_encryption: Option<Option<LogEncryptionConfig>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -988,6 +991,10 @@ pub struct UnlockStatusResponse {
     pub locked_generation: Option<UnlockLockedGeneration>,
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug, Serialize)]
 pub struct UpdateUnlockModeRequest {
     pub mode: String,
@@ -1001,6 +1008,9 @@ pub struct UpdateUnlockModeRequest {
     pub org_keyring_blob: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signed_policy_artifact: Option<String>,
+    /// Ask CAP to accept the signed descriptor before the guest wrap is removed.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub validate_only: bool,
 }
 
 #[derive(Debug, Deserialize)]

@@ -270,6 +270,7 @@ pub(crate) async fn resolve_signed_policy_artifact(
     provided_artifact: Option<String>,
     signing_service_pubkey_hex: Option<&str>,
     log_encryption: Option<LogEncryptionConfig>,
+    pin_log_encryption: bool,
 ) -> Result<crate::signing_service::SignedPolicyArtifact, (StatusCode, Json<serde_json::Value>)> {
     use crate::signing_service::validate_proof_bundle_budget;
     artifacts
@@ -297,7 +298,7 @@ pub(crate) async fn resolve_signed_policy_artifact(
     let generated = signing_service
         .agent_policy(&crate::signing_service::AgentPolicyRequest {
             descriptor: artifacts.descriptor.clone(),
-            log_encryption: log_encryption.clone(),
+            log_encryption: pin_log_encryption.then(|| log_encryption.clone()),
         })
         .await
         .map_err(signing_error_response)?;
@@ -488,8 +489,10 @@ pub struct RollbackRequest {
 #[derive(Debug, Deserialize)]
 pub struct AgentPolicyRequest {
     pub descriptor: enclava_common::descriptor::DeploymentDescriptor,
+    /// Omitted means the broker may select a recipient. Null is an explicit
+    /// no-recipient pin from unlock disable.
     #[serde(default)]
-    pub log_encryption: Option<LogEncryptionConfig>,
+    pub log_encryption: Option<Option<LogEncryptionConfig>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1384,6 +1387,7 @@ async fn deploy_app_candidate(
             body.signed_policy_artifact.clone(),
             signing_service_pubkey_hex,
             log_encryption.clone(),
+            false,
         )
         .await?;
         app_spec.generated_agent_policy = Some(

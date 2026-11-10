@@ -533,6 +533,11 @@ pub struct UpdateUnlockModeRequest {
     pub org_keyring_blob: Option<String>,
     #[serde(default)]
     pub signed_policy_artifact: Option<String>,
+    /// Compare the signed descriptor to the locked primary and return without
+    /// a receipt or a commit. The CLI calls this before it removes the guest
+    /// wrap, so a rewritten status cannot strand the TEE.
+    #[serde(default)]
+    pub validate_only: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1851,7 +1856,7 @@ pub async fn update_unlock_mode(
         ));
     }
 
-    if current == requested {
+    if current == requested && !body.validate_only {
         return Ok(Json(UpdateUnlockModeResponse {
             app_name: app.name,
             unlock_mode: requested.api_value().to_string(),
@@ -1860,63 +1865,70 @@ pub async fn update_unlock_mode(
         }));
     }
 
-    let receipt = body.transition_receipt.as_ref().ok_or((
-        StatusCode::BAD_REQUEST,
-        Json(serde_json::json!({
-            "error": "transition_receipt required for unlock mode change"
-        })),
-    ))?;
-    let verified_receipt =
-        verify_transition_receipt(receipt, &app, current, requested).map_err(|field| {
-            (
+    // A preview has no TEE receipt yet. It exists so the CLI can learn that
+    // CAP will reject the signed descriptor before the guest wrap is removed.
+    let receipt_gate = if body.validate_only {
+        None
+    } else {
+        let receipt = body.transition_receipt.as_ref().ok_or((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "transition_receipt required for unlock mode change"
+            })),
+        ))?;
+        let verified_receipt = verify_transition_receipt(receipt, &app, current, requested)
+            .map_err(|field| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "invalid transition_receipt",
+                        "field": field,
+                    })),
+                )
+            })?;
+        let transition_attestation = body.transition_attestation.as_ref().ok_or((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "transition_attestation required for unlock mode change"
+            })),
+        ))?;
+        verify_transition_attestation(transition_attestation, &app, &verified_receipt).map_err(
+            |field| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "invalid transition_attestation",
+                        "field": field,
+                    })),
+                )
+            },
+        )?;
+        verify_transition_snp_quote(transition_attestation, receipt, quote_verification_now())
+            .map_err(|error| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "invalid transition_attestation",
+                        "field": "transition_attestation.quote",
+                        "reason": error.reason(),
+                    })),
+                )
+            })?;
+        // Server-side freshness window: without it, captured quote/receipt
+        // pairs can be replayed once (monotonicity and the unique receipt
+        // index only block reuse after the first consumption).
+        if !transition_receipt_is_fresh(verified_receipt.receipt_timestamp, Utc::now()) {
+            return Err((
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
                     "error": "invalid transition_receipt",
-                    "field": field,
+                    "field": "transition_receipt.payload.timestamp",
+                    "reason": "transition receipt outside freshness window",
                 })),
-            )
-        })?;
-    let transition_attestation = body.transition_attestation.as_ref().ok_or((
-        StatusCode::BAD_REQUEST,
-        Json(serde_json::json!({
-            "error": "transition_attestation required for unlock mode change"
-        })),
-    ))?;
-    verify_transition_attestation(transition_attestation, &app, &verified_receipt).map_err(
-        |field| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "invalid transition_attestation",
-                    "field": field,
-                })),
-            )
-        },
-    )?;
-    verify_transition_snp_quote(transition_attestation, receipt, quote_verification_now())
-        .map_err(|error| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "invalid transition_attestation",
-                    "field": "transition_attestation.quote",
-                    "reason": error.reason(),
-                })),
-            )
-        })?;
-    // Server-side freshness window: without it, captured quote/receipt
-    // pairs can be replayed once (monotonicity and the unique receipt
-    // index only block reuse after the first consumption).
-    if !transition_receipt_is_fresh(verified_receipt.receipt_timestamp, Utc::now()) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "invalid transition_receipt",
-                "field": "transition_receipt.payload.timestamp",
-                "reason": "transition receipt outside freshness window",
-            })),
-        ));
-    }
+            ));
+        }
+        Some((receipt, verified_receipt, transition_attestation))
+    };
 
     let signing_artifacts = crate::signing_service::decode_optional_blobs(
         body.customer_descriptor_blob.clone(),
@@ -2083,6 +2095,7 @@ pub async fn update_unlock_mode(
             body.signed_policy_artifact.clone(),
             signing_service_pubkey_hex,
             log_encryption.clone(),
+            true,
         )
         .await?;
         app_spec.generated_agent_policy = Some(
@@ -2108,6 +2121,17 @@ pub async fn update_unlock_mode(
         )?;
         signed_policy_artifact = Some(signed);
     }
+
+    if body.validate_only {
+        return Ok(Json(UpdateUnlockModeResponse {
+            app_name: app.name,
+            unlock_mode: current.api_value().to_string(),
+            deployment_id: None,
+            status: "validated".to_string(),
+        }));
+    }
+    let (receipt, verified_receipt, transition_attestation) =
+        receipt_gate.expect("unlock mode change without validate_only has a verified receipt");
 
     let descriptor_platform_binding = crate::signing_service::descriptor_platform_binding_for(
         &state,

@@ -449,13 +449,16 @@ async fn fetch_generated_agent_policy(
     release: &PlatformRelease,
     descriptor: &enclava_cli::descriptor::DeploymentDescriptor,
     log_encryption: Option<LogEncryptionConfig>,
+    pin_log_encryption: bool,
 ) -> Result<(GeneratedAgentPolicy, Option<LogEncryptionConfig>), Box<dyn std::error::Error>> {
     let response = api
         .generate_agent_policy(
             &descriptor.app_name,
             &AgentPolicyRequest {
                 descriptor: descriptor.clone(),
-                log_encryption,
+                // Pinning sends null for an explicit no-recipient. Omitting the
+                // field is the ordinary-deploy signal that a broker may select.
+                log_encryption: pin_log_encryption.then(|| log_encryption.clone()),
             },
         )
         .await?;
@@ -802,8 +805,14 @@ pub(crate) async fn build_signed_deploy_blobs(
         omit_luks2_header_seal_claim: !release_carries_seal_claim,
         omit_log_spool_bind_claim: !log_spool_state_bind_supported,
     };
-    let (generated_agent_policy, echoed_log_encryption) =
-        fetch_generated_agent_policy(api, &release, &descriptor, log_encryption.clone()).await?;
+    let (generated_agent_policy, echoed_log_encryption) = fetch_generated_agent_policy(
+        api,
+        &release,
+        &descriptor,
+        log_encryption.clone(),
+        pin_log_encryption,
+    )
+    .await?;
     // Unlock disable pins the locked generation's recipient, including an
     // explicit none. Ordinary deploys do not: a broker may select a key, and
     // failing `None == response` would retire that contract.

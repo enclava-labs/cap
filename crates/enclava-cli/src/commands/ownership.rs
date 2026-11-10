@@ -158,6 +158,7 @@ async fn ensure_unlock_mode_change_supported(
         customer_descriptor_blob: None,
         org_keyring_blob: None,
         signed_policy_artifact: None,
+        validate_only: false,
     };
     println!("Checking unlock-mode support for {app_name}...");
     match api.update_unlock_mode(app_name, &probe).await {
@@ -1086,12 +1087,27 @@ pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::erro
             // working through a KDS outage.
             tee.complete_transition_quote_crl(&mut transition_attestation)
                 .await?;
-            // Re-read after the password prompt and signing, immediately before
-            // the guest wrap is removed. disable_auto_unlock and receipt
-            // signing still run after this check; the server rejects a changed
-            // generation, but those TEE calls are the leftover window.
+            // Re-read after the password prompt and signing. The CAP preview below
+            // is what must pass before the guest wrap is removed.
             let latest = api.get_unlock_status(&app_name).await?;
             require_same_locked_generation(&signed.generation, &latest)?;
+
+            // CAP must accept the signed descriptor before the wrap is removed.
+            // A proxy that rewrote both status reads fails here, with the guest
+            // wrap still in place.
+            api.update_unlock_mode(
+                &app_name,
+                &UpdateUnlockModeRequest {
+                    mode: "password".to_string(),
+                    transition_receipt: None,
+                    transition_attestation: None,
+                    customer_descriptor_blob: Some(signed_blobs.customer_descriptor_blob.clone()),
+                    org_keyring_blob: Some(signed_blobs.org_keyring_blob.clone()),
+                    signed_policy_artifact: Some(signed_blobs.signed_policy_artifact.clone()),
+                    validate_only: true,
+                },
+            )
+            .await?;
 
             println!("Disabling auto-unlock for {app_name}...");
             tee.disable_auto_unlock(&password).await?;
@@ -1115,6 +1131,7 @@ pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::erro
                         customer_descriptor_blob: Some(signed_blobs.customer_descriptor_blob),
                         org_keyring_blob: Some(signed_blobs.org_keyring_blob),
                         signed_policy_artifact: Some(signed_blobs.signed_policy_artifact),
+                        validate_only: false,
                     },
                 )
                 .await?;
