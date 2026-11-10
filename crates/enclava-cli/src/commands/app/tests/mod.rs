@@ -3791,6 +3791,27 @@ fn status_json_payload_carries_diagnostics_with_stable_shape() {
     );
 }
 
+#[test]
+fn bounded_tee_error_strips_controls_and_caps_length() {
+    assert_eq!(
+        bounded_tee_error(Some("enclava_init_failed:\u{1b}[31mred\u{7}")).as_deref(),
+        Some("enclava_init_failed:[31mred")
+    );
+    assert_eq!(
+        bounded_tee_error(Some(&"x".repeat(2000)))
+            .as_deref()
+            .unwrap()
+            .len(),
+        512
+    );
+    assert_eq!(bounded_tee_error(Some("\u{1b}\u{7}\u{0}")), None);
+    assert_eq!(bounded_tee_error(None), None);
+    assert_eq!(
+        bounded_tee_error(Some("storage_error: enclava_init_failed")).as_deref(),
+        Some("storage_error: enclava_init_failed")
+    );
+}
+
 // --- attested-channel deploy phases ------------------------------------------
 //
 // The deploy flow may only read /status and deliver passwords/config over the
